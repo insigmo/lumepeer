@@ -70,6 +70,20 @@ in-memory and an encrypted-file backend. Two local instances complete
 `tests/integration`, alongside the guest-limit and queue-overflow tests §17.2
 requires and property tests over the §8.1 state machine.
 
+Phase 2 (Linux/X11): real screen capture through `x11rb`, a `CaptureController`
+that starts capture with the first viewer and stops it with the last, the
+`openh264` software encoder, ABR driven by receiver feedback, and a decoder that
+runs as a separate process confined by seccomp-BPF, exchanging frames over a
+shared memory ring buffer (§11.3). `tests/integration/tests/media_pipeline.rs`
+runs capture -> encode -> sandboxed decode end to end.
+
+The media backends are behind features so the default build needs no platform
+SDK:
+
+```sh
+cargo test -p lumepeer-media --features capture-x11,encode-openh264
+```
+
 Still skeletons that return an explicit error rather than pretending to work:
-media capture and encoding, the sandboxed decoder, the native keystore backends
-of §11.2, and every broker route.
+Wayland, Windows and macOS capture, hardware encoding, the native keystore
+backends of §11.2, and every broker route.

@@ -17,5 +17,7 @@ workspace = true
 [dev-dependencies]
 lumepeer-core.workspace = true
 lumepeer-net.workspace = true
+lumepeer-media = { workspace = true, features = ["capture-x11", "encode-openh264"] }
+iroh-base.workspace = true
 iroh.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

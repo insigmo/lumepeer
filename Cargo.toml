@@ -23,6 +23,7 @@ repository = "https://github.com/insigmo/lumepeer"
 lumepeer-core = { path = "crates/core" }
 lumepeer-net = { path = "crates/net" }
 lumepeer-media = { path = "crates/media" }
+lumepeer-decoder-worker = { path = "crates/decoder-worker" }
 
 # Design doc §5 — exact pins, updates go through a dedicated compatibility PR.
 iroh = "=1.0.2"
@@ -56,6 +57,9 @@ rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)
 chacha20poly1305 = "0.10" # encrypted-file keystore fallback (§11.2)
 x11rb = "0.13"          # safe X11 client for the lower-trust Linux capture (§11)
+memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
+seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
+libc = "0.2"            # syscall numbers for that filter
 
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }

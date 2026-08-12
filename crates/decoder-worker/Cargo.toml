@@ -15,6 +15,11 @@ workspace = true
 
 [dependencies]
 lumepeer-media.workspace = true
+openh264.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
+seccompiler.workspace = true
+libc.workspace = true
