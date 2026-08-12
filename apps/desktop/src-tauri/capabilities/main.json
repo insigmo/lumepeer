@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "core:window:allow-close",
+      "allow": [{ "label": "main" }]
+    }
+  ]
+}

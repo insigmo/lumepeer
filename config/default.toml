@@ -1,0 +1,25 @@
+# Base configuration (design doc §5.1).
+# Override locally with config/local.toml, which is gitignored and must never
+# hold secrets that belong in the OS keystore (§11.2).
+
+[runtime]
+# tokio worker threads are capped explicitly rather than defaulting to the core
+# count (§5.1).
+max_worker_threads = 4
+
+[network]
+# Relay fallback is part of the Iroh defaults; direct connections are preferred.
+prefer_direct = true
+
+[logging]
+# Human-readable on stdout in development, structured JSON to file in
+# production; rotation follows LOG_ROTATION_DAYS / LOG_ROTATION_MAX_MIB (§16.1).
+format = "auto"
+directory = "logs"
+
+[license]
+broker_base_url = "https://broker.invalid"
+
+[ui]
+# The consent screen must render instantly even on weak hardware (§5.1).
+locale = "en"

@@ -1,0 +1,16 @@
+# Host policy for the ControlLimited role (design doc §8.2, §5.1).
+#
+# Deny-by-default allowlist of actions per peer or group. Editable only by the
+# host through the UI: never by a guest, never through the broker API. Changes
+# apply to future ConsentGrant only and never widen an already active session.
+
+[defaults]
+# Nothing is allowed unless a rule below allows it.
+allow = []
+
+# One table per peer identity or group. `peer` holds the hex endpoint id.
+#
+# [[peers]]
+# peer = "…"
+# allow = ["pointer_move", "pointer_click"]
+peers = []
