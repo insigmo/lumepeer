@@ -1,0 +1,14 @@
+# Names that are spelled the way their vendors spell them; `doc_markdown` must
+# not force backticks on them.
+doc-valid-idents = [
+    "AppContainer",
+    "MediaCodec",
+    "OpenTelemetry",
+    "PipeWire",
+    "PostgreSQL",
+    "SQLite",
+    "ScreenCaptureKit",
+    "VideoToolbox",
+    "XShm",
+    "..",
+]

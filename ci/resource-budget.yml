@@ -1,0 +1,53 @@
+# Resource budget gate (design doc §15, §16.2, §19 phase 5).
+#
+# Runs on a self-hosted runner pinned to the reference configuration: 4 vCPU,
+# 8 GiB RAM, no discrete GPU. Exceeding a threshold fails the release gate; it
+# is never downgraded to a warning. Relaxing a threshold needs an ADR with an
+# explicit release-owner sign-off.
+#
+# Not wired into .github/workflows yet: it activates in phase 5, once there is
+# something to measure beyond the skeleton.
+
+reference_hardware:
+  vcpu: 4
+  ram_gib: 8
+  discrete_gpu: false
+
+tooling:
+  linux: [heaptrack, "valgrind massif"]
+  macos: [instruments]
+  windows: [etw]
+
+budgets:
+  # Every value mirrors a constant or a row of §15. Changing one here without
+  # changing the design doc text is itself a defect (§2.7).
+  idle_rss_mib:
+    target: 60 # IDLE_RAM_BUDGET_MIB
+    gate_p95: 70
+  idle_cpu_percent:
+    target: 0.5
+    gate_p95: 1.0
+  active_extra_rss_mib:
+    target: 150 # ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB
+    gate_p95: 180
+  active_cpu_percent:
+    target_range: [5, 15]
+    gate_p95: 20
+  glass_to_glass_lan_ms:
+    target: 120
+    gate_p95: 150
+  glass_to_glass_wan_ms:
+    target: 250
+    gate_p95: 350
+  input_rtt_lan_ms:
+    target: 100
+    gate_p95: 150
+  input_rtt_wan_ms:
+    target: 200
+    gate_p95: 300
+  connection_established_lan_s:
+    target: 2
+    gate_p95: 3
+  connection_established_wan_s:
+    target: 5
+    gate_p95: 8

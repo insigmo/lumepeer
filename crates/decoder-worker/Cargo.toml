@@ -1,0 +1,20 @@
+[package]
+name = "lumepeer-decoder-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lumepeer-decoder-worker"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+lumepeer-media.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

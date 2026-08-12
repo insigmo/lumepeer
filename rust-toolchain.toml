@@ -1,0 +1,5 @@
+[toolchain]
+# MSRV is pinned here (design doc §5). Bumping it is a separate PR with CI on
+# every tier-1 target.
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

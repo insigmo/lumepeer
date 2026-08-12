@@ -1,0 +1,19 @@
+{
+  "name": "lumepeer-desktop-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "lit-html": "^3"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "vite": "^6"
+  }
+}
