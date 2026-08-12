@@ -3,6 +3,10 @@
 //! Capture never starts without an active viewer and stops as soon as the last
 //! viewer leaves (§8.1, §11).
 
+use std::collections::BTreeSet;
+
+use lumepeer_core::NodeId;
+
 use crate::error::{MediaError, Result};
 
 #[cfg(target_os = "windows")]
@@ -11,7 +15,11 @@ pub mod windows;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "capture-x11"
+))]
 pub mod linux_x11;
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
@@ -63,7 +71,7 @@ pub struct Frame {
 }
 
 /// Platform screen capture backend (§11.1).
-pub trait ScreenCapturer: Send {
+pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// Starts capturing `target`.
     ///
     /// # Errors
@@ -124,7 +132,236 @@ impl ScreenCapturer for StubCapturer {
 /// [`MediaError::CaptureUnavailable`] when no backend is compiled in for this
 /// target.
 pub fn platform_capturer() -> Result<Box<dyn ScreenCapturer>> {
-    Err(MediaError::CaptureUnavailable(
-        "phase 2: platform capture backends per §11".to_owned(),
-    ))
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-x11"
+    ))]
+    {
+        // X11 first, Wayland later (ADR 0003). On a Wayland session `start`
+        // fails unless Xwayland is reachable, and the error says so.
+        Ok(Box::new(linux_x11::X11Capturer::new()))
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-x11"
+    )))]
+    {
+        Err(MediaError::CaptureUnavailable(
+            "no capture backend is compiled in for this target".to_owned(),
+        ))
+    }
+}
+
+/// Viewer-gated owner of a capturer (§8.1, §11).
+///
+/// Capture starts when the first viewer holding a `view` grant appears and
+/// stops with the last one. There is no path that produces a frame with no
+/// viewer attached: that is the "no capture without viewer" rule of §19 phase 2
+/// and it is enforced here rather than by convention at the call sites.
+#[derive(Debug)]
+pub struct CaptureController {
+    capturer: Box<dyn ScreenCapturer>,
+    target: CaptureTarget,
+    viewers: BTreeSet<NodeId>,
+    capturing: bool,
+}
+
+impl CaptureController {
+    /// Wraps `capturer`; nothing is captured until a viewer is added.
+    #[must_use]
+    pub fn new(capturer: Box<dyn ScreenCapturer>, target: CaptureTarget) -> Self {
+        Self {
+            capturer,
+            target,
+            viewers: BTreeSet::new(),
+            capturing: false,
+        }
+    }
+
+    /// Registers a viewer, starting capture if it is the first one.
+    ///
+    /// Idempotent per peer: the same viewer twice does not start a second
+    /// capture and does not keep it alive after its single revoke.
+    ///
+    /// # Errors
+    /// Propagates the backend error from [`ScreenCapturer::start`]; the viewer
+    /// is not registered if capture could not start.
+    pub fn add_viewer(&mut self, peer: NodeId) -> Result<()> {
+        if self.viewers.contains(&peer) {
+            return Ok(());
+        }
+        if self.viewers.is_empty() {
+            self.capturer.start(self.target)?;
+            self.capturing = true;
+        }
+        self.viewers.insert(peer);
+        Ok(())
+    }
+
+    /// Removes a viewer, stopping capture with the last one.
+    pub fn remove_viewer(&mut self, peer: &NodeId) {
+        if !self.viewers.remove(peer) {
+            return;
+        }
+        if self.viewers.is_empty() {
+            self.stop();
+        }
+    }
+
+    /// Drops every viewer and stops capture: revoke, screen lock, user switch
+    /// or license expiry (§8.1, §18).
+    pub fn stop(&mut self) {
+        self.viewers.clear();
+        if self.capturing {
+            self.capturer.stop();
+            self.capturing = false;
+        }
+    }
+
+    /// Number of viewers currently holding a `view` grant.
+    #[must_use]
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.len()
+    }
+
+    /// Whether the backend is currently capturing.
+    #[must_use]
+    pub const fn is_capturing(&self) -> bool {
+        self.capturing
+    }
+
+    /// What this backend allows on the input side (§11.1).
+    #[must_use]
+    pub fn input_capability(&self) -> InputCapability {
+        self.capturer.input_capability()
+    }
+
+    /// Next frame, or `None` when the screen has not changed (§11.1).
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureUnavailable`] when no viewer is attached, plus
+    /// whatever the backend reports.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>> {
+        if !self.capturing {
+            return Err(MediaError::CaptureUnavailable(
+                "no viewer holds a view grant: capture must not run".to_owned(),
+            ));
+        }
+        self.capturer.next_frame()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Capturer that counts starts and stops and always yields the same frame.
+    #[derive(Debug, Default)]
+    struct CountingCapturer {
+        starts: usize,
+        stops: usize,
+        running: bool,
+    }
+
+    impl ScreenCapturer for CountingCapturer {
+        fn start(&mut self, _target: CaptureTarget) -> Result<()> {
+            self.starts += 1;
+            self.running = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<Option<Frame>> {
+            assert!(self.running, "frames must never be produced while stopped");
+            Ok(Some(Frame {
+                width: 2,
+                height: 1,
+                format: PixelFormat::Bgra8,
+                timestamp_us: 0,
+                data: vec![0; 8],
+            }))
+        }
+
+        fn stop(&mut self) {
+            self.stops += 1;
+            self.running = false;
+        }
+
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::Full
+        }
+    }
+
+    fn peer(n: u8) -> NodeId {
+        iroh_base::SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    #[test]
+    fn nothing_is_captured_without_a_viewer() {
+        let mut controller = CaptureController::new(
+            Box::new(CountingCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        );
+        assert!(!controller.is_capturing());
+        assert!(matches!(
+            controller.next_frame(),
+            Err(MediaError::CaptureUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn capture_starts_with_the_first_viewer_and_stops_with_the_last() {
+        let mut controller = CaptureController::new(
+            Box::new(CountingCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        );
+
+        controller.add_viewer(peer(1)).unwrap();
+        assert!(controller.is_capturing());
+        assert!(controller.next_frame().unwrap().is_some());
+
+        controller.add_viewer(peer(2)).unwrap();
+        // A second viewer must not start a second capture.
+        assert_eq!(controller.viewer_count(), 2);
+
+        controller.remove_viewer(&peer(1));
+        assert!(controller.is_capturing(), "one viewer is still watching");
+
+        controller.remove_viewer(&peer(2));
+        assert!(!controller.is_capturing());
+        assert_eq!(controller.viewer_count(), 0);
+        assert!(matches!(
+            controller.next_frame(),
+            Err(MediaError::CaptureUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn adding_the_same_viewer_twice_does_not_outlive_its_revoke() {
+        let mut controller = CaptureController::new(
+            Box::new(CountingCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        );
+        controller.add_viewer(peer(1)).unwrap();
+        controller.add_viewer(peer(1)).unwrap();
+        assert_eq!(controller.viewer_count(), 1);
+        controller.remove_viewer(&peer(1));
+        assert!(!controller.is_capturing());
+    }
+
+    #[test]
+    fn stop_drops_every_viewer_at_once() {
+        let mut controller = CaptureController::new(
+            Box::new(CountingCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        );
+        controller.add_viewer(peer(1)).unwrap();
+        controller.add_viewer(peer(2)).unwrap();
+        controller.stop();
+        assert_eq!(controller.viewer_count(), 0);
+        assert!(!controller.is_capturing());
+    }
 }
