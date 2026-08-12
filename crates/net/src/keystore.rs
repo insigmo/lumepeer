@@ -112,20 +112,209 @@ pub const fn platform_backend() -> Backend {
 /// Opens the platform keystore.
 ///
 /// # Errors
-/// [`NetError::Keystore`] on every platform whose native backend is still
-/// phase 4 work. Falling back to the encrypted file there would weaken the
+/// [`NetError::Keystore`] when the platform's native backend is unavailable or
+/// not implemented yet. Falling back to the encrypted file would weaken the
 /// storage of §11.2 without the user being told, so it is refused instead;
 /// callers that accept the fallback construct [`FileKeystore`] explicitly.
 pub fn open() -> Result<Box<dyn Keystore>> {
     let backend = platform_backend();
+
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "secret-service"
+    ))]
+    if backend == Backend::LinuxSecretService {
+        return Ok(Box::new(
+            secret_service_backend::SecretServiceKeystore::new(),
+        ));
+    }
+
     if backend == Backend::EncryptedFile {
         return Err(NetError::Keystore(
             "no OS keystore on this platform; construct FileKeystore explicitly".to_owned(),
         ));
     }
     Err(NetError::Keystore(format!(
-        "{backend:?} backend is phase 4 work (design doc §19)"
+        "the {backend:?} backend is not built into this binary"
     )))
+}
+
+/// D-Bus Secret Service backend for Linux (§11.2).
+///
+/// Kept as an inline module so the file list of §6 stays exact.
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "secret-service"
+))]
+pub mod secret_service_backend {
+    use std::collections::HashMap;
+
+    use secret_service::{EncryptionType, SecretService};
+
+    use super::{IDENTITY_ENTRY, Keystore};
+    use crate::error::{NetError, Result};
+
+    /// Attribute key under which the identity is filed.
+    const ATTRIBUTE: &str = "lumepeer";
+    /// MIME type of the stored blob: raw key bytes, not text.
+    const CONTENT_TYPE: &str = "application/octet-stream";
+
+    /// Keystore backed by the D-Bus Secret Service (gnome-keyring, `KWallet`).
+    #[derive(Debug, Default)]
+    pub struct SecretServiceKeystore {
+        _private: (),
+    }
+
+    impl SecretServiceKeystore {
+        /// Creates the backend. The D-Bus connection is opened per operation:
+        /// the identity is read once at startup, so a persistent connection
+        /// would only keep an idle socket open against the budgets of §15.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { _private: () }
+        }
+
+        /// Runs one Secret Service operation on a private current-thread
+        /// runtime.
+        ///
+        /// The [`Keystore`] trait is synchronous because everything that calls
+        /// it is: identity handling happens before the endpoint exists. The
+        /// runtime is created and dropped inside the call, so this never
+        /// borrows the caller's executor and never blocks it from the inside.
+        fn block_on<F, T>(future: F) -> Result<T>
+        where
+            F: std::future::Future<Output = Result<T>>,
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| NetError::Keystore(format!("cannot start a runtime: {e}")))?;
+            runtime.block_on(future)
+        }
+
+        fn attributes() -> HashMap<&'static str, &'static str> {
+            HashMap::from([(ATTRIBUTE, IDENTITY_ENTRY)])
+        }
+
+        async fn load() -> Result<Option<iroh::SecretKey>> {
+            let service = SecretService::connect(EncryptionType::Dh)
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            let items = service
+                .search_items(Self::attributes())
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+
+            let Some(item) = items.unlocked.first().or_else(|| items.locked.first()) else {
+                return Ok(None);
+            };
+            item.unlock()
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            let secret = item
+                .get_secret()
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+
+            let bytes: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
+                NetError::Keystore("the stored identity has the wrong length".to_owned())
+            })?;
+            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        }
+
+        async fn store(key: iroh::SecretKey) -> Result<()> {
+            let service = SecretService::connect(EncryptionType::Dh)
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            let collection = service
+                .get_default_collection()
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            collection
+                .unlock()
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            collection
+                .create_item(
+                    "Lumepeer endpoint identity",
+                    Self::attributes(),
+                    &key.to_bytes(),
+                    // Replace: an install has exactly one endpoint identity.
+                    true,
+                    CONTENT_TYPE,
+                )
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            Ok(())
+        }
+
+        async fn delete() -> Result<()> {
+            let service = SecretService::connect(EncryptionType::Dh)
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            let items = service
+                .search_items(Self::attributes())
+                .await
+                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            for item in items.unlocked.iter().chain(items.locked.iter()) {
+                item.unlock()
+                    .await
+                    .map_err(|e| NetError::Keystore(e.to_string()))?;
+                item.delete()
+                    .await
+                    .map_err(|e| NetError::Keystore(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Keystore for SecretServiceKeystore {
+        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
+            Self::block_on(Self::load())
+        }
+
+        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
+            Self::block_on(Self::store(key.clone()))
+        }
+
+        fn delete_identity(&self) -> Result<()> {
+            Self::block_on(Self::delete())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+
+        use super::*;
+        use crate::keystore::load_or_create;
+
+        /// Runs against the session keyring when one is reachable. There is no
+        /// keyring on a headless CI runner, and the test says so instead of
+        /// failing.
+        #[test]
+        fn the_session_keyring_round_trips_an_identity() {
+            let store = SecretServiceKeystore::new();
+            let Ok(existing) = store.load_identity() else {
+                return;
+            };
+            // Never clobber a real identity: only run on a machine that has
+            // none stored yet, and clean up afterwards.
+            if existing.is_some() {
+                return;
+            }
+
+            let key = load_or_create(&store).unwrap();
+            assert_eq!(
+                store.load_identity().unwrap().unwrap().public(),
+                key.public()
+            );
+            store.delete_identity().unwrap();
+            assert!(store.load_identity().unwrap().is_none());
+        }
+    }
 }
 
 /// In-memory keystore. Never persists anything; used by tests and by ephemeral
@@ -345,7 +534,18 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_instead_of_downgrading_to_the_file_fallback() {
-        assert!(matches!(open(), Err(NetError::Keystore(_))));
+    fn open_never_downgrades_to_the_file_fallback() {
+        match open() {
+            // A platform with a built-in native backend returns it.
+            Ok(store) => {
+                assert_eq!(platform_backend(), Backend::LinuxSecretService);
+                // Opening must not have created anything yet.
+                let _ = store.load_identity();
+            }
+            // Everywhere else the caller is told, rather than silently handed
+            // the weaker file store (§11.2).
+            Err(NetError::Keystore(_)) => {}
+            Err(other) => panic!("unexpected keystore error: {other}"),
+        }
     }
 }

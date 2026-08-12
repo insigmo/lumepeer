@@ -72,6 +72,105 @@ impl Grants {
     }
 }
 
+/// One allowlistable action of the `ControlLimited` role (§8.2).
+///
+/// The set is deliberately coarse: a host granting "pointer only" should not
+/// have to enumerate keys, and a policy file that needs a scancode table would
+/// not be reviewable by the person it protects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAction {
+    /// Move the pointer.
+    PointerMove,
+    /// Press or release a pointer button.
+    PointerClick,
+    /// Scroll the wheel.
+    Scroll,
+    /// Press or release a key.
+    KeyPress,
+}
+
+impl ControlAction {
+    /// Action an input event asks for (§9.1, §11).
+    #[must_use]
+    pub const fn of(event: &crate::protocol::InputEventPayload) -> Self {
+        use crate::protocol::InputDetail;
+        match event.detail {
+            InputDetail::PointerMove { .. } => Self::PointerMove,
+            InputDetail::Wheel { .. } => Self::Scroll,
+            InputDetail::Press | InputDetail::Release => {
+                if event.logical >= crate::protocol::POINTER_BUTTON_LOGICAL_BASE {
+                    Self::PointerClick
+                } else {
+                    Self::KeyPress
+                }
+            }
+        }
+    }
+}
+
+/// Host policy for the `ControlLimited` role (§8.2, §5.1).
+///
+/// Deny by default: an action is permitted only if a rule names it. The host
+/// edits this through its own UI; neither a guest nor the broker can reach it,
+/// and a change applies to future `ConsentGrant` only — [`super::session::
+/// SessionManager`] snapshots the allowlist when it grants, so an edit never
+/// widens a session that is already running.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ControlPolicy {
+    #[serde(default)]
+    defaults: PolicyDefaults,
+    #[serde(default)]
+    peers: Vec<PolicyPeer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PolicyDefaults {
+    #[serde(default)]
+    allow: Vec<ControlAction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PolicyPeer {
+    /// Hex endpoint id the rule applies to.
+    peer: String,
+    #[serde(default)]
+    allow: Vec<ControlAction>,
+}
+
+impl ControlPolicy {
+    /// A policy that permits nothing.
+    #[must_use]
+    pub fn deny_all() -> Self {
+        Self::default()
+    }
+
+    /// Parses `config/control_policy.toml`.
+    ///
+    /// # Errors
+    /// [`CoreError::Malformed`] if the file is not valid TOML for this shape.
+    /// A policy that fails to parse is not silently replaced by a permissive
+    /// one: the caller keeps denying (§2.1).
+    pub fn from_toml(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|_| CoreError::Malformed)
+    }
+
+    /// Actions `peer` may perform under `ControlLimited`.
+    #[must_use]
+    pub fn allowed_for(&self, peer: &NodeId) -> Vec<ControlAction> {
+        let hex = peer.to_string();
+        let mut allowed = self.defaults.allow.clone();
+        for rule in &self.peers {
+            if rule.peer.eq_ignore_ascii_case(&hex) {
+                allowed.extend_from_slice(&rule.allow);
+            }
+        }
+        allowed.sort_unstable();
+        allowed.dedup();
+        allowed
+    }
+}
+
 /// Opaque handle handed to the host when a consent request is queued (§8.3).
 ///
 /// A guest cannot forge it; the host uses it to grant or revoke one specific

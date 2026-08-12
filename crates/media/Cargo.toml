@@ -15,6 +15,8 @@ default = []
 # that `cargo build --workspace` in phase 0 needs no platform SDKs.
 capture-scap = ["dep:scap"]
 capture-x11 = ["dep:x11rb"]
+# xdg-desktop-portal negotiation for the Wayland path (§11).
+capture-portal = ["dep:ashpd", "dep:tokio"]
 encode-openh264 = ["dep:openh264"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
@@ -24,10 +26,16 @@ lumepeer-core.workspace = true
 iroh-base.workspace = true
 blake3.workspace = true
 memmap2.workspace = true
+tokio = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
-x11rb = { workspace = true, optional = true }
+ashpd = { version = "0.13.13", default-features = false, features = [
+    "tokio",
+    "screencast",
+    "remote_desktop",
+], optional = true }
+x11rb = { workspace = true, optional = true, features = ["xtest"] }

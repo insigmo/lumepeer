@@ -1,0 +1,32 @@
+# Protocol golden vectors (design doc §17.2).
+#
+# Frozen wire encodings of MessageEnvelope for PROTOCOL_MAJOR 1, PROTOCOL_MINOR 0.
+# Format: <valid|invalid> <name> <hex payload, without the u32_be length prefix>.
+#
+# These do not change without bumping PROTOCOL_MINOR: an interop partner that
+# passes today must keep passing tomorrow.
+
+valid hello abababababababababababababababab0100000100000104636f72650301020300
+valid hello_ack abababababababababababababababab000001010000
+valid consent_request abababababababababababababababab01010200
+valid consent_grant_view abababababababababababababababab0001030000
+valid consent_grant_full abababababababababababababababab0002030200
+valid consent_revoke abababababababababababababababab00030400
+valid session_start abababababababababababababababab00040500
+valid license_warn_300 abababababababababababababababab000507ac0200
+valid ping abababababababababababababababab0006102a00
+valid pong abababababababababababababababab0102112a00
+valid resume_hello abababababababababababababababab010312abababababababababababababababab0900
+valid quality_adjust abababababababababababababababab01040f1ea01f00
+valid file_offer abababababababababababababababab01050d0a7265706f72742e706466d209070707070707070707070707070707070707070707070707070707070707070700
+valid clipboard abababababababababababababababab00070a02686900
+valid input_press abababababababababababababababab010609411e030000
+valid input_pointer_move abababababababababababababababab0107090000000280800280800100
+valid input_wheel abababababababababababababababab01080900000003050a00
+
+# Rejected inputs. Each names the rule of §9.1 it violates.
+invalid empty_frame 
+invalid truncated_envelope abab
+invalid unknown_message_kind abababababababababababababababab0000ff00
+invalid trailing_garbage abababababababababababababababab000001010000ff
+invalid bad_direction_byte abababababababababababababababab0700010100

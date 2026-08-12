@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 use rand::Rng as _;
 
 use crate::NodeId;
-pub use crate::consent::{ConsentQueue, ConsentRateLimiter, ConsentTicket, Grants, Role};
+pub use crate::consent::{
+    ConsentQueue, ConsentRateLimiter, ConsentTicket, ControlAction, ControlPolicy, Grants, Role,
+};
 use crate::constants::RECONNECT_WINDOW_SECS;
 use crate::error::{CoreError, Result};
 use crate::license::Plan;
+use crate::protocol::InputEventPayload;
 
 /// States of a single guest session (§8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +85,9 @@ struct ActiveSession {
     session_id: [u8; 16],
     role: Role,
     grants: Grants,
+    /// Allowlist captured when consent was granted. §8.2: a later policy edit
+    /// applies to future grants only and never widens a running session.
+    allowed_actions: Vec<ControlAction>,
     state: SessionState,
     /// Monotonic instant the session entered `Reconnecting` (§12.3: never
     /// wall-clock).
@@ -95,6 +101,7 @@ pub struct SessionManager {
     plan: Plan,
     queue: ConsentQueue,
     limiter: ConsentRateLimiter,
+    policy: ControlPolicy,
     sessions: HashMap<NodeId, ActiveSession>,
 }
 
@@ -119,6 +126,7 @@ impl SessionManager {
             plan,
             queue: ConsentQueue::new(),
             limiter: ConsentRateLimiter::new(),
+            policy: ControlPolicy::deny_all(),
             sessions: HashMap::new(),
         }
     }
@@ -132,6 +140,14 @@ impl SessionManager {
     /// Replaces the plan, e.g. after a license refresh (§12.2).
     pub const fn set_plan(&mut self, plan: Plan) {
         self.plan = plan;
+    }
+
+    /// Replaces the `ControlLimited` policy (§8.2).
+    ///
+    /// Running sessions keep the allowlist they were granted under; the new
+    /// policy applies to the next `ConsentGrant`.
+    pub fn set_control_policy(&mut self, policy: ControlPolicy) {
+        self.policy = policy;
     }
 
     /// Queues a consent request for `peer`.
@@ -179,12 +195,18 @@ impl SessionManager {
             .sessions
             .get(&peer)
             .map_or_else(Self::new_session_id, |s| s.session_id);
+        let allowed_actions = if role == Role::ControlLimited {
+            self.policy.allowed_for(&peer)
+        } else {
+            Vec::new()
+        };
         self.sessions.insert(
             peer,
             ActiveSession {
                 session_id,
                 role,
                 grants: Grants::from_role(role),
+                allowed_actions,
                 state: SessionState::Active,
                 disconnected_at: None,
             },
@@ -276,6 +298,43 @@ impl SessionManager {
             .iter()
             .find(|(_, s)| s.role.is_controller())
             .map(|(peer, _)| *peer)
+    }
+
+    /// Decides whether one input event may reach the platform adapter (§11).
+    ///
+    /// Every event passes through here: the adapter is not allowed to inject
+    /// anything the core has not authorized, and the check is per event rather
+    /// than per session so that a revoke takes effect on the next event.
+    ///
+    /// # Errors
+    /// - [`CoreError::UnknownPeer`] if the peer holds no session.
+    /// - [`CoreError::NotPermitted`] if the session is not active, holds no
+    ///   `input` grant, or asks for an action outside its allowlist (§8.2).
+    pub fn authorize_input(&self, peer: &NodeId, event: &InputEventPayload) -> Result<()> {
+        let session = self.sessions.get(peer).ok_or(CoreError::UnknownPeer)?;
+        if session.state != SessionState::Active {
+            return Err(CoreError::NotPermitted);
+        }
+        let permitted = match session.role {
+            // `view` only: nothing to inject, ever.
+            Role::ViewOnly => false,
+            // The grant is the authority, not the role name.
+            Role::FullControl => session.grants.input,
+            Role::ControlLimited => session.allowed_actions.contains(&ControlAction::of(event)),
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(CoreError::NotPermitted)
+        }
+    }
+
+    /// Actions `peer` may perform right now, as captured at grant time.
+    #[must_use]
+    pub fn allowed_actions(&self, peer: &NodeId) -> &[ControlAction] {
+        self.sessions
+            .get(peer)
+            .map_or(&[], |session| session.allowed_actions.as_slice())
     }
 
     /// Every guest holding grants, in no particular order.
@@ -418,6 +477,175 @@ mod tests {
         manager.revoke(peer(1)).unwrap();
         manager.grant(peer(2), Role::FullControl).unwrap();
         assert_eq!(manager.controller(), Some(peer(2)));
+    }
+
+    fn key_event() -> InputEventPayload {
+        InputEventPayload {
+            logical: 65,
+            scancode: 30,
+            modifiers: 0,
+            detail: crate::protocol::InputDetail::Press,
+        }
+    }
+
+    fn move_event() -> InputEventPayload {
+        InputEventPayload {
+            logical: 0,
+            scancode: 0,
+            modifiers: 0,
+            detail: crate::protocol::InputDetail::PointerMove { x: 1, y: 2 },
+        }
+    }
+
+    #[test]
+    fn view_only_may_never_inject_anything() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::ViewOnly).unwrap();
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &key_event()),
+            Err(CoreError::NotPermitted)
+        ));
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &move_event()),
+            Err(CoreError::NotPermitted)
+        ));
+    }
+
+    #[test]
+    fn full_control_may_inject_and_an_unknown_peer_may_not() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        manager.authorize_input(&peer(1), &key_event()).unwrap();
+        assert!(matches!(
+            manager.authorize_input(&peer(2), &key_event()),
+            Err(CoreError::UnknownPeer)
+        ));
+    }
+
+    #[test]
+    fn control_limited_is_deny_by_default_and_follows_the_allowlist() {
+        let policy = ControlPolicy::from_toml(
+            r#"
+            [defaults]
+            allow = ["pointer_move"]
+            "#,
+        )
+        .unwrap();
+
+        let mut manager = SessionManager::new();
+        // Without a policy nothing is permitted, not even with the role.
+        manager.grant(peer(1), Role::ControlLimited).unwrap();
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &move_event()),
+            Err(CoreError::NotPermitted)
+        ));
+
+        manager.revoke(peer(1)).unwrap();
+        manager.set_control_policy(policy);
+        manager.grant(peer(1), Role::ControlLimited).unwrap();
+        manager.authorize_input(&peer(1), &move_event()).unwrap();
+        // Keys are not on the allowlist.
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &key_event()),
+            Err(CoreError::NotPermitted)
+        ));
+    }
+
+    #[test]
+    fn a_policy_edit_does_not_widen_a_running_session() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::ControlLimited).unwrap();
+
+        // The host widens the policy while the session runs (§8.2).
+        manager.set_control_policy(
+            ControlPolicy::from_toml(
+                r#"
+                [defaults]
+                allow = ["pointer_move", "key_press"]
+                "#,
+            )
+            .unwrap(),
+        );
+        assert!(manager.allowed_actions(&peer(1)).is_empty());
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &move_event()),
+            Err(CoreError::NotPermitted)
+        ));
+
+        // Only the next grant picks it up.
+        manager.revoke(peer(1)).unwrap();
+        manager.grant(peer(1), Role::ControlLimited).unwrap();
+        manager.authorize_input(&peer(1), &move_event()).unwrap();
+    }
+
+    #[test]
+    fn a_per_peer_rule_adds_to_the_defaults() {
+        let policy = ControlPolicy::from_toml(&format!(
+            r#"
+            [defaults]
+            allow = ["pointer_move"]
+
+            [[peers]]
+            peer = "{}"
+            allow = ["scroll"]
+            "#,
+            peer(1)
+        ))
+        .unwrap();
+        assert_eq!(
+            policy.allowed_for(&peer(1)),
+            vec![ControlAction::PointerMove, ControlAction::Scroll]
+        );
+        assert_eq!(
+            policy.allowed_for(&peer(2)),
+            vec![ControlAction::PointerMove]
+        );
+    }
+
+    #[test]
+    fn a_malformed_policy_does_not_become_a_permissive_one() {
+        assert!(ControlPolicy::from_toml("this is not toml [[[").is_err());
+        assert!(
+            ControlPolicy::from_toml(
+                r#"[defaults]
+            allow = ["fly_the_plane"]"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_checked_in_policy_file_permits_nothing() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/control_policy.toml"
+        ))
+        .unwrap();
+        let policy = ControlPolicy::from_toml(&text).unwrap();
+        assert!(policy.allowed_for(&peer(1)).is_empty());
+    }
+
+    #[test]
+    fn a_revoked_session_stops_authorizing_on_the_next_event() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        manager.authorize_input(&peer(1), &key_event()).unwrap();
+        manager.revoke(peer(1)).unwrap();
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &key_event()),
+            Err(CoreError::UnknownPeer)
+        ));
+    }
+
+    #[test]
+    fn a_disconnected_session_does_not_authorize_input() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        manager.on_disconnect(peer(1)).unwrap();
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &key_event()),
+            Err(CoreError::NotPermitted)
+        ));
     }
 
     #[test]

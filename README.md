@@ -20,16 +20,16 @@ Deviations from it live in `docs/adr/`, never in silence.
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `crates/core` | Session state machine, consent, permissions, license, audit. TCB. |
-| `crates/net` | Iroh endpoint, invite tickets, control framing, reconnect, keystore. |
-| `crates/media` | Capture, encode, jitter buffer, adaptive bitrate. |
-| `crates/decoder-worker` | Decoder in its own sandboxed OS process (§11.3). |
-| `apps/desktop` | Tauri app: `src-tauri` Rust backend, `src` TypeScript webview. |
-| `services/broker` | Axum + SQLite license broker. |
-| `docs/adr` | Architecture decision records. |
-| `ci/resource-budget.yml` | Performance and memory gate for release CI (§15). |
+| Path                     | What                                                                 |
+|--------------------------|----------------------------------------------------------------------|
+| `crates/core`            | Session state machine, consent, permissions, license, audit. TCB.    |
+| `crates/net`             | Iroh endpoint, invite tickets, control framing, reconnect, keystore. |
+| `crates/media`           | Capture, encode, jitter buffer, adaptive bitrate.                    |
+| `crates/decoder-worker`  | Decoder in its own sandboxed OS process (§11.3).                     |
+| `apps/desktop`           | Tauri app: `src-tauri` Rust backend, `src` TypeScript webview.       |
+| `services/broker`        | Axum + SQLite license broker.                                        |
+| `docs/adr`               | Architecture decision records.                                       |
+| `ci/resource-budget.yml` | Performance and memory gate for release CI (§15).                    |
 
 Three ALPNs, each on its own QUIC connection: `rd/control/1`, `rd/media/1` and
 `rd/file/1`. The file connection opens lazily only after `FileAccept(true)`, so
@@ -84,6 +84,22 @@ SDK:
 cargo test -p lumepeer-media --features capture-x11,encode-openh264
 ```
 
+Phase 3: the broker serves `/v1/license/issue|heartbeat|revoke|refresh` and
+`/v1/webhook/payment` against SQLite, tokens are signed and verified in the
+binary format of §12.1, and `LicenseGuard` implements the offline table of
+§12.4, including the clock-rollback row. `cargo fuzz` targets live in
+`tests/fuzz`, with their corpus replayed on stable by
+`tests/integration/tests/protocol_golden.rs`, next to the frozen interop vectors
+in `tests/interop/golden_vectors.txt`.
+
+The broker refuses to start without its keys:
+
+```sh
+LUMEPEER_BROKER_SIGNING_KEY=<64 hex chars> \
+LUMEPEER_BROKER_WEBHOOK_SECRET=<shared secret> \
+cargo run -p lumepeer-broker
+```
+
 Still skeletons that return an explicit error rather than pretending to work:
-Wayland, Windows and macOS capture, hardware encoding, the native keystore
-backends of §11.2, and every broker route.
+Wayland, Windows and macOS capture, hardware encoding, and the native keystore
+backends of §11.2.

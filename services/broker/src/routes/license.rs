@@ -3,14 +3,25 @@
 //! Issue is idempotent per `idempotency_key`; heartbeat only records liveness
 //! and never ends an active session on its own — a missed heartbeat is part of
 //! the offline grace of §12.4, not a separate failure mode.
+//!
+//! Nothing here is an authorization decision about a session: the broker sells
+//! entitlement, the host decides who may look at its screen (§2.3, §4).
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use lumepeer_core::constants::TRIAL_SESSION_LIMIT_SECS;
+use lumepeer_core::license::{LicenseToken, Plan, TOKEN_VERSION};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
+use crate::db;
+
+/// How long an issued token stays valid. Shorter than any offline grace of
+/// §12.3, so a device that never comes back has to refresh before it can rely
+/// on the grace at all.
+pub const TOKEN_LIFETIME_SECS: u64 = 24 * 60 * 60;
 
 /// Mounts the license routes.
 pub fn router() -> Router<AppState> {
@@ -35,7 +46,7 @@ pub struct IssueRequest {
 /// Response carrying a signed license token (§12.1).
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
-    /// Base64 of the binary token.
+    /// Base32 of the binary token.
     pub token: String,
 }
 
@@ -48,24 +59,302 @@ pub struct HeartbeatRequest {
     pub active_seconds: u64,
 }
 
+/// Answer to a heartbeat.
+#[derive(Debug, Serialize)]
+pub struct HeartbeatResponse {
+    /// Whether the device may keep running.
+    pub ok: bool,
+    /// Reason when it may not; free of secrets (§15).
+    pub reason: Option<String>,
+}
+
+/// Body of `/v1/license/revoke` and `/v1/license/refresh`.
+#[derive(Debug, Deserialize)]
+pub struct DeviceRequest {
+    /// Device the call is about.
+    pub device_id: String,
+}
+
+/// Error body returned to the client.
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    /// Stable machine-readable code.
+    pub code: &'static str,
+    /// Short message, free of secrets and of token bytes (§15).
+    pub message: String,
+}
+
+fn error(
+    status: StatusCode,
+    code: &'static str,
+    message: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            code,
+            message: message.to_owned(),
+        }),
+    )
+}
+
+/// Issues a token, or returns the one a previous call with the same
+/// `idempotency_key` already issued (§12.2, §18).
 async fn issue(
-    State(_state): State<AppState>,
-    Json(_body): Json<IssueRequest>,
-) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "phase 3: license issue")
+    State(state): State<AppState>,
+    Json(body): Json<IssueRequest>,
+) -> Result<(StatusCode, Json<TokenResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let now = crate::now_secs();
+
+    if let Some(existing) = db::token_for_idempotency_key(&state.pool, &body.idempotency_key)
+        .await
+        .map_err(|e| internal(&e))?
+    {
+        // Same key, same token, and no second device row (§18).
+        return Ok((
+            StatusCode::OK,
+            Json(TokenResponse {
+                token: encode(&existing),
+            }),
+        ));
+    }
+
+    let Some(license) = db::active_license_for_account(&state.pool, &body.account_id, now)
+        .await
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "NO_ACTIVE_LICENSE",
+            "the account has no active license",
+        ));
+    };
+
+    let plan = Plan::from_wire_or_trial(license.plan);
+
+    // Seat conflict: when one more device than the plan seats asks for a token,
+    // the device with the oldest heartbeat loses the seat (§12.2, §19 phase 3).
+    // Losing it is recorded rather than deleted, so the displaced device learns
+    // why on its next heartbeat instead of looking like a broker fault.
+    let seats = usize::from(plan.max_concurrent_guests());
+    let live = db::live_devices(&state.pool, &license.id)
+        .await
+        .map_err(|e| internal(&e))?;
+    if !live.iter().any(|(id, _)| id == &body.device_id) && live.len() >= seats {
+        for (id, _) in live.iter().rev().take(live.len() + 1 - seats) {
+            db::displace_device(&state.pool, id, now)
+                .await
+                .map_err(|e| internal(&e))?;
+            tracing::info!("displacing a device: the license has no free seat");
+        }
+    }
+
+    let mut token = LicenseToken {
+        version: TOKEN_VERSION,
+        key_id: state.key_id,
+        license_id: parse_id(&license.id),
+        plan,
+        device_id: parse_id(&body.device_id),
+        issued_at: now,
+        not_before: now,
+        expires_at: now
+            .saturating_add(TOKEN_LIFETIME_SECS)
+            .min(license.expires_at),
+        features: 0,
+        // Binds the token to the entitlement it was derived from, so a later
+        // audit can tell which license row produced it without storing the
+        // account identity in the token itself (§15).
+        payload_hash: *blake3::hash(license.id.as_bytes()).as_bytes(),
+        signature: [0u8; 64],
+    };
+    token.sign(&state.signing_key);
+    let bytes = token.encode();
+
+    db::record_issue(
+        &state.pool,
+        &license.id,
+        &body.device_id,
+        &body.idempotency_key,
+        &bytes,
+        now,
+    )
+    .await
+    .map_err(|e| internal(&e))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(TokenResponse {
+            token: encode(&bytes),
+        }),
+    ))
 }
 
+/// Records liveness and answers whether the device may keep running.
 async fn heartbeat(
-    State(_state): State<AppState>,
-    Json(_body): Json<HeartbeatRequest>,
-) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "phase 3: license heartbeat")
+    State(state): State<AppState>,
+    Json(body): Json<HeartbeatRequest>,
+) -> Result<Json<HeartbeatResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now = crate::now_secs();
+    let Some(device) = db::device(&state.pool, &body.device_id)
+        .await
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_DEVICE",
+            "no such device",
+        ));
+    };
+
+    // Trial time only ever grows: a client reporting a smaller number than the
+    // ledger already holds does not get its trial back (§12.3).
+    let used = device.trial_seconds_used.max(body.active_seconds);
+    db::record_heartbeat(&state.pool, &body.device_id, used, now)
+        .await
+        .map_err(|e| internal(&e))?;
+
+    let license = db::license(&state.pool, &device.license_id)
+        .await
+        .map_err(|e| internal(&e))?;
+    let Some(license) = license else {
+        return Ok(Json(HeartbeatResponse {
+            ok: false,
+            reason: Some("the license no longer exists".to_owned()),
+        }));
+    };
+
+    if license.revoked_at.is_some() {
+        return Ok(Json(HeartbeatResponse {
+            ok: false,
+            reason: Some("the license was revoked".to_owned()),
+        }));
+    }
+    if license.expires_at < now {
+        return Ok(Json(HeartbeatResponse {
+            ok: false,
+            reason: Some("the license expired".to_owned()),
+        }));
+    }
+    if device.displaced_at.is_some() {
+        return Ok(Json(HeartbeatResponse {
+            ok: false,
+            reason: Some("another device took the seat of this license".to_owned()),
+        }));
+    }
+    if Plan::from_wire_or_trial(license.plan) == Plan::Trial && used >= TRIAL_SESSION_LIMIT_SECS {
+        return Ok(Json(HeartbeatResponse {
+            ok: false,
+            reason: Some("the trial session limit is used up".to_owned()),
+        }));
+    }
+
+    Ok(Json(HeartbeatResponse {
+        ok: true,
+        reason: None,
+    }))
 }
 
-async fn revoke(State(_state): State<AppState>) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "phase 3: license revoke")
+/// Revokes the license behind a device. Idempotent: revoking twice is fine.
+async fn revoke(
+    State(state): State<AppState>,
+    Json(body): Json<DeviceRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let now = crate::now_secs();
+    let Some(device) = db::device(&state.pool, &body.device_id)
+        .await
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_DEVICE",
+            "no such device",
+        ));
+    };
+    db::revoke_license(&state.pool, &device.license_id, now)
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-async fn refresh(State(_state): State<AppState>) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "phase 3: license refresh")
+/// Issues a fresh token for a device that already has one.
+async fn refresh(
+    State(state): State<AppState>,
+    Json(body): Json<DeviceRequest>,
+) -> Result<Json<TokenResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let now = crate::now_secs();
+    let Some(device) = db::device(&state.pool, &body.device_id)
+        .await
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(error(
+            StatusCode::NOT_FOUND,
+            "UNKNOWN_DEVICE",
+            "no such device",
+        ));
+    };
+    let Some(license) = db::license(&state.pool, &device.license_id)
+        .await
+        .map_err(|e| internal(&e))?
+    else {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "NO_ACTIVE_LICENSE",
+            "the license no longer exists",
+        ));
+    };
+    if license.revoked_at.is_some() || license.expires_at < now {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "LICENSE_INACTIVE",
+            "the license is revoked or expired",
+        ));
+    }
+
+    let mut token = LicenseToken {
+        version: TOKEN_VERSION,
+        key_id: state.key_id,
+        license_id: parse_id(&license.id),
+        plan: Plan::from_wire_or_trial(license.plan),
+        device_id: parse_id(&body.device_id),
+        issued_at: now,
+        not_before: now,
+        expires_at: now
+            .saturating_add(TOKEN_LIFETIME_SECS)
+            .min(license.expires_at),
+        features: 0,
+        payload_hash: *blake3::hash(license.id.as_bytes()).as_bytes(),
+        signature: [0u8; 64],
+    };
+    token.sign(&state.signing_key);
+    Ok(Json(TokenResponse {
+        token: encode(&token.encode()),
+    }))
+}
+
+/// Maps a database failure to a 500 without leaking the query or the path.
+fn internal(error: &sqlx::Error) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(%error, "broker database failure");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            code: "INTERNAL",
+            message: "internal error".to_owned(),
+        }),
+    )
+}
+
+/// Base32 of the binary token, matching the ticket encoding of §7.
+fn encode(bytes: &[u8]) -> String {
+    data_encoding::BASE32_NOPAD.encode(bytes)
+}
+
+/// Derives the 16 byte identifier a token carries from a textual id.
+///
+/// Client-supplied ids are opaque strings; hashing them keeps the token's fixed
+/// layout without putting an account-controlled string into it (§12.1, §15).
+fn parse_id(text: &str) -> [u8; 16] {
+    let hash = blake3::hash(text.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hash.as_bytes()[..16]);
+    out
 }

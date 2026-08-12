@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 
 use lumepeer_core::NodeId;
+use lumepeer_core::protocol::InputEventPayload;
 
 use crate::error::{MediaError, Result};
 
@@ -92,6 +93,69 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
 
     /// What this backend allows on the input side.
     fn input_capability(&self) -> InputCapability;
+}
+
+/// Platform input adapter (§11).
+///
+/// The adapter is the last step, never the first: `lumepeer-core` authorizes
+/// every event before it reaches an implementation of this trait, and the
+/// adapter itself never consults grants. Guests send logical keys and physical
+/// scancodes, never raw OS handles (§11).
+pub trait InputInjector: Send + std::fmt::Debug {
+    /// Injects one already authorized event.
+    ///
+    /// # Errors
+    /// [`MediaError::InputUnavailable`] if the platform refuses the injection,
+    /// which on macOS means the accessibility permission was withdrawn during
+    /// the session and the caller must revoke (§18).
+    fn inject(&mut self, event: &InputEventPayload) -> Result<()>;
+
+    /// What this adapter can do, mirroring [`ScreenCapturer::input_capability`].
+    fn capability(&self) -> InputCapability;
+}
+
+/// Injector that refuses everything, for a session that degraded to view-only
+/// because the platform gave no input capability (§18).
+#[derive(Debug, Default)]
+pub struct NoInputInjector;
+
+impl InputInjector for NoInputInjector {
+    fn inject(&mut self, _event: &InputEventPayload) -> Result<()> {
+        Err(MediaError::InputUnavailable(
+            "this session has no input capability".to_owned(),
+        ))
+    }
+
+    fn capability(&self) -> InputCapability {
+        InputCapability::None
+    }
+}
+
+/// Opens the input adapter of the current platform.
+///
+/// # Errors
+/// [`MediaError::InputUnavailable`] when no adapter is compiled in. The caller
+/// continues view-only and says so in the UI rather than failing the session
+/// (§18).
+pub fn platform_injector() -> Result<Box<dyn InputInjector>> {
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-x11"
+    ))]
+    {
+        linux_x11::X11Injector::connect().map(|i| Box::new(i) as Box<dyn InputInjector>)
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-x11"
+    )))]
+    {
+        Err(MediaError::InputUnavailable(
+            "no input adapter is compiled in for this target".to_owned(),
+        ))
+    }
 }
 
 /// Capturer that produces nothing. Used in phase 0/1, where the consent and
