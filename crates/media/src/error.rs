@@ -17,6 +17,12 @@ pub enum MediaError {
     #[error("capture interrupted: {0}")]
     CaptureInterrupted(String),
 
+    /// The platform refuses input injection: no adapter, no permission, or a
+    /// permission withdrawn mid-session (§18). The session degrades to
+    /// view-only and the UI says so; it never silently keeps "control".
+    #[error("input injection unavailable: {0}")]
+    InputUnavailable(String),
+
     /// No hardware encoder and the software fallback did not pass the
     /// resource gate (§18).
     #[error("no usable encoder: {0}")]

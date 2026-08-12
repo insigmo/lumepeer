@@ -9,6 +9,14 @@ use crate::consent::Role;
 use crate::constants::MAX_CONTROL_FRAME_BYTES;
 use crate::error::{CoreError, Result};
 
+/// Logical identifiers at or above this value denote pointer buttons rather
+/// than keys.
+///
+/// §9.1 fixes the field but not the namespace; splitting it here lets the host
+/// policy of §8.2 distinguish `PointerClick` from `KeyPress` without a platform
+/// scancode table. See docs/adr/0007.
+pub const POINTER_BUTTON_LOGICAL_BASE: u32 = 0xF000_0000;
+
 /// Protocol major version. A mismatch closes the connection before consent (§9.1).
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor version. Unknown optional features are ignored (§9.1).
@@ -186,7 +194,18 @@ impl MessageEnvelope {
         if bytes.is_empty() || bytes.len() > MAX_CONTROL_FRAME_BYTES {
             return Err(CoreError::FrameSize { size: bytes.len() });
         }
-        postcard::from_bytes(bytes).map_err(|_| CoreError::Malformed)
+        // `postcard::from_bytes` stops at the end of the value and ignores
+        // whatever follows. A frame is length-prefixed, so trailing bytes mean
+        // the two sides disagree about what the frame contains; that is a
+        // malformed frame, not a decodable one with padding. Rejecting it also
+        // keeps the encoding canonical, which the interop vectors of §17.2 rely
+        // on.
+        let (envelope, rest) =
+            postcard::take_from_bytes::<Self>(bytes).map_err(|_| CoreError::Malformed)?;
+        if !rest.is_empty() {
+            return Err(CoreError::Malformed);
+        }
+        Ok(envelope)
     }
 }
 
@@ -234,6 +253,24 @@ mod tests {
         assert!(matches!(
             MessageEnvelope::decode(&[]),
             Err(CoreError::FrameSize { size: 0 })
+        ));
+    }
+
+    #[test]
+    fn trailing_bytes_make_a_frame_malformed() {
+        let envelope = MessageEnvelope {
+            session_id: [1u8; 16],
+            direction: Direction::HostToGuest,
+            seq: 0,
+            kind: MessageKind::ConsentRevoke,
+            body: Vec::new(),
+        };
+        let mut bytes = envelope.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), envelope);
+        bytes.push(0xff);
+        assert!(matches!(
+            MessageEnvelope::decode(&bytes),
+            Err(CoreError::Malformed)
         ));
     }
 

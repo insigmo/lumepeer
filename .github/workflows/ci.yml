@@ -55,17 +55,37 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm xvfb libx11-dev
+          sudo apt-get install -y nasm xvfb libx11-dev libxtst-dev libdbus-1-dev gnome-keyring
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,encode-openh264 -- -D warnings
       - run: cargo build -p lumepeer-decoder-worker
+      - run: cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D warnings
+      - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
       - name: Test the media pipeline under Xvfb
-        run: xvfb-run -a cargo test -p lumepeer-media --features capture-x11,encode-openh264
+        # LUMEPEER_TEST_XTEST enables the input injection test, which is only
+        # safe against a throwaway display like this one.
+        run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,encode-openh264
       - name: Capture, encode and sandboxed decode end to end
         run: xvfb-run -a cargo test -p lumepeer-integration-tests --test media_pipeline
+      - name: Error matrix (§18)
+        run: xvfb-run -a cargo test -p lumepeer-integration-tests --test error_matrix
+      - name: Keystore against a session keyring
+        run: dbus-run-session -- cargo test -p lumepeer-net --features secret-service
+
+  # The fuzz targets live outside the workspace and need nightly, so they get
+  # their own job. A build is enough per commit; longer runs belong to the
+  # release checklist (§21).
+  fuzz:
+    name: fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --manifest-path tests/fuzz/Cargo.toml
 
   supply-chain:
     name: audit and deny

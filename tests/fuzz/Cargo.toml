@@ -1,0 +1,43 @@
+[package]
+name = "lumepeer-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Not a workspace member: `cargo fuzz` builds this with its own flags on
+# nightly, and pulling libfuzzer-sys into the workspace would put a nightly-only
+# dependency into every stable build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lumepeer-core = { path = "../../crates/core" }
+lumepeer-net = { path = "../../crates/net" }
+ed25519-dalek = "2"
+
+[[bin]]
+name = "control_envelope"
+path = "fuzz_targets/control_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "license_token"
+path = "fuzz_targets/license_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invite_ticket"
+path = "fuzz_targets/invite_ticket.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true
