@@ -55,8 +55,21 @@ one.
 
 ## Status
 
-Phase 0 of §19 is done: the workspace builds, the constants of §14, the wire
-types of §9.1 and the signatures of §8.3/§11.1 are in place, CI runs fmt,
-clippy, build, test, audit and deny. Media capture, the Iroh endpoint, the
-keystore backends and every broker route are still skeletons that return an
-explicit error rather than pretending to work.
+Phases 0 and 1 of §19 are done.
+
+Phase 0: the workspace builds, the constants of §14, the wire types of §9.1 and
+the signatures of §8.3/§11.1 are in place, CI runs fmt, clippy, build, test,
+audit and deny.
+
+Phase 1: the Iroh endpoint binds and dials all three ALPNs, invite tickets are
+signed, encoded as QR strings and single-use, the control stream carries the
+framing and anti-replay rules of §9.1, the consent model of §8 runs in memory
+behind the five IPC commands, and the keystore ships as a trait with an
+in-memory and an encrypted-file backend. Two local instances complete
+`Hello`/`HelloAck` -> `ConsentRequest` -> `ConsentGrant` -> `ConsentRevoke` in
+`tests/integration`, alongside the guest-limit and queue-overflow tests §17.2
+requires and property tests over the §8.1 state machine.
+
+Still skeletons that return an explicit error rather than pretending to work:
+media capture and encoding, the sandboxed decoder, the native keystore backends
+of §11.2, and every broker route.

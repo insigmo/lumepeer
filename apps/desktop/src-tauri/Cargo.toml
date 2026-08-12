@@ -21,6 +21,7 @@ tauri-build.workspace = true
 lumepeer-core.workspace = true
 lumepeer-net.workspace = true
 lumepeer-media.workspace = true
+rand.workspace = true
 tauri.workspace = true
 tokio.workspace = true
 serde.workspace = true

@@ -3,10 +3,13 @@
 //! Deny-by-default: nothing is permitted unless the host explicitly granted it,
 //! and neither the UI nor the guest is a source of authorization (§2.1, §2.3).
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use crate::NodeId;
-use crate::constants::MAX_PENDING_CONSENTS;
+use crate::constants::{CONSENT_RATE_PER_MINUTE, MAX_PENDING_CONSENTS};
 use crate::error::{CoreError, Result};
 
 /// Role a guest may hold. `FullControl` does not imply clipboard, file
@@ -160,5 +163,129 @@ impl ConsentQueue {
     /// Drops every pending request, e.g. on screen lock or session end (§18).
     pub fn clear(&mut self) {
         self.pending.clear();
+    }
+}
+
+/// Sliding-window rate limit of `ConsentRequest` per authenticated peer (§9.2).
+///
+/// Independent of [`ConsentQueue`]: this bounds how often one `NodeId` may ask,
+/// the queue bounds how many unanswered requests exist across all guests (§8.1).
+/// Measured on the monotonic clock, so a wall-clock rollback cannot widen the
+/// window (§12.3).
+#[derive(Debug, Default)]
+pub struct ConsentRateLimiter {
+    hits: HashMap<NodeId, Vec<Instant>>,
+}
+
+impl ConsentRateLimiter {
+    /// Creates an empty limiter.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            hits: HashMap::new(),
+        }
+    }
+
+    /// Records one request from `peer`.
+    ///
+    /// # Errors
+    /// [`CoreError::ConsentRateLimited`] once `peer` has already made
+    /// `CONSENT_RATE_PER_MINUTE` requests inside the last minute. The excess
+    /// request is not recorded, so it cannot push the window forward.
+    pub fn check(&mut self, peer: NodeId) -> Result<()> {
+        self.check_at(peer, Instant::now())
+    }
+
+    /// [`Self::check`] against an explicit instant, for tests.
+    ///
+    /// # Errors
+    /// Same as [`Self::check`].
+    pub fn check_at(&mut self, peer: NodeId, now: Instant) -> Result<()> {
+        let window = Duration::from_mins(1);
+        let hits = self.hits.entry(peer).or_default();
+        hits.retain(|at| now.duration_since(*at) < window);
+        if hits.len() >= CONSENT_RATE_PER_MINUTE as usize {
+            return Err(CoreError::ConsentRateLimited);
+        }
+        hits.push(now);
+        Ok(())
+    }
+
+    /// Forgets the history of `peer`, e.g. after the session ended.
+    pub fn forget(&mut self, peer: &NodeId) {
+        self.hits.remove(peer);
+    }
+
+    /// Forgets every peer.
+    pub fn clear(&mut self) {
+        self.hits.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// Deterministic test peer.
+    pub(crate) fn peer(n: u8) -> NodeId {
+        iroh_base::SecretKey::from_bytes(&[n; 32]).public()
+    }
+
+    #[test]
+    fn queue_overflow_rejects_newcomer_without_evicting() {
+        let mut queue = ConsentQueue::new();
+        for n in 0..u8::try_from(MAX_PENDING_CONSENTS).unwrap() {
+            queue.push(peer(n + 1), Role::ViewOnly).unwrap();
+        }
+        let overflow = queue.push(peer(200), Role::ViewOnly);
+        assert!(matches!(overflow, Err(CoreError::PendingConsentQueueFull)));
+        // §8.1: the existing queue is untouched, nothing is evicted.
+        assert_eq!(queue.len(), MAX_PENDING_CONSENTS);
+        assert!(queue.contains(&peer(1)));
+        assert!(!queue.contains(&peer(200)));
+    }
+
+    #[test]
+    fn removing_a_ticket_renumbers_the_rest() {
+        let mut queue = ConsentQueue::new();
+        queue.push(peer(1), Role::ViewOnly).unwrap();
+        queue.push(peer(2), Role::ViewOnly).unwrap();
+        queue.push(peer(3), Role::FullControl).unwrap();
+        queue.remove(&peer(1)).unwrap();
+        let positions: Vec<u8> = queue.tickets().iter().map(|t| t.queue_position).collect();
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    #[test]
+    fn full_control_implies_input_but_never_clipboard_files_or_recording() {
+        let grants = Grants::from_role(Role::FullControl);
+        assert!(grants.view && grants.input);
+        assert!(!grants.clipboard_read);
+        assert!(!grants.clipboard_write);
+        assert!(!grants.file_transfer);
+        assert!(!grants.recording);
+    }
+
+    #[test]
+    fn rate_limiter_allows_the_quota_then_refuses_within_the_minute() {
+        let mut limiter = ConsentRateLimiter::new();
+        let start = Instant::now();
+        for i in 0..CONSENT_RATE_PER_MINUTE {
+            limiter
+                .check_at(peer(1), start + Duration::from_secs(u64::from(i)))
+                .unwrap();
+        }
+        let refused = limiter.check_at(peer(1), start + Duration::from_secs(10));
+        assert!(matches!(refused, Err(CoreError::ConsentRateLimited)));
+        // A different peer has its own budget (§9.2 is per authenticated NodeId).
+        limiter
+            .check_at(peer(2), start + Duration::from_secs(10))
+            .unwrap();
+        // Once the window has passed the peer may ask again.
+        limiter
+            .check_at(peer(1), start + Duration::from_secs(61))
+            .unwrap();
     }
 }

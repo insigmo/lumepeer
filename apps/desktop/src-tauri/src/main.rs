@@ -10,16 +10,13 @@
     unreachable_pub,
     reason = "binary crate: `pub` marks the IPC surface of §13, not a library API"
 )]
-#![allow(
-    dead_code,
-    reason = "phase 0 skeleton: the DTO fields of §13 are consumed in phase 1"
-)]
 
 mod commands;
 
 use std::sync::Mutex;
 
 use lumepeer_core::session::SessionManager;
+use rand::Rng as _;
 
 /// State shared by every IPC command.
 ///
@@ -29,12 +26,19 @@ use lumepeer_core::session::SessionManager;
 pub struct AppState {
     /// Session state machine, consent queue and grants (§8).
     pub sessions: Mutex<SessionManager>,
+    /// Per-install salt for the pseudonymized peer labels of §15. Regenerated
+    /// on every start: labels are stable within a run and meaningless across
+    /// runs, so a log cannot be correlated back to an identity.
+    pub install_salt: [u8; 32],
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let mut install_salt = [0u8; 32];
+        rand::rng().fill_bytes(&mut install_salt);
         Self {
             sessions: Mutex::new(SessionManager::new()),
+            install_salt,
         }
     }
 }

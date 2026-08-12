@@ -1,0 +1,21 @@
+[package]
+name = "lumepeer-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# Nothing to build: this member exists only to host the integration tests of
+# design doc §17.1 in the `/tests/integration` path required by §6.
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lumepeer-core.workspace = true
+lumepeer-net.workspace = true
+iroh.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
