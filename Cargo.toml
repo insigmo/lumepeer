@@ -7,6 +7,7 @@ members = [
     "crates/decoder-worker",
     "apps/desktop/src-tauri",
     "services/broker",
+    "tests/integration",
 ]
 
 [workspace.package]
@@ -25,8 +26,15 @@ lumepeer-media = { path = "crates/media" }
 
 # Design doc §5 — exact pins, updates go through a dedicated compatibility PR.
 iroh = "=1.0.2"
-iroh-base = "=1.0.2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `key` is not a default feature; `NodeId` is `iroh_base::PublicKey` (§7).
+iroh-base = { version = "=1.0.2", features = ["key"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 serde-big-array = "0.5"
@@ -43,6 +51,10 @@ config = "0.14"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md
 scap = "=0.1.0-beta.1" # `scap = "0.1"` in §5 does not resolve: only pre-releases exist
 openh264 = "0.9"       # §5 says 0.6; 0.6 is long unmaintained
+# Not named in §5; see docs/adr/0004-phase-1-transport-dependencies.md.
+rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
+data-encoding = "2"     # base32 for the QR ticket encoding (§7)
+chacha20poly1305 = "0.10" # encrypted-file keystore fallback (§11.2)
 
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
