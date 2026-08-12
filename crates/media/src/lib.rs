@@ -5,7 +5,11 @@
 //! a separate sandboxed process (§11.3). Capture starts only once a viewer
 //! holds a `view` grant and stops with the last viewer (§8.1, §11).
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: the shared memory ring buffer that §11.3
+// mandates for decoder IPC cannot be expressed in safe Rust. The exception is
+// confined to `decode::shm`, every block there carries a SAFETY note and is
+// covered by tests, as §21 requires. Nothing else in the crate may opt in.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod abr;

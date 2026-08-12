@@ -44,6 +44,29 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
 
+  # The media backends of phase 2 are behind features so that the default build
+  # needs no platform SDK. They still have to be built and tested, and the X11
+  # ones need a display, which Xvfb provides.
+  media:
+    name: media backends (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm xvfb libx11-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,encode-openh264 -- -D warnings
+      - run: cargo build -p lumepeer-decoder-worker
+      - name: Test the media pipeline under Xvfb
+        run: xvfb-run -a cargo test -p lumepeer-media --features capture-x11,encode-openh264
+      - name: Capture, encode and sandboxed decode end to end
+        run: xvfb-run -a cargo test -p lumepeer-integration-tests --test media_pipeline
+
   supply-chain:
     name: audit and deny
     runs-on: ubuntu-latest

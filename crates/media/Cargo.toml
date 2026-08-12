@@ -16,11 +16,14 @@ default = []
 capture-scap = ["dep:scap"]
 capture-x11 = ["dep:x11rb"]
 encode-openh264 = ["dep:openh264"]
+# The decoder worker links openh264 itself; this only affects the media crate.
+decode-openh264 = ["dep:openh264"]
 
 [dependencies]
 lumepeer-core.workspace = true
 iroh-base.workspace = true
 blake3.workspace = true
+memmap2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
