@@ -55,6 +55,7 @@ openh264 = "0.9"       # §5 says 0.6; 0.6 is long unmaintained
 rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)
 chacha20poly1305 = "0.10" # encrypted-file keystore fallback (§11.2)
+x11rb = "0.13"          # safe X11 client for the lower-trust Linux capture (§11)
 
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }

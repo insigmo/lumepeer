@@ -14,11 +14,17 @@ default = []
 # Phase 2 pulls in the real capture/encode backends. Kept behind features so
 # that `cargo build --workspace` in phase 0 needs no platform SDKs.
 capture-scap = ["dep:scap"]
+capture-x11 = ["dep:x11rb"]
 encode-openh264 = ["dep:openh264"]
 
 [dependencies]
 lumepeer-core.workspace = true
+iroh-base.workspace = true
+blake3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+
+[target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
+x11rb = { workspace = true, optional = true }
