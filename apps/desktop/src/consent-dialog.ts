@@ -7,6 +7,8 @@
 
 import { html, type TemplateResult } from 'lit-html';
 
+import type { Locale } from './i18n';
+import { t } from './i18n';
 import type { SessionStatus } from './session-status';
 
 export type Role = 'view_only' | 'control_limited' | 'full_control';
@@ -21,28 +23,32 @@ async function revoke(peer: string): Promise<void> {
   await invoke('session_revoke', { args: { peer } });
 }
 
-export function consentDialog(request: SessionStatus | undefined): TemplateResult {
+export function consentDialog(
+  request: SessionStatus | undefined,
+  locale: Locale,
+): TemplateResult {
   if (!request) {
     return html`
       <section class="consent" aria-live="polite">
-        <h1>No pending requests</h1>
-        <p>Nobody is asking to connect right now.</p>
+        <h1>${t(locale, 'consent.none.title')}</h1>
+        <p>${t(locale, 'consent.none.body')}</p>
       </section>
     `;
   }
 
   return html`
     <section class="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
-      <h1 id="consent-title">${request.peer_label} wants to connect</h1>
-      <p>Granting view lets them see this screen. Input, clipboard, files and
-        recording stay off until you enable each one separately.</p>
+      <h1 id="consent-title">${t(locale, 'consent.request.title', request.peer_label)}</h1>
+      <p>${t(locale, 'consent.request.body')}</p>
       <div class="consent-actions">
-        <button type="button" @click=${() => void revoke(request.peer_label)}>Deny</button>
+        <button type="button" autofocus @click=${() => void revoke(request.peer_label)}>
+          ${t(locale, 'consent.action.deny')}
+        </button>
         <button type="button" @click=${() => void grant(request.peer_label, 'view_only')}>
-          Allow view only
+          ${t(locale, 'consent.action.allowView')}
         </button>
         <button type="button" @click=${() => void grant(request.peer_label, 'full_control')}>
-          Allow full control
+          ${t(locale, 'consent.action.allowFull')}
         </button>
       </div>
     </section>
