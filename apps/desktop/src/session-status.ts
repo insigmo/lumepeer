@@ -6,6 +6,8 @@
 
 import { html, type TemplateResult } from 'lit-html';
 
+import type { Locale } from './i18n';
+import { t } from './i18n';
 import type { Role } from './consent-dialog';
 
 export interface SessionStatus {
@@ -19,23 +21,29 @@ async function revoke(peer: string): Promise<void> {
   await invoke('session_revoke', { args: { peer } });
 }
 
-export function sessionStatus(sessions: SessionStatus[]): TemplateResult {
+const roleKey: Record<Role, 'status.role.viewOnly' | 'status.role.controlLimited' | 'status.role.fullControl'> = {
+  view_only: 'status.role.viewOnly',
+  control_limited: 'status.role.controlLimited',
+  full_control: 'status.role.fullControl',
+};
+
+export function sessionStatus(sessions: SessionStatus[], locale: Locale): TemplateResult {
   if (sessions.length === 0) {
-    return html`<section class="status" aria-live="polite"><p>Not sharing.</p></section>`;
+    return html`<section class="status" aria-live="polite"><p>${t(locale, 'status.notSharing')}</p></section>`;
   }
 
   return html`
     <section class="status" aria-live="polite">
-      <h2>Active sessions</h2>
+      <h2>${t(locale, 'status.heading')}</h2>
       <ul>
         ${sessions.map(
           (session) => html`
             <li>
               <span>${session.peer_label}</span>
-              <span>${session.role}</span>
-              <span>${session.input ? 'input on' : 'input off'}</span>
+              <span>${t(locale, roleKey[session.role])}</span>
+              <span>${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span>
               <button type="button" @click=${() => void revoke(session.peer_label)}>
-                Revoke
+                ${t(locale, 'status.revoke')}
               </button>
             </li>
           `,
