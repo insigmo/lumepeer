@@ -100,6 +100,21 @@ LUMEPEER_BROKER_WEBHOOK_SECRET=<shared secret> \
 cargo run -p lumepeer-broker
 ```
 
-Still skeletons that return an explicit error rather than pretending to work:
-Wayland, Windows and macOS capture, hardware encoding, and the native keystore
-backends of §11.2.
+Phase 4 (Linux only, see ADR 0007): `SessionManager::authorize_input` checks
+every event before it reaches a platform adapter, the `ControlLimited` allowlist
+of §8.2 is snapshotted at grant time so a policy edit cannot widen a running
+session, X11 input injection goes through XTEST, the Secret Service keystore of
+§11.2 works against a real session keyring, the Wayland portal handshake runs in
+the normative order of §11, and every row of the error matrix has its own test
+in `tests/integration/tests/error_matrix.rs`.
+
+The X11 injection test drives whatever display it runs against, so it is opt-in:
+
+```sh
+LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11
+```
+
+Still failing with an explicit error rather than pretending to work: PipeWire
+frame consumption on Wayland, everything Windows and macOS specific (capture,
+input, keystore, decoder sandbox), and hardware encoding. Each needs a machine
+that can build and run it; ADR 0007 lists them.
