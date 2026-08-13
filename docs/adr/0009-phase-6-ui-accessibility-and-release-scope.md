@@ -40,7 +40,7 @@ there. Rather than let those rules silently no-op or produce a false pass,
 explicitly, and every other rule in axe-core's default ruleset (ARIA
 correctness, label association, landmark structure, focus order semantics,
 and more) runs for real against both locales, both consent-dialog states,
-and both session-status states. 13/13 tests pass with zero violations found,
+and both session-status states. 8/8 tests pass with zero violations found,
 and no markup had to change to get there — the components were already
 compliant with everything jsdom can check. A real-browser audit (Playwright
 + axe, or axe's own CI action against a built bundle) would close the

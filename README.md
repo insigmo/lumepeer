@@ -142,7 +142,7 @@ Phase 6: the consent and status screens exist as real, tested UI. `apps/
 desktop/src/i18n.ts` localizes them in English and Arabic, Arabic chosen
 because it is RTL and actually exercises the `dir` switch rather than being
 a second LTR translation. `apps/desktop/src/accessibility.test.ts` runs an
-axe-core audit against both screens in both locales under jsdom (13/13
+axe-core audit against both screens in both locales under jsdom (8/8
 passing, zero violations, no markup changes needed), excluding only the two
 rules jsdom's lack of a layout engine can't support. `apps/desktop/src/
 keyboard-nav.test.ts` confirms every control is a real, reachable `<button>`
