@@ -137,3 +137,24 @@ ADR 0008 has the detail, and it is one line to flip once the hardware exists.
 Signed artifact verification, also part of the §21 checklist, has nothing
 behind it yet either: `tauri.conf.json` carries no bundle signing key, which is
 phase 6 work.
+
+Phase 6: the consent and status screens exist as real, tested UI. `apps/
+desktop/src/i18n.ts` localizes them in English and Arabic, Arabic chosen
+because it is RTL and actually exercises the `dir` switch rather than being
+a second LTR translation. `apps/desktop/src/accessibility.test.ts` runs an
+axe-core audit against both screens in both locales under jsdom (13/13
+passing, zero violations, no markup changes needed), excluding only the two
+rules jsdom's lack of a layout engine can't support. `apps/desktop/src/
+keyboard-nav.test.ts` confirms every control is a real, reachable `<button>`
+and that `Deny` carries the default focus. `tauri.conf.json`'s
+`plugins.updater` block signs update artifacts with an Ed25519 key, closing
+the gap ADR 0008 flagged, though `endpoints: []` since no distribution
+server exists yet.
+
+What phase 6 does not cover: OS-level installer code signing (Windows
+Authenticode, Apple Developer ID + notarization) needs paid vendor
+relationships and, for Apple, hardware this repo does not have, so it is not
+attempted; and the third-party penetration test §19 phase 6 asks for needs
+an independent human tester no CI job or agent session can substitute for,
+so Task 7's security-review pass stands in for it instead, imperfectly.
+ADR 0009 has the detail on both.
