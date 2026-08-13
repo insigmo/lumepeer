@@ -55,7 +55,8 @@ one.
 
 ## Status
 
-Phases 0 and 1 of §19 are done.
+Phases 0 through 4 of §19 are done; phase 5 is done except for what needs the
+reference-hardware runner of §16.2 (see below).
 
 Phase 0: the workspace builds, the constants of §14, the wire types of §9.1 and
 the signatures of §8.3/§11.1 are in place, CI runs fmt, clippy, build, test,
@@ -118,3 +119,21 @@ Still failing with an explicit error rather than pretending to work: PipeWire
 frame consumption on Wayland, everything Windows and macOS specific (capture,
 input, keystore, decoder sandbox), and hardware encoding. Each needs a machine
 that can build and run it; ADR 0007 lists them.
+
+Phase 5: `cargo audit`/`cargo deny` (already wired since phase 0/3) are joined
+by a `cargo cyclonedx` SBOM step in the same `supply-chain` CI job, uploaded as
+an artifact on every push. `DecoderHandle::pid()` lets the sandboxed decoder
+worker's `VmRSS` be sampled from outside the sandbox;
+`tests/integration/tests/resource_budget.rs` drives a real capture -> encode ->
+decode loop and checks it against the `active_extra_rss_mib` gate of
+`ci/resource-budget.yml`. `docs/release-checklist.md` maps every §21 line to
+what actually enforces it today.
+
+What phase 5 does not cover: the acceptance criterion of §19 is the release
+build passing every §15 threshold on the reference hardware of §16.2, and no
+such self-hosted runner is registered against this repository. The
+`resource-budget` CI job is wired up with `if: false` for exactly that reason;
+ADR 0008 has the detail, and it is one line to flip once the hardware exists.
+Signed artifact verification, also part of the §21 checklist, has nothing
+behind it yet either: `tauri.conf.json` carries no bundle signing key, which is
+phase 6 work.

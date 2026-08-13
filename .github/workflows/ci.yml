@@ -88,15 +88,45 @@ jobs:
       - run: cargo check --manifest-path tests/fuzz/Cargo.toml
 
   supply-chain:
-    name: audit and deny
+    name: audit, deny and SBOM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit,cargo-deny
+          tool: cargo-audit,cargo-deny,cargo-cyclonedx
       - run: cargo audit
       # Licence, advisory, source and ban policy of deny.toml, including the
       # rule that `quinn` must not become a direct dependency (§5, §20).
       - run: cargo deny check
+      # Release checklist (§21): a CycloneDX SBOM per workspace member,
+      # generated on every push so a release build always has one on hand
+      # rather than as a one-off manual step.
+      - run: cargo cyclonedx --all --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: '**/*.cdx.json'
+          retention-days: 90
+
+  # Phase 5 acceptance criterion (design doc §19): release build stays inside
+  # the thresholds of §15 on the reference hardware of ci/resource-budget.yml.
+  # There is no such runner registered against this repository yet (§16.2
+  # calls for a self-hosted runner pinned to a fixed weak-hardware config,
+  # which is infrastructure this repo does not own); the label below is where
+  # it attaches once one exists, and the job is skipped rather than failing
+  # the workflow until then (see docs/adr/0008-phase-5-resource-and-security-gates.md).
+  resource-budget:
+    name: resource budget (§15)
+    runs-on: [self-hosted, lumepeer-reference]
+    if: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p lumepeer-decoder-worker
+      - run: cargo build --release -p lumepeer-media --features capture-x11,encode-openh264
+      - run: >
+          LUMEPEER_TEST_RESOURCE_BUDGET=1
+          cargo test --release -p lumepeer-integration-tests --test resource_budget
