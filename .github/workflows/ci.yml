@@ -44,6 +44,24 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
 
+  # Design doc §19 phase 6: the desktop frontend's own test suite (i18n
+  # coverage and an axe-core accessibility audit of the consent/status
+  # screens) runs independently of the platform build matrix above.
+  ui:
+    name: ui (i18n + accessibility)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+        working-directory: apps/desktop
+      - run: npm run typecheck
+        working-directory: apps/desktop
+      - run: npm test
+        working-directory: apps/desktop
+
   # The media backends of phase 2 are behind features so that the default build
   # needs no platform SDK. They still have to be built and tested, and the X11
   # ones need a display, which Xvfb provides.

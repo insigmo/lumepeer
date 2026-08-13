@@ -6,14 +6,19 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
     "lit-html": "^3"
   },
   "devDependencies": {
+    "@testing-library/dom": "^10.4.1",
+    "axe-core": "^4.13.0",
+    "jsdom": "^30.0.1",
     "typescript": "^5",
-    "vite": "^6"
+    "vite": "^6",
+    "vitest": "^4.1.10"
   }
 }
