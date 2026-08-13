@@ -24,9 +24,13 @@ translation.** `apps/desktop/src/i18n.ts`'s `Locale` type is `'en' | 'ar'`.
 §19 phase 6's done-criterion is "localized in at least two languages"
 alongside RTL support, and picking a second LTR language (French, German)
 would satisfy the letter of "two languages" while leaving the `dir` switch
-(`dirOf`, `ltr`/`rtl`) completely untested. Arabic forces every screen that
-claims RTL support to actually lay out right-to-left under test, which is
-the only way "supports RTL" means something more than an unused code path.
+(`dirOf`, `ltr`/`rtl`) completely untested. Arabic means `dirOf`'s
+locale-to-direction mapping — the pure function `main.ts`'s `applyDir()`
+relies on — is unit tested against a real RTL locale in `i18n.test.ts`,
+rather than the branch going unused. jsdom has no layout engine (the same
+reason `color-contrast` is excluded from the axe audit below), so no test
+here asserts `document.documentElement.dir` or confirms any screen actually
+renders right-to-left; only the mapping logic is verified.
 
 **The axe-core audit runs against jsdom, and `color-contrast`/`target-size`
 are excluded because jsdom has no layout engine.** `apps/desktop/src/
@@ -60,14 +64,19 @@ checks that the markup is structurally accessible; it does not simulate
 Tab and assert where focus actually goes, so this had to be a second, more
 literal test.
 
-**Updater-artifact signing closes the exact gap ADR 0008 flagged; OS-level
-code signing does not, and is not attempted.** ADR 0008 recorded that
-`tauri.conf.json` had no bundle signing key configured. Task 5 added the
-`plugins.updater` block: an Ed25519 keypair signs update artifacts, and
-`tauri-plugin-updater` verifies that signature against the `pubkey` in
-`tauri.conf.json` before installing an update. `endpoints: []` because no
-distribution server exists yet to serve update manifests from — the signing
-mechanism is real and wired, the transport it will fetch over is not.
+**Updater-artifact signing closes the exact gap ADR 0008 flagged; runtime
+verification and OS-level code signing do not, and are not attempted.** ADR
+0008 recorded that `tauri.conf.json` had no bundle signing key configured.
+Task 5 added the `plugins.updater` block: `tauri-cli` reads `pubkey` and, at
+bundle time, signs update artifacts with the matching Ed25519 private key
+when `TAURI_SIGNING_PRIVATE_KEY` is set (no release CI job sets it yet).
+That is signing only. Verifying that signature at install time is the job
+of the `tauri-plugin-updater` crate, and it is not a dependency of
+`apps/desktop/src-tauri` (not in `Cargo.toml`, not registered with
+`.plugin(...)` in `main.rs`, no updater permission in
+`capabilities/main.json`) — installing and wiring it up is deferred
+alongside the distribution server, since `endpoints: []` means there is
+nothing to verify against yet either way.
 
 This is a narrower thing than OS-level code signing. Windows Authenticode
 (a certificate from a CA, ~$300-600/year and an EV option that requires a
@@ -140,7 +149,8 @@ automation, without paid signing vendor relationships, and without an
 independent security tester can produce: two real locales with RTL actually
 exercised, an axe-core audit covering every rule that does not need a layout
 engine, a keyboard-reachability test with a safe default focus, and
-Ed25519 updater-artifact signing wired end to end. It is not complete for
-the full §19 phase 6 acceptance bar — OS-level code signing and a genuine
-third-party penetration test both remain open, tracked here and in
+Ed25519 updater-artifact signing configured at bundle time. It is not
+complete for the full §19 phase 6 acceptance bar — runtime updater-signature
+verification (installing `tauri-plugin-updater`), OS-level code signing and
+a genuine third-party penetration test all remain open, tracked here and in
 `docs/release-checklist.md` rather than assumed done.
