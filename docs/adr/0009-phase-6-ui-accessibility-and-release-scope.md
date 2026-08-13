@@ -103,9 +103,35 @@ literal requirement.
 
 ### Security review outcome
 
-Recorded after Task 7's review. Task 7 runs the structured security-review
-pass described above and appends its findings as a new subsection here,
-directly under this heading, once that review is complete.
+Ran 2026-08-13 against the full Tasks 1-6 diff (commits `9672602..7895a46`),
+scoped to: the `plugins.updater` config, private-key handling for the
+Ed25519 updater signing key, and i18n string interpolation reaching the DOM.
+
+- **`plugins.updater` config** (`apps/desktop/src-tauri/tauri.conf.json`):
+  `endpoints: []`, so there is no update-distribution host to hijack yet.
+  `pubkey` is the Ed25519 *public* key (base64 minisign format) — intended
+  to be committed, not a secret.
+- **Private key handling**: `apps/desktop/src-tauri/updater.key` is listed
+  in `.gitignore` and confirmed absent from git (`git ls-files` and
+  `git check-ignore -v` both checked); not referenced by any logging
+  statement in the diff.
+- **i18n / DOM interpolation**: `t(locale, 'consent.request.title',
+  request.peer_label)` and `session-status.ts`'s session list only ever
+  pass the already-pseudonymized `peer_label` (§15) into templates, never a
+  raw `NodeId`. Rendering goes through `lit-html`'s `html` tagged template
+  (auto-escaping, no `unsafeHTML`/`dangerouslySetInnerHTML`-equivalent
+  anywhere in the diff), so no injection path exists even if a peer label
+  contained markup-like characters. `locale` itself is type-constrained to
+  the `'en' | 'ar'` union by `detectLocale`, which only returns validated
+  `SUPPORTED_LOCALES` members or the default — no raw `navigator.language`
+  string reaches `document.documentElement.lang`/`.dir`.
+
+**Outcome: no high/critical findings.** No medium/low findings recorded
+either — the scoped areas matched their intended design with no deviation.
+This review is a repo-automation substitute for the third-party penetration
+test §19 phase 6 asks for, not equivalent to one: it covers only the code
+introduced in Tasks 1-6, using static reading, not a tester probing the
+live system.
 
 ## Consequences
 
