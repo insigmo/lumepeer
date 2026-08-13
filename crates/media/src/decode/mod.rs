@@ -176,6 +176,14 @@ impl DecoderHandle {
         self.sandbox
     }
 
+    /// OS process id of the worker, for out-of-band resource sampling (§15,
+    /// §16.2). Never used to reach into the sandboxed process otherwise: the
+    /// only channels into it are the ring and the pipes above.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Sends one encoded frame to the worker and waits for the picture.
     ///
     /// # Errors
