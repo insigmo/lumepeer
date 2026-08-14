@@ -1,19 +1,34 @@
 //! Owner of the network/session runtime (design doc §2.3, §4, §13).
 //!
-//! `NetworkActor` is the single owner of `SessionManager` (and, from Task 3
-//! on, of `PeerEndpoint`/`TicketRegistry` too). Tauri commands never lock
-//! anything directly: they send an `ActorCommand` and await the reply, so
-//! there is exactly one place that decides authorization (§2.3).
+//! `NetworkActor` is the single owner of `SessionManager`, `PeerEndpoint` and
+//! `TicketRegistry`. Tauri commands never lock anything directly: they send an
+//! `ActorCommand` and await the reply, so there is exactly one place that
+//! decides authorization (§2.3).
+//!
+//! Every live control connection is split in two: a reader task owns the
+//! inbound half and reports what it sees back to the actor, while the actor
+//! keeps only an outbound channel. That is what makes `ConsentGrant` delivery
+//! and disconnect detection work symmetrically on the host and the guest side,
+//! and it keeps a partially read frame from ever being cancelled by an
+//! outbound write.
+
+use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
-use lumepeer_core::session::SessionManager;
+use lumepeer_core::constants::{CONTROL_HANDSHAKE_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES};
+use lumepeer_core::protocol::MessageKind;
+use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_net::keystore::load_or_create;
 use lumepeer_net::ticket::TicketRegistry;
-use lumepeer_net::{InviteTicket, PeerEndpoint};
+use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use rand::Rng as _;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+
+/// Capacity of the notification broadcast. Listeners that fall behind lag;
+/// nothing in the actor's own progress depends on them.
+const NOTIFY_CAPACITY: usize = 32;
 
 /// State of one session as the webview needs to know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -49,6 +64,25 @@ pub struct InviteDto {
     pub expires_at: u64,
 }
 
+/// Something the actor observed that a listener may want to react to.
+///
+/// Deliberately carries no peer identity: it crosses no trust boundary today
+/// and must not become a channel for one (§15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorNotification {
+    /// A remote host granted `role` to this node (guest side).
+    ConsentGranted {
+        /// Role the host decided on, which may be lower than the one asked for.
+        role: Role,
+    },
+    /// A remote host withdrew its grant (guest side).
+    ConsentRevoked,
+    /// A consent request was queued for the host user to decide (host side).
+    ConsentRequested,
+    /// A control connection closed, in either direction.
+    Disconnected,
+}
+
 /// Failure returned by an actor call.
 #[derive(Debug)]
 pub enum ActorError {
@@ -59,7 +93,7 @@ pub enum ActorError {
     /// A `SessionManager` decision was refused.
     Core(CoreError),
     /// A network operation failed.
-    Net(lumepeer_net::NetError),
+    Net(NetError),
     /// The actor task is gone; the caller's channel op failed.
     ChannelClosed,
 }
@@ -93,9 +127,16 @@ enum ActorCommand {
 #[derive(Debug, Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorCommand>,
+    notify: broadcast::Sender<ActorNotification>,
 }
 
 impl ActorHandle {
+    /// Stream of [`ActorNotification`]s from this point on.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<ActorNotification> {
+        self.notify.subscribe()
+    }
+
     /// Snapshot of every pending and active session.
     ///
     /// # Errors
@@ -172,18 +213,46 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Pseudonymized peer identifier, safe for logs and for the webview (§15).
+///
+/// The same value is used as the IPC label and as the `tracing` field, so an
+/// operator reading the log can line a warning up with a row in the UI without
+/// either side ever seeing a raw `NodeId`.
+fn peer_tag(install_salt: &[u8; 32], peer: &NodeId) -> String {
+    let hash = lumepeer_core::audit::peer_hash(install_salt, peer);
+    hash[..8].iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
+/// The actor's end of one live control connection.
+struct ConnectionHandle {
+    /// Distinguishes generations of connection to the same peer, so a stale
+    /// `Closed` event cannot tear down a freshly established replacement.
+    id: u64,
+    outbound: mpsc::Sender<MessageKind>,
+}
+
 /// What a spawned per-connection task reports back to the main loop.
 enum ActorEvent {
     /// A guest's `Hello` passed the handshake and the ed25519 signature
     /// check; the ticket still needs `TicketRegistry::claim` before any
     /// consent is queued, which only the actor's own thread can do.
     Handshaked {
-        connection: lumepeer_net::ControlConnection,
+        connection: Box<ControlConnection>,
         peer: NodeId,
         ticket: InviteTicket,
     },
+    /// A live connection delivered a control message.
+    Inbound {
+        peer: NodeId,
+        id: u64,
+        kind: MessageKind,
+    },
     /// A live connection's stream closed or errored.
-    Closed { peer: NodeId },
+    Closed { peer: NodeId, id: u64 },
 }
 
 /// Runtime state the actor owns and loops over.
@@ -193,28 +262,28 @@ struct Actor {
     /// Per-process salt for pseudonymized labels (§15): regenerated on every
     /// start, so a label is stable within a run and meaningless across runs.
     install_salt: [u8; 32],
-    /// label -> NodeId, rebuilt on every command that changes session state.
+    /// label -> `NodeId`, rebuilt on every command that changes session state.
     labels: std::collections::HashMap<String, NodeId>,
     endpoint: PeerEndpoint,
     identity: SigningKey,
     tickets: TicketRegistry,
     /// Live control connections, keyed by peer, so `Grant`/`Revoke` can
     /// write `ConsentGrant`/`ConsentRevoke` back to the right stream.
-    connections: std::collections::HashMap<NodeId, lumepeer_net::ControlConnection>,
-    /// Handshake results and stream-closed notifications from the
-    /// per-connection tasks spawned by the accept loop.
+    connections: std::collections::HashMap<NodeId, ConnectionHandle>,
+    next_connection_id: u64,
+    /// Caps concurrent handshakes so a flood of half-open connections cannot
+    /// spawn unbounded tasks (§3.2).
+    handshake_slots: Arc<Semaphore>,
+    /// Handshake results, inbound messages and stream-closed notifications
+    /// from the per-connection tasks.
     events_tx: mpsc::Sender<ActorEvent>,
     events_rx: mpsc::Receiver<ActorEvent>,
+    notify: broadcast::Sender<ActorNotification>,
 }
 
 impl Actor {
     fn label_of(&self, peer: &NodeId) -> String {
-        let hash = lumepeer_core::audit::peer_hash(&self.install_salt, peer);
-        hash[..8].iter().fold(String::new(), |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
+        peer_tag(&self.install_salt, peer)
     }
 
     fn resolve(&self, label: &str) -> Result<NodeId, ActorError> {
@@ -223,11 +292,17 @@ impl Actor {
 
     /// Rebuilds the label table from current pending + active peers, and
     /// returns the snapshot list in the same pass.
+    ///
+    /// A session in `Reconnecting` is deliberately omitted: `SessionManager::
+    /// active()` still returns it (it holds its slot against the plan ceiling
+    /// for the reconnect window of §10), but its transport is gone, so showing
+    /// it as `Active` would tell the host user that a guest is watching when
+    /// nobody is.
     fn rebuild_labels_and_snapshot(&mut self) -> Vec<SessionSnapshot> {
         self.labels.clear();
         let mut out = Vec::new();
         for ticket in self.sessions.pending() {
-            let label = self.label_of(&ticket.peer);
+            let label = peer_tag(&self.install_salt, &ticket.peer);
             self.labels.insert(label.clone(), ticket.peer);
             out.push(SessionSnapshot {
                 label,
@@ -237,7 +312,10 @@ impl Actor {
             });
         }
         for (peer, role, grants) in self.sessions.active() {
-            let label = self.label_of(&peer);
+            if self.sessions.state(&peer) != SessionState::Active {
+                continue;
+            }
+            let label = peer_tag(&self.install_salt, &peer);
             self.labels.insert(label.clone(), peer);
             out.push(SessionSnapshot {
                 label,
@@ -256,11 +334,11 @@ impl Actor {
                     let Some(command) = command else { break };
                     self.handle_command(command).await;
                 }
-                incoming = self.endpoint.accept() => {
+                // Single await, so losing this race cannot drop a connection
+                // that is already half accepted.
+                incoming = self.endpoint.accept_incoming() => {
                     let Some(incoming) = incoming else { break };
-                    if let Ok(connection) = incoming {
-                        self.spawn_handshake(connection);
-                    }
+                    self.spawn_handshake(incoming);
                 }
                 event = self.events_rx.recv() => {
                     if let Some(event) = event {
@@ -271,56 +349,224 @@ impl Actor {
         }
     }
 
-    fn spawn_handshake(&self, connection: iroh::endpoint::Connection) {
+    /// Finishes the QUIC handshake, checks the ALPN and runs the control
+    /// handshake, all on its own task and under one deadline (§9.1, §18).
+    fn spawn_handshake(&self, incoming: iroh::endpoint::Incoming) {
+        let Ok(permit) = Arc::clone(&self.handshake_slots).try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_INFLIGHT_HANDSHAKES,
+                "refusing an incoming connection: handshake slots exhausted"
+            );
+            drop(incoming);
+            return;
+        };
         let tx = self.events_tx.clone();
-        let now = unix_now();
         let verifying_key = self.identity.verifying_key();
-        let peer = connection.remote_id();
+        let salt = self.install_salt;
         tokio::spawn(async move {
-            let Ok((control, hello)) = lumepeer_net::host_handshake(connection).await else {
-                let _ = tx.send(ActorEvent::Closed { peer }).await;
+            let _permit = permit;
+            let deadline = std::time::Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS);
+            let Ok(outcome) = tokio::time::timeout(deadline, async move {
+                let connection = PeerEndpoint::finish_accept(incoming).await.ok()?;
+                let peer = connection.remote_id();
+                let tag = peer_tag(&salt, &peer);
+                // An unauthenticated peer must not be able to park a media or
+                // file connection in the control handshake's read (§4.1).
+                if Channel::from_alpn(connection.alpn()) != Some(Channel::Control) {
+                    tracing::warn!(peer = %tag, "closing a non-control connection");
+                    connection.close(
+                        lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                        lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+                    );
+                    return None;
+                }
+                let (control, hello) = match lumepeer_net::host_handshake(connection).await {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        tracing::warn!(peer = %tag, %error, "control handshake failed");
+                        return None;
+                    }
+                };
+                let Ok(ticket) = postcard::from_bytes::<InviteTicket>(&hello.invite_proof) else {
+                    tracing::warn!(peer = %tag, "invite proof is not a ticket");
+                    control.close_with(&NetError::InvalidTicket);
+                    return None;
+                };
+                if let Err(error) = ticket.verify(&verifying_key, unix_now()) {
+                    tracing::warn!(peer = %tag, %error, "invite ticket did not verify");
+                    control.close_with(&NetError::InvalidTicket);
+                    return None;
+                }
+                Some((control, peer, ticket))
+            })
+            .await
+            else {
+                tracing::warn!(
+                    timeout_secs = CONTROL_HANDSHAKE_TIMEOUT_SECS,
+                    "dropping an incoming connection that did not finish its handshake in time"
+                );
                 return;
             };
-            let Ok(ticket) = postcard::from_bytes::<InviteTicket>(&hello.invite_proof) else {
-                control.close_with(&lumepeer_net::NetError::InvalidTicket);
-                let _ = tx.send(ActorEvent::Closed { peer }).await;
-                return;
-            };
-            if ticket.verify(&verifying_key, now).is_err() {
-                control.close_with(&lumepeer_net::NetError::InvalidTicket);
-                let _ = tx.send(ActorEvent::Closed { peer }).await;
-                return;
+            if let Some((connection, peer, ticket)) = outcome {
+                let _ = tx
+                    .send(ActorEvent::Handshaked {
+                        connection: Box::new(connection),
+                        peer,
+                        ticket,
+                    })
+                    .await;
             }
-            let _ = tx
-                .send(ActorEvent::Handshaked {
-                    connection: control,
-                    peer,
-                    ticket,
-                })
-                .await;
         });
+    }
+
+    /// Takes ownership of an authenticated connection: the reader half runs as
+    /// its own task, the writer half is driven from the actor's outbound
+    /// channel. Neither can cancel the other mid-frame.
+    ///
+    /// This is what makes a stored connection *live* rather than merely
+    /// retained: without the reader, nothing would ever observe a
+    /// `ConsentGrant` on the guest side or a closed stream on either side.
+    fn adopt(&mut self, connection: ControlConnection, peer: NodeId) {
+        self.next_connection_id = self.next_connection_id.wrapping_add(1);
+        let id = self.next_connection_id;
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
+        let (mut reader, mut writer) = connection.split();
+        let tag = self.label_of(&peer);
+
+        let events = self.events_tx.clone();
+        let read_tag = tag.clone();
+        tokio::spawn(async move {
+            loop {
+                match reader.recv().await {
+                    Ok(envelope) => {
+                        if events
+                            .send(ActorEvent::Inbound {
+                                peer,
+                                id,
+                                kind: envelope.kind,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %read_tag, %error, "control stream ended");
+                        let _ = events.send(ActorEvent::Closed { peer, id }).await;
+                        return;
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(kind) = outbound_rx.recv().await {
+                if let Err(error) = writer.send(kind).await {
+                    tracing::warn!(peer = %tag, %error, "control send failed");
+                    return;
+                }
+            }
+        });
+
+        // Replacing an entry drops the old outbound sender, which ends that
+        // generation's writer task; its reader reports `Closed` with the older
+        // id, which `handle_event` ignores.
+        self.connections.insert(
+            peer,
+            ConnectionHandle {
+                id,
+                outbound: outbound_tx,
+            },
+        );
+    }
+
+    /// Queues one message on a peer's connection without ever blocking the
+    /// actor loop on a slow or stalled writer.
+    fn send_to(&mut self, peer: &NodeId, kind: MessageKind) {
+        let Some(handle) = self.connections.get(peer) else {
+            return;
+        };
+        if handle.outbound.try_send(kind).is_err() {
+            tracing::warn!(
+                peer = %peer_tag(&self.install_salt, peer),
+                "dropping a control message: the connection is gone or backed up"
+            );
+        }
     }
 
     fn handle_event(&mut self, event: ActorEvent) {
         match event {
-            ActorEvent::Handshaked { connection, peer, ticket } => {
-                // Single-use enforcement runs here, on the actor's own thread,
-                // so two connections racing the same ticket cannot both win it.
-                let now = unix_now();
-                if self.tickets.claim(&ticket, now).is_err() {
-                    connection.close_with(&lumepeer_net::NetError::InvalidTicket);
-                    return;
-                }
-                let _ = self.sessions.request_consent_as(peer, ticket.allowed_request);
-                self.connections.insert(peer, connection);
-                self.rebuild_labels_and_snapshot();
-            }
-            ActorEvent::Closed { peer } => {
-                self.connections.remove(&peer);
-                let _ = self.sessions.on_disconnect(peer);
-                self.rebuild_labels_and_snapshot();
-            }
+            ActorEvent::Handshaked {
+                connection,
+                peer,
+                ticket,
+            } => self.on_handshaked(*connection, peer, &ticket),
+            ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
+            ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
         }
+    }
+
+    fn on_handshaked(&mut self, connection: ControlConnection, peer: NodeId, ticket: &InviteTicket) {
+        let tag = self.label_of(&peer);
+        // Single-use enforcement runs here, on the actor's own thread, so two
+        // connections racing the same ticket cannot both win it.
+        if let Err(error) = self.tickets.claim(ticket, unix_now()) {
+            tracing::warn!(peer = %tag, %error, "invite claim refused");
+            connection.close_with(&NetError::InvalidTicket);
+            return;
+        }
+        // Every connection, first time or reconnect, gets a fresh decision.
+        if let Err(error) = self.sessions.request_consent_as(peer, ticket.allowed_request) {
+            tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
+            // The ticket is already burned and nobody will ever decide on this
+            // peer, so the connection must not linger: close it here, before
+            // it is ever stored.
+            connection.close_with(&NetError::ConsentUnavailable);
+            return;
+        }
+        tracing::info!(peer = %tag, "consent request queued");
+        self.adopt(connection, peer);
+        let _ = self.notify.send(ActorNotification::ConsentRequested);
+        self.rebuild_labels_and_snapshot();
+    }
+
+    fn on_inbound(&mut self, peer: NodeId, id: u64, kind: &MessageKind) {
+        if self.connections.get(&peer).is_none_or(|c| c.id != id) {
+            return;
+        }
+        let tag = self.label_of(&peer);
+        match *kind {
+            // Guest side: the host decided.
+            MessageKind::ConsentGrant(role) => {
+                tracing::info!(peer = %tag, ?role, "remote host granted consent");
+                let _ = self.notify.send(ActorNotification::ConsentGranted { role });
+            }
+            MessageKind::ConsentRevoke => {
+                tracing::info!(peer = %tag, "remote host revoked consent");
+                let _ = self.notify.send(ActorNotification::ConsentRevoked);
+            }
+            // Everything else belongs to a phase this build does not run yet.
+            // Nothing a peer sends may ever grant itself consent (§2.3).
+            ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
+        }
+    }
+
+    fn on_closed(&mut self, peer: NodeId, id: u64) {
+        // Only the current generation may tear the peer's state down.
+        if self.connections.get(&peer).is_some_and(|c| c.id != id) {
+            return;
+        }
+        self.connections.remove(&peer);
+        if self.sessions.on_disconnect(peer).is_err() {
+            // No active session to move into the reconnect window, so this was
+            // a guest that dropped before the host decided: drop its queued
+            // request instead of leaving it pending forever.
+            let _ = self.sessions.revoke(peer);
+        }
+        tracing::info!(peer = %peer_tag(&self.install_salt, &peer), "peer disconnected");
+        let _ = self.notify.send(ActorNotification::Disconnected);
+        self.rebuild_labels_and_snapshot();
     }
 
     async fn handle_command(&mut self, command: ActorCommand) {
@@ -333,9 +579,8 @@ impl Actor {
                 let result = match self.resolve(&label) {
                     Ok(peer) => match self.sessions.grant(peer, role) {
                         Ok(()) => {
-                            if let Some(connection) = self.connections.get_mut(&peer) {
-                                let _ = connection.send(lumepeer_core::protocol::MessageKind::ConsentGrant(role)).await;
-                            }
+                            self.send_to(&peer, MessageKind::ConsentGrant(role));
+                            tracing::info!(peer = %label, ?role, "consent granted");
                             Ok(())
                         }
                         Err(e) => Err(ActorError::Core(e)),
@@ -349,9 +594,8 @@ impl Actor {
                 let result = match self.resolve(&label) {
                     Ok(peer) => match self.sessions.revoke(peer) {
                         Ok(()) => {
-                            if let Some(connection) = self.connections.get_mut(&peer) {
-                                let _ = connection.send(lumepeer_core::protocol::MessageKind::ConsentRevoke).await;
-                            }
+                            self.send_to(&peer, MessageKind::ConsentRevoke);
+                            tracing::info!(peer = %label, "consent revoked");
                             Ok(())
                         }
                         Err(e) => Err(ActorError::Core(e)),
@@ -377,16 +621,25 @@ impl Actor {
                     },
                     Err(e) => Err(ActorError::Net(e)),
                 };
+                if let Err(ActorError::Net(ref error)) = result {
+                    tracing::warn!(%error, "could not issue an invite");
+                }
                 let _ = reply.send(result);
             }
             ActorCommand::InviteConnect { ticket, reply } => {
                 let result = self.connect_with_ticket(&ticket).await;
+                if let Err(ActorError::Net(ref error)) = result {
+                    tracing::warn!(%error, "invite connect failed");
+                }
                 let _ = reply.send(result);
             }
         }
     }
 
-    async fn connect_with_ticket(&self, raw: &str) -> Result<(), ActorError> {
+    /// Guest side: dial the host named by the ticket, run the handshake and
+    /// **keep** the connection. Dropping it here would close the QUIC
+    /// connection under it and the host's `ConsentGrant` would never arrive.
+    async fn connect_with_ticket(&mut self, raw: &str) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_qr_string(raw).map_err(ActorError::Net)?;
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
         let connection = self
@@ -394,12 +647,15 @@ impl Actor {
             .connect_control(addr)
             .await
             .map_err(ActorError::Net)?;
-        let proof = postcard::to_allocvec(&ticket).map_err(|_| {
-            ActorError::Net(lumepeer_net::NetError::MalformedTicket)
-        })?;
-        lumepeer_net::guest_handshake(connection, Role::ViewOnly, proof, Vec::new())
-            .await
-            .map_err(ActorError::Net)?;
+        let proof = postcard::to_allocvec(&ticket)
+            .map_err(|_| ActorError::Net(NetError::MalformedTicket))?;
+        let control =
+            lumepeer_net::guest_handshake(connection, ticket.allowed_request, proof, Vec::new())
+                .await
+                .map_err(ActorError::Net)?;
+        let peer = control.peer();
+        tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
+        self.adopt(control, peer);
         Ok(())
     }
 }
@@ -413,10 +669,9 @@ impl Actor {
 /// background and only logs.
 ///
 /// # Errors
-/// [`lumepeer_net::NetError`] if the keystore or the endpoint bind fails —
-/// surfaced as a startup failure rather than silently degrading (§11.2,
-/// §24.5).
-pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
+/// [`NetError`] if the keystore or the endpoint bind fails — surfaced as a
+/// startup failure rather than silently degrading (§11.2, §24.5).
+pub async fn spawn_actor() -> Result<ActorHandle, NetError> {
     let store = lumepeer_net::keystore::open()?;
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
@@ -440,6 +695,7 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
 pub fn spawn_actor_with(endpoint: PeerEndpoint, identity: SigningKey) -> ActorHandle {
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
+    let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
     let actor = Actor {
@@ -451,9 +707,151 @@ pub fn spawn_actor_with(endpoint: PeerEndpoint, identity: SigningKey) -> ActorHa
         identity,
         tickets: TicketRegistry::new(),
         connections: std::collections::HashMap::new(),
+        next_connection_id: 0,
+        handshake_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
         events_tx,
         events_rx,
+        notify: notify.clone(),
     };
     tokio::spawn(actor.run());
-    ActorHandle { tx }
+    ActorHandle { tx, notify }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "a failed assumption must fail the test"
+    )]
+
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Anything slower than this on loopback means the test is stuck.
+    const TIMEOUT: Duration = Duration::from_secs(20);
+
+    async fn actor() -> (ActorHandle, PeerEndpoint) {
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
+        (spawn_actor_with(endpoint.clone(), identity), endpoint)
+    }
+
+    /// Polls `status` the way the frontend does until a pending row shows up.
+    async fn wait_for_pending(handle: &ActorHandle) -> String {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let rows = handle.status().await.unwrap();
+            if let Some(row) = rows.iter().find(|r| r.state == SessionStateDto::Pending) {
+                return row.label.clone();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no pending session");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// C1: the guest actor must keep its `ControlConnection` after the
+    /// handshake and keep reading it, or the host's `ConsentGrant` is never
+    /// observed. Both sides run as real actors, driven only through the same
+    /// handle the Tauri commands use.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_actor_observes_the_hosts_grant_and_revoke() {
+        let (host, _host_endpoint) = actor().await;
+        let (guest, _guest_endpoint) = actor().await;
+        let mut events = guest.subscribe();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+
+        let granted = tokio::time::timeout(TIMEOUT, events.recv()).await.unwrap();
+        assert_eq!(
+            granted.unwrap(),
+            ActorNotification::ConsentGranted {
+                role: Role::ViewOnly
+            }
+        );
+
+        let rows = host.status().await.unwrap();
+        assert!(rows.iter().any(|r| r.state == SessionStateDto::Active));
+
+        host.revoke(label).await.unwrap();
+        let revoked = tokio::time::timeout(TIMEOUT, events.recv()).await.unwrap();
+        assert_eq!(revoked.unwrap(), ActorNotification::ConsentRevoked);
+    }
+
+    /// I3: when the guest goes away before the host decides, the host's reader
+    /// task must notice and the pending row must disappear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_that_leaves_before_the_grant_stops_being_pending() {
+        let (host, _host_endpoint) = actor().await;
+        let (guest, guest_endpoint) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        guest_endpoint.close().await;
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if host.status().await.unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the pending entry for {label} survived the disconnect"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// I7: a connection on a non-control ALPN must never reach the control
+    /// handshake, and it must not become a pending consent request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_media_alpn_connection_is_refused_without_a_handshake() {
+        let (host, host_endpoint) = actor().await;
+        let stranger = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+
+        // Issued so the host has a live ticket: the ALPN must be what stops
+        // this, not the absence of an invite.
+        let _invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let connection = stranger
+            .connect(host_endpoint.addr(), lumepeer_net::ALPN_MEDIA)
+            .await
+            .unwrap();
+        // The host closes it; the guest never gets a control stream.
+        assert!(
+            tokio::time::timeout(TIMEOUT, connection.closed())
+                .await
+                .is_ok(),
+            "the host left a media connection open"
+        );
+        assert!(host.status().await.unwrap().is_empty());
+    }
+
+    /// Unknown labels are refused cleanly, with no panic and no peer parsing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_label_is_refused() {
+        let (host, _endpoint) = actor().await;
+        assert!(matches!(
+            host.grant("deadbeefdeadbeef".to_owned(), Role::ViewOnly)
+                .await,
+            Err(ActorError::UnknownPeer)
+        ));
+        assert!(matches!(
+            host.revoke("deadbeefdeadbeef".to_owned()).await,
+            Err(ActorError::UnknownPeer)
+        ));
+    }
 }
