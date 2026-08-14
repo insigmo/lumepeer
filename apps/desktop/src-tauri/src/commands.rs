@@ -58,6 +58,39 @@ impl IpcError {
             message: error.to_string(),
         }
     }
+
+    /// Maps a transport failure onto the error matrix of §18.
+    ///
+    /// The message is a fixed string chosen per code, never the `Display` of
+    /// the underlying error: an iroh dial failure spells out the address and
+    /// `NodeId` it was trying to reach, and that must not reach the webview
+    /// through the error channel any more than through the happy path (§15).
+    ///
+    /// Everything that is not a bad ticket, an unreachable host or a version
+    /// mismatch collapses into `REJECTED` on purpose, so a stranger probing a
+    /// ticket learns nothing about *why* it failed.
+    fn net(error: &lumepeer_net::NetError) -> Self {
+        use lumepeer_core::CoreError;
+        use lumepeer_net::NetError;
+
+        let (code, message) = match *error {
+            NetError::MalformedTicket | NetError::InvalidTicket => {
+                ("BAD_TICKET", "the invite is not valid or has expired")
+            }
+            NetError::Dial(_) | NetError::Endpoint(_) => {
+                ("DIAL_FAILED", "the host could not be reached")
+            }
+            NetError::Framing(CoreError::IncompatibleVersion { .. }) => (
+                "INCOMPATIBLE_VERSION",
+                "the host speaks an incompatible protocol version",
+            ),
+            _ => ("REJECTED", "the host refused the connection"),
+        };
+        Self {
+            code,
+            message: message.to_owned(),
+        }
+    }
 }
 
 impl From<ActorError> for IpcError {
@@ -65,10 +98,7 @@ impl From<ActorError> for IpcError {
         match error {
             ActorError::UnknownPeer => Self::unknown_peer(),
             ActorError::Core(e) => Self::core(&e),
-            ActorError::Net(e) => Self {
-                code: "NET",
-                message: e.to_string(),
-            },
+            ActorError::Net(e) => Self::net(&e),
             ActorError::ChannelClosed => Self::poisoned(),
         }
     }
