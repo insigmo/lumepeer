@@ -42,3 +42,5 @@ apps/desktop/src-tauri/gen/
 # apps/desktop/src-tauri/updater.key — Ed25519 updater signing key (Task 5,
 # ADR 0009). Never commit; lives only in the release operator's secret store.
 apps/desktop/src-tauri/updater.key
+.claude/
+CLAUDE.md

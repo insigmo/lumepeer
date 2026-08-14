@@ -1,0 +1,7 @@
+version: "3"
+
+tasks:
+  build:
+    desc: Build all workspace crates
+    cmds:
+      - cargo build --workspace
