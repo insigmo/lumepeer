@@ -172,6 +172,20 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// What a spawned per-connection task reports back to the main loop.
+enum ActorEvent {
+    /// A guest's `Hello` passed the handshake and the ed25519 signature
+    /// check; the ticket still needs `TicketRegistry::claim` before any
+    /// consent is queued, which only the actor's own thread can do.
+    Handshaked {
+        connection: lumepeer_net::ControlConnection,
+        peer: NodeId,
+        ticket: InviteTicket,
+    },
+    /// A live connection's stream closed or errored.
+    Closed { peer: NodeId },
+}
+
 /// Runtime state the actor owns and loops over.
 struct Actor {
     rx: mpsc::Receiver<ActorCommand>,
@@ -184,6 +198,13 @@ struct Actor {
     endpoint: PeerEndpoint,
     identity: SigningKey,
     tickets: TicketRegistry,
+    /// Live control connections, keyed by peer, so `Grant`/`Revoke` can
+    /// write `ConsentGrant`/`ConsentRevoke` back to the right stream.
+    connections: std::collections::HashMap<NodeId, lumepeer_net::ControlConnection>,
+    /// Handshake results and stream-closed notifications from the
+    /// per-connection tasks spawned by the accept loop.
+    events_tx: mpsc::Sender<ActorEvent>,
+    events_rx: mpsc::Receiver<ActorEvent>,
 }
 
 impl Actor {
@@ -229,47 +250,138 @@ impl Actor {
     }
 
     async fn run(mut self) {
-        while let Some(command) = self.rx.recv().await {
-            match command {
-                ActorCommand::Status { reply } => {
-                    let snapshot = self.rebuild_labels_and_snapshot();
-                    let _ = reply.send(snapshot);
+        loop {
+            tokio::select! {
+                command = self.rx.recv() => {
+                    let Some(command) = command else { break };
+                    self.handle_command(command).await;
                 }
-                ActorCommand::Grant { label, role, reply } => {
-                    let result = self
-                        .resolve(&label)
-                        .and_then(|peer| self.sessions.grant(peer, role).map_err(ActorError::Core));
-                    self.rebuild_labels_and_snapshot();
-                    let _ = reply.send(result);
+                incoming = self.endpoint.accept() => {
+                    let Some(incoming) = incoming else { break };
+                    if let Ok(connection) = incoming {
+                        self.spawn_handshake(connection);
+                    }
                 }
-                ActorCommand::Revoke { label, reply } => {
-                    let result = self
-                        .resolve(&label)
-                        .and_then(|peer| self.sessions.revoke(peer).map_err(ActorError::Core));
-                    self.rebuild_labels_and_snapshot();
-                    let _ = reply.send(result);
+                event = self.events_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_event(event);
+                    }
                 }
-                ActorCommand::InviteCreate { role, reply } => {
-                    let now = unix_now();
-                    let result = match InviteTicket::issue(&self.identity, &self.endpoint.addr(), role, now) {
-                        Ok(ticket) => match ticket.to_qr_string() {
-                            Ok(qr_string) => {
-                                self.tickets.register(&ticket);
-                                Ok(InviteDto {
-                                    qr_string,
-                                    expires_at: ticket.expires_at,
-                                })
+            }
+        }
+    }
+
+    fn spawn_handshake(&self, connection: iroh::endpoint::Connection) {
+        let tx = self.events_tx.clone();
+        let now = unix_now();
+        let verifying_key = self.identity.verifying_key();
+        let peer = connection.remote_id();
+        tokio::spawn(async move {
+            let Ok((control, hello)) = lumepeer_net::host_handshake(connection).await else {
+                let _ = tx.send(ActorEvent::Closed { peer }).await;
+                return;
+            };
+            let Ok(ticket) = postcard::from_bytes::<InviteTicket>(&hello.invite_proof) else {
+                control.close_with(&lumepeer_net::NetError::InvalidTicket);
+                let _ = tx.send(ActorEvent::Closed { peer }).await;
+                return;
+            };
+            if ticket.verify(&verifying_key, now).is_err() {
+                control.close_with(&lumepeer_net::NetError::InvalidTicket);
+                let _ = tx.send(ActorEvent::Closed { peer }).await;
+                return;
+            }
+            let _ = tx
+                .send(ActorEvent::Handshaked {
+                    connection: control,
+                    peer,
+                    ticket,
+                })
+                .await;
+        });
+    }
+
+    fn handle_event(&mut self, event: ActorEvent) {
+        match event {
+            ActorEvent::Handshaked { connection, peer, ticket } => {
+                // Single-use enforcement runs here, on the actor's own thread,
+                // so two connections racing the same ticket cannot both win it.
+                let now = unix_now();
+                if self.tickets.claim(&ticket, now).is_err() {
+                    connection.close_with(&lumepeer_net::NetError::InvalidTicket);
+                    return;
+                }
+                let _ = self.sessions.request_consent_as(peer, ticket.allowed_request);
+                self.connections.insert(peer, connection);
+                self.rebuild_labels_and_snapshot();
+            }
+            ActorEvent::Closed { peer } => {
+                self.connections.remove(&peer);
+                let _ = self.sessions.on_disconnect(peer);
+                self.rebuild_labels_and_snapshot();
+            }
+        }
+    }
+
+    async fn handle_command(&mut self, command: ActorCommand) {
+        match command {
+            ActorCommand::Status { reply } => {
+                let snapshot = self.rebuild_labels_and_snapshot();
+                let _ = reply.send(snapshot);
+            }
+            ActorCommand::Grant { label, role, reply } => {
+                let result = match self.resolve(&label) {
+                    Ok(peer) => match self.sessions.grant(peer, role) {
+                        Ok(()) => {
+                            if let Some(connection) = self.connections.get_mut(&peer) {
+                                let _ = connection.send(lumepeer_core::protocol::MessageKind::ConsentGrant(role)).await;
                             }
-                            Err(e) => Err(ActorError::Net(e)),
-                        },
+                            Ok(())
+                        }
+                        Err(e) => Err(ActorError::Core(e)),
+                    },
+                    Err(e) => Err(e),
+                };
+                self.rebuild_labels_and_snapshot();
+                let _ = reply.send(result);
+            }
+            ActorCommand::Revoke { label, reply } => {
+                let result = match self.resolve(&label) {
+                    Ok(peer) => match self.sessions.revoke(peer) {
+                        Ok(()) => {
+                            if let Some(connection) = self.connections.get_mut(&peer) {
+                                let _ = connection.send(lumepeer_core::protocol::MessageKind::ConsentRevoke).await;
+                            }
+                            Ok(())
+                        }
+                        Err(e) => Err(ActorError::Core(e)),
+                    },
+                    Err(e) => Err(e),
+                };
+                self.rebuild_labels_and_snapshot();
+                let _ = reply.send(result);
+            }
+            ActorCommand::InviteCreate { role, reply } => {
+                let now = unix_now();
+                let issued = InviteTicket::issue(&self.identity, &self.endpoint.addr(), role, now);
+                let result = match issued {
+                    Ok(ticket) => match ticket.to_qr_string() {
+                        Ok(qr_string) => {
+                            self.tickets.register(&ticket);
+                            Ok(InviteDto {
+                                qr_string,
+                                expires_at: ticket.expires_at,
+                            })
+                        }
                         Err(e) => Err(ActorError::Net(e)),
-                    };
-                    let _ = reply.send(result);
-                }
-                ActorCommand::InviteConnect { ticket, reply } => {
-                    let result = self.connect_with_ticket(&ticket).await;
-                    let _ = reply.send(result);
-                }
+                    },
+                    Err(e) => Err(ActorError::Net(e)),
+                };
+                let _ = reply.send(result);
+            }
+            ActorCommand::InviteConnect { ticket, reply } => {
+                let result = self.connect_with_ticket(&ticket).await;
+                let _ = reply.send(result);
             }
         }
     }
@@ -306,6 +418,7 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
     endpoint.online().await;
 
     let (tx, rx) = mpsc::channel(32);
+    let (events_tx, events_rx) = mpsc::channel(32);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
     let actor = Actor {
@@ -316,6 +429,9 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
         endpoint,
         identity,
         tickets: TicketRegistry::new(),
+        connections: std::collections::HashMap::new(),
+        events_tx,
+        events_rx,
     };
     tokio::spawn(actor.run());
     Ok(ActorHandle { tx })
