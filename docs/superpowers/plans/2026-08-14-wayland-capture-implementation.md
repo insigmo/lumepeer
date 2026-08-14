@@ -6,13 +6,13 @@
 
 **Architecture:** A new `PortalHandle` owns the ashpd `Session`/`RemoteDesktop` proxy and a persistent tokio runtime, shared via `Arc<Mutex<_>>` between the capturer and injector. Negotiation happens lazily on the capturer's first `start()`. Frame consumption runs on a dedicated OS thread owning a PipeWire `MainLoop`, feeding a bounded channel that `next_frame()` drains non-blockingly. `platform_capturer()`/`platform_injector()` are replaced by a single `platform_backend()` that runtime-detects X11 vs. Wayland and returns a paired `(ScreenCapturer, InputInjector)`.
 
-**Tech Stack:** Rust, `pipewire` crate 0.10 (pipewire-rs), `libspa` 0.10 (re-exported as `pipewire::spa`), `ashpd` 0.13.13 (already a dependency), `tokio` current-thread runtime.
+**Tech Stack:** Rust, `pipewire` crate 0.8.0 (pipewire-rs — pinned by `scap`'s existing `pipewire = "^0.8.0"`, see Global Constraints), `libspa` 0.8 (re-exported as `pipewire::spa`), `ashpd` 0.13.13 (already a dependency), `tokio` current-thread runtime.
 
 **Spec:** `docs/superpowers/specs/2026-08-14-wayland-capture-design.md`
 
 ## Global Constraints
 
-- `pipewire` crate version: `0.10` (matches the workspace's existing `ashpd = "0.13.13"` pin style — exact minor, not a caret range wider than needed).
+- `pipewire` crate version: `0.8.0`, exact. **Not the initially planned `0.10`** — Task 1 discovered that `scap` (an existing, already-`optional`-declared dependency of `crates/media`, used by the unrelated `capture-scap` feature) pins `pipewire = "^0.8.0"`, and Cargo's `links = "pipewire-0.3"` uniqueness rule allows only one resolved version of a native-linking crate across the *entire workspace lockfile*, regardless of which features are active for a given build invocation. `0.8.0` is the only version satisfying `^0.8.0`, so it is not a preference, it is the only value that resolves at all. Verified directly: `pipewire::main_loop::MainLoop`, `pipewire::context::Context::new(&mainloop)` (single-argument, no properties param), `Context::connect(None)` (returns `Core`, not a `*Rc` type), and `pipewire::stream::Stream::new(&core, ..)` replace the `MainLoopRc`/`ContextRc::new(&mainloop, None)`/`connect_rc`/`StreamBox` names an earlier pass of this plan used before the conflict was found — 0.8 predates that Rc/Box smart-pointer split. Everything else this plan uses (`libspa`'s pod/video/format types, `Stream`'s `add_local_listener_with_user_data`/`param_changed`/`process`/`register`/`connect`/`dequeue_buffer`, the `pipewire::channel` module) is byte-for-byte identical between 0.8.0 and 0.10.0 — confirmed by downloading and diffing both crates' source, not by assumption.
 - No DMA-BUF/EGL import — `SPA_DATA_MemPtr` buffers only, copied out (per spec's non-goals).
 - Requested video format is fixed `BGRx` (`PixelFormat::Bgra8` on the `Frame` side) — no negotiation of alternate formats.
 - `capture-portal` feature gates all of this; it must not affect the default `cargo build --workspace` (no platform SDK required, per the feature's existing doc comment in `crates/media/Cargo.toml`).
@@ -51,8 +51,10 @@ ashpd = { version = "0.13.13", default-features = false, features = [
     "remote_desktop",
 ], optional = true }
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
-pipewire = { version = "0.10", optional = true }
+pipewire = { version = "0.8.0", optional = true }
 ```
+
+**Note (already executed as of this revision):** Task 1 tried `0.10` first and hit a Cargo resolver error — `scap` (an existing, already-declared dependency of `crates/media`) pins `pipewire = "^0.8.0"`, and Cargo's `links = "pipewire-0.3"` uniqueness rule forces one resolved version workspace-wide. `0.8.0` is correct and already committed; see Global Constraints for the full explanation and its effect on Task 4's code.
 
 - [ ] **Step 2: Install the system packages CI needs**
 
@@ -791,12 +793,16 @@ impl PipeWireFrameThread {
         use pipewire::stream::StreamFlags;
 
         pipewire::init();
-        let mainloop = pipewire::main_loop::MainLoopRc::new(None)
+        // pipewire 0.8.0 API (see Global Constraints): MainLoop is already
+        // Rc-backed and Clone on its own — no separate *Rc type. Context::new
+        // takes only the loop, no properties argument. connect() (not
+        // connect_rc()) returns Core directly.
+        let mainloop = pipewire::main_loop::MainLoop::new(None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-        let context = pipewire::context::ContextRc::new(&mainloop, None)
+        let context = pipewire::context::Context::new(&mainloop)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
         let core = context
-            .connect_rc(None)
+            .connect(None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         // Cross-thread shutdown: dropping `PipeWireFrameThread` sends
@@ -811,7 +817,7 @@ impl PipeWireFrameThread {
             *pipewire::keys::MEDIA_CATEGORY => "Capture",
             *pipewire::keys::MEDIA_ROLE => "Screen",
         };
-        let stream = pipewire::stream::StreamBox::new(&core, "lumepeer-capture", props)
+        let stream = pipewire::stream::Stream::new(&core, "lumepeer-capture", props)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         let data = StreamUserData {
