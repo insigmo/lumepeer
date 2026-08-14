@@ -41,7 +41,7 @@ describe('accessibility: consent dialog', () => {
     });
 
     it(`has no axe violations with a pending request (${locale})`, async () => {
-      const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false };
+      const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
       render(consentDialog(request, locale), container);
       expect(await auditViolations(container)).toEqual([]);
     });
@@ -57,7 +57,7 @@ describe('accessibility: session status', () => {
 
     it(`has no axe violations with active sessions (${locale})`, async () => {
       const sessions: SessionStatus[] = [
-        { peer_label: 'guest-ab12', role: 'full_control', input: true },
+        { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active' },
       ];
       render(sessionStatus(sessions, locale), container);
       expect(await auditViolations(container)).toEqual([]);
