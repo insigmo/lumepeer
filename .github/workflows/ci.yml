@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # ld dies with "Bus error" linking the dev/test profile of this workspace
+  # (iroh + tauri + sqlx + webkit all in one binary) on stock GitHub runners:
+  # full debug info overflows the tmpfs-backed /tmp. Trim it instead of
+  # disabling debug info outright, so panics still carry file:line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # Phase 0 acceptance criterion (design doc §19): the workspace builds on
