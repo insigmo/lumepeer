@@ -3720,6 +3720,7 @@ dependencies = [
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
+ "postcard",
  "serde_json",
  "tokio",
  "ureq",
