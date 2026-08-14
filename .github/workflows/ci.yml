@@ -73,7 +73,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm xvfb libx11-dev libxtst-dev libdbus-1-dev gnome-keyring
+          sudo apt-get install -y nasm xvfb libx11-dev libxtst-dev libdbus-1-dev gnome-keyring libpipewire-0.3-dev libclang-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
