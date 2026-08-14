@@ -26,7 +26,7 @@ function focusables(root: HTMLElement): HTMLButtonElement[] {
 
 describe('keyboard navigation: consent dialog', () => {
   it('every action is a real <button>, reachable by Tab, none disabled or tabindex=-1', () => {
-    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false };
+    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
     render(consentDialog(request, 'en'), container);
 
     const buttons = focusables(container);
@@ -38,7 +38,7 @@ describe('keyboard navigation: consent dialog', () => {
   });
 
   it('the deny action is first in DOM order and carries autofocus, so a keyboard/screen-reader user lands on the safe default', () => {
-    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false };
+    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
     render(consentDialog(request, 'en'), container);
 
     const buttons = focusables(container);

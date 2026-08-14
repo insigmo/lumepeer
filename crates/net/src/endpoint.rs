@@ -115,8 +115,30 @@ impl PeerEndpoint {
     /// [`NetError::Io`] if the handshake of an incoming connection fails; the
     /// caller keeps accepting afterwards.
     pub async fn accept(&self) -> Option<Result<iroh::endpoint::Connection>> {
-        let incoming = self.inner.accept().await?;
-        Some(incoming.await.map_err(|e| NetError::Io(e.to_string())))
+        let incoming = self.accept_incoming().await?;
+        Some(Self::finish_accept(incoming).await)
+    }
+
+    /// Accepts the next incoming connection *without* awaiting its QUIC
+    /// handshake, or `None` once the endpoint is closed.
+    ///
+    /// Unlike [`Self::accept`] this is a single await, so it is safe to drop
+    /// inside a `tokio::select!`: no connection can be lost between the two
+    /// stages. The caller finishes the handshake with [`Self::finish_accept`],
+    /// normally on its own task so that a slow peer cannot stall the loop.
+    pub async fn accept_incoming(&self) -> Option<iroh::endpoint::Incoming> {
+        self.inner.accept().await
+    }
+
+    /// Completes the QUIC handshake of a connection taken from
+    /// [`Self::accept_incoming`].
+    ///
+    /// # Errors
+    /// [`NetError::Io`] if the handshake fails.
+    pub async fn finish_accept(
+        incoming: iroh::endpoint::Incoming,
+    ) -> Result<iroh::endpoint::Connection> {
+        incoming.await.map_err(|e| NetError::Io(e.to_string()))
     }
 
     /// Borrows the underlying endpoint.
