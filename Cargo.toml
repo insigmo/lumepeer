@@ -47,7 +47,12 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 axum = "0.8"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio-rustls",
+    "macros",
+    "migrate",
+] }
 toml = "0.8"
 config = "0.14"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md

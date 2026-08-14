@@ -4,7 +4,38 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack timing side-channel in `rsa`. Reachable
+    # only via sqlx-mysql's optional `rsa` dependency; sqlx is built with
+    # `default-features = false` and only the `sqlite` backend (root
+    # Cargo.toml), so sqlx-mysql/rsa are never compiled or linked. Cargo.lock
+    # still lists them because cargo does not prune unenabled optional
+    # dependencies. Upstream has "no fixed upgrade available".
+    "RUSTSEC-2023-0071",
+
+    # Unmaintained-only advisories (no CVE, "no safe upgrade available") from
+    # Tauri 2.x's Linux GTK3 windowing stack (atk/gdk/gtk/... via
+    # muda/tao/webkit2gtk/wry) and a few of its transitive deps. These track
+    # Tauri's own migration to gtk4-rs; nothing to act on from this repo.
+    "RUSTSEC-2024-0411", # atk
+    "RUSTSEC-2024-0412", # atk-sys
+    "RUSTSEC-2024-0413", # gdk
+    "RUSTSEC-2024-0414", # gdk-sys
+    "RUSTSEC-2024-0415", # gdk-pixbuf
+    "RUSTSEC-2024-0416", # gdk-pixbuf-sys
+    "RUSTSEC-2024-0417", # gio
+    "RUSTSEC-2024-0418", # gio-sys
+    "RUSTSEC-2024-0419", # glib
+    "RUSTSEC-2024-0420", # glib-sys
+    "RUSTSEC-2024-0436", # paste, unmaintained
+    "RUSTSEC-2023-0089", # atomic-polyfill, unmaintained
+    "RUSTSEC-2024-0370", # proc-macro-error, unmaintained
+    "RUSTSEC-2025-0075", # unic-char-property, unmaintained
+    "RUSTSEC-2025-0080", # unic-common, unmaintained
+    "RUSTSEC-2025-0081", # unic-char-range, unmaintained
+    "RUSTSEC-2025-0098", # unic-ucd-version, unmaintained
+    "RUSTSEC-2025-0100", # unic-ucd-ident, unmaintained
+]
 
 [licenses]
 version = 2
@@ -21,12 +52,22 @@ allow = [
     "CDLA-Permissive-2.0",
     "MPL-2.0",
     "OpenSSL",
+    "Unlicense",
+    "CC0-1.0",
 ]
 confidence-threshold = 0.9
 
+[licenses.private]
+# All workspace crates are `publish = false` (§workspace.package): there is no
+# license to check for something that is never published.
+ignore = true
+
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+# Every crate this flags is an intra-workspace `path` dependency
+# (`lumepeer-*.workspace = true`): those have no ambiguous registry version to
+# pin, so the wildcard check has nothing to protect against here.
+wildcards = "allow"
 # `quinn` is an internal choice of iroh (design doc §5, §20): pinning it by hand
 # may break iroh compatibility, so it must not become a direct dependency.
 deny = [{ crate = "quinn", wrappers = ["iroh"] }]
