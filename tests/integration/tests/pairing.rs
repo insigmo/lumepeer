@@ -2,6 +2,8 @@
 //! §9.1). First test that exercises `host_handshake` + `guest_handshake`
 //! together against a live `TicketRegistry`, rather than each in isolation.
 
+#![allow(clippy::expect_used, reason = "a failed assumption must fail the test")]
+
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
 use lumepeer_core::session::SessionManager;
