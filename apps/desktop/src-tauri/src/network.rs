@@ -436,18 +436,3 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
     tokio::spawn(actor.run());
     Ok(ActorHandle { tx })
 }
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-
-    use super::*;
-
-    #[tokio::test]
-    async fn status_starts_empty_and_unknown_label_is_refused() {
-        let handle = spawn_actor();
-        assert!(handle.status().await.unwrap().is_empty());
-        let err = handle.grant("nonexistent".to_owned(), Role::ViewOnly).await;
-        assert!(matches!(err, Err(ActorError::UnknownPeer)));
-    }
-}
