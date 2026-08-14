@@ -6,7 +6,7 @@ use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
 use lumepeer_core::session::SessionManager;
 use lumepeer_net::ticket::{InviteTicket, TicketRegistry};
-use lumepeer_net::{PeerEndpoint, host_handshake, guest_handshake};
+use lumepeer_net::{PeerEndpoint, guest_handshake, host_handshake};
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()

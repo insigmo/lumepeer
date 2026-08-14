@@ -287,7 +287,10 @@ impl Actor {
     }
 
     fn resolve(&self, label: &str) -> Result<NodeId, ActorError> {
-        self.labels.get(label).copied().ok_or(ActorError::UnknownPeer)
+        self.labels
+            .get(label)
+            .copied()
+            .ok_or(ActorError::UnknownPeer)
     }
 
     /// Rebuilds the label table from current pending + active peers, and
@@ -507,7 +510,12 @@ impl Actor {
         }
     }
 
-    fn on_handshaked(&mut self, connection: ControlConnection, peer: NodeId, ticket: &InviteTicket) {
+    fn on_handshaked(
+        &mut self,
+        connection: ControlConnection,
+        peer: NodeId,
+        ticket: &InviteTicket,
+    ) {
         let tag = self.label_of(&peer);
         // Single-use enforcement runs here, on the actor's own thread, so two
         // connections racing the same ticket cannot both win it.
@@ -517,7 +525,10 @@ impl Actor {
             return;
         }
         // Every connection, first time or reconnect, gets a fresh decision.
-        if let Err(error) = self.sessions.request_consent_as(peer, ticket.allowed_request) {
+        if let Err(error) = self
+            .sessions
+            .request_consent_as(peer, ticket.allowed_request)
+        {
             tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
             // The ticket is already burned and nobody will ever decide on this
             // peer, so the connection must not linger: close it here, before
