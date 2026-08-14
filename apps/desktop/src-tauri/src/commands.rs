@@ -1,21 +1,21 @@
 //! Tauri IPC surface (design doc §13).
 //!
-//! Exactly five commands are exposed, matching the allowlist in
-//! `capabilities/main.json`. Every command takes a typed DTO, never
-//! `serde_json::Value`, and every decision is taken by `lumepeer-core`: the
-//! webview is an untrusted presentation layer (§2.3, §4).
+//! Every command takes a typed DTO, never `serde_json::Value`, and every
+//! decision is taken by the network actor: the webview is an untrusted
+//! presentation layer (§2.3, §4). The only peer-identifying string that
+//! ever crosses this boundary is the pseudonymized label the actor handed
+//! out on a previous `session_status` poll — never a raw `NodeId`.
 
 #![allow(
     clippy::needless_pass_by_value,
     reason = "tauri command handlers take Window and State by value"
 )]
 
-use lumepeer_core::NodeId;
-use lumepeer_core::license::Plan;
 use serde::{Deserialize, Serialize};
 use tauri::Window;
 
 use crate::AppState;
+use crate::network::{ActorError, SessionStateDto};
 
 /// Label of the only window allowed to call these commands.
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -38,45 +38,36 @@ impl IpcError {
         }
     }
 
-    fn core(error: &lumepeer_core::CoreError) -> Self {
-        Self {
-            code: "CORE",
-            message: error.to_string(),
-        }
-    }
-
-    fn bad_peer() -> Self {
-        Self {
-            code: "BAD_PEER",
-            message: "peer identity is not a valid endpoint id".to_owned(),
-        }
-    }
-
     fn poisoned() -> Self {
         Self {
             code: "STATE_POISONED",
             message: "session state is unavailable".to_owned(),
         }
     }
+
+    fn unknown_peer() -> Self {
+        Self {
+            code: "UNKNOWN_PEER",
+            message: "no session matches that peer".to_owned(),
+        }
+    }
+
+    fn core(error: &lumepeer_core::CoreError) -> Self {
+        Self {
+            code: "CORE",
+            message: error.to_string(),
+        }
+    }
 }
 
-/// Parses the hex endpoint id the UI passes back to us.
-///
-/// The webview only ever echoes an identity the core handed it; an identity it
-/// invented is refused here and authorizes nothing either way (§2.3).
-fn parse_peer(peer: &str) -> Result<NodeId, IpcError> {
-    peer.parse::<NodeId>().map_err(|_| IpcError::bad_peer())
-}
-
-/// Pseudonymized label of a peer: the first 8 bytes of the salted BLAKE3 of its
-/// identity, never the identity itself (§15).
-fn peer_label(install_salt: &[u8; 32], peer: &NodeId) -> String {
-    let hash = lumepeer_core::audit::peer_hash(install_salt, peer);
-    hash[..8].iter().fold(String::new(), |mut out, byte| {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-        out
-    })
+impl From<ActorError> for IpcError {
+    fn from(error: ActorError) -> Self {
+        match error {
+            ActorError::UnknownPeer => Self::unknown_peer(),
+            ActorError::Core(e) => Self::core(&e),
+            ActorError::ChannelClosed => Self::poisoned(),
+        }
+    }
 }
 
 /// Rejects calls coming from any window other than the main one (§13).
@@ -120,19 +111,29 @@ impl From<lumepeer_core::consent::Role> for RoleDto {
     }
 }
 
-/// Argument of [`session_request`].
-#[derive(Debug, Clone, Deserialize)]
-pub struct SessionRequestArgs {
-    /// Peer that asked for consent, as the hex identity shown in the UI.
-    pub peer: String,
-    /// Role the peer asked for.
-    pub role: RoleDto,
+/// Session state as seen by the webview.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStateDtoWire {
+    /// Queued, waiting for the host's decision.
+    Pending,
+    /// Consent granted, grants are live.
+    Active,
+}
+
+impl From<SessionStateDto> for SessionStateDtoWire {
+    fn from(value: SessionStateDto) -> Self {
+        match value {
+            SessionStateDto::Pending => Self::Pending,
+            SessionStateDto::Active => Self::Active,
+        }
+    }
 }
 
 /// Argument of [`session_grant`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionGrantArgs {
-    /// Peer being granted.
+    /// Pseudonymized label of the peer, as handed out by `session_status`.
     pub peer: String,
     /// Role the host chose, which may be lower than the requested one.
     pub role: RoleDto,
@@ -141,7 +142,7 @@ pub struct SessionGrantArgs {
 /// Argument of [`session_revoke`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct SessionRevokeArgs {
-    /// Peer being revoked.
+    /// Pseudonymized label of the peer being revoked.
     pub peer: String,
 }
 
@@ -150,7 +151,9 @@ pub struct SessionRevokeArgs {
 pub struct SessionStatusDto {
     /// Pseudonymized peer label; never a raw `NodeId` (§15).
     pub peer_label: String,
-    /// Role currently held.
+    /// Pending or active.
+    pub state: SessionStateDtoWire,
+    /// Role requested (pending) or granted (active).
     pub role: RoleDto,
     /// Whether input injection is currently permitted.
     pub input: bool,
@@ -167,80 +170,58 @@ pub struct LicenseStatusDto {
     pub offline: bool,
 }
 
-/// Queues a consent request raised by the transport layer.
+/// Grants a role. The decision is taken by the actor, never in the webview
+/// (§2.3).
 ///
 /// # Errors
-/// Rejects calls from other windows, and propagates the rate limit of §9.2 and
-/// the queue limit of §8.1.
+/// Rejects calls from other windows; propagates [`ActorError`] as an
+/// [`IpcError`] (plan ceiling of §8.2, single-controller rule, unknown
+/// label).
 #[tauri::command]
-pub fn session_request(
-    window: Window,
-    state: tauri::State<'_, AppState>,
-    args: SessionRequestArgs,
-) -> Result<(), IpcError> {
-    check_window(&window)?;
-    let peer = parse_peer(&args.peer)?;
-    let mut sessions = state.sessions.lock().map_err(|_| IpcError::poisoned())?;
-    sessions
-        .request_consent_as(peer, args.role.into())
-        .map(|_ticket| ())
-        .map_err(|e| IpcError::core(&e))
-}
-
-/// Grants a role. The decision is taken here on the Rust side, never in the
-/// webview (§2.3).
-///
-/// # Errors
-/// Propagates [`lumepeer_core::CoreError`] as an [`IpcError`]: the plan ceiling
-/// of §8.2 and the single-controller rule reject the call here, not in the UI.
-#[tauri::command]
-pub fn session_grant(
+pub async fn session_grant(
     window: Window,
     state: tauri::State<'_, AppState>,
     args: SessionGrantArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    let peer = parse_peer(&args.peer)?;
-    let mut sessions = state.sessions.lock().map_err(|_| IpcError::poisoned())?;
-    sessions
-        .grant(peer, args.role.into())
-        .map_err(|e| IpcError::core(&e))
+    state.network.grant(args.peer, args.role.into()).await?;
+    Ok(())
 }
 
 /// Revokes every grant of a peer immediately (§8.1).
 ///
 /// # Errors
-/// Propagates [`lumepeer_core::CoreError`] as an [`IpcError`].
+/// Rejects calls from other windows; propagates [`ActorError`] as an
+/// [`IpcError`].
 #[tauri::command]
-pub fn session_revoke(
+pub async fn session_revoke(
     window: Window,
     state: tauri::State<'_, AppState>,
     args: SessionRevokeArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    let peer = parse_peer(&args.peer)?;
-    let mut sessions = state.sessions.lock().map_err(|_| IpcError::poisoned())?;
-    sessions.revoke(peer).map_err(|e| IpcError::core(&e))
+    state.network.revoke(args.peer).await?;
+    Ok(())
 }
 
-/// Lists active sessions for the status indicator.
+/// Lists pending and active sessions for the status/consent UI.
 ///
 /// # Errors
-/// Rejects calls from other windows.
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
 #[tauri::command]
-pub fn session_status(
+pub async fn session_status(
     window: Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SessionStatusDto>, IpcError> {
     check_window(&window)?;
-    let sessions = state.sessions.lock().map_err(|_| IpcError::poisoned())?;
-    Ok(sessions
-        .active()
+    let snapshot = state.network.status().await?;
+    Ok(snapshot
         .into_iter()
-        .map(|(peer, role, grants)| SessionStatusDto {
-            peer_label: peer_label(&state.install_salt, &peer),
-            role: role.into(),
-            input: grants.input,
+        .map(|s| SessionStatusDto {
+            peer_label: s.label,
+            state: s.state.into(),
+            role: s.role.into(),
+            input: s.input,
         })
         .collect())
 }
@@ -250,20 +231,12 @@ pub fn session_status(
 /// # Errors
 /// Rejects calls from other windows.
 #[tauri::command]
-pub fn license_status(
-    window: Window,
-    state: tauri::State<'_, AppState>,
-) -> Result<LicenseStatusDto, IpcError> {
+pub fn license_status(window: Window) -> Result<LicenseStatusDto, IpcError> {
     check_window(&window)?;
-    let sessions = state.sessions.lock().map_err(|_| IpcError::poisoned())?;
-    let plan = match sessions.plan() {
-        Plan::Trial => "trial",
-        Plan::Pro => "pro",
-        Plan::Team => "team",
-    };
+    // Phase 3 fills these from a verified license token (§12.1, §12.4); the
+    // plan is Trial until then, same default `SessionManager::new()` used.
     Ok(LicenseStatusDto {
-        plan: plan.to_owned(),
-        // Phase 3 fills these from a verified license token (§12.1, §12.4).
+        plan: "trial".to_owned(),
         seconds_left: None,
         offline: true,
     })

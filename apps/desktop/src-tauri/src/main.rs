@@ -1,7 +1,7 @@
 //! Lumepeer desktop application (design doc §4, §13).
 //!
-//! The Tauri layer owns the window and forwards typed IPC calls into
-//! `lumepeer-core`. It holds no authority of its own: the webview is an
+//! The Tauri layer owns the window and forwards typed IPC calls into the
+//! network actor. It holds no authority of its own: the webview is an
 //! untrusted presentation layer (§2.3).
 
 #![forbid(unsafe_code)]
@@ -12,44 +12,24 @@
 )]
 
 mod commands;
+mod network;
 
-use std::sync::Mutex;
-
-use lumepeer_core::session::SessionManager;
-use rand::Rng as _;
-
-/// State shared by every IPC command.
-///
-/// The `SessionManager` is the single authorization decision point, so it is
-/// behind one lock rather than cloned per command.
+/// State shared by every IPC command: a handle into the network actor.
 #[derive(Debug)]
 pub struct AppState {
-    /// Session state machine, consent queue and grants (§8).
-    pub sessions: Mutex<SessionManager>,
-    /// Per-install salt for the pseudonymized peer labels of §15. Regenerated
-    /// on every start: labels are stable within a run and meaningless across
-    /// runs, so a log cannot be correlated back to an identity.
-    pub install_salt: [u8; 32],
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        let mut install_salt = [0u8; 32];
-        rand::rng().fill_bytes(&mut install_salt);
-        Self {
-            sessions: Mutex::new(SessionManager::new()),
-            install_salt,
-        }
-    }
+    /// Channel handle into the `NetworkActor` (§2.3): the only way commands
+    /// reach `SessionManager` or the transport.
+    pub network: network::ActorHandle,
 }
 
 fn main() {
     init_tracing();
 
     tauri::Builder::default()
-        .manage(AppState::default())
+        .manage(AppState {
+            network: network::spawn_actor(),
+        })
         .invoke_handler(tauri::generate_handler![
-            commands::session_request,
             commands::session_grant,
             commands::session_revoke,
             commands::session_status,
