@@ -14,7 +14,10 @@ pub mod keystore;
 pub mod reconnect;
 pub mod ticket;
 
-pub use connection::{ControlConnection, HelloInfo, guest_handshake, host_handshake};
+pub use connection::{
+    Channel, ControlConnection, ControlReader, ControlWriter, HelloInfo, guest_handshake,
+    host_handshake,
+};
 pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, PeerEndpoint};
 pub use error::{NetError, Result};
 pub use ticket::InviteTicket;
