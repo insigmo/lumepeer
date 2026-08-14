@@ -65,6 +65,10 @@ impl From<ActorError> for IpcError {
         match error {
             ActorError::UnknownPeer => Self::unknown_peer(),
             ActorError::Core(e) => Self::core(&e),
+            ActorError::Net(e) => Self {
+                code: "NET",
+                message: e.to_string(),
+            },
             ActorError::ChannelClosed => Self::poisoned(),
         }
     }
@@ -146,6 +150,29 @@ pub struct SessionRevokeArgs {
     pub peer: String,
 }
 
+/// Argument of [`invite_create`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InviteCreateArgs {
+    /// Role the invite allows the guest to request.
+    pub role: RoleDto,
+}
+
+/// What [`invite_create`] hands back to the UI to render as a QR code.
+#[derive(Debug, Clone, Serialize)]
+pub struct InviteDto {
+    /// String to encode as a QR code (also usable as plain text).
+    pub qr_string: String,
+    /// Unix seconds after which the invite is dead.
+    pub expires_at: u64,
+}
+
+/// Argument of [`invite_connect`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InviteConnectArgs {
+    /// The scanned/pasted QR string.
+    pub ticket: String,
+}
+
 /// Snapshot of one session for the status UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatusDto {
@@ -224,6 +251,39 @@ pub async fn session_status(
             input: s.input,
         })
         .collect())
+}
+
+/// Issues an invite for `args.role` and returns the QR payload.
+///
+/// # Errors
+/// Rejects calls from other windows; propagates [`ActorError`].
+#[tauri::command]
+pub async fn invite_create(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: InviteCreateArgs,
+) -> Result<InviteDto, IpcError> {
+    check_window(&window)?;
+    let dto = state.network.invite_create(args.role.into()).await?;
+    Ok(InviteDto {
+        qr_string: dto.qr_string,
+        expires_at: dto.expires_at,
+    })
+}
+
+/// Connects to the host named by `args.ticket`.
+///
+/// # Errors
+/// Rejects calls from other windows; propagates [`ActorError`].
+#[tauri::command]
+pub async fn invite_connect(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: InviteConnectArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.invite_connect(args.ticket).await?;
+    Ok(())
 }
 
 /// Reports the license state.
