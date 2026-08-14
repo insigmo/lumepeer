@@ -22,6 +22,7 @@ lumepeer-core.workspace = true
 lumepeer-net = { workspace = true, features = ["secret-service"] }
 lumepeer-media.workspace = true
 ed25519-dalek.workspace = true
+iroh.workspace = true
 postcard.workspace = true
 rand.workspace = true
 tauri.workspace = true

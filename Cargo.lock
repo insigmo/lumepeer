@@ -3693,6 +3693,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek 2.2.0",
+ "iroh",
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
