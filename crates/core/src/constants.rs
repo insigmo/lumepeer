@@ -11,6 +11,13 @@ pub const MAX_PENDING_CONSENTS: usize = 3;
 pub const RECONNECT_WINDOW_SECS: u64 = 60;
 /// Control-channel keepalive interval (§9.1).
 pub const PING_INTERVAL_SECS: u64 = 20;
+/// Deadline for one accepted connection to complete the control handshake
+/// before the host drops it, so a peer that connects and then goes silent
+/// cannot tie up a task (§9.1, §18).
+pub const CONTROL_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Handshakes the host will run concurrently. Beyond this, further incoming
+/// connections are closed immediately rather than queued (§3.2).
+pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;
 /// Cumulative active session time granted to the trial plan (§12.3).
 pub const TRIAL_SESSION_LIMIT_SECS: u64 = 30 * 60;
 /// Thresholds before license expiry at which `LicenseWarn` is sent (§9.1).

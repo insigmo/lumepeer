@@ -55,43 +55,19 @@ pub struct HelloInfo {
     pub invite_proof: Vec<u8>,
 }
 
-/// An authenticated control connection with one peer.
+/// Read half of a [`ControlConnection`].
 ///
-/// It owns the QUIC connection: dropping a `Connection` closes it, so the
-/// control channel has to outlive the handshake that produced it.
+/// Owned by whoever drives the inbound loop. It keeps a clone of the QUIC
+/// connection so it can still close it with a §18 code; the connection stays
+/// open as long as either half is alive.
 #[derive(Debug)]
-pub struct ControlConnection {
+pub struct ControlReader {
     connection: Connection,
     session_id: [u8; 16],
-    outbound: Direction,
     reader: FrameReader<RecvStream>,
-    writer: FrameWriter<SendStream>,
 }
 
-impl ControlConnection {
-    /// Wraps an accepted or dialed bidirectional stream together with the
-    /// connection it belongs to.
-    #[must_use]
-    pub const fn new(
-        connection: Connection,
-        session_id: [u8; 16],
-        recv: RecvStream,
-        send: SendStream,
-        inbound_direction: Direction,
-    ) -> Self {
-        let outbound = match inbound_direction {
-            Direction::HostToGuest => Direction::GuestToHost,
-            Direction::GuestToHost => Direction::HostToGuest,
-        };
-        Self {
-            connection,
-            session_id,
-            outbound,
-            reader: FrameReader::new(recv, inbound_direction),
-            writer: FrameWriter::new(send),
-        }
-    }
-
+impl ControlReader {
     /// Authenticated peer identity.
     #[must_use]
     pub fn peer(&self) -> NodeId {
@@ -116,16 +92,16 @@ impl ControlConnection {
         self.session_id
     }
 
-    /// Adopts the session id the host assigned in its `HelloAck`.
-    pub const fn set_session_id(&mut self, session_id: [u8; 16]) {
-        self.session_id = session_id;
-    }
-
     /// Reads the next control message.
     ///
     /// Framing enforces the size bound, the direction and strict `seq`; this
     /// adds the `session_id` half of the anti-replay tuple, so a frame from
     /// another session cannot be spliced in (§9.1).
+    ///
+    /// This is **not** cancel-safe: a partially read frame cannot be resumed,
+    /// so it must not be dropped inside a `select!` that another branch can
+    /// win. That is exactly why the read half is separable from the write
+    /// half — a reader loop never has to race a writer.
     ///
     /// # Errors
     /// Propagates framing and I/O errors; the caller closes the stream with the
@@ -136,6 +112,47 @@ impl ControlConnection {
             return Err(NetError::Framing(CoreError::Malformed));
         }
         Ok(envelope)
+    }
+
+    /// Highest sequence number processed so far, for `ResumeHello` (§10).
+    #[must_use]
+    pub const fn last_received_seq(&self) -> u64 {
+        self.reader.expected_seq().saturating_sub(1)
+    }
+}
+
+/// Write half of a [`ControlConnection`].
+#[derive(Debug)]
+pub struct ControlWriter {
+    connection: Connection,
+    session_id: [u8; 16],
+    outbound: Direction,
+    writer: FrameWriter<SendStream>,
+}
+
+impl ControlWriter {
+    /// Authenticated peer identity.
+    #[must_use]
+    pub fn peer(&self) -> NodeId {
+        self.connection.remote_id()
+    }
+
+    /// Underlying QUIC connection, for the close codes of §18.
+    #[must_use]
+    pub const fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Closes the control connection with the code that matches `error` (§18).
+    pub fn close_with(&self, error: &NetError) {
+        let (code, reason) = close_for(error);
+        self.connection.close(code.into(), reason.as_bytes());
+    }
+
+    /// Session this connection belongs to.
+    #[must_use]
+    pub const fn session_id(&self) -> [u8; 16] {
+        self.session_id
     }
 
     /// Sends one control message, filling in session, direction and sequence.
@@ -152,11 +169,106 @@ impl ControlConnection {
         };
         self.writer.write_frame(&mut envelope).await
     }
+}
+
+/// An authenticated control connection with one peer.
+///
+/// It owns the QUIC connection: dropping every handle to a `Connection` closes
+/// it, so the control channel has to outlive the handshake that produced it.
+#[derive(Debug)]
+pub struct ControlConnection {
+    reader: ControlReader,
+    writer: ControlWriter,
+}
+
+impl ControlConnection {
+    /// Wraps an accepted or dialed bidirectional stream together with the
+    /// connection it belongs to.
+    #[must_use]
+    pub fn new(
+        connection: Connection,
+        session_id: [u8; 16],
+        recv: RecvStream,
+        send: SendStream,
+        inbound_direction: Direction,
+    ) -> Self {
+        let outbound = match inbound_direction {
+            Direction::HostToGuest => Direction::GuestToHost,
+            Direction::GuestToHost => Direction::HostToGuest,
+        };
+        Self {
+            reader: ControlReader {
+                connection: connection.clone(),
+                session_id,
+                reader: FrameReader::new(recv, inbound_direction),
+            },
+            writer: ControlWriter {
+                connection,
+                session_id,
+                outbound,
+                writer: FrameWriter::new(send),
+            },
+        }
+    }
+
+    /// Splits into an independently owned read and write half, so an inbound
+    /// loop and an outbound sender can run as two tasks without either one
+    /// cancelling the other's partially completed frame.
+    #[must_use]
+    pub fn split(self) -> (ControlReader, ControlWriter) {
+        (self.reader, self.writer)
+    }
+
+    /// Authenticated peer identity.
+    #[must_use]
+    pub fn peer(&self) -> NodeId {
+        self.reader.peer()
+    }
+
+    /// Underlying QUIC connection, for the close codes of §18.
+    #[must_use]
+    pub const fn connection(&self) -> &Connection {
+        self.reader.connection()
+    }
+
+    /// Closes the control connection with the code that matches `error` (§18).
+    pub fn close_with(&self, error: &NetError) {
+        self.reader.close_with(error);
+    }
+
+    /// Session this connection belongs to.
+    #[must_use]
+    pub const fn session_id(&self) -> [u8; 16] {
+        self.reader.session_id()
+    }
+
+    /// Adopts the session id the host assigned in its `HelloAck`.
+    pub const fn set_session_id(&mut self, session_id: [u8; 16]) {
+        self.reader.session_id = session_id;
+        self.writer.session_id = session_id;
+    }
+
+    /// Reads the next control message. See [`ControlReader::recv`].
+    ///
+    /// # Errors
+    /// Propagates framing and I/O errors; the caller closes the stream with the
+    /// matching code from [`crate::error::close_code`] (§18).
+    pub async fn recv(&mut self) -> Result<MessageEnvelope> {
+        self.reader.recv().await
+    }
+
+    /// Sends one control message. See [`ControlWriter::send`].
+    ///
+    /// # Errors
+    /// Propagates framing and I/O errors.
+    pub async fn send(&mut self, kind: MessageKind) -> Result<()> {
+        self.writer.send(kind).await
+    }
 
     /// Highest sequence number processed so far, for `ResumeHello` (§10).
     #[must_use]
     pub const fn last_received_seq(&self) -> u64 {
-        self.reader.expected_seq().saturating_sub(1)
+        self.reader.last_received_seq()
     }
 }
 
@@ -195,7 +307,7 @@ pub async fn guest_handshake(
         })
         .await?;
 
-    let envelope = control.reader.read_frame().await?;
+    let envelope = control.reader.reader.read_frame().await?;
     let MessageKind::HelloAck { major, .. } = envelope.kind else {
         let error = NetError::Framing(CoreError::Malformed);
         control.close_with(&error);
@@ -230,7 +342,7 @@ pub async fn host_handshake(connection: Connection) -> Result<(ControlConnection
     let mut control =
         ControlConnection::new(connection, [0u8; 16], recv, send, Direction::GuestToHost);
 
-    let envelope = control.reader.read_frame().await?;
+    let envelope = control.reader.reader.read_frame().await?;
     let MessageKind::Hello {
         major,
         minor,
@@ -277,6 +389,9 @@ pub const CLOSE_MALFORMED: u32 = 2;
 pub const CLOSE_FRAME_SIZE: u32 = 3;
 /// QUIC application close code for a duplicate or skipped `seq` (§18).
 pub const CLOSE_REPLAY_OR_ORDER: u32 = 4;
+/// QUIC application close code for a host that cannot take another consent
+/// decision right now: queue full or per-peer rate limit (§8.1, §9.2).
+pub const CLOSE_CONSENT_UNAVAILABLE: u32 = 5;
 
 /// Close code and reason string that a framing error must close the stream
 /// with (§9.1, §18).
@@ -291,6 +406,9 @@ pub fn close_for(error: &NetError) -> (u32, &'static str) {
         }
         NetError::Framing(CoreError::IncompatibleVersion { .. }) => {
             (CLOSE_INCOMPATIBLE_VERSION, close_code::INCOMPATIBLE_VERSION)
+        }
+        NetError::ConsentUnavailable => {
+            (CLOSE_CONSENT_UNAVAILABLE, close_code::CONSENT_UNAVAILABLE)
         }
         _ => (CLOSE_MALFORMED, close_code::MALFORMED),
     }
@@ -333,6 +451,14 @@ mod tests {
         assert_eq!(
             close_for(&NetError::Io("gone".to_owned())).1,
             close_code::MALFORMED
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_queue_consent_says_so_in_its_close_code() {
+        assert_eq!(
+            close_for(&NetError::ConsentUnavailable),
+            (CLOSE_CONSENT_UNAVAILABLE, close_code::CONSENT_UNAVAILABLE)
         );
     }
 }

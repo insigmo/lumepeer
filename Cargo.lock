@@ -3692,9 +3692,12 @@ name = "lumepeer-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek 2.2.0",
+ "iroh",
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
+ "postcard",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -3717,6 +3720,7 @@ dependencies = [
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
+ "postcard",
  "serde_json",
  "tokio",
  "ureq",
