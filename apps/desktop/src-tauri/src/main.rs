@@ -25,20 +25,32 @@ pub struct AppState {
 fn main() {
     init_tracing();
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: failed to start the async runtime: {error}");
+            std::process::exit(1);
+        });
+    let network = runtime
+        .block_on(network::spawn_actor())
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: failed to bind the network endpoint: {error}");
+            std::process::exit(1);
+        });
+
     tauri::Builder::default()
-        .manage(AppState {
-            network: network::spawn_actor(),
-        })
+        .manage(AppState { network })
         .invoke_handler(tauri::generate_handler![
             commands::session_grant,
             commands::session_revoke,
             commands::session_status,
             commands::license_status,
+            commands::invite_create,
+            commands::invite_connect,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
-            // Nothing sensitive here: this is a startup failure of the window
-            // layer, before any peer or license data exists (§15).
             eprintln!("fatal: failed to start the application: {error}");
             std::process::exit(1);
         });
