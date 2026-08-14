@@ -306,7 +306,14 @@ pub mod secret_service_backend {
                 return;
             }
 
-            let key = load_or_create(&store).unwrap();
+            // Storing can also fail on a headless runner: gnome-keyring may
+            // accept the connection and an empty search, then fail to unlock
+            // or create the default collection because there is no prompter
+            // to answer it. That is the same "no usable keyring here" case
+            // as the load above, so skip rather than fail.
+            let Ok(key) = load_or_create(&store) else {
+                return;
+            };
             assert_eq!(
                 store.load_identity().unwrap().unwrap().public(),
                 key.public()
