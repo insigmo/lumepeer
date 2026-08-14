@@ -10,10 +10,13 @@ import type { Locale } from './i18n';
 import { t } from './i18n';
 import type { Role } from './consent-dialog';
 
+export type SessionState = 'pending' | 'active';
+
 export interface SessionStatus {
   peer_label: string;
   role: Role;
   input: boolean;
+  state: SessionState;
 }
 
 async function revoke(peer: string): Promise<void> {

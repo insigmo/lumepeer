@@ -16,6 +16,11 @@ export type TranslationKey =
   | 'consent.action.deny'
   | 'consent.action.allowView'
   | 'consent.action.allowFull'
+  | 'invite.heading'
+  | 'invite.create'
+  | 'invite.qrAlt'
+  | 'invite.connectLabel'
+  | 'invite.connect'
   | 'status.notSharing'
   | 'status.heading'
   | 'status.inputOn'
@@ -36,6 +41,11 @@ const en: Dictionary = {
   'consent.action.deny': 'Deny',
   'consent.action.allowView': 'Allow view only',
   'consent.action.allowFull': 'Allow full control',
+  'invite.heading': 'Invite and connect',
+  'invite.create': 'Create invite',
+  'invite.qrAlt': 'QR code',
+  'invite.connectLabel': 'Enter invite code:',
+  'invite.connect': 'Connect',
   'status.notSharing': 'Not sharing.',
   'status.heading': 'Active sessions',
   'status.inputOn': 'input on',
@@ -55,6 +65,11 @@ const ar: Dictionary = {
   'consent.action.deny': 'رفض',
   'consent.action.allowView': 'السماح بالمشاهدة فقط',
   'consent.action.allowFull': 'السماح بالتحكم الكامل',
+  'invite.heading': 'الدعوة والاتصال',
+  'invite.create': 'إنشاء دعوة',
+  'invite.qrAlt': 'رمز الاستجابة السريعة',
+  'invite.connectLabel': 'أدخل رمز الدعوة:',
+  'invite.connect': 'الاتصال',
   'status.notSharing': 'لا مشاركة حالياً.',
   'status.heading': 'الجلسات النشطة',
   'status.inputOn': 'الإدخال مفعّل',

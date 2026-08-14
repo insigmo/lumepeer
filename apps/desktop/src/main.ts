@@ -8,6 +8,7 @@ import { render } from 'lit-html';
 
 import { consentDialog } from './consent-dialog';
 import { detectLocale, dirOf, type Locale } from './i18n';
+import { inviteView } from './invite-view';
 import { sessionStatus, type SessionStatus } from './session-status';
 
 const root = document.querySelector('#app');
@@ -25,13 +26,11 @@ async function refresh(): Promise<void> {
   applyDir();
   const { invoke } = await import('@tauri-apps/api/core');
   const sessions = await invoke<SessionStatus[]>('session_status');
-  const pending = sessions.length === 0;
+  const pendingRequest = sessions.find((session) => session.state === 'pending');
+  const activeSessions = sessions.filter((session) => session.state === 'active');
 
   render(
-    [
-      pending ? consentDialog(undefined, locale) : consentDialog(sessions[0], locale),
-      sessionStatus(sessions, locale),
-    ],
+    [inviteView(locale), consentDialog(pendingRequest, locale), sessionStatus(activeSessions, locale)],
     root as HTMLElement,
   );
 }
