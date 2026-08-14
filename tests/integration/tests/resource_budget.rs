@@ -20,16 +20,23 @@
     reason = "a failed assumption must fail the test"
 )]
 
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use lumepeer_media::capture::{CaptureTarget, Frame, InputCapability, PixelFormat, ScreenCapturer};
+#[cfg(target_os = "linux")]
 use lumepeer_media::decode::DecoderHandle;
+#[cfg(target_os = "linux")]
 use lumepeer_media::encode::{EncoderConfig, select_encoder};
+#[cfg(target_os = "linux")]
 use lumepeer_media::error::MediaError;
 
 /// Path of the decoder worker built into the same target directory, same
 /// approach as `media_pipeline.rs`.
+#[cfg(target_os = "linux")]
 fn worker_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
@@ -43,6 +50,7 @@ fn worker_binary() -> PathBuf {
 /// the design doc's single point of truth instead of drifting from a copy.
 /// Hand-rolled rather than a YAML crate: the file is a flat, hand-written
 /// table and a new dependency for one number is not worth an ADR.
+#[cfg(target_os = "linux")]
 fn gate_p95_mib(budget_key: &str) -> f64 {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
@@ -101,11 +109,13 @@ fn read_vmrss_mib(pid: u32) -> Option<f64> {
 
 /// Synthetic capturer, same shape as `media_pipeline.rs`: it exists so this
 /// test does not depend on a live display being present on the runner.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 struct MovingCapturer {
     tick: u8,
 }
 
+#[cfg(target_os = "linux")]
 impl ScreenCapturer for MovingCapturer {
     fn start(&mut self, _target: CaptureTarget) -> Result<(), MediaError> {
         Ok(())
@@ -145,15 +155,15 @@ impl ScreenCapturer for MovingCapturer {
     ignore = "VmRSS sampling is implemented for Linux only, matching ADR 0007's scope"
 )]
 fn the_decoder_worker_stays_within_the_active_extra_rss_gate() {
-    if std::env::var_os("LUMEPEER_TEST_RESOURCE_BUDGET").is_none() {
-        eprintln!(
-            "skipping: set LUMEPEER_TEST_RESOURCE_BUDGET=1 (the resource-budget CI job does)"
-        );
-        return;
-    }
-
     #[cfg(target_os = "linux")]
     {
+        if std::env::var_os("LUMEPEER_TEST_RESOURCE_BUDGET").is_none() {
+            eprintln!(
+                "skipping: set LUMEPEER_TEST_RESOURCE_BUDGET=1 (the resource-budget CI job does)"
+            );
+            return;
+        }
+
         let mut decoder = match DecoderHandle::spawn_with(&worker_binary()) {
             Ok(decoder) => decoder,
             Err(MediaError::SandboxUnavailable(e)) => {
