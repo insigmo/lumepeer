@@ -33,6 +33,12 @@ pub enum NetError {
     #[error("malformed invite ticket encoding")]
     MalformedTicket,
 
+    /// Host cannot take another consent decision right now: the pending queue
+    /// is full or the peer is rate limited (§8.1, §9.2). Raised on the host
+    /// side to close a connection it can no longer make progress on.
+    #[error("host cannot accept another consent request")]
+    ConsentUnavailable,
+
     /// Reconnect came from a different peer or for a different session (§10).
     #[error("reconnect rejected")]
     ReconnectRejected,
@@ -55,4 +61,6 @@ pub mod close_code {
     pub const INCOMPATIBLE_VERSION: &str = "IncompatibleVersion";
     /// Message could not be decoded.
     pub const MALFORMED: &str = "MALFORMED";
+    /// Host cannot queue another consent decision (§8.1, §9.2).
+    pub const CONSENT_UNAVAILABLE: &str = "CONSENT_UNAVAILABLE";
 }
