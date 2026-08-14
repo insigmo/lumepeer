@@ -1,0 +1,12 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack timing side-channel in `rsa`, pulled in
+    # transitively only via sqlx-mysql's optional `rsa` dependency. We build
+    # sqlx with `default-features = false` and only the `sqlite` backend
+    # (see root Cargo.toml), so sqlx-mysql/rsa are never compiled or linked;
+    # Cargo.lock still lists them because cargo does not prune unenabled
+    # optional dependencies from the lockfile. Upstream has "no fixed upgrade
+    # available", so there is nothing to update to; ignore until sqlx drops
+    # the optional dependency or a fix ships.
+    "RUSTSEC-2023-0071",
+]
