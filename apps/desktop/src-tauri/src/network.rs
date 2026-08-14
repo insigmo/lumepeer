@@ -406,6 +406,12 @@ impl Actor {
 
 /// Binds the endpoint from the OS keystore identity and spawns the actor.
 ///
+/// Reaching a relay is **not** awaited here: on a LAN-only machine that wait
+/// never finishes, and `main` blocks on this call before Tauri creates a
+/// window, so blocking it would leave the app with no window and no error at
+/// all. Ticket pairing does not need a relay (§7), so the wait runs in the
+/// background and only logs.
+///
 /// # Errors
 /// [`lumepeer_net::NetError`] if the keystore or the endpoint bind fails —
 /// surfaced as a startup failure rather than silently degrading (§11.2,
@@ -415,8 +421,23 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let endpoint = PeerEndpoint::bind(secret_key).await?;
-    endpoint.online().await;
 
+    tokio::spawn({
+        let endpoint = endpoint.clone();
+        async move {
+            endpoint.online().await;
+            tracing::info!("endpoint reached a relay; invites are dialable from outside the LAN");
+        }
+    });
+
+    Ok(spawn_actor_with(endpoint, identity))
+}
+
+/// Spawns the actor over an already bound endpoint. Split out of
+/// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
+/// relay or a Tauri window.
+#[must_use]
+pub fn spawn_actor_with(endpoint: PeerEndpoint, identity: SigningKey) -> ActorHandle {
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
     let mut install_salt = [0u8; 32];
@@ -434,5 +455,5 @@ pub async fn spawn_actor() -> Result<ActorHandle, lumepeer_net::NetError> {
         events_rx,
     };
     tokio::spawn(actor.run());
-    Ok(ActorHandle { tx })
+    ActorHandle { tx }
 }
