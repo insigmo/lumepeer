@@ -270,7 +270,7 @@ pub const ERROR_BYTE: u8 = 0x13;
 pub mod shm {
     use std::fs::OpenOptions;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     use memmap2::MmapMut;
 
@@ -366,13 +366,20 @@ pub mod shm {
         /// [`MediaError::DecoderWorker`] if the file cannot be created or
         /// mapped.
         pub fn create() -> Result<(Self, PathBuf)> {
+            // The clock alone is not fine-grained enough on every platform to
+            // tell apart two rings created back to back in the same process
+            // (e.g. macOS's `SystemTime` resolution is coarser than a
+            // nanosecond), so a counter guarantees uniqueness that the clock
+            // can't.
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
             let mut path = std::env::temp_dir();
             path.push(format!(
-                "lumepeer-decoder-{}-{}.ring",
+                "lumepeer-decoder-{}-{}-{}.ring",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.subsec_nanos())
+                    .map_or(0, |d| d.subsec_nanos()),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
 
             let mut options = OpenOptions::new();
