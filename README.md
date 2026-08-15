@@ -8,6 +8,26 @@ The specification is `p2p-iroh-tauri-design-v12.md`. Section references in the
 code (`§8.2`, `§14`, …) point into it, and it wins over anything written here.
 Deviations from it live in `docs/adr/`, never in silence.
 
+## Installing
+
+Every push to `master` bumps the patch version, tags it and builds/publishes
+that release for Windows (amd64/arm64), Linux (amd64/arm64, `.deb`/`.rpm`)
+and macOS (arm64, `.dmg`) — see `.github/workflows/release.yml`. Grab an
+installer straight from the [latest release](https://github.com/insigmo/lumepeer/releases/latest),
+or use the installer scripts, which detect the OS/arch and install with the
+platform's native package manager:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/insigmo/lumepeer/refs/heads/master/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/insigmo/lumepeer/refs/heads/master/install.ps1 | iex
+```
+
+Pass `--version vX.Y.Z` (`-Version vX.Y.Z` on Windows) to pin a release
+instead of installing latest.
+
 ## Ground rules
 
 - Anything not explicitly permitted is forbidden. The host's Rust core is the
