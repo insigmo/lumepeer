@@ -8,7 +8,7 @@ the other way around.
 | §21 line | Enforced by | Status |
 |---|---|---|
 | Protocol golden vectors, fuzz corpus and interop tests pass | `fuzz` job (`cargo check --manifest-path tests/fuzz/Cargo.toml`), `tests/integration/tests/protocol_golden.rs` replaying the corpus, `tests/interop/golden_vectors.txt` | Automated, runs on every push/PR |
-| `cargo audit`, `cargo deny`, SBOM and signed artifact verification pass in release CI | `supply-chain` job: `cargo audit`, `cargo deny check`, `cargo cyclonedx` uploaded as the `sbom` artifact; `apps/desktop/src-tauri/tauri.conf.json`'s `plugins.updater` block (Ed25519 keypair, `pubkey` set) | Audit/deny/SBOM automated. Updater-artifact signing is configured (bundle-time): `tauri-cli` signs artifacts with the Ed25519 key when `TAURI_SIGNING_PRIVATE_KEY` is set. Runtime verification requires installing and registering `tauri-plugin-updater`, which is not done, deferred alongside the distribution server (`endpoints: []`). OS-level installer code signing (Windows Authenticode, Apple Developer ID + notarization) is **not attempted** — paid vendor relationships and, for Apple, hardware this repo lacks. Blocks an actual cross-platform release; see ADR 0009. |
+| `cargo audit`, `cargo deny`, SBOM and signed artifact verification pass in release CI | `supply-chain` job: `cargo audit`, `cargo deny check`, `cargo cyclonedx` uploaded as the `sbom` artifact; `apps/desktop/src-tauri/tauri.conf.json`'s `plugins.updater` block (Ed25519 keypair, `pubkey` set) | Audit/deny/SBOM automated. Updater-artifact signing is configured (bundle-time): `.github/workflows/release.yml`'s `build` job passes `TAURI_SIGNING_PRIVATE_KEY`/`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` from repo secrets to `tauri-action`, which signs artifacts with the Ed25519 key — **the secrets themselves still have to be created and added under repo Settings → Secrets before the first release run, or every platform build fails.** Runtime verification requires installing and registering `tauri-plugin-updater`, which is not done, deferred alongside the distribution server (`endpoints: []`). OS-level installer code signing (Windows Authenticode, Apple Developer ID + notarization) is **not attempted** — paid vendor relationships and, for Apple, hardware this repo lacks. Blocks an actual cross-platform release; see ADR 0009. |
 | No `unsafe` without `SAFETY:` rationale, test and owner review; no `unwrap`/`expect` on network, parse, keystore or permission paths | `unsafe_code = "deny"` at the workspace level (`Cargo.toml`), with narrow, commented `#![allow(unsafe_code)]` only in `crates/media`'s shared-memory ring (§11.3); `clippy::unwrap_used`/`clippy::expect_used` at `"warn"` workspace-wide, promoted to a hard failure by `RUSTFLAGS: -D warnings` in `build` | Automated (clippy + lint config), still relies on `#[allow(...)]` review discipline for the intentional exceptions inside test files |
 | User-visible consent, active-session indicator and immediate revoke work on every claimed host OS | `crates/core`'s `SessionManager` (§8) plus the UI screens of phase 6: `apps/desktop/src/consent-dialog.ts`/`session-status.ts`, localized in `en`/`ar` (`apps/desktop/src/i18n.ts`), audited by `apps/desktop/src/accessibility.test.ts` (axe-core, 8/8 passing) and `apps/desktop/src/keyboard-nav.test.ts` | Implemented and tested for Linux/X11 (see ADR 0007/0008 for platform scope). Consent/revoke logic tested by `tests/integration/tests/consent_cycle.rs`, `error_matrix.rs`; the UI layer's accessibility and keyboard reachability are tested under jsdom, not a real browser — see ADR 0009 for what that does and does not cover |
 | Privacy review confirms logs/telemetry carry no secret or content data | `crates/core`/`crates/net` structured logging follows §15's field allowlist by construction (no `NodeId`, ticket, IP, clipboard, filename, token or keystroke fields exist on the log call sites) | Manual review, no automated grep-for-secrets gate yet |
@@ -27,3 +27,24 @@ registered against this repository yet. See
 `docs/adr/0008-phase-5-resource-and-security-gates.md` for why, and what it
 would take to turn it on. Until then, this line of §21/§19 is **not** a real
 release gate: it is tooling that runs the moment the hardware exists.
+
+## Release pipeline
+
+`.github/workflows/release.yml` builds and publishes on every push to
+`master`: `guard` skips the workflow's own version-bump commit, `version`
+computes the next patch tag from the highest existing `v*` tag (or takes the
+bump type from `workflow_dispatch`, or the tag as-is on a manual `v*` push),
+writes it into `Cargo.toml` / `apps/desktop/package.json` /
+`apps/desktop/src-tauri/tauri.conf.json`, commits as `github-actions[bot]` and
+pushes the commit + tag with the default `GITHUB_TOKEN` (no PAT needed —
+GitHub does not let that token's own pushes retrigger workflows, so this
+can't loop). `build` then runs the platform matrix — Linux amd64/arm64
+(`.deb` + `.rpm`, `tauri.conf.json`'s `bundle.targets = "all"`), Windows
+amd64/arm64 (NSIS + MSI) and macOS arm64 (`.dmg`) — each publishing straight
+to that tag's GitHub Release via `tauri-action`. `install.sh` / `install.ps1`
+at the repo root pull the matching asset from the latest (or a pinned)
+release and install it with the platform's native package manager.
+
+Windows/Linux ARM64 build **natively** on GitHub's `windows-11-arm` /
+`ubuntu-24.04-arm` hosted runners, not cross-compiled, so no extra linker
+setup is needed for those legs.
