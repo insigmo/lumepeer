@@ -185,21 +185,28 @@ pub mod secret_service_backend {
         }
 
         /// Runs one Secret Service operation on a private current-thread
-        /// runtime.
+        /// runtime, on a plain OS thread.
         ///
         /// The [`Keystore`] trait is synchronous because everything that calls
-        /// it is: identity handling happens before the endpoint exists. The
-        /// runtime is created and dropped inside the call, so this never
-        /// borrows the caller's executor and never blocks it from the inside.
+        /// it is: identity handling happens before the endpoint exists. Callers
+        /// such as `spawn_actor` run inside `main`'s tokio runtime, and tokio
+        /// refuses to build a nested runtime on a thread that already drives
+        /// one, so the runtime has to live on a fresh OS thread rather than
+        /// the caller's.
         fn block_on<F, T>(future: F) -> Result<T>
         where
-            F: std::future::Future<Output = Result<T>>,
+            F: std::future::Future<Output = Result<T>> + Send + 'static,
+            T: Send + 'static,
         {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| NetError::Keystore(format!("cannot start a runtime: {e}")))?;
-            runtime.block_on(future)
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| NetError::Keystore(format!("cannot start a runtime: {e}")))?;
+                runtime.block_on(future)
+            })
+            .join()
+            .unwrap_or_else(|_| Err(NetError::Keystore("keystore thread panicked".to_owned())))
         }
 
         fn attributes() -> HashMap<&'static str, &'static str> {

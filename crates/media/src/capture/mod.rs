@@ -190,6 +190,49 @@ impl ScreenCapturer for StubCapturer {
     }
 }
 
+/// Which windowing session this process is running under (§11, ADR 0010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    /// A native X11 session, or Xwayland with no compositor portal reachable.
+    X11,
+    /// A Wayland session: xdg-desktop-portal is the only capture path.
+    Wayland,
+    /// Neither `XDG_SESSION_TYPE` nor a display variable gave a signal.
+    Unknown,
+}
+
+/// Pure classification, testable without touching real process environment.
+fn session_type_from(
+    xdg_session_type: Option<&str>,
+    wayland_display: Option<&str>,
+    display: Option<&str>,
+) -> SessionType {
+    match xdg_session_type {
+        Some("wayland") => return SessionType::Wayland,
+        Some("x11") => return SessionType::X11,
+        _ => {}
+    }
+    if wayland_display.is_some() {
+        return SessionType::Wayland;
+    }
+    if display.is_some() {
+        return SessionType::X11;
+    }
+    SessionType::Unknown
+}
+
+/// Detects the current session type from the real process environment
+/// (§11). `Unknown` is treated as Wayland by callers, since Wayland is the
+/// common default on current distributions (ADR 0003).
+#[must_use]
+pub fn detect_session_type() -> SessionType {
+    session_type_from(
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("DISPLAY").ok().as_deref(),
+    )
+}
+
 /// Opens the capture backend of the current platform.
 ///
 /// # Errors
@@ -427,5 +470,35 @@ mod tests {
         controller.stop();
         assert_eq!(controller.viewer_count(), 0);
         assert!(!controller.is_capturing());
+    }
+
+    #[test]
+    fn session_type_from_xdg_session_type_wins_over_everything_else() {
+        assert_eq!(
+            session_type_from(Some("x11"), Some("wayland-0"), Some(":0")),
+            SessionType::X11
+        );
+        assert_eq!(
+            session_type_from(Some("wayland"), None, Some(":0")),
+            SessionType::Wayland
+        );
+    }
+
+    #[test]
+    fn session_type_falls_back_to_wayland_display_when_xdg_session_type_is_absent() {
+        assert_eq!(
+            session_type_from(None, Some("wayland-0"), None),
+            SessionType::Wayland
+        );
+    }
+
+    #[test]
+    fn session_type_falls_back_to_x11_display_when_nothing_else_is_set() {
+        assert_eq!(session_type_from(None, None, Some(":0")), SessionType::X11);
+    }
+
+    #[test]
+    fn session_type_is_unknown_with_no_signal_at_all() {
+        assert_eq!(session_type_from(None, None, None), SessionType::Unknown);
     }
 }

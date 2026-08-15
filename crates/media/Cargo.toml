@@ -15,8 +15,9 @@ default = []
 # that `cargo build --workspace` in phase 0 needs no platform SDKs.
 capture-scap = ["dep:scap"]
 capture-x11 = ["dep:x11rb"]
-# xdg-desktop-portal negotiation for the Wayland path (§11).
-capture-portal = ["dep:ashpd", "dep:tokio"]
+# xdg-desktop-portal negotiation and PipeWire frame consumption for the
+# Wayland path (§11).
+capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
@@ -39,3 +40,4 @@ ashpd = { version = "0.13.13", default-features = false, features = [
     "remote_desktop",
 ], optional = true }
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
+pipewire = { version = "0.8", optional = true }
