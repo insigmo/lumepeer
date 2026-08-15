@@ -6,10 +6,11 @@
 //! defence against a local admin on the host machine (§3.1).
 //!
 //! Phase 1 ships the trait, the in-memory store used by the tests and the
-//! encrypted-file fallback. The native backends named in §11.2 (Credential
-//! Manager, Keychain, Secret Service, Android Keystore) are phase 4 work per
-//! §19, and [`open`] refuses rather than silently downgrading to the fallback
-//! on a platform that has a real store.
+//! encrypted-file fallback. Of the native backends named in §11.2, macOS
+//! Keychain and Linux Secret Service are implemented; Windows Credential
+//! Manager and Android Keystore remain phase 4 work per §19 (see ADR 0007),
+//! and [`open`] refuses rather than silently downgrading to the fallback on a
+//! platform that has a real store.
 
 use std::fs;
 use std::io::Write as _;
@@ -127,6 +128,13 @@ pub fn open() -> Result<Box<dyn Keystore>> {
     if backend == Backend::LinuxSecretService {
         return Ok(Box::new(
             secret_service_backend::SecretServiceKeystore::new(),
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if backend == Backend::AppleKeychain {
+        return Ok(Box::new(
+            apple_keychain_backend::AppleKeychainKeystore::new(),
         ));
     }
 
@@ -311,6 +319,105 @@ pub mod secret_service_backend {
             // or create the default collection because there is no prompter
             // to answer it. That is the same "no usable keyring here" case
             // as the load above, so skip rather than fail.
+            let Ok(key) = load_or_create(&store) else {
+                return;
+            };
+            assert_eq!(
+                store.load_identity().unwrap().unwrap().public(),
+                key.public()
+            );
+            store.delete_identity().unwrap();
+            assert!(store.load_identity().unwrap().is_none());
+        }
+    }
+}
+
+/// macOS/iOS Keychain backend (§11.2).
+///
+/// Kept as an inline module so the file list of §6 stays exact.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod apple_keychain_backend {
+    use security_framework::base::Error as SfError;
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password,
+    };
+    use security_framework_sys::base::errSecItemNotFound;
+
+    use super::{IDENTITY_ENTRY, Keystore};
+    use crate::error::{NetError, Result};
+
+    /// Keychain service name the identity item is filed under. Matches the
+    /// Tauri bundle identifier so the item is recognisable in Keychain Access.
+    const SERVICE: &str = "io.insigmo.lumepeer";
+
+    /// Keystore backed by Keychain Services via `security-framework`.
+    #[derive(Debug, Default)]
+    pub struct AppleKeychainKeystore {
+        _private: (),
+    }
+
+    impl AppleKeychainKeystore {
+        /// Creates the backend. Each operation opens and closes its own
+        /// Keychain query; there is no persistent handle to hold.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { _private: () }
+        }
+
+        fn is_not_found(error: SfError) -> bool {
+            error.code() == errSecItemNotFound
+        }
+    }
+
+    impl Keystore for AppleKeychainKeystore {
+        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
+            let bytes = match get_generic_password(SERVICE, IDENTITY_ENTRY) {
+                Ok(bytes) => bytes,
+                Err(e) if Self::is_not_found(e) => return Ok(None),
+                Err(e) => return Err(NetError::Keystore(e.to_string())),
+            };
+            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                NetError::Keystore("the stored identity has the wrong length".to_owned())
+            })?;
+            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        }
+
+        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
+            set_generic_password(SERVICE, IDENTITY_ENTRY, &key.to_bytes())
+                .map_err(|e| NetError::Keystore(e.to_string()))
+        }
+
+        fn delete_identity(&self) -> Result<()> {
+            match delete_generic_password(SERVICE, IDENTITY_ENTRY) {
+                Ok(()) => Ok(()),
+                Err(e) if Self::is_not_found(e) => Ok(()),
+                Err(e) => Err(NetError::Keystore(e.to_string())),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+
+        use super::*;
+        use crate::keystore::load_or_create;
+
+        /// Runs against the login Keychain. There is no Keychain on a
+        /// headless CI runner without one unlocked, and the test says so
+        /// instead of failing.
+        #[test]
+        fn the_keychain_round_trips_an_identity() {
+            let store = AppleKeychainKeystore::new();
+            let Ok(existing) = store.load_identity() else {
+                return;
+            };
+            // Never clobber a real identity: only run on a machine that has
+            // none stored yet, and clean up afterwards.
+            if existing.is_some() {
+                return;
+            }
+
             let Ok(key) = load_or_create(&store) else {
                 return;
             };
@@ -545,7 +652,10 @@ mod tests {
         match open() {
             // A platform with a built-in native backend returns it.
             Ok(store) => {
-                assert_eq!(platform_backend(), Backend::LinuxSecretService);
+                assert!(matches!(
+                    platform_backend(),
+                    Backend::LinuxSecretService | Backend::AppleKeychain
+                ));
                 // Opening must not have created anything yet.
                 let _ = store.load_identity();
             }
