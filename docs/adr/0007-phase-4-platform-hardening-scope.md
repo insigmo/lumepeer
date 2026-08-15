@@ -53,12 +53,15 @@ user declining, not as a failure (§18). Turning the granted node id into frames
 needs the PipeWire C bindings and a Wayland session to test against; `start`
 therefore returns an explicit error after negotiating, rather than pretending.
 
-**Keystore: Linux is real, Windows and macOS are not.** The Secret Service
-backend of §11.2 is implemented and tested against a live session keyring. The
-Credential Manager and Keychain backends are not written: they cannot be
-compiled here, let alone tested, and `keystore::open` refuses on those platforms
-rather than falling back to the encrypted file, which would quietly weaken
-§11.2. That refusal is the honest state, not a placeholder that appears to work.
+**Keystore: Linux and macOS are real, Windows is not.** The Secret Service
+backend of §11.2 is implemented and tested against a live session keyring, and
+the Keychain backend (`security-framework`'s generic-password API, filed under
+the Tauri bundle identifier) was added once a macOS machine was available to
+build and test it against the login Keychain. The Credential Manager backend
+is still not written: it cannot be compiled here, let alone tested, and
+`keystore::open` refuses on Windows rather than falling back to the encrypted
+file, which would quietly weaken §11.2. That refusal is the honest state, not
+a placeholder that appears to work.
 
 **Error matrix coverage.** All 17 rows of §18 have their own test in
 `tests/integration/tests/error_matrix.rs`. Rows whose trigger is a platform
@@ -74,8 +77,8 @@ each needing a machine that can build and run it:
 - PipeWire frame consumption for the Wayland path.
 - Windows capture (DXGI/WGC), input (`SendInput`), keystore (Credential
   Manager) and the `AppContainer` decoder sandbox.
-- macOS capture (`ScreenCaptureKit`), input (`CGEvent`), keystore (Keychain) and
-  the `sandbox_init` decoder sandbox.
+- macOS capture (`ScreenCaptureKit`), input (`CGEvent`) and the
+  `sandbox_init` decoder sandbox. (Keystore is now done — see above.)
 - Running the §18 matrix on each of those OSes, which §19 requires before
   phase 4 can be called done on them.
 

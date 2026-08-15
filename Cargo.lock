@@ -3758,6 +3758,8 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "secret-service",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde-big-array",
  "thiserror 2.0.20",
