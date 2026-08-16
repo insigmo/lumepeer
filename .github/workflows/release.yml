@@ -169,6 +169,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins a specific channel, which shadows the
+      # `stable` toolchain the action above installed as soon as cargo runs
+      # inside this repo — so its `targets:` add lands on the wrong
+      # toolchain for any job whose target isn't the runner's native arch
+      # (only macos-amd64 today). Adding it again here targets whichever
+      # toolchain actually resolves for this directory.
+      - run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
