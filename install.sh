@@ -140,8 +140,9 @@ install_macos() {
   local arch dmg_pat
   arch="$(uname -m)"
   case "${arch}" in
-    arm64) dmg_pat='\.dmg$' ;;
-    *) echo "No macOS build for arch '${arch}' yet (Apple Silicon only)." >&2; exit 1 ;;
+    arm64) dmg_pat='aarch64\.dmg$' ;;
+    x86_64) dmg_pat='x64\.dmg$' ;;
+    *) echo "No macOS build for arch '${arch}' yet." >&2; exit 1 ;;
   esac
 
   need_cmd hdiutil

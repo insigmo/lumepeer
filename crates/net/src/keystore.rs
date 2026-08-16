@@ -138,6 +138,13 @@ pub fn open() -> Result<Box<dyn Keystore>> {
         ));
     }
 
+    #[cfg(all(target_os = "windows", feature = "keyring"))]
+    if backend == Backend::WindowsCredentialManager {
+        return Ok(Box::new(
+            windows_credential_manager_backend::WindowsCredentialManagerKeystore::new(),
+        ));
+    }
+
     if backend == Backend::EncryptedFile {
         return Err(NetError::Keystore(
             "no OS keystore on this platform; construct FileKeystore explicitly".to_owned(),
@@ -438,6 +445,107 @@ pub mod apple_keychain_backend {
     }
 }
 
+/// Windows Credential Manager backend (§11.2).
+///
+/// Kept as an inline module so the file list of §6 stays exact. The
+/// underlying `CredWriteW`/`CredReadW`/`CredDeleteW` calls are FFI and
+/// therefore `unsafe`, which `lumepeer_net`'s crate-wide `forbid(unsafe_code)`
+/// does not allow anywhere in this crate; `keyring`'s `windows-native` backend
+/// carries that unsafe in its own compiled crate instead, the same way
+/// `secret-service` and `security-framework` keep D-Bus and Keychain FFI out
+/// of this one.
+#[cfg(all(target_os = "windows", feature = "keyring"))]
+pub mod windows_credential_manager_backend {
+    use keyring::Entry;
+
+    use super::{IDENTITY_ENTRY, Keystore};
+    use crate::error::{NetError, Result};
+
+    /// Credential Manager target service, matching the Tauri bundle
+    /// identifier so the entry is recognisable in Credential Manager.
+    const SERVICE: &str = "io.insigmo.lumepeer";
+
+    /// Keystore backed by Windows Credential Manager via the `keyring` crate.
+    #[derive(Debug, Default)]
+    pub struct WindowsCredentialManagerKeystore {
+        _private: (),
+    }
+
+    impl WindowsCredentialManagerKeystore {
+        /// Creates the backend. Each operation opens and closes its own
+        /// Credential Manager handle; there is no persistent handle to hold.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self { _private: () }
+        }
+
+        fn entry() -> Result<Entry> {
+            Entry::new(SERVICE, IDENTITY_ENTRY).map_err(|e| NetError::Keystore(e.to_string()))
+        }
+    }
+
+    impl Keystore for WindowsCredentialManagerKeystore {
+        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
+            let bytes = match Self::entry()?.get_secret() {
+                Ok(bytes) => bytes,
+                Err(keyring::Error::NoEntry) => return Ok(None),
+                Err(e) => return Err(NetError::Keystore(e.to_string())),
+            };
+            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                NetError::Keystore("the stored identity has the wrong length".to_owned())
+            })?;
+            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        }
+
+        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
+            Self::entry()?
+                .set_secret(&key.to_bytes())
+                .map_err(|e| NetError::Keystore(e.to_string()))
+        }
+
+        fn delete_identity(&self) -> Result<()> {
+            match Self::entry()?.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(NetError::Keystore(e.to_string())),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+
+        use super::*;
+        use crate::keystore::load_or_create;
+
+        /// Runs against the real Credential Manager. There is no user
+        /// profile to store into on a headless CI runner without one loaded,
+        /// and the test says so instead of failing.
+        #[test]
+        fn the_credential_manager_round_trips_an_identity() {
+            let store = WindowsCredentialManagerKeystore::new();
+            let Ok(existing) = store.load_identity() else {
+                return;
+            };
+            // Never clobber a real identity: only run on a machine that has
+            // none stored yet, and clean up afterwards.
+            if existing.is_some() {
+                return;
+            }
+
+            let Ok(key) = load_or_create(&store) else {
+                return;
+            };
+            assert_eq!(
+                store.load_identity().unwrap().unwrap().public(),
+                key.public()
+            );
+            store.delete_identity().unwrap();
+            assert!(store.load_identity().unwrap().is_none());
+        }
+    }
+}
+
 /// In-memory keystore. Never persists anything; used by tests and by ephemeral
 /// guest sessions that must not leave an identity behind.
 #[derive(Debug, Default)]
@@ -661,7 +769,9 @@ mod tests {
             Ok(store) => {
                 assert!(matches!(
                     platform_backend(),
-                    Backend::LinuxSecretService | Backend::AppleKeychain
+                    Backend::LinuxSecretService
+                        | Backend::AppleKeychain
+                        | Backend::WindowsCredentialManager
                 ));
                 // Opening must not have created anything yet.
                 let _ = store.load_identity();

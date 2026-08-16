@@ -19,7 +19,7 @@ tauri-build.workspace = true
 
 [dependencies]
 lumepeer-core.workspace = true
-lumepeer-net = { workspace = true, features = ["secret-service"] }
+lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
 lumepeer-media.workspace = true
 ed25519-dalek.workspace = true
 iroh.workspace = true
