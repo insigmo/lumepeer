@@ -21,6 +21,13 @@ capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
+# Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19
+# phase 4; ADR 0011). Kept behind a feature, matching capture-x11/
+# encode-openh264, so `cargo build --workspace` needs no platform SDK. The
+# `windows` crate itself is not optional (the AppContainer decoder sandbox
+# of `decode::windows_sandbox` needs it unconditionally on Windows - see
+# below), so this feature only gates the encoder module itself.
+encode-mf = []
 
 [dependencies]
 lumepeer-core.workspace = true
@@ -42,18 +49,23 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
 pipewire = { version = "0.8", optional = true }
 
-# §11.3's Windows decoder sandbox (`decode::windows_sandbox`): AppContainer
-# can only be applied at process creation, so the worker is launched by hand
-# through `CreateProcessW` rather than `std::process::Command`. Version
-# 0.61.3 matches what `apps/desktop/src-tauri`'s dependency tree (tauri,
-# webview2-com, tao) already resolves to, so this does not add a second
-# `windows` major version to the workspace (checked against Cargo.lock).
+# Used unconditionally on Windows (not gated by a Cargo feature): §11.3's
+# `decode::windows_sandbox` needs it for the AppContainer decoder sandbox
+# regardless of which encoder feature is built, and the `encode-mf` hardware
+# encoder (ADR 0011) reuses the same dependency rather than pulling in a
+# second `windows` major version. AppContainer can only be applied at
+# process creation, so the worker is launched by hand through
+# `CreateProcessW` rather than `std::process::Command`. Version 0.61.3
+# matches what `apps/desktop/src-tauri`'s dependency tree (tauri,
+# webview2-com, tao) already resolves to (checked against Cargo.lock).
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",

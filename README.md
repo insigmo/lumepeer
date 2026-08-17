@@ -135,10 +135,13 @@ The X11 injection test drives whatever display it runs against, so it is opt-in:
 LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11
 ```
 
-Still failing with an explicit error rather than pretending to work: PipeWire
-frame consumption on Wayland, everything Windows and macOS specific (capture,
-input, keystore, decoder sandbox), and hardware encoding. Each needs a machine
-that can build and run it; ADR 0007 lists them.
+Still failing with an explicit error rather than pretending to work: Windows
+screen capture and input injection, and everything macOS-specific (capture,
+input, decoder sandbox). Windows keystore, the Windows `AppContainer` decoder
+sandbox and a Windows Media Foundation hardware H.264 encoder (behind the
+`encode-mf` feature; ADR 0011) are done, each needing a machine that can build
+and run it, which this one now is for Windows. ADR 0007 and ADR 0011 have the
+detail.
 
 Phase 5: `cargo audit`/`cargo deny` (already wired since phase 0/3) are joined
 by a `cargo cyclonedx` SBOM step in the same `supply-chain` CI job, uploaded as
