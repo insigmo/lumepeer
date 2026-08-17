@@ -69,6 +69,7 @@ libc = "0.2"            # syscall numbers for that filter
 
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
+tauri-plugin-updater = "2"
 
 # dev-dependencies
 proptest = "1"

@@ -9,6 +9,7 @@
     {
       "identifier": "core:window:allow-close",
       "allow": [{ "label": "main" }]
-    }
+    },
+    "updater:default"
   ]
 }
