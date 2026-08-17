@@ -75,3 +75,10 @@ pub const ABR_ADJUST_MAX_RATE_PER_SEC: u32 = 1;
 pub const LOG_ROTATION_DAYS: u32 = 7;
 /// Log rotation by size (§16.1).
 pub const LOG_ROTATION_MAX_MIB: u32 = 100;
+/// Bound on how long the Windows Media Foundation hardware encoder waits for
+/// an async MFT event (`METransformNeedInput`/`METransformHaveOutput`) before
+/// treating the encoder as stalled. Not in the design doc: added so a wedged
+/// GPU driver fails one `encode()` call instead of hanging the session
+/// forever, per the "degrade towards safety, tell the user" rule of §24.5
+/// (ADR 0011).
+pub const ENCODE_HW_EVENT_TIMEOUT_MS: u64 = 2_000;

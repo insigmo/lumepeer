@@ -81,12 +81,32 @@ pub trait VideoEncoder: Send {
 
 /// Whether a platform hardware encoder can be used right now.
 ///
-/// Media Foundation, `VideoToolbox`, `MediaCodec` and VA-API bindings are
-/// phase 4 work (§19), so this is `None` everywhere for the moment and the
-/// software fallback of §18 carries the pipeline.
+/// On Windows, with the `encode-mf` feature built in and `config.codec`
+/// asking for H.264, this genuinely enumerates and activates a
+/// hardware-accelerated H.264 encoder MFT via Media Foundation (`MFTEnumEx`
+/// filtered to `MFT_ENUM_FLAG_HARDWARE`) and only reports
+/// [`EncoderKind::Hardware`] if one actually activates and accepts NV12
+/// input / H.264 output — never a hopeful guess (ADR 0011). The `windows`
+/// submodule only ever probes and builds H.264; AV1 hardware is not
+/// implemented, so this deliberately reports `None` for `VideoCodec::Av1`
+/// here rather than reusing the H.264 answer for a codec it never checked
+/// (that mismatch is exactly the bug §11's mutual-hardware-support rule for
+/// AV1 exists to prevent). `VideoToolbox`, `MediaCodec` and VA-API bindings
+/// remain phase 4 work (§19), so this is `None` on every other platform.
 #[must_use]
-pub const fn probe_hardware(_config: EncoderConfig) -> Option<EncoderKind> {
-    None
+pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
+    #[cfg(all(target_os = "windows", feature = "encode-mf"))]
+    {
+        if config.codec == VideoCodec::H264 && windows::hardware_h264_available(config) {
+            return Some(EncoderKind::Hardware);
+        }
+        None
+    }
+    #[cfg(not(all(target_os = "windows", feature = "encode-mf")))]
+    {
+        let _ = config;
+        None
+    }
 }
 
 /// Selects an encoder: hardware if available, otherwise the software fallback
@@ -96,7 +116,11 @@ pub const fn probe_hardware(_config: EncoderConfig) -> Option<EncoderKind> {
 /// [`MediaError::EncoderUnavailable`] when neither path is usable; the UI must
 /// explain why instead of silently degrading.
 pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
-    if config.codec == VideoCodec::Av1 && probe_hardware(config) != Some(EncoderKind::Hardware) {
+    // Probing now does real, non-free work (COM enumeration on Windows), so
+    // it is computed once rather than once per branch below.
+    let hardware = probe_hardware(config);
+
+    if config.codec == VideoCodec::Av1 && hardware != Some(EncoderKind::Hardware) {
         // §11: AV1 only with mutual hardware support, and there is no software
         // AV1 fallback in v1.
         return Err(MediaError::EncoderUnavailable(
@@ -104,10 +128,24 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         ));
     }
 
-    if let Some(EncoderKind::Hardware) = probe_hardware(config) {
-        return Err(MediaError::EncoderUnavailable(
-            "hardware encoder probing reported a backend that is not implemented yet".to_owned(),
-        ));
+    if let Some(EncoderKind::Hardware) = hardware {
+        #[cfg(all(target_os = "windows", feature = "encode-mf"))]
+        {
+            tracing::info!("hardware H.264 encoder available, using Media Foundation (§18)");
+            return windows::MediaFoundationEncoder::new(config)
+                .map(|e| Box::new(e) as Box<dyn VideoEncoder>);
+        }
+        // Every other platform's `probe_hardware` above is hardcoded `None`,
+        // so this arm is unreachable there; it stays as an honest error
+        // rather than a silent fallback if that ever changes without wiring
+        // up a constructor here too.
+        #[cfg(not(all(target_os = "windows", feature = "encode-mf")))]
+        {
+            return Err(MediaError::EncoderUnavailable(
+                "hardware encoder probing reported a backend that is not implemented yet"
+                    .to_owned(),
+            ));
+        }
     }
 
     #[cfg(feature = "encode-openh264")]
@@ -122,6 +160,21 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         ))
     }
 }
+
+/// Windows Media Foundation hardware H.264 encoder (§5.1, §11, §18/§19 phase
+/// 4; ADR 0011).
+///
+/// The second and only other place in the crate that needs `unsafe`, besides
+/// `decode::shm` (ADR 0005): every `IMFTransform`/`IMFActivate`/`IMFSample`
+/// call in the `windows` crate's Media Foundation bindings is `unsafe fn`
+/// because it crosses into COM. Each `unsafe` block in this module carries a
+/// `SAFETY:` note, as §21 requires.
+#[cfg(all(target_os = "windows", feature = "encode-mf"))]
+#[allow(
+    unsafe_code,
+    reason = "Media Foundation is COM; every IMFTransform/IMFSample call in the `windows` crate is `unsafe fn`. See ADR 0011."
+)]
+pub mod windows;
 
 /// `openh264` software fallback (§5.1, §18).
 ///

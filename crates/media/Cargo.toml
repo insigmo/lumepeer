@@ -21,6 +21,10 @@ capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
+# Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19
+# phase 4; ADR 0011). Kept behind a feature, matching capture-x11/
+# encode-openh264, so `cargo build --workspace` needs no platform SDK.
+encode-mf = ["dep:windows"]
 
 [dependencies]
 lumepeer-core.workspace = true
@@ -41,3 +45,13 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ], optional = true }
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
 pipewire = { version = "0.8", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Media Foundation COM bindings for the hardware H.264 encoder MFT. Version
+# matches the `windows` 0.61 already resolved for `apps/desktop/src-tauri`
+# (via `tauri`/`wry`), so this does not pull in a second copy of the crate.
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_MediaFoundation",
+] }
