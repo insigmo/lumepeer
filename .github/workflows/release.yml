@@ -133,6 +133,12 @@ jobs:
     name: build (${{ matrix.name }})
     strategy:
       fail-fast: false
+      # All 6 targets upload assets to the same GitHub release via
+      # tauri-action; letting them all hit the release API at once is a
+      # known source of intermittent 5xx ("No server is currently
+      # available") on the asset-upload step. Capping concurrency here
+      # trades a bit of wall-clock time for fewer flaky release runs.
+      max-parallel: 3
       matrix:
         include:
           - name: linux-amd64 (deb/rpm)

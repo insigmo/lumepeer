@@ -28,6 +28,9 @@ node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/gen/
 
+# go-task checksum cache (Taskfile.yml build:frontend up-to-date tracking)
+.task/
+
 # Broker database
 *.db
 *.db-wal
