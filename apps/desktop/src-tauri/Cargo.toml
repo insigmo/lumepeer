@@ -14,6 +14,15 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Off by default: never part of `cargo build --workspace`, the Task client
+# builds, or the release CI matrix. Opt in locally with
+# `cargo build --features pilot` to get tauri-pilot wired in for
+# cross-platform UI debugging; main.rs additionally gates it on
+# `debug_assertions` so it cannot end up in a release binary even if this
+# feature were mistakenly enabled for one.
+pilot = ["dep:tauri-plugin-pilot"]
+
 [build-dependencies]
 tauri-build.workspace = true
 
@@ -27,9 +36,19 @@ postcard.workspace = true
 rand.workspace = true
 tauri.workspace = true
 tauri-plugin-updater.workspace = true
+tauri-plugin-pilot = { version = "0.7.2", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# Real screen capture exists only for Linux/X11 today (crates/media's
+# Windows/macOS backends are still "phase 2: not implemented yet" stubs).
+# Scoped to this target so Windows/macOS builds never pull x11rb in for
+# nothing; capture/mod.rs's own `#[cfg(target_os = "linux")]` gate on
+# platform_capturer() would keep them inert either way, but there is no
+# reason to compile them.
+[target.'cfg(target_os = "linux")'.dependencies]
+lumepeer-media = { workspace = true, features = ["capture-x11"] }
