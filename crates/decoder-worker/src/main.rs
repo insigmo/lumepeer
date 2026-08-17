@@ -10,8 +10,15 @@
 //!
 //! Startup order is normative and must not be reordered for convenience:
 //!
-//! 1. Map the ring file named by `argv[1]`.
-//! 2. Apply the sandbox. After this the process can open nothing.
+//! 1. Map the ring: by the path in `argv[1]` everywhere but Windows, where
+//!    `AppContainer` blocks opening it by path at all, so the parent hands
+//!    over an already-open handle instead (its raw value, in `argv[2]`) and
+//!    the sandbox is already applied by the time this process starts (see
+//!    point 2).
+//! 2. Apply the sandbox. After this the process can open nothing. On
+//!    Windows this only *verifies* confinement rather than applying it,
+//!    since `AppContainer` is process-creation-time only and the parent
+//!    already did it before spawning this process.
 //! 3. Emit the readiness byte, then decode until told to stop.
 
 // `deny` rather than `forbid`: the decode loop touches the shared mapping of
@@ -44,10 +51,28 @@ mod sandbox {
     pub fn apply(kind: SandboxKind) -> anyhow::Result<()> {
         match kind {
             SandboxKind::LinuxSeccomp => linux_seccomp(),
+            SandboxKind::WindowsAppContainer => windows_app_container(),
             other => anyhow::bail!(
                 "the {other:?} sandbox is not implemented yet; refusing to decode unconfined"
             ),
         }
+    }
+
+    /// Confinement was already applied by the parent at `CreateProcessW`
+    /// time (`lumepeer_media::decode::windows_sandbox::spawn_confined`):
+    /// `AppContainer` is a process-*creation*-time restriction, so by the
+    /// time this binary's `main` runs it is too late to apply it, only to
+    /// check it. This is that check, so that running the worker binary
+    /// directly (bypassing `DecoderHandle::spawn`) fails closed instead of
+    /// decoding unconfined.
+    #[cfg(windows)]
+    fn windows_app_container() -> anyhow::Result<()> {
+        lumepeer_media::decode::windows_verify_confined().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    #[cfg(not(windows))]
+    fn windows_app_container() -> anyhow::Result<()> {
+        anyhow::bail!("AppContainer is only available on Windows")
     }
 
     #[cfg(all(target_os = "linux", not(target_os = "android")))]
@@ -120,20 +145,47 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("no sandbox mechanism available on this platform; refusing to decode");
     };
 
-    let path = std::env::args_os()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("usage: lumepeer-decoder-worker <ring-path>"))?;
-
     // 1. Everything that needs the filesystem happens before the sandbox.
-    let ring = SharedRing::open(std::path::Path::new(&path))?;
+    let ring = open_ring()?;
     let mut decoder = Decoder::new()?;
 
-    // 2. Confine. A failure here is fatal on purpose (§11.3).
+    // 2. Confine (or, on Windows, verify the parent already confined this
+    // process before spawning it - see sandbox::apply's doc comment). A
+    // failure here is fatal on purpose (§11.3).
     sandbox::apply(kind)?;
     tracing::info!(?kind, "decoder worker confined");
 
     // 3. Only now is any untrusted bitstream touched.
     run(ring, &mut decoder)
+}
+
+/// Maps the ring buffer the parent created.
+///
+/// Every platform but Windows opens it by the path in `argv[1]`. Windows
+/// never opens the ring by path at all: `AppContainer` blocks path-based
+/// filesystem access even to a file the process was already granted, so the
+/// parent hands over an already-open handle instead (see
+/// `lumepeer_media::decode::windows_sandbox`'s module doc comment), passed
+/// as the raw handle value in `argv[2]`.
+#[cfg(not(windows))]
+fn open_ring() -> anyhow::Result<SharedRing> {
+    let path = std::env::args_os()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: lumepeer-decoder-worker <ring-path>"))?;
+    Ok(SharedRing::open(std::path::Path::new(&path))?)
+}
+
+#[cfg(windows)]
+fn open_ring() -> anyhow::Result<SharedRing> {
+    let handle_arg = std::env::args_os().nth(2).ok_or_else(|| {
+        anyhow::anyhow!("usage: lumepeer-decoder-worker <ring-path> <ring-handle>")
+    })?;
+    let handle_value: isize = handle_arg
+        .to_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("ring handle argument is not a valid integer"))?;
+    let handle = handle_value as std::os::windows::io::RawHandle;
+    Ok(SharedRing::from_raw_handle(handle)?)
 }
 
 /// Reads wake-up bytes, decodes what the ring holds, answers with a status byte.
