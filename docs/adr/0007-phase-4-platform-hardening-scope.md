@@ -75,8 +75,14 @@ Phase 4 is complete for Linux/X11 and partially complete overall. What remains,
 each needing a machine that can build and run it:
 
 - PipeWire frame consumption for the Wayland path.
-- Windows capture (DXGI/WGC), input (`SendInput`), keystore (Credential
-  Manager) and the `AppContainer` decoder sandbox.
+- Windows capture (DXGI/WGC) and input (`SendInput`). (Keystore and the
+  `AppContainer` decoder sandbox are now done — see below and above.
+  `AppContainer` is process-*creation*-time-only, so unlike Linux seccomp the
+  parent launches the worker already confined via `CreateProcessW` rather
+  than the worker confining itself; `crates/media/src/decode/windows_sandbox.rs`
+  has the detail, and `tests/integration/tests/media_pipeline.rs`'s
+  `a_captured_frame_reaches_the_guest_through_the_sandboxed_decoder` exercises
+  it for real on Windows, not just at compile time.)
 - macOS capture (`ScreenCaptureKit`), input (`CGEvent`) and the
   `sandbox_init` decoder sandbox. (Keystore is now done — see above.)
 - Running the §18 matrix on each of those OSes, which §19 requires before
