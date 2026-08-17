@@ -168,8 +168,9 @@ rules jsdom's lack of a layout engine can't support. `apps/desktop/src/
 keyboard-nav.test.ts` confirms every control is a real, reachable `<button>`
 and that `Deny` carries the default focus. `tauri.conf.json`'s
 `plugins.updater` block signs update artifacts with an Ed25519 key, closing
-the gap ADR 0008 flagged, though `endpoints: []` since no distribution
-server exists yet.
+the gap ADR 0008 flagged; `tauri-plugin-updater` is installed and registered
+in `apps/desktop/src-tauri` so that signature is verified at install time
+too, though `endpoints: []` since no distribution server exists yet.
 
 What phase 6 does not cover: OS-level installer code signing (Windows
 Authenticode, Apple Developer ID + notarization) needs paid vendor
