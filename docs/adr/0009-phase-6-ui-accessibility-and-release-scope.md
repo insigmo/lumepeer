@@ -65,18 +65,21 @@ Tab and assert where focus actually goes, so this had to be a second, more
 literal test.
 
 **Updater-artifact signing closes the exact gap ADR 0008 flagged; runtime
-verification and OS-level code signing do not, and are not attempted.** ADR
-0008 recorded that `tauri.conf.json` had no bundle signing key configured.
-Task 5 added the `plugins.updater` block: `tauri-cli` reads `pubkey` and, at
-bundle time, signs update artifacts with the matching Ed25519 private key
-when `TAURI_SIGNING_PRIVATE_KEY` is set (no release CI job sets it yet).
-That is signing only. Verifying that signature at install time is the job
-of the `tauri-plugin-updater` crate, and it is not a dependency of
-`apps/desktop/src-tauri` (not in `Cargo.toml`, not registered with
-`.plugin(...)` in `main.rs`, no updater permission in
-`capabilities/main.json`) — installing and wiring it up is deferred
-alongside the distribution server, since `endpoints: []` means there is
-nothing to verify against yet either way.
+verification is now wired, OS-level code signing is not, and is not
+attempted.** ADR 0008 recorded that `tauri.conf.json` had no bundle signing
+key configured. Task 5 added the `plugins.updater` block: `tauri-cli` reads
+`pubkey` and, at bundle time, signs update artifacts with the matching
+Ed25519 private key when `TAURI_SIGNING_PRIVATE_KEY` is set (no release CI
+job sets it yet). That was signing only. Verifying that signature at install
+time is the job of the `tauri-plugin-updater` crate: it is now a dependency
+of `apps/desktop/src-tauri` (matching `tauri`'s `2.x` line, pinned to the
+same major as the rest of `apps/desktop/src-tauri/Cargo.toml`), registered
+with `.plugin(tauri_plugin_updater::Builder::new().build())` in `main.rs`,
+with the plugin's `updater:default` permission set granted in
+`capabilities/main.json`. There is still nothing to verify against —
+`endpoints: []` — so standing up a distribution server remains deferred, and
+no frontend code calls the updater's `check`/`download`/`install` commands
+yet; the design doesn't ask for an auto-check on startup, so none was added.
 
 This is a narrower thing than OS-level code signing. Windows Authenticode
 (a certificate from a CA, ~$300-600/year and an EV option that requires a
@@ -148,9 +151,10 @@ Phase 6 is complete for what a single development machine without browser
 automation, without paid signing vendor relationships, and without an
 independent security tester can produce: two real locales with RTL actually
 exercised, an axe-core audit covering every rule that does not need a layout
-engine, a keyboard-reachability test with a safe default focus, and
-Ed25519 updater-artifact signing configured at bundle time. It is not
-complete for the full §19 phase 6 acceptance bar — runtime updater-signature
-verification (installing `tauri-plugin-updater`), OS-level code signing and
-a genuine third-party penetration test all remain open, tracked here and in
-`docs/release-checklist.md` rather than assumed done.
+engine, a keyboard-reachability test with a safe default focus, Ed25519
+updater-artifact signing configured at bundle time, and `tauri-plugin-updater`
+installed and registered so that signature gets verified at install time too.
+It is not complete for the full §19 phase 6 acceptance bar — a distribution
+server to actually serve updates against (`endpoints: []` today), OS-level
+code signing and a genuine third-party penetration test all remain open,
+tracked here and in `docs/release-checklist.md` rather than assumed done.
