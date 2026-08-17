@@ -1,7 +1,134 @@
 version: "3"
 
+vars:
+  DESKTOP_DIR: apps/desktop
+
 tasks:
   build:
     desc: Build all workspace crates
     cmds:
       - cargo build --workspace
+
+  # ---------------------------------------------------------------------
+  # Desktop client builds, mirroring the 6-target matrix in
+  # .github/workflows/release.yml. The frontend bundle and the shared
+  # workspace crates are built once and reused by every client target that
+  # runs afterwards in the same `task` invocation (see build:frontend and
+  # build:base below for how each is kept to a single run).
+  #
+  # Cross-OS bundling is not possible from a single machine: Tauri links
+  # platform system libraries (webkit2gtk, Cocoa, MSVC) at build time, the
+  # same reason release.yml runs each OS on its own runner. `task
+  # build:clients` therefore only builds the targets valid for the host
+  # it's run on (via `platforms:`) — run it on each OS to cover the full
+  # matrix, same as CI does. Cross-arch targets (e.g. windows-arm64 from an
+  # amd64 host, linux-arm64 without `cross`/Docker) additionally need their
+  # own linker/SDK installed; `rustup target add` alone does not provide
+  # that.
+  # ---------------------------------------------------------------------
+
+  build:frontend:
+    desc: >-
+      Build the Tauri webview bundle once. tauri-build reads frontendDist at
+      compile time, and the bundle itself is platform-independent, so every
+      client target reuses this same apps/desktop/dist instead of rebuilding
+      it. Skipped entirely (via checksum) when sources haven't changed since
+      the last run, including across separate `task` invocations.
+    run: once
+    dir: "{{.DESKTOP_DIR}}"
+    sources:
+      - src/**/*
+      - index.html
+      - package.json
+      - package-lock.json
+      - vite.config.ts
+      - tsconfig.json
+    generates:
+      - dist/**/*
+    cmds:
+      - npm install
+      - npm run build
+
+  build:base:
+    desc: >-
+      Compile the shared Rust workspace crates for the host once. This warms
+      the crate/build-script cache in the shared target/ directory that
+      every cross-target client build below reuses for its host-context
+      compilation (proc macros, build scripts), and fails fast on a plain
+      workspace error before any slower per-target Tauri bundling runs.
+    run: once
+    deps: [build:frontend]
+    cmds:
+      - cargo build --workspace --exclude lumepeer-desktop
+
+  build:client:linux-amd64:
+    desc: Build the Linux amd64 client (.deb/.rpm)
+    platforms: [linux/amd64]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add x86_64-unknown-linux-gnu
+      - npx tauri build --target x86_64-unknown-linux-gnu
+
+  build:client:linux-arm64:
+    desc: >-
+      Build the Linux arm64 client (.deb/.rpm). Needs an arm64 cross
+      toolchain/linker (e.g. via `cross`/Docker) unless run on an arm64
+      Linux host directly.
+    platforms: [linux/arm64]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add aarch64-unknown-linux-gnu
+      - npx tauri build --target aarch64-unknown-linux-gnu
+
+  build:client:windows-amd64:
+    desc: Build the Windows amd64 client
+    platforms: [windows]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add x86_64-pc-windows-msvc
+      - npx tauri build --target x86_64-pc-windows-msvc
+
+  build:client:windows-arm64:
+    desc: >-
+      Build the Windows arm64 client. Needs the "MSVC ARM64 build tools"
+      component of Visual Studio installed in addition to the rustup target.
+    platforms: [windows]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add aarch64-pc-windows-msvc
+      - npx tauri build --target aarch64-pc-windows-msvc
+
+  build:client:macos-arm64:
+    desc: Build the macOS arm64 client
+    platforms: [darwin]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add aarch64-apple-darwin
+      - npx tauri build --target aarch64-apple-darwin
+
+  build:client:macos-amd64:
+    desc: Build the macOS amd64 client
+    platforms: [darwin]
+    deps: [build:base]
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add x86_64-apple-darwin
+      - npx tauri build --target x86_64-apple-darwin
+
+  build:clients:
+    desc: >-
+      Build every desktop client target valid for this host OS, compiling
+      the frontend bundle and shared workspace crates once and reusing them
+      across all of them.
+    cmds:
+      - task: build:client:linux-amd64
+      - task: build:client:linux-arm64
+      - task: build:client:windows-amd64
+      - task: build:client:windows-arm64
+      - task: build:client:macos-arm64
+      - task: build:client:macos-amd64
