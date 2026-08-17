@@ -40,6 +40,7 @@ fn main() {
         });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState { network })
         .invoke_handler(tauri::generate_handler![
             commands::session_grant,
