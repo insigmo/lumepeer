@@ -41,3 +41,21 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ], optional = true }
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
 pipewire = { version = "0.8", optional = true }
+
+# §11.3's Windows decoder sandbox (`decode::windows_sandbox`): AppContainer
+# can only be applied at process creation, so the worker is launched by hand
+# through `CreateProcessW` rather than `std::process::Command`. Version
+# 0.61.3 matches what `apps/desktop/src-tauri`'s dependency tree (tauri,
+# webview2-com, tao) already resolves to, so this does not add a second
+# `windows` major version to the workspace (checked against Cargo.lock).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

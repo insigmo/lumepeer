@@ -18,15 +18,44 @@
 //!   worker over the worker's stdin, worker to parent over its stdout.
 //! - The worker maps the file, applies the sandbox and only then decodes. The
 //!   order matters: after the sandbox it can no longer open anything.
+//!
+//! Windows is the one platform where step 2 cannot literally be "the worker
+//! applies its own sandbox": `AppContainer` is a process-*creation*-time
+//! restriction, not something a running process can drop itself into. There
+//! the parent (`DecoderHandle::spawn_with`, via [`windows_sandbox`])
+//! launches the worker already confined, with the ring handed over as an
+//! inherited handle rather than a path — the worker's own `sandbox::apply`
+//! only verifies the confinement took effect. See the `windows_sandbox`
+//! module doc comment for the full picture and why handle inheritance,
+//! rather than an ACL grant on the ring file, is what makes step 1 possible
+//! at all under `AppContainer`.
 
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(not(windows))]
+use std::process::{Child, Command, Stdio};
 
 use crate::encode::EncodedFrame;
 use crate::error::{MediaError, Result};
 
 pub use self::shm::{RING_SLOTS, SLOT_PAYLOAD_BYTES, SharedRing, Slot};
+#[cfg(windows)]
+pub use self::windows_sandbox::verify_confined as windows_verify_confined;
+
+#[cfg(windows)]
+mod windows_sandbox;
+
+/// A boxed writer that is also `Debug` (for [`DecoderHandle`]'s derive) and
+/// `Send` (the handle crosses into whatever thread its caller lives on).
+/// `Write` and `Debug` are both non-auto traits, so combining them in one
+/// trait object needs a supertrait rather than `Box<dyn Write + Debug>`
+/// directly; `Send`, an auto trait, composes freely either way.
+trait DebugWrite: Write + std::fmt::Debug + Send {}
+impl<T: Write + std::fmt::Debug + Send> DebugWrite for T {}
+
+/// As [`DebugWrite`], for the read half.
+trait DebugRead: Read + std::fmt::Debug + Send {}
+impl<T: Read + std::fmt::Debug + Send> DebugRead for T {}
 
 /// Name of the worker binary, which sits next to the main executable.
 pub const WORKER_BINARY: &str = "lumepeer-decoder-worker";
@@ -88,13 +117,62 @@ pub struct DecodedFrame {
     pub data: Vec<u8>,
 }
 
+/// OS process running the worker, abstracted over how it was spawned.
+///
+/// Every platform but Windows spawns through [`std::process::Command`], so
+/// this is a thin pass-through there. Windows cannot apply `AppContainer` to
+/// an already-running process (see the module doc comment and
+/// `windows_sandbox`), so the confined worker is launched by hand through
+/// `CreateProcessW`, and this is what lets [`DecoderHandle`] stay ignorant
+/// of that difference everywhere else.
+#[derive(Debug)]
+enum WorkerProcess {
+    #[cfg(not(windows))]
+    Command(Child),
+    #[cfg(windows)]
+    Confined(windows_sandbox::ConfinedProcess),
+}
+
+impl WorkerProcess {
+    fn id(&self) -> u32 {
+        match self {
+            #[cfg(not(windows))]
+            Self::Command(child) => child.id(),
+            #[cfg(windows)]
+            Self::Confined(process) => process.id(),
+        }
+    }
+
+    fn kill(&mut self) {
+        match self {
+            #[cfg(not(windows))]
+            Self::Command(child) => {
+                let _ = child.kill();
+            }
+            #[cfg(windows)]
+            Self::Confined(process) => process.kill(),
+        }
+    }
+
+    fn wait(&mut self) {
+        match self {
+            #[cfg(not(windows))]
+            Self::Command(child) => {
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            Self::Confined(process) => process.wait(),
+        }
+    }
+}
+
 /// Handle to the out-of-process decoder.
 #[derive(Debug)]
 pub struct DecoderHandle {
     sandbox: SandboxKind,
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    process: WorkerProcess,
+    stdin: Box<dyn DebugWrite>,
+    stdout: Box<dyn DebugRead>,
     ring: SharedRing,
     /// Kept so the backing file is removed when the handle drops.
     path: PathBuf,
@@ -130,22 +208,45 @@ impl DecoderHandle {
         };
 
         let (ring, path) = SharedRing::create()?;
-        let mut child = Command::new(program)
-            .arg(&path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| MediaError::DecoderWorker(format!("cannot spawn the worker: {e}")))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| MediaError::DecoderWorker("worker has no stdin".to_owned()))?;
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| MediaError::DecoderWorker("worker has no stdout".to_owned()))?;
+        #[cfg(windows)]
+        let (process, stdin, mut stdout): (
+            WorkerProcess,
+            Box<dyn DebugWrite>,
+            Box<dyn DebugRead>,
+        ) = {
+            let (confined, stdin, stdout) = windows_sandbox::spawn_confined(program, &path)?;
+            (WorkerProcess::Confined(confined), stdin, stdout)
+        };
+
+        #[cfg(not(windows))]
+        let (process, stdin, mut stdout): (
+            WorkerProcess,
+            Box<dyn DebugWrite>,
+            Box<dyn DebugRead>,
+        ) = {
+            let mut child = Command::new(program)
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|e| MediaError::DecoderWorker(format!("cannot spawn the worker: {e}")))?;
+
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| MediaError::DecoderWorker("worker has no stdin".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| MediaError::DecoderWorker("worker has no stdout".to_owned()))?;
+            (
+                WorkerProcess::Command(child),
+                Box::new(stdin) as Box<dyn DebugWrite>,
+                Box::new(stdout) as Box<dyn DebugRead>,
+            )
+        };
 
         // The worker reports once the sandbox is applied. Until that byte
         // arrives nothing has been decoded, so a worker that refuses to confine
@@ -162,7 +263,7 @@ impl DecoderHandle {
 
         Ok(Self {
             sandbox,
-            child,
+            process,
             stdin,
             stdout,
             ring,
@@ -181,7 +282,7 @@ impl DecoderHandle {
     /// only channels into it are the ring and the pipes above.
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.process.id()
     }
 
     /// Sends one encoded frame to the worker and waits for the picture.
@@ -231,7 +332,7 @@ impl DecoderHandle {
     pub fn shutdown(&mut self) {
         let _ = self.stdin.write_all(&[STOP_BYTE]);
         let _ = self.stdin.flush();
-        let _ = self.child.wait();
+        self.process.wait();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -239,8 +340,8 @@ impl DecoderHandle {
 impl Drop for DecoderHandle {
     fn drop(&mut self) {
         // Never leave a decoder running behind a session that ended (§8.1).
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.process.kill();
+        self.process.wait();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -432,6 +533,49 @@ pub mod shm {
             // SAFETY: same contract as in `create`: the only writers are this
             // process and the peer that created the file, both of which touch
             // the mapping exclusively through the accessors below.
+            let map = unsafe { MmapMut::map_mut(&file) }
+                .map_err(|e| MediaError::DecoderWorker(e.to_string()))?;
+            Ok(Self { map })
+        }
+
+        /// Opens the ring from an already-open handle inherited from the
+        /// parent (Windows only). `AppContainer` confinement is applied by
+        /// the parent at process-creation time (`decode::windows_sandbox`),
+        /// before the worker's `main` even starts, so unlike [`Self::open`]
+        /// the worker never opens the ring by path itself — it maps the
+        /// handle the parent already duplicated in for exactly this
+        /// purpose.
+        ///
+        /// # Errors
+        /// [`MediaError::DecoderWorker`] if the handle does not map a file
+        /// of the expected size.
+        #[cfg(windows)]
+        #[allow(
+            clippy::not_unsafe_ptr_arg_deref,
+            reason = "kept as a safe fn deliberately: the worker binary that is the only realistic caller has #![deny(unsafe_code)] and cannot open an unsafe block. `handle` is not attacker- or user-controlled input - it is a value the trusted parent process places directly into this worker's own argv in spawn_confined, the worker's only source for it. The unsafe File::from_raw_handle call below is what actually dereferences it, and that block carries its own SAFETY note."
+        )]
+        pub fn from_raw_handle(handle: std::os::windows::io::RawHandle) -> Result<Self> {
+            use std::os::windows::io::FromRawHandle as _;
+
+            // SAFETY: `handle` is a HANDLE the parent duplicated into this
+            // process specifically to be the ring file, before this process
+            // even started (see `decode::windows_sandbox::spawn_confined`);
+            // it is open, valid, and from this point on uniquely owned by
+            // this process, exactly like the `File` opened by path above.
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            let length = file
+                .metadata()
+                .map_err(|e| MediaError::DecoderWorker(e.to_string()))?
+                .len();
+            if length != MAPPING_BYTES as u64 {
+                return Err(MediaError::DecoderWorker(format!(
+                    "ring handle maps {length} bytes, expected {MAPPING_BYTES}"
+                )));
+            }
+
+            // SAFETY: same contract as `open`/`create`: the only writers are
+            // this process and its parent, both touching the mapping only
+            // through the accessors below.
             let map = unsafe { MmapMut::map_mut(&file) }
                 .map_err(|e| MediaError::DecoderWorker(e.to_string()))?;
             Ok(Self { map })
