@@ -32,7 +32,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::view::{
     MediaTarget, SharedCapture, ViewSlot, ViewWindows, encode_view_response, lock_capture,
-    spawn_encode_loop, spawn_media_receiver, window_label,
+    slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
@@ -133,6 +133,9 @@ enum ActorCommand {
     /// as the binary IPC response of `view_next_frame`.
     ViewFrame {
         label: String,
+        /// Timestamp of the picture the caller already has, or 0 for none.
+        /// Matching the current frame skips re-serializing its pixels.
+        since_us: u64,
         reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
     },
     /// Guest side: one input event to forward to the host being viewed.
@@ -230,13 +233,22 @@ impl ActorHandle {
     /// Newest picture of the view onto `label`, as the raw bytes
     /// `view_next_frame` hands to the webview.
     ///
+    /// `since_us` is the timestamp of the picture the caller already has, or
+    /// 0 for none; the pixel payload is omitted when it already matches the
+    /// current frame (§15: a caller polling faster than the video updates
+    /// should not pay for re-serializing an unchanged picture).
+    ///
     /// # Errors
     /// [`ActorError::UnknownPeer`] if no view window belongs to `label`;
     /// [`ActorError::ChannelClosed`] if the actor is gone.
-    pub async fn view_frame(&self, label: String) -> Result<Vec<u8>, ActorError> {
+    pub async fn view_frame(&self, label: String, since_us: u64) -> Result<Vec<u8>, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(ActorCommand::ViewFrame { label, reply })
+            .send(ActorCommand::ViewFrame {
+                label,
+                since_us,
+                reply,
+            })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -934,13 +946,15 @@ impl Actor {
                 }
                 let _ = reply.send(result);
             }
-            ActorCommand::ViewFrame { label, reply } => {
+            ActorCommand::ViewFrame {
+                label,
+                since_us,
+                reply,
+            } => {
                 let result = self.resolve(&label).and_then(|peer| {
                     let state = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
-                    Ok(encode_view_response(
-                        &state.slot.borrow(),
-                        state.grants.input,
-                    ))
+                    let response = slot_for_poll(&state.slot.borrow(), since_us);
+                    Ok(encode_view_response(&response, state.grants.input))
                 });
                 let _ = reply.send(result);
             }
@@ -1466,7 +1480,7 @@ mod tests {
         assert_eq!(window_label, crate::view::window_label(&peer_label));
         assert!(input, "FullControl carries a live input grant");
 
-        let frame = guest.view_frame(peer_label.clone()).await.unwrap();
+        let frame = guest.view_frame(peer_label.clone(), 0).await.unwrap();
         assert_eq!(
             frame.len(),
             crate::view::VIEW_RESPONSE_HEADER_BYTES,
@@ -1489,7 +1503,7 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            guest.view_frame(peer_label).await,
+            guest.view_frame(peer_label, 0).await,
             Err(ActorError::UnknownPeer)
         ));
     }
@@ -1520,7 +1534,7 @@ mod tests {
             guest.input(peer_label.clone(), pointer_event(3, 4)).await,
             Err(ActorError::Core(CoreError::NotPermitted))
         ));
-        let frame = guest.view_frame(peer_label).await.unwrap();
+        let frame = guest.view_frame(peer_label, 0).await.unwrap();
         assert_eq!(frame[1], 0);
     }
 
@@ -1538,7 +1552,7 @@ mod tests {
             Err(ActorError::UnknownPeer)
         ));
         assert!(matches!(
-            host.view_frame("deadbeefdeadbeef".to_owned()).await,
+            host.view_frame("deadbeefdeadbeef".to_owned(), 0).await,
             Err(ActorError::UnknownPeer)
         ));
         assert!(matches!(

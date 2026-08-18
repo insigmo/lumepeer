@@ -18,6 +18,7 @@ import {
   logicalOfKey,
   paintFrame,
   POINTER_BUTTON_LOGICAL_BASE,
+  suppressContextMenu,
   ViewInput,
   viewOverlay,
   VIEW_RESPONSE_HEADER_BYTES,
@@ -234,6 +235,16 @@ describe('view window: input listeners follow the live grant', () => {
     input.setEnabled(true);
     container.dispatchEvent(new KeyboardEvent('keydown', { key: 'BrightnessUp', bubbles: true }));
     expect(calls).toEqual([]);
+  });
+});
+
+describe('view window: context menu', () => {
+  it('prevents the native context menu from opening', () => {
+    const target = document.createElement('div');
+    suppressContextMenu(target);
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
   });
 });
 

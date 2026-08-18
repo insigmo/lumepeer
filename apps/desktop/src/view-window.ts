@@ -166,6 +166,17 @@ export function logicalOfButton(button: number): number {
 }
 
 /**
+ * Stops the local WebView's native context menu from popping up over the
+ * remote picture. A right click already reaches the host as an ordinary
+ * pointer-button press/release through {@link ViewInput} regardless of this
+ * — this only removes the local popup that would otherwise sit on top of
+ * whatever the host's own right-click menu shows.
+ */
+export function suppressContextMenu(target: EventTarget): void {
+  target.addEventListener('contextmenu', (event) => event.preventDefault());
+}
+
+/**
  * Owner of the view window's pointer and keyboard listeners.
  *
  * Listeners are attached on `setEnabled(true)` and fully removed on

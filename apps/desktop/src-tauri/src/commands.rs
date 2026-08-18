@@ -360,11 +360,16 @@ pub fn license_status(window: Window) -> Result<LicenseStatusDto, IpcError> {
     })
 }
 
-/// Argument of every remote-view command.
+/// Argument of [`view_next_frame`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct ViewArgs {
     /// Pseudonymized label of the host being watched.
     pub peer: String,
+    /// Timestamp of the picture the caller already has, or 0 if it has none
+    /// yet. Lets the actor skip re-serializing the pixel buffer when nothing
+    /// new has arrived since the caller's last poll.
+    #[serde(default)]
+    pub since_us: u64,
 }
 
 /// Argument of [`input_pointer_move`].
@@ -415,7 +420,10 @@ pub struct WheelArgs {
 /// encoding. Layout, little endian:
 /// `status:u8 | input:u8 | width:u32 | height:u32 | timestamp_us:u64 | RGBA8`.
 /// `status` is 0 waiting, 1 live, 2 reconnecting, 3 failed; before the first
-/// picture only the 18-byte header comes back.
+/// picture only the 18-byte header comes back. The pixel payload is also
+/// omitted whenever `args.since_us` already names the current picture — the
+/// caller is polling faster than the video updates, and the header alone
+/// tells it that.
 ///
 /// # Errors
 /// Rejects calls from anything but this peer's own view window; [`IpcError`] if
@@ -427,7 +435,7 @@ pub async fn view_next_frame(
     args: ViewArgs,
 ) -> Result<tauri::ipc::Response, IpcError> {
     check_view_window(&window, &args.peer)?;
-    let bytes = state.network.view_frame(args.peer).await?;
+    let bytes = state.network.view_frame(args.peer, args.since_us).await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 

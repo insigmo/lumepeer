@@ -26,6 +26,7 @@ use iroh::endpoint::Connection;
 use lumepeer_core::constants::{
     ENCODE_DEFAULT_FPS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS,
 };
+use lumepeer_media::abr::{AbrController, ReceiverFeedback};
 use lumepeer_media::capture::CaptureController;
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
@@ -137,6 +138,34 @@ impl ViewSlot {
             status: ViewStatus::Waiting,
             frame: None,
         }
+    }
+}
+
+/// Builds the slot `view_next_frame` should actually serialize for one poll.
+///
+/// `since_us` is the timestamp of the picture the caller already has, or 0
+/// for none — the same "no picture" sentinel [`encode_view_response`] itself
+/// uses. `status`/`input` must ride on every poll regardless (an overlay
+/// transition or a lowered grant must never be missed), but the pixel
+/// payload is dropped when it would just be the picture the caller already
+/// painted: a guest polling faster than the video updates (its `tick` loop
+/// runs on `requestAnimationFrame`, the host encodes at a fixed, often
+/// slower, cadence) would otherwise pay a multi-megabyte re-serialization
+/// for nothing on most polls.
+#[must_use]
+pub fn slot_for_poll(current: &ViewSlot, since_us: u64) -> ViewSlot {
+    let unchanged = since_us != 0
+        && current
+            .frame
+            .as_ref()
+            .is_some_and(|f| f.timestamp_us == since_us);
+    ViewSlot {
+        status: current.status,
+        frame: if unchanged {
+            None
+        } else {
+            current.frame.clone()
+        },
     }
 }
 
@@ -299,8 +328,15 @@ pub fn spawn_encode_loop(
             }
         };
         let interval = Duration::from_millis(MILLIS_PER_SEC / u64::from(ENCODE_DEFAULT_FPS.max(1)));
+        // `rd/media/1` is a reliable, ordered QUIC stream: nothing on it is
+        // ever silently lost the way `ReceiverFeedback.loss` is named for.
+        // The one congestion signal available without a guest-side wire
+        // message is how long each write actually takes relative to the
+        // frame budget — see docs/adr/0015-host-local-abr.md.
+        let mut abr = AbrController::new();
 
         loop {
+            let tick_started = Instant::now();
             let shared = Arc::clone(&capture);
             // `next_frame` is a blocking platform call; it must not sit on a
             // tokio worker thread.
@@ -310,7 +346,7 @@ pub fn spawn_encode_loop(
                 Ok(Ok(Some(frame))) => frame,
                 // The screen has not changed (§11.1): nothing to send.
                 Ok(Ok(None)) => {
-                    tokio::time::sleep(interval).await;
+                    sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
                 Ok(Err(error)) => {
@@ -327,7 +363,7 @@ pub fn spawn_encode_loop(
                 Ok(bitstream) => bitstream,
                 Err(error) => {
                     tracing::warn!(peer = %tag, %error, "encoder refused a frame");
-                    tokio::time::sleep(interval).await;
+                    sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
             };
@@ -339,13 +375,59 @@ pub fn spawn_encode_loop(
                 );
                 continue;
             }
+            let write_started = Instant::now();
             if let Err(error) = writer.write_frame(&encode_media_payload(&bitstream)).await {
                 tracing::info!(peer = %tag, %error, "media stream ended");
                 return;
             }
-            tokio::time::sleep(interval).await;
+            if let Some(target_kbps) = abr.on_feedback(write_congestion_feedback(
+                write_started.elapsed(),
+                interval,
+                bitstream.data.len(),
+            )) && let Err(error) = encoder.set_bitrate(target_kbps)
+            {
+                tracing::warn!(peer = %tag, %error, target_kbps, "encoder refused a bitrate change");
+            }
+            sleep_for_the_rest_of(interval, tick_started).await;
         }
     })
+}
+
+/// Sleeps only what's left of `interval` after `tick_started`, instead of
+/// unconditionally sleeping the whole interval on top of however long the
+/// tick's own work took — the latter compounds every tick that capture,
+/// encode or write is not instant, and real throughput falls under
+/// `ENCODE_DEFAULT_FPS` under any load at all.
+async fn sleep_for_the_rest_of(interval: Duration, tick_started: Instant) {
+    if let Some(remaining) = interval.checked_sub(tick_started.elapsed()) {
+        tokio::time::sleep(remaining).await;
+    }
+}
+
+/// Turns how long one write actually took into the [`ReceiverFeedback`]
+/// shape [`AbrController`] expects, standing in for real loss on a stream
+/// that cannot lose bytes (see docs/adr/0015-host-local-abr.md).
+///
+/// A write finishing inside the frame budget reports no congestion; one
+/// running twice the budget or beyond reports total loss, saturating the
+/// controller's multiplicative-decrease branch. `rtt_ms` has no local
+/// equivalent here and `goodput_kbps` is not read by
+/// `AbrController::on_feedback`'s current decision, but both are filled in
+/// honestly rather than left at a placeholder.
+fn write_congestion_feedback(
+    write_elapsed: Duration,
+    interval: Duration,
+    frame_bytes: usize,
+) -> ReceiverFeedback {
+    let over_budget = write_elapsed.as_secs_f32() / interval.as_secs_f32().max(f32::EPSILON) - 1.0;
+    let bits = (frame_bytes as u128).saturating_mul(8);
+    let millis = write_elapsed.as_millis().max(1);
+    let goodput_kbps = u32::try_from(bits / millis).unwrap_or(u32::MAX);
+    ReceiverFeedback {
+        loss: over_budget.clamp(0.0, 1.0),
+        rtt_ms: 0,
+        goodput_kbps,
+    }
 }
 
 /// Everything the guest's media loop needs to reach one host.
@@ -369,7 +451,9 @@ pub struct MediaTarget {
 /// neither is a revoke, so neither closes anything on the first failure.
 /// One recovery pass, bounded by [`RECONNECT_WINDOW_SECS`], is attempted; a
 /// stream that delivers a frame refreshes that budget, so it is a rolling
-/// one-shot allowance rather than a lifetime total.
+/// one-shot allowance rather than a lifetime total. Before the first frame
+/// ever arrives, a failed pass keeps the slot `Waiting` instead of
+/// `Reconnecting`: nothing was connected yet, so nothing was lost.
 pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let window = Duration::from_secs(RECONNECT_WINDOW_SECS);
@@ -377,6 +461,12 @@ pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) 
         // `None` means "healthy so far": the single recovery pass has not been
         // opened, or a delivered frame closed it again.
         let mut recovery_deadline: Option<Instant> = None;
+        // Distinguishes "never got a picture yet" from "had one, then lost
+        // it" so the very first dial attempt does not read as a lost
+        // connection: a first-attempt hiccup (host still routing the media
+        // ALPN, an extra NAT round trip) is completely normal and must stay
+        // `Waiting`, not `Reconnecting`.
+        let mut ever_live = false;
 
         loop {
             let produced = stream_once(&target, &slot).await;
@@ -386,12 +476,17 @@ pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) 
             }
             if produced {
                 recovery_deadline = None;
+                ever_live = true;
             }
 
             match recovery_deadline {
-                None => {
+                None if ever_live => {
                     tracing::info!(peer = %target.tag, "media stopped: starting one recovery pass");
                     set_status(&slot, ViewStatus::Reconnecting);
+                    recovery_deadline = Some(Instant::now() + window);
+                }
+                None => {
+                    tracing::debug!(peer = %target.tag, "still waiting for the first frame");
                     recovery_deadline = Some(Instant::now() + window);
                 }
                 Some(deadline) if Instant::now() < deadline => {}
@@ -582,5 +677,99 @@ mod tests {
     #[test]
     fn a_view_window_label_is_derived_from_the_pseudonymized_peer_label() {
         assert_eq!(window_label("ab12cd34"), "view-ab12cd34");
+    }
+
+    fn slot_with_frame(timestamp_us: u64) -> ViewSlot {
+        ViewSlot {
+            status: ViewStatus::Live,
+            frame: Some(DecodedFrame {
+                width: 2,
+                height: 1,
+                timestamp_us,
+                data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            }),
+        }
+    }
+
+    #[test]
+    fn polling_with_the_current_frames_timestamp_omits_the_pixels() {
+        let current = slot_with_frame(7);
+        let polled = slot_for_poll(&current, 7);
+        assert_eq!(polled.status, ViewStatus::Live);
+        assert!(
+            polled.frame.is_none(),
+            "the caller already has this picture"
+        );
+    }
+
+    #[test]
+    fn polling_with_a_stale_or_missing_timestamp_still_carries_the_picture() {
+        let current = slot_with_frame(7);
+        assert_eq!(slot_for_poll(&current, 6).frame, current.frame);
+        assert_eq!(slot_for_poll(&current, 0).frame, current.frame);
+    }
+
+    #[test]
+    fn the_zero_sentinel_never_matches_even_a_zero_timestamped_frame() {
+        // `since_us == 0` means "the caller has nothing yet", not "the
+        // caller already has the frame timestamped 0" — a real capture
+        // timestamp of exactly 0 is what a fresh session's first frame
+        // would carry, and it must still be sent.
+        let current = slot_with_frame(0);
+        assert!(slot_for_poll(&current, 0).frame.is_some());
+    }
+
+    #[test]
+    fn a_write_inside_budget_reports_no_congestion() {
+        let interval = Duration::from_millis(33);
+        let feedback = write_congestion_feedback(Duration::from_millis(10), interval, 1_000);
+        assert!(feedback.loss.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_write_exactly_at_budget_reports_no_congestion() {
+        let interval = Duration::from_millis(33);
+        let feedback = write_congestion_feedback(interval, interval, 1_000);
+        assert!(feedback.loss.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_write_double_the_budget_saturates_at_full_loss() {
+        let interval = Duration::from_millis(33);
+        let feedback = write_congestion_feedback(interval * 2, interval, 1_000);
+        assert!((feedback.loss - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_write_double_the_budget_or_worse_never_exceeds_full_loss() {
+        let interval = Duration::from_millis(33);
+        let feedback = write_congestion_feedback(interval * 10, interval, 1_000);
+        assert!(
+            (feedback.loss - 1.0).abs() < f32::EPSILON,
+            "loss must stay within AbrController's 0.0..=1.0 contract"
+        );
+    }
+
+    #[test]
+    fn a_write_halfway_over_budget_reports_half_loss() {
+        let interval = Duration::from_millis(100);
+        let feedback = write_congestion_feedback(Duration::from_millis(150), interval, 1_000);
+        assert!((feedback.loss - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn status_and_input_stay_live_on_every_poll_even_when_pixels_are_skipped() {
+        let mut current = slot_with_frame(7);
+        current.status = ViewStatus::Reconnecting;
+        let polled = slot_for_poll(&current, 7);
+        assert_eq!(polled.status, ViewStatus::Reconnecting);
+        let bytes = encode_view_response(&polled, true);
+        assert_eq!(bytes[0], ViewStatus::Reconnecting.code());
+        assert_eq!(bytes[1], 1);
+        assert_eq!(
+            bytes.len(),
+            VIEW_RESPONSE_HEADER_BYTES,
+            "no stale pixels ride along"
+        );
     }
 }
