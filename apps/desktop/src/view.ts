@@ -13,6 +13,7 @@ import { detectLocale, dirOf, t, type Locale } from './i18n';
 import {
   decodeViewFrame,
   paintFrame,
+  suppressContextMenu,
   ViewInput,
   viewOverlay,
   type InputSink,
@@ -58,6 +59,10 @@ const sink: InputSink = {
 const input = canvas ? new ViewInput(canvas, sink) : undefined;
 let status: ViewStatus = 'waiting';
 let stopped = false;
+// Timestamp of the picture already painted, or 0 for none — sent back as
+// `since_us` so the actor can skip re-serializing pixels this window
+// already has when it's polled faster than the video actually updates.
+let lastPaintedUs = 0;
 
 function renderOverlay(): void {
   if (!overlay) {
@@ -83,7 +88,7 @@ async function tick(): Promise<void> {
   }
   try {
     const invoke = await invoker();
-    const response = await invoke('view_next_frame', { args: { peer } });
+    const response = await invoke('view_next_frame', { args: { peer, since_us: lastPaintedUs } });
     const frame = decodeViewFrame(response as ArrayBuffer);
     if (frame.status !== status) {
       status = frame.status;
@@ -92,7 +97,9 @@ async function tick(): Promise<void> {
     // The grant is live: a host that lowered the role mid-session takes the
     // listeners away again on the very next frame (§8.1).
     input?.setEnabled(frame.input);
-    paintFrame(canvas, frame);
+    if (paintFrame(canvas, frame)) {
+      lastPaintedUs = frame.timestampUs;
+    }
   } catch {
     // The view is gone (session ended, window closing): stop polling rather
     // than spinning on a command that will keep failing.
@@ -111,6 +118,9 @@ function loop(): void {
 
 async function main(): Promise<void> {
   renderOverlay();
+  // The remote host's own right-click menu is part of the picture; the
+  // local WebView's native one has no business appearing on top of it.
+  suppressContextMenu(document);
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
   await getCurrentWindow().onCloseRequested(() => {
     stopped = true;

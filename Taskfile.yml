@@ -12,11 +12,11 @@ vars:
   # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
   # VM's IP changes after a reboot, update it here — nothing else reads it.
   LINUX_HOST: beta@192.168.40.128
-  MACOS_HOST: beta@192.168.1.45
+  MACOS_HOST: beta@192.168.1.38
   REMOTE_DIR: lumepeer
 
 tasks:
-  build:
+  build:workspace:
     desc: Build all workspace crates
     cmds:
       - cargo build --workspace
@@ -125,13 +125,22 @@ tasks:
       - npx tauri build --target aarch64-apple-darwin
 
   build:client:macos-amd64:
-    desc: Build the macOS amd64 client
+    desc: >-
+      Build the macOS amd64 client. App-bundle only (--bundles app), no
+      .dmg: dmg bundling shells out to create-dmg, which drives Finder via
+      AppleScript to lay out icons — that AppleEvent has no GUI/Aqua
+      session to talk to over SSH and hangs until it times out
+      (`AppleEvent timed out. (-1712)`), a known limitation of running
+      non-interactively over SSH rather than a real login session. Not
+      needed anyway: task build/install install the .app directly. The
+      real release .dmg still comes from release.yml's hosted macOS
+      runners, which do have a working GUI session.
     platforms: [darwin]
     deps: [build:base]
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-apple-darwin
-      - npx tauri build --target x86_64-apple-darwin
+      - npx tauri build --target x86_64-apple-darwin --bundles app
 
   build:clients:
     desc: >-
@@ -173,12 +182,15 @@ tasks:
       # the real thing, `-u` and `-T`/`--null` both broke under them)
       # captures uncommitted and untracked-but-not-ignored files too.
       # `git archive` on the resulting tree avoids depending on the local
-      # `tar` binary at all.
+      # `tar` binary at all. The index file name is unique to this task
+      # (not shared with sync:macos) because `task build`/`release:all` run
+      # both syncs concurrently — a shared name let them race on the same
+      # file and corrupt each other's index.
       - |
-        rm -f .git/lumepeer-sync-index
-        GIT_INDEX_FILE=.git/lumepeer-sync-index git add -A
-        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index git write-tree)
-        rm -f .git/lumepeer-sync-index
+        rm -f .git/lumepeer-sync-index-linux
+        GIT_INDEX_FILE=.git/lumepeer-sync-index-linux git add -A
+        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index-linux git write-tree)
+        rm -f .git/lumepeer-sync-index-linux
         git archive --format=tar "$TREE" | ssh {{.LINUX_HOST}} "mkdir -p ~/{{.REMOTE_DIR}} && tar -xf - -C ~/{{.REMOTE_DIR}}"
 
   sync:macos:
@@ -187,10 +199,10 @@ tasks:
       build VM over SSH.
     cmds:
       - |
-        rm -f .git/lumepeer-sync-index
-        GIT_INDEX_FILE=.git/lumepeer-sync-index git add -A
-        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index git write-tree)
-        rm -f .git/lumepeer-sync-index
+        rm -f .git/lumepeer-sync-index-macos
+        GIT_INDEX_FILE=.git/lumepeer-sync-index-macos git add -A
+        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index-macos git write-tree)
+        rm -f .git/lumepeer-sync-index-macos
         git archive --format=tar "$TREE" | ssh {{.MACOS_HOST}} "mkdir -p ~/{{.REMOTE_DIR}} && tar -xf - -C ~/{{.REMOTE_DIR}}"
 
   remote:build:linux:
@@ -214,3 +226,54 @@ tasks:
       - build:clients
       - remote:build:linux
       - remote:build:macos
+
+  # ---------------------------------------------------------------------
+  # build: build the amd64 client for Windows, Linux and macOS — Windows
+  # locally, Linux and macOS over SSH on their VMs, each build landing in
+  # that machine's own target/ bundle dir — then print the exact command to
+  # run on each machine to install what was just built there. This task
+  # never installs anything itself: installing means msiexec/dpkg running
+  # elevated, which shouldn't happen silently from an unattended `task`
+  # run, so the human runs the printed command by hand on each machine.
+  # Distinct from install.sh/install.ps1 at the repo root, which download a
+  # *published* GitHub Release rather than this working tree's own build.
+  # ---------------------------------------------------------------------
+
+  remote:build:linux-amd64:
+    desc: Sync and build only the Linux amd64 client on the Linux VM over SSH.
+    cmds:
+      - task: sync:linux
+      - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:client:linux-amd64"
+
+  remote:build:macos-amd64:
+    desc: Sync and build only the macOS amd64 client on the macOS VM over SSH.
+    cmds:
+      - task: sync:macos
+      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:client:macos-amd64"
+
+  build:
+    desc: >-
+      Build the amd64 client for Windows, Linux and macOS — Windows
+      locally, Linux and macOS over SSH on their VMs, all three running
+      concurrently since they share nothing — then print the command to
+      run on each machine to install the bundle that was just built there.
+    deps:
+      - build:client:windows-amd64
+      - remote:build:linux-amd64
+      - remote:build:macos-amd64
+    cmds:
+      - |
+        cat <<'MSG'
+
+        Builds done. Run these on each machine to install:
+
+          Windows (this machine, elevated shell):
+            msiexec /i target\x86_64-pc-windows-msvc\release\bundle\msi\*.msi /quiet /norestart
+
+          Linux ({{.LINUX_HOST}}):
+            ssh {{.LINUX_HOST}} "cd ~/{{.REMOTE_DIR}} && sudo dpkg -i target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb || sudo apt-get install -f -y"
+
+          macOS ({{.MACOS_HOST}}):
+            ssh {{.MACOS_HOST}} "cd ~/{{.REMOTE_DIR}} && rm -rf /Applications/Lumepeer.app && cp -R target/x86_64-apple-darwin/release/bundle/macos/Lumepeer.app /Applications/"
+
+        MSG
