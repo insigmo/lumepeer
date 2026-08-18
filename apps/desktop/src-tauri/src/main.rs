@@ -13,6 +13,7 @@
 
 mod commands;
 mod network;
+mod view;
 
 /// State shared by every IPC command: a handle into the network actor.
 #[derive(Debug)]
@@ -30,12 +31,6 @@ fn main() {
         .build()
         .unwrap_or_else(|error| {
             eprintln!("fatal: failed to start the async runtime: {error}");
-            std::process::exit(1);
-        });
-    let network = runtime
-        .block_on(network::spawn_actor())
-        .unwrap_or_else(|error| {
-            eprintln!("fatal: failed to bind the network endpoint: {error}");
             std::process::exit(1);
         });
 
@@ -58,7 +53,24 @@ fn main() {
     }
 
     builder
-        .manage(AppState { network })
+        // The actor is built here rather than before the builder because it now
+        // owns the remote-view windows, and an `AppHandle` only exists once
+        // Tauri has set the application up.
+        .setup(move |app| {
+            use tauri::Manager as _;
+
+            let network = runtime
+                .block_on(network::spawn_actor(app.handle().clone()))
+                .unwrap_or_else(|error| {
+                    eprintln!("fatal: failed to bind the network endpoint: {error}");
+                    std::process::exit(1);
+                });
+            app.manage(AppState { network });
+            // The runtime owns every actor and connection task; dropping it
+            // here would abort all of them.
+            app.manage(runtime);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::session_grant,
             commands::session_revoke,
@@ -66,6 +78,10 @@ fn main() {
             commands::license_status,
             commands::invite_create,
             commands::invite_connect,
+            commands::view_next_frame,
+            commands::input_pointer_move,
+            commands::input_press,
+            commands::input_wheel,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

@@ -10,6 +10,12 @@
       "identifier": "core:window:allow-close",
       "allow": [{ "label": "main" }]
     },
-    "updater:default"
+    "updater:default",
+    "allow-session-grant",
+    "allow-session-revoke",
+    "allow-session-status",
+    "allow-license-status",
+    "allow-invite-create",
+    "allow-invite-connect"
   ]
 }

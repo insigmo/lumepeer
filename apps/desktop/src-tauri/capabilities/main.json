@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries.",
+  "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries. Every application command it may call is named here one by one; a command that is not listed cannot be invoked from this window at all.",
   "windows": ["main"],
   "local": true,
   "permissions": [
@@ -10,6 +10,12 @@
       "identifier": "core:window:allow-close",
       "allow": [{ "label": "main" }]
     },
-    "updater:default"
+    "updater:default",
+    "allow-session-grant",
+    "allow-session-revoke",
+    "allow-session-status",
+    "allow-license-status",
+    "allow-invite-create",
+    "allow-invite-connect"
   ]
 }
