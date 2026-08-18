@@ -34,8 +34,25 @@ fn main() {
             std::process::exit(1);
         });
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_updater::Builder::new().build())
+    #[allow(
+        unused_mut,
+        reason = "only reassigned when built with --features pilot (debug-only tauri-pilot wiring below)"
+    )]
+    let mut builder =
+        tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build());
+
+    // Local cross-platform debugging aid, never in a release binary: gated
+    // on both the non-default `pilot` Cargo feature and debug_assertions.
+    // Its capability grant lives in capabilities-pilot/, which build.rs only
+    // reads when this feature is enabled (see build.rs) — the default
+    // capabilities/ directory never mentions the `pilot:default` permission,
+    // so a plain build never has to know the plugin exists.
+    #[cfg(all(debug_assertions, feature = "pilot"))]
+    {
+        builder = builder.plugin(tauri_plugin_pilot::init());
+    }
+
+    builder
         // The actor is built here rather than before the builder because it now
         // owns the remote-view windows, and an `AppHandle` only exists once
         // Tauri has set the application up.

@@ -8,6 +8,11 @@ vars:
   # client built without them starts, pairs and consents normally and
   # reports "no capture backend" instead of showing a picture (§18).
   LINUX_MEDIA_FEATURES: capture-x11,encode-openh264
+  # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
+  # VM's IP changes after a reboot, update it here — nothing else reads it.
+  LINUX_HOST: beta@192.168.40.128
+  MACOS_HOST: beta@192.168.1.44
+  REMOTE_DIR: lumepeer
 
 tasks:
   build:
@@ -139,3 +144,72 @@ tasks:
       - task: build:client:windows-arm64
       - task: build:client:macos-arm64
       - task: build:client:macos-amd64
+
+  # ---------------------------------------------------------------------
+  # Remote build VMs. `task release:all` is the one command that covers all
+  # three OSes from this Windows machine: it builds the Windows targets
+  # right here, and drives the Linux/macOS VMs over SSH, each syncing this
+  # working tree — including uncommitted changes, via `git ls-files` piped
+  # into `tar` rather than `git archive HEAD`, which would silently skip
+  # anything not yet committed (no git needed on the remote — plain tar
+  # extracts it) — and then running the same `task build:clients` there, so
+  # those hosts get the identical once-per-host base/frontend caching.
+  # Bootstrap requirements per VM: passwordless SSH (done), rustup/cargo
+  # (done), and on the Linux VM specifically, apt packages that need a
+  # one-time sudo password a non-interactive SSH session can't supply —
+  # see project notes for the exact command.
+  # ---------------------------------------------------------------------
+
+  sync:linux:
+    desc: >-
+      Sync this working tree (including uncommitted changes) to the Linux
+      build VM over SSH.
+    cmds:
+      # A plain `git archive HEAD` would only ever see committed content.
+      # Building a tree from a throwaway index (not the real staging area,
+      # and not a mktemp path — Task's cross-platform `mktemp`/`tar`
+      # builtins for Windows hosts with no real coreutils don't behave like
+      # the real thing, `-u` and `-T`/`--null` both broke under them)
+      # captures uncommitted and untracked-but-not-ignored files too.
+      # `git archive` on the resulting tree avoids depending on the local
+      # `tar` binary at all.
+      - |
+        rm -f .git/lumepeer-sync-index
+        GIT_INDEX_FILE=.git/lumepeer-sync-index git add -A
+        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index git write-tree)
+        rm -f .git/lumepeer-sync-index
+        git archive --format=tar "$TREE" | ssh {{.LINUX_HOST}} "mkdir -p ~/{{.REMOTE_DIR}} && tar -xf - -C ~/{{.REMOTE_DIR}}"
+
+  sync:macos:
+    desc: >-
+      Sync this working tree (including uncommitted changes) to the macOS
+      build VM over SSH.
+    cmds:
+      - |
+        rm -f .git/lumepeer-sync-index
+        GIT_INDEX_FILE=.git/lumepeer-sync-index git add -A
+        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index git write-tree)
+        rm -f .git/lumepeer-sync-index
+        git archive --format=tar "$TREE" | ssh {{.MACOS_HOST}} "mkdir -p ~/{{.REMOTE_DIR}} && tar -xf - -C ~/{{.REMOTE_DIR}}"
+
+  remote:build:linux:
+    desc: Sync and build every Linux client target on the remote Linux VM.
+    cmds:
+      - task: sync:linux
+      - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:clients"
+
+  remote:build:macos:
+    desc: Sync and build every macOS client target on the remote macOS VM.
+    cmds:
+      - task: sync:macos
+      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:clients"
+
+  release:all:
+    desc: >-
+      Build every desktop client for Windows, Linux and macOS with one
+      command: Windows builds locally, Linux and macOS build over SSH on
+      their VMs, all three running concurrently since they share nothing.
+    deps:
+      - build:clients
+      - remote:build:linux
+      - remote:build:macos

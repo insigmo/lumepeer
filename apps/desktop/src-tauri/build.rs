@@ -21,9 +21,25 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
-    tauri_build::try_build(
-        tauri_build::Attributes::new()
-            .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS)),
-    )
-    .unwrap_or_else(|error| panic!("failed to run tauri-build: {error}"));
+    let attrs =
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
+
+    // Default build reads capabilities/ (main.json, view.json) via tauri-
+    // build's built-in default pattern. The `pilot` feature (debug-only
+    // tauri-pilot integration, see Cargo.toml/main.rs) points instead at
+    // capabilities-pilot/, which carries copies of main.json and pilot.json —
+    // Tauri validates every capability file's permissions against the
+    // plugins/commands actually compiled in, so pilot.json's `pilot:default`
+    // permission must never be visible to a build that doesn't compile the
+    // plugin, or the build fails. capabilities-pilot/main.json must stay in
+    // sync with capabilities/main.json's `allow-*` list by hand (see its own
+    // description field).
+    let attrs = if cfg!(feature = "pilot") {
+        println!("cargo:rerun-if-changed=capabilities-pilot");
+        attrs.capabilities_path_pattern("./capabilities-pilot/**/*")
+    } else {
+        attrs
+    };
+
+    tauri_build::try_build(attrs).unwrap_or_else(|error| panic!("failed to run tauri-build: {error}"));
 }
