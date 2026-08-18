@@ -21,8 +21,8 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
-    let attrs =
-        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
+    let attrs = tauri_build::Attributes::new()
+        .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
 
     // Default build reads capabilities/ (main.json, view.json) via tauri-
     // build's built-in default pattern. The `pilot` feature (debug-only
@@ -41,5 +41,6 @@ fn main() {
         attrs
     };
 
-    tauri_build::try_build(attrs).unwrap_or_else(|error| panic!("failed to run tauri-build: {error}"));
+    tauri_build::try_build(attrs)
+        .unwrap_or_else(|error| panic!("failed to run tauri-build: {error}"));
 }

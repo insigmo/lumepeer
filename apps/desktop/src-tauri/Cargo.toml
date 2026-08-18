@@ -25,6 +25,8 @@ default = []
 capture-x11 = ["lumepeer-media/capture-x11"]
 capture-portal = ["lumepeer-media/capture-portal"]
 capture-scap = ["lumepeer-media/capture-scap"]
+capture-windows = ["lumepeer-media/capture-windows"]
+capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
 encode-openh264 = ["lumepeer-media/encode-openh264"]
 encode-mf = ["lumepeer-media/encode-mf"]
 decode-openh264 = ["lumepeer-media/decode-openh264"]
@@ -57,11 +59,12 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Real screen capture exists only for Linux/X11 today (crates/media's
-# Windows/macOS backends are still "phase 2: not implemented yet" stubs).
-# Scoped to this target so Windows/macOS builds never pull x11rb in for
-# nothing; capture/mod.rs's own `#[cfg(target_os = "linux")]` gate on
-# platform_capturer() would keep them inert either way, but there is no
-# reason to compile them.
+# Linux gets real capture unconditionally rather than through the
+# capture-x11 pass-through above, so a Linux build never has to remember to
+# ask for it. Windows and macOS builds do need `--features capture-windows`
+# / `--features capture-screencapturekit` explicitly (see Taskfile.yml) —
+# unlike x11rb, the `windows`/`objc2` bindings those pull in are large enough
+# that making them unconditional here would slow down every Windows/macOS
+# build, including ones that never touch capture.
 [target.'cfg(target_os = "linux")'.dependencies]
 lumepeer-media = { workspace = true, features = ["capture-x11"] }
