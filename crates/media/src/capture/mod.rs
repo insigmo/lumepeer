@@ -249,10 +249,22 @@ pub fn platform_capturer() -> Result<Box<dyn ScreenCapturer>> {
         // fails unless Xwayland is reachable, and the error says so.
         Ok(Box::new(linux_x11::X11Capturer::new()))
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        not(target_os = "android"),
-        feature = "capture-x11"
+    #[cfg(all(target_os = "windows", feature = "capture-windows"))]
+    {
+        Ok(Box::new(windows::WindowsCapturer::new()))
+    }
+    #[cfg(all(target_os = "macos", feature = "capture-screencapturekit"))]
+    {
+        Ok(Box::new(macos::MacosCapturer::new()))
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "capture-x11"
+        ),
+        all(target_os = "windows", feature = "capture-windows"),
+        all(target_os = "macos", feature = "capture-screencapturekit"),
     )))]
     {
         Err(MediaError::CaptureUnavailable(

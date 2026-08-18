@@ -202,11 +202,14 @@ mod screen_capture_kit {
 
         /// Converts one sample buffer and publishes it if the screen changed.
         fn accept(&self, sample: &CMSampleBuffer) {
+            // A sample with no image buffer carries no pixels to send: that is
+            // how an idle frame usually arrives. It is not the only way one
+            // can, though, so `publish` still compares hashes rather than
+            // trusting this to be the whole story.
+            //
             // SAFETY: `sample` is the buffer ScreenCaptureKit just handed to
             // the delegate method below; it is valid for that call, and
-            // `image_buffer` only reads it. Idle frames, which is how
-            // ScreenCaptureKit says "nothing changed", carry no image buffer
-            // and land in the `None` arm.
+            // `image_buffer` only reads it.
             let Some(pixels) = (unsafe { sample.image_buffer() }) else {
                 return;
             };
