@@ -28,6 +28,19 @@ decode-openh264 = ["dep:openh264"]
 # of `decode::windows_sandbox` needs it unconditionally on Windows - see
 # below), so this feature only gates the encoder module itself.
 encode-mf = []
+# DXGI Desktop Duplication screen capture (§11, §18; ADR 0012). Same
+# convention as capture-x11/encode-mf above, so `cargo build --workspace`
+# needs no platform SDK and pulls in no extra bindings. The `windows` crate
+# itself is not optional on Windows (see below), so this feature only adds the
+# Direct3D 11/DXGI binding modules the capturer needs on top of what the
+# decoder sandbox and the encoder already require.
+capture-windows = [
+    "windows/Win32_Graphics_Direct3D",
+    "windows/Win32_Graphics_Direct3D11",
+    "windows/Win32_Graphics_Dxgi",
+    "windows/Win32_Graphics_Dxgi_Common",
+    "windows/Win32_Graphics_Gdi",
+]
 
 [dependencies]
 lumepeer-core.workspace = true
