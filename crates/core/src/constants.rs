@@ -3,6 +3,18 @@
 
 /// Maximum size of one control frame payload, checked before allocation (§9.1).
 pub const MAX_CONTROL_FRAME_BYTES: usize = 65_536;
+/// Maximum size of one media frame payload on `rd/media/1`, checked before
+/// allocation exactly as `MAX_CONTROL_FRAME_BYTES` is on the control channel
+/// (§3.2, §9.1). Encoded video needs far more room than a control message, but
+/// still a bound: at the `ABR_MAX_BITRATE_KBPS` ceiling a single keyframe stays
+/// orders of magnitude below this. It is deliberately at or under
+/// `lumepeer_media::decode::SLOT_PAYLOAD_BYTES`, so a frame that passed this
+/// check always fits the decoder's shared-memory slot.
+pub const MAX_MEDIA_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Pause between redial attempts inside the one media recovery pass bounded by
+/// [`RECONNECT_WINDOW_SECS`]. Not a second reconnect window: it only keeps a
+/// host that refuses instantly from turning that window into a busy loop.
+pub const MEDIA_REDIAL_BACKOFF_MS: u64 = 500;
 /// Per-`NodeId` rate limit on `ConsentRequest` (§9.2).
 pub const CONSENT_RATE_PER_MINUTE: u32 = 5;
 /// Total size of the host-side consent queue across all guests (§8.1).

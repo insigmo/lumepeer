@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod error;
 pub mod framing;
 pub mod keystore;
+pub mod media;
 pub mod reconnect;
 pub mod ticket;
 
@@ -20,4 +21,8 @@ pub use connection::{
 };
 pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, PeerEndpoint};
 pub use error::{NetError, Result};
+pub use media::{
+    MediaFrameReader, MediaFrameWriter, accept_media_stream, check_media_frame_length,
+    open_media_stream,
+};
 pub use ticket::InviteTicket;

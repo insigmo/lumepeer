@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-session-revoke"
+description = "Enables the session_revoke command without any pre-configured scope."
+commands.allow = ["session_revoke"]
+
+[[permission]]
+identifier = "deny-session-revoke"
+description = "Denies the session_revoke command without any pre-configured scope."
+commands.deny = ["session_revoke"]
