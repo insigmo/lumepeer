@@ -12,7 +12,7 @@ vars:
   # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
   # VM's IP changes after a reboot, update it here — nothing else reads it.
   LINUX_HOST: beta@192.168.40.128
-  MACOS_HOST: beta@192.168.1.44
+  MACOS_HOST: beta@192.168.1.45
   REMOTE_DIR: lumepeer
 
 tasks:
