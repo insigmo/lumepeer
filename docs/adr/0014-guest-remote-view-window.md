@@ -1,4 +1,4 @@
-# ADR 0012 — Guest remote-view window: media channel, IPC ACL, failure policy
+# ADR 0014 — Guest remote-view window: media channel, IPC ACL, failure policy
 
 Status: accepted
 Date: 2026-08-18
