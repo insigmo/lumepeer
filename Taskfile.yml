@@ -2,12 +2,13 @@ version: "3"
 
 vars:
   DESKTOP_DIR: apps/desktop
-  # Media backends the Linux client links in. Kept here rather than as
-  # defaults in apps/desktop/src-tauri/Cargo.toml so `cargo build
-  # --workspace` still needs no platform SDK (X11 headers, openh264); a
+  # Media backends each client links in. Kept here rather than as defaults in
+  # apps/desktop/src-tauri/Cargo.toml so `cargo build --workspace` still
+  # needs no platform SDK (X11 headers, DXGI/D3D11 bindings, openh264); a
   # client built without them starts, pairs and consents normally and
   # reports "no capture backend" instead of showing a picture (§18).
   LINUX_MEDIA_FEATURES: capture-x11,encode-openh264
+  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf
   # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
   # VM's IP changes after a reboot, update it here — nothing else reads it.
   LINUX_HOST: beta@192.168.40.128
@@ -101,7 +102,7 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-pc-windows-msvc
-      - npx tauri build --target x86_64-pc-windows-msvc
+      - npx tauri build --target x86_64-pc-windows-msvc --features {{.WINDOWS_MEDIA_FEATURES}}
 
   build:client:windows-arm64:
     desc: >-
