@@ -17,8 +17,12 @@ use tauri::Window;
 use crate::AppState;
 use crate::network::{ActorError, SessionStateDto};
 
-/// Label of the only window allowed to call these commands.
+/// Label of the window allowed to call the session/invite/license commands.
 const MAIN_WINDOW_LABEL: &str = "main";
+
+/// Prefix of a remote-view window's label (`view-{peer label}`), the only other
+/// window this build ever creates.
+const VIEW_WINDOW_PREFIX: &str = "view-";
 
 /// Error returned to the webview. Carries a code and a short message, never
 /// secrets, tickets, tokens or raw peer identities (§15).
@@ -107,6 +111,23 @@ impl From<ActorError> for IpcError {
 /// Rejects calls coming from any window other than the main one (§13).
 fn check_window(window: &Window) -> Result<(), IpcError> {
     if window.label() == MAIN_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err(IpcError::denied())
+    }
+}
+
+/// Rejects calls that do not come from the view window of `peer`.
+///
+/// The Tauri capability in `capabilities/view.json` already limits these four
+/// commands to `view-*` windows; this narrows it one step further, to *that*
+/// peer's own window, so one open view cannot poll frames from or drive input
+/// into another session. Cheap, and it keeps the rule in the Rust layer where
+/// the rest of the authorization lives rather than only in a JSON file (§2.3,
+/// §13).
+fn check_view_window(window: &Window, peer: &str) -> Result<(), IpcError> {
+    let label = window.label();
+    if label.strip_prefix(VIEW_WINDOW_PREFIX) == Some(peer) {
         Ok(())
     } else {
         Err(IpcError::denied())
@@ -247,8 +268,13 @@ pub async fn session_grant(
 
 /// Revokes every grant of a peer immediately (§8.1).
 ///
+/// Callable from the main window for any peer, and from a `view-{peer}` window
+/// for its own peer only: closing a view window ends that session, which is the
+/// same one on/off switch as the status list's revoke button rather than a
+/// second state to keep in sync.
+///
 /// # Errors
-/// Rejects calls from other windows; propagates [`ActorError`] as an
+/// Rejects calls from any other window; propagates [`ActorError`] as an
 /// [`IpcError`].
 #[tauri::command]
 pub async fn session_revoke(
@@ -256,7 +282,9 @@ pub async fn session_revoke(
     state: tauri::State<'_, AppState>,
     args: SessionRevokeArgs,
 ) -> Result<(), IpcError> {
-    check_window(&window)?;
+    if check_window(&window).is_err() {
+        check_view_window(&window, &args.peer)?;
+    }
     state.network.revoke(args.peer).await?;
     Ok(())
 }
@@ -330,4 +358,171 @@ pub fn license_status(window: Window) -> Result<LicenseStatusDto, IpcError> {
         seconds_left: None,
         offline: true,
     })
+}
+
+/// Argument of every remote-view command.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+}
+
+/// Argument of [`input_pointer_move`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct PointerMoveArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Horizontal position, normalized to `0..=65535` of the captured surface.
+    pub x: u16,
+    /// Vertical position, normalized to `0..=65535` of the captured surface.
+    pub y: u16,
+    /// Modifier bitmask.
+    pub modifiers: u32,
+}
+
+/// Argument of [`input_press`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct PressArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Platform-independent logical key or pointer-button identifier.
+    pub logical: u32,
+    /// Physical scancode as reported by this machine.
+    pub scancode: u32,
+    /// Modifier bitmask.
+    pub modifiers: u32,
+    /// `true` for a press, `false` for a release.
+    pub pressed: bool,
+}
+
+/// Argument of [`input_wheel`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct WheelArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Horizontal delta.
+    pub dx: i16,
+    /// Vertical delta.
+    pub dy: i16,
+    /// Modifier bitmask.
+    pub modifiers: u32,
+}
+
+/// Newest decoded picture for a view window, as raw bytes.
+///
+/// Binary rather than JSON on purpose: a 1080p RGBA picture is ~8 MB, and
+/// base64-ing that per frame would spend the whole latency budget of §15 on
+/// encoding. Layout, little endian:
+/// `status:u8 | input:u8 | width:u32 | height:u32 | timestamp_us:u64 | RGBA8`.
+/// `status` is 0 waiting, 1 live, 2 reconnecting, 3 failed; before the first
+/// picture only the 18-byte header comes back.
+///
+/// # Errors
+/// Rejects calls from anything but this peer's own view window; [`IpcError`] if
+/// no such view exists or the actor is gone.
+#[tauri::command]
+pub async fn view_next_frame(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    let bytes = state.network.view_frame(args.peer).await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Forwards absolute pointer motion to the host being watched (§11).
+///
+/// # Errors
+/// Rejects calls from anything but this peer's own view window; [`IpcError`]
+/// with `CORE` if the session no longer holds an `input` grant. The host checks
+/// again, per event, and is the authority (§2.3).
+#[tauri::command]
+pub async fn input_pointer_move(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: PointerMoveArgs,
+) -> Result<(), IpcError> {
+    use lumepeer_core::protocol::{InputDetail, InputEventPayload};
+
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .input(
+            args.peer,
+            InputEventPayload {
+                logical: 0,
+                scancode: 0,
+                modifiers: args.modifiers,
+                detail: InputDetail::PointerMove {
+                    x: args.x,
+                    y: args.y,
+                },
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Forwards a key or pointer-button press/release to the host (§11).
+///
+/// # Errors
+/// As [`input_pointer_move`].
+#[tauri::command]
+pub async fn input_press(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: PressArgs,
+) -> Result<(), IpcError> {
+    use lumepeer_core::protocol::{InputDetail, InputEventPayload};
+
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .input(
+            args.peer,
+            InputEventPayload {
+                logical: args.logical,
+                scancode: args.scancode,
+                modifiers: args.modifiers,
+                detail: if args.pressed {
+                    InputDetail::Press
+                } else {
+                    InputDetail::Release
+                },
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Forwards a scroll wheel movement to the host (§11).
+///
+/// # Errors
+/// As [`input_pointer_move`].
+#[tauri::command]
+pub async fn input_wheel(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: WheelArgs,
+) -> Result<(), IpcError> {
+    use lumepeer_core::protocol::{InputDetail, InputEventPayload};
+
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .input(
+            args.peer,
+            InputEventPayload {
+                logical: 0,
+                scancode: 0,
+                modifiers: args.modifiers,
+                detail: InputDetail::Wheel {
+                    dx: args.dx,
+                    dy: args.dy,
+                },
+            },
+        )
+        .await?;
+    Ok(())
 }

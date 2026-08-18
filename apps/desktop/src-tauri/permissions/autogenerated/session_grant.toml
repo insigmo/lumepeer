@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-session-grant"
+description = "Enables the session_grant command without any pre-configured scope."
+commands.allow = ["session_grant"]
+
+[[permission]]
+identifier = "deny-session-grant"
+description = "Denies the session_grant command without any pre-configured scope."
+commands.deny = ["session_grant"]

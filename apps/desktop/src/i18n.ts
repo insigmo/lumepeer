@@ -28,7 +28,13 @@ export type TranslationKey =
   | 'status.revoke'
   | 'status.role.viewOnly'
   | 'status.role.controlLimited'
-  | 'status.role.fullControl';
+  | 'status.role.fullControl'
+  | 'view.canvasLabel'
+  | 'view.waiting'
+  | 'view.reconnecting'
+  | 'view.failed.title'
+  | 'view.failed.body'
+  | 'view.failed.dismiss';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -54,6 +60,12 @@ const en: Dictionary = {
   'status.role.viewOnly': 'view only',
   'status.role.controlLimited': 'limited control',
   'status.role.fullControl': 'full control',
+  'view.canvasLabel': 'Remote screen',
+  'view.waiting': 'Waiting for the remote screen…',
+  'view.reconnecting': 'Connection lost, reconnecting…',
+  'view.failed.title': 'Connection lost',
+  'view.failed.body': 'The remote screen could not be reconnected, so the session has ended.',
+  'view.failed.dismiss': 'Close',
 };
 
 const ar: Dictionary = {
@@ -78,6 +90,12 @@ const ar: Dictionary = {
   'status.role.viewOnly': 'مشاهدة فقط',
   'status.role.controlLimited': 'تحكم محدود',
   'status.role.fullControl': 'تحكم كامل',
+  'view.canvasLabel': 'الشاشة البعيدة',
+  'view.waiting': 'في انتظار الشاشة البعيدة…',
+  'view.reconnecting': 'انقطع الاتصال، جارٍ إعادة الاتصال…',
+  'view.failed.title': 'انقطع الاتصال',
+  'view.failed.body': 'تعذّرت إعادة الاتصال بالشاشة البعيدة، لذلك انتهت الجلسة.',
+  'view.failed.dismiss': 'إغلاق',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

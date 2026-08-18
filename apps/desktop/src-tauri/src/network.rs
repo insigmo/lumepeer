@@ -15,16 +15,25 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use lumepeer_core::consent::Role;
+use lumepeer_core::consent::{Grants, Role};
 use lumepeer_core::constants::{CONTROL_HANDSHAKE_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES};
-use lumepeer_core::protocol::MessageKind;
+use lumepeer_core::protocol::{InputEventPayload, MessageKind};
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::{CoreError, NodeId};
+use lumepeer_media::capture::{
+    CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_capturer,
+    platform_injector,
+};
 use lumepeer_net::keystore::load_or_create;
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use rand::Rng as _;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+
+use crate::view::{
+    MediaTarget, SharedCapture, ViewSlot, ViewWindows, encode_view_response, lock_capture,
+    spawn_encode_loop, spawn_media_receiver, window_label,
+};
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -120,6 +129,18 @@ enum ActorCommand {
         ticket: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Guest side: newest decoded picture for one view window, already encoded
+    /// as the binary IPC response of `view_next_frame`.
+    ViewFrame {
+        label: String,
+        reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
+    },
+    /// Guest side: one input event to forward to the host being viewed.
+    Input {
+        label: String,
+        event: Box<InputEventPayload>,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
 }
 
 /// Thin handle IPC commands hold. Cloneable: every command gets its own
@@ -205,6 +226,44 @@ impl ActorHandle {
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
+
+    /// Newest picture of the view onto `label`, as the raw bytes
+    /// `view_next_frame` hands to the webview.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn view_frame(&self, label: String) -> Result<Vec<u8>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ViewFrame { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Forwards one input event to the host behind `label`.
+    ///
+    /// The guest drops it if its own copy of the grant no longer carries
+    /// `input`; the host checks again, authoritatively, per event (§2.3, §8.1).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`;
+    /// [`ActorError::Core`] with [`CoreError::NotPermitted`] if the session
+    /// holds no `input` grant; [`ActorError::ChannelClosed`] if the actor is
+    /// gone.
+    pub async fn input(&self, label: String, event: InputEventPayload) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::Input {
+                label,
+                event: Box::new(event),
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
 }
 
 fn unix_now() -> u64 {
@@ -233,6 +292,41 @@ struct ConnectionHandle {
     /// `Closed` event cannot tear down a freshly established replacement.
     id: u64,
     outbound: mpsc::Sender<MessageKind>,
+    /// Kept so this side can close the QUIC connection outright. Dropping the
+    /// outbound sender alone only ends the writer task; the reader would sit
+    /// in `recv` until the far end noticed.
+    connection: iroh::endpoint::Connection,
+}
+
+/// Host side: one running capture/encode loop, plus the connection it writes
+/// on, so a revoke can stop both without waiting for the loop to notice.
+struct MediaSession {
+    task: tokio::task::JoinHandle<()>,
+    connection: iroh::endpoint::Connection,
+}
+
+impl MediaSession {
+    /// Stops the loop and closes the media connection.
+    fn stop(self) {
+        self.task.abort();
+        self.connection.close(
+            lumepeer_net::connection::CLOSE_MALFORMED.into(),
+            lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+        );
+    }
+}
+
+/// Guest side: one open remote-view window and the pipeline feeding it.
+struct ViewState {
+    /// Tauri window label, `view-{peer label}`.
+    label: String,
+    /// Grants as the host last announced them. Advisory on this side: the host
+    /// re-checks every event (§2.3).
+    grants: Grants,
+    /// Single-slot newest picture plus pipeline health. Dropping this receiver
+    /// is also how the media task learns the view is gone.
+    slot: watch::Receiver<ViewSlot>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// What a spawned per-connection task reports back to the main loop.
@@ -253,6 +347,29 @@ enum ActorEvent {
     },
     /// A live connection's stream closed or errored.
     Closed { peer: NodeId, id: u64 },
+    /// An incoming `rd/media/1` connection finished its QUIC handshake. It has
+    /// proven nothing beyond its `NodeId`; whether it may exist at all is a
+    /// question only the actor can answer, since only the actor knows which
+    /// peers hold a live, granted control session (§4.1).
+    MediaAccepted {
+        connection: Box<iroh::endpoint::Connection>,
+        peer: NodeId,
+    },
+}
+
+/// Outcome of one accepted incoming connection, before the actor sees it.
+enum Accepted {
+    /// Control ALPN: handshake ran and the invite ticket verified.
+    Control {
+        connection: Box<ControlConnection>,
+        peer: NodeId,
+        ticket: Box<InviteTicket>,
+    },
+    /// Media ALPN: authenticated only, nothing decided.
+    Media {
+        connection: Box<iroh::endpoint::Connection>,
+        peer: NodeId,
+    },
 }
 
 /// Runtime state the actor owns and loops over.
@@ -279,6 +396,21 @@ struct Actor {
     events_tx: mpsc::Sender<ActorEvent>,
     events_rx: mpsc::Receiver<ActorEvent>,
     notify: broadcast::Sender<ActorNotification>,
+    /// Host side: the single "capture only with a viewer" gate of §8.1/§11,
+    /// shared with every encode loop.
+    capture: SharedCapture,
+    /// Host side: one encode loop per peer currently receiving video.
+    media: std::collections::HashMap<NodeId, MediaSession>,
+    /// Host side: platform input adapter, opened on the first authorized event
+    /// so a host that never grants `input` never touches it.
+    injector: Option<Box<dyn InputInjector>>,
+    /// Guest side: one open view window per host being watched.
+    views: std::collections::HashMap<NodeId, ViewState>,
+    /// Guest side: dialable address per host, remembered from its invite so the
+    /// media dial does not have to wait for discovery.
+    host_addrs: std::collections::HashMap<NodeId, iroh::EndpointAddr>,
+    /// How view windows are created and closed.
+    windows: Arc<dyn ViewWindows>,
 }
 
 impl Actor {
@@ -327,6 +459,14 @@ impl Actor {
                 input: grants.input,
             });
         }
+        // Guest side: a host being watched has no entry in this node's own
+        // `SessionManager` (it is not *our* guest), but its view window still
+        // has to be able to name it over IPC — `view_next_frame`, the input
+        // commands and the window's own close/revoke all go through a label.
+        for peer in self.views.keys().copied().collect::<Vec<_>>() {
+            let label = peer_tag(&self.install_salt, &peer);
+            self.labels.insert(label, peer);
+        }
         out
     }
 
@@ -373,15 +513,28 @@ impl Actor {
                 let connection = PeerEndpoint::finish_accept(incoming).await.ok()?;
                 let peer = connection.remote_id();
                 let tag = peer_tag(&salt, &peer);
-                // An unauthenticated peer must not be able to park a media or
-                // file connection in the control handshake's read (§4.1).
-                if Channel::from_alpn(connection.alpn()) != Some(Channel::Control) {
-                    tracing::warn!(peer = %tag, "closing a non-control connection");
-                    connection.close(
-                        lumepeer_net::connection::CLOSE_MALFORMED.into(),
-                        lumepeer_net::error::close_code::MALFORMED.as_bytes(),
-                    );
-                    return None;
+                match Channel::from_alpn(connection.alpn()) {
+                    Some(Channel::Control) => {}
+                    // Media is authenticated here and authorized by the actor:
+                    // this task cannot see whether the peer holds a live,
+                    // granted control session, and guessing would be a way to
+                    // widen a grant outside `lumepeer-core` (§2.3).
+                    Some(Channel::Media) => {
+                        return Some(Accepted::Media {
+                            connection: Box::new(connection),
+                            peer,
+                        });
+                    }
+                    // An unauthenticated peer must not be able to park a file
+                    // connection in the control handshake's read (§4.1).
+                    Some(Channel::File) | None => {
+                        tracing::warn!(peer = %tag, "closing a non-control connection");
+                        connection.close(
+                            lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                            lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+                        );
+                        return None;
+                    }
                 }
                 let (control, hello) = match lumepeer_net::host_handshake(connection).await {
                     Ok(pair) => pair,
@@ -400,7 +553,11 @@ impl Actor {
                     control.close_with(&NetError::InvalidTicket);
                     return None;
                 }
-                Some((control, peer, ticket))
+                Some(Accepted::Control {
+                    connection: Box::new(control),
+                    peer,
+                    ticket: Box::new(ticket),
+                })
             })
             .await
             else {
@@ -410,15 +567,22 @@ impl Actor {
                 );
                 return;
             };
-            if let Some((connection, peer, ticket)) = outcome {
-                let _ = tx
-                    .send(ActorEvent::Handshaked {
-                        connection: Box::new(connection),
-                        peer,
-                        ticket,
-                    })
-                    .await;
-            }
+            let event = match outcome {
+                Some(Accepted::Control {
+                    connection,
+                    peer,
+                    ticket,
+                }) => ActorEvent::Handshaked {
+                    connection,
+                    peer,
+                    ticket: *ticket,
+                },
+                Some(Accepted::Media { connection, peer }) => {
+                    ActorEvent::MediaAccepted { connection, peer }
+                }
+                None => return,
+            };
+            let _ = tx.send(event).await;
         });
     }
 
@@ -433,6 +597,7 @@ impl Actor {
         self.next_connection_id = self.next_connection_id.wrapping_add(1);
         let id = self.next_connection_id;
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
+        let quic = connection.connection().clone();
         let (mut reader, mut writer) = connection.split();
         let tag = self.label_of(&peer);
 
@@ -480,6 +645,7 @@ impl Actor {
             ConnectionHandle {
                 id,
                 outbound: outbound_tx,
+                connection: quic,
             },
         );
     }
@@ -507,6 +673,137 @@ impl Actor {
             } => self.on_handshaked(*connection, peer, &ticket),
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
             ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
+            ActorEvent::MediaAccepted { connection, peer } => {
+                self.on_media_accepted(*connection, peer);
+            }
+        }
+    }
+
+    /// Host side: a media connection may exist only for a peer that already
+    /// holds a live, granted control session with a `view` grant (§4.1, §8.1).
+    ///
+    /// Deny-by-default: everything else is closed, including a peer whose
+    /// control session is merely pending or already revoked. The check is made
+    /// here, on the actor's own thread, because this is the only place that can
+    /// read `SessionManager` — a media connection must never be able to
+    /// authorize itself.
+    fn on_media_accepted(&mut self, connection: iroh::endpoint::Connection, peer: NodeId) {
+        let tag = self.label_of(&peer);
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            tracing::warn!(peer = %tag, "refusing a media connection without a granted view session");
+            connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+            return;
+        }
+        // A redial replaces the previous stream rather than adding a second
+        // encode loop against the same capture.
+        if let Some(previous) = self.media.remove(&peer) {
+            previous.stop();
+        }
+        tracing::info!(peer = %tag, "media connection accepted; starting the encode loop");
+        let task = spawn_encode_loop(connection.clone(), Arc::clone(&self.capture), tag);
+        self.media.insert(peer, MediaSession { task, connection });
+    }
+
+    /// Host side: stops sending video to `peer` and drops it as a viewer, which
+    /// stops capture altogether if it was the last one (§8.1, §11).
+    fn stop_media(&mut self, peer: NodeId) {
+        if let Some(session) = self.media.remove(&peer) {
+            session.stop();
+        }
+        lock_capture(&self.capture).remove_viewer(&peer);
+    }
+
+    /// Guest side: opens the view window for a host that just granted, or
+    /// refreshes the grants of one already open.
+    fn start_view(&mut self, peer: NodeId, role: Role) {
+        let grants = Grants::from_role(role);
+        let tag = self.label_of(&peer);
+        if !grants.view {
+            self.stop_view(peer);
+            return;
+        }
+        // A second `ConsentGrant` on a live view is a role change, not a new
+        // window: keep the pipeline, update what the window may do.
+        if let Some(state) = self.views.get_mut(&peer) {
+            state.grants = grants;
+            tracing::info!(peer = %tag, input = grants.input, "view grants updated");
+            return;
+        }
+        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+            tracing::warn!(peer = %tag, "no remembered address for this host: cannot open media");
+            return;
+        };
+
+        let label = window_label(&tag);
+        let (slot_tx, slot_rx) = watch::channel(ViewSlot::waiting());
+        let task = spawn_media_receiver(
+            MediaTarget {
+                endpoint: self.endpoint.clone(),
+                addr,
+                tag: tag.clone(),
+                worker: None,
+            },
+            slot_tx,
+        );
+        self.views.insert(
+            peer,
+            ViewState {
+                label: label.clone(),
+                grants,
+                slot: slot_rx,
+                task,
+            },
+        );
+        self.windows.open(&label, &tag, grants.input);
+        self.rebuild_labels_and_snapshot();
+    }
+
+    /// Guest side: closes the view window and tears the pipeline down.
+    fn stop_view(&mut self, peer: NodeId) {
+        let Some(state) = self.views.remove(&peer) else {
+            return;
+        };
+        // Dropping the receiver already tells the media task to stop; aborting
+        // makes sure a decoder does not outlive the session it belonged to
+        // (§8.1).
+        state.task.abort();
+        drop(state.slot);
+        self.windows.close(&state.label);
+        tracing::info!(peer = %self.label_of(&peer), "view window closed");
+    }
+
+    /// Host side: injects one authorized input event (§11).
+    ///
+    /// The authorization is re-taken per event rather than once at grant time,
+    /// so a `session_grant` that lowered the role in between takes effect on
+    /// the very next event.
+    fn inject(&mut self, peer: NodeId, event: &InputEventPayload) {
+        let tag = self.label_of(&peer);
+        if let Err(error) = self.sessions.authorize_input(&peer, event) {
+            tracing::warn!(peer = %tag, %error, "dropping an unauthorized input event");
+            return;
+        }
+        if self.injector.is_none() {
+            match platform_injector() {
+                Ok(injector) => self.injector = Some(injector),
+                Err(error) => {
+                    // §18: the session degrades to view-only and says so in the
+                    // log rather than failing the session.
+                    tracing::warn!(peer = %tag, %error, "no input adapter: staying view-only");
+                    return;
+                }
+            }
+        }
+        if let Some(injector) = self.injector.as_mut()
+            && let Err(error) = injector.inject(event)
+        {
+            tracing::warn!(peer = %tag, %error, "input injection failed");
         }
     }
 
@@ -552,11 +849,20 @@ impl Actor {
             MessageKind::ConsentGrant(role) => {
                 tracing::info!(peer = %tag, ?role, "remote host granted consent");
                 let _ = self.notify.send(ActorNotification::ConsentGranted { role });
+                // Reacted to here rather than through the notification stream:
+                // `ActorNotification` deliberately carries no peer identity
+                // (§15), and opening a media connection needs to know exactly
+                // which host granted.
+                self.start_view(peer, role);
             }
             MessageKind::ConsentRevoke => {
                 tracing::info!(peer = %tag, "remote host revoked consent");
                 let _ = self.notify.send(ActorNotification::ConsentRevoked);
+                self.stop_view(peer);
             }
+            // Host side: a guest asks for input. Authorization is `lumepeer-
+            // core`'s, per event.
+            MessageKind::InputEvent(ref event) => self.inject(peer, event),
             // Everything else belongs to a phase this build does not run yet.
             // Nothing a peer sends may ever grant itself consent (§2.3).
             ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
@@ -569,6 +875,10 @@ impl Actor {
             return;
         }
         self.connections.remove(&peer);
+        // Both sides of the media pipeline end with the control connection: the
+        // host stops capturing for this viewer, the guest closes its window.
+        self.stop_media(peer);
+        self.stop_view(peer);
         if self.sessions.on_disconnect(peer).is_err() {
             // No active session to move into the reconnect window, so this was
             // a guest that dropped before the host decided: drop its queued
@@ -587,32 +897,12 @@ impl Actor {
                 let _ = reply.send(snapshot);
             }
             ActorCommand::Grant { label, role, reply } => {
-                let result = match self.resolve(&label) {
-                    Ok(peer) => match self.sessions.grant(peer, role) {
-                        Ok(()) => {
-                            self.send_to(&peer, MessageKind::ConsentGrant(role));
-                            tracing::info!(peer = %label, ?role, "consent granted");
-                            Ok(())
-                        }
-                        Err(e) => Err(ActorError::Core(e)),
-                    },
-                    Err(e) => Err(e),
-                };
+                let result = self.on_grant(&label, role);
                 self.rebuild_labels_and_snapshot();
                 let _ = reply.send(result);
             }
             ActorCommand::Revoke { label, reply } => {
-                let result = match self.resolve(&label) {
-                    Ok(peer) => match self.sessions.revoke(peer) {
-                        Ok(()) => {
-                            self.send_to(&peer, MessageKind::ConsentRevoke);
-                            tracing::info!(peer = %label, "consent revoked");
-                            Ok(())
-                        }
-                        Err(e) => Err(ActorError::Core(e)),
-                    },
-                    Err(e) => Err(e),
-                };
+                let result = self.on_revoke(&label);
                 self.rebuild_labels_and_snapshot();
                 let _ = reply.send(result);
             }
@@ -644,7 +934,92 @@ impl Actor {
                 }
                 let _ = reply.send(result);
             }
+            ActorCommand::ViewFrame { label, reply } => {
+                let result = self.resolve(&label).and_then(|peer| {
+                    let state = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+                    Ok(encode_view_response(
+                        &state.slot.borrow(),
+                        state.grants.input,
+                    ))
+                });
+                let _ = reply.send(result);
+            }
+            ActorCommand::Input {
+                label,
+                event,
+                reply,
+            } => {
+                let result = self.on_input(&label, *event);
+                let _ = reply.send(result);
+            }
         }
+    }
+
+    /// Host side: grants `role` and, if it carries `view`, registers the peer
+    /// as a viewer — which is what starts capture (§8.1, §11).
+    ///
+    /// A platform with no capture backend still grants: consent, input and the
+    /// control channel work regardless, and the guest is told there is no
+    /// picture rather than being refused a session it did ask for (§18).
+    fn on_grant(&mut self, label: &str, role: Role) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        self.sessions.grant(peer, role).map_err(ActorError::Core)?;
+        self.send_to(&peer, MessageKind::ConsentGrant(role));
+        if self.sessions.grants(&peer).is_some_and(|g| g.view)
+            && let Err(error) = lock_capture(&self.capture).add_viewer(peer)
+        {
+            tracing::warn!(
+                peer = %label,
+                %error,
+                "consent granted but this platform cannot capture"
+            );
+        }
+        tracing::info!(peer = %label, ?role, "consent granted");
+        Ok(())
+    }
+
+    /// Both directions of "end this session now".
+    ///
+    /// On the host it is the revoke of §8.1. On the guest, where the watched
+    /// host has no entry in this node's own `SessionManager`, it is the view
+    /// window closing: the control connection is dropped, which the host sees
+    /// as a disconnect and answers with its own `remove_viewer`.
+    fn on_revoke(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if self.views.contains_key(&peer) {
+            tracing::info!(peer = %label, "leaving a session from the view window");
+            self.stop_view(peer);
+            self.host_addrs.remove(&peer);
+            if let Some(handle) = self.connections.remove(&peer) {
+                handle.connection.close(
+                    lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                    lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+                );
+            }
+            return Ok(());
+        }
+        self.sessions.revoke(peer).map_err(ActorError::Core)?;
+        self.send_to(&peer, MessageKind::ConsentRevoke);
+        self.stop_media(peer);
+        tracing::info!(peer = %label, "consent revoked");
+        Ok(())
+    }
+
+    /// Guest side: forwards one input event, gated on this node's own copy of
+    /// the grant. The host re-checks authoritatively (§2.3).
+    fn on_input(&mut self, label: &str, event: InputEventPayload) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let permitted = self
+            .views
+            .get(&peer)
+            .ok_or(ActorError::UnknownPeer)?
+            .grants
+            .input;
+        if !permitted {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        self.send_to(&peer, MessageKind::InputEvent(event));
+        Ok(())
     }
 
     /// Guest side: dial the host named by the ticket, run the handshake and
@@ -655,7 +1030,7 @@ impl Actor {
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
         let connection = self
             .endpoint
-            .connect_control(addr)
+            .connect_control(addr.clone())
             .await
             .map_err(ActorError::Net)?;
         let proof = postcard::to_allocvec(&ticket)
@@ -666,6 +1041,9 @@ impl Actor {
                 .map_err(ActorError::Net)?;
         let peer = control.peer();
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
+        // Remembered for the media dial that follows a `ConsentGrant`: the
+        // ticket is the only place this address is known without discovery.
+        self.host_addrs.insert(peer, addr);
         self.adopt(control, peer);
         Ok(())
     }
@@ -682,7 +1060,7 @@ impl Actor {
 /// # Errors
 /// [`NetError`] if the keystore or the endpoint bind fails — surfaced as a
 /// startup failure rather than silently degrading (§11.2, §24.5).
-pub async fn spawn_actor() -> Result<ActorHandle, NetError> {
+pub async fn spawn_actor(app: tauri::AppHandle) -> Result<ActorHandle, NetError> {
     let store = lumepeer_net::keystore::open()?;
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
@@ -696,14 +1074,44 @@ pub async fn spawn_actor() -> Result<ActorHandle, NetError> {
         }
     });
 
-    Ok(spawn_actor_with(endpoint, identity))
+    Ok(spawn_actor_with(
+        endpoint,
+        identity,
+        Arc::new(crate::view::TauriViewWindows::new(app)),
+        default_capture(),
+    ))
+}
+
+/// Builds the host's capture controller, falling back to a capturer that
+/// produces nothing when the platform has no backend compiled in.
+///
+/// A missing backend must not stop the app from starting or from accepting a
+/// session: consent, input and the rest of the control channel work regardless,
+/// and the guest is told there is no picture rather than being disconnected
+/// (§18).
+#[must_use]
+pub fn default_capture() -> SharedCapture {
+    let capturer = platform_capturer().unwrap_or_else(|error| {
+        tracing::warn!(%error, "no capture backend on this platform: sessions stay blank");
+        Box::new(StubCapturer::default())
+    });
+    Arc::new(std::sync::Mutex::new(CaptureController::new(
+        capturer,
+        CaptureTarget::PrimaryDisplay,
+    )))
 }
 
 /// Spawns the actor over an already bound endpoint. Split out of
 /// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
-/// relay or a Tauri window.
+/// relay or a Tauri window: `windows` and `capture` are the two seams that
+/// would otherwise need one.
 #[must_use]
-pub fn spawn_actor_with(endpoint: PeerEndpoint, identity: SigningKey) -> ActorHandle {
+pub fn spawn_actor_with(
+    endpoint: PeerEndpoint,
+    identity: SigningKey,
+    windows: Arc<dyn ViewWindows>,
+    capture: SharedCapture,
+) -> ActorHandle {
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
@@ -723,6 +1131,12 @@ pub fn spawn_actor_with(endpoint: PeerEndpoint, identity: SigningKey) -> ActorHa
         events_tx,
         events_rx,
         notify: notify.clone(),
+        capture,
+        media: std::collections::HashMap::new(),
+        injector: None,
+        views: std::collections::HashMap::new(),
+        host_addrs: std::collections::HashMap::new(),
+        windows,
     };
     tokio::spawn(actor.run());
     ActorHandle { tx, notify }
@@ -738,16 +1152,135 @@ mod tests {
 
     use std::time::Duration;
 
+    use lumepeer_media::capture::{Frame, InputCapability, ScreenCapturer};
+    use lumepeer_media::error::{MediaError, Result as MediaResult};
+
     use super::*;
+    use crate::view::DetachedViewWindows;
 
     /// Anything slower than this on loopback means the test is stuck.
     const TIMEOUT: Duration = Duration::from_secs(20);
 
-    async fn actor() -> (ActorHandle, PeerEndpoint) {
+    /// Capturer that never produces a picture but does start and stop, so the
+    /// viewer bookkeeping of `CaptureController` is exercised on a machine with
+    /// no capture backend compiled in.
+    #[derive(Debug, Default)]
+    struct SilentCapturer {
+        running: bool,
+    }
+
+    impl ScreenCapturer for SilentCapturer {
+        fn start(&mut self, _target: CaptureTarget) -> MediaResult<()> {
+            self.running = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> MediaResult<Option<Frame>> {
+            if self.running {
+                Ok(None)
+            } else {
+                Err(MediaError::CaptureUnavailable("stopped".to_owned()))
+            }
+        }
+
+        fn stop(&mut self) {
+            self.running = false;
+        }
+
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::None
+        }
+    }
+
+    fn test_capture() -> SharedCapture {
+        Arc::new(std::sync::Mutex::new(CaptureController::new(
+            Box::new(SilentCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        )))
+    }
+
+    /// [`ViewWindows`] that records what the actor asked for, so the guest side
+    /// of a grant can be asserted without a Tauri runtime.
+    #[derive(Debug, Default)]
+    struct RecordingWindows {
+        opened: std::sync::Mutex<Vec<(String, String, bool)>>,
+        closed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingWindows {
+        fn opened(&self) -> Vec<(String, String, bool)> {
+            self.opened.lock().unwrap().clone()
+        }
+
+        fn closed(&self) -> Vec<String> {
+            self.closed.lock().unwrap().clone()
+        }
+    }
+
+    impl ViewWindows for RecordingWindows {
+        fn open(&self, label: &str, peer_label: &str, input: bool) {
+            self.opened
+                .lock()
+                .unwrap()
+                .push((label.to_owned(), peer_label.to_owned(), input));
+        }
+
+        fn close(&self, label: &str) {
+            self.closed.lock().unwrap().push(label.to_owned());
+        }
+    }
+
+    async fn actor() -> (ActorHandle, PeerEndpoint, SharedCapture) {
+        let (handle, endpoint, capture, _windows) =
+            actor_with_windows(Arc::new(DetachedViewWindows)).await;
+        (handle, endpoint, capture)
+    }
+
+    async fn actor_with_windows(
+        windows: Arc<dyn ViewWindows>,
+    ) -> (
+        ActorHandle,
+        PeerEndpoint,
+        SharedCapture,
+        Arc<dyn ViewWindows>,
+    ) {
         let secret = iroh::SecretKey::generate();
         let identity = SigningKey::from_bytes(&secret.to_bytes());
         let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
-        (spawn_actor_with(endpoint.clone(), identity), endpoint)
+        let capture = test_capture();
+        let handle = spawn_actor_with(
+            endpoint.clone(),
+            identity,
+            Arc::clone(&windows),
+            Arc::clone(&capture),
+        );
+        (handle, endpoint, capture, windows)
+    }
+
+    /// Polls until `predicate` holds, or fails the test.
+    async fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if predicate() {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn viewers(capture: &SharedCapture) -> usize {
+        lock_capture(capture).viewer_count()
+    }
+
+    fn pointer_event(x: u16, y: u16) -> InputEventPayload {
+        use lumepeer_core::protocol::InputDetail;
+        InputEventPayload {
+            logical: 0,
+            scancode: 0,
+            modifiers: 0,
+            detail: InputDetail::PointerMove { x, y },
+        }
     }
 
     /// Polls `status` the way the frontend does until a pending row shows up.
@@ -769,8 +1302,8 @@ mod tests {
     /// handle the Tauri commands use.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_guest_actor_observes_the_hosts_grant_and_revoke() {
-        let (host, _host_endpoint) = actor().await;
-        let (guest, _guest_endpoint) = actor().await;
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let mut events = guest.subscribe();
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
@@ -801,8 +1334,8 @@ mod tests {
     /// task must notice and the pending row must disappear.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_guest_that_leaves_before_the_grant_stops_being_pending() {
-        let (host, _host_endpoint) = actor().await;
-        let (guest, guest_endpoint) = actor().await;
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, guest_endpoint, _guest_capture) = actor().await;
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
         guest.invite_connect(invite.qr_string).await.unwrap();
@@ -827,9 +1360,13 @@ mod tests {
 
     /// I7: a connection on a non-control ALPN must never reach the control
     /// handshake, and it must not become a pending consent request.
+    ///
+    /// Media is now an accepted ALPN, so this also pins the rule that makes
+    /// accepting it safe: without a granted control session behind the same
+    /// `NodeId` the connection is still closed, and no capture starts.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_media_alpn_connection_is_refused_without_a_handshake() {
-        let (host, host_endpoint) = actor().await;
+        let (host, host_endpoint, capture) = actor().await;
         let stranger = PeerEndpoint::bind_local(iroh::SecretKey::generate())
             .await
             .unwrap();
@@ -841,7 +1378,7 @@ mod tests {
             .connect(host_endpoint.addr(), lumepeer_net::ALPN_MEDIA)
             .await
             .unwrap();
-        // The host closes it; the guest never gets a control stream.
+        // The host closes it; the stranger never gets a media stream.
         assert!(
             tokio::time::timeout(TIMEOUT, connection.closed())
                 .await
@@ -849,12 +1386,148 @@ mod tests {
             "the host left a media connection open"
         );
         assert!(host.status().await.unwrap().is_empty());
+        assert!(
+            !lock_capture(&capture).is_capturing(),
+            "a refused media dial must never start capture"
+        );
+    }
+
+    /// The whole point of this phase: granting `view` registers the guest as a
+    /// viewer, which is what starts capture, and revoking takes it away again
+    /// (§8.1, §11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_adds_a_viewer_and_a_revoke_removes_it() {
+        let (host, _host_endpoint, capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        assert_eq!(viewers(&capture), 0);
+        assert!(!lock_capture(&capture).is_capturing());
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        assert_eq!(viewers(&capture), 1, "a view grant must start capture");
+        assert!(lock_capture(&capture).is_capturing());
+
+        host.revoke(label).await.unwrap();
+        assert_eq!(viewers(&capture), 0, "a revoke must stop capture");
+        assert!(!lock_capture(&capture).is_capturing());
+    }
+
+    /// A guest that disappears without a revoke must not leave the host
+    /// capturing its own screen for nobody.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disconnect_removes_the_viewer_too() {
+        let (host, _host_endpoint, capture) = actor().await;
+        let (guest, guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+        assert_eq!(viewers(&capture), 1);
+
+        guest_endpoint.close().await;
+        wait_until("the viewer survived the disconnect", || {
+            viewers(&capture) == 0
+        })
+        .await;
+        assert!(!lock_capture(&capture).is_capturing());
+    }
+
+    /// The guest side of a grant: a view window opens by itself, is pollable
+    /// through the same pseudonymized-label IPC as everything else, and closing
+    /// it ends the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_granted_guest_gets_a_view_window_and_closing_it_ends_the_session() {
+        let (host, _host_endpoint, host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::FullControl).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (window_label, peer_label, input) = recorder.opened().remove(0);
+        assert_eq!(window_label, crate::view::window_label(&peer_label));
+        assert!(input, "FullControl carries a live input grant");
+
+        let frame = guest.view_frame(peer_label.clone()).await.unwrap();
+        assert_eq!(
+            frame.len(),
+            crate::view::VIEW_RESPONSE_HEADER_BYTES,
+            "no picture has been decoded yet, so only the header comes back"
+        );
+        assert_eq!(frame[1], 1, "the live input grant rides on every frame");
+
+        // Input is forwarded while the grant carries it.
+        guest
+            .input(peer_label.clone(), pointer_event(1, 2))
+            .await
+            .unwrap();
+
+        // Closing the window is the guest's revoke: the session ends from this
+        // side and the host stops capturing.
+        guest.revoke(peer_label.clone()).await.unwrap();
+        assert!(recorder.closed().contains(&window_label));
+        wait_until("the host kept capturing after the guest left", || {
+            viewers(&host_capture) == 0
+        })
+        .await;
+        assert!(matches!(
+            guest.view_frame(peer_label).await,
+            Err(ActorError::UnknownPeer)
+        ));
+    }
+
+    /// A `ViewOnly` session must not be able to forward input, and the guest
+    /// drops it before it ever reaches the wire (the host checks again).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_only_guest_cannot_forward_input() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, input) = recorder.opened().remove(0);
+        assert!(!input, "ViewOnly must never imply input (§2.2, §8.2)");
+        assert!(matches!(
+            guest.input(peer_label.clone(), pointer_event(3, 4)).await,
+            Err(ActorError::Core(CoreError::NotPermitted))
+        ));
+        let frame = guest.view_frame(peer_label).await.unwrap();
+        assert_eq!(frame[1], 0);
     }
 
     /// Unknown labels are refused cleanly, with no panic and no peer parsing.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unknown_label_is_refused() {
-        let (host, _endpoint) = actor().await;
+        let (host, _endpoint, _capture) = actor().await;
         assert!(matches!(
             host.grant("deadbeefdeadbeef".to_owned(), Role::ViewOnly)
                 .await,
@@ -862,6 +1535,15 @@ mod tests {
         ));
         assert!(matches!(
             host.revoke("deadbeefdeadbeef".to_owned()).await,
+            Err(ActorError::UnknownPeer)
+        ));
+        assert!(matches!(
+            host.view_frame("deadbeefdeadbeef".to_owned()).await,
+            Err(ActorError::UnknownPeer)
+        ));
+        assert!(matches!(
+            host.input("deadbeefdeadbeef".to_owned(), pointer_event(1, 1))
+                .await,
             Err(ActorError::UnknownPeer)
         ));
     }

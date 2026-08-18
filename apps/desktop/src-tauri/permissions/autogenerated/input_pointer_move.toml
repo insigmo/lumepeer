@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-input-pointer-move"
+description = "Enables the input_pointer_move command without any pre-configured scope."
+commands.allow = ["input_pointer_move"]
+
+[[permission]]
+identifier = "deny-input-pointer-move"
+description = "Denies the input_pointer_move command without any pre-configured scope."
+commands.deny = ["input_pointer_move"]

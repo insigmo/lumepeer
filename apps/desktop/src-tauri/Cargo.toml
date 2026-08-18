@@ -14,6 +14,20 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+# Pass-throughs onto `lumepeer-media`'s platform backends. Default is empty so
+# `cargo build --workspace` still needs no platform SDK; a real host build turns
+# on the ones its target has (e.g. `--features capture-x11,encode-openh264` on
+# X11 Linux). Without any of them the app runs, pairs and consents normally and
+# reports "no capture backend" instead of showing a picture (§18).
+[features]
+default = []
+capture-x11 = ["lumepeer-media/capture-x11"]
+capture-portal = ["lumepeer-media/capture-portal"]
+capture-scap = ["lumepeer-media/capture-scap"]
+encode-openh264 = ["lumepeer-media/encode-openh264"]
+encode-mf = ["lumepeer-media/encode-mf"]
+decode-openh264 = ["lumepeer-media/decode-openh264"]
+
 [build-dependencies]
 tauri-build.workspace = true
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-input-press"
+description = "Enables the input_press command without any pre-configured scope."
+commands.allow = ["input_press"]
+
+[[permission]]
+identifier = "deny-input-press"
+description = "Denies the input_press command without any pre-configured scope."
+commands.deny = ["input_press"]
