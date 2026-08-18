@@ -48,7 +48,7 @@ mod screen_capture_kit {
     use objc2::runtime::ProtocolObject;
     use objc2::{AnyThread, DefinedClass, define_class, msg_send};
     use objc2_core_graphics::CGMainDisplayID;
-    use objc2_core_media::{CMSampleBuffer, CMTimeMake};
+    use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
         CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
         CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
@@ -74,7 +74,7 @@ mod screen_capture_kit {
 
     /// `kCVPixelBufferLock_ReadOnly`. Named rather than inlined because the
     /// lock and the matching unlock must be passed the identical flags:
-    /// CoreVideo documents non-symmetrical use as undefined behavior.
+    /// `CoreVideo` documents non-symmetrical use as undefined behavior.
     const LOCK_READ_ONLY: CVPixelBufferLockFlags = CVPixelBufferLockFlags(1);
 
     /// `kCVReturnSuccess`.
@@ -131,13 +131,9 @@ mod screen_capture_kit {
 
     impl ErrorInfo {
         fn from_ns(error: &NSError) -> Self {
-            // SAFETY: `error` is the NSError ScreenCaptureKit passed to this
-            // handler; `code` and `localizedDescription` only read its own
-            // fields and are valid for the duration of the call.
-            let (code, message) = unsafe { (error.code(), error.localizedDescription()) };
             Self {
-                code,
-                message: message.to_string(),
+                code: error.code(),
+                message: error.localizedDescription().to_string(),
             }
         }
 
@@ -422,23 +418,23 @@ mod screen_capture_kit {
                 // pointers as non-null, each valid for this call. `retain`
                 // takes our own reference to the content so it outlives the
                 // handler; `ErrorInfo::from_ns` only reads the error.
-                let outcome = unsafe {
-                    if !content.is_null() {
-                        Ok(ContentHandoff(Retained::retain(content).ok_or_else(|| {
-                            ErrorInfo {
-                                code: 0,
-                                message: "shareable content could not be retained".to_owned(),
-                            }
-                        })?))
-                    } else if !error.is_null() {
-                        Err(ErrorInfo::from_ns(&*error))
+                let retained = unsafe {
+                    if content.is_null() {
+                        None
                     } else {
-                        Err(ErrorInfo {
-                            code: 0,
-                            message: "ScreenCaptureKit reported neither content nor an error"
-                                .to_owned(),
-                        })
+                        Retained::retain(content)
                     }
+                };
+                let outcome = match retained {
+                    Some(content) => Ok(ContentHandoff(content)),
+                    // SAFETY: as above; reached only when `content` was null,
+                    // so ScreenCaptureKit passed an error instead.
+                    None if !error.is_null() => Err(ErrorInfo::from_ns(unsafe { &*error })),
+                    None => Err(ErrorInfo {
+                        code: 0,
+                        message: "ScreenCaptureKit reported neither content nor an error"
+                            .to_owned(),
+                    }),
                 };
                 let _ = tx.try_send(outcome);
             },
@@ -489,9 +485,7 @@ mod screen_capture_kit {
         }
 
         let wanted = match target {
-            // SAFETY: `CGMainDisplayID` takes no arguments and only reads
-            // global window-server state.
-            CaptureTarget::PrimaryDisplay => unsafe { CGMainDisplayID() },
+            CaptureTarget::PrimaryDisplay => CGMainDisplayID(),
             CaptureTarget::Display(id) => id,
         };
         for display in &displays {
@@ -502,9 +496,9 @@ mod screen_capture_kit {
         }
 
         match target {
-            CaptureTarget::PrimaryDisplay => displays.firstObject().ok_or_else(|| {
-                MediaError::CaptureUnavailable("no primary display".to_owned())
-            }),
+            CaptureTarget::PrimaryDisplay => displays
+                .firstObject()
+                .ok_or_else(|| MediaError::CaptureUnavailable("no primary display".to_owned())),
             CaptureTarget::Display(n) => displays
                 .iter()
                 .nth(usize::try_from(n).unwrap_or(usize::MAX))
@@ -605,7 +599,7 @@ mod screen_capture_kit {
                 config.setQueueDepth(STREAM_QUEUE_DEPTH);
                 config.setShowsCursor(true);
                 config.setCapturesAudio(false);
-                config.setMinimumFrameInterval(CMTimeMake(1, i32::from(ENCODE_DEFAULT_FPS)));
+                config.setMinimumFrameInterval(CMTime::new(1, i32::from(ENCODE_DEFAULT_FPS)));
                 (filter, config, width, height)
             };
             if width <= 0 || height <= 0 {
@@ -628,14 +622,15 @@ mod screen_capture_kit {
                     &config,
                     Some(ProtocolObject::from_ref(&*sink)),
                 );
-                stream.addStreamOutput_type_sampleHandlerQueue_error(
-                    ProtocolObject::from_ref(&*sink),
-                    SCStreamOutputType::Screen,
-                    Some(&queue),
-                )
-                .map_err(|e| {
-                    ErrorInfo::from_ns(&e).into_media_error("attaching the capture output")
-                })?;
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(
+                        ProtocolObject::from_ref(&*sink),
+                        SCStreamOutputType::Screen,
+                        Some(&queue),
+                    )
+                    .map_err(|e| {
+                        ErrorInfo::from_ns(&e).into_media_error("attaching the capture output")
+                    })?;
                 stream
             };
 
@@ -673,12 +668,13 @@ mod screen_capture_kit {
             let Some(active) = self.active.take() else {
                 return;
             };
+            let stream = active.stream;
             // A failed stop still drops the stream, which releases it; there is
             // nothing left for the caller to do about it, so the result is
             // deliberately discarded rather than logged as an error.
             let _ = wait_for_completion("the stream stop", |handler| {
                 // SAFETY: as in `start`; the handler outlives the call.
-                unsafe { active.stream.stopCaptureWithCompletionHandler(Some(handler)) };
+                unsafe { stream.stopCaptureWithCompletionHandler(Some(handler)) };
             });
         }
 
@@ -696,7 +692,7 @@ mod screen_capture_kit {
 
         use super::*;
 
-        /// The FourCC must be the one CoreVideo means by
+        /// The four-char code must be the one `CoreVideo` means by
         /// `kCVPixelFormatType_32BGRA`, or the stream would silently hand back
         /// a format the rest of the pipeline misreads.
         #[test]
@@ -825,7 +821,9 @@ mod screen_capture_kit {
                     Err(e) => panic!("capture failed on a live display: {e}"),
                 }
             }
-            let frame = frame.expect("a live stream must produce a frame within 2.5s");
+            let Some(frame) = frame else {
+                panic!("a live stream must produce a frame within 2.5s");
+            };
 
             assert!(frame.width > 0 && frame.height > 0);
             assert_eq!(frame.format, PixelFormat::Bgra8);
