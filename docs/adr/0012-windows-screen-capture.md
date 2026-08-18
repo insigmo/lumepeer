@@ -117,20 +117,30 @@ against the real thing" mistake ADR 0011 documented for the encoder, and
 
 ### What is still not covered
 
-`capture::windows` is implemented but not yet selected: `platform_capturer`
-in `crates/media/src/capture/mod.rs` still only returns the X11 backend,
-because that function is shared with the parallel macOS capture and desktop
-pipeline work and is theirs to wire. Nothing else in the crate reaches this
-backend until that one-line arm exists.
-
 Multi-monitor is enumerated but only ever captures one output at a time;
-there is no combined virtual-desktop target. The mouse cursor is not
-composited into the frame — Desktop Duplication reports pointer position
-and shape separately, and drawing it is left to a later change. Input
-injection on Windows is unimplemented: `input_capability` reports `Full`
-because `SendInput` can do it, but no `InputInjector` exists yet, so
-`platform_injector` still returns `InputUnavailable` on Windows and a
-session degrades to view-only per §18.
+there is no combined virtual-desktop target. Input injection on Windows is
+unimplemented: `input_capability` reports `Full` because `SendInput` can do
+it, but no `InputInjector` exists yet, so `platform_injector` still returns
+`InputUnavailable` on Windows and a session degrades to view-only per §18.
+
+`platform_capturer` in `crates/media/src/capture/mod.rs` now selects this
+backend on Windows (it did not at first, when this ADR was written — that
+was closed alongside the macOS and Linux Wayland capture work).
+
+Desktop Duplication reports the pointer's position and shape separately
+instead of compositing them into the frame the way macOS's
+`setShowsCursor(true)` and the Wayland portal's `CursorMode::Embedded` do,
+so `capture::windows` draws it itself: `GetFramePointerShape` on a shape
+change, `PointerPosition` on every acquire, composited onto the BGRA8 buffer
+before it is hashed and handed out. All three DXGI shape encodings are
+implemented (`MONOCHROME`'s stacked AND/XOR masks, `COLOR`'s straight alpha
+blend, `MASKED_COLOR`'s alpha-as-AND-mask XOR) per the classic Win32
+monochrome-cursor rule and Microsoft's own desktop-duplication sample. A
+pointer-only update (`LastPresentTime == 0`, cursor moved over an otherwise
+static desktop) still produces a frame by recompositing onto the last
+delivered cursor-free image, rather than the cursor going stale between real
+repaints — and since the hash in §11.1's dedup check runs after compositing,
+cursor motion alone counts as a real change, as it should.
 
 ## Consequences
 

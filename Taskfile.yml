@@ -127,20 +127,42 @@ tasks:
   build:client:macos-amd64:
     desc: >-
       Build the macOS amd64 client. App-bundle only (--bundles app), no
-      .dmg: dmg bundling shells out to create-dmg, which drives Finder via
-      AppleScript to lay out icons — that AppleEvent has no GUI/Aqua
-      session to talk to over SSH and hangs until it times out
+      .dmg: Tauri's own dmg bundling shells out to create-dmg, which drives
+      Finder via AppleScript to lay out icons — that AppleEvent has no
+      GUI/Aqua session to talk to over SSH and hangs until it times out
       (`AppleEvent timed out. (-1712)`), a known limitation of running
-      non-interactively over SSH rather than a real login session. Not
-      needed anyway: task build/install install the .app directly. The
-      real release .dmg still comes from release.yml's hosted macOS
-      runners, which do have a working GUI session.
+      non-interactively over SSH rather than a real login session.
+      package:dmg:macos-amd64 packages this same .app into a .dmg
+      afterwards without going through Tauri's bundler or Finder at all.
+      release.yml's hosted macOS runners, which do have a working GUI
+      session, still build the real release .dmg the ordinary way.
     platforms: [darwin]
     deps: [build:base]
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-apple-darwin
       - npx tauri build --target x86_64-apple-darwin --bundles app
+
+  package:dmg:macos-amd64:
+    desc: >-
+      Package the macOS amd64 .app already built by build:client:macos-amd64
+      into a plain .dmg. Not Tauri's own dmg bundler (which shells out to
+      create-dmg, which drives Finder over AppleScript to lay out icons — see
+      the comment on build:client:macos-amd64 for why that hangs over SSH).
+      Plain `hdiutil create` needs no Finder/Aqua session at all, so it works
+      the same way non-interactively as it does at a real console; the
+      tradeoff is no icon layout, which install:macos-amd64 doesn't need
+      anyway since it mounts and copies the .app straight back out.
+    platforms: [darwin]
+    deps: [build:client:macos-amd64]
+    dir: "{{.DESKTOP_DIR}}"
+    vars:
+      APP_DIR: target/x86_64-apple-darwin/release/bundle/macos
+      DMG_DIR: target/x86_64-apple-darwin/release/bundle/dmg
+    cmds:
+      - mkdir -p {{.DMG_DIR}}
+      - rm -f {{.DMG_DIR}}/Lumepeer_x64.dmg
+      - hdiutil create -volname Lumepeer -srcfolder {{.APP_DIR}} -ov -format UDZO {{.DMG_DIR}}/Lumepeer_x64.dmg
 
   build:clients:
     desc: >-
@@ -230,13 +252,19 @@ tasks:
   # ---------------------------------------------------------------------
   # build: build the amd64 client for Windows, Linux and macOS — Windows
   # locally, Linux and macOS over SSH on their VMs, each build landing in
-  # that machine's own target/ bundle dir — then print the exact command to
-  # run on each machine to install what was just built there. This task
-  # never installs anything itself: installing means msiexec/dpkg running
-  # elevated, which shouldn't happen silently from an unattended `task`
-  # run, so the human runs the printed command by hand on each machine.
-  # Distinct from install.sh/install.ps1 at the repo root, which download a
-  # *published* GitHub Release rather than this working tree's own build.
+  # that machine's own target/ bundle dir — then actually install what was
+  # just built on each of those same machines (this one, and both VMs),
+  # echoing the exact command run for each so a manual re-run needs no
+  # lookup. This used to only print the install commands, on the theory that
+  # an unattended `task` run installing something elevated shouldn't happen
+  # silently; in practice that meant the running app never got replaced, so
+  # "just built it" and "actually running the new build" quietly drifted
+  # apart (Windows NSIS/MSI can't even overwrite the old .exe while it's
+  # running - a locked-file failure the printed command never surfaced back
+  # here). install:windows-amd64 kills the running process first for exactly
+  # that reason. Distinct from install.sh/install.ps1 at the repo root, which
+  # install a *published* GitHub Release rather than this working tree's own
+  # build.
   # ---------------------------------------------------------------------
 
   remote:build:linux-amd64:
@@ -245,35 +273,77 @@ tasks:
       - task: sync:linux
       - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:client:linux-amd64"
 
-  remote:build:macos-amd64:
-    desc: Sync and build only the macOS amd64 client on the macOS VM over SSH.
+  remote:package:dmg:macos-amd64:
+    desc: >-
+      Sync, build and package the macOS amd64 client into a .dmg on
+      {{.MACOS_HOST}} over SSH (see package:dmg:macos-amd64 for why a .dmg
+      rather than a bare .app copy).
     cmds:
       - task: sync:macos
-      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:client:macos-amd64"
+      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task package:dmg:macos-amd64"
+
+  install:windows-amd64:
+    desc: >-
+      Install the Windows amd64 client build:client:windows-amd64 just
+      produced (prefers the silent NSIS installer, falls back to the msi).
+      Kills any running lumepeer-desktop.exe first: an installer can't
+      replace a locked exe, and that lock is the usual reason a build
+      "didn't take" - the old process just kept running the old file.
+    platforms: [windows]
+    cmds:
+      - |
+        set -e
+        taskkill /IM lumepeer-desktop.exe /F >/dev/null 2>&1 || true
+        nsis=$(ls target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1)
+        if [ -n "$nsis" ]; then
+          echo "$nsis /S"
+          "$nsis" /S
+        else
+          msi=$(ls target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi 2>/dev/null | head -1)
+          if [ -z "$msi" ]; then
+            echo "no installer under target/x86_64-pc-windows-msvc/release/bundle/{nsis,msi} - run 'task build:client:windows-amd64' first" >&2
+            exit 1
+          fi
+          echo "msiexec /i \"$msi\" /quiet /norestart"
+          msiexec /i "$msi" /quiet /norestart
+        fi
+
+  install:linux-amd64:
+    desc: >-
+      Install the Linux amd64 client build:client:linux-amd64 just produced,
+      on {{.LINUX_HOST}} over SSH (needs the VM's one-time passwordless-sudo
+      setup from the project notes).
+    cmds:
+      - |
+        cmd='cd ~/{{.REMOTE_DIR}} && test -d target/x86_64-unknown-linux-gnu/release/bundle/deb || { echo "no Linux build on {{.LINUX_HOST}} yet - run task remote:build:linux-amd64 first" >&2; exit 1; }; sudo dpkg -i target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb || sudo apt-get install -f -y'
+        echo "ssh {{.LINUX_HOST}} \"$cmd\""
+        ssh {{.LINUX_HOST}} "$cmd"
+
+  install:macos-amd64:
+    desc: >-
+      Mount the .dmg package:dmg:macos-amd64 just built on {{.MACOS_HOST}}
+      and install it to /Applications there - the same mount/copy/detach
+      install.sh's install_macos does for a published release, just against
+      this working tree's own build instead.
+    cmds:
+      - |
+        cmd='cd ~/{{.REMOTE_DIR}} && dmg=$(ls target/x86_64-apple-darwin/release/bundle/dmg/*.dmg 2>/dev/null | head -1); test -n "$dmg" || { echo "no macOS dmg on {{.MACOS_HOST}} yet - run task remote:package:dmg:macos-amd64 first" >&2; exit 1; }; killall Lumepeer >/dev/null 2>&1; mnt=$(mktemp -d) && hdiutil attach "$dmg" -nobrowse -quiet -mountpoint "$mnt" && rm -rf /Applications/Lumepeer.app && cp -R "$mnt"/*.app /Applications/ && hdiutil detach "$mnt" -quiet'
+        echo "ssh {{.MACOS_HOST}} \"$cmd\""
+        ssh {{.MACOS_HOST}} "$cmd"
 
   build:
     desc: >-
       Build the amd64 client for Windows, Linux and macOS — Windows
       locally, Linux and macOS over SSH on their VMs, all three running
-      concurrently since they share nothing — then print the command to
-      run on each machine to install the bundle that was just built there.
+      concurrently since they share nothing — then install what was just
+      built on each of those same machines, echoing the exact command run
+      for each. See the comment above this section for why installing is
+      no longer left as a printed suggestion.
     deps:
       - build:client:windows-amd64
       - remote:build:linux-amd64
-      - remote:build:macos-amd64
+      - remote:package:dmg:macos-amd64
     cmds:
-      - |
-        cat <<'MSG'
-
-        Builds done. Run these on each machine to install:
-
-          Windows (this machine, elevated shell):
-            msiexec /i target\x86_64-pc-windows-msvc\release\bundle\msi\*.msi /quiet /norestart
-
-          Linux ({{.LINUX_HOST}}):
-            ssh {{.LINUX_HOST}} "cd ~/{{.REMOTE_DIR}} && sudo dpkg -i target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb || sudo apt-get install -f -y"
-
-          macOS ({{.MACOS_HOST}}):
-            ssh {{.MACOS_HOST}} "cd ~/{{.REMOTE_DIR}} && rm -rf /Applications/Lumepeer.app && cp -R target/x86_64-apple-darwin/release/bundle/macos/Lumepeer.app /Applications/"
-
-        MSG
+      - task: install:windows-amd64
+      - task: install:linux-amd64
+      - task: install:macos-amd64

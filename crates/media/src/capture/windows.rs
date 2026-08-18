@@ -71,8 +71,10 @@ mod dxgi {
         CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
         DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_NOT_FOUND,
         DXGI_ERROR_SESSION_DISCONNECTED, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT,
-        DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput,
-        IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+        DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
+        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
+        IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::core::Interface as _;
 
@@ -246,6 +248,20 @@ mod dxgi {
         /// without actually changing yields `None` instead of a duplicate
         /// (§11.1), exactly as the X11 backend does it.
         last_hash: Option<[u8; 32]>,
+        /// The last cursor bitmap Desktop Duplication reported, kept across
+        /// frames because a shape update is only reported when it changes,
+        /// not on every acquire (MSDN, `PointerShapeBufferSize`).
+        pointer_shape: Option<PointerShape>,
+        /// Top-left corner to draw `pointer_shape` at, in this monitor's
+        /// frame coordinates, or `None` while the OS reports the pointer
+        /// hidden. Already hotspot-adjusted by DXGI (MSDN,
+        /// `DXGI_OUTDUPL_POINTER_POSITION`), so no offset is applied here.
+        pointer_position: Option<(i32, i32)>,
+        /// The last desktop image read back from the GPU, without the cursor
+        /// composited in, so a pointer-only update (see `next_frame`) can
+        /// redraw the cursor at its new spot without leaving a trail of
+        /// previous positions baked into the picture.
+        last_frame_data: Option<Vec<u8>>,
         started_at: Instant,
     }
 
@@ -325,6 +341,9 @@ mod dxgi {
                 duplication,
                 staging,
                 last_hash: None,
+                pointer_shape: None,
+                pointer_position: None,
+                last_frame_data: None,
                 started_at: Instant::now(),
             })
         }
@@ -364,12 +383,30 @@ mod dxgi {
         }
 
         /// Turns an acquired desktop surface into an owned, tightly packed
-        /// BGRA8 [`Frame`], or `None` when the desktop image did not change.
+        /// BGRA8 [`Frame`] with the cursor composited on top (ADR 0012's
+        /// "drawing it is left to a later change"), or `None` when nothing
+        /// visible changed.
         fn frame_from(
             &mut self,
             resource: Option<&IDXGIResource>,
             info: &DXGI_OUTDUPL_FRAME_INFO,
         ) -> Result<Option<Frame>> {
+            // A shape update is only reported when it actually changes, not
+            // on every acquire, so this is fetched before anything else and
+            // cached on `self` regardless of which path below returns.
+            if info.PointerShapeBufferSize > 0 {
+                self.pointer_shape = Some(fetch_pointer_shape(
+                    &self.duplication,
+                    info.PointerShapeBufferSize,
+                )?);
+            }
+            if info.LastMouseUpdateTime != 0 {
+                self.pointer_position = info.PointerPosition.Visible.as_bool().then_some((
+                    info.PointerPosition.Position.x,
+                    info.PointerPosition.Position.y,
+                ));
+            }
+
             // A zero `LastPresentTime` means nothing was presented since the
             // last acquire, and the surface handed back with it carries no
             // desktop image at all - not a stale one, an uninitialized one.
@@ -383,7 +420,19 @@ mod dxgi {
             // changed" and the first real present delivers a full frame a few
             // milliseconds later (§11.1, ADR 0012).
             if info.LastPresentTime == 0 {
-                return Ok(None);
+                // The cursor alone can still have moved: DXGI reports that as
+                // a real acquire with a new PointerPosition but no new
+                // desktop image. Recompositing it onto the last delivered
+                // (cursor-free) desktop pixels keeps cursor motion visible
+                // over an otherwise static screen instead of it going stale
+                // between real repaints.
+                if info.LastMouseUpdateTime == 0 {
+                    return Ok(None);
+                }
+                let Some(base) = self.last_frame_data.clone() else {
+                    return Ok(None);
+                };
+                return Ok(self.finish_frame(base));
             }
             let Some(resource) = resource else {
                 return Err(MediaError::CaptureInterrupted(
@@ -431,6 +480,27 @@ mod dxgi {
             }
 
             let data = read_back(&self.context, &self.staging.texture, width, height)?;
+            // Cached cursor-free, so a later pointer-only update (above) has
+            // a clean base to redraw the cursor onto instead of compositing
+            // on top of wherever it last was.
+            self.last_frame_data = Some(data.clone());
+            Ok(self.finish_frame(data))
+        }
+
+        /// Composites the cached cursor onto `data` (if one is visible),
+        /// hashes the result and turns it into a [`Frame`], or `None` when
+        /// §11.1's "identical to the previous one" holds even with the
+        /// cursor included.
+        fn finish_frame(&mut self, mut data: Vec<u8>) -> Option<Frame> {
+            if let (Some(pos), Some(shape)) = (self.pointer_position, self.pointer_shape.as_ref()) {
+                composite_pointer(
+                    &mut data,
+                    self.staging.width,
+                    self.staging.height,
+                    pos,
+                    shape,
+                );
+            }
 
             // A present is not a change: Windows repaints regions that end up
             // pixel-identical (measured here - 13 consecutive presents, each
@@ -438,22 +508,25 @@ mod dxgi {
             // the dirty-rect metadata both say "new frame" for a screen that
             // did not visibly change. Hashing is what actually answers §11.1's
             // "identical to the previous one", and it is far cheaper than
-            // encoding and shipping a duplicate 4K frame (ADR 0012).
+            // encoding and shipping a duplicate 4K frame (ADR 0012). Hashing
+            // after compositing means cursor motion over a static screen
+            // still counts as a change, which is correct: the picture a
+            // viewer sees did change.
             let hash = *blake3::hash(&data).as_bytes();
             if self.last_hash == Some(hash) {
-                return Ok(None);
+                return None;
             }
             self.last_hash = Some(hash);
 
             let timestamp_us =
                 u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            Ok(Some(Frame {
-                width,
-                height,
+            Some(Frame {
+                width: self.staging.width,
+                height: self.staging.height,
                 format: PixelFormat::Bgra8,
                 timestamp_us,
                 data,
-            }))
+            })
         }
     }
 
@@ -551,6 +624,243 @@ mod dxgi {
                 "desktop duplication mapped an unusable frame buffer".to_owned(),
             )
         })
+    }
+
+    /// A cursor bitmap as `GetFramePointerShape` hands it back: still in
+    /// whichever of the three DXGI shape encodings the OS chose, since that
+    /// choice is what [`composite_pointer`] switches on.
+    struct PointerShape {
+        kind: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        pixels: Vec<u8>,
+    }
+
+    /// Reads the current cursor bitmap off `duplication`.
+    ///
+    /// Only called when `DXGI_OUTDUPL_FRAME_INFO::PointerShapeBufferSize` is
+    /// nonzero, i.e. the shape changed since the last acquire - Desktop
+    /// Duplication does not repeat it on every frame.
+    fn fetch_pointer_shape(
+        duplication: &IDXGIOutputDuplication,
+        buffer_size: u32,
+    ) -> Result<PointerShape> {
+        let mut buffer = vec![0u8; buffer_size as usize];
+        let mut required = 0u32;
+        let mut shape_info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        // SAFETY: `buffer` is a locally owned allocation exactly
+        // `buffer_size` bytes long, which is what `GetFramePointerShape`
+        // requires the capacity argument to match; `required` and
+        // `shape_info` are locals that outlive the call and are only written
+        // to.
+        unsafe {
+            duplication.GetFramePointerShape(
+                buffer_size,
+                buffer.as_mut_ptr().cast(),
+                &raw mut required,
+                &raw mut shape_info,
+            )
+        }
+        .map_err(|e| {
+            MediaError::CaptureInterrupted(format!("reading the cursor shape failed: {e}"))
+        })?;
+        buffer.truncate(required as usize);
+        Ok(PointerShape {
+            kind: shape_info.Type,
+            width: shape_info.Width,
+            height: shape_info.Height,
+            pitch: shape_info.Pitch,
+            pixels: buffer,
+        })
+    }
+
+    /// Draws `shape` onto `data` with its top-left corner at `pos`, clipped
+    /// to `frame_width`x`frame_height`.
+    ///
+    /// `pos` needs no hotspot adjustment: DXGI's `PointerPosition.Position`
+    /// already names where the shape's top-left corner belongs (MSDN,
+    /// `DXGI_OUTDUPL_POINTER_POSITION`).
+    fn composite_pointer(
+        data: &mut [u8],
+        frame_width: u32,
+        frame_height: u32,
+        pos: (i32, i32),
+        shape: &PointerShape,
+    ) {
+        if shape.kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0.cast_unsigned() {
+            composite_monochrome(data, frame_width, frame_height, pos, shape);
+        } else if shape.kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned() {
+            composite_color(data, frame_width, frame_height, pos, shape, false);
+        } else if shape.kind
+            == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR
+                .0
+                .cast_unsigned()
+        {
+            composite_color(data, frame_width, frame_height, pos, shape, true);
+        }
+        // Any other value is a shape type this DXGI version does not
+        // document; leaving the frame undrawn is the honest degradation.
+    }
+
+    /// `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR` / `..._MASKED_COLOR`: a 32bpp
+    /// BGRA bitmap.
+    ///
+    /// Plain `COLOR` alpha-blends normally. `MASKED_COLOR` reuses the alpha
+    /// byte as a 1-bit AND mask instead of real alpha (MSDN): a set bit means
+    /// XOR the color onto the background (used for cursors like the text
+    /// I-beam that must stay visible over any background), a clear bit means
+    /// draw the color opaque.
+    fn composite_color(
+        data: &mut [u8],
+        frame_width: u32,
+        frame_height: u32,
+        pos: (i32, i32),
+        shape: &PointerShape,
+        masked: bool,
+    ) {
+        let (pos_x, pos_y) = pos;
+        for row in 0..shape.height {
+            let Some(dst_y) = pos_y
+                .checked_add_unsigned(row)
+                .filter(|y| u32::try_from(*y).is_ok_and(|y| y < frame_height))
+            else {
+                continue;
+            };
+            let src_row = (row * shape.pitch) as usize;
+            for col in 0..shape.width {
+                let Some(dst_x) = pos_x
+                    .checked_add_unsigned(col)
+                    .filter(|x| u32::try_from(*x).is_ok_and(|x| x < frame_width))
+                else {
+                    continue;
+                };
+                let src_off = src_row + (col as usize) * BYTES_PER_PIXEL;
+                let Some(src) = shape.pixels.get(src_off..src_off + BYTES_PER_PIXEL) else {
+                    continue;
+                };
+                #[allow(
+                    clippy::cast_sign_loss,
+                    reason = "dst_x/dst_y were just checked non-negative and in range above"
+                )]
+                let dst_off =
+                    ((dst_y as u32 * frame_width + dst_x as u32) as usize) * BYTES_PER_PIXEL;
+                let Some(dst) = data.get_mut(dst_off..dst_off + BYTES_PER_PIXEL) else {
+                    continue;
+                };
+                if masked {
+                    if src[3] == 0 {
+                        dst[0] = src[0];
+                        dst[1] = src[1];
+                        dst[2] = src[2];
+                    } else {
+                        dst[0] ^= src[0];
+                        dst[1] ^= src[1];
+                        dst[2] ^= src[2];
+                    }
+                    dst[3] = 0xFF;
+                } else {
+                    let alpha = u16::from(src[3]);
+                    if alpha == 0 {
+                        continue;
+                    }
+                    if alpha == 0xFF {
+                        dst[..3].copy_from_slice(&src[..3]);
+                    } else {
+                        for c in 0..3 {
+                            let s = u16::from(src[c]);
+                            let d = u16::from(dst[c]);
+                            // s, d in 0..=255 and alpha in 1..=254 here (0 and
+                            // 255 are handled above), so the blend is always
+                            // in 0..=255: never a truncating cast.
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "blend of two u8 channels by a u8 alpha over 255 is bounded to 0..=255"
+                            )]
+                            let blended = ((s * alpha + d * (255 - alpha)) / 255) as u8;
+                            dst[c] = blended;
+                        }
+                    }
+                    dst[3] = 0xFF;
+                }
+            }
+        }
+    }
+
+    /// `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME`: a 1bpp AND mask stacked
+    /// directly above a 1bpp XOR mask of the same size, so `shape.height` is
+    /// double the actual cursor height (MSDN).
+    ///
+    /// Per-pixel result follows the classic Win32 monochrome cursor rule:
+    /// AND=1,XOR=0 leaves the background alone (transparent), AND=0,XOR=0 is
+    /// opaque black, AND=0,XOR=1 is opaque white, AND=1,XOR=1 inverts
+    /// whatever is already there.
+    fn composite_monochrome(
+        data: &mut [u8],
+        frame_width: u32,
+        frame_height: u32,
+        pos: (i32, i32),
+        shape: &PointerShape,
+    ) {
+        let (pos_x, pos_y) = pos;
+        let cursor_height = shape.height / 2;
+        for row in 0..cursor_height {
+            let Some(dst_y) = pos_y
+                .checked_add_unsigned(row)
+                .filter(|y| u32::try_from(*y).is_ok_and(|y| y < frame_height))
+            else {
+                continue;
+            };
+            let and_row = (row * shape.pitch) as usize;
+            let xor_row = ((row + cursor_height) * shape.pitch) as usize;
+            for col in 0..shape.width {
+                let Some(dst_x) = pos_x
+                    .checked_add_unsigned(col)
+                    .filter(|x| u32::try_from(*x).is_ok_and(|x| x < frame_width))
+                else {
+                    continue;
+                };
+                let byte_index = (col / 8) as usize;
+                let bit = 7 - (col % 8);
+                let (Some(&and_byte), Some(&xor_byte)) = (
+                    shape.pixels.get(and_row + byte_index),
+                    shape.pixels.get(xor_row + byte_index),
+                ) else {
+                    continue;
+                };
+                let and_bit = (and_byte >> bit) & 1;
+                let xor_bit = (xor_byte >> bit) & 1;
+                #[allow(
+                    clippy::cast_sign_loss,
+                    reason = "dst_x/dst_y were just checked non-negative and in range above"
+                )]
+                let dst_off =
+                    ((dst_y as u32 * frame_width + dst_x as u32) as usize) * BYTES_PER_PIXEL;
+                let Some(dst) = data.get_mut(dst_off..dst_off + BYTES_PER_PIXEL) else {
+                    continue;
+                };
+                match (and_bit, xor_bit) {
+                    (0, 0) => {
+                        dst[0] = 0;
+                        dst[1] = 0;
+                        dst[2] = 0;
+                        dst[3] = 0xFF;
+                    }
+                    (0, 1) => {
+                        dst[0] = 0xFF;
+                        dst[1] = 0xFF;
+                        dst[2] = 0xFF;
+                        dst[3] = 0xFF;
+                    }
+                    (1, 0) => {}
+                    _ => {
+                        dst[0] ^= 0xFF;
+                        dst[1] ^= 0xFF;
+                        dst[2] ^= 0xFF;
+                    }
+                }
+            }
+        }
     }
 
     /// Maps a failure while opening a duplication.
@@ -849,6 +1159,144 @@ mod dxgi {
         /// couple of seconds of real desktop time, plenty for a blinking
         /// caret or a clock, and it cannot hang the suite.
         const POLL_ATTEMPTS: usize = 60;
+
+        /// A 4x4 opaque-black frame, tightly packed BGRA8 - the canvas the
+        /// cursor-compositing tests below draw onto.
+        fn blank_frame() -> Vec<u8> {
+            [0, 0, 0, 0xFF].repeat(16)
+        }
+
+        fn pixel(data: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+            let off = ((y * width + x) as usize) * BYTES_PER_PIXEL;
+            data[off..off + BYTES_PER_PIXEL].try_into().unwrap()
+        }
+
+        /// A fully opaque red pixel, `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR`,
+        /// draws its color straight onto the frame.
+        #[test]
+        fn color_cursor_draws_opaque_pixels() {
+            let mut data = blank_frame();
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 1,
+                height: 1,
+                pitch: 4,
+                pixels: vec![0, 0, 0xFF, 0xFF], // BGRA: opaque red
+            };
+            composite_pointer(&mut data, 4, 4, (1, 1), &shape);
+            assert_eq!(pixel(&data, 4, 1, 1), [0, 0, 0xFF, 0xFF]);
+            // Untouched neighbor stays the canvas's original black.
+            assert_eq!(pixel(&data, 4, 0, 0), [0, 0, 0, 0xFF]);
+        }
+
+        /// A zero-alpha `COLOR` pixel is fully transparent: the background
+        /// underneath must be left alone, not overwritten with garbage.
+        #[test]
+        fn color_cursor_skips_transparent_pixels() {
+            let mut data = blank_frame();
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 1,
+                height: 1,
+                pitch: 4,
+                pixels: vec![0xFF, 0xFF, 0xFF, 0],
+            };
+            composite_pointer(&mut data, 4, 4, (2, 2), &shape);
+            assert_eq!(pixel(&data, 4, 2, 2), [0, 0, 0, 0xFF]);
+        }
+
+        /// `MASKED_COLOR` reuses the alpha byte as a 1-bit AND mask (MSDN):
+        /// alpha 0 means draw the color opaque, alpha 0xFF means XOR the
+        /// color onto whatever is already there.
+        #[test]
+        fn masked_color_cursor_replaces_or_xors_by_the_mask_bit() {
+            let mut data = blank_frame();
+            // Seed a known background so the XOR branch has something to
+            // combine with.
+            let bg_off = 5 * BYTES_PER_PIXEL; // row 1, col 1 of a 4-wide frame
+            data[bg_off..bg_off + 4].copy_from_slice(&[0x0F, 0x0F, 0x0F, 0xFF]);
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR
+                    .0
+                    .cast_unsigned(),
+                width: 2,
+                height: 1,
+                pitch: 8,
+                pixels: vec![
+                    0xF0, 0xF0, 0xF0, 0x00, // col 0: mask clear -> opaque replace
+                    0xF0, 0xF0, 0xF0, 0xFF, // col 1: mask set -> XOR
+                ],
+            };
+            composite_pointer(&mut data, 4, 4, (0, 1), &shape);
+            assert_eq!(pixel(&data, 4, 0, 1), [0xF0, 0xF0, 0xF0, 0xFF]);
+            assert_eq!(pixel(&data, 4, 1, 1), [0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        /// `MONOCHROME` stacks a 1bpp AND mask directly above a 1bpp XOR
+        /// mask of the same size (MSDN), so all four AND/XOR combinations
+        /// have to land on the classic Win32 monochrome-cursor outcomes:
+        /// invert, white, transparent, black.
+        #[test]
+        fn monochrome_cursor_covers_all_four_mask_combinations() {
+            let mut data = blank_frame();
+            let bg_off = 0usize;
+            data[bg_off..bg_off + 4].copy_from_slice(&[0x33, 0x55, 0x77, 0xFF]);
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0.cast_unsigned(),
+                width: 4,
+                height: 2, // one real row: AND row then XOR row
+                pitch: 1,
+                pixels: vec![
+                    0b1010_0000, // AND row: col0=1 col1=0 col2=1 col3=0
+                    0b1100_0000, // XOR row: col0=1 col1=1 col2=0 col3=0
+                ],
+            };
+            composite_pointer(&mut data, 4, 4, (0, 0), &shape);
+            // col0: AND=1,XOR=1 -> invert the seeded background.
+            assert_eq!(pixel(&data, 4, 0, 0), [0xCC, 0xAA, 0x88, 0xFF]);
+            // col1: AND=0,XOR=1 -> opaque white.
+            assert_eq!(pixel(&data, 4, 1, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+            // col2: AND=1,XOR=0 -> transparent, background untouched.
+            assert_eq!(pixel(&data, 4, 2, 0), [0, 0, 0, 0xFF]);
+            // col3: AND=0,XOR=0 -> opaque black.
+            assert_eq!(pixel(&data, 4, 3, 0), [0, 0, 0, 0xFF]);
+        }
+
+        /// A cursor partly off the frame's top-left edge (negative position,
+        /// routine near a monitor's corner) must clip instead of panicking
+        /// or wrapping into an unrelated pixel via a negative-to-unsigned
+        /// cast.
+        #[test]
+        fn cursor_partially_off_the_top_left_edge_is_clipped_not_panicking() {
+            let mut data = blank_frame();
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 2,
+                height: 2,
+                pitch: 8,
+                pixels: vec![0xFF; 32], // 2x2 opaque white
+            };
+            composite_pointer(&mut data, 4, 4, (-1, -1), &shape);
+            // Only the in-bounds corner (shape-local (1,1) -> frame (0,0))
+            // was drawable.
+            assert_eq!(pixel(&data, 4, 0, 0), [0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        /// A cursor running off the bottom-right edge must likewise clip
+        /// rather than writing past the end of `data`.
+        #[test]
+        fn cursor_partially_off_the_bottom_right_edge_is_clipped_not_panicking() {
+            let mut data = blank_frame();
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 2,
+                height: 2,
+                pitch: 8,
+                pixels: vec![0xFF; 32],
+            };
+            composite_pointer(&mut data, 4, 4, (3, 3), &shape);
+            assert_eq!(pixel(&data, 4, 3, 3), [0xFF, 0xFF, 0xFF, 0xFF]);
+        }
     }
 }
 
