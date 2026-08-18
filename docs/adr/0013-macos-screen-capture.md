@@ -148,6 +148,41 @@ and no alternative capture path: an ungranted prompt ends the attempt. That
 is the §2 rule ("no unattended access, no hidden capture, no bypassing OS
 permission prompts") applied literally, not a best effort.
 
+### What the Mac actually did
+
+Verified on the macOS 26.6.2 / x86_64 test VM, not just compiled:
+`cargo build`, `cargo test` (25 passed), `cargo clippy --all-targets -D
+warnings` and `cargo fmt --check` all pass with the feature on, and the
+default `cargo build -p lumepeer-media` still builds on macOS with the stub.
+
+Screen Recording is **not** granted to a `cargo test` binary run over SSH,
+which is the more interesting half of the result. No prompt appeared — TCC
+has no GUI session to raise one in, and a test binary has no bundle identity
+to attach a grant to — and the request did not hang waiting for one either.
+`SCShareableContent` came back immediately with
+
+```
+domain=com.apple.ScreenCaptureKit.SCStreamErrorDomain code=-3801
+desc=The user declined TCCs for application, window, display capture
+```
+
+which is the mapping this module already had: `start` returned
+`MediaError::PermissionDenied`, and the live-capture test printed
+`skipped: Screen Recording is not granted to this test binary` and passed
+rather than failing the suite, the way `capture::linux_x11`'s tests skip on a
+headless runner. That is exactly the intended shape — the backend refuses and
+says why, instead of finding another way to the pixels — but it does mean the
+frame-copy path (`copy_bgra`/`read_locked`) has been compiled and reviewed,
+not executed. Exercising it needs a granted, bundled application, which is
+`apps/desktop`'s job and therefore the parallel pipeline effort's, not this
+one's. The `-3801` mapping, the change-detection and the stop-reason logic
+are covered by tests that do run.
+
+Worth recording for whoever wires this up: the grant attaches to the
+*application bundle*, so the desktop app will need
+`NSScreenCaptureUsageDescription` in its `Info.plist` and a signed bundle for
+macOS to offer the prompt at all — a bare binary can only ever be denied.
+
 ### What is still not covered
 
 Window and application capture (`SCContentFilter`'s other initializers),
