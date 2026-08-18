@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Mirrors capabilities/main.json for the `pilot`-feature build (see build.rs) - keep both files' permissions list identical. Duplicated because Tauri's build-time capability glob reads one directory tree per build, and the pilot build additionally needs pilot.json alongside it.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "core:window:allow-close",
+      "allow": [{ "label": "main" }]
+    },
+    "updater:default",
+    "allow-session-grant",
+    "allow-session-revoke",
+    "allow-session-status",
+    "allow-license-status",
+    "allow-invite-create",
+    "allow-invite-connect"
+  ]
+}

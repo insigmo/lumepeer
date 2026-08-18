@@ -15,6 +15,21 @@ default = []
 # that `cargo build --workspace` in phase 0 needs no platform SDKs.
 capture-scap = ["dep:scap"]
 capture-x11 = ["dep:x11rb"]
+# ScreenCaptureKit capture for macOS (§11, §5.1; ADR 0013). Kept behind a
+# feature, exactly like capture-x11 above, so `cargo build --workspace` needs
+# no platform SDK by default. The objc2 framework bindings it pulls in are
+# declared optional in the macOS target table below, so this feature is inert
+# (and the deps are never built) on every other platform.
+capture-screencapturekit = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-core-graphics",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-screen-capture-kit",
+    "dep:block2",
+    "dep:dispatch2",
+]
 # xdg-desktop-portal negotiation and PipeWire frame consumption for the
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
@@ -28,6 +43,19 @@ decode-openh264 = ["dep:openh264"]
 # of `decode::windows_sandbox` needs it unconditionally on Windows - see
 # below), so this feature only gates the encoder module itself.
 encode-mf = []
+# DXGI Desktop Duplication screen capture (§11, §18; ADR 0012). Same
+# convention as capture-x11/encode-mf above, so `cargo build --workspace`
+# needs no platform SDK and pulls in no extra bindings. The `windows` crate
+# itself is not optional on Windows (see below), so this feature only adds the
+# Direct3D 11/DXGI binding modules the capturer needs on top of what the
+# decoder sandbox and the encoder already require.
+capture-windows = [
+    "windows/Win32_Graphics_Direct3D",
+    "windows/Win32_Graphics_Direct3D11",
+    "windows/Win32_Graphics_Dxgi",
+    "windows/Win32_Graphics_Dxgi_Common",
+    "windows/Win32_Graphics_Gdi",
+]
 
 [dependencies]
 lumepeer-core.workspace = true
@@ -48,6 +76,56 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ], optional = true }
 x11rb = { workspace = true, optional = true, features = ["xtest"] }
 pipewire = { version = "0.8", optional = true }
+
+# ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in
+# (§11, ADR 0013), all optional and pulled in only by
+# `capture-screencapturekit`. These are the `objc2` framework bindings, not a
+# second Apple-interop ecosystem: the versions below are the ones
+# `apps/desktop/src-tauri`'s dependency tree (tauri, tao, objc2-app-kit)
+# already resolves to, checked against Cargo.lock, so enabling the feature
+# adds three framework crates rather than a duplicate objc2 major version.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSEnumerator",
+    "NSError",
+    "NSString",
+] }
+objc2-core-graphics = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CGDirectDisplay",
+] }
+objc2-core-media = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CMBase",
+    "CMSampleBuffer",
+    "CMTime",
+    "objc2-core-video",
+] }
+objc2-core-video = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "SCStream",
+    "SCShareableContent",
+    "block2",
+    "dispatch2",
+    "objc2-core-graphics",
+    "objc2-core-media",
+] }
+block2 = { version = "0.6.2", optional = true }
+dispatch2 = { version = "0.3.1", optional = true, default-features = false, features = [
+    "std",
+    "objc2",
+] }
 
 # Used unconditionally on Windows (not gated by a Cargo feature): §11.3's
 # `decode::windows_sandbox` needs it for the AppContainer decoder sandbox
