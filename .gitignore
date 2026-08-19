@@ -51,3 +51,12 @@ apps/desktop/src-tauri/binaries/
 apps/desktop/src-tauri/updater.key
 .claude/
 CLAUDE.md
+
+# Installers collected by `task build` (Taskfile.yml collect:installers) —
+# release artifacts of one local build, never checked in.
+installers/
+
+# Unpacked aarch64 cross toolchain + arm64 sysroot for the linux-arm64
+# client build (ci/provision-linux-arm64-cross.sh). ~1.3G of extracted
+# Debian packages, local to the machine that built it.
+.cross/
