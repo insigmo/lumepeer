@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connect-status"
+description = "Enables the connect_status command without any pre-configured scope."
+commands.allow = ["connect_status"]
+
+[[permission]]
+identifier = "deny-connect-status"
+description = "Denies the connect_status command without any pre-configured scope."
+commands.deny = ["connect_status"]
