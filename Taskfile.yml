@@ -12,7 +12,7 @@ vars:
   # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
   # VM's IP changes after a reboot, update it here — nothing else reads it.
   LINUX_HOST: beta@192.168.40.128
-  MACOS_HOST: beta@192.168.1.38
+  MACOS_HOST: beta@192.168.1.44
   REMOTE_DIR: lumepeer
 
 tasks:
@@ -192,7 +192,8 @@ tasks:
       anyway since it mounts and copies the .app straight back out.
     platforms: [darwin]
     deps: [build:client:macos-amd64]
-    dir: "{{.DESKTOP_DIR}}"
+    # No `dir:` — unlike the build tasks this one runs from the repo root,
+    # since the paths below are into the workspace-wide target/ directory.
     vars:
       APP_DIR: target/x86_64-apple-darwin/release/bundle/macos
       DMG_DIR: target/x86_64-apple-darwin/release/bundle/dmg
