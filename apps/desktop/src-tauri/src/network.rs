@@ -13,6 +13,7 @@
 //! outbound write.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::{Grants, Role};
@@ -30,6 +31,7 @@ use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpo
 use rand::Rng as _;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
+use crate::connection_history::{ConnectionHistory, HistoryEntry};
 use crate::view::{
     MediaTarget, SharedCapture, ViewSlot, ViewWindows, encode_view_response, lock_capture,
     slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
@@ -112,6 +114,10 @@ enum ActorCommand {
     Status {
         reply: oneshot::Sender<Vec<SessionSnapshot>>,
     },
+    /// Past connections that have already ended (§21 punch-list item 5).
+    History {
+        reply: oneshot::Sender<Vec<HistoryEntry>>,
+    },
     Grant {
         label: String,
         role: Role,
@@ -152,6 +158,11 @@ enum ActorCommand {
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorCommand>,
     notify: broadcast::Sender<ActorNotification>,
+    /// Whether the local endpoint has reached a relay and is dialable from
+    /// outside the LAN. False from process start; flips true at most once,
+    /// when `PeerEndpoint::online()` first resolves (see `spawn_actor`) —
+    /// this crate never observes a relay going back offline.
+    online: Arc<AtomicBool>,
 }
 
 impl ActorHandle {
@@ -159,6 +170,14 @@ impl ActorHandle {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<ActorNotification> {
         self.notify.subscribe()
+    }
+
+    /// Whether this host is currently ready to accept incoming connections
+    /// from outside the LAN. Purely a status report for the UI — carries no
+    /// authorization of its own (§2.3).
+    #[must_use]
+    pub fn online(&self) -> bool {
+        self.online.load(Ordering::Relaxed)
     }
 
     /// Snapshot of every pending and active session.
@@ -169,6 +188,20 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::Status { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Past connections that have already ended, newest first (§21 punch-list
+    /// item 5).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn history(&self) -> Result<Vec<HistoryEntry>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::History { reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -423,6 +456,9 @@ struct Actor {
     host_addrs: std::collections::HashMap<NodeId, iroh::EndpointAddr>,
     /// How view windows are created and closed.
     windows: Arc<dyn ViewWindows>,
+    /// Host side: past connections that have already ended (§21 punch-list
+    /// item 5).
+    history: ConnectionHistory,
 }
 
 impl Actor {
@@ -891,13 +927,26 @@ impl Actor {
         // host stops capturing for this viewer, the guest closes its window.
         self.stop_media(peer);
         self.stop_view(peer);
+        let label = peer_tag(&self.install_salt, &peer);
+        // A session the host had granted disappears from the live list the
+        // instant its transport drops (`rebuild_labels_and_snapshot`'s own
+        // doc comment: showing `Reconnecting` as `Active` would lie about
+        // who is watching) — so this is the moment it belongs in history,
+        // whether or not a reconnect later resumes it (§21 punch-list item
+        // 5). A peer that never got past a pending request has no role to
+        // record.
+        if self.sessions.state(&peer) == SessionState::Active
+            && let Some(role) = self.sessions.role(&peer)
+        {
+            self.history.record(label.clone(), role);
+        }
         if self.sessions.on_disconnect(peer).is_err() {
             // No active session to move into the reconnect window, so this was
             // a guest that dropped before the host decided: drop its queued
             // request instead of leaving it pending forever.
             let _ = self.sessions.revoke(peer);
         }
-        tracing::info!(peer = %peer_tag(&self.install_salt, &peer), "peer disconnected");
+        tracing::info!(peer = %label, "peer disconnected");
         let _ = self.notify.send(ActorNotification::Disconnected);
         self.rebuild_labels_and_snapshot();
     }
@@ -907,6 +956,9 @@ impl Actor {
             ActorCommand::Status { reply } => {
                 let snapshot = self.rebuild_labels_and_snapshot();
                 let _ = reply.send(snapshot);
+            }
+            ActorCommand::History { reply } => {
+                let _ = reply.send(self.history.entries().to_vec());
             }
             ActorCommand::Grant { label, role, reply } => {
                 let result = self.on_grant(&label, role);
@@ -1012,6 +1064,14 @@ impl Actor {
             }
             return Ok(());
         }
+        // Captured before `revoke` removes the session: an explicit revoke is
+        // always a final end, worth a history entry the same as a dropped
+        // transport (§21 punch-list item 5).
+        if self.sessions.state(&peer) == SessionState::Active
+            && let Some(role) = self.sessions.role(&peer)
+        {
+            self.history.record(label.to_owned(), role);
+        }
         self.sessions.revoke(peer).map_err(ActorError::Core)?;
         self.send_to(&peer, MessageKind::ConsentRevoke);
         self.stop_media(peer);
@@ -1079,21 +1139,40 @@ pub async fn spawn_actor(app: tauri::AppHandle) -> Result<ActorHandle, NetError>
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let endpoint = PeerEndpoint::bind(secret_key).await?;
+    let history_path = connection_history_path(&app);
+
+    let handle = spawn_actor_with(
+        endpoint.clone(),
+        identity,
+        Arc::new(crate::view::TauriViewWindows::new(app)),
+        default_capture(),
+        history_path,
+    );
 
     tokio::spawn({
-        let endpoint = endpoint.clone();
+        let online = Arc::clone(&handle.online);
         async move {
             endpoint.online().await;
+            online.store(true, Ordering::Relaxed);
             tracing::info!("endpoint reached a relay; invites are dialable from outside the LAN");
         }
     });
 
-    Ok(spawn_actor_with(
-        endpoint,
-        identity,
-        Arc::new(crate::view::TauriViewWindows::new(app)),
-        default_capture(),
-    ))
+    Ok(handle)
+}
+
+/// Where the connection history file lives, if the app data directory can be
+/// resolved at all. `None` degrades the feature to in-memory-only for this
+/// run rather than failing startup over a convenience list (§18).
+fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager as _;
+    match app.path().app_local_data_dir() {
+        Ok(dir) => Some(dir.join("connection_history.json")),
+        Err(error) => {
+            tracing::warn!(%error, "cannot resolve the app data directory; connection history will not persist");
+            None
+        }
+    }
 }
 
 /// Builds the host's capture controller, falling back to a capturer that
@@ -1125,6 +1204,7 @@ pub fn spawn_actor_with(
     identity: SigningKey,
     windows: Arc<dyn ViewWindows>,
     capture: SharedCapture,
+    history_path: Option<std::path::PathBuf>,
 ) -> ActorHandle {
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
@@ -1151,9 +1231,14 @@ pub fn spawn_actor_with(
         views: std::collections::HashMap::new(),
         host_addrs: std::collections::HashMap::new(),
         windows,
+        history: ConnectionHistory::open(history_path),
     };
     tokio::spawn(actor.run());
-    ActorHandle { tx, notify }
+    ActorHandle {
+        tx,
+        notify,
+        online: Arc::new(AtomicBool::new(false)),
+    }
 }
 
 #[cfg(test)]
@@ -1267,6 +1352,7 @@ mod tests {
             identity,
             Arc::clone(&windows),
             Arc::clone(&capture),
+            None,
         );
         (handle, endpoint, capture, windows)
     }
@@ -1430,6 +1516,62 @@ mod tests {
         host.revoke(label).await.unwrap();
         assert_eq!(viewers(&capture), 0, "a revoke must stop capture");
         assert!(!lock_capture(&capture).is_capturing());
+    }
+
+    /// A revoked session must not just vanish from the live list: it belongs
+    /// in the sidebar's connection history too (§21 punch-list item 5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoke_records_the_session_in_connection_history() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        assert!(host.history().await.unwrap().is_empty());
+
+        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::FullControl).await.unwrap();
+        host.revoke(label.clone()).await.unwrap();
+
+        let history = host.history().await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].peer_label, label);
+        assert_eq!(history[0].role, Role::FullControl);
+    }
+
+    /// A guest that vanishes mid-session must show up in history too: the
+    /// live entry already disappeared (`Reconnecting` is hidden from the
+    /// snapshot), so this is the only place it would ever be remembered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_disconnect_also_records_history_even_without_an_explicit_revoke() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.qr_string).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+
+        guest_endpoint.close().await;
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let history = host.history().await.unwrap();
+            if !history.is_empty() {
+                assert_eq!(history[0].peer_label, label);
+                assert_eq!(history[0].role, Role::ViewOnly);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the disconnect was never recorded in history"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     /// A guest that disappears without a revoke must not leave the host

@@ -146,10 +146,28 @@ pub fn platform_injector() -> Result<Box<dyn InputInjector>> {
     {
         linux_x11::X11Injector::connect().map(|i| Box::new(i) as Box<dyn InputInjector>)
     }
-    #[cfg(not(all(
-        target_os = "linux",
-        not(target_os = "android"),
-        feature = "capture-x11"
+    #[cfg(all(target_os = "windows", feature = "capture-windows"))]
+    {
+        windows::WindowsInjector::connect().map(|i| Box::new(i) as Box<dyn InputInjector>)
+    }
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "capture-screencapturekit"
+    ))]
+    {
+        macos::MacosInjector::connect().map(|i| Box::new(i) as Box<dyn InputInjector>)
+    }
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "capture-x11"
+        ),
+        all(target_os = "windows", feature = "capture-windows"),
+        all(
+            any(target_os = "macos", target_os = "ios"),
+            feature = "capture-screencapturekit"
+        ),
     )))]
     {
         Err(MediaError::InputUnavailable(

@@ -25,10 +25,10 @@
 //! so no capture backend exists there (§1.2).
 
 #[cfg(all(target_os = "macos", feature = "capture-screencapturekit"))]
-pub use self::screen_capture_kit::MacosCapturer;
+pub use self::screen_capture_kit::{MacosCapturer, MacosInjector};
 
 #[cfg(not(all(target_os = "macos", feature = "capture-screencapturekit")))]
-pub use self::unavailable::MacosCapturer;
+pub use self::unavailable::{MacosCapturer, MacosInjector};
 
 /// The real backend. Kept in an inline module so the `unsafe_code` carve-out
 /// this file needs cannot leak onto the stub below (§21, ADR 0013).
@@ -47,7 +47,11 @@ mod screen_capture_kit {
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-    use objc2_core_graphics::CGMainDisplayID;
+    use objc2_core_foundation::{CFRetained, CGPoint};
+    use objc2_core_graphics::{
+        CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType,
+        CGKeyCode, CGMainDisplayID, CGMouseButton, CGScrollEventUnit,
+    };
     use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
         CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
@@ -61,9 +65,16 @@ mod screen_capture_kit {
     };
 
     use lumepeer_core::constants::ENCODE_DEFAULT_FPS;
+    use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
 
-    use crate::capture::{CaptureTarget, Frame, InputCapability, PixelFormat, ScreenCapturer};
+    use crate::capture::{
+        CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
+    };
     use crate::error::{MediaError, Result};
+
+    /// Full range of a normalized pointer coordinate (§9.1), matching
+    /// `capture::linux_x11::POINTER_RANGE`.
+    const POINTER_RANGE: u32 = 65_535;
 
     /// `kCVPixelFormatType_32BGRA`, the packed little-endian BGRA format this
     /// backend pins on the stream so frames arrive in the one layout
@@ -689,6 +700,268 @@ mod screen_capture_kit {
         }
     }
 
+    /// macOS virtual key codes for the named keys the guest can send
+    /// (`Carbon.framework`/`HIToolbox`'s `kVK_*` constants, `Events.h`, read
+    /// from the SDK header directly rather than transcribed from memory) —
+    /// not bound by `objc2-core-graphics`, so listed here by hand, the same
+    /// way `capture::linux_x11` hand-lists its XTEST event type codes.
+    /// Matches `apps/desktop/src/view-window.ts`'s `NAMED_KEYS` table one to
+    /// one, with the two renames Apple's naming inverts relative to the web:
+    /// `kVK_Delete` is the key left of Return (the web's `Backspace`),
+    /// `kVK_ForwardDelete` is the web's `Delete`. `Insert` (0xe008) and
+    /// `F21`..`F24` (0xe115..=0xe118) have no `kVK_` constant at all and so
+    /// have no entry here; `key` reports those explicitly rather than
+    /// guessing a code.
+    fn named_key_vk(logical: u32) -> Option<CGKeyCode> {
+        Some(match logical {
+            0x08 => 0x33,   // Backspace -> kVK_Delete
+            0x09 => 0x30,   // Tab -> kVK_Tab
+            0x0d => 0x24,   // Enter -> kVK_Return
+            0x1b => 0x35,   // Escape -> kVK_Escape
+            0x7f => 0x75,   // Delete -> kVK_ForwardDelete
+            0xe000 => 0x7B, // ArrowLeft
+            0xe001 => 0x7E, // ArrowUp
+            0xe002 => 0x7C, // ArrowRight
+            0xe003 => 0x7D, // ArrowDown
+            0xe004 => 0x73, // Home
+            0xe005 => 0x77, // End
+            0xe006 => 0x74, // PageUp
+            0xe007 => 0x79, // PageDown
+            0xe010 => 0x38, // Shift
+            0xe011 => 0x3B, // Control
+            0xe012 => 0x3A, // Alt -> kVK_Option
+            0xe013 => 0x37, // Meta -> kVK_Command
+            0xe014 => 0x39, // CapsLock
+            0xe101 => 0x7A, // F1
+            0xe102 => 0x78, // F2
+            0xe103 => 0x63, // F3
+            0xe104 => 0x76, // F4
+            0xe105 => 0x60, // F5
+            0xe106 => 0x61, // F6
+            0xe107 => 0x62, // F7
+            0xe108 => 0x64, // F8
+            0xe109 => 0x65, // F9
+            0xe10a => 0x6D, // F10
+            0xe10b => 0x67, // F11
+            0xe10c => 0x6F, // F12
+            0xe10d => 0x69, // F13
+            0xe10e => 0x6B, // F14
+            0xe10f => 0x71, // F15
+            0xe110 => 0x6A, // F16
+            0xe111 => 0x40, // F17
+            0xe112 => 0x4F, // F18
+            0xe113 => 0x50, // F19
+            0xe114 => 0x5A, // F20
+            _ => return None,
+        })
+    }
+
+    /// Input injection through `CGEvent`, posted at the HID tap so it reaches
+    /// every application, the same reach `SendInput` has on Windows and
+    /// XTEST has on X11 (§11).
+    ///
+    /// Screen Recording (this file's own permission, for capture) and
+    /// Accessibility (this type's permission, for posting events) are
+    /// separate macOS grants. Losing Accessibility mid-session is a normal,
+    /// handled event: the next `inject` returns [`MediaError::InputUnavailable`]
+    /// and the caller revokes rather than crashing (§18).
+    #[derive(Debug)]
+    pub struct MacosInjector {
+        /// Primary display size in points, read once at `connect` so every
+        /// `PointerMove` scales the guest's normalized 0..=65535 coordinate
+        /// without re-querying `CGDirectDisplay` per event.
+        width: f64,
+        height: f64,
+        /// Wherever `PointerMove` last put the pointer. `Press`/`Release`
+        /// carry no coordinate of their own (`view-window.ts`'s `sink.press`
+        /// takes no x/y at all — the guest always moves, then clicks), and
+        /// `CGEventCreateMouseEvent` requires *some* position for a button
+        /// event, unlike XTEST/`SendInput`, which post a click at wherever
+        /// the pointer already is without being told.
+        last_position: CGPoint,
+        /// The button a `Press` last reported down, cleared on its matching
+        /// `Release`. Drives whether the next `PointerMove` posts
+        /// `MouseMoved` or a `*Dragged` variant: unlike X11/`SendInput`,
+        /// Quartz event delivery genuinely distinguishes the two, and most
+        /// `AppKit` views only receive `mouseMoved:` when a window has opted
+        /// in, while `mouseDragged:` always fires while a button is down —
+        /// so getting this wrong silently breaks drag-select and window
+        /// dragging rather than just mislabeling an event.
+        held: Option<CGMouseButton>,
+    }
+
+    impl MacosInjector {
+        /// # Errors
+        /// [`MediaError::InputUnavailable`] if the primary display's size
+        /// cannot be read — implausible on a running desktop, but this keeps
+        /// `PointerMove` from ever scaling against a size it never checked.
+        pub fn connect() -> Result<Self> {
+            let display = CGMainDisplayID();
+            let width = CGDisplayPixelsWide(display);
+            let height = CGDisplayPixelsHigh(display);
+            if width == 0 || height == 0 {
+                return Err(MediaError::InputUnavailable(
+                    "cannot read the primary display's size".to_owned(),
+                ));
+            }
+            // A real display's pixel width/height is nowhere near f64's
+            // 2^52 exact-integer ceiling, so the precision this could lose
+            // in principle never actually happens.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "display pixel counts stay far below f64's 52-bit exact-integer range"
+            )]
+            Ok(Self {
+                width: width as f64,
+                height: height as f64,
+                last_position: CGPoint { x: 0.0, y: 0.0 },
+                held: None,
+            })
+        }
+
+        fn post(event: Option<CFRetained<CGEvent>>) -> Result<()> {
+            let Some(event) = event else {
+                return Err(MediaError::InputUnavailable(
+                    "CGEvent creation failed".to_owned(),
+                ));
+            };
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+            Ok(())
+        }
+
+        fn key_vk(vk: CGKeyCode, pressed: bool) -> Result<()> {
+            Self::post(CGEvent::new_keyboard_event(None, vk, pressed))
+        }
+
+        /// One code point, sent by value rather than by virtual key: the
+        /// guest's `logical` is a Unicode code point, not a layout-dependent
+        /// key, and `CGEventKeyboardSetUnicodeString` is the escape hatch
+        /// macOS gives for that (matches any layout, any language) — the
+        /// same role `KEYEVENTF_UNICODE` plays in the Windows backend.
+        /// `virtual_key` 0 (`kVK_ANSI_A`) is an arbitrary placeholder: the
+        /// Unicode string overrides whatever character it would have typed.
+        fn key_unicode(unit: u16, pressed: bool) -> Result<()> {
+            let Some(event) = CGEvent::new_keyboard_event(None, 0, pressed) else {
+                return Err(MediaError::InputUnavailable(
+                    "CGEvent creation failed".to_owned(),
+                ));
+            };
+            let units = [unit];
+            // SAFETY: `units` is a live, one-element `[u16]` for the length
+            // (1) passed alongside it; `CGEvent` copies the string out before
+            // this call returns and keeps no pointer into `units`.
+            unsafe {
+                CGEvent::keyboard_set_unicode_string(Some(&event), 1, units.as_ptr());
+            }
+            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+            Ok(())
+        }
+
+        fn key(logical: u32, pressed: bool) -> Result<()> {
+            if let Some(vk) = named_key_vk(logical) {
+                return Self::key_vk(vk, pressed);
+            }
+            let ch = char::from_u32(logical).ok_or_else(|| {
+                MediaError::InputUnavailable(format!(
+                    "logical key {logical} is neither a named key nor a valid code point"
+                ))
+            })?;
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                Self::key_unicode(*unit, pressed)?;
+            }
+            Ok(())
+        }
+
+        fn button(&mut self, logical: u32, pressed: bool) -> Result<()> {
+            let index = logical.saturating_sub(POINTER_BUTTON_LOGICAL_BASE);
+            let (event_type, mouse_button) = match (index, pressed) {
+                (0, true) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
+                (0, false) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
+                (1, true) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+                (1, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
+                (2, true) => (CGEventType::RightMouseDown, CGMouseButton::Right),
+                (2, false) => (CGEventType::RightMouseUp, CGMouseButton::Right),
+                _ => {
+                    return Err(MediaError::InputUnavailable(format!(
+                        "pointer button {index} is not supported"
+                    )));
+                }
+            };
+            self.held = pressed.then_some(mouse_button);
+            Self::post(CGEvent::new_mouse_event(
+                None,
+                event_type,
+                self.last_position,
+                mouse_button,
+            ))
+        }
+
+        /// `x`/`y` are normalized to 0..=65535 of the captured surface
+        /// (§9.1); `CGEvent`'s mouse position is in points from the primary
+        /// display's top-left, so this scales by the size cached in
+        /// `connect` — the same role `X11Injector::to_screen` plays.
+        fn point(&self, x: u16, y: u16) -> CGPoint {
+            CGPoint {
+                x: f64::from(x) * self.width / f64::from(POINTER_RANGE),
+                y: f64::from(y) * self.height / f64::from(POINTER_RANGE),
+            }
+        }
+
+        fn wheel(dx: i16, dy: i16) -> Result<()> {
+            if dx == 0 && dy == 0 {
+                return Ok(());
+            }
+            Self::post(CGEvent::new_scroll_wheel_event2(
+                None,
+                CGScrollEventUnit::Pixel,
+                2,
+                i32::from(dy),
+                i32::from(dx),
+                0,
+            ))
+        }
+    }
+
+    impl InputInjector for MacosInjector {
+        fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
+            match event.detail {
+                InputDetail::PointerMove { x, y } => {
+                    self.last_position = self.point(x, y);
+                    let (event_type, button) = match self.held {
+                        Some(button @ CGMouseButton::Left) => {
+                            (CGEventType::LeftMouseDragged, button)
+                        }
+                        Some(button @ CGMouseButton::Right) => {
+                            (CGEventType::RightMouseDragged, button)
+                        }
+                        Some(button) => (CGEventType::OtherMouseDragged, button),
+                        None => (CGEventType::MouseMoved, CGMouseButton::Left),
+                    };
+                    Self::post(CGEvent::new_mouse_event(
+                        None,
+                        event_type,
+                        self.last_position,
+                        button,
+                    ))
+                }
+                InputDetail::Wheel { dx, dy } => Self::wheel(dx, dy),
+                InputDetail::Press | InputDetail::Release => {
+                    let pressed = matches!(event.detail, InputDetail::Press);
+                    if event.logical >= POINTER_BUTTON_LOGICAL_BASE {
+                        self.button(event.logical, pressed)
+                    } else {
+                        Self::key(event.logical, pressed)
+                    }
+                }
+            }
+        }
+
+        fn capability(&self) -> InputCapability {
+            InputCapability::Full
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         #![allow(clippy::unwrap_used)]
@@ -701,6 +974,76 @@ mod screen_capture_kit {
         #[test]
         fn bgra_four_char_code_matches_core_video() {
             assert_eq!(PIXEL_FORMAT_32BGRA, 0x4247_5241);
+        }
+
+        /// Named keys map to the `kVK_*` code the guest actually means,
+        /// including the two spots Apple's naming inverts relative to the
+        /// web (`Backspace` -> `kVK_Delete`, `Delete` ->
+        /// `kVK_ForwardDelete`). Anything outside the table falls through to
+        /// `key`'s Unicode path instead.
+        #[test]
+        fn named_keys_map_to_the_matching_virtual_key() {
+            assert_eq!(named_key_vk(0x08), Some(0x33)); // Backspace -> kVK_Delete
+            assert_eq!(named_key_vk(0x7f), Some(0x75)); // Delete -> kVK_ForwardDelete
+            assert_eq!(named_key_vk(0x0d), Some(0x24)); // Enter -> kVK_Return
+            assert_eq!(named_key_vk(0xe000), Some(0x7B)); // ArrowLeft
+            assert_eq!(named_key_vk(0xe101), Some(0x7A)); // F1
+            assert_eq!(named_key_vk(0xe114), Some(0x5A)); // F20, the last named one
+            // A plain character code point is not a named key: `key` sends it
+            // through `CGEventKeyboardSetUnicodeString` instead.
+            assert_eq!(named_key_vk(u32::from(b'a')), None);
+            // Insert and F21..F24 have no `kVK_` constant at all.
+            assert_eq!(named_key_vk(0xe008), None);
+            assert_eq!(named_key_vk(0xe115), None);
+        }
+
+        /// The real thing, against the real window server. `connect` cannot
+        /// fail on a missing permission (reading the display size needs
+        /// none), but posting the event can: skipped rather than failed when
+        /// Accessibility is not granted to this test binary, the normal
+        /// state for a run over SSH (matches this file's own
+        /// `capture_produces_a_frame_when_screen_recording_is_granted`, one
+        /// permission over from this one). Even when it runs, this only
+        /// moves the pointer to the position it already has — read back from
+        /// a fresh null `CGEvent`, which still carries the live HID location
+        /// — so nothing visible happens (matches `capture::linux_x11`'s
+        /// XTEST test).
+        #[test]
+        fn cgevent_injection_works_when_explicitly_enabled() {
+            if std::env::var("LUMEPEER_TEST_CGEVENT").as_deref() != Ok("1") {
+                return;
+            }
+            let mut injector = MacosInjector::connect().unwrap();
+            assert_eq!(injector.capability(), InputCapability::Full);
+
+            let probe = CGEvent::new(None).unwrap();
+            let current = CGEvent::location(Some(&probe));
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "test-only: the u16::try_from right after already guards the range"
+            )]
+            let normalize = |value: f64, extent: f64| -> u16 {
+                u16::try_from(((value / extent) * f64::from(POINTER_RANGE)) as i64)
+                    .unwrap_or(u16::MAX)
+            };
+            let payload = InputEventPayload {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: InputDetail::PointerMove {
+                    x: normalize(current.x, injector.width),
+                    y: normalize(current.y, injector.height),
+                },
+            };
+            match injector.inject(&payload) {
+                Ok(()) => {}
+                Err(MediaError::InputUnavailable(reason)) => {
+                    eprintln!(
+                        "skipped: Accessibility is not granted to this test binary: {reason}"
+                    );
+                }
+                Err(e) => panic!("injection failed for an unexpected reason: {e}"),
+            }
         }
 
         /// The §18 matrix rows this backend can produce. Permission is the one
@@ -846,7 +1189,9 @@ mod screen_capture_kit {
 /// `cargo build --workspace` needs no platform SDK.
 #[cfg(not(all(target_os = "macos", feature = "capture-screencapturekit")))]
 mod unavailable {
-    use crate::capture::{CaptureTarget, Frame, InputCapability, ScreenCapturer};
+    use lumepeer_core::protocol::InputEventPayload;
+
+    use crate::capture::{CaptureTarget, Frame, InputCapability, InputInjector, ScreenCapturer};
     use crate::error::{MediaError, Result};
 
     /// `ScreenCaptureKit` capturer, not built in.
@@ -879,6 +1224,37 @@ mod unavailable {
         fn stop(&mut self) {}
 
         fn input_capability(&self) -> InputCapability {
+            InputCapability::Full
+        }
+    }
+
+    /// `CGEvent` injector, not built in.
+    #[derive(Debug, Default)]
+    pub struct MacosInjector {
+        _private: (),
+    }
+
+    impl MacosInjector {
+        /// Refuses: rebuild with `capture-screencapturekit` to get real
+        /// injection.
+        ///
+        /// # Errors
+        /// Always.
+        pub fn connect() -> Result<Self> {
+            Err(MediaError::InputUnavailable(
+                "macOS input injection needs the `capture-screencapturekit` feature".to_owned(),
+            ))
+        }
+    }
+
+    impl InputInjector for MacosInjector {
+        fn inject(&mut self, _event: &InputEventPayload) -> Result<()> {
+            Err(MediaError::InputUnavailable(
+                "macOS input injection needs the `capture-screencapturekit` feature".to_owned(),
+            ))
+        }
+
+        fn capability(&self) -> InputCapability {
             InputCapability::Full
         }
     }

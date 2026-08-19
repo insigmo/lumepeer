@@ -23,6 +23,7 @@ capture-x11 = ["dep:x11rb"]
 capture-screencapturekit = [
     "dep:objc2",
     "dep:objc2-foundation",
+    "dep:objc2-core-foundation",
     "dep:objc2-core-graphics",
     "dep:objc2-core-media",
     "dep:objc2-core-video",
@@ -55,6 +56,7 @@ capture-windows = [
     "windows/Win32_Graphics_Dxgi",
     "windows/Win32_Graphics_Dxgi_Common",
     "windows/Win32_Graphics_Gdi",
+    "windows/Win32_UI_Input_KeyboardAndMouse",
 ]
 
 [dependencies]
@@ -86,6 +88,10 @@ pipewire = { version = "0.8", optional = true }
 # adds three framework crates rather than a duplicate objc2 major version.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CFCGTypes",
+] }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
     "NSArray",
@@ -96,6 +102,9 @@ objc2-foundation = { version = "0.3.2", optional = true, default-features = fals
 objc2-core-graphics = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
     "CGDirectDisplay",
+    "CGEvent",
+    "CGEventTypes",
+    "CGRemoteOperation",
 ] }
 objc2-core-media = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",

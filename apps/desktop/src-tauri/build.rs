@@ -11,6 +11,8 @@ const COMMANDS: &[&str] = &[
     "session_grant",
     "session_revoke",
     "session_status",
+    "connection_history",
+    "network_status",
     "license_status",
     "invite_create",
     "invite_connect",

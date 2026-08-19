@@ -38,22 +38,24 @@
 //! (ADR 0012).
 
 #[cfg(feature = "capture-windows")]
-pub use dxgi::WindowsCapturer;
+pub use dxgi::{WindowsCapturer, WindowsInjector};
 #[cfg(not(feature = "capture-windows"))]
-pub use stub::WindowsCapturer;
+pub use stub::{WindowsCapturer, WindowsInjector};
 
-/// DXGI Desktop Duplication capture (§11, §18; ADR 0012).
+/// DXGI Desktop Duplication capture, plus `SendInput` injection (§11, §18;
+/// ADR 0012).
 ///
-/// The fourth and last place in the crate that needs `unsafe`, after
-/// `decode::shm` (ADR 0005), `decode::windows_sandbox` (ADR 0007) and
-/// `encode::windows` (ADR 0011): every `IDXGIOutputDuplication`/`ID3D11Device`
-/// call in the `windows` crate's Direct3D 11 and DXGI bindings is `unsafe fn`
-/// because it crosses into COM. Each `unsafe` block in this module carries a
-/// `SAFETY:` note, as §21 requires.
+/// The fourth place in the crate that needs `unsafe`, after `decode::shm`
+/// (ADR 0005), `decode::windows_sandbox` (ADR 0007) and `encode::windows`
+/// (ADR 0011): every `IDXGIOutputDuplication`/`ID3D11Device` call in the
+/// `windows` crate's Direct3D 11 and DXGI bindings is `unsafe fn` because it
+/// crosses into COM, and `SendInput` (below, `WindowsInjector`) is `unsafe`
+/// for the same FFI reason even though it touches no COM interface. Each
+/// `unsafe` block in this module carries a `SAFETY:` note, as §21 requires.
 #[cfg(feature = "capture-windows")]
 #[allow(
     unsafe_code,
-    reason = "DXGI Desktop Duplication is COM; every IDXGIOutputDuplication/ID3D11Device call in the `windows` crate is `unsafe fn`. See ADR 0012."
+    reason = "DXGI Desktop Duplication is COM and SendInput is raw FFI; every IDXGIOutputDuplication/ID3D11Device call in the `windows` crate is `unsafe fn`. See ADR 0012."
 )]
 mod dxgi {
     use std::time::Instant;
@@ -76,9 +78,22 @@ mod dxgi {
         DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
         IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK,
+        VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT,
+        VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    };
     use windows::core::Interface as _;
 
-    use crate::capture::{CaptureTarget, Frame, InputCapability, PixelFormat, ScreenCapturer};
+    use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
+
+    use crate::capture::{
+        CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
+    };
     use crate::error::{MediaError, Result};
 
     /// Bytes per pixel of `DXGI_FORMAT_B8G8R8A8_UNORM`, the only format
@@ -974,6 +989,242 @@ mod dxgi {
         }
     }
 
+    /// Extra mouse buttons carried in `MOUSEINPUT.mouseData` alongside
+    /// `MOUSEEVENTF_XDOWN`/`MOUSEEVENTF_XUP` (winuser.h; a stable Win32 ABI
+    /// constant, not re-exposed under `Win32_UI_Input_KeyboardAndMouse`).
+    const XBUTTON1: u32 = 0x0001;
+    const XBUTTON2: u32 = 0x0002;
+
+    /// Named keys the guest can send that are not a single character (§9.1's
+    /// `logical`, matching `apps/desktop/src/view-window.ts`'s `NAMED_KEYS`
+    /// table plus its `0xe100 + N` F-key encoding one to one). Everything
+    /// else `Self::key` treats as a Unicode code point.
+    fn named_key_vk(logical: u32) -> Option<VIRTUAL_KEY> {
+        Some(match logical {
+            0x08 => VK_BACK,
+            0x09 => VK_TAB,
+            0x0d => VK_RETURN,
+            0x1b => VK_ESCAPE,
+            0x7f => VK_DELETE,
+            0xe000 => VK_LEFT,
+            0xe001 => VK_UP,
+            0xe002 => VK_RIGHT,
+            0xe003 => VK_DOWN,
+            0xe004 => VK_HOME,
+            0xe005 => VK_END,
+            0xe006 => VK_PRIOR,
+            0xe007 => VK_NEXT,
+            0xe008 => VK_INSERT,
+            0xe010 => VK_SHIFT,
+            0xe011 => VK_CONTROL,
+            0xe012 => VK_MENU,
+            0xe013 => VK_LWIN,
+            0xe014 => VK_CAPITAL,
+            0xe101..=0xe118 => VIRTUAL_KEY(VK_F1.0 + u16::try_from(logical - 0xe101).unwrap_or(0)),
+            _ => return None,
+        })
+    }
+
+    /// Input injection through `SendInput` (§11).
+    ///
+    /// Stateless: every call synthesizes one already-authorized event and
+    /// nothing here ever consults a grant (§2.3, §11), matching
+    /// `X11Injector`.
+    #[derive(Debug, Default)]
+    pub struct WindowsInjector {
+        _private: (),
+    }
+
+    impl WindowsInjector {
+        /// Nothing to set up: `SendInput` needs no connection or handle.
+        /// Fallible signature only to match `X11Injector::connect` and leave
+        /// room for a future capability probe.
+        ///
+        /// # Errors
+        /// Never, today.
+        pub const fn connect() -> Result<Self> {
+            Ok(Self { _private: () })
+        }
+
+        fn send(inputs: &[INPUT]) -> Result<()> {
+            let size = i32::try_from(size_of::<INPUT>()).unwrap_or(0);
+            // SAFETY: `inputs` is a fully initialized, valid `&[INPUT]` for its
+            // own length, exactly what `SendInput` requires; no pointer into it
+            // is retained past this call.
+            let sent = unsafe { SendInput(inputs, size) };
+            if sent as usize != inputs.len() {
+                return Err(MediaError::InputUnavailable(
+                    "SendInput did not accept every synthesized event (desktop locked or blocked by UIPI?)"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn key_vk(vk: VIRTUAL_KEY, pressed: bool) -> Result<()> {
+            Self::send(&[INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        wScan: 0,
+                        dwFlags: if pressed {
+                            KEYBD_EVENT_FLAGS::default()
+                        } else {
+                            KEYEVENTF_KEYUP
+                        },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }])
+        }
+
+        /// One UTF-16 code unit, sent by value rather than by virtual key: the
+        /// guest's `logical` is a Unicode code point, not a layout-dependent
+        /// key, and `KEYEVENTF_UNICODE` is exactly the escape hatch Windows
+        /// gives for that (matches any layout, any language).
+        fn key_unicode(unit: u16, pressed: bool) -> Result<()> {
+            Self::send(&[INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: if pressed {
+                            KEYEVENTF_UNICODE
+                        } else {
+                            KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                        },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }])
+        }
+
+        fn key(logical: u32, pressed: bool) -> Result<()> {
+            if let Some(vk) = named_key_vk(logical) {
+                return Self::key_vk(vk, pressed);
+            }
+            let ch = char::from_u32(logical).ok_or_else(|| {
+                MediaError::InputUnavailable(format!(
+                    "logical key {logical} is neither a named key nor a valid code point"
+                ))
+            })?;
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf) {
+                Self::key_unicode(*unit, pressed)?;
+            }
+            Ok(())
+        }
+
+        fn button(logical: u32, pressed: bool) -> Result<()> {
+            let index = logical.saturating_sub(POINTER_BUTTON_LOGICAL_BASE);
+            let (flags, mouse_data) = match (index, pressed) {
+                (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+                (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+                (1, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+                (1, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+                (2, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+                (2, false) => (MOUSEEVENTF_RIGHTUP, 0),
+                (3, true) => (MOUSEEVENTF_XDOWN, XBUTTON1),
+                (3, false) => (MOUSEEVENTF_XUP, XBUTTON1),
+                (4, true) => (MOUSEEVENTF_XDOWN, XBUTTON2),
+                (4, false) => (MOUSEEVENTF_XUP, XBUTTON2),
+                _ => {
+                    return Err(MediaError::InputUnavailable(format!(
+                        "pointer button {index} is not supported"
+                    )));
+                }
+            };
+            Self::send(&[INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: mouse_data,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }])
+        }
+
+        /// `x`/`y` are already normalized to 0..=65535 of the captured surface
+        /// (§9.1), which is exactly `MOUSEEVENTF_ABSOLUTE`'s coordinate space
+        /// for the primary monitor — the same surface `CaptureTarget::
+        /// PrimaryDisplay` captures — so no scaling is needed here.
+        fn move_to(x: u16, y: u16) -> Result<()> {
+            Self::send(&[INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: i32::from(x),
+                        dy: i32::from(y),
+                        mouseData: 0,
+                        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            }])
+        }
+
+        fn wheel(dx: i16, dy: i16) -> Result<()> {
+            let mut inputs = Vec::with_capacity(2);
+            for (delta, flags) in [(dy, MOUSEEVENTF_WHEEL), (dx, MOUSEEVENTF_HWHEEL)] {
+                if delta == 0 {
+                    continue;
+                }
+                inputs.push(INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: 0,
+                            dy: 0,
+                            // `mouseData` is a `DWORD` in WinAPI but read as a
+                            // signed wheel delta; sign-extend through `i32` so
+                            // a negative (scroll down/left) delta round-trips
+                            // through the same two's-complement bit pattern.
+                            mouseData: i32::from(delta).cast_unsigned(),
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+            if inputs.is_empty() {
+                return Ok(());
+            }
+            Self::send(&inputs)
+        }
+    }
+
+    impl InputInjector for WindowsInjector {
+        fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
+            match event.detail {
+                InputDetail::PointerMove { x, y } => Self::move_to(x, y),
+                InputDetail::Wheel { dx, dy } => Self::wheel(dx, dy),
+                InputDetail::Press | InputDetail::Release => {
+                    let pressed = matches!(event.detail, InputDetail::Press);
+                    if event.logical >= POINTER_BUTTON_LOGICAL_BASE {
+                        Self::button(event.logical, pressed)
+                    } else {
+                        Self::key(event.logical, pressed)
+                    }
+                }
+            }
+        }
+
+        fn capability(&self) -> InputCapability {
+            InputCapability::Full
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         #![allow(clippy::unwrap_used)]
@@ -989,6 +1240,23 @@ mod dxgi {
         /// actually duplicate the screen take this first, or they would race
         /// each other into a false "no duplicable desktop" skip.
         static ONE_DUPLICATION_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+        /// Named keys map to the virtual key the guest actually means;
+        /// anything outside the named table falls through to `key`'s
+        /// Unicode path instead (matches `view-window.ts`'s `NAMED_KEYS`).
+        #[test]
+        fn named_keys_map_to_the_matching_virtual_key() {
+            assert_eq!(named_key_vk(0x08), Some(VK_BACK));
+            assert_eq!(named_key_vk(0x0d), Some(VK_RETURN));
+            assert_eq!(named_key_vk(0xe000), Some(VK_LEFT));
+            assert_eq!(named_key_vk(0xe014), Some(VK_CAPITAL));
+            // F1 and F24, the ends of the 0xe100+N encoding.
+            assert_eq!(named_key_vk(0xe101), Some(VK_F1));
+            assert_eq!(named_key_vk(0xe118).map(|vk| vk.0), Some(VK_F1.0 + 23));
+            // A plain character code point is not a named key: `key` sends it
+            // through `KEYEVENTF_UNICODE` instead.
+            assert_eq!(named_key_vk(u32::from(b'a')), None);
+        }
 
         /// A capture backend must never claim it is running when it is not.
         #[test]
@@ -1307,7 +1575,9 @@ mod dxgi {
 /// `capture::windows::WindowsCapturer` to anything that names it.
 #[cfg(not(feature = "capture-windows"))]
 mod stub {
-    use crate::capture::{CaptureTarget, Frame, InputCapability, ScreenCapturer};
+    use lumepeer_core::protocol::InputEventPayload;
+
+    use crate::capture::{CaptureTarget, Frame, InputCapability, InputInjector, ScreenCapturer};
     use crate::error::{MediaError, Result};
 
     /// DXGI/WGC capturer, not built in.
@@ -1344,6 +1614,40 @@ mod stub {
         fn stop(&mut self) {}
 
         fn input_capability(&self) -> InputCapability {
+            InputCapability::Full
+        }
+    }
+
+    /// `SendInput` injector, not built in.
+    #[derive(Debug, Default)]
+    pub struct WindowsInjector {
+        _private: (),
+    }
+
+    /// Why every call below refuses, in one place.
+    fn injection_not_built_in() -> MediaError {
+        MediaError::InputUnavailable(
+            "windows input injection is not built in: rebuild with the `capture-windows` feature"
+                .to_owned(),
+        )
+    }
+
+    impl WindowsInjector {
+        /// Refuses: rebuild with `capture-windows` to get real injection.
+        ///
+        /// # Errors
+        /// Always.
+        pub fn connect() -> Result<Self> {
+            Err(injection_not_built_in())
+        }
+    }
+
+    impl InputInjector for WindowsInjector {
+        fn inject(&mut self, _event: &InputEventPayload) -> Result<()> {
+            Err(injection_not_built_in())
+        }
+
+        fn capability(&self) -> InputCapability {
             InputCapability::Full
         }
     }

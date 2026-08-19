@@ -37,20 +37,35 @@ export function consentDialog(
   }
 
   return html`
-    <section class="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
-      <h1 id="consent-title">${t(locale, 'consent.request.title', request.peer_label)}</h1>
-      <p>${t(locale, 'consent.request.body')}</p>
-      <div class="consent-actions">
-        <button type="button" autofocus @click=${() => void revoke(request.peer_label)}>
-          ${t(locale, 'consent.action.deny')}
-        </button>
-        <button type="button" @click=${() => void grant(request.peer_label, 'view_only')}>
-          ${t(locale, 'consent.action.allowView')}
-        </button>
-        <button type="button" @click=${() => void grant(request.peer_label, 'full_control')}>
-          ${t(locale, 'consent.action.allowFull')}
-        </button>
-      </div>
-    </section>
+    <div class="consent-backdrop">
+      <section class="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
+        <h1 id="consent-title">${t(locale, 'consent.request.title', request.peer_label)}</h1>
+        <p>${t(locale, 'consent.request.body')}</p>
+        <div class="consent-actions">
+          <button
+            type="button"
+            autofocus
+            class="consent-action-deny"
+            @click=${() => void revoke(request.peer_label)}
+          >
+            ${t(locale, 'consent.action.deny')}
+          </button>
+          <button
+            type="button"
+            class="consent-action-view"
+            @click=${() => void grant(request.peer_label, 'view_only')}
+          >
+            ${t(locale, 'consent.action.allowView')}
+          </button>
+          <button
+            type="button"
+            class="consent-action-full"
+            @click=${() => void grant(request.peer_label, 'full_control')}
+          >
+            ${t(locale, 'consent.action.allowFull')}
+          </button>
+        </div>
+      </section>
+    </div>
   `;
 }
