@@ -237,6 +237,25 @@ pub struct SessionStatusDto {
     pub input: bool,
 }
 
+/// One row of the past-connections list (§21 punch-list item 5).
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryEntryDto {
+    /// Pseudonymized peer label, as `session_status` uses (§15).
+    pub peer_label: String,
+    /// Role the peer held before the session ended.
+    pub role: RoleDto,
+    /// Unix seconds the session ended.
+    pub ended_at: u64,
+}
+
+/// Whether this host is ready to accept incoming connections.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkStatusDto {
+    /// True once the local endpoint has reached a relay and is dialable
+    /// from outside the LAN.
+    pub ready: bool,
+}
+
 /// License state for the UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct LicenseStatusDto {
@@ -311,6 +330,28 @@ pub async fn session_status(
         .collect())
 }
 
+/// Lists past connections that have already ended, newest first (§21
+/// punch-list item 5).
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn connection_history(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<HistoryEntryDto>, IpcError> {
+    check_window(&window)?;
+    let entries = state.network.history().await?;
+    Ok(entries
+        .into_iter()
+        .map(|e| HistoryEntryDto {
+            peer_label: e.peer_label,
+            role: e.role.into(),
+            ended_at: e.ended_at,
+        })
+        .collect())
+}
+
 /// Issues an invite for `args.role` and returns the QR payload.
 ///
 /// # Errors
@@ -342,6 +383,21 @@ pub async fn invite_connect(
     check_window(&window)?;
     state.network.invite_connect(args.ticket).await?;
     Ok(())
+}
+
+/// Reports whether this host is ready to accept incoming connections.
+///
+/// # Errors
+/// Rejects calls from other windows.
+#[tauri::command]
+pub fn network_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<NetworkStatusDto, IpcError> {
+    check_window(&window)?;
+    Ok(NetworkStatusDto {
+        ready: state.network.online(),
+    })
 }
 
 /// Reports the license state.

@@ -74,11 +74,12 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -505,7 +506,15 @@ pub(crate) fn spawn_confined(program: &Path, ring_path: &Path) -> Result<Confine
             None,
             None,
             true,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                // The worker is a console-subsystem binary; without this flag
+                // Windows allocates it a fresh, visible console the moment it
+                // runs (its stdio pipes above only cover stdin/stdout, not
+                // console *allocation*). It must stay confined and unseen,
+                // never a window the guest or a bystander can see (§11.3).
+                | CREATE_NO_WINDOW,
             None,
             PCWSTR(cwd_wide.as_ptr()),
             &raw const startup.StartupInfo,

@@ -10,10 +10,20 @@
       "identifier": "core:window:allow-close",
       "allow": [{ "label": "main" }]
     },
+    {
+      "identifier": "core:window:allow-minimize",
+      "allow": [{ "label": "main" }]
+    },
+    {
+      "identifier": "core:window:allow-toggle-maximize",
+      "allow": [{ "label": "main" }]
+    },
     "updater:default",
     "allow-session-grant",
     "allow-session-revoke",
     "allow-session-status",
+    "allow-connection-history",
+    "allow-network-status",
     "allow-license-status",
     "allow-invite-create",
     "allow-invite-connect"

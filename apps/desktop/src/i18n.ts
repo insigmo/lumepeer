@@ -18,17 +18,37 @@ export type TranslationKey =
   | 'consent.action.allowFull'
   | 'invite.heading'
   | 'invite.create'
+  | 'invite.refresh'
   | 'invite.qrAlt'
   | 'invite.connectLabel'
   | 'invite.connect'
-  | 'status.notSharing'
-  | 'status.heading'
+  | 'invite.connectPlaceholder'
+  | 'invite.connecting'
   | 'status.inputOn'
   | 'status.inputOff'
   | 'status.revoke'
+  | 'status.endedJustNow'
+  | 'status.endedMinutesAgo'
+  | 'status.endedHoursAgo'
+  | 'status.endedDaysAgo'
   | 'status.role.viewOnly'
   | 'status.role.controlLimited'
   | 'status.role.fullControl'
+  | 'status.ready'
+  | 'status.notReady'
+  | 'titlebar.minimize'
+  | 'titlebar.maximize'
+  | 'titlebar.close'
+  | 'sidebar.inviteLabel'
+  | 'sidebar.copyCode'
+  | 'sidebar.copied'
+  | 'sidebar.serverless'
+  | 'panel.heading'
+  | 'panel.subtext'
+  | 'connections.header'
+  | 'connections.refresh'
+  | 'connections.emptyTitle'
+  | 'connections.emptySubtext'
   | 'view.canvasLabel'
   | 'view.waiting'
   | 'view.reconnecting'
@@ -49,17 +69,37 @@ const en: Dictionary = {
   'consent.action.allowFull': 'Allow full control',
   'invite.heading': 'Invite and connect',
   'invite.create': 'Create invite',
+  'invite.refresh': 'Refresh invite',
   'invite.qrAlt': 'QR code',
   'invite.connectLabel': 'Enter invite code:',
   'invite.connect': 'Connect',
-  'status.notSharing': 'Not sharing.',
-  'status.heading': 'Active sessions',
+  'invite.connectPlaceholder': 'Paste invite code here',
+  'invite.connecting': 'Connecting',
   'status.inputOn': 'input on',
   'status.inputOff': 'input off',
   'status.revoke': 'Revoke',
+  'status.endedJustNow': 'Ended just now',
+  'status.endedMinutesAgo': (n) => `Ended ${n}m ago`,
+  'status.endedHoursAgo': (n) => `Ended ${n}h ago`,
+  'status.endedDaysAgo': (n) => `Ended ${n}d ago`,
   'status.role.viewOnly': 'view only',
   'status.role.controlLimited': 'limited control',
   'status.role.fullControl': 'full control',
+  'status.ready': 'Ready to connect',
+  'status.notReady': 'Not ready to connect',
+  'titlebar.minimize': 'Minimize',
+  'titlebar.maximize': 'Maximize',
+  'titlebar.close': 'Close',
+  'sidebar.inviteLabel': 'Your invite code',
+  'sidebar.copyCode': 'Copy code',
+  'sidebar.copied': 'Copied',
+  'sidebar.serverless': 'P2P · serverless',
+  'panel.heading': 'Connect to device',
+  'panel.subtext': 'Paste an invite code to connect to a remote device.',
+  'connections.header': 'Connections',
+  'connections.refresh': 'Refresh',
+  'connections.emptyTitle': 'No connections yet',
+  'connections.emptySubtext': 'Connected devices will appear here.',
   'view.canvasLabel': 'Remote screen',
   'view.waiting': 'Waiting for the remote screen…',
   'view.reconnecting': 'Connection lost, reconnecting…',
@@ -79,17 +119,37 @@ const ar: Dictionary = {
   'consent.action.allowFull': 'السماح بالتحكم الكامل',
   'invite.heading': 'الدعوة والاتصال',
   'invite.create': 'إنشاء دعوة',
+  'invite.refresh': 'تحديث الدعوة',
   'invite.qrAlt': 'رمز الاستجابة السريعة',
   'invite.connectLabel': 'أدخل رمز الدعوة:',
   'invite.connect': 'الاتصال',
-  'status.notSharing': 'لا مشاركة حالياً.',
-  'status.heading': 'الجلسات النشطة',
+  'invite.connectPlaceholder': 'الصق رمز الدعوة هنا',
+  'invite.connecting': 'جارٍ الاتصال',
   'status.inputOn': 'الإدخال مفعّل',
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
+  'status.endedJustNow': 'انتهت للتو',
+  'status.endedMinutesAgo': (n) => `انتهت قبل ${n} د`,
+  'status.endedHoursAgo': (n) => `انتهت قبل ${n} س`,
+  'status.endedDaysAgo': (n) => `انتهت قبل ${n} يوم`,
   'status.role.viewOnly': 'مشاهدة فقط',
   'status.role.controlLimited': 'تحكم محدود',
   'status.role.fullControl': 'تحكم كامل',
+  'status.ready': 'جاهز للاتصال',
+  'status.notReady': 'غير جاهز للاتصال',
+  'titlebar.minimize': 'تصغير',
+  'titlebar.maximize': 'تكبير',
+  'titlebar.close': 'إغلاق',
+  'sidebar.inviteLabel': 'رمز الدعوة الخاص بك',
+  'sidebar.copyCode': 'نسخ الرمز',
+  'sidebar.copied': 'تم النسخ',
+  'sidebar.serverless': 'اتصال مباشر · بلا خوادم',
+  'panel.heading': 'الاتصال بجهاز',
+  'panel.subtext': 'الصق رمز الدعوة للاتصال بجهاز بعيد.',
+  'connections.header': 'الاتصالات',
+  'connections.refresh': 'تحديث',
+  'connections.emptyTitle': 'لا توجد اتصالات بعد',
+  'connections.emptySubtext': 'ستظهر الأجهزة المتصلة هنا.',
   'view.canvasLabel': 'الشاشة البعيدة',
   'view.waiting': 'في انتظار الشاشة البعيدة…',
   'view.reconnecting': 'انقطع الاتصال، جارٍ إعادة الاتصال…',

@@ -12,6 +12,7 @@
 )]
 
 mod commands;
+mod connection_history;
 mod network;
 mod view;
 
@@ -75,6 +76,8 @@ fn main() {
             commands::session_grant,
             commands::session_revoke,
             commands::session_status,
+            commands::connection_history,
+            commands::network_status,
             commands::license_status,
             commands::invite_create,
             commands::invite_connect,

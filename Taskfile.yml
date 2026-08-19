@@ -74,10 +74,32 @@ tasks:
     cmds:
       - cargo build --workspace --exclude lumepeer-desktop
 
+  # Builds lumepeer-decoder-worker for TARGET and stages it under
+  # src-tauri/binaries with the -$TARGET_TRIPLE suffix tauri.conf.json's
+  # externalBin expects, so `tauri build` actually bundles a decoder worker
+  # into the installer. Without this step the worker is compiled (build:base
+  # already builds every workspace crate) but never shipped: `cargo build`
+  # happens to drop it right next to a *debug* binary in the same target/
+  # dir, which is why a `cargo tauri dev`/debug run can decode a session
+  # fine while the installed .exe/.deb sits on "waiting for the remote
+  # screen" forever — DecoderHandle::spawn() finds nothing next to the
+  # installed binary and the session never gets past its first frame.
+  stage:decoder-worker:
+    desc: Cross-compiles and stages the decoder-worker sidecar for TARGET.
+    internal: true
+    cmds:
+      - rustup target add {{.TARGET}}
+      - cargo build --release -p lumepeer-decoder-worker --target {{.TARGET}}
+      - mkdir -p {{.DESKTOP_DIR}}/src-tauri/binaries
+      - cp target/{{.TARGET}}/release/lumepeer-decoder-worker{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-decoder-worker-{{.TARGET}}{{.EXT}}
+
   build:client:linux-amd64:
     desc: Build the Linux amd64 client (.deb/.rpm)
     platforms: [linux/amd64]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: x86_64-unknown-linux-gnu, EXT: "" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-unknown-linux-gnu
@@ -89,7 +111,10 @@ tasks:
       toolchain/linker (e.g. via `cross`/Docker) unless run on an arm64
       Linux host directly.
     platforms: [linux/arm64]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: aarch64-unknown-linux-gnu, EXT: "" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add aarch64-unknown-linux-gnu
@@ -98,7 +123,10 @@ tasks:
   build:client:windows-amd64:
     desc: Build the Windows amd64 client
     platforms: [windows]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: x86_64-pc-windows-msvc, EXT: ".exe" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-pc-windows-msvc
@@ -109,7 +137,10 @@ tasks:
       Build the Windows arm64 client. Needs the "MSVC ARM64 build tools"
       component of Visual Studio installed in addition to the rustup target.
     platforms: [windows]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: aarch64-pc-windows-msvc, EXT: ".exe" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add aarch64-pc-windows-msvc
@@ -118,7 +149,10 @@ tasks:
   build:client:macos-arm64:
     desc: Build the macOS arm64 client
     platforms: [darwin]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: aarch64-apple-darwin, EXT: "" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add aarch64-apple-darwin
@@ -137,7 +171,10 @@ tasks:
       release.yml's hosted macOS runners, which do have a working GUI
       session, still build the real release .dmg the ordinary way.
     platforms: [darwin]
-    deps: [build:base]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: x86_64-apple-darwin, EXT: "" }
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-apple-darwin

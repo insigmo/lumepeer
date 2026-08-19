@@ -60,6 +60,50 @@ impl<T: Read + std::fmt::Debug + Send> DebugRead for T {}
 /// Name of the worker binary, which sits next to the main executable.
 pub const WORKER_BINARY: &str = "lumepeer-decoder-worker";
 
+/// Target triple this build was compiled for, matching the `-$TARGET_TRIPLE`
+/// suffix Tauri's `externalBin` sidecar convention requires on the source
+/// binary (see `apps/desktop/src-tauri/tauri.conf.json` and the `stage
+/// decoder-worker sidecar` steps in `Taskfile.yml`). Only the six triples the
+/// Taskfile actually builds are listed; an unrecognized target has no sidecar
+/// candidate and falls back to the bare [`WORKER_BINARY`] name.
+const TARGET_TRIPLE: Option<&str> = {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some("x86_64-pc-windows-msvc")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        Some("aarch64-pc-windows-msvc")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("x86_64-unknown-linux-gnu")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        Some("aarch64-unknown-linux-gnu")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some("x86_64-apple-darwin")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("aarch64-apple-darwin")
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    )))]
+    {
+        None
+    }
+};
+
 /// Sandbox mechanism used to confine the decoder worker (§11.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxKind {
@@ -178,6 +222,35 @@ pub struct DecoderHandle {
     path: PathBuf,
 }
 
+/// Picks the worker binary to spawn next to `exe`.
+///
+/// Tries the bare [`WORKER_BINARY`] name first — what a `cargo build`
+/// workspace tree drops beside the debug binary, so nothing changes for
+/// local/dev runs — then the target-triple-suffixed sidecar name an
+/// installed Tauri build actually ships (`externalBin` copies the binary in
+/// verbatim, triple suffix included; it is not stripped at bundle time).
+/// Falls back to the bare path when neither exists so the resulting spawn
+/// error still names a concrete, useful path.
+fn locate_worker_binary(exe: &Path) -> PathBuf {
+    let mut bare = exe.with_file_name(WORKER_BINARY);
+    if cfg!(windows) {
+        bare.set_extension("exe");
+    }
+    if bare.is_file() {
+        return bare;
+    }
+    if let Some(triple) = TARGET_TRIPLE {
+        let mut sidecar = exe.with_file_name(format!("{WORKER_BINARY}-{triple}"));
+        if cfg!(windows) {
+            sidecar.set_extension("exe");
+        }
+        if sidecar.is_file() {
+            return sidecar;
+        }
+    }
+    bare
+}
+
 impl DecoderHandle {
     /// Spawns the decoder worker inside the platform sandbox, looking for the
     /// worker binary next to the current executable.
@@ -189,11 +262,7 @@ impl DecoderHandle {
     pub fn spawn() -> Result<Self> {
         let exe = std::env::current_exe()
             .map_err(|e| MediaError::DecoderWorker(format!("cannot locate the executable: {e}")))?;
-        let mut worker = exe.with_file_name(WORKER_BINARY);
-        if cfg!(windows) {
-            worker.set_extension("exe");
-        }
-        Self::spawn_with(&worker)
+        Self::spawn_with(&locate_worker_binary(&exe))
     }
 
     /// Spawns a specific worker binary.

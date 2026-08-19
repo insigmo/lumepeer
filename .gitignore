@@ -28,6 +28,10 @@ node_modules/
 apps/desktop/dist/
 apps/desktop/src-tauri/gen/
 
+# Decoder-worker sidecar staged for Tauri's externalBin bundling (Taskfile.yml
+# stage:decoder-worker), rebuilt per target before every client build.
+apps/desktop/src-tauri/binaries/
+
 # go-task checksum cache (Taskfile.yml build:frontend up-to-date tracking)
 .task/
 

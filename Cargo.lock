@@ -3846,6 +3846,7 @@ dependencies = [
  "lumepeer-core",
  "memmap2",
  "objc2",
+ "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-media",
  "objc2-core-video",
