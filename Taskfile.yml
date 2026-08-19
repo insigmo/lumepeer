@@ -2,6 +2,9 @@ version: "3"
 
 vars:
   DESKTOP_DIR: apps/desktop
+  # Where `task build` leaves the finished installers: one directory holding
+  # all eight of them, regardless of which machine each was built on.
+  INSTALLERS_DIR: installers
   # Media backends each client links in. Kept here rather than as defaults in
   # apps/desktop/src-tauri/Cargo.toml so `cargo build --workspace` still
   # needs no platform SDK (X11 headers, DXGI/D3D11 bindings, openh264); a
@@ -9,10 +12,25 @@ vars:
   # reports "no capture backend" instead of showing a picture (§18).
   LINUX_MEDIA_FEATURES: capture-x11,encode-openh264
   WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf
-  # Build VMs reachable over passwordless SSH. Both are DHCP leases, so if a
-  # VM's IP changes after a reboot, update it here — nothing else reads it.
+  # macOS has no hardware encoder wired up yet (encode::select_encoder only
+  # implements the Media Foundation one), so the openh264 software fallback
+  # is what an Apple host encodes with; without it select_encoder errors and
+  # the guest sits on "waiting for the remote screen" until it gives up.
+  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-openh264
+  # Unpacked aarch64 cross toolchain + arm64 sysroot the linux-arm64 target
+  # links against, provisioned by ci/provision-linux-arm64-cross.sh (see
+  # cross:linux-arm64 below). Gitignored and local to whichever machine built
+  # it — never synced between hosts.
+  CROSS_DIR: "{{.ROOT_DIR}}/.cross"
+  # Build VMs reachable over passwordless SSH. Nothing else reads these.
+  # The Linux VM is on the hypervisor's own NAT segment, where its DHCP lease
+  # is stable in practice but no name resolves — so it stays an address, and
+  # if it does move after a reboot, update it here. The Mac is a real machine
+  # on the LAN and its lease has moved (192.168.1.44 -> .39 already), so it is
+  # named by mDNS instead: Bonjour follows it across leases, and both Windows
+  # and the VMs resolve .local without extra setup.
   LINUX_HOST: beta@192.168.40.128
-  MACOS_HOST: beta@192.168.1.44
+  MACOS_HOST: beta@betas-iMac.local
   REMOTE_DIR: lumepeer
 
 tasks:
@@ -22,21 +40,34 @@ tasks:
       - cargo build --workspace
 
   # ---------------------------------------------------------------------
-  # Desktop client builds, mirroring the 6-target matrix in
-  # .github/workflows/release.yml. The frontend bundle and the shared
-  # workspace crates are built once and reused by every client target that
-  # runs afterwards in the same `task` invocation (see build:frontend and
-  # build:base below for how each is kept to a single run).
+  # Desktop client builds. Eight installers, one per OS/arch/package
+  # combination, matching the release.yml matrix (whose two Linux jobs each
+  # emit a .deb and an .rpm, so its six jobs are these eight files):
   #
-  # Cross-OS bundling is not possible from a single machine: Tauri links
+  #   windows-amd64   .exe (NSIS)   windows-arm64   .exe (NSIS)
+  #   linux-amd64     .deb + .rpm   linux-arm64     .deb + .rpm
+  #   macos-amd64     .dmg          macos-arm64     .dmg
+  #
+  # Each build passes an explicit `--bundles` rather than letting
+  # tauri.conf.json's `targets: "all"` decide, so a target produces exactly
+  # the package listed above and `task build` collects a predictable set:
+  # "all" would additionally emit an .msi next to every Windows .exe and an
+  # AppImage next to every Linux pair, and on macOS it would hand the .dmg to
+  # Tauri's own bundler, which cannot run over SSH (see package:dmg).
+  #
+  # Cross-*OS* bundling is not possible from a single machine: Tauri links
   # platform system libraries (webkit2gtk, Cocoa, MSVC) at build time, the
-  # same reason release.yml runs each OS on its own runner. `task
-  # build:clients` therefore only builds the targets valid for the host
-  # it's run on (via `platforms:`) — run it on each OS to cover the full
-  # matrix, same as CI does. Cross-arch targets (e.g. windows-arm64 from an
-  # amd64 host, linux-arm64 without `cross`/Docker) additionally need their
-  # own linker/SDK installed; `rustup target add` alone does not provide
-  # that.
+  # same reason release.yml runs each OS on its own runner. So
+  # `task build:clients` only builds the targets valid for the host it runs
+  # on (via `platforms:`), and `task build` covers all three OSes by driving
+  # the Linux and macOS VMs over SSH. Cross-*arch* within one OS does work on
+  # each host, but needs its own toolchain there:
+  #   - windows-arm64 needs Visual Studio's "MSVC ARM64 build tools"
+  #     component -> `task bootstrap:windows-arm64`, one time, elevated.
+  #   - linux-arm64 needs an aarch64 cross compiler and an arm64 sysroot
+  #     -> cross:linux-arm64 provisions both, unprivileged, on first use.
+  #   - macos-arm64 needs nothing beyond the rustup target: the Xcode command
+  #     line tools cross-compile between Apple architectures either way.
   # ---------------------------------------------------------------------
 
   build:frontend:
@@ -74,6 +105,25 @@ tasks:
     cmds:
       - cargo build --workspace --exclude lumepeer-desktop
 
+  cross:linux-arm64:
+    desc: >-
+      Provision the aarch64 cross toolchain and the arm64 sysroot the
+      linux-arm64 client links against, under {{.CROSS_DIR}}. Needs no root:
+      the header of ci/provision-linux-arm64-cross.sh explains why the arm64
+      development packages are unpacked into a private sysroot instead of
+      being installed via `dpkg --add-architecture arm64` — short version,
+      libwebkit2gtk-4.1-dev and friends are Multi-Arch: no, so installing the
+      arm64 copies evicts the amd64 ones and breaks linux-amd64 on the same
+      machine. Runs once and is skipped afterwards via the stamp file it
+      leaves behind; delete {{.CROSS_DIR}} to force a rebuild.
+    internal: true
+    platforms: [linux]
+    run: once
+    status:
+      - test -f {{.CROSS_DIR}}/stamp
+    cmds:
+      - ci/provision-linux-arm64-cross.sh {{.CROSS_DIR}}
+
   # Builds lumepeer-decoder-worker for TARGET and stages it under
   # src-tauri/binaries with the -$TARGET_TRIPLE suffix tauri.conf.json's
   # externalBin expects, so `tauri build` actually bundles a decoder worker
@@ -87,6 +137,17 @@ tasks:
   stage:decoder-worker:
     desc: Cross-compiles and stages the decoder-worker sidecar for TARGET.
     internal: true
+    # Each of these is named after one target triple, so all of them are
+    # inert for every target except aarch64-unknown-linux-gnu and this can
+    # stay a single task shared by all six. The wrappers they point at are
+    # what carry the awkward parts of that cross setup (--sysroot,
+    # LD_LIBRARY_PATH, the sysroot's library search path);
+    # ci/provision-linux-arm64-cross.sh writes them and documents why.
+    env:
+      CC_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-gcc"
+      CXX_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-g++"
+      AR_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-ar"
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-gcc"
     cmds:
       - rustup target add {{.TARGET}}
       - cargo build --release -p lumepeer-decoder-worker --target {{.TARGET}}
@@ -94,8 +155,8 @@ tasks:
       - cp target/{{.TARGET}}/release/lumepeer-decoder-worker{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-decoder-worker-{{.TARGET}}{{.EXT}}
 
   build:client:linux-amd64:
-    desc: Build the Linux amd64 client (.deb/.rpm)
-    platforms: [linux/amd64]
+    desc: Build the Linux amd64 client (.deb + .rpm)
+    platforms: [linux]
     deps:
       - build:base
       - task: stage:decoder-worker
@@ -103,25 +164,41 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-unknown-linux-gnu
-      - npx tauri build --target x86_64-unknown-linux-gnu --features {{.LINUX_MEDIA_FEATURES}}
+      - npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm --features {{.LINUX_MEDIA_FEATURES}}
 
   build:client:linux-arm64:
     desc: >-
-      Build the Linux arm64 client (.deb/.rpm). Needs an arm64 cross
-      toolchain/linker (e.g. via `cross`/Docker) unless run on an arm64
-      Linux host directly.
-    platforms: [linux/arm64]
+      Build the Linux arm64 client (.deb + .rpm), cross-compiled against the
+      sysroot cross:linux-arm64 unpacks. pkg-config has to be aimed at that
+      sysroot explicitly: PKG_CONFIG_LIBDIR *replaces* the default search
+      path rather than extending it, which is what keeps the host's amd64 .pc
+      files from leaking in and handing the linker x86-64 libraries. The
+      compiler and linker side needs no flags here — the wrappers CC/CXX and
+      the target linker point at carry all of it.
+    platforms: [linux]
     deps:
       - build:base
+      - cross:linux-arm64
       - task: stage:decoder-worker
         vars: { TARGET: aarch64-unknown-linux-gnu, EXT: "" }
     dir: "{{.DESKTOP_DIR}}"
+    env:
+      # Repeated from stage:decoder-worker rather than shared through a YAML
+      # anchor: Task parses `env:` with its own unmarshaller, which rejects a
+      # mapping carrying one.
+      CC_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-gcc"
+      CXX_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-g++"
+      AR_aarch64_unknown_linux_gnu: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-ar"
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "{{.CROSS_DIR}}/bin/aarch64-linux-gnu-gcc"
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      PKG_CONFIG_SYSROOT_DIR: "{{.CROSS_DIR}}/sysroot"
+      PKG_CONFIG_LIBDIR: "{{.CROSS_DIR}}/sysroot/usr/lib/aarch64-linux-gnu/pkgconfig:{{.CROSS_DIR}}/sysroot/usr/share/pkgconfig:{{.CROSS_DIR}}/sysroot/usr/lib/pkgconfig"
     cmds:
       - rustup target add aarch64-unknown-linux-gnu
-      - npx tauri build --target aarch64-unknown-linux-gnu --features {{.LINUX_MEDIA_FEATURES}}
+      - npx tauri build --target aarch64-unknown-linux-gnu --bundles deb,rpm --features {{.LINUX_MEDIA_FEATURES}}
 
   build:client:windows-amd64:
-    desc: Build the Windows amd64 client
+    desc: Build the Windows amd64 client (NSIS .exe)
     platforms: [windows]
     deps:
       - build:base
@@ -130,12 +207,19 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-pc-windows-msvc
-      - npx tauri build --target x86_64-pc-windows-msvc --features {{.WINDOWS_MEDIA_FEATURES}}
+      - npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --features {{.WINDOWS_MEDIA_FEATURES}}
 
   build:client:windows-arm64:
     desc: >-
-      Build the Windows arm64 client. Needs the "MSVC ARM64 build tools"
-      component of Visual Studio installed in addition to the rustup target.
+      Build the Windows arm64 client (NSIS .exe). Needs two Visual Studio
+      components on top of the rustup target, both installed by
+      `task bootstrap:windows-arm64`: the "MSVC ARM64 build tools" (the
+      Windows SDK already ships its arm64 import libraries, but without that
+      component there is no arm64 CRT or link.exe and the build dies at the
+      link step), and clang — `ring` assembles its aarch64 sources from
+      perlasm-generated .S files that MSVC's armasm64 cannot read, so its
+      build script asks cc-rs for `clang` by name on this target only. Since
+      Visual Studio does not put its LLVM on PATH, this task adds it.
     platforms: [windows]
     deps:
       - build:base
@@ -144,32 +228,28 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add aarch64-pc-windows-msvc
-      - npx tauri build --target aarch64-pc-windows-msvc
-
-  build:client:macos-arm64:
-    desc: Build the macOS arm64 client
-    platforms: [darwin]
-    deps:
-      - build:base
-      - task: stage:decoder-worker
-        vars: { TARGET: aarch64-apple-darwin, EXT: "" }
-    dir: "{{.DESKTOP_DIR}}"
-    cmds:
-      - rustup target add aarch64-apple-darwin
-      - npx tauri build --target aarch64-apple-darwin
+      - |
+        set -e
+        # vswhere prints CRLF, and the trailing \r survives $(...) — left in,
+        # it lands in the middle of the PATH entry built below and Windows
+        # rejects the whole path ("The filename, directory name, or volume
+        # label syntax is incorrect"), which reads exactly like clang not
+        # being installed at all. Backslashes for the same reason: mixing
+        # them with forward slashes in one path is rejected too.
+        vs=$("C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)
+        vs=${vs%$'\r'}
+        export PATH="$vs\\VC\\Tools\\Llvm\\bin;$PATH"
+        if ! command -v clang >/dev/null; then
+          echo "no clang under $vs\\VC\\Tools\\Llvm\\bin - run 'task bootstrap:windows-arm64' (ring needs it to assemble its aarch64 sources)" >&2
+          exit 1
+        fi
+        npx tauri build --target aarch64-pc-windows-msvc --bundles nsis --features {{.WINDOWS_MEDIA_FEATURES}}
 
   build:client:macos-amd64:
     desc: >-
-      Build the macOS amd64 client. App-bundle only (--bundles app), no
-      .dmg: Tauri's own dmg bundling shells out to create-dmg, which drives
-      Finder via AppleScript to lay out icons — that AppleEvent has no
-      GUI/Aqua session to talk to over SSH and hangs until it times out
-      (`AppleEvent timed out. (-1712)`), a known limitation of running
-      non-interactively over SSH rather than a real login session.
-      package:dmg:macos-amd64 packages this same .app into a .dmg
-      afterwards without going through Tauri's bundler or Finder at all.
-      release.yml's hosted macOS runners, which do have a working GUI
-      session, still build the real release .dmg the ordinary way.
+      Build the macOS amd64 client as an .app bundle. package:dmg:macos-amd64
+      turns it into the shipped .dmg — see package:dmg for why Tauri's own
+      dmg bundler is not what produces it.
     platforms: [darwin]
     deps:
       - build:base
@@ -178,56 +258,139 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-apple-darwin
-      - npx tauri build --target x86_64-apple-darwin --bundles app
+      - npx tauri build --target x86_64-apple-darwin --bundles app --features {{.MACOS_MEDIA_FEATURES}}
 
-  package:dmg:macos-amd64:
+  build:client:macos-arm64:
     desc: >-
-      Package the macOS amd64 .app already built by build:client:macos-amd64
-      into a plain .dmg. Not Tauri's own dmg bundler (which shells out to
-      create-dmg, which drives Finder over AppleScript to lay out icons — see
-      the comment on build:client:macos-amd64 for why that hangs over SSH).
-      Plain `hdiutil create` needs no Finder/Aqua session at all, so it works
-      the same way non-interactively as it does at a real console; the
-      tradeoff is no icon layout, which install:macos-amd64 doesn't need
-      anyway since it mounts and copies the .app straight back out.
+      Build the macOS arm64 client as an .app bundle. Cross-compiles fine
+      from an Intel Mac — the command line tools carry both slices — so this
+      needs no counterpart to bootstrap:windows-arm64 or cross:linux-arm64.
+      package:dmg:macos-arm64 turns it into the shipped .dmg.
     platforms: [darwin]
-    deps: [build:client:macos-amd64]
+    deps:
+      - build:base
+      - task: stage:decoder-worker
+        vars: { TARGET: aarch64-apple-darwin, EXT: "" }
+    dir: "{{.DESKTOP_DIR}}"
+    cmds:
+      - rustup target add aarch64-apple-darwin
+      - npx tauri build --target aarch64-apple-darwin --bundles app --features {{.MACOS_MEDIA_FEATURES}}
+
+  package:dmg:
+    desc: >-
+      Package an already-built macOS .app into a .dmg with plain `hdiutil
+      create`, deliberately not through Tauri's own dmg bundler: that one
+      shells out to create-dmg, which drives Finder via AppleScript to lay
+      out the icons, and that AppleEvent has no GUI/Aqua session to talk to
+      over SSH — it hangs until it times out (`AppleEvent timed out.
+      (-1712)`). hdiutil needs no Finder at all, so it behaves the same
+      non-interactively as it does at a real console; the tradeoff is no icon
+      layout, which nothing here needs — install:macos-amd64 mounts the image
+      and copies the .app straight back out, and so does install.sh.
+      release.yml's hosted macOS runners do have a working GUI session and
+      still build the ordinary Tauri .dmg.
+    internal: true
+    platforms: [darwin]
     # No `dir:` — unlike the build tasks this one runs from the repo root,
     # since the paths below are into the workspace-wide target/ directory.
     vars:
-      APP_DIR: target/x86_64-apple-darwin/release/bundle/macos
-      DMG_DIR: target/x86_64-apple-darwin/release/bundle/dmg
+      BUNDLE_DIR: target/{{.TARGET}}/release/bundle
     cmds:
-      - mkdir -p {{.DMG_DIR}}
-      - rm -f {{.DMG_DIR}}/Lumepeer_x64.dmg
-      - hdiutil create -volname Lumepeer -srcfolder {{.APP_DIR}} -ov -format UDZO {{.DMG_DIR}}/Lumepeer_x64.dmg
+      # Image a staging directory holding just the .app rather than the
+      # bundle's macos/ directory itself: hdiutil sizes the image from the
+      # source folder and then copies everything in it, so any leftover a
+      # previous run dropped next to the .app (create-dmg's own
+      # rw.<pid>.*.dmg scratch images, from when its Finder step timed out
+      # mid-run) both bloats the payload and overflows the estimate — `No
+      # space left on device` from inside the image, on a host with plenty of
+      # free disk.
+      # The dmg/ directory is wiped rather than written into, because it is
+      # this task's output and nobody else's: a .dmg an older revision of it
+      # left behind under a different name (it used to omit the version) would
+      # otherwise sit there forever and be collected alongside the real one.
+      - |
+        set -e
+        version=$(node -p "require('./{{.DESKTOP_DIR}}/src-tauri/tauri.conf.json').version")
+        stage={{.BUNDLE_DIR}}/dmg/stage
+        rm -rf {{.BUNDLE_DIR}}/dmg
+        mkdir -p "$stage"
+        cp -R {{.BUNDLE_DIR}}/macos/Lumepeer.app "$stage"/
+        hdiutil create -volname Lumepeer -srcfolder "$stage" -ov -format UDZO \
+          {{.BUNDLE_DIR}}/dmg/Lumepeer_${version}_{{.ARCH_SUFFIX}}.dmg
+        rm -rf "$stage"
 
-  build:clients:
-    desc: >-
-      Build every desktop client target valid for this host OS, compiling
-      the frontend bundle and shared workspace crates once and reusing them
-      across all of them.
+  package:dmg:macos-amd64:
+    desc: Build the macOS amd64 client and package it as a .dmg.
+    platforms: [darwin]
+    deps: [build:client:macos-amd64]
+    cmds:
+      - task: package:dmg
+        vars: { TARGET: x86_64-apple-darwin, ARCH_SUFFIX: x64 }
+
+  package:dmg:macos-arm64:
+    desc: Build the macOS arm64 client and package it as a .dmg.
+    platforms: [darwin]
+    deps: [build:client:macos-arm64]
+    cmds:
+      - task: package:dmg
+        vars: { TARGET: aarch64-apple-darwin, ARCH_SUFFIX: aarch64 }
+
+  build:installers:windows:
+    desc: Build both Windows installers (amd64 + arm64) on this host.
+    platforms: [windows]
+    cmds:
+      - task: build:client:windows-amd64
+      - task: build:client:windows-arm64
+
+  build:installers:linux:
+    desc: Build all four Linux packages (.deb + .rpm, amd64 + arm64) on this host.
+    platforms: [linux]
     cmds:
       - task: build:client:linux-amd64
       - task: build:client:linux-arm64
-      - task: build:client:windows-amd64
-      - task: build:client:windows-arm64
-      - task: build:client:macos-arm64
-      - task: build:client:macos-amd64
+
+  build:installers:macos:
+    desc: Build both macOS installers (amd64 + arm64 .dmg) on this host.
+    platforms: [darwin]
+    cmds:
+      - task: package:dmg:macos-amd64
+      - task: package:dmg:macos-arm64
+
+  build:clients:
+    desc: >-
+      Build every installer valid for this host OS, compiling the frontend
+      bundle and shared workspace crates once and reusing them across all of
+      them. The three per-OS tasks are platform-gated, so exactly one of them
+      does anything on any given machine.
+    cmds:
+      - task: build:installers:windows
+      - task: build:installers:linux
+      - task: build:installers:macos
+
+  bootstrap:windows-arm64:
+    desc: >-
+      One-time: add the two Visual Studio components build:client:windows-arm64
+      needs — the MSVC ARM64 build tools (to link) and clang (for `ring`'s
+      aarch64 assembly). Raises a UAC prompt — the VS installer refuses to
+      modify an installation unprivileged — so run this from a session that
+      can answer one, and re-run it if either component is missing: adding a
+      component that is already installed is a no-op.
+    platforms: [windows]
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File ci/install-windows-arm64-toolchain.ps1
 
   # ---------------------------------------------------------------------
-  # Remote build VMs. `task release:all` is the one command that covers all
-  # three OSes from this Windows machine: it builds the Windows targets
-  # right here, and drives the Linux/macOS VMs over SSH, each syncing this
-  # working tree — including uncommitted changes, via `git ls-files` piped
-  # into `tar` rather than `git archive HEAD`, which would silently skip
-  # anything not yet committed (no git needed on the remote — plain tar
-  # extracts it) — and then running the same `task build:clients` there, so
-  # those hosts get the identical once-per-host base/frontend caching.
-  # Bootstrap requirements per VM: passwordless SSH (done), rustup/cargo
-  # (done), and on the Linux VM specifically, apt packages that need a
-  # one-time sudo password a non-interactive SSH session can't supply —
-  # see project notes for the exact command.
+  # Remote build VMs. `task build` is the one command that covers all three
+  # OSes from this Windows machine: it builds the Windows targets right here,
+  # and drives the Linux/macOS VMs over SSH, each syncing this working tree —
+  # including uncommitted changes, via a throwaway git index rather than
+  # `git archive HEAD`, which would silently skip anything not yet committed
+  # (no git needed on the remote — plain tar extracts it) — and then running
+  # that host's own `task build:installers:*` there, so those machines get
+  # the identical once-per-host base/frontend caching.
+  # Bootstrap requirements per VM: passwordless SSH (done) and rustup/cargo
+  # (done). Nothing else — the arm64 cross toolchain provisions itself,
+  # unprivileged, on first use.
   # ---------------------------------------------------------------------
 
   sync:linux:
@@ -243,9 +406,9 @@ tasks:
       # captures uncommitted and untracked-but-not-ignored files too.
       # `git archive` on the resulting tree avoids depending on the local
       # `tar` binary at all. The index file name is unique to this task
-      # (not shared with sync:macos) because `task build`/`release:all` run
-      # both syncs concurrently — a shared name let them race on the same
-      # file and corrupt each other's index.
+      # (not shared with sync:macos) because `task build` runs both syncs
+      # concurrently — a shared name let them race on the same file and
+      # corrupt each other's index.
       - |
         rm -f .git/lumepeer-sync-index-linux
         GIT_INDEX_FILE=.git/lumepeer-sync-index-linux git add -A
@@ -266,47 +429,19 @@ tasks:
         git archive --format=tar "$TREE" | ssh {{.MACOS_HOST}} "mkdir -p ~/{{.REMOTE_DIR}} && tar -xf - -C ~/{{.REMOTE_DIR}}"
 
   remote:build:linux:
-    desc: Sync and build every Linux client target on the remote Linux VM.
+    desc: Sync and build all four Linux packages on the remote Linux VM.
     cmds:
       - task: sync:linux
-      - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:clients"
+      - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:installers:linux"
 
   remote:build:macos:
-    desc: Sync and build every macOS client target on the remote macOS VM.
+    desc: Sync and build both macOS .dmg installers on the remote macOS VM.
     cmds:
       - task: sync:macos
-      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:clients"
-
-  release:all:
-    desc: >-
-      Build every desktop client for Windows, Linux and macOS with one
-      command: Windows builds locally, Linux and macOS build over SSH on
-      their VMs, all three running concurrently since they share nothing.
-    deps:
-      - build:clients
-      - remote:build:linux
-      - remote:build:macos
-
-  # ---------------------------------------------------------------------
-  # build: build the amd64 client for Windows, Linux and macOS — Windows
-  # locally, Linux and macOS over SSH on their VMs, each build landing in
-  # that machine's own target/ bundle dir — then actually install what was
-  # just built on each of those same machines (this one, and both VMs),
-  # echoing the exact command run for each so a manual re-run needs no
-  # lookup. This used to only print the install commands, on the theory that
-  # an unattended `task` run installing something elevated shouldn't happen
-  # silently; in practice that meant the running app never got replaced, so
-  # "just built it" and "actually running the new build" quietly drifted
-  # apart (Windows NSIS/MSI can't even overwrite the old .exe while it's
-  # running - a locked-file failure the printed command never surfaced back
-  # here). install:windows-amd64 kills the running process first for exactly
-  # that reason. Distinct from install.sh/install.ps1 at the repo root, which
-  # install a *published* GitHub Release rather than this working tree's own
-  # build.
-  # ---------------------------------------------------------------------
+      - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:installers:macos"
 
   remote:build:linux-amd64:
-    desc: Sync and build only the Linux amd64 client on the Linux VM over SSH.
+    desc: Sync and build only the Linux amd64 packages on the Linux VM over SSH.
     cmds:
       - task: sync:linux
       - ssh {{.LINUX_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task build:client:linux-amd64"
@@ -314,53 +449,125 @@ tasks:
   remote:package:dmg:macos-amd64:
     desc: >-
       Sync, build and package the macOS amd64 client into a .dmg on
-      {{.MACOS_HOST}} over SSH (see package:dmg:macos-amd64 for why a .dmg
-      rather than a bare .app copy).
+      {{.MACOS_HOST}} over SSH (see package:dmg for why a .dmg rather than a
+      bare .app copy).
     cmds:
       - task: sync:macos
       - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task package:dmg:macos-amd64"
 
+  collect:installers:
+    desc: >-
+      Copy the eight installers into {{.INSTALLERS_DIR}}/ — the two Windows
+      ones out of this machine's target/ directory, the other six off the
+      Linux and macOS VMs over scp. The directory is emptied first: it is a
+      snapshot of one build of one version, and a package left over from an
+      earlier version would sit there looking current, since nothing in the
+      names says when it was built. Every expected file is checked for at the
+      end, so a target that quietly produced nothing fails here instead of
+      shipping a short set.
+    cmds:
+      # Every file is named in full rather than globbed out of its bundle
+      # directory. A glob would also pick up whatever an *earlier* version
+      # left in the same directory — cargo/tauri never clean those, so
+      # target/.../bundle/nsis holds one -setup.exe per version ever built —
+      # and the collected set would silently gain a stale package. Naming
+      # them also means a target that did not rebuild for this version fails
+      # the copy loudly instead of contributing an old artifact.
+      - |
+        set -e
+        version=$(node -p "require('./{{.DESKTOP_DIR}}/src-tauri/tauri.conf.json').version")
+        rm -rf {{.INSTALLERS_DIR}}
+        mkdir -p {{.INSTALLERS_DIR}}
+
+        cp target/x86_64-pc-windows-msvc/release/bundle/nsis/Lumepeer_${version}_x64-setup.exe {{.INSTALLERS_DIR}}/
+        cp target/aarch64-pc-windows-msvc/release/bundle/nsis/Lumepeer_${version}_arm64-setup.exe {{.INSTALLERS_DIR}}/
+
+        scp -q {{.LINUX_HOST}}:{{.REMOTE_DIR}}/target/x86_64-unknown-linux-gnu/release/bundle/deb/Lumepeer_${version}_amd64.deb {{.INSTALLERS_DIR}}/
+        scp -q {{.LINUX_HOST}}:{{.REMOTE_DIR}}/target/aarch64-unknown-linux-gnu/release/bundle/deb/Lumepeer_${version}_arm64.deb {{.INSTALLERS_DIR}}/
+        scp -q {{.LINUX_HOST}}:{{.REMOTE_DIR}}/target/x86_64-unknown-linux-gnu/release/bundle/rpm/Lumepeer-${version}-1.x86_64.rpm {{.INSTALLERS_DIR}}/
+        scp -q {{.LINUX_HOST}}:{{.REMOTE_DIR}}/target/aarch64-unknown-linux-gnu/release/bundle/rpm/Lumepeer-${version}-1.aarch64.rpm {{.INSTALLERS_DIR}}/
+
+        scp -q {{.MACOS_HOST}}:{{.REMOTE_DIR}}/target/x86_64-apple-darwin/release/bundle/dmg/Lumepeer_${version}_x64.dmg {{.INSTALLERS_DIR}}/
+        scp -q {{.MACOS_HOST}}:{{.REMOTE_DIR}}/target/aarch64-apple-darwin/release/bundle/dmg/Lumepeer_${version}_aarch64.dmg {{.INSTALLERS_DIR}}/
+
+        missing=0
+        for name in Lumepeer_${version}_x64-setup.exe Lumepeer_${version}_arm64-setup.exe \
+                    Lumepeer_${version}_amd64.deb Lumepeer_${version}_arm64.deb \
+                    Lumepeer-${version}-1.x86_64.rpm Lumepeer-${version}-1.aarch64.rpm \
+                    Lumepeer_${version}_x64.dmg Lumepeer_${version}_aarch64.dmg; do
+          if [ ! -f {{.INSTALLERS_DIR}}/$name ]; then
+            echo "collect: $name missing from {{.INSTALLERS_DIR}}/" >&2
+            missing=1
+          fi
+        done
+        [ "$missing" = 0 ] || exit 1
+        echo "collect: {{.INSTALLERS_DIR}}/ holds all 8 installers for v${version}"
+        ls {{.INSTALLERS_DIR}}
+
+  build:
+    desc: >-
+      Build all eight installers — Windows amd64/arm64 locally, the four
+      Linux packages and both macOS .dmg files over SSH on their VMs, all
+      three OSes running concurrently since they share nothing — and collect
+      them into {{.INSTALLERS_DIR}}/. Run it from the Windows machine; each
+      VM builds what its own OS covers.
+
+      This no longer installs what it built on each machine (it used to, so
+      that "just built it" and "actually running the new build" could not
+      drift apart). An eight-target build is a release-artifact run rather
+      than a dev loop, and installing an arm64 package on an amd64 machine is
+      not a thing anyway. `task install:windows-amd64`,
+      `task install:linux-amd64` and `task install:macos-amd64` still do it
+      on demand.
+    deps:
+      - build:installers:windows
+      - remote:build:linux
+      - remote:build:macos
+    cmds:
+      - task: collect:installers
+
+  # ---------------------------------------------------------------------
+  # Installing a build onto the machine that produced it, echoing the exact
+  # command run for each so a manual re-run needs no lookup. Distinct from
+  # install.sh/install.ps1 at the repo root, which install a *published*
+  # GitHub Release rather than this working tree's own build.
+  # ---------------------------------------------------------------------
+
   install:windows-amd64:
     desc: >-
       Install the Windows amd64 client build:client:windows-amd64 just
-      produced (prefers the silent NSIS installer, falls back to the msi).
-      Kills any running lumepeer-desktop.exe first: an installer can't
-      replace a locked exe, and that lock is the usual reason a build
-      "didn't take" - the old process just kept running the old file.
+      produced. Kills any running lumepeer-desktop.exe first: an installer
+      can't replace a locked exe, and that lock is the usual reason a build
+      "didn't take" — the old process just kept running the old file.
     platforms: [windows]
     cmds:
       - |
         set -e
         taskkill /IM lumepeer-desktop.exe /F >/dev/null 2>&1 || true
         nsis=$(ls target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1)
-        if [ -n "$nsis" ]; then
-          echo "$nsis /S"
-          "$nsis" /S
-        else
-          msi=$(ls target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi 2>/dev/null | head -1)
-          if [ -z "$msi" ]; then
-            echo "no installer under target/x86_64-pc-windows-msvc/release/bundle/{nsis,msi} - run 'task build:client:windows-amd64' first" >&2
-            exit 1
-          fi
-          echo "msiexec /i \"$msi\" /quiet /norestart"
-          msiexec /i "$msi" /quiet /norestart
+        if [ -z "$nsis" ]; then
+          echo "no installer under target/x86_64-pc-windows-msvc/release/bundle/nsis - run 'task build:client:windows-amd64' first" >&2
+          exit 1
         fi
+        echo "$nsis /S"
+        "$nsis" /S
 
   install:linux-amd64:
     desc: >-
       Install the Linux amd64 client build:client:linux-amd64 just produced,
-      on {{.LINUX_HOST}} over SSH (needs the VM's one-time passwordless-sudo
-      setup from the project notes).
+      on {{.LINUX_HOST}} over SSH. dpkg needs root there, so this asks for a
+      TTY and the VM's sudo password — run it from a terminal that can answer
+      the prompt.
     cmds:
       - |
         cmd='cd ~/{{.REMOTE_DIR}} && test -d target/x86_64-unknown-linux-gnu/release/bundle/deb || { echo "no Linux build on {{.LINUX_HOST}} yet - run task remote:build:linux-amd64 first" >&2; exit 1; }; sudo dpkg -i target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb || sudo apt-get install -f -y'
-        echo "ssh {{.LINUX_HOST}} \"$cmd\""
-        ssh {{.LINUX_HOST}} "$cmd"
+        echo "ssh -t {{.LINUX_HOST}} \"$cmd\""
+        ssh -t {{.LINUX_HOST}} "$cmd"
 
   install:macos-amd64:
     desc: >-
       Mount the .dmg package:dmg:macos-amd64 just built on {{.MACOS_HOST}}
-      and install it to /Applications there - the same mount/copy/detach
+      and install it to /Applications there — the same mount/copy/detach
       install.sh's install_macos does for a published release, just against
       this working tree's own build instead.
     cmds:
@@ -368,20 +575,3 @@ tasks:
         cmd='cd ~/{{.REMOTE_DIR}} && dmg=$(ls target/x86_64-apple-darwin/release/bundle/dmg/*.dmg 2>/dev/null | head -1); test -n "$dmg" || { echo "no macOS dmg on {{.MACOS_HOST}} yet - run task remote:package:dmg:macos-amd64 first" >&2; exit 1; }; killall Lumepeer >/dev/null 2>&1; mnt=$(mktemp -d) && hdiutil attach "$dmg" -nobrowse -quiet -mountpoint "$mnt" && rm -rf /Applications/Lumepeer.app && cp -R "$mnt"/*.app /Applications/ && hdiutil detach "$mnt" -quiet'
         echo "ssh {{.MACOS_HOST}} \"$cmd\""
         ssh {{.MACOS_HOST}} "$cmd"
-
-  build:
-    desc: >-
-      Build the amd64 client for Windows, Linux and macOS — Windows
-      locally, Linux and macOS over SSH on their VMs, all three running
-      concurrently since they share nothing — then install what was just
-      built on each of those same machines, echoing the exact command run
-      for each. See the comment above this section for why installing is
-      no longer left as a printed suggestion.
-    deps:
-      - build:client:windows-amd64
-      - remote:build:linux-amd64
-      - remote:package:dmg:macos-amd64
-    cmds:
-      - task: install:windows-amd64
-      - task: install:linux-amd64
-      - task: install:macos-amd64
