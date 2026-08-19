@@ -9,7 +9,15 @@ import { html, render } from 'lit-html';
 import { consentDialog } from './consent-dialog';
 import { detectLocale, dirOf, type Locale } from './i18n';
 import { t } from './i18n';
-import { connectPanel, inviteCodePanel, onInviteStateChange } from './invite-view';
+import {
+  connectPanel,
+  inviteCodePanel,
+  isConnecting,
+  onInviteStateChange,
+  reconnect,
+  setConnectPhase,
+  type ConnectPhase,
+} from './invite-view';
 import { logoMark } from './logo';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
@@ -64,7 +72,14 @@ function renderNow(): void {
             <main class="main-panel">
               ${connectPanel(locale)}
               <div class="main-divider"></div>
-              ${sessionStatus(activeSessions, locale, () => void refresh(), history)}
+              ${sessionStatus(
+                activeSessions,
+                locale,
+                () => void refresh(),
+                history,
+                (peer) => void reconnect(peer),
+                isConnecting(),
+              )}
             </main>
           </div>
         </div>
@@ -78,14 +93,18 @@ function renderNow(): void {
 async function refresh(): Promise<void> {
   try {
     const { invoke } = await import('@tauri-apps/api/core');
-    const [sessionResult, historyResult, networkResult] = await Promise.all([
+    const [sessionResult, historyResult, networkResult, connectResult] = await Promise.all([
       invoke<SessionStatus[]>('session_status'),
       invoke<HistoryEntry[]>('connection_history'),
       invoke<{ ready: boolean }>('network_status'),
+      invoke<{ phase: ConnectPhase; pending: boolean }>('connect_status'),
     ]);
     sessions = sessionResult;
     history = historyResult;
     networkReady = networkResult.ready;
+    // The connect form's own wait: a dial that returned is not a session yet,
+    // and only the actor knows whether the far side has decided (§21 item 6).
+    setConnectPhase(connectResult.phase);
   } catch (error) {
     console.error('refresh failed:', error);
   }

@@ -25,9 +25,16 @@ pub enum NetError {
     #[error("framing error: {0}")]
     Framing(#[from] CoreError),
 
-    /// Invite ticket is expired, already consumed, or its signature is invalid (§7).
+    /// Invite ticket is expired, retired by the host, or its signature is
+    /// invalid (§7, ADR 0016).
     #[error("invalid invite ticket")]
     InvalidTicket,
+
+    /// This node already holds a control connection to the host it was asked
+    /// to dial. Guest-side only: a second dial would replace the live
+    /// connection and its teardown would end the session that was working.
+    #[error("already connected to this host")]
+    AlreadyConnected,
 
     /// Ticket string could not be decoded.
     #[error("malformed invite ticket encoding")]

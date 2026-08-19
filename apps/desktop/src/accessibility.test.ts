@@ -17,10 +17,7 @@ import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
 
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn().mockResolvedValue({ qr_string: 'test-ticket-string', expires_at: 0 }),
-}));
-vi.mock('qrcode', () => ({
-  default: { toDataURL: vi.fn().mockResolvedValue('data:image/png;base64,stub') },
+  invoke: vi.fn().mockResolvedValue({ code: 'test-invite-code', expires_at: 0 }),
 }));
 
 const LAYOUT_DEPENDENT_RULES = ['color-contrast', 'target-size'];

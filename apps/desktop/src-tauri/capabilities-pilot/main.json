@@ -23,6 +23,8 @@
     "allow-session-revoke",
     "allow-session-status",
     "allow-connection-history",
+    "allow-history-connect",
+    "allow-connect-status",
     "allow-network-status",
     "allow-license-status",
     "allow-invite-create",

@@ -61,9 +61,13 @@ async fn full_pairing_round_trip_grants_and_the_guest_sees_it() {
     registry
         .claim(&claimed_ticket, now)
         .expect("first claim succeeds");
+    registry
+        .claim(&claimed_ticket, now)
+        .expect("a live invite is a way back in, so a repeat claim is allowed (ADR 0016)");
+    registry.retire_all();
     assert!(
         registry.claim(&claimed_ticket, now).is_err(),
-        "a second claim of the same ticket must be refused"
+        "an invite the host has replaced must stop working at once"
     );
 
     let mut sessions = SessionManager::new();

@@ -14,7 +14,7 @@ would otherwise put a nightly-only dependency into every stable build.
 |---|---|---|
 | `control_envelope` | `MessageEnvelope::decode` (§9.1) | First thing an unauthenticated peer sends. |
 | `license_token` | `LicenseToken::parse_and_verify` (§12.1) | A token is attacker-supplied until `verify_strict` says otherwise. |
-| `invite_ticket` | `InviteTicket::from_qr_string` (§7) | Comes from a QR code or a short link. |
+| `invite_ticket` | `InviteTicket::from_code` (§7) | Comes from a pasted invite code or a short link. |
 
 ## Running
 
