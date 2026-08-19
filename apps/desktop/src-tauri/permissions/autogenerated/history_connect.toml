@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-history-connect"
+description = "Enables the history_connect command without any pre-configured scope."
+commands.allow = ["history_connect"]
+
+[[permission]]
+identifier = "deny-history-connect"
+description = "Denies the history_connect command without any pre-configured scope."
+commands.deny = ["history_connect"]
