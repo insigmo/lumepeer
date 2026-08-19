@@ -17,6 +17,22 @@ use crate::error::{CoreError, Result};
 /// scancode table. See docs/adr/0007.
 pub const POINTER_BUTTON_LOGICAL_BASE: u32 = 0xF000_0000;
 
+/// `Shift` bit of [`InputEventPayload::modifiers`].
+///
+/// §9.1 fixes the field but not its bit layout, the same gap `POINTER_BUTTON_
+/// LOGICAL_BASE` fills for `logical`. The guest webview's `modifiersOf`
+/// (`apps/desktop/src/view-window.ts`) writes exactly these four bits, and the
+/// platform injectors of §11 read them back — the X11 one has to, since it
+/// needs to know whether the character it was asked for is reachable at the
+/// current shift level of the host's own layout.
+pub const MODIFIER_SHIFT: u32 = 1 << 0;
+/// `Control` bit of [`InputEventPayload::modifiers`].
+pub const MODIFIER_CTRL: u32 = 1 << 1;
+/// `Alt` bit of [`InputEventPayload::modifiers`].
+pub const MODIFIER_ALT: u32 = 1 << 2;
+/// `Meta`/`Super`/`Command` bit of [`InputEventPayload::modifiers`].
+pub const MODIFIER_META: u32 = 1 << 3;
+
 /// Protocol major version. A mismatch closes the connection before consent (§9.1).
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor version. Unknown optional features are ignored (§9.1).

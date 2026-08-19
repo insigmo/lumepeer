@@ -77,6 +77,8 @@ fn main() {
             commands::session_revoke,
             commands::session_status,
             commands::connection_history,
+            commands::history_connect,
+            commands::connect_status,
             commands::network_status,
             commands::license_status,
             commands::invite_create,

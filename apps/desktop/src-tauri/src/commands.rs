@@ -81,6 +81,10 @@ impl IpcError {
             NetError::MalformedTicket | NetError::InvalidTicket => {
                 ("BAD_TICKET", "the invite is not valid or has expired")
             }
+            NetError::AlreadyConnected => (
+                "ALREADY_CONNECTED",
+                "you are already connected to this device",
+            ),
             NetError::Dial(_) | NetError::Endpoint(_) => {
                 ("DIAL_FAILED", "the host could not be reached")
             }
@@ -208,11 +212,11 @@ pub struct InviteCreateArgs {
     pub role: RoleDto,
 }
 
-/// What [`invite_create`] hands back to the UI to render as a QR code.
+/// What [`invite_create`] hands back to the UI to show as the invite code.
 #[derive(Debug, Clone, Serialize)]
 pub struct InviteDto {
-    /// String to encode as a QR code (also usable as plain text).
-    pub qr_string: String,
+    /// The invite code itself: plain text the host shows and a guest pastes.
+    pub code: String,
     /// Unix seconds after which the invite is dead.
     pub expires_at: u64,
 }
@@ -220,7 +224,7 @@ pub struct InviteDto {
 /// Argument of [`invite_connect`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InviteConnectArgs {
-    /// The scanned/pasted QR string.
+    /// The pasted invite code.
     pub ticket: String,
 }
 
@@ -237,15 +241,37 @@ pub struct SessionStatusDto {
     pub input: bool,
 }
 
-/// One row of the past-connections list (§21 punch-list item 5).
+/// One remembered host this node has connected to (§21 punch-list item 5).
+///
+/// The invite code the row carries stays in Rust: the webview reconnects by
+/// label through [`history_connect`], never by handing a code back (§13).
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntryDto {
-    /// Pseudonymized peer label, as `session_status` uses (§15).
+    /// Pseudonymized host label, stable across restarts; never a raw `NodeId`
+    /// (§15).
     pub peer_label: String,
-    /// Role the peer held before the session ended.
+    /// Role the host last granted.
     pub role: RoleDto,
-    /// Unix seconds the session ended.
+    /// Unix seconds the last session with this host ended.
     pub ended_at: u64,
+}
+
+/// Argument of [`history_connect`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryConnectArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+}
+
+/// Guest-side state of this node's own outgoing connect attempt (§21
+/// punch-list item 6).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectStatusDto {
+    /// One of `idle`, `awaiting_consent`, `connected`, `denied`, `failed`.
+    pub phase: &'static str,
+    /// Whether a decision is still outstanding on the far side, which is what
+    /// keeps the Connect button disabled.
+    pub pending: bool,
 }
 
 /// Whether this host is ready to accept incoming connections.
@@ -330,7 +356,7 @@ pub async fn session_status(
         .collect())
 }
 
-/// Lists past connections that have already ended, newest first (§21
+/// Lists hosts this node has connected to before, most recent first (§21
 /// punch-list item 5).
 ///
 /// # Errors
@@ -352,7 +378,46 @@ pub async fn connection_history(
         .collect())
 }
 
-/// Issues an invite for `args.role` and returns the QR payload.
+/// Dials a remembered host again, using the invite code kept alongside its
+/// history row.
+///
+/// The code itself never crosses this boundary in either direction: the
+/// webview names a remembered host by label, and the actor looks the code up
+/// (§13, ADR 0016). The host still decides — reconnecting asks for consent
+/// exactly like a first connection does (§2.3).
+///
+/// # Errors
+/// Rejects calls from other windows; propagates [`ActorError`].
+#[tauri::command]
+pub async fn history_connect(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HistoryConnectArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.history_connect(args.peer).await?;
+    Ok(())
+}
+
+/// Reports how this node's own outgoing connect attempt is going, so the
+/// connect form can stay disabled while the far side is deciding.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn connect_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<ConnectStatusDto, IpcError> {
+    check_window(&window)?;
+    let phase = state.network.connect_state().await?;
+    Ok(ConnectStatusDto {
+        phase: phase.as_str(),
+        pending: phase.is_pending(),
+    })
+}
+
+/// Issues an invite for `args.role` and returns its code.
 ///
 /// # Errors
 /// Rejects calls from other windows; propagates [`ActorError`].
@@ -365,7 +430,7 @@ pub async fn invite_create(
     check_window(&window)?;
     let dto = state.network.invite_create(args.role.into()).await?;
     Ok(InviteDto {
-        qr_string: dto.qr_string,
+        code: dto.code,
         expires_at: dto.expires_at,
     })
 }

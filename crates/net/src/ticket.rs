@@ -1,11 +1,12 @@
-//! Invite tickets and their QR/short-link encodings (design doc §7).
+//! Invite tickets and their text/short-link encodings (design doc §7).
 //!
-//! A ticket is single-use with a TTL of `INVITE_TICKET_TTL_SECS`. The QR code
+//! A ticket carries a TTL of `INVITE_TICKET_TTL_SECS` and is reusable until
+//! it expires or the host issues a replacement (ADR 0016). The invite code
 //! carries the ticket itself; a short link carries only an opaque random id of
 //! `SHORT_LINK_ID_BITS`, never endpoint identity.
 //!
 //! Parsing a ticket authorizes nothing: the host verifies the signature, the
-//! TTL and the single-use state, and the guest still has to pass consent (§2.3).
+//! TTL and the registry state, and the guest still has to pass consent (§2.3).
 
 use std::collections::HashMap;
 
@@ -19,15 +20,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{NetError, Result};
 
-/// Prefix of the QR payload, so a scanner can tell our tickets apart.
-pub const QR_PREFIX: &str = "lumepeer1:";
+/// Prefix of the invite code, so a reader can tell our tickets apart.
+pub const INVITE_CODE_PREFIX: &str = "lumepeer1:";
 
 /// Bytes of the random invite id, from `INVITE_ID_BITS` (§14).
 pub const INVITE_ID_BYTES: usize = INVITE_ID_BITS / 8;
 /// Bytes of the opaque short-link id, from `SHORT_LINK_ID_BITS` (§14).
 pub const SHORT_LINK_ID_BYTES: usize = SHORT_LINK_ID_BITS / 8;
 
-/// One-shot invitation issued by the host (§7).
+/// Invitation issued by the host (§7). Live until its TTL runs out or the
+/// host issues a replacement (ADR 0016).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteTicket {
     /// Protocol major the host speaks (§9.1).
@@ -56,18 +58,22 @@ struct SignedFields<'a> {
     allowed_request: Role,
 }
 
-/// Lifecycle of a ticket on the host side; claiming is atomic and reuse is
-/// refused (§7).
+/// Lifecycle of a ticket on the host side (§7, as amended by ADR 0016).
+///
+/// A live ticket may be claimed more than once: the host's consent decision,
+/// not the invite, is what authorizes a session, and a guest that was let in
+/// once has to be able to come back without the host reading out a new code.
+/// What bounds an invite is its TTL and the host's own ability to retire it by
+/// issuing a replacement — never a claim count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketState {
-    /// Issued, not claimed yet.
-    Unused,
-    /// Claimed by a peer, handshake in progress.
-    Claimed,
-    /// Successfully used; cannot be reused.
-    Consumed,
-    /// TTL elapsed before it was claimed.
+    /// Issued and claimable, however many times, until it expires or the host
+    /// retires it.
+    Live,
+    /// TTL elapsed; no further claim is possible.
     Expired,
+    /// Withdrawn by the host, which is what issuing a replacement does.
+    Retired,
 }
 
 impl InviteTicket {
@@ -138,25 +144,29 @@ impl InviteTicket {
         postcard::from_bytes(&self.node_addr).map_err(|_| NetError::MalformedTicket)
     }
 
-    /// Encodes the ticket into the string embedded in a QR code (§7).
+    /// Encodes the ticket into the invite code the host shows and the guest
+    /// pastes (§7).
     ///
     /// # Errors
     /// [`NetError::MalformedTicket`] if encoding fails.
-    pub fn to_qr_string(&self) -> Result<String> {
+    pub fn to_code(&self) -> Result<String> {
         let bytes = postcard::to_allocvec(self).map_err(|_| NetError::MalformedTicket)?;
-        Ok(format!("{QR_PREFIX}{}", BASE32_NOPAD.encode(&bytes)))
+        Ok(format!(
+            "{INVITE_CODE_PREFIX}{}",
+            BASE32_NOPAD.encode(&bytes)
+        ))
     }
 
-    /// Parses a ticket produced by [`Self::to_qr_string`].
+    /// Parses a ticket produced by [`Self::to_code`].
     ///
     /// The signature and TTL are checked by [`Self::verify`] before the ticket
     /// is honoured; parsing alone authorizes nothing (§2.3).
     ///
     /// # Errors
     /// [`NetError::MalformedTicket`] on decoding failure.
-    pub fn from_qr_string(encoded: &str) -> Result<Self> {
+    pub fn from_code(encoded: &str) -> Result<Self> {
         let body = encoded
-            .strip_prefix(QR_PREFIX)
+            .strip_prefix(INVITE_CODE_PREFIX)
             .ok_or(NetError::MalformedTicket)?;
         let bytes = BASE32_NOPAD
             .decode(body.as_bytes())
@@ -179,8 +189,9 @@ pub fn new_short_link_id() -> [u8; SHORT_LINK_ID_BYTES] {
     id
 }
 
-/// Host-side registry of issued tickets. A claim is atomic: the first claimer
-/// wins and every later attempt is refused, expired or not (§7).
+/// Host-side registry of issued tickets. A claim checks that the invite is one
+/// this host issued, is still live and has not expired; a repeat claim of a
+/// live ticket is allowed and still faces consent (§7, ADR 0016).
 #[derive(Debug, Default)]
 pub struct TicketRegistry {
     states: HashMap<[u8; INVITE_ID_BYTES], TicketState>,
@@ -195,9 +206,9 @@ impl TicketRegistry {
         }
     }
 
-    /// Records a freshly issued ticket as `Unused`.
+    /// Records a freshly issued ticket as [`TicketState::Live`].
     pub fn register(&mut self, ticket: &InviteTicket) {
-        self.states.insert(ticket.invite_id, TicketState::Unused);
+        self.states.insert(ticket.invite_id, TicketState::Live);
     }
 
     /// State of a ticket, if the host issued it.
@@ -208,12 +219,14 @@ impl TicketRegistry {
 
     /// Claims a ticket for a peer that presented it.
     ///
-    /// Expires the entry when `now` is past the TTL, and refuses anything that
-    /// is not exactly one `Unused` ticket.
+    /// Expires the entry when `now` is past the TTL, and refuses anything this
+    /// host did not issue or has already retired. A live ticket claimed again
+    /// is accepted: the guest still has to pass consent, and that is where the
+    /// host decides (§2.3, ADR 0016).
     ///
     /// # Errors
-    /// [`NetError::InvalidTicket`] if the ticket is unknown, expired, already
-    /// claimed or already consumed.
+    /// [`NetError::InvalidTicket`] if the ticket is unknown, expired or
+    /// retired.
     pub fn claim(&mut self, ticket: &InviteTicket, now: u64) -> Result<()> {
         let state = self
             .states
@@ -223,27 +236,23 @@ impl TicketRegistry {
             *state = TicketState::Expired;
             return Err(NetError::InvalidTicket);
         }
-        if *state != TicketState::Unused {
+        if *state != TicketState::Live {
             return Err(NetError::InvalidTicket);
         }
-        *state = TicketState::Claimed;
         Ok(())
     }
 
-    /// Marks a claimed ticket as spent once the handshake succeeded.
+    /// Retires every ticket this host has issued so far.
     ///
-    /// # Errors
-    /// [`NetError::InvalidTicket`] if the ticket was not in `Claimed`.
-    pub fn consume(&mut self, invite_id: &[u8; INVITE_ID_BYTES]) -> Result<()> {
-        let state = self
-            .states
-            .get_mut(invite_id)
-            .ok_or(NetError::InvalidTicket)?;
-        if *state != TicketState::Claimed {
-            return Err(NetError::InvalidTicket);
+    /// Issuing a replacement invite is what calls this: exactly one invite is
+    /// live at a time, so "refresh the code" is also how a host withdraws the
+    /// one it handed out earlier (ADR 0016).
+    pub fn retire_all(&mut self) {
+        for state in self.states.values_mut() {
+            if *state == TicketState::Live {
+                *state = TicketState::Retired;
+            }
         }
-        *state = TicketState::Consumed;
-        Ok(())
     }
 }
 
@@ -268,19 +277,19 @@ mod tests {
     }
 
     #[test]
-    fn qr_roundtrip_preserves_the_ticket() {
+    fn code_roundtrip_preserves_the_ticket() {
         let issued = ticket(1_000);
-        let decoded = InviteTicket::from_qr_string(&issued.to_qr_string().unwrap()).unwrap();
+        let decoded = InviteTicket::from_code(&issued.to_code().unwrap()).unwrap();
         assert_eq!(issued, decoded);
         assert_eq!(decoded.endpoint_addr().unwrap(), addr());
     }
 
     #[test]
-    fn qr_string_without_the_prefix_is_refused() {
-        let encoded = ticket(1_000).to_qr_string().unwrap();
-        let stripped = encoded.strip_prefix(QR_PREFIX).unwrap().to_owned();
+    fn a_code_without_the_prefix_is_refused() {
+        let encoded = ticket(1_000).to_code().unwrap();
+        let stripped = encoded.strip_prefix(INVITE_CODE_PREFIX).unwrap().to_owned();
         assert!(matches!(
-            InviteTicket::from_qr_string(&stripped),
+            InviteTicket::from_code(&stripped),
             Err(NetError::MalformedTicket)
         ));
     }
@@ -310,21 +319,49 @@ mod tests {
         ));
     }
 
+    /// ADR 0016: an invite is a way back to a host the guest has already been
+    /// let in to, so the same code has to keep working. Consent, not the
+    /// invite, is what authorizes each of those sessions.
     #[test]
-    fn a_ticket_can_be_claimed_exactly_once() {
+    fn a_live_ticket_can_be_claimed_more_than_once() {
         let issued = ticket(1_000);
         let mut registry = TicketRegistry::new();
         registry.register(&issued);
         registry.claim(&issued, 1_000).unwrap();
+        registry.claim(&issued, 1_000).unwrap();
+        registry
+            .claim(&issued, 1_000 + INVITE_TICKET_TTL_SECS)
+            .unwrap();
+        assert_eq!(registry.state(&issued.invite_id), Some(TicketState::Live));
+    }
+
+    /// The host's own withdrawal path: issuing a replacement invite retires
+    /// every code it read out before, and a retired code stops working at
+    /// once even though its TTL has not run out.
+    #[test]
+    fn a_retired_ticket_is_refused_even_before_its_ttl_runs_out() {
+        let issued = ticket(1_000);
+        let mut registry = TicketRegistry::new();
+        registry.register(&issued);
+        registry.claim(&issued, 1_000).unwrap();
+
+        registry.retire_all();
+        assert_eq!(
+            registry.state(&issued.invite_id),
+            Some(TicketState::Retired)
+        );
         assert!(matches!(
             registry.claim(&issued, 1_000),
             Err(NetError::InvalidTicket)
         ));
-        registry.consume(&issued.invite_id).unwrap();
-        assert_eq!(
-            registry.state(&issued.invite_id),
-            Some(TicketState::Consumed)
-        );
+    }
+
+    /// A code this host never issued is refused whatever its state table says
+    /// — deny-by-default, not "unknown means fine".
+    #[test]
+    fn an_unregistered_ticket_is_refused() {
+        let issued = ticket(1_000);
+        let mut registry = TicketRegistry::new();
         assert!(matches!(
             registry.claim(&issued, 1_000),
             Err(NetError::InvalidTicket)

@@ -19,14 +19,16 @@ export type TranslationKey =
   | 'invite.heading'
   | 'invite.create'
   | 'invite.refresh'
-  | 'invite.qrAlt'
   | 'invite.connectLabel'
   | 'invite.connect'
   | 'invite.connectPlaceholder'
   | 'invite.connecting'
+  | 'invite.denied'
+  | 'invite.failed'
   | 'status.inputOn'
   | 'status.inputOff'
   | 'status.revoke'
+  | 'status.reconnect'
   | 'status.endedJustNow'
   | 'status.endedMinutesAgo'
   | 'status.endedHoursAgo'
@@ -70,14 +72,16 @@ const en: Dictionary = {
   'invite.heading': 'Invite and connect',
   'invite.create': 'Create invite',
   'invite.refresh': 'Refresh invite',
-  'invite.qrAlt': 'QR code',
   'invite.connectLabel': 'Enter invite code:',
   'invite.connect': 'Connect',
   'invite.connectPlaceholder': 'Paste invite code here',
   'invite.connecting': 'Connecting',
+  'invite.denied': 'The other device declined the request.',
+  'invite.failed': 'The connection ended before it was accepted.',
   'status.inputOn': 'input on',
   'status.inputOff': 'input off',
   'status.revoke': 'Revoke',
+  'status.reconnect': 'Connect again',
   'status.endedJustNow': 'Ended just now',
   'status.endedMinutesAgo': (n) => `Ended ${n}m ago`,
   'status.endedHoursAgo': (n) => `Ended ${n}h ago`,
@@ -120,14 +124,16 @@ const ar: Dictionary = {
   'invite.heading': 'الدعوة والاتصال',
   'invite.create': 'إنشاء دعوة',
   'invite.refresh': 'تحديث الدعوة',
-  'invite.qrAlt': 'رمز الاستجابة السريعة',
   'invite.connectLabel': 'أدخل رمز الدعوة:',
   'invite.connect': 'الاتصال',
   'invite.connectPlaceholder': 'الصق رمز الدعوة هنا',
   'invite.connecting': 'جارٍ الاتصال',
+  'invite.denied': 'رفض الجهاز الآخر الطلب.',
+  'invite.failed': 'انتهى الاتصال قبل قبوله.',
   'status.inputOn': 'الإدخال مفعّل',
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
+  'status.reconnect': 'الاتصال مرة أخرى',
   'status.endedJustNow': 'انتهت للتو',
   'status.endedMinutesAgo': (n) => `انتهت قبل ${n} د`,
   'status.endedHoursAgo': (n) => `انتهت قبل ${n} س`,

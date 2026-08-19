@@ -69,10 +69,53 @@ pub struct SessionSnapshot {
 /// What `invite_create` hands back to the UI.
 #[derive(Debug, Clone)]
 pub struct InviteDto {
-    /// String to render as a QR code and/or show as text (§7).
-    pub qr_string: String,
+    /// The invite code to show in the sidebar (§7).
+    pub code: String,
     /// Unix seconds after which the invite is dead.
     pub expires_at: u64,
+}
+
+/// Guest side: how far this node's own outgoing connect attempt has got (§21
+/// punch-list item 6).
+///
+/// A dial is not the end of the story — the host user still has to decide, and
+/// that decision can take as long as it takes. Without this the connect form
+/// has nothing to wait on: it would go back to idle the moment the handshake
+/// returned, invite a second attempt against a host that is already deciding
+/// on the first, and show no sign of the wait at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectPhase {
+    /// Nothing outgoing in flight.
+    Idle,
+    /// Connected to the host; its user has not decided yet.
+    AwaitingConsent,
+    /// The host granted and the view window is open.
+    Connected,
+    /// The host refused, or ended the request without granting.
+    Denied,
+    /// The dial or the handshake failed, or the host dropped mid-request.
+    Failed,
+}
+
+impl ConnectPhase {
+    /// Whether the connect form should stay disabled: something is in flight
+    /// and a second attempt would only race it.
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        matches!(self, Self::AwaitingConsent)
+    }
+
+    /// Stable wire string for the webview.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::AwaitingConsent => "awaiting_consent",
+            Self::Connected => "connected",
+            Self::Denied => "denied",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 /// Something the actor observed that a listener may want to react to.
@@ -114,9 +157,19 @@ enum ActorCommand {
     Status {
         reply: oneshot::Sender<Vec<SessionSnapshot>>,
     },
-    /// Past connections that have already ended (§21 punch-list item 5).
+    /// Hosts this node has connected to before (§21 punch-list item 5).
     History {
         reply: oneshot::Sender<Vec<HistoryEntry>>,
+    },
+    /// Guest side: dial a remembered host again, using the invite code the
+    /// history row kept. The code never leaves the Rust side (§13).
+    HistoryConnect {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: how this node's own outgoing connect attempt is going.
+    ConnectState {
+        reply: oneshot::Sender<ConnectPhase>,
     },
     Grant {
         label: String,
@@ -193,8 +246,8 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
-    /// Past connections that have already ended, newest first (§21 punch-list
-    /// item 5).
+    /// Hosts this node has connected to before, most recent first (§21
+    /// punch-list item 5).
     ///
     /// # Errors
     /// [`ActorError::ChannelClosed`] if the actor task is gone.
@@ -202,6 +255,34 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::History { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Dials a remembered host again by its history label.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no history row carries that label;
+    /// [`ActorError::Net`] if the remembered invite no longer works or the
+    /// dial fails; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn history_connect(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryConnect { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// How this node's own outgoing connect attempt is going.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn connect_state(&self) -> Result<ConnectPhase, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ConnectState { reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -324,6 +405,29 @@ fn unix_now() -> u64 {
 /// either side ever seeing a raw `NodeId`.
 fn peer_tag(install_salt: &[u8; 32], peer: &NodeId) -> String {
     let hash = lumepeer_core::audit::peer_hash(install_salt, peer);
+    hex_prefix(&hash)
+}
+
+/// Fixed domain-separation salt for [`host_tag`]. Not a secret and not an
+/// install salt: its only job is to keep this hash from colliding with the
+/// per-run `peer_tag` namespace.
+const HOST_LABEL_SALT: [u8; 32] = *b"lumepeer/connection-history/v1\0\0";
+
+/// Pseudonymized label of a *host this node connected to*, stable across
+/// restarts (§15, ADR 0016).
+///
+/// [`peer_tag`]'s install salt is deliberately not used here. That salt is
+/// regenerated on every start precisely so a guest's label cannot be
+/// correlated across runs — right for someone else appearing in this host's
+/// UI, and exactly wrong for the list of hosts this user chose to connect to
+/// and expects to recognize tomorrow. It is still a one-way hash: no raw
+/// `NodeId` reaches the webview or the history file.
+fn host_tag(peer: &NodeId) -> String {
+    let hash = lumepeer_core::audit::peer_hash(&HOST_LABEL_SALT, peer);
+    hex_prefix(&hash)
+}
+
+fn hex_prefix(hash: &[u8; 32]) -> String {
     hash[..8].iter().fold(String::new(), |mut out, byte| {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
@@ -365,6 +469,9 @@ impl MediaSession {
 struct ViewState {
     /// Tauri window label, `view-{peer label}`.
     label: String,
+    /// Role the host announced, kept so the history row written when this view
+    /// closes says what was actually granted.
+    role: Role,
     /// Grants as the host last announced them. Advisory on this side: the host
     /// re-checks every event (§2.3).
     grants: Grants,
@@ -454,11 +561,19 @@ struct Actor {
     /// Guest side: dialable address per host, remembered from its invite so the
     /// media dial does not have to wait for discovery.
     host_addrs: std::collections::HashMap<NodeId, iroh::EndpointAddr>,
+    /// Guest side: the invite code used to reach each host, kept so the history
+    /// row written when the session ends can dial it again (ADR 0016).
+    host_invites: std::collections::HashMap<NodeId, String>,
     /// How view windows are created and closed.
     windows: Arc<dyn ViewWindows>,
-    /// Host side: past connections that have already ended (§21 punch-list
-    /// item 5).
+    /// Guest side: hosts this node has connected to before (§21 punch-list
+    /// item 5). Nothing is recorded on the host side — see
+    /// `connection_history`'s module docs.
     history: ConnectionHistory,
+    /// Guest side: phase of this node's own outgoing connect attempt.
+    connect_phase: ConnectPhase,
+    /// Host the phase above is about, once the dial has resolved one.
+    connect_peer: Option<NodeId>,
 }
 
 impl Actor {
@@ -780,6 +895,7 @@ impl Actor {
         // window: keep the pipeline, update what the window may do.
         if let Some(state) = self.views.get_mut(&peer) {
             state.grants = grants;
+            state.role = role;
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
             return;
         }
@@ -803,6 +919,7 @@ impl Actor {
             peer,
             ViewState {
                 label: label.clone(),
+                role,
                 grants,
                 slot: slot_rx,
                 task,
@@ -812,7 +929,14 @@ impl Actor {
         self.rebuild_labels_and_snapshot();
     }
 
-    /// Guest side: closes the view window and tears the pipeline down.
+    /// Guest side: closes the view window, tears the pipeline down, and
+    /// remembers the host (§21 punch-list item 5, ADR 0016).
+    ///
+    /// Every way a session this node started can end runs through here — the
+    /// host revoking, the transport dropping, the operator closing the window
+    /// — so this is the one place the remembered-hosts list has to be written,
+    /// and it is written on the side that dialed rather than the side that was
+    /// dialed.
     fn stop_view(&mut self, peer: NodeId) {
         let Some(state) = self.views.remove(&peer) else {
             return;
@@ -823,7 +947,45 @@ impl Actor {
         state.task.abort();
         drop(state.slot);
         self.windows.close(&state.label);
+        if let Some(code) = self.host_invites.get(&peer).cloned() {
+            self.history.record(host_tag(&peer), state.role, code);
+        }
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
+    }
+
+    /// Drops this node's control connection to `peer` outright.
+    ///
+    /// Dropping the outbound sender alone only ends the writer task; the far
+    /// end would sit in `recv` until it noticed by itself.
+    fn close_connection(&mut self, peer: NodeId) {
+        if let Some(handle) = self.connections.remove(&peer) {
+            handle.connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+        }
+    }
+
+    /// Guest side: moves the connect form out of its pending state when the
+    /// host it was waiting on resolves, one way or the other.
+    ///
+    /// `outcome` is what to report if the host never granted. Once it has,
+    /// the form has nothing left to wait for, so a session ending after that
+    /// is simply idle rather than a failure worth putting on screen.
+    fn settle_connect(&mut self, peer: NodeId, outcome: ConnectPhase) {
+        if self.connect_peer != Some(peer) {
+            return;
+        }
+        if outcome == ConnectPhase::Connected {
+            self.connect_phase = ConnectPhase::Connected;
+            return;
+        }
+        self.connect_phase = if self.connect_phase.is_pending() {
+            outcome
+        } else {
+            ConnectPhase::Idle
+        };
+        self.connect_peer = None;
     }
 
     /// Host side: injects one authorized input event (§11).
@@ -901,12 +1063,26 @@ impl Actor {
                 // `ActorNotification` deliberately carries no peer identity
                 // (§15), and opening a media connection needs to know exactly
                 // which host granted.
+                self.settle_connect(peer, ConnectPhase::Connected);
                 self.start_view(peer, role);
             }
             MessageKind::ConsentRevoke => {
                 tracing::info!(peer = %tag, "remote host revoked consent");
                 let _ = self.notify.send(ActorNotification::ConsentRevoked);
+                // A revoke while the request is still pending is the host
+                // pressing Deny; after a grant it is an ordinary end of
+                // session, and the connect form should just go quiet.
+                let dialed = self.host_addrs.contains_key(&peer);
+                self.settle_connect(peer, ConnectPhase::Denied);
                 self.stop_view(peer);
+                if dialed {
+                    // Guest side: with the grant withdrawn there is nothing
+                    // left to say on this connection. Leaving it open would
+                    // hold a stream on the host for a session that no longer
+                    // exists, and would make the next Connect to the same host
+                    // look like the duplicate `connect_with_ticket` refuses.
+                    self.close_connection(peer);
+                }
             }
             // Host side: a guest asks for input. Authorization is `lumepeer-
             // core`'s, per event.
@@ -924,22 +1100,12 @@ impl Actor {
         }
         self.connections.remove(&peer);
         // Both sides of the media pipeline end with the control connection: the
-        // host stops capturing for this viewer, the guest closes its window.
+        // host stops capturing for this viewer, the guest closes its window
+        // (and, on the guest, records the host it was watching).
         self.stop_media(peer);
+        self.settle_connect(peer, ConnectPhase::Failed);
         self.stop_view(peer);
         let label = peer_tag(&self.install_salt, &peer);
-        // A session the host had granted disappears from the live list the
-        // instant its transport drops (`rebuild_labels_and_snapshot`'s own
-        // doc comment: showing `Reconnecting` as `Active` would lie about
-        // who is watching) — so this is the moment it belongs in history,
-        // whether or not a reconnect later resumes it (§21 punch-list item
-        // 5). A peer that never got past a pending request has no role to
-        // record.
-        if self.sessions.state(&peer) == SessionState::Active
-            && let Some(role) = self.sessions.role(&peer)
-        {
-            self.history.record(label.clone(), role);
-        }
         if self.sessions.on_disconnect(peer).is_err() {
             // No active session to move into the reconnect window, so this was
             // a guest that dropped before the host decided: drop its queued
@@ -960,6 +1126,19 @@ impl Actor {
             ActorCommand::History { reply } => {
                 let _ = reply.send(self.history.entries().to_vec());
             }
+            ActorCommand::HistoryConnect { label, reply } => {
+                let result = match self.history.code_of(&label).map(ToOwned::to_owned) {
+                    Some(code) => self.connect_with_ticket(&code).await,
+                    None => Err(ActorError::UnknownPeer),
+                };
+                if let Err(ActorError::Net(ref error)) = result {
+                    tracing::warn!(%error, "reconnecting to a remembered host failed");
+                }
+                let _ = reply.send(result);
+            }
+            ActorCommand::ConnectState { reply } => {
+                let _ = reply.send(self.connect_phase);
+            }
             ActorCommand::Grant { label, role, reply } => {
                 let result = self.on_grant(&label, role);
                 self.rebuild_labels_and_snapshot();
@@ -974,11 +1153,15 @@ impl Actor {
                 let now = unix_now();
                 let issued = InviteTicket::issue(&self.identity, &self.endpoint.addr(), role, now);
                 let result = match issued {
-                    Ok(ticket) => match ticket.to_qr_string() {
-                        Ok(qr_string) => {
+                    Ok(ticket) => match ticket.to_code() {
+                        Ok(code) => {
+                            // Exactly one invite is live at a time: issuing a
+                            // replacement is also how the host withdraws the
+                            // code it read out earlier (ADR 0016).
+                            self.tickets.retire_all();
                             self.tickets.register(&ticket);
                             Ok(InviteDto {
-                                qr_string,
+                                code,
                                 expires_at: ticket.expires_at,
                             })
                         }
@@ -1054,24 +1237,17 @@ impl Actor {
         let peer = self.resolve(label)?;
         if self.views.contains_key(&peer) {
             tracing::info!(peer = %label, "leaving a session from the view window");
+            self.settle_connect(peer, ConnectPhase::Idle);
+            // Records the host into the remembered list on its way out.
             self.stop_view(peer);
             self.host_addrs.remove(&peer);
-            if let Some(handle) = self.connections.remove(&peer) {
-                handle.connection.close(
-                    lumepeer_net::connection::CLOSE_MALFORMED.into(),
-                    lumepeer_net::error::close_code::MALFORMED.as_bytes(),
-                );
-            }
+            self.close_connection(peer);
             return Ok(());
         }
-        // Captured before `revoke` removes the session: an explicit revoke is
-        // always a final end, worth a history entry the same as a dropped
-        // transport (§21 punch-list item 5).
-        if self.sessions.state(&peer) == SessionState::Active
-            && let Some(role) = self.sessions.role(&peer)
-        {
-            self.history.record(label.to_owned(), role);
-        }
+        // Nothing is written to the remembered-hosts list here. This branch is
+        // the *host* ending a session it granted, and a host keeps no record of
+        // who visited it: it decided once, the decision ended with the session,
+        // and a list it never asked for is not the app's to build (ADR 0016).
         self.sessions.revoke(peer).map_err(ActorError::Core)?;
         self.send_to(&peer, MessageKind::ConsentRevoke);
         self.stop_media(peer);
@@ -1100,8 +1276,17 @@ impl Actor {
     /// **keep** the connection. Dropping it here would close the QUIC
     /// connection under it and the host's `ConsentGrant` would never arrive.
     async fn connect_with_ticket(&mut self, raw: &str) -> Result<(), ActorError> {
-        let ticket = InviteTicket::from_qr_string(raw).map_err(ActorError::Net)?;
+        let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
+        // Dialing a host this node is already talking to would replace the live
+        // connection in `connections`, and the replacement's own teardown would
+        // then close the session that was working. Refusing here is what makes
+        // a second Connect harmless rather than destructive (§21 punch-list
+        // item 6).
+        if self.connections.contains_key(&addr.id) {
+            tracing::info!(peer = %self.label_of(&addr.id), "already connected to this host");
+            return Err(ActorError::Net(NetError::AlreadyConnected));
+        }
         let connection = self
             .endpoint
             .connect_control(addr.clone())
@@ -1118,6 +1303,11 @@ impl Actor {
         // Remembered for the media dial that follows a `ConsentGrant`: the
         // ticket is the only place this address is known without discovery.
         self.host_addrs.insert(peer, addr);
+        // Remembered so the history row written when this session ends can dial
+        // the same host again (ADR 0016).
+        self.host_invites.insert(peer, raw.to_owned());
+        self.connect_phase = ConnectPhase::AwaitingConsent;
+        self.connect_peer = Some(peer);
         self.adopt(control, peer);
         Ok(())
     }
@@ -1230,8 +1420,11 @@ pub fn spawn_actor_with(
         injector: None,
         views: std::collections::HashMap::new(),
         host_addrs: std::collections::HashMap::new(),
+        host_invites: std::collections::HashMap::new(),
         windows,
         history: ConnectionHistory::open(history_path),
+        connect_phase: ConnectPhase::Idle,
+        connect_peer: None,
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -1383,6 +1576,36 @@ mod tests {
         }
     }
 
+    /// Polls the remembered-hosts list until it has an entry, or fails.
+    async fn wait_for_history(handle: &ActorHandle, what: &str) -> Vec<HistoryEntry> {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let entries = handle.history().await.unwrap();
+            if !entries.is_empty() {
+                return entries;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Polls the connect phase the way the connect form does, until it reaches
+    /// `want`.
+    async fn wait_for_phase(handle: &ActorHandle, want: ConnectPhase) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let phase = handle.connect_state().await.unwrap();
+            if phase == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "connect phase stuck at {phase:?}, wanted {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Polls `status` the way the frontend does until a pending row shows up.
     async fn wait_for_pending(handle: &ActorHandle) -> String {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
@@ -1407,7 +1630,7 @@ mod tests {
         let mut events = guest.subscribe();
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
 
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -1438,7 +1661,7 @@ mod tests {
         let (guest, guest_endpoint, _guest_capture) = actor().await;
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
@@ -1504,7 +1727,7 @@ mod tests {
         assert!(!lock_capture(&capture).is_capturing());
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
@@ -1518,60 +1741,246 @@ mod tests {
         assert!(!lock_capture(&capture).is_capturing());
     }
 
-    /// A revoked session must not just vanish from the live list: it belongs
-    /// in the sidebar's connection history too (§21 punch-list item 5).
+    /// §21 punch-list item 5 / ADR 0016: an ended session is remembered by the
+    /// side that dialed, so it can go back, and by nobody on the side that was
+    /// dialed. The host decided once; it keeps no roster of who visited.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_revoke_records_the_session_in_connection_history() {
-        let (host, _host_endpoint, _capture) = actor().await;
+    async fn the_guest_remembers_the_host_and_the_host_remembers_nobody() {
+        let (host, host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
         assert!(host.history().await.unwrap().is_empty());
+        assert!(guest.history().await.unwrap().is_empty());
 
         let invite = host.invite_create(Role::FullControl).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
         host.grant(label.clone(), Role::FullControl).await.unwrap();
         host.revoke(label.clone()).await.unwrap();
 
-        let history = host.history().await.unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].peer_label, label);
-        assert_eq!(history[0].role, Role::FullControl);
+        let remembered = wait_for_history(&guest, "the guest never remembered the host").await;
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].peer_label, host_tag(&host_endpoint.addr().id));
+        assert_eq!(remembered[0].role, Role::FullControl);
+        assert!(
+            host.history().await.unwrap().is_empty(),
+            "a host must not build a record of the guests it let in"
+        );
     }
 
-    /// A guest that vanishes mid-session must show up in history too: the
-    /// live entry already disappeared (`Reconnecting` is hidden from the
-    /// snapshot), so this is the only place it would ever be remembered.
+    /// The same has to hold when nobody revokes anything: a host that simply
+    /// disappears is still a host worth remembering on the guest side, since
+    /// its view window closing is the only signal either side gets.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_disconnect_also_records_history_even_without_an_explicit_revoke() {
-        let (host, _host_endpoint, _capture) = actor().await;
-        let (guest, guest_endpoint, _guest_capture) = actor().await;
+    async fn a_disconnect_records_the_host_without_an_explicit_revoke() {
+        let (host, host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+        // `grant` returns once the message is queued, not once it lands. Tear
+        // the host down before the guest has the grant and there is no session
+        // to lose, which would make this test pass or fail on timing rather
+        // than on the behaviour it is about.
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        let host_id = host_endpoint.addr().id;
+        host_endpoint.close().await;
+
+        let remembered =
+            wait_for_history(&guest, "a vanished host was never recorded on the guest").await;
+        assert_eq!(remembered[0].peer_label, host_tag(&host_id));
+        assert_eq!(remembered[0].role, Role::ViewOnly);
+    }
+
+    /// The reason the guest keeps the list at all (ADR 0016): a remembered row
+    /// dials the host again on its own, without the operator hunting down a
+    /// code, and the host is asked for consent again exactly as the first time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remembered_host_can_be_dialed_again_and_still_needs_consent() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
         host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        host.revoke(label).await.unwrap();
+        let remembered = wait_for_history(&guest, "nothing to reconnect to").await;
 
-        guest_endpoint.close().await;
+        // Nothing is retyped: the row carries the code, and the code stays in
+        // Rust — the caller only names the host.
+        guest
+            .history_connect(remembered[0].peer_label.clone())
+            .await
+            .unwrap();
 
-        let deadline = tokio::time::Instant::now() + TIMEOUT;
-        loop {
-            let history = host.history().await.unwrap();
-            if !history.is_empty() {
-                assert_eq!(history[0].peer_label, label);
-                assert_eq!(history[0].role, Role::ViewOnly);
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the disconnect was never recorded in history"
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        let again = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("a reconnect must queue a fresh consent request, not walk straight in");
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.label == again && row.state == SessionStateDto::Pending),
+            "the host decides again on every reconnect (§2.3)"
+        );
+
+        assert!(
+            matches!(
+                guest.history_connect("no-such-host".to_owned()).await,
+                Err(ActorError::UnknownPeer)
+            ),
+            "a label that names no remembered host must dial nothing"
+        );
+    }
+
+    /// §21 punch-list item 6: the connect form has to know that a dial which
+    /// returned is not a session yet, or it re-enables itself while the host
+    /// is still looking at the consent dialog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_connect_phase_waits_for_the_host_to_decide() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        assert_eq!(guest.connect_state().await.unwrap(), ConnectPhase::Idle);
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        assert_eq!(
+            guest.connect_state().await.unwrap(),
+            ConnectPhase::AwaitingConsent,
+            "the handshake is done but nobody has decided yet"
+        );
+        assert!(guest.connect_state().await.unwrap().is_pending());
+
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        assert!(!guest.connect_state().await.unwrap().is_pending());
+
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+    }
+
+    /// A host that says no has to say it in a way the guest's form can show:
+    /// a denial is not the same as a dial that never landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_request_leaves_the_connect_phase_denied() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        // Deny is a revoke of a session that was never granted (§8.1).
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Denied).await;
+    }
+
+    /// The bug behind §21 punch-list item 6: a second Connect against a host
+    /// this node is already talking to used to replace the live connection,
+    /// and the replacement's own teardown then killed the working session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_connect_to_the_same_host_is_refused_and_leaves_the_session_alone() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code.clone()).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        assert!(
+            matches!(
+                guest.invite_connect(invite.code).await,
+                Err(ActorError::Net(NetError::AlreadyConnected))
+            ),
+            "a duplicate dial must be refused, not raced"
+        );
+
+        assert_eq!(
+            guest.connect_state().await.unwrap(),
+            ConnectPhase::Connected,
+            "the refused second dial must not disturb the live session"
+        );
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.label == label && row.state == SessionStateDto::Active)
+        );
+    }
+
+    /// ADR 0016 end to end: the same code the host read out once has to work
+    /// again after the session ends, or "remembered host" is a list of dead
+    /// links and the operator is back to asking for a new code every time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_invite_code_still_works_after_a_session_has_ended() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code.clone()).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        host.revoke(label).await.unwrap();
+        // Granted and then ended is not a denial: the form goes quiet rather
+        // than reporting a refusal that never happened.
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+
+        guest
+            .invite_connect(invite.code)
+            .await
+            .expect("a live invite is a way back in, not a one-shot");
+        tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("the second connection must reach the host's consent queue");
+    }
+
+    /// The other half of ADR 0016: "refresh invite" is the host's withdrawal
+    /// switch, so the code it replaced has to stop working immediately.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refreshing_the_invite_retires_the_code_it_replaced() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let first = host.invite_create(Role::ViewOnly).await.unwrap();
+        let second = host.invite_create(Role::ViewOnly).await.unwrap();
+        assert_ne!(first.code, second.code);
+
+        // Whether the dial itself reports success is a race and not the point:
+        // the host refuses the retired ticket *after* the handshake, by
+        // closing, and that close can land on either side of the guest's own
+        // handshake completing. What must never happen either way is a consent
+        // request reaching the host.
+        let _ = guest.invite_connect(first.code).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), wait_for_pending(&host))
+                .await
+                .is_err(),
+            "a replaced invite must not reach the host's consent queue"
+        );
     }
 
     /// A guest that disappears without a revoke must not leave the host
@@ -1582,7 +1991,7 @@ mod tests {
         let (guest, guest_endpoint, _guest_capture) = actor().await;
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
@@ -1608,7 +2017,7 @@ mod tests {
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
         let invite = host.invite_create(Role::FullControl).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
@@ -1660,7 +2069,7 @@ mod tests {
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.qr_string).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();

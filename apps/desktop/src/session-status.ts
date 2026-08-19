@@ -19,11 +19,17 @@ export interface SessionStatus {
   state: SessionState;
 }
 
-/** One row of `connection_history` (§21 punch-list item 5): a session that has already ended. */
+/**
+ * One row of `connection_history` (§21 punch-list item 5): a host this device
+ * has connected to before, and can go back to.
+ *
+ * The invite code behind the row stays in Rust — clicking it names the host by
+ * label and the actor looks the code up (§13).
+ */
 export interface HistoryEntry {
   peer_label: string;
   role: Role;
-  /** Unix seconds the session ended. */
+  /** Unix seconds the last session with this host ended. */
   ended_at: number;
 }
 
@@ -62,6 +68,8 @@ export function sessionStatus(
   locale: Locale,
   onRefresh: () => void = () => {},
   history: HistoryEntry[] = [],
+  onReconnect: (peer: string) => void = () => {},
+  reconnectDisabled = false,
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -118,9 +126,18 @@ export function sessionStatus(
             ${history.map(
               (entry) => html`
                 <li class="history-row">
-                  <span class="peer-label">${entry.peer_label}</span>
-                  <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
-                  <span class="peer-meta history-ended">${relativeTime(entry.ended_at, locale)}</span>
+                  <button
+                    type="button"
+                    class="history-reconnect"
+                    ?disabled=${reconnectDisabled}
+                    title=${t(locale, 'status.reconnect')}
+                    @click=${() => onReconnect(entry.peer_label)}
+                  >
+                    <span class="peer-label">${entry.peer_label}</span>
+                    <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
+                    <span class="peer-meta history-ended">${relativeTime(entry.ended_at, locale)}</span>
+                    <span class="history-action">${t(locale, 'status.reconnect')}</span>
+                  </button>
                 </li>
               `,
             )}
