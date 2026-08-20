@@ -26,6 +26,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Only for the `wan_probe` example, which needs iroh's own logs to explain a
+# failed relay connection.
+tracing-subscriber.workspace = true
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
 secret-service = { version = "5.1.0", features = ["rt-tokio-crypto-rust"], optional = true }

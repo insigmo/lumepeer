@@ -38,10 +38,14 @@ use std::process::{Child, Command, Stdio};
 use crate::encode::EncodedFrame;
 use crate::error::{MediaError, Result};
 
+#[cfg(target_os = "macos")]
+pub use self::macos_sandbox::{PROFILE as MACOS_SANDBOX_PROFILE, confine as macos_confine};
 pub use self::shm::{RING_SLOTS, SLOT_PAYLOAD_BYTES, SharedRing, Slot};
 #[cfg(windows)]
 pub use self::windows_sandbox::verify_confined as windows_verify_confined;
 
+#[cfg(target_os = "macos")]
+mod macos_sandbox;
 #[cfg(windows)]
 mod windows_sandbox;
 
@@ -452,6 +456,16 @@ pub mod shm {
     /// Payload bytes per slot. One 4K RGBA picture does not fit and is not
     /// meant to: the worker returns pictures capped at this size.
     pub const SLOT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+    /// A slot has to hold one RGBA8 picture of the largest size the pipeline
+    /// carries, or a host at that size would decode into nothing and the
+    /// guest would wait forever for a screen (§18; ADR 0018). Raising
+    /// `MAX_PICTURE_PIXELS` without raising this stops the build here rather
+    /// than at runtime on somebody's 4K monitor.
+    const _: () = assert!(
+        lumepeer_core::constants::MAX_PICTURE_PIXELS * 4 <= SLOT_PAYLOAD_BYTES,
+        "SLOT_PAYLOAD_BYTES cannot hold one MAX_PICTURE_PIXELS RGBA8 picture"
+    );
 
     /// Bytes of the per-slot header: length, width, height, timestamp.
     const SLOT_HEADER_BYTES: usize = 24;

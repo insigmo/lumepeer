@@ -35,15 +35,15 @@ use lumepeer_core::constants::ENCODE_HW_EVENT_TIMEOUT_MS;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
     IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT,
-    MF_EVENT_TYPE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+    MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
+    MFCreateAlignedMemoryBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSTARTUP_NOSOCKET, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive,
@@ -160,6 +160,33 @@ impl MediaFoundationEncoder {
         self.dims = (width, height);
         Ok(())
     }
+
+    /// Puts the transform back into its streaming state after the per-frame
+    /// `MFT_MESSAGE_COMMAND_DRAIN` above.
+    ///
+    /// A drain is not a pause: MSDN's "Basic MFT Processing Model" ends the
+    /// current stream with it, and an asynchronous MFT stops raising
+    /// `METransformNeedInput` until the client starts a new one. Without this
+    /// the *second* `encode()` of a session waits for an input request that
+    /// never comes and fails on `ENCODE_HW_EVENT_TIMEOUT_MS` - one picture
+    /// reaches the guest and the view then sits on "waiting for the remote
+    /// screen" for the rest of the session (§18).
+    fn restart_after_drain(&self) -> Result<()> {
+        // The drain finishes with METransformDrainComplete; starting the next
+        // stream before it lands is undefined for the driver, and the wait is
+        // effectively free because the output this frame owns has already
+        // been read by the time it runs.
+        if let Some(events) = &self.events {
+            wait_for_event(events, METransformDrainComplete)?;
+        }
+        // SAFETY: ProcessMessage with a message type that takes no pointer
+        // parameter.
+        unsafe {
+            self.transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
+        }
+        .map_err(|e| MediaError::Encode(format!("START_OF_STREAM refused after a drain: {e}")))
+    }
 }
 
 impl VideoEncoder for MediaFoundationEncoder {
@@ -205,6 +232,7 @@ impl VideoEncoder for MediaFoundationEncoder {
             match drain_output(&self.transform)? {
                 DrainResult::Frame(mut encoded) => {
                     encoded.timestamp_us = frame.timestamp_us;
+                    self.restart_after_drain()?;
                     return Ok(encoded);
                 }
                 DrainResult::NeedMoreInput => {
@@ -1057,6 +1085,28 @@ mod tests {
         assert!(first.keyframe, "the first frame must be decodable alone");
         assert!(!first.data.is_empty());
         assert_eq!(encoder.kind(), EncoderKind::Hardware);
+    }
+
+    #[test]
+    fn a_session_keeps_encoding_past_the_first_frame_when_hardware_is_available() {
+        // The encode loop of `apps/desktop/src/view.rs` calls `encode()` once
+        // per captured frame on one long-lived encoder, so the very first
+        // frame succeeding proves nothing on its own: an async MFT that is
+        // left in its drained state after frame one stops asking for input
+        // and every later frame fails with the event timeout, which reads to
+        // the guest as "waiting for the remote screen" forever.
+        let Some(mut encoder) = try_new_encoder() else {
+            eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
+            return;
+        };
+        for index in 0..4u64 {
+            let mut source = frame(64, 64, 0x20);
+            source.timestamp_us = index * 33_333;
+            let encoded = encoder
+                .encode(&source)
+                .unwrap_or_else(|error| panic!("frame {index} failed to encode: {error}"));
+            assert!(!encoded.data.is_empty(), "frame {index} encoded to nothing");
+        }
     }
 
     #[test]

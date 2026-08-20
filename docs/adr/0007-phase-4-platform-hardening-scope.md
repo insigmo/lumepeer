@@ -83,8 +83,12 @@ each needing a machine that can build and run it:
   has the detail, and `tests/integration/tests/media_pipeline.rs`'s
   `a_captured_frame_reaches_the_guest_through_the_sandboxed_decoder` exercises
   it for real on Windows, not just at compile time.)
-- macOS capture (`ScreenCaptureKit`), input (`CGEvent`) and the
-  `sandbox_init` decoder sandbox. (Keystore is now done — see above.)
+- macOS: running the §18 matrix on the machine itself. (Keystore is now done
+  — see above; capture is `ScreenCaptureKit` per ADR 0013, and the
+  `sandbox_init` decoder sandbox per ADR 0019. Unlike `AppContainer`,
+  `sandbox_init` confines the calling process, so the worker fences itself in
+  after mapping the ring exactly the way the Linux seccomp path does;
+  `crates/media/src/decode/macos_sandbox.rs` has the detail.)
 - Running the §18 matrix on each of those OSes, which §19 requires before
   phase 4 can be called done on them.
 
