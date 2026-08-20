@@ -96,20 +96,22 @@ fn a_captured_frame_reaches_the_guest_through_the_sandboxed_decoder() {
         Ok(decoder) => decoder,
         // On a platform whose sandbox is not implemented yet the worker must
         // refuse rather than decode unconfined (§11.3). That refusal is the
-        // correct behaviour, so the test records it and stops. On Linux and
-        // Windows, where a sandbox is implemented (seccomp, AppContainer), a
-        // refusal is a real failure.
+        // correct behaviour, so the test records it and stops. On Linux,
+        // Windows and macOS, where a sandbox is implemented (seccomp,
+        // AppContainer, `sandbox_init`), a refusal is a real failure.
         Err(MediaError::SandboxUnavailable(e)) => {
             #[cfg(any(
                 all(target_os = "linux", not(target_os = "android")),
-                target_os = "windows"
+                target_os = "windows",
+                target_os = "macos"
             ))]
             panic!(
                 "a sandbox is implemented on this platform, so the worker must confine itself: {e}"
             );
             #[cfg(not(any(
                 all(target_os = "linux", not(target_os = "android")),
-                target_os = "windows"
+                target_os = "windows",
+                target_os = "macos"
             )))]
             {
                 let _ = e;

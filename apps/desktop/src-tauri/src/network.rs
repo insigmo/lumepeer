@@ -1151,7 +1151,23 @@ impl Actor {
             }
             ActorCommand::InviteCreate { role, reply } => {
                 let now = unix_now();
-                let issued = InviteTicket::issue(&self.identity, &self.endpoint.addr(), role, now);
+                let addr = self.endpoint.addr();
+                // An invite is only worth anything if it carries somewhere to
+                // dial. Until the endpoint has reached a relay (and, with the
+                // direct transports cleared, it has nothing else to offer) the
+                // address set is empty and the code would be dead on arrival —
+                // which is far worse than saying "not yet": the host reads it
+                // out, the guest pastes it, and the failure surfaces on the
+                // wrong machine.
+                if addr.addrs.is_empty() {
+                    tracing::warn!(
+                        "refusing to issue an invite: the endpoint has no dialable address yet"
+                    );
+                    let _ = reply.send(Err(ActorError::Net(NetError::Offline)));
+                    return;
+                }
+                tracing::info!(addrs = ?addr.addrs, "issuing an invite");
+                let issued = InviteTicket::issue(&self.identity, &addr, role, now);
                 let result = match issued {
                     Ok(ticket) => match ticket.to_code() {
                         Ok(code) => {
@@ -1329,6 +1345,13 @@ pub async fn spawn_actor(app: tauri::AppHandle) -> Result<ActorHandle, NetError>
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let endpoint = PeerEndpoint::bind(secret_key).await?;
+    if lumepeer_net::endpoint::lan_direct_enabled() {
+        tracing::info!("transport: relay + direct IP paths (LUMEPEER_LAN_DIRECT is set)");
+    } else {
+        tracing::info!(
+            "transport: relay only — direct IP paths are off, so every session goes over the internet. Set LUMEPEER_LAN_DIRECT=1 to put the LAN path back."
+        );
+    }
     let history_path = connection_history_path(&app);
 
     let handle = spawn_actor_with(

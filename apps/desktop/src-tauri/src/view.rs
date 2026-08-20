@@ -30,6 +30,7 @@ use lumepeer_media::abr::{AbrController, ReceiverFeedback};
 use lumepeer_media::capture::CaptureController;
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
+use lumepeer_media::scale::fit_within_budget;
 use lumepeer_net::{PeerEndpoint, accept_media_stream, open_media_stream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -358,6 +359,12 @@ pub fn spawn_encode_loop(
                     return;
                 }
             };
+
+            // A screen larger than the pipeline's picture budget is reduced
+            // here, before anything downstream has to carry it: the encoder,
+            // the wire, the sandboxed decoder's shared-memory slot and the
+            // guest's canvas all size themselves off this frame (ADR 0018).
+            let frame = fit_within_budget(frame);
 
             let bitstream = match encoder.encode(&frame) {
                 Ok(bitstream) => bitstream,

@@ -88,6 +88,12 @@ impl IpcError {
             NetError::Dial(_) | NetError::Endpoint(_) => {
                 ("DIAL_FAILED", "the host could not be reached")
             }
+            // This device, not the peer: nothing is wrong with the invite or
+            // the far side, so it must not read like a rejection.
+            NetError::Offline => (
+                "OFFLINE",
+                "this device is not reachable from the internet yet — wait for the status to turn ready, then try again",
+            ),
             NetError::Framing(CoreError::IncompatibleVersion { .. }) => (
                 "INCOMPATIBLE_VERSION",
                 "the host speaks an incompatible protocol version",

@@ -24,6 +24,33 @@ fn alpn_list() -> Vec<Vec<u8>> {
     SUPPORTED_ALPNS.iter().map(|a| (*a).to_vec()).collect()
 }
 
+/// Environment variable that puts the direct IP transports — the LAN path —
+/// back on. See [`lan_direct_enabled`].
+pub const LAN_DIRECT_ENV: &str = "LUMEPEER_LAN_DIRECT";
+
+/// Whether this process may use direct IP paths (which is what makes two peers
+/// on the same LAN talk without ever leaving it).
+///
+/// **Temporarily off by default.** WAN connectivity is being verified, and as
+/// long as a direct path exists two machines on one network reach each other
+/// without the relay, so a passing test proves nothing about the internet
+/// path. With the direct transports cleared the only route left is the relay,
+/// i.e. out to the internet and back — which is exactly what has to be proven
+/// to work.
+///
+/// Nothing is deleted: set `LUMEPEER_LAN_DIRECT=1` (or `true`/`yes`/`on`) and
+/// [`PeerEndpoint::bind`] is the full relay-plus-direct endpoint again.
+#[must_use]
+pub fn lan_direct_enabled() -> bool {
+    match std::env::var(LAN_DIRECT_ENV) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Owner of the Iroh endpoint and its per-ALPN accept loops.
 #[derive(Debug, Clone)]
 pub struct PeerEndpoint {
@@ -34,10 +61,51 @@ impl PeerEndpoint {
     /// Binds an endpoint using the long-term identity from the OS keystore
     /// (§7, §11.2), with relays and address lookup enabled.
     ///
+    /// Which transports it gets is decided by [`lan_direct_enabled`]: today
+    /// that means [`Self::bind_relay_only`] unless `LUMEPEER_LAN_DIRECT` is
+    /// set, in which case it is [`Self::bind_with_lan`].
+    ///
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
     pub async fn bind(secret_key: iroh::SecretKey) -> Result<Self> {
+        if lan_direct_enabled() {
+            Self::bind_with_lan(secret_key).await
+        } else {
+            Self::bind_relay_only(secret_key).await
+        }
+    }
+
+    /// Binds the full endpoint: relays, address lookup **and** direct IP
+    /// paths, so two peers on one network can hole-punch onto a LAN path and
+    /// never touch the relay. This is the shipping behaviour; it is reached
+    /// through [`Self::bind`] only while `LUMEPEER_LAN_DIRECT` is set.
+    ///
+    /// # Errors
+    /// [`NetError::Endpoint`] if binding or discovery setup fails.
+    pub async fn bind_with_lan(secret_key: iroh::SecretKey) -> Result<Self> {
         let inner = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .alpns(alpn_list())
+            .bind()
+            .await
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Binds with relays and address lookup but **no** IP transports at all.
+    ///
+    /// Without an IP transport there is no direct path to hole-punch onto and
+    /// no LAN shortcut to fall into: every packet of every session goes over
+    /// the relay, out to the internet and back. That makes a session between
+    /// two machines that happen to share a network an honest test of the WAN
+    /// path, and it makes the address in an invite ticket relay-only, since
+    /// `EndpointAddr` can then hold nothing else.
+    ///
+    /// # Errors
+    /// [`NetError::Endpoint`] if binding or discovery setup fails.
+    pub async fn bind_relay_only(secret_key: iroh::SecretKey) -> Result<Self> {
+        let inner = Endpoint::builder(presets::N0)
+            .clear_ip_transports()
             .secret_key(secret_key)
             .alpns(alpn_list())
             .bind()

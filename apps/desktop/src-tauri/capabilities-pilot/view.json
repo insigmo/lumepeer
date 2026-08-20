@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "view-window",
+  "description": "Mirrors capabilities/view.json for the `pilot`-feature build (see build.rs) - keep both files identical apart from this line. Per-window capability of a remote-view window (design doc §13). Deliberately NOT `core:default`: a window that renders a remote screen and forwards input needs exactly four application commands, its own close (`allow-close` for the close-requested event, `allow-destroy` for the unconditional close the JS API issues once that event is not prevented), and the close-request event that turns closing the window into ending the session. Everything else — filesystem, shell, network, clipboard, other windows' commands — is absent rather than denied, and there are no wildcard entries.",
+  "windows": ["view-*"],
+  "local": true,
+  "permissions": [
+    "core:event:default",
+    {
+      "identifier": "core:window:allow-close",
+      "allow": [{ "label": "view-*" }]
+    },
+    {
+      "identifier": "core:window:allow-destroy",
+      "allow": [{ "label": "view-*" }]
+    },
+    "allow-view-next-frame",
+    "allow-input-pointer-move",
+    "allow-input-press",
+    "allow-input-wheel",
+    "allow-session-revoke"
+  ]
+}

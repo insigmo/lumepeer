@@ -11,6 +11,17 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 65_536;
 /// `lumepeer_media::decode::SLOT_PAYLOAD_BYTES`, so a frame that passed this
 /// check always fits the decoder's shared-memory slot.
 pub const MAX_MEDIA_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Largest picture, in pixels, that travels through the media pipeline in one
+/// frame (§11, §15; ADR 0018).
+///
+/// A host screen bigger than this is downscaled before it is encoded, so the
+/// wire, the sandboxed decoder's shared-memory slot and the guest's canvas all
+/// stay inside the memory budget of `ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB`.
+/// One RGBA8 picture of this size is 8 MiB, which is exactly what
+/// `lumepeer_media::decode::SLOT_PAYLOAD_BYTES` holds — the two are asserted
+/// against each other at compile time there, so raising one without the other
+/// does not build.
+pub const MAX_PICTURE_PIXELS: usize = 1920 * 1080;
 /// Pause between redial attempts inside the one media recovery pass bounded by
 /// [`RECONNECT_WINDOW_SECS`]. Not a second reconnect window: it only keeps a
 /// host that refuses instantly from turning that window into a busy loop.

@@ -52,10 +52,31 @@ mod sandbox {
         match kind {
             SandboxKind::LinuxSeccomp => linux_seccomp(),
             SandboxKind::WindowsAppContainer => windows_app_container(),
-            other => anyhow::bail!(
+            SandboxKind::MacosSandbox => macos_sandbox(),
+            other @ SandboxKind::AndroidIsolatedProcess => anyhow::bail!(
                 "the {other:?} sandbox is not implemented yet; refusing to decode unconfined"
             ),
         }
+    }
+
+    /// Self-applied `sandbox_init(3)` confinement, the macOS counterpart of
+    /// `linux_seccomp` below: same ordering (everything is already open by
+    /// the time this runs), same fatal-on-failure contract. The profile and
+    /// the FFI live in `lumepeer_media::decode::macos_sandbox` because this
+    /// binary is `#![deny(unsafe_code)]` and `sandbox_init` is a C entry
+    /// point; ADR 0019 has the reasoning.
+    #[cfg(target_os = "macos")]
+    fn macos_sandbox() -> anyhow::Result<()> {
+        lumepeer_media::decode::macos_confine().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// `SandboxKind::MacosSandbox` is also what `platform_sandbox()` reports
+    /// on iOS, where `sandbox_init` is not available to an app at all (the
+    /// kernel applies the container sandbox at `exec`). Refusing is the
+    /// §11.3 answer there until an iOS build exists to confine.
+    #[cfg(not(target_os = "macos"))]
+    fn macos_sandbox() -> anyhow::Result<()> {
+        anyhow::bail!("sandbox_init is only available on macOS")
     }
 
     /// Confinement was already applied by the parent at `CreateProcessW`
@@ -219,13 +240,29 @@ fn run(mut ring: SharedRing, decoder: &mut Decoder) -> anyhow::Result<()> {
 
         let status = match decoder.decode(&slot.data) {
             Ok(Some(picture)) => {
-                ring.push_return(
+                // A picture too large for the return slot is a refusal, not a
+                // reason to take the worker down: the host is supposed to keep
+                // every frame inside `MAX_PICTURE_PIXELS` (ADR 0018), and one
+                // that does not must fail this frame the same way a malformed
+                // bitstream does rather than killing the process the rest of
+                // the session depends on (§2.4).
+                match ring.push_return(
                     picture.width,
                     picture.height,
                     slot.timestamp_us,
                     &picture.rgba,
-                )?;
-                FRAME_BYTE
+                ) {
+                    Ok(()) => FRAME_BYTE,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            width = picture.width,
+                            height = picture.height,
+                            "refusing a picture that does not fit the return slot"
+                        );
+                        ERROR_BYTE
+                    }
+                }
             }
             Ok(None) => PENDING_BYTE,
             Err(error) => {

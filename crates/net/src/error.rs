@@ -53,6 +53,12 @@ pub enum NetError {
     /// Keystore is unavailable or refused the operation (§11.2).
     #[error("keystore unavailable: {0}")]
     Keystore(String),
+
+    /// The local endpoint has no address a peer could dial yet — it has not
+    /// reached a relay and has no usable direct address either. Raised on the
+    /// host side instead of issuing an invite nobody can act on (§7).
+    #[error("this device is not reachable yet")]
+    Offline,
 }
 
 /// Convenience alias for net results.
