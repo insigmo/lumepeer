@@ -26,6 +26,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 # Only for the `wan_probe` example, which needs iroh's own logs to explain a
 # failed relay connection.
 tracing-subscriber.workspace = true

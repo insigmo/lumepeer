@@ -32,6 +32,11 @@ pub enum MediaError {
     #[error("encode failed: {0}")]
     Encode(String),
 
+    /// The Opus audio codec refused an operation (§5.1, ADR 0023). The
+    /// session keeps running without audio; the UI reports it (§18).
+    #[error("audio codec error: {0}")]
+    Audio(String),
+
     /// The decoder sandbox could not be established, so decoding must not
     /// start at all: degrade towards safety, not convenience (§11.3).
     #[error("decoder sandbox unavailable on this platform: {0}")]

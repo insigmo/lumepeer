@@ -26,11 +26,13 @@
 #![warn(missing_docs)]
 
 pub mod abr;
+pub mod audio;
 pub mod capture;
 pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod jitter;
+pub mod record;
 pub mod scale;
 
 pub use error::{MediaError, Result};

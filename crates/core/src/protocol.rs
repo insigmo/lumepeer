@@ -6,7 +6,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::consent::Role;
-use crate::constants::MAX_CONTROL_FRAME_BYTES;
+use crate::constants::{
+    CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
+    MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+};
 use crate::error::{CoreError, Result};
 
 /// Logical identifiers at or above this value denote pointer buttons rather
@@ -36,7 +39,13 @@ pub const MODIFIER_META: u32 = 1 << 3;
 /// Protocol major version. A mismatch closes the connection before consent (§9.1).
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor version. Unknown optional features are ignored (§9.1).
-pub const PROTOCOL_MINOR: u16 = 0;
+///
+/// 1: appended `Chat`, `KeyframeRequest`, `CursorShape`, `MonitorsList`,
+/// `MonitorSelect`, `PrivacyMode`/`PrivacyModeAck`, `AudioStart`/`AudioStop`,
+/// `FileAbort` and `FileChunkAck` after `ResumeHello`; added per-message
+/// limit checks in `MessageEnvelope::decode`. Existing variants kept their
+/// discriminants, so a MINOR 0 peer decodes every old message unchanged.
+pub const PROTOCOL_MINOR: u16 = 1;
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -145,6 +154,102 @@ pub enum MessageKind {
         /// Highest sequence number the sender has processed.
         last_received_seq: u64,
     },
+    /// One chat message of the in-session text chat (§9.2).
+    ///
+    /// Appended after `ResumeHello` so every earlier variant keeps its
+    /// postcard discriminant; the golden vectors of §17.2 depend on that
+    /// (`PROTOCOL_MINOR 1`).
+    Chat {
+        /// UTF-8 message, at most `CHAT_MAX_BYTES` bytes.
+        text: String,
+    },
+    /// Guest asks the host encoder for an instant keyframe (§11): decoder
+    /// joined mid-stream or packets were lost beyond what the jitter buffer
+    /// can conceal. The host must answer with a keyframe at the next
+    /// opportunity, rate-limited by the caller.
+    KeyframeRequest,
+    /// Host announces the shape of its cursor (§11). Sent when the cursor
+    /// changes; the guest draws it locally over the video for minimum input
+    /// latency feedback.
+    CursorShape {
+        /// Shape payload: geometry plus RGBA pixels.
+        shape: CursorShapeData,
+    },
+    /// Host lists the monitors a guest may target (§11).
+    MonitorsList {
+        /// One entry per monitor, at most `MAX_MONITORS_PER_HOST`.
+        monitors: Vec<MonitorInfo>,
+    },
+    /// Guest picks which monitor to capture; the host re-targets capture.
+    MonitorSelect {
+        /// Monitor id as announced in `MonitorsList`.
+        monitor_id: u32,
+    },
+    /// Guest asks the host to enable or disable privacy mode (§11): blank
+    /// the host's physical monitors and block local input while the session
+    /// is controlled. The host user must have enabled this capability.
+    PrivacyMode {
+        /// `true` to blank and lock, `false` to restore.
+        enabled: bool,
+    },
+    /// Host answers `PrivacyMode`: whether the mode actually became active.
+    PrivacyModeAck {
+        /// Whether privacy mode is now active on the host.
+        active: bool,
+    },
+    /// Host offers to start streaming audio (§11); parameters are fixed by
+    /// constants (`AUDIO_SAMPLE_RATE_HZ` etc.) so none travel on the wire.
+    AudioStart {
+        /// Sample rate, always `AUDIO_SAMPLE_RATE_HZ` today.
+        sample_rate_hz: u32,
+        /// Channel count, always `AUDIO_CHANNELS` today.
+        channels: u8,
+    },
+    /// Either side stops the audio channel (§11).
+    AudioStop,
+    /// Sender aborts one file transfer mid-flight (§9.2). Unlike
+    /// `FileAccept(false)` this applies after chunking has already begun.
+    FileAbort {
+        /// Transfer being aborted, as announced in `FileTransferStart`.
+        transfer_id: u64,
+    },
+    /// Receiver acknowledges contiguous bytes received (§9.2), driving the
+    /// sender's resume point after a reconnect.
+    FileChunkAck {
+        /// Transfer being acknowledged.
+        transfer_id: u64,
+        /// Number of leading bytes now durably received.
+        offset: u64,
+    },
+}
+
+/// Pixel geometry plus RGBA payload of one cursor shape (§11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorShapeData {
+    /// Width in pixels, at least 1.
+    pub width: u16,
+    /// Height in pixels, at least 1.
+    pub height: u16,
+    /// Hotspot x within the shape.
+    pub hotspot_x: u16,
+    /// Hotspot y within the shape.
+    pub hotspot_y: u16,
+    /// Premultiplied BGRA pixels, exactly `width * height * 4` bytes and at
+    /// most `MAX_CURSOR_SHAPE_PIXELS * 4`.
+    pub rgba: Vec<u8>,
+}
+
+/// One monitor of the host, as reported in `MonitorsList` (§11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    /// Host-assigned stable id a guest passes back in `MonitorSelect`.
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Whether this is the host's primary display.
+    pub primary: bool,
 }
 
 /// Input event payload: logical key plus physical scancode, never raw OS
@@ -221,7 +326,59 @@ impl MessageEnvelope {
         if !rest.is_empty() {
             return Err(CoreError::Malformed);
         }
+        envelope.check_limits()?;
         Ok(envelope)
+    }
+
+    /// Enforces the per-message limits of §14 that are narrower than the
+    /// frame bound (§9.1 allocation-DoS protection at the type level).
+    ///
+    /// # Errors
+    /// [`CoreError::Malformed`] when any payload exceeds its constant:
+    /// chat text over `CHAT_MAX_BYTES`, clipboard over `CLIPBOARD_MAX_BYTES`,
+    /// a cursor whose pixel count contradicts its geometry or exceeds
+    /// `MAX_CURSOR_SHAPE_PIXELS`, more than `MAX_MONITORS_PER_HOST` monitors,
+    /// or a `FileOffer` larger than `FILE_OFFER_MAX_BYTES`.
+    fn check_limits(&self) -> Result<()> {
+        match &self.kind {
+            MessageKind::Chat { text } => {
+                if text.len() > CHAT_MAX_BYTES {
+                    return Err(CoreError::Malformed);
+                }
+            }
+            MessageKind::ClipboardSync { data } => {
+                if data.len() > CLIPBOARD_MAX_BYTES {
+                    return Err(CoreError::Malformed);
+                }
+            }
+            MessageKind::CursorShape { shape } => {
+                let pixels = usize::from(shape.width) * usize::from(shape.height);
+                if pixels == 0 || pixels > MAX_CURSOR_SHAPE_PIXELS || shape.rgba.len() != pixels * 4
+                {
+                    return Err(CoreError::Malformed);
+                }
+                if usize::from(shape.hotspot_x) >= usize::from(shape.width)
+                    || usize::from(shape.hotspot_y) >= usize::from(shape.height)
+                {
+                    return Err(CoreError::Malformed);
+                }
+            }
+            MessageKind::MonitorsList { monitors } => {
+                if monitors.len() > MAX_MONITORS_PER_HOST {
+                    return Err(CoreError::Malformed);
+                }
+                for monitor in monitors {
+                    if monitor.width == 0 || monitor.height == 0 {
+                        return Err(CoreError::Malformed);
+                    }
+                }
+            }
+            MessageKind::FileOffer { size, .. } if *size > FILE_OFFER_MAX_BYTES => {
+                return Err(CoreError::Malformed);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +403,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::constants::{
+        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_MAX_BYTES, FILE_OFFER_MAX_BYTES,
+    };
 
     fn envelope(kind: MessageKind) -> MessageEnvelope {
         MessageEnvelope {
@@ -305,6 +465,139 @@ mod tests {
         assert!(matches!(
             check_version(PROTOCOL_MAJOR + 1),
             Err(CoreError::IncompatibleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn chat_roundtrips_and_oversize_is_rejected() {
+        let long = "x".repeat(CHAT_MAX_BYTES);
+        let original = envelope(MessageKind::Chat { text: long });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        // One byte over the chat limit is a limit violation, not a crash.
+        let mut oversized_text = String::with_capacity(CHAT_MAX_BYTES + 1);
+        for _ in 0..=(CHAT_MAX_BYTES) {
+            oversized_text.push('y');
+        }
+        let oversized = envelope(MessageKind::Chat {
+            text: oversized_text,
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&oversized.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn keyframe_request_roundtrips() {
+        let original = envelope(MessageKind::KeyframeRequest);
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+    }
+
+    #[test]
+    fn cursor_shape_roundtrips_and_bad_geometry_is_rejected() {
+        let shape = CursorShapeData {
+            width: 2,
+            height: 2,
+            hotspot_x: 1,
+            hotspot_y: 1,
+            rgba: vec![0xAA; 2 * 2 * 4],
+        };
+        let original = envelope(MessageKind::CursorShape {
+            shape: shape.clone(),
+        });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        // Pixel count disagreeing with the geometry is malformed, never a
+        // short read further down the pipeline.
+        let mut lying = shape;
+        lying.rgba.pop();
+        let bad = envelope(MessageKind::CursorShape { shape: lying });
+        assert!(matches!(
+            MessageEnvelope::decode(&bad.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn monitors_list_roundtrips_and_overflow_is_rejected() {
+        let monitors = vec![MonitorInfo {
+            id: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        }];
+        let original = envelope(MessageKind::MonitorsList {
+            monitors: monitors.clone(),
+        });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        let flood = vec![
+            MonitorInfo {
+                id: 0,
+                width: 1,
+                height: 1,
+                primary: false,
+            };
+            MAX_MONITORS_PER_HOST + 1
+        ];
+        let overflow = envelope(MessageKind::MonitorsList { monitors: flood });
+        assert!(matches!(
+            MessageEnvelope::decode(&overflow.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+    }
+
+    #[test]
+    fn privacy_audio_and_file_abort_roundtrip() {
+        let cases = [
+            MessageKind::PrivacyMode { enabled: true },
+            MessageKind::PrivacyModeAck { active: false },
+            MessageKind::AudioStart {
+                sample_rate_hz: AUDIO_SAMPLE_RATE_HZ,
+                channels: AUDIO_CHANNELS,
+            },
+            MessageKind::AudioStop,
+            MessageKind::FileAbort { transfer_id: 7 },
+            MessageKind::FileChunkAck {
+                transfer_id: 7,
+                offset: 4096,
+            },
+        ];
+        for kind in cases {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn legacy_clipboard_limit_is_enforced_on_decode() {
+        // The frame bound of §9.1 already keeps a >64 KiB clipboard off the
+        // wire entirely: `encode` refuses before anything is sent.
+        let oversized = envelope(MessageKind::ClipboardSync {
+            data: vec![0; CLIPBOARD_MAX_BYTES + 1],
+        });
+        assert!(matches!(
+            oversized.encode(),
+            Err(CoreError::FrameSize { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_file_offer_size_limit_is_enforced_on_decode() {
+        let oversized = envelope(MessageKind::FileOffer {
+            name: "big.bin".to_owned(),
+            size: FILE_OFFER_MAX_BYTES + 1,
+            hash: [0; 32],
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&oversized.encode().unwrap()),
+            Err(CoreError::Malformed)
         ));
     }
 }

@@ -43,6 +43,59 @@
         background: rgb(0 0 0 / 70%);
         text-align: center;
       }
+      #chat-panel {
+        position: absolute;
+        inset-block-end: 0;
+        inset-inline-end: 0;
+        width: min(20rem, 40vw);
+        max-height: 45%;
+        display: flex;
+        flex-direction: column;
+        background: rgb(0 0 0 / 72%);
+        border-start-start-radius: 0.5rem;
+        font-size: 0.85rem;
+      }
+      .chat-log {
+        flex: 1;
+        overflow-y: auto;
+        margin: 0;
+        padding: 0.5rem;
+        list-style: none;
+      }
+      .chat-row {
+        margin-block: 0.15rem;
+        overflow-wrap: anywhere;
+      }
+      .chat-out {
+        text-align: end;
+        color: #9fd0ff;
+      }
+      .chat-in {
+        text-align: start;
+        color: #f2f2f5;
+      }
+      .chat-compose {
+        display: flex;
+        gap: 0.25rem;
+        padding: 0.35rem;
+        border-block-start: 1px solid rgb(255 255 255 / 18%);
+      }
+      .chat-input {
+        flex: 1;
+        min-width: 0;
+        background: #1c1c22;
+        color: inherit;
+        border: 1px solid rgb(255 255 255 / 25%);
+        border-radius: 0.25rem;
+        padding: 0.25rem 0.4rem;
+      }
+      .chat-send {
+        background: #2b2b33;
+        color: inherit;
+        border: 1px solid rgb(255 255 255 / 25%);
+        border-radius: 0.25rem;
+        padding: 0.25rem 0.6rem;
+      }
       .view-modal {
         position: absolute;
         inset: 0;
@@ -60,6 +113,7 @@
     <main id="view">
       <canvas id="screen" width="1" height="1"></canvas>
       <div id="overlay"></div>
+      <aside id="chat-panel" class="chat-panel" hidden></aside>
     </main>
     <script type="module" src="/src/view.ts"></script>
   </body>

@@ -56,7 +56,11 @@ export type TranslationKey =
   | 'view.reconnecting'
   | 'view.failed.title'
   | 'view.failed.body'
-  | 'view.failed.dismiss';
+  | 'view.failed.dismiss'
+  | 'chat.logLabel'
+  | 'chat.inputLabel'
+  | 'chat.inputPlaceholder'
+  | 'chat.send';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -110,6 +114,10 @@ const en: Dictionary = {
   'view.failed.title': 'Connection lost',
   'view.failed.body': 'The remote screen could not be reconnected, so the session has ended.',
   'view.failed.dismiss': 'Close',
+  'chat.logLabel': 'Chat',
+  'chat.inputLabel': 'Chat message',
+  'chat.inputPlaceholder': 'Type a message…',
+  'chat.send': 'Send',
 };
 
 const ar: Dictionary = {
@@ -162,6 +170,10 @@ const ar: Dictionary = {
   'view.failed.title': 'انقطع الاتصال',
   'view.failed.body': 'تعذّرت إعادة الاتصال بالشاشة البعيدة، لذلك انتهت الجلسة.',
   'view.failed.dismiss': 'إغلاق',
+  'chat.logLabel': 'المحادثة',
+  'chat.inputLabel': 'رسالة المحادثة',
+  'chat.inputPlaceholder': 'اكتب رسالة…',
+  'chat.send': 'إرسال',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

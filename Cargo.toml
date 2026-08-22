@@ -62,6 +62,14 @@ openh264 = "0.9"       # §5 says 0.6; 0.6 is long unmaintained
 rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)
 chacha20poly1305 = "0.10" # encrypted-file keystore fallback (§11.2)
+opus = "0.3"             # Opus audio codec bindings over vendored libopus (§5.1, ADR 0023)
+# Unattended-access password hashing (phase 7 catch-up; ADR 0021). Not named
+# in §5; the spec predates the unattended feature.
+argon2 = "0.5"
+# HMAC-SHA1 for RFC 6238 TOTP only (ADR 0021): SHA1 stays confined to the
+# compatibility requirement towards authenticator apps; nothing else uses it.
+hmac = "0.12"
+sha1 = "0.10"
 x11rb = "0.13"          # safe X11 client for the lower-trust Linux capture (§11)
 memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)

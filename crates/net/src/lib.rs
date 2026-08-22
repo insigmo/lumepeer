@@ -9,6 +9,7 @@
 pub mod connection;
 pub mod endpoint;
 pub mod error;
+pub mod file_transfer;
 pub mod framing;
 pub mod keystore;
 pub mod media;

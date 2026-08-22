@@ -5,7 +5,8 @@
 //! channel.
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh_base::RelayUrl;
 
 use crate::error::{NetError, Result};
 
@@ -57,6 +58,11 @@ pub struct PeerEndpoint {
     inner: Endpoint,
 }
 
+/// Environment variable overriding the relay URL clients reach for when hole
+/// punching fails (docs/relay-deployment.md). Unset means iroh's default
+/// public relay fleet.
+const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
+
 impl PeerEndpoint {
     /// Binds an endpoint using the long-term identity from the OS keystore
     /// (§7, §11.2), with relays and address lookup enabled.
@@ -83,9 +89,11 @@ impl PeerEndpoint {
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
     pub async fn bind_with_lan(secret_key: iroh::SecretKey) -> Result<Self> {
-        let inner = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
-            .alpns(alpn_list())
+            .alpns(alpn_list());
+        builder = with_relay_override(builder);
+        let inner = builder
             .bind()
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
@@ -104,10 +112,12 @@ impl PeerEndpoint {
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
     pub async fn bind_relay_only(secret_key: iroh::SecretKey) -> Result<Self> {
-        let inner = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .secret_key(secret_key)
-            .alpns(alpn_list())
+            .alpns(alpn_list());
+        builder = with_relay_override(builder);
+        let inner = builder
             .bind()
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;

@@ -30,6 +30,7 @@ vars:
   # named by mDNS instead: Bonjour follows it across leases, and both Windows
   # and the VMs resolve .local without extra setup.
   LINUX_HOST: beta@192.168.40.128
+  WAYLANDLINUX_HOST: beta@192.168.40.130
   MACOS_HOST: beta@betas-iMac.local
   REMOTE_DIR: lumepeer
 

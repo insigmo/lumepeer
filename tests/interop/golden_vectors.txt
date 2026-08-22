@@ -1,7 +1,12 @@
 # Protocol golden vectors (design doc §17.2).
 #
-# Frozen wire encodings of MessageEnvelope for PROTOCOL_MAJOR 1, PROTOCOL_MINOR 0.
-# Format: <valid|invalid> <name> <hex payload, without the u32_be length prefix>.
+# Frozen wire encodings of MessageEnvelope. Format:
+#   <valid|invalid> <name> <hex payload, without the u32_be length prefix>
+#
+# Vectors do not change once recorded: an interop partner that passes today
+# must keep passing tomorrow. Each block names the PROTOCOL_MINOR it was
+# frozen under. New messages are appended with new vectors; changing or
+# removing an existing line requires a major-version conversation.
 #
 # These do not change without bumping PROTOCOL_MINOR: an interop partner that
 # passes today must keep passing tomorrow.
@@ -28,5 +33,19 @@ valid input_wheel abababababababababababababababab01080900000003050a00
 invalid empty_frame 
 invalid truncated_envelope abab
 invalid unknown_message_kind abababababababababababababababab0000ff00
+
+# --- Frozen for PROTOCOL_MINOR 1: chat, keyframe request, cursor shape,
+# --- monitors, privacy mode, audio negotiation and file-transfer control.
+valid minor1_chat abababababababababababababababab00001302686900
+valid minor1_keyframe_request abababababababababababababababab00001400
+valid minor1_cursor_shape abababababababababababababababab0000150202010110aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00
+valid minor1_monitors_list abababababababababababababababab0000160100800fb8080100
+valid minor1_monitor_select abababababababababababababababab0000170100
+valid minor1_privacy_mode_on abababababababababababababababab0000180100
+valid minor1_privacy_mode_ack_off abababababababababababababababab0000190000
+valid minor1_audio_start abababababababababababababababab00001a80f7020200
+valid minor1_audio_stop abababababababababababababababab00001b00
+valid minor1_file_abort abababababababababababababababab00001c0700
+valid minor1_file_chunk_ack abababababababababababababababab00001d07802000
 invalid trailing_garbage abababababababababababababababab000001010000ff
 invalid bad_direction_byte abababababababababababababababab0700010100
