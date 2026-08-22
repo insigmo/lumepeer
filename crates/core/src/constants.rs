@@ -105,3 +105,50 @@ pub const LOG_ROTATION_MAX_MIB: u32 = 100;
 /// forever, per the "degrade towards safety, tell the user" rule of §24.5
 /// (ADR 0011).
 pub const ENCODE_HW_EVENT_TIMEOUT_MS: u64 = 2_000;
+
+/// Maximum UTF-8 byte length of one chat message (§9.2). Chat rides the
+/// control channel, so it must always stay well under
+/// `MAX_CONTROL_FRAME_BYTES`.
+pub const CHAT_MAX_BYTES: usize = 4_096;
+
+/// Maximum pixel area of one cursor shape update (§11). A cursor is UI
+/// chrome, never a second video channel; anything larger is malformed.
+pub const MAX_CURSOR_SHAPE_PIXELS: usize = 128 * 128;
+
+/// Maximum number of monitors one host may report in `MonitorsList` (§11).
+pub const MAX_MONITORS_PER_HOST: usize = 8;
+
+/// Audio sample rate of the Opus audio channel (§11). Opus internally
+/// supports 8/12/16/24/48 kHz; 48 kHz is the only full-band rate and the
+/// single fixed value keeps the negotiation trivial.
+pub const AUDIO_SAMPLE_RATE_HZ: u32 = 48_000;
+/// Audio channel count of the Opus audio channel (§11).
+pub const AUDIO_CHANNELS: u8 = 2;
+/// Duration of one encoded audio frame in milliseconds (§11). 20 ms is the
+/// Opus default and keeps latency under one video frame at 30 fps.
+pub const AUDIO_FRAME_MS: u32 = 20;
+/// Default audio bitrate (§11): 96 kbit/s, the Opus sweet spot for a
+/// stereo desktop-audio mix.
+pub const AUDIO_DEFAULT_BITRATE_BPS: i32 = 96_000;
+/// Maximum size of one encoded audio frame on the wire (§11). 20 ms of
+/// uncompressed 48 kHz stereo s16 is 3 840 bytes; Opus output is smaller,
+/// but the bound stays for the length check before allocation.
+pub const AUDIO_MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Maximum payload of one file-transfer chunk on `rd/file/1` (§9.2). Chunks
+/// ride the media framing bound, so they must stay strictly under
+/// `MAX_MEDIA_FRAME_BYTES` with room for the chunk header.
+pub const FILE_CHUNK_MAX_BYTES: usize = 256 * 1024;
+/// Maximum concurrent file transfers per session (§9.2). Mirrors
+/// `MAX_PENDING_FILE_OFFERS` for the transfer phase that follows an offer.
+pub const MAX_CONCURRENT_FILE_TRANSFERS: usize = 3;
+
+/// Time step of the RFC 6238 TOTP second factor (§8; ADR 0021). 30 s is what
+/// every mainstream authenticator app defaults to.
+pub const UNATTENDED_TOTP_STEP_SECS: u64 = 30;
+/// Consecutive failed unattended verifications before the host locks out
+/// brute force (§18).
+pub const UNATTENDED_MAX_FAILED_ATTEMPTS: u32 = 5;
+/// How long the host refuses every unattended verification once the failure
+/// limit is reached (§18).
+pub const UNATTENDED_LOCKOUT_DURATION_SECS: u64 = 300;

@@ -661,3 +661,102 @@ pub async fn input_wheel(
         .await?;
     Ok(())
 }
+
+/// DTO of one chat transcript row.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatEntryDto {
+    /// `true` when sent by the local user, `false` when received.
+    pub outgoing: bool,
+    /// Message text (already validated by the core).
+    pub text: String,
+    /// Local wall-clock time in Unix seconds; display-only (§15).
+    pub at_unix: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatSendArgs {
+    /// Pseudonymized label of the session partner.
+    pub peer: String,
+    /// Text to send, validated again inside the core (§9.2).
+    pub text: String,
+}
+
+/// Sends one chat message to `peer` and returns the stored entry (§9.2).
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed or the actor refuses.
+#[tauri::command]
+pub async fn chat_send(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ChatSendArgs,
+) -> Result<ChatEntryDto, IpcError> {
+    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    let stored = state.network.chat_send(args.peer, args.text).await?;
+    Ok(ChatEntryDto {
+        outgoing: stored.outgoing,
+        text: stored.text,
+        at_unix: stored.at_unix,
+    })
+}
+
+/// Returns the chat transcript with `peer`, oldest first (§9.2).
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed.
+#[tauri::command]
+pub async fn chat_transcript(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<Vec<ChatEntryDto>, IpcError> {
+    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
+    let rows = state.network.chat_transcript(peer).await?;
+    Ok(rows
+        .into_iter()
+        .map(|e| ChatEntryDto {
+            outgoing: e.outgoing,
+            text: e.text,
+            at_unix: e.at_unix,
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClipboardPushArgs {
+    /// Pseudonymized label of the session partner.
+    pub peer: String,
+    /// UTF-8 text to sync, bounded by §9.2 inside the actor/core.
+    pub text: String,
+}
+
+/// Pushes the local clipboard text to `peer` (grant-gated, §8.2).
+///
+/// # Errors
+/// [`IpcError`] when unallowed or refused for lack of a grant.
+#[tauri::command]
+pub async fn clipboard_push(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ClipboardPushArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    state.network.clipboard_push(args.peer, args.text).await?;
+    Ok(())
+}
+
+/// Pulls the newest inbound clipboard payload from `peer`, if any (§9.2).
+///
+/// Pull semantics keep payloads off any broadcast surface (§15).
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed.
+#[tauri::command]
+pub async fn clipboard_pull(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<Option<String>, IpcError> {
+    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
+    Ok(state.network.clipboard_pull(peer).await?)
+}

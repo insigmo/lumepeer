@@ -67,8 +67,8 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 0,
-        "the vectors are frozen for minor 0; bump the file together with the version"
+        PROTOCOL_MINOR, 1,
+        "the vectors are frozen per minor; bump the file together with the version"
     );
 
     let vectors = vectors();

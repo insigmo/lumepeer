@@ -19,6 +19,11 @@ ed25519-dalek.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+data-encoding.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

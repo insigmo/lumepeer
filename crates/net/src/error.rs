@@ -59,6 +59,43 @@ pub enum NetError {
     /// host side instead of issuing an invite nobody can act on (§7).
     #[error("this device is not reachable yet")]
     Offline,
+
+    /// More than `MAX_CONCURRENT_FILE_TRANSFERS` transfers are active (§9.2).
+    #[error("too many concurrent file transfers")]
+    TooManyTransfers,
+
+    /// Chunk for a transfer id that was never registered (§9.2).
+    #[error("unknown file transfer")]
+    UnknownTransfer,
+
+    /// Chunk offset is not the resume point; chunks are strictly sequential.
+    #[error("chunk gap: expected offset {expected}, got {got}")]
+    ChunkGap {
+        /// Offset the receiver had reached.
+        expected: u64,
+        /// Offset the chunk claimed.
+        got: u64,
+    },
+
+    /// Chunk would extend the transfer past its announced size (§9.2).
+    #[error("chunk overruns the announced file size")]
+    ChunkOverrun,
+
+    /// Chunk length outside `1..=FILE_CHUNK_MAX_BYTES` (§9.2, §3.2).
+    #[error("file chunk size {0} outside 1..=FILE_CHUNK_MAX_BYTES")]
+    ChunkTooLarge(usize),
+
+    /// Transfer already ended; no further chunks are accepted.
+    #[error("transfer already closed")]
+    TransferClosed,
+
+    /// Chunk accounting overflowed; treated as hostile input.
+    #[error("offset arithmetic overflow")]
+    Overflow,
+
+    /// Peer stream ended mid-frame; the partial data must be discarded.
+    #[error("peer closed the stream mid-{0}")]
+    TruncatedStream(&'static str),
 }
 
 /// Convenience alias for net results.

@@ -35,6 +35,11 @@ capture-screencapturekit = [
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
+# Opus audio encode/decode (§5.1; ADR 0023). audiopus_sys vendors libopus and
+# builds it with cmake — the same precedent as openh264-sys — so the default
+# build still needs no platform SDK. Without this feature every audio entry
+# point is inert and the session runs video-only.
+audio-opus = ["dep:opus"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
 # Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19
@@ -69,6 +74,7 @@ thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+opus = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
 ashpd = { version = "0.13.13", default-features = false, features = [

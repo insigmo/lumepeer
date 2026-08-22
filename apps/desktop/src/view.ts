@@ -9,6 +9,7 @@
 
 import { render } from 'lit-html';
 
+import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import {
   decodeViewFrame,
@@ -24,6 +25,7 @@ const params = new URLSearchParams(window.location.search);
 const peer = params.get('peer') ?? '';
 const canvas = document.querySelector<HTMLCanvasElement>('#screen');
 const overlay = document.querySelector<HTMLElement>('#overlay');
+const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
 const locale: Locale = detectLocale(navigator);
 
 document.documentElement.lang = locale;
@@ -118,6 +120,12 @@ function loop(): void {
 
 async function main(): Promise<void> {
   renderOverlay();
+  // The chat panel polls the actor's transcript; it exists only while this
+  // window does, so no explicit teardown beyond the poll's own stop.
+  if (chatPanel) {
+    chatPanel.hidden = false;
+    startChatPolling(chatPanel, new ChatState(), locale, peer, tauriChatCommands);
+  }
   // The remote host's own right-click menu is part of the picture; the
   // local WebView's native one has no business appearing on top of it.
   suppressContextMenu(document);

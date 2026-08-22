@@ -87,6 +87,10 @@ fn main() {
             commands::input_pointer_move,
             commands::input_press,
             commands::input_wheel,
+            commands::chat_send,
+            commands::chat_transcript,
+            commands::clipboard_push,
+            commands::clipboard_pull,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

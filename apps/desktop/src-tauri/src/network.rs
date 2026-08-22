@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
+use lumepeer_core::chat::{ChatEntry, ChatLog};
+use lumepeer_core::clipboard::ClipboardSync;
 use lumepeer_core::consent::{Grants, Role};
 use lumepeer_core::constants::{CONTROL_HANDSHAKE_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES};
 use lumepeer_core::protocol::{InputEventPayload, MessageKind};
@@ -122,7 +124,7 @@ impl ConnectPhase {
 ///
 /// Deliberately carries no peer identity: it crosses no trust boundary today
 /// and must not become a channel for one (§15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActorNotification {
     /// A remote host granted `role` to this node (guest side).
     ConsentGranted {
@@ -135,6 +137,16 @@ pub enum ActorNotification {
     ConsentRequested,
     /// A control connection closed, in either direction.
     Disconnected,
+    /// A chat message arrived from a peer. The label is pseudonymized (§15);
+    /// the transcript itself stays inside the actor and is polled by the UI.
+    ChatFromPeer {
+        /// Pseudonymized peer label the message came from.
+        label: String,
+    },
+    /// The peer's clipboard changed and passed §9.2 validation; the payload
+    /// is delivered through `clipboard_inbound`, never on the notification
+    /// bus (§15: notifications are broadcast to every listener).
+    ClipboardFromPeer,
 }
 
 /// Failure returned by an actor call.
@@ -202,6 +214,29 @@ enum ActorCommand {
         label: String,
         event: Box<InputEventPayload>,
         reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: send one chat message to `label`.
+    ChatSend {
+        label: String,
+        text: String,
+        reply: oneshot::Sender<Result<ChatEntry, ActorError>>,
+    },
+    /// Either side: fetch the chat transcript of `label`.
+    ChatTranscript {
+        label: String,
+        reply: oneshot::Sender<Vec<ChatEntry>>,
+    },
+    /// Either side: push the local clipboard text to the peer, gated on the
+    /// session's clipboard grants (§8.2).
+    ClipboardPush {
+        label: String,
+        text: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: fetch the newest inbound clipboard payload, if any.
+    ClipboardPull {
+        label: String,
+        reply: oneshot::Sender<Option<String>>,
     },
 }
 
@@ -378,6 +413,62 @@ impl ActorHandle {
     /// [`ActorError::Core`] with [`CoreError::NotPermitted`] if the session
     /// holds no `input` grant; [`ActorError::ChannelClosed`] if the actor is
     /// gone.
+    /// Sends one chat message to the session with `label` and returns the
+    /// stored transcript entry.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] / [`ActorError::Core`] as refused;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn chat_send(&self, label: String, text: String) -> Result<ChatEntry, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ChatSend { label, text, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// The chat transcript of `label`, oldest first.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn chat_transcript(&self, label: String) -> Result<Vec<ChatEntry>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ChatTranscript { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Pushes the local clipboard to `label` (grant-gated, §8.2).
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without the clipboard grant;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn clipboard_push(&self, label: String, text: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ClipboardPush { label, text, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Takes the newest inbound clipboard payload from `label`, if any.
+    /// Pull semantics keep payloads off the broadcast bus (§15).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn clipboard_pull(&self, label: String) -> Result<Option<String>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ClipboardPull { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     pub async fn input(&self, label: String, event: InputEventPayload) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -390,6 +481,13 @@ impl ActorHandle {
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
+}
+
+/// Current Unix time in whole seconds; 0 if the clock is before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn unix_now() -> u64 {
@@ -564,6 +662,12 @@ struct Actor {
     /// Guest side: the invite code used to reach each host, kept so the history
     /// row written when the session ends can dial it again (ADR 0016).
     host_invites: std::collections::HashMap<NodeId, String>,
+    /// Per-peer chat transcripts (§9.2), dropped when the session ends.
+    chat: ChatLog,
+    /// Per-peer clipboard sync state (§9.2): echo suppression both ways.
+    clipboard: std::collections::HashMap<NodeId, ClipboardSync>,
+    /// Newest inbound clipboard payload per peer, for the UI to pull.
+    clipboard_inbound: std::collections::HashMap<NodeId, String>,
     /// How view windows are created and closed.
     windows: Arc<dyn ViewWindows>,
     /// Guest side: hosts this node has connected to before (§21 punch-list
@@ -1087,6 +1191,51 @@ impl Actor {
             // Host side: a guest asks for input. Authorization is `lumepeer-
             // core`'s, per event.
             MessageKind::InputEvent(ref event) => self.inject(peer, event),
+            // Chat: validate, store, tell the UI there is something to pull.
+            // A refused message is dropped with a log line — it never closes
+            // the session (chat is content, not control).
+            MessageKind::Chat { ref text } => {
+                let at = unix_now_secs();
+                match self.chat.record(peer, false, text, at) {
+                    Ok(_) => {
+                        let _ = self
+                            .notify
+                            .send(ActorNotification::ChatFromPeer { label: tag.clone() });
+                    }
+                    Err(error) => {
+                        tracing::warn!(peer = %tag, %error, "dropping an invalid chat message");
+                    }
+                }
+            }
+            // Clipboard from the peer: §9.2 validation plus grant check on
+            // the receiving side's own copy of the grants; then stage the
+            // payload for the UI to apply and pull.
+            MessageKind::ClipboardSync { ref data } => {
+                let granted_to_guest = self
+                    .sessions
+                    .grants(&peer)
+                    .is_some_and(|g| g.clipboard_read);
+                let permitted = self
+                    .views
+                    .get(&peer)
+                    .is_some_and(|v| v.grants.clipboard_write)
+                    || (granted_to_guest && !self.views.contains_key(&peer));
+                if !permitted {
+                    tracing::warn!(peer = %tag, "clipboard update without a grant; ignored");
+                    return;
+                }
+                let sync = self.clipboard.entry(peer).or_default();
+                match sync.remote_received(data) {
+                    Ok(text) => {
+                        self.clipboard_inbound
+                            .insert(peer, String::from_utf8_lossy(text).into_owned());
+                        let _ = self.notify.send(ActorNotification::ClipboardFromPeer);
+                    }
+                    Err(error) => {
+                        tracing::warn!(peer = %tag, %error, "dropping an invalid clipboard payload");
+                    }
+                }
+            }
             // Everything else belongs to a phase this build does not run yet.
             // Nothing a peer sends may ever grant itself consent (§2.3).
             ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
@@ -1099,6 +1248,11 @@ impl Actor {
             return;
         }
         self.connections.remove(&peer);
+        // Chat and clipboard state are per-session by design (§15): nothing
+        // about a past peer survives its connection here.
+        self.chat.drop_transcript(&peer);
+        self.clipboard.remove(&peer);
+        self.clipboard_inbound.remove(&peer);
         // Both sides of the media pipeline end with the control connection: the
         // host stops capturing for this viewer, the guest closes its window
         // (and, on the guest, records the host it was watching).
@@ -1150,41 +1304,7 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::InviteCreate { role, reply } => {
-                let now = unix_now();
-                let addr = self.endpoint.addr();
-                // An invite is only worth anything if it carries somewhere to
-                // dial. Until the endpoint has reached a relay (and, with the
-                // direct transports cleared, it has nothing else to offer) the
-                // address set is empty and the code would be dead on arrival —
-                // which is far worse than saying "not yet": the host reads it
-                // out, the guest pastes it, and the failure surfaces on the
-                // wrong machine.
-                if addr.addrs.is_empty() {
-                    tracing::warn!(
-                        "refusing to issue an invite: the endpoint has no dialable address yet"
-                    );
-                    let _ = reply.send(Err(ActorError::Net(NetError::Offline)));
-                    return;
-                }
-                tracing::info!(addrs = ?addr.addrs, "issuing an invite");
-                let issued = InviteTicket::issue(&self.identity, &addr, role, now);
-                let result = match issued {
-                    Ok(ticket) => match ticket.to_code() {
-                        Ok(code) => {
-                            // Exactly one invite is live at a time: issuing a
-                            // replacement is also how the host withdraws the
-                            // code it read out earlier (ADR 0016).
-                            self.tickets.retire_all();
-                            self.tickets.register(&ticket);
-                            Ok(InviteDto {
-                                code,
-                                expires_at: ticket.expires_at,
-                            })
-                        }
-                        Err(e) => Err(ActorError::Net(e)),
-                    },
-                    Err(e) => Err(ActorError::Net(e)),
-                };
+                let result = self.on_invite_create(role);
                 if let Err(ActorError::Net(ref error)) = result {
                     tracing::warn!(%error, "could not issue an invite");
                 }
@@ -1217,7 +1337,144 @@ impl Actor {
                 let result = self.on_input(&label, *event);
                 let _ = reply.send(result);
             }
+            ActorCommand::ChatSend { label, text, reply } => {
+                let result = self.on_chat_send(&label, &text);
+                let _ = reply.send(result);
+            }
+            ActorCommand::ChatTranscript { label, reply } => {
+                let _ = reply.send(self.on_chat_transcript(&label));
+            }
+            ActorCommand::ClipboardPush { label, text, reply } => {
+                let result = self.on_clipboard_push(&label, &text);
+                let _ = reply.send(result);
+            }
+            ActorCommand::ClipboardPull { label, reply } => {
+                let _ = reply.send(self.on_clipboard_pull(&label));
+            }
         }
+    }
+
+    /// Issues an invite for `role`, refusing while the endpoint has no
+    /// dialable address (§7).
+    fn on_invite_create(&mut self, role: Role) -> Result<InviteDto, ActorError> {
+        let now = unix_now();
+        let addr = self.endpoint.addr();
+        // An invite is only worth anything if it carries somewhere to
+        // dial. Until the endpoint has reached a relay (and, with the
+        // direct transports cleared, it has nothing else to offer) the
+        // address set is empty and the code would be dead on arrival —
+        // which is far worse than saying "not yet": the host reads it
+        // out, the guest pastes it, and the failure surfaces on the
+        // wrong machine.
+        if addr.addrs.is_empty() {
+            tracing::warn!("refusing to issue an invite: the endpoint has no dialable address yet");
+            return Err(ActorError::Net(NetError::Offline));
+        }
+        tracing::info!(addrs = ?addr.addrs, "issuing an invite");
+        let issued = InviteTicket::issue(&self.identity, &addr, role, now);
+        match issued {
+            Ok(ticket) => match ticket.to_code() {
+                Ok(code) => {
+                    // Exactly one invite is live at a time: issuing a
+                    // replacement is also how the host withdraws the
+                    // code it read out earlier (ADR 0016).
+                    self.tickets.retire_all();
+                    self.tickets.register(&ticket);
+                    Ok(InviteDto {
+                        code,
+                        expires_at: ticket.expires_at,
+                    })
+                }
+                Err(e) => Err(ActorError::Net(e)),
+            },
+            Err(e) => Err(ActorError::Net(e)),
+        }
+    }
+
+    /// Transcript of `label`; empty for an unknown label rather than an
+    /// error, because a transcript poll races session teardown routinely.
+    fn on_chat_transcript(&self, label: &str) -> Vec<ChatEntry> {
+        match self.resolve(label) {
+            Ok(peer) => self.chat.transcript(&peer).to_vec(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Takes and clears `label`'s staged inbound clipboard payload.
+    fn on_clipboard_pull(&mut self, label: &str) -> Option<String> {
+        match self.resolve(label) {
+            Ok(peer) => self.clipboard_inbound.remove(&peer),
+            Err(_) => None,
+        }
+    }
+
+    /// Both directions: record and forward one chat message (§9.2).
+    ///
+    /// The sender's own copy of the grants is advisory here; the receiving
+    /// host re-checks what its session state allows before showing anything.
+    /// A chat needs no separate grant: it is part of every granted session.
+    fn on_chat_send(&mut self, label: &str, text: &str) -> Result<ChatEntry, ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.connections.contains_key(&peer) {
+            return Err(ActorError::UnknownPeer);
+        }
+        let at = unix_now_secs();
+        let stored = self
+            .chat
+            .record(peer, true, text, at)
+            .map_err(ActorError::Core)?
+            .clone();
+        self.send_to(
+            &peer,
+            MessageKind::Chat {
+                text: text.to_owned(),
+            },
+        );
+        Ok(stored)
+    }
+
+    /// Push the local clipboard to `label`, gated on this side's own copy of
+    /// the clipboard grants (§8.2): a host pushes only with
+    /// `clipboard_read` of that guest session, a guest only with
+    /// `clipboard_write` announced by the host. The host re-checks.
+    fn on_clipboard_push(&mut self, label: &str, text: &str) -> Result<(), ActorError> {
+        use lumepeer_core::clipboard as clip;
+        let peer = self.resolve(label)?;
+        let permitted = if self.host_addrs.contains_key(&peer) {
+            // This node dialed the peer: it is the guest. Sending our
+            // clipboard *to* the host writes there, so the grant needed is
+            // the one the host gave us for writing its clipboard... which is
+            // exactly `clipboard_write`.
+            self.views
+                .get(&peer)
+                .is_some_and(|v| v.grants.clipboard_write)
+        } else {
+            // Host side: handing our clipboard out reads it, so the session
+            // must carry `clipboard_read`.
+            self.sessions
+                .grants(&peer)
+                .is_some_and(|g| g.clipboard_read)
+        };
+        if !permitted {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        clip::validate_payload(text.as_bytes()).map_err(ActorError::Core)?;
+        let sync = self.clipboard.entry(peer).or_default();
+        if sync
+            .local_changed(text.as_bytes())
+            .map_err(ActorError::Core)?
+            .is_none()
+        {
+            // Echo of a remote update we applied ourselves: do not send.
+            return Ok(());
+        }
+        self.send_to(
+            &peer,
+            MessageKind::ClipboardSync {
+                data: text.as_bytes().to_vec(),
+            },
+        );
+        Ok(())
     }
 
     /// Host side: grants `role` and, if it carries `view`, registers the peer
@@ -1444,6 +1701,9 @@ pub fn spawn_actor_with(
         views: std::collections::HashMap::new(),
         host_addrs: std::collections::HashMap::new(),
         host_invites: std::collections::HashMap::new(),
+        chat: ChatLog::new(),
+        clipboard: std::collections::HashMap::new(),
+        clipboard_inbound: std::collections::HashMap::new(),
         windows,
         history: ConnectionHistory::open(history_path),
         connect_phase: ConnectPhase::Idle,

@@ -10,13 +10,17 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod address_book;
 pub mod audit;
+pub mod chat;
+pub mod clipboard;
 pub mod consent;
 pub mod constants;
 pub mod error;
 pub mod license;
 pub mod protocol;
 pub mod session;
+pub mod unattended;
 
 /// Peer identity: the Iroh endpoint public key. Long-term identity material
 /// itself lives only in the OS keystore (§7, §11.2).
