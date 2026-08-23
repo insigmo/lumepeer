@@ -28,6 +28,10 @@ env:
   # nothing and the dev/test-profile link step is prone to OOM on shared
   # runners (see ci.yml for the "Bus error" incident this works around).
   CARGO_PROFILE_RELEASE_DEBUG: "0"
+  # Matches ci.yml: audiopus_sys (vendored libopus, `audio-opus`) declares
+  # compatibility with CMake < 3.5, which CMake 4 refuses to configure.
+  # Harmless under CMake 3.x. See the RUSTSEC-2026-0150 note in deny.toml.
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
 permissions:
   contents: write
@@ -199,6 +203,23 @@ jobs:
           key: ${{ matrix.target }}
       - run: npm install
         working-directory: apps/desktop
+      # tauri-build validates `externalBin` at compile time: the sidecar must
+      # exist as binaries/lumepeer-decoder-worker-<target-triple><exe> before
+      # lumepeer-desktop builds. The directory is gitignored (build artifact),
+      # so CI produces it here from the same source tree — same recipe as the
+      # ci.yml build job, except it stages from a --target release build so
+      # the macos-amd64 job on arm64 hardware bundles an x86_64 worker.
+      - name: Build the decoder-worker sidecar for this target
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          cargo build --release -p lumepeer-decoder-worker --target ${{ matrix.target }}
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/lumepeer-decoder-worker${EXE}" \
+             "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${{ matrix.target }}${EXE}"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
