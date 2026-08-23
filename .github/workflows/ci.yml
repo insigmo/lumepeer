@@ -53,6 +53,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # tauri-build validates `externalBin` at compile time: the sidecar must
+      # exist as binaries/lumepeer-decoder-worker-<target-triple><exe> before
+      # lumepeer-desktop builds. The directory is gitignored (build artifact),
+      # so CI produces it here from the same source tree.
+      - name: Build the decoder-worker sidecar for this target
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          cargo build -p lumepeer-decoder-worker
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp "target/debug/lumepeer-decoder-worker${EXE}" \
+             "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${TRIPLE}${EXE}"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
