@@ -40,6 +40,16 @@ encode-openh264 = ["dep:openh264"]
 # build still needs no platform SDK. Without this feature every audio entry
 # point is inert and the session runs video-only.
 audio-opus = ["dep:opus"]
+# Desktop-audio capture backends (§11; questions.md item 8, ADR 0023): WASAPI
+# loopback on Windows. The `windows` crate itself is already unconditional on
+# Windows (see below), so this feature only adds the WASAPI/COM binding
+# modules the capturer needs on top of what the decoder sandbox requires.
+audio-capture = ["windows/Win32_Media_Audio"]
+# PipeWire monitor capture on Linux (questions.md item 8, ADR 0023). The
+# `pipewire` dependency is already optional under the Linux target table
+# (pulled in by `capture-portal`); this feature reuses it rather than adding a
+# second binding set.
+audio-capture-pipewire = []
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
 # Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19

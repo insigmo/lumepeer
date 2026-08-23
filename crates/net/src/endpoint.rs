@@ -5,8 +5,8 @@
 //! channel.
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayMode};
-use iroh_base::RelayUrl;
+use iroh::endpoint::Builder as EndpointBuilder;
+use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
 
 use crate::error::{NetError, Result};
 
@@ -62,6 +62,27 @@ pub struct PeerEndpoint {
 /// punching fails (docs/relay-deployment.md). Unset means iroh's default
 /// public relay fleet.
 const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
+
+/// Applies `LUMEPEER_RELAY_URL` to a builder when set (§7 fallback path,
+/// docs/relay-deployment.md). A malformed URL is ignored with an error log:
+/// binding must keep working offline, and the endpoint logs which relay it
+/// actually uses either way.
+fn with_relay_override(builder: EndpointBuilder) -> EndpointBuilder {
+    match std::env::var(RELAY_URL_ENV) {
+        Err(_) => builder,
+        Ok(url) => match url.parse::<RelayUrl>() {
+            Ok(relay) => builder.relay_mode(RelayMode::custom([relay])),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %url,
+                    "ignoring LUMEPEER_RELAY_URL: not a valid relay URL"
+                );
+                builder
+            }
+        },
+    }
+}
 
 impl PeerEndpoint {
     /// Binds an endpoint using the long-term identity from the OS keystore

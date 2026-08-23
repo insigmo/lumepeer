@@ -369,11 +369,17 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_roundtrip_over_a_duplex() {
+        // The duplex buffer is deliberately small: the reader side must run
+        // concurrently, or a chunk bigger than the buffer deadlocks the
+        // writer against the capacity limit — exactly the backpressure QUIC
+        // would apply on a real connection.
         let (mut client, mut server) = tokio::io::duplex(1024);
         let payload = vec![0xABu8; FILE_CHUNK_MAX_BYTES.min(4096)];
 
-        write_chunk(&mut client, 42, 0, &payload).await.unwrap();
-        let (id, offset, bytes) = read_chunk(&mut server).await.unwrap();
+        let (write_result, read_result) =
+            tokio::join!(write_chunk(&mut client, 42, 0, &payload), read_chunk(&mut server));
+        let () = write_result.unwrap();
+        let (id, offset, bytes) = read_result.unwrap();
         assert_eq!(id, 42);
         assert_eq!(offset, 0);
         assert_eq!(bytes, payload);

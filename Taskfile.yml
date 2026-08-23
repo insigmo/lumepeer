@@ -456,6 +456,42 @@ tasks:
       - task: sync:macos
       - ssh {{.MACOS_HOST}} ". ~/lumepeer-env.sh && cd ~/{{.REMOTE_DIR}} && task package:dmg:macos-amd64"
 
+  # ---------------------------------------------------------------------
+  # E2E smoke tests on the Linux VMs over SSH (e2e/run-on-vm.sh). The X11
+  # VM runs them now; the Wayland VM joins once its capture path lands
+  # (questions.md item 4: Wayland last). `task e2e:x11` syncs the tree —
+  # including uncommitted changes, same throwaway-index trick as
+  # sync:linux — then runs the script remotely.
+  # ---------------------------------------------------------------------
+
+  e2e:sync-common:
+    internal: true
+    cmds:
+      - |
+        rm -f .git/lumepeer-sync-index-e2e
+        GIT_INDEX_FILE=.git/lumepeer-sync-index-e2e git add -A
+        TREE=$(GIT_INDEX_FILE=.git/lumepeer-sync-index-e2e git write-tree)
+        rm -f .git/lumepeer-sync-index-e2e
+        mkdir -p target/e2e && git archive --format=tar "$TREE" > target/e2e/tree.tar
+
+  e2e:x11:
+    desc: Run the desktop E2E smoke scenario on the X11 Linux VM over SSH.
+    deps: [e2e:sync-common]
+    cmds:
+      - scp -q target/e2e/tree.tar {{.LINUX_HOST}}:/tmp/lumepeer-e2e-tree.tar
+      - |
+        ssh {{.LINUX_HOST}} "mkdir -p ~/lumepeer && tar -xf /tmp/lumepeer-e2e-tree.tar -C ~/lumepeer"
+        ssh {{.LINUX_HOST}} "bash -s x11" < e2e/run-on-vm.sh
+
+  e2e:wayland:
+    desc: Run the desktop E2E smoke scenario on the Wayland Linux VM over SSH.
+    deps: [e2e:sync-common]
+    cmds:
+      - scp -q target/e2e/tree.tar {{.WAYLANDLINUX_HOST}}:/tmp/lumepeer-e2e-tree.tar
+      - |
+        ssh {{.WAYLANDLINUX_HOST}} "mkdir -p ~/lumepeer && tar -xf /tmp/lumepeer-e2e-tree.tar -C ~/lumepeer"
+        ssh {{.WAYLANDLINUX_HOST}} "bash -s wayland" < e2e/run-on-vm.sh
+
   collect:installers:
     desc: >-
       Copy the eight installers into {{.INSTALLERS_DIR}}/ — the two Windows

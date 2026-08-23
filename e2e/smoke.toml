@@ -1,0 +1,53 @@
+# E2E smoke scenario for the Lumepeer desktop app (§13, ADR 0023).
+#
+# Runs against a debug build with `--features pilot` via tauri-pilot's
+# declarative runner (`tauri-pilot run e2e/smoke.toml --junit out.xml`).
+# Step actions come from tauri-pilot-cli 0.7.2 (`src/scenario.rs`): eval,
+# assert-url, wait, screenshot, ... The assertions cover what a session-less
+# app can honestly show: the window is alive, the new chat/clipboard IPC
+# commands exist and answer with the documented shapes.
+
+[scenario]
+name = "lumepeer-smoke"
+
+[[step]]
+name = "main-window-url"
+action = "assert-url"
+expected = "index.html"
+
+[[step]]
+name = "dom-ready"
+action = "eval"
+script = "document.readyState"
+
+[[step]]
+name = "chat-input-command-exists"
+# An unknown command rejects; `chat_transcript` must resolve for any label.
+action = "eval"
+script = "window.__TAURI__.core.invoke('chat_transcript', { peer: 'e2e-no-such-peer' }).then(() => 'ok').catch((e) => 'ERR:' + e)"
+expected = "ok"
+
+[[step]]
+name = "clipboard-pull-empty-for-unknown-peer"
+action = "eval"
+script = "window.__TAURI__.core.invoke('clipboard_pull', { peer: 'e2e-no-such-peer' }).then((v) => v === null ? 'null' : 'payload:' + v).catch((e) => 'ERR:' + e)"
+expected = "null"
+
+[[step]]
+name = "chat-send-refuses-unknown-peer"
+# Deny-by-default: sending to a peer that is not in session state must fail
+# with the structured refusal, not hang and not succeed silently.
+action = "eval"
+script = "window.__TAURI__.core.invoke('chat_send', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
+expected = "UNKNOWN_PEER"
+
+[[step]]
+name = "clipboard-push-refused-without-grant"
+action = "eval"
+script = "window.__TAURI__.core.invoke('clipboard_push', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
+expected = "UNKNOWN_PEER"
+
+[[step]]
+name = "screenshot-main"
+action = "screenshot"
+path = "/tmp/lumepeer-e2e-main.png"

@@ -23,6 +23,10 @@ data-encoding.workspace = true
 chacha20poly1305.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Audio stream payload types (§11). The net crate never links a codec: this is
+# the plain `AudioChunk` struct and the constants, which build without any
+# feature.
+lumepeer-media.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

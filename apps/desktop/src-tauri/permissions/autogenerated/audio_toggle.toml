@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-audio-toggle"
+description = "Enables the audio_toggle command without any pre-configured scope."
+commands.allow = ["audio_toggle"]
+
+[[permission]]
+identifier = "deny-audio-toggle"
+description = "Denies the audio_toggle command without any pre-configured scope."
+commands.deny = ["audio_toggle"]

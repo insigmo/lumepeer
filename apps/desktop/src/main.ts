@@ -6,6 +6,7 @@
 
 import { html, render } from 'lit-html';
 
+import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { consentDialog } from './consent-dialog';
 import { detectLocale, dirOf, type Locale } from './i18n';
 import { t } from './i18n';
@@ -24,6 +25,7 @@ import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
 
 const root = document.querySelector('#app');
+const chatPanel = document.querySelector<HTMLElement>('#host-chat-panel');
 let locale: Locale = detectLocale(navigator);
 
 // Latest polled state (§ main.ts refresh loop below). Rendering is split
@@ -33,6 +35,52 @@ let locale: Locale = detectLocale(navigator);
 let sessions: SessionStatus[] = [];
 let history: HistoryEntry[] = [];
 let networkReady = false;
+
+// Host-side chat with one peer at a time. The panel is the same chat.ts
+// component the view window mounts; only the placement differs. The poll's
+// stop handle is kept so switching peers or closing the drawer does not leave
+// the previous transcript polling behind.
+let chatStop: (() => void) | undefined;
+let chatPeer: string | undefined;
+
+/** Opens (or re-targets) the host chat drawer onto `peer`. */
+function openChat(peer: string): void {
+  if (!chatPanel) {
+    return;
+  }
+  if (chatPeer !== peer) {
+    chatStop?.();
+    // Header (title + close) plus the body the poll loop renders into; the
+    // close button is re-created per peer so its handler never goes stale.
+    chatPanel.replaceChildren();
+    const head = document.createElement('div');
+    head.className = 'host-chat-head';
+    const body = document.createElement('div');
+    body.className = 'host-chat-body';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'host-chat-close';
+    close.setAttribute('aria-label', t(locale, 'chat.close'));
+    close.textContent = '×';
+    close.addEventListener('click', closeChat);
+    head.append(close);
+    chatPanel.append(head, body);
+    chatStop = startChatPolling(body, new ChatState(), locale, peer, tauriChatCommands);
+    chatPeer = peer;
+  }
+  chatPanel.hidden = false;
+}
+
+/** Closes the host chat drawer and stops its transcript poll. */
+function closeChat(): void {
+  chatStop?.();
+  chatStop = undefined;
+  chatPeer = undefined;
+  if (chatPanel) {
+    chatPanel.hidden = true;
+    render(html``, chatPanel);
+  }
+}
 
 function applyDir(): void {
   document.documentElement.lang = locale;
@@ -79,6 +127,7 @@ function renderNow(): void {
                 history,
                 (peer) => void reconnect(peer),
                 isConnecting(),
+                openChat,
               )}
             </main>
           </div>
@@ -102,6 +151,12 @@ async function refresh(): Promise<void> {
     sessions = sessionResult;
     history = historyResult;
     networkReady = networkResult.ready;
+    // The peer the drawer is open on ended its session: close rather than
+    // leave a transcript poll spinning on a dead label (the poll itself stops
+    // on the first IPC error, but this keeps the UI honest immediately).
+    if (chatPeer && !sessions.some((s) => s.state === 'active' && s.peer_label === chatPeer)) {
+      closeChat();
+    }
     // The connect form's own wait: a dial that returned is not a session yet,
     // and only the actor knows whether the far side has decided (§21 item 6).
     setConnectPhase(connectResult.phase);

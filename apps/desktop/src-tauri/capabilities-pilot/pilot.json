@@ -4,5 +4,8 @@
   "description": "Debug-only capability for tauri-pilot UI automation. Only ever read when built with `cargo build --features pilot` (see build.rs, which points the capability glob at this directory instead of capabilities/ for that build). Never present in a default or release build.",
   "windows": ["main", "view-*"],
   "local": true,
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
   "permissions": ["pilot:default"]
 }

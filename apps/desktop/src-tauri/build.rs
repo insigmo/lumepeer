@@ -22,6 +22,12 @@ const COMMANDS: &[&str] = &[
     "input_pointer_move",
     "input_press",
     "input_wheel",
+    "chat_send",
+    "chat_transcript",
+    "clipboard_push",
+    "clipboard_pull",
+    "audio_toggle",
+    "recording_toggle",
 ];
 
 fn main() {
