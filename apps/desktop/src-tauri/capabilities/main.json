@@ -4,6 +4,9 @@
   "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries. Every application command it may call is named here one by one; a command that is not listed cannot be invoked from this window at all.",
   "windows": ["main"],
   "local": true,
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
   "permissions": [
     "core:default",
     {
@@ -28,6 +31,11 @@
     "allow-network-status",
     "allow-license-status",
     "allow-invite-create",
-    "allow-invite-connect"
+    "allow-invite-connect",
+    "allow-chat-send",
+    "allow-chat-transcript",
+    "allow-clipboard-push",
+    "allow-clipboard-pull",
+    "allow-audio-toggle"
   ]
 }

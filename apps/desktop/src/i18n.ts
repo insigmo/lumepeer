@@ -60,7 +60,9 @@ export type TranslationKey =
   | 'chat.logLabel'
   | 'chat.inputLabel'
   | 'chat.inputPlaceholder'
-  | 'chat.send';
+  | 'chat.send'
+  | 'chat.open'
+  | 'chat.close';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -118,6 +120,8 @@ const en: Dictionary = {
   'chat.inputLabel': 'Chat message',
   'chat.inputPlaceholder': 'Type a message…',
   'chat.send': 'Send',
+  'chat.open': 'Chat',
+  'chat.close': 'Close chat',
 };
 
 const ar: Dictionary = {
@@ -174,6 +178,8 @@ const ar: Dictionary = {
   'chat.inputLabel': 'رسالة المحادثة',
   'chat.inputPlaceholder': 'اكتب رسالة…',
   'chat.send': 'إرسال',
+  'chat.open': 'المحادثة',
+  'chat.close': 'إغلاق المحادثة',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

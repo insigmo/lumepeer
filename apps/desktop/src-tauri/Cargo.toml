@@ -44,7 +44,7 @@ tauri-build.workspace = true
 [dependencies]
 lumepeer-core.workspace = true
 lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
-lumepeer-media.workspace = true
+lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] }
 ed25519-dalek.workspace = true
 iroh.workspace = true
 postcard.workspace = true

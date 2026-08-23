@@ -760,3 +760,57 @@ pub async fn clipboard_pull(
     check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
     Ok(state.network.clipboard_pull(peer).await?)
 }
+
+#[derive(Debug, Deserialize)]
+pub struct AudioToggleArgs {
+    /// Pseudonymized label of the guest session to stream audio to.
+    pub peer: String,
+    /// `true` starts the stream (§11 `AudioStart`), `false` stops it.
+    pub on: bool,
+}
+
+/// Host side: turns the desktop-audio stream to `peer` on or off (§11).
+///
+/// The decision lives in the actor: a live granted session is required there,
+/// exactly like every other media surface. Host-side only, so only the main
+/// window may call it — a guest's view window has nothing to toggle.
+///
+/// # Errors
+/// [`IpcError`] when unallowed or refused for lack of a grant.
+#[tauri::command]
+pub async fn audio_toggle(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AudioToggleArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.audio_toggle(args.peer, args.on).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordToggleArgs {
+    /// Pseudonymized label of the session to record.
+    pub peer: String,
+    /// Destination `.lmrc` path chosen by the host user; `None` stops.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Host side: starts or stops the session recording of `peer` (§17).
+///
+/// The `recording` grant is checked inside the actor (§8.2); this command
+/// only carries the host user's choice and the destination path.
+///
+/// # Errors
+/// [`IpcError`] when unallowed or refused for lack of the grant.
+#[tauri::command]
+pub async fn recording_toggle(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RecordToggleArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.record_toggle(args.peer, args.path).await?;
+    Ok(())
+}

@@ -3920,6 +3920,7 @@ dependencies = [
  "iroh",
  "keyring",
  "lumepeer-core",
+ "lumepeer-media",
  "postcard",
  "proptest",
  "rand 0.10.2",

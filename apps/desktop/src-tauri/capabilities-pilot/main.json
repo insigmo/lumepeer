@@ -4,6 +4,9 @@
   "description": "Mirrors capabilities/main.json for the `pilot`-feature build (see build.rs) - keep both files' permissions list identical. Duplicated because Tauri's build-time capability glob reads one directory tree per build, and the pilot build additionally needs pilot.json alongside it.",
   "windows": ["main"],
   "local": true,
+  "remote": {
+    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
+  },
   "permissions": [
     "core:default",
     {
@@ -28,6 +31,11 @@
     "allow-network-status",
     "allow-license-status",
     "allow-invite-create",
-    "allow-invite-connect"
+    "allow-invite-connect",
+    "allow-chat-send",
+    "allow-chat-transcript",
+    "allow-clipboard-push",
+    "allow-clipboard-pull",
+    "allow-audio-toggle"
   ]
 }

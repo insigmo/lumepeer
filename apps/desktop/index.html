@@ -8,6 +8,10 @@
   </head>
   <body>
     <main id="app"></main>
+    <!-- Host-side chat drawer. Filled by main.ts when a session row's Chat
+         button is pressed; the panel itself is the same chat.ts component the
+         view window uses, so both sides share one implementation (§9.2). -->
+    <aside id="host-chat-panel" class="host-chat-panel" hidden></aside>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

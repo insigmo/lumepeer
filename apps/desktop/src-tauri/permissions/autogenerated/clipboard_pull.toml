@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clipboard-pull"
+description = "Enables the clipboard_pull command without any pre-configured scope."
+commands.allow = ["clipboard_pull"]
+
+[[permission]]
+identifier = "deny-clipboard-pull"
+description = "Denies the clipboard_pull command without any pre-configured scope."
+commands.deny = ["clipboard_pull"]

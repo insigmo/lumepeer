@@ -14,6 +14,7 @@
 mod commands;
 mod connection_history;
 mod network;
+mod recorder;
 mod view;
 
 /// State shared by every IPC command: a handle into the network actor.
@@ -91,6 +92,8 @@ fn main() {
             commands::chat_transcript,
             commands::clipboard_push,
             commands::clipboard_pull,
+            commands::audio_toggle,
+            commands::recording_toggle,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

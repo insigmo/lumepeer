@@ -70,6 +70,7 @@ export function sessionStatus(
   history: HistoryEntry[] = [],
   onReconnect: (peer: string) => void = () => {},
   reconnectDisabled = false,
+  onOpenChat: (peer: string) => void = () => {},
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -117,6 +118,18 @@ export function sessionStatus(
                   <span class="peer-label">${session.peer_label}</span>
                   <span class="peer-meta">${t(locale, roleKey[session.role])}</span>
                   <span class="peer-meta">${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span>
+                  ${session.state === 'active'
+                    ? html`
+                        <button
+                          type="button"
+                          class="chat-open-btn"
+                          aria-label=${`${t(locale, 'chat.open')}: ${session.peer_label}`}
+                          @click=${() => onOpenChat(session.peer_label)}
+                        >
+                          ${t(locale, 'chat.open')}
+                        </button>
+                      `
+                    : ''}
                   <button type="button" class="revoke-btn" @click=${() => void revoke(session.peer_label)}>
                     ${t(locale, 'status.revoke')}
                   </button>

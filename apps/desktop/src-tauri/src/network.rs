@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::chat::{ChatEntry, ChatLog};
@@ -237,6 +238,29 @@ enum ActorCommand {
     ClipboardPull {
         label: String,
         reply: oneshot::Sender<Option<String>>,
+    },
+    /// Host side: start streaming desktop audio to `label` (§11 `AudioStart`).
+    /// Requires a live `view` grant and an accepted media connection.
+    AudioOn {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: stop the audio stream started by [`ActorCommand::AudioOn`].
+    AudioOff {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: start recording the session with `label` into `path`
+    /// (§9.2, §17). Requires the independent `recording` grant (§8.2).
+    RecordOn {
+        label: String,
+        path: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: stop the recording and flush it to disk.
+    RecordOff {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
     },
 }
 
@@ -469,6 +493,51 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
+    /// Host side: turns the desktop-audio stream to `label` on or off (§11).
+    ///
+    /// Refused without a live granted session; audio rides the same media
+    /// connection the picture uses, so it also needs an accepted media dial.
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without a granted view session;
+    /// [`ActorError::UnknownPeer`] when no media connection exists yet;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn audio_toggle(&self, label: String, on: bool) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(if on {
+                ActorCommand::AudioOn { label, reply }
+            } else {
+                ActorCommand::AudioOff { label, reply }
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: starts or stops the session recording of `label` (§17).
+    /// Gated on the independent `recording` grant inside the actor (§8.2).
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without the recording grant;
+    /// [`ActorError::Net`] when the file cannot be created;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn record_toggle(
+        &self,
+        label: String,
+        path: Option<String>,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(match path {
+                Some(path) => ActorCommand::RecordOn { label, path, reply },
+                None => ActorCommand::RecordOff { label, reply },
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
     pub async fn input(&self, label: String, event: InputEventPayload) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -547,9 +616,16 @@ struct ConnectionHandle {
 
 /// Host side: one running capture/encode loop, plus the connection it writes
 /// on, so a revoke can stop both without waiting for the loop to notice.
+/// `recorder` is the §17 slot the actor swaps a session recorder into; it
+/// lives as long as the media session itself.
 struct MediaSession {
     task: tokio::task::JoinHandle<()>,
     connection: iroh::endpoint::Connection,
+    #[allow(
+        dead_code,
+        reason = "kept for the actor to swap recorders into mid-session"
+    )]
+    recorder: crate::view::SharedRecorder,
 }
 
 impl MediaSession {
@@ -560,6 +636,24 @@ impl MediaSession {
             lumepeer_net::connection::CLOSE_MALFORMED.into(),
             lumepeer_net::error::close_code::MALFORMED.as_bytes(),
         );
+    }
+}
+
+/// Host side: one running audio loop for a peer, with its own stop flag.
+///
+/// Audio is opt-in per session: the host user turns it on (`AudioStart` of
+/// §11) and off again, and every teardown path — revoke, disconnect, media
+/// session replacement — flips the flag and aborts the task.
+struct AudioSession {
+    stop: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AudioSession {
+    /// Stops capture and ends the loop.
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
     }
 }
 
@@ -651,6 +745,14 @@ struct Actor {
     capture: SharedCapture,
     /// Host side: one encode loop per peer currently receiving video.
     media: std::collections::HashMap<NodeId, MediaSession>,
+    /// Host side: one audio loop per peer the host user enabled sound for.
+    /// Opt-in per §11's `AudioStart`; dies with the session like everything
+    /// else per-peer.
+    audio: std::collections::HashMap<NodeId, AudioSession>,
+    /// Host side: live session recordings keyed by peer (§17). Gated on the
+    /// independent `recording` grant; flushed and dropped when the session
+    /// ends so no recorder can outlive what it was allowed to record.
+    recorders: HashMap<NodeId, crate::recorder::SessionRecorder>,
     /// Host side: platform input adapter, opened on the first authorized event
     /// so a host that never grants `input` never touches it.
     injector: Option<Box<dyn InputInjector>>,
@@ -973,15 +1075,33 @@ impl Actor {
             previous.stop();
         }
         tracing::info!(peer = %tag, "media connection accepted; starting the encode loop");
-        let task = spawn_encode_loop(connection.clone(), Arc::clone(&self.capture), tag);
-        self.media.insert(peer, MediaSession { task, connection });
+        let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(None));
+        let task = spawn_encode_loop(
+            connection.clone(),
+            Arc::clone(&self.capture),
+            Arc::clone(&recorder),
+            tag,
+        );
+        self.media.insert(peer, MediaSession { task, connection, recorder });
     }
 
     /// Host side: stops sending video to `peer` and drops it as a viewer, which
     /// stops capture altogether if it was the last one (§8.1, §11).
+    /// The audio stream, if the host user had enabled it, dies with the media
+    /// session — there is no audio without a picture's session. A live
+    /// recording is flushed and closed too: a recording may only cover the
+    /// session it was granted for (§8.2, §17).
     fn stop_media(&mut self, peer: NodeId) {
         if let Some(session) = self.media.remove(&peer) {
             session.stop();
+        }
+        if let Some(session) = self.audio.remove(&peer) {
+            session.stop();
+        }
+        if let Some(mut recorder) = self.recorders.remove(&peer) {
+            recorder.write_event(0, r#"{"event":"record-stop","reason":"session-end"}"#);
+            let clean = recorder.stop();
+            tracing::info!(peer = %self.label_of(&peer), clean, "recording flushed at session end");
         }
         lock_capture(&self.capture).remove_viewer(&peer);
     }
@@ -1351,7 +1471,99 @@ impl Actor {
             ActorCommand::ClipboardPull { label, reply } => {
                 let _ = reply.send(self.on_clipboard_pull(&label));
             }
+            ActorCommand::AudioOn { label, reply } => {
+                let _ = reply.send(self.on_audio_toggle(&label, true));
+            }
+            ActorCommand::AudioOff { label, reply } => {
+                let _ = reply.send(self.on_audio_toggle(&label, false));
+            }
+            ActorCommand::RecordOn {
+                label,
+                path,
+                reply,
+            } => {
+                let _ = reply.send(self.on_record_toggle(&label, Some(path)));
+            }
+            ActorCommand::RecordOff { label, reply } => {
+                let _ = reply.send(self.on_record_toggle(&label, None));
+            }
         }
+    }
+
+    /// Host side: starts or stops the session recording of `label` (§17).
+    ///
+    /// Gated on the independent `recording` grant (§8.2): a session that was
+    /// granted view/input/clipboard but not `recording` cannot be recorded,
+    /// no matter what the UI asks. The file lands only where the host user
+    /// chose; the guest is never told recording state changed beyond what the
+    /// §15 log policy already allows.
+    fn on_record_toggle(&mut self, label: &str, path: Option<String>) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if let Some(path) = path {
+            let permitted = self.connections.contains_key(&peer)
+                && self.sessions.state(&peer) == SessionState::Active
+                && self.sessions.grants(&peer).is_some_and(|g| g.recording);
+            if !permitted {
+                return Err(ActorError::Core(CoreError::NotPermitted));
+            }
+            if self.recorders.contains_key(&peer) {
+                return Ok(()); // already recording this session
+            }
+            let recorder =
+                crate::recorder::SessionRecorder::start(std::path::PathBuf::from(path))
+                    .map_err(|error| {
+                        tracing::warn!(peer = %label, %error, "cannot open the recording file");
+                        ActorError::Net(NetError::Io(error.to_string()))
+                    })?;
+            recorder.write_event(
+                0,
+                &format!(r#"{{"event":"record-start","session":"{label}"}}"#),
+            );
+            self.recorders.insert(peer, recorder);
+            tracing::info!(peer = %label, "recording started");
+        } else if let Some(mut recorder) = self.recorders.remove(&peer) {
+            recorder.write_event(0, r#"{"event":"record-stop"}"#);
+            let clean = recorder.stop();
+            tracing::info!(peer = %label, clean, "recording stopped");
+        }
+        Ok(())
+    }
+
+    /// Host side: turns the desktop-audio stream to `label` on or off (§11).
+    ///
+    /// Authorization mirrors `on_media_accepted`: a live control connection,
+    /// an Active session and a `view` grant — audio is part of what `view`
+    /// may carry (§8.1 "receive video **and audio**"), but it is opt-in per
+    /// session because it is the host user's microphone-adjacent surface.
+    fn on_audio_toggle(&mut self, label: &str, on: bool) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        if on {
+            if self.audio.contains_key(&peer) {
+                return Ok(()); // already streaming; idempotent
+            }
+            let Some(session) = self.media.get(&peer) else {
+                // No media connection to ride on yet.
+                return Err(ActorError::UnknownPeer);
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let task = crate::view::spawn_audio_loop(
+                session.connection.clone(),
+                Arc::clone(&stop),
+                self.label_of(&peer),
+            );
+            self.audio.insert(peer, AudioSession { stop, task });
+            tracing::info!(peer = %label, "audio streaming enabled");
+        } else if let Some(session) = self.audio.remove(&peer) {
+            session.stop();
+            tracing::info!(peer = %label, "audio streaming disabled");
+        }
+        Ok(())
     }
 
     /// Issues an invite for `role`, refusing while the endpoint has no
@@ -1597,8 +1809,53 @@ impl Actor {
 /// # Errors
 /// [`NetError`] if the keystore or the endpoint bind fails — surfaced as a
 /// startup failure rather than silently degrading (§11.2, §24.5).
+/// Opens the keystore, honouring the `LUMEPEER_KEYSTORE=file` override.
+///
+/// Default is the OS-native backend (`crates/net::keystore::open`). The
+/// override selects the encrypted-file store — the documented fallback for
+/// headless environments (CI, SSH-run E2E) where no secret-service prompter
+/// exists to unlock the keyring. `LUMEPEER_KEYSTORE_PATH` chooses the file
+/// location; it defaults to the app data directory.
+///
+/// # Errors
+/// [`NetError`] as [`keystore::open`], or when `LUMEPEER_KEYSTORE=file` is
+/// set but no usable path can be derived.
+fn open_keystore() -> Result<Box<dyn lumepeer_net::keystore::Keystore>, NetError> {
+    const KEYSTORE_ENV: &str = "LUMEPEER_KEYSTORE";
+    if std::env::var(KEYSTORE_ENV).as_deref() != Ok("file") {
+        return lumepeer_net::keystore::open();
+    }
+    let path = std::env::var("LUMEPEER_KEYSTORE_PATH").map_err(|_| {
+        NetError::Keystore("LUMEPEER_KEYSTORE=file also needs LUMEPEER_KEYSTORE_PATH".to_owned())
+    })?;
+    let path = std::path::PathBuf::from(path);
+    tracing::info!(path = %path.display(), "using the encrypted-file keystore (LUMEPEER_KEYSTORE=file)");
+    // The user secret mixes the machine id with the user name: stable for
+    // this user on this machine, never written anywhere (§11.2).
+    let machine = machine_id();
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    Ok(Box::new(lumepeer_net::keystore::FileKeystore::new(
+        path,
+        format!("{machine}:{user}").as_bytes(),
+    )))
+}
+
+/// Reads `/etc/machine-id` (or the fallback `DBUS` path) for the file-keystore
+/// user secret. A missing file is not fatal: an empty id only weakens the
+/// secret to the user name, matching the fallback's documented threat model.
+fn machine_id() -> String {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(id) = std::fs::read_to_string(path) {
+            return id.trim().to_owned();
+        }
+    }
+    String::new()
+}
+
 pub async fn spawn_actor(app: tauri::AppHandle) -> Result<ActorHandle, NetError> {
-    let store = lumepeer_net::keystore::open()?;
+    let store = open_keystore()?;
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let endpoint = PeerEndpoint::bind(secret_key).await?;
@@ -1697,6 +1954,8 @@ pub fn spawn_actor_with(
         notify: notify.clone(),
         capture,
         media: std::collections::HashMap::new(),
+        audio: std::collections::HashMap::new(),
+        recorders: HashMap::new(),
         injector: None,
         views: std::collections::HashMap::new(),
         host_addrs: std::collections::HashMap::new(),
