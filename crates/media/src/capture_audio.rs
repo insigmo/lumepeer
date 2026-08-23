@@ -24,6 +24,14 @@
 //! runs video-only, mirroring the `audio-opus` contract. The pure conversion
 //! helpers below are feature-independent and always tested.
 
+#[cfg(any(
+    all(target_os = "windows", feature = "audio-capture"),
+    all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ),
+))]
 use std::time::Duration;
 
 use crate::error::Result;
@@ -78,6 +86,14 @@ pub trait AudioCapturer: Send + std::fmt::Debug {
 /// container stores, and a session never spans a clock adjustment large
 /// enough for the two to disagree about ordering (§12.3 uses the same
 /// reasoning).
+#[cfg(any(
+    all(target_os = "windows", feature = "audio-capture"),
+    all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ),
+))]
 pub(crate) fn capture_timestamp_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -87,6 +103,14 @@ pub(crate) fn capture_timestamp_us() -> u64 {
 /// How long one blocking read may take before the backend is considered
 /// stuck. Generous on purpose: a chunk itself is 20 ms of audio, but a device
 /// resuming from suspend may legitimately be late once.
+#[cfg(any(
+    all(target_os = "windows", feature = "audio-capture"),
+    all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ),
+))]
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(all(target_os = "windows", feature = "audio-capture"))]
@@ -270,7 +294,7 @@ mod tests {
     fn without_a_backend_the_entry_point_refuses_loudly() {
         assert!(matches!(
             platform_audio_capturer(),
-            Err(MediaError::CaptureUnavailable(_))
+            Err(crate::error::MediaError::CaptureUnavailable(_))
         ));
     }
 }

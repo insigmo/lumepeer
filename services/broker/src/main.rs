@@ -89,7 +89,7 @@ fn decode_hex32(text: &str) -> Result<[u8; 32], ()> {
         return Err(());
     }
     let mut out = [0u8; 32];
-    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = (pair[0] as char).to_digit(16).ok_or(())?;
         let lo = (pair[1] as char).to_digit(16).ok_or(())?;
         out[index] = u8::try_from(hi * 16 + lo).map_err(|_| ())?;

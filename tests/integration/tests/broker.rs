@@ -209,7 +209,13 @@ fn sign_webhook(timestamp: u64, body: &[u8]) -> String {
 
 fn verifying_key() -> ed25519_dalek::VerifyingKey {
     let mut bytes = [0u8; 32];
-    for (index, chunk) in SIGNING_KEY_HEX.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in SIGNING_KEY_HEX
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let text = std::str::from_utf8(chunk).unwrap();
         bytes[index] = u8::from_str_radix(text, 16).unwrap();
     }
@@ -481,7 +487,13 @@ fn trial_token() -> LicenseToken {
         signature: [0u8; 64],
     };
     let mut bytes = [0u8; 32];
-    for (index, chunk) in SIGNING_KEY_HEX.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in SIGNING_KEY_HEX
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let text = std::str::from_utf8(chunk).unwrap();
         bytes[index] = u8::from_str_radix(text, 16).unwrap();
     }

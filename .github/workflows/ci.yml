@@ -14,6 +14,10 @@ env:
   # disabling debug info outright, so panics still carry file:line.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # audiopus_sys (vendored libopus, `audio-opus`) declares compatibility with
+  # CMake < 3.5, which CMake 4 refuses to configure. Harmless under CMake 3.x.
+  # See the RUSTSEC-2026-0150 note in deny.toml.
+  CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
 jobs:
   # Phase 0 acceptance criterion (design doc §19): the workspace builds on

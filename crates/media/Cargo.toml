@@ -164,6 +164,7 @@ dispatch2 = { version = "0.3.1", optional = true, default-features = false, feat
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
+    "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_Security_Isolation",
@@ -173,4 +174,11 @@ windows = { version = "0.61.3", features = [
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    # IMMDevice::Activate is feature-gated behind BOTH
+    # Win32::System::Com::StructuredStorage and Win32::System::Variant (its
+    # PROPVARIANT parameter); without them the method is compiled out of the
+    # `windows` bindings and the WASAPI capturer fails with E0599 when the
+    # crate builds outside the full workspace feature unification.
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
 ] }
