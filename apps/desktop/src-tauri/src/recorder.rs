@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
-use lumepeer_media::record::{RecordingWriter, RecordingError};
+use lumepeer_media::record::{RecordingError, RecordingWriter};
 
 /// Bounded queue between the media loops and the writer thread. Deep enough
 /// for several seconds of audio; video fills it fast at high bitrate, which
@@ -29,38 +29,31 @@ const IDLE_POLL: Duration = Duration::from_millis(200);
 #[derive(Debug)]
 enum Record {
     /// Video bitstream chunk (H.264).
-    Video {
-        timestamp_us: u64,
-        data: Vec<u8>,
-    },
+    Video { timestamp_us: u64, data: Vec<u8> },
     /// Opus packet.
-    Audio {
-        timestamp_us: u64,
-        data: Vec<u8>,
-    },
+    Audio { timestamp_us: u64, data: Vec<u8> },
     /// Event-log JSON line.
-    Event {
-        timestamp_us: u64,
-        line: String,
-    },
+    Event { timestamp_us: u64, line: String },
 }
 
 /// Handle the actor holds for one live recording.
 ///
-/// Cloning is not supported on purpose: exactly one owner flips `stop`, and
-/// that is the actor's teardown path.
+/// Shared as an `Arc` between the actor (ownership, teardown), the video
+/// encode loop and the audio loop; every writer method takes `&self`, and
+/// `stop` is idempotent so a racing teardown is harmless.
 pub struct SessionRecorder {
-    tx: Option<SyncSender<Record>>,
+    tx: std::sync::Mutex<Option<SyncSender<Record>>>,
     path: PathBuf,
-    join: Option<std::thread::JoinHandle<Result<(), RecordingError>>>,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), RecordingError>>>>,
 }
 
 impl std::fmt::Debug for SessionRecorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let active = self.tx.lock().is_ok();
         f.debug_struct("SessionRecorder")
-            .field("active", &self.tx.is_some())
+            .field("active", &active)
             .field("path", &self.path)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -73,23 +66,24 @@ impl SessionRecorder {
     /// [`std::io::Error`] surfaces as [`RecordingError::Io`] if the file
     /// cannot be created — reported to the caller before any media flows.
     pub fn start(path: PathBuf) -> Result<Self, RecordingError> {
-        let file = std::fs::File::create(&path)
-            .map_err(|e| RecordingError::Io(e.to_string()))?;
+        let file = std::fs::File::create(&path).map_err(|e| RecordingError::Io(e.to_string()))?;
         let (tx, rx) = mpsc::sync_channel::<Record>(QUEUE_CAPACITY);
         let join = std::thread::Builder::new()
             .name("lmrc-writer".to_owned())
             .spawn(move || run_writer(rx, file))
-            .map_err(|_| {
-                RecordingError::Io("cannot spawn the writer thread".to_owned())
-            })?;
+            .map_err(|_| RecordingError::Io("cannot spawn the writer thread".to_owned()))?;
         Ok(Self {
-            tx: Some(tx),
+            tx: std::sync::Mutex::new(Some(tx)),
             path,
-            join: Some(join),
+            join: std::sync::Mutex::new(Some(join)),
         })
     }
 
     /// Where this recording is being written.
+    ///
+    /// Test-only for now: the actor never needs the path after `start`, and
+    /// the round-trip test asserts against it.
+    #[cfg(test)]
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -121,7 +115,11 @@ impl SessionRecorder {
     }
 
     fn send(&self, record: Record) {
-        let Some(tx) = &self.tx else { return };
+        let guard = self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(tx) = guard.as_ref() else { return };
         if tx.try_send(record).is_err() {
             // Queue full or writer gone: drop rather than block the media
             // loops. The recording loses a frame; the session does not.
@@ -131,9 +129,21 @@ impl SessionRecorder {
 
     /// Stops the recording, flushing whatever was queued. Idempotent;
     /// returns whether the file flushed cleanly.
-    pub fn stop(&mut self) -> bool {
-        self.tx.take();
-        match self.join.take() {
+    ///
+    /// Takes `&self` on purpose: the recorder is shared between the video
+    /// loop, the audio loop and the actor, and any of them — usually the
+    /// actor's teardown — may be the one that ends the recording.
+    pub fn stop(&self) -> bool {
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let join = self
+            .join
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        match join {
             Some(join) => matches!(join.join(), Ok(Ok(()))),
             None => true,
         }
@@ -147,16 +157,19 @@ impl Drop for SessionRecorder {
 }
 
 /// Writer thread body: drains the queue into the container until the sender
-/// side goes away, then flushes.
-fn run_writer(
-    rx: mpsc::Receiver<Record>,
-    file: std::fs::File,
-) -> Result<(), RecordingError> {
+/// side goes away, then flushes. Consumes `rx` so the channel disconnects
+/// exactly when this thread exits.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "rx must be owned to end the loop on sender drop"
+)]
+fn run_writer(rx: mpsc::Receiver<Record>, file: std::fs::File) -> Result<(), RecordingError> {
     let mut writer = RecordingWriter::new(file)?;
     loop {
         match rx.recv_timeout(IDLE_POLL) {
             Ok(record) => write_one(&mut writer, record),
-            Err(RecvTimeoutError::Timeout) => continue,
+            // A timeout is just the poll window elapsing; keep waiting.
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -194,13 +207,13 @@ mod tests {
     #[test]
     fn a_recording_round_trips_video_and_audio() {
         let path = temp_path("roundtrip");
-        let mut recorder = SessionRecorder::start(path.clone()).unwrap();
+        let recorder = SessionRecorder::start(path.clone()).unwrap();
         recorder.write_video(1_000, b"frame-one");
         recorder.write_audio(21_000, b"opus-packet");
         recorder.write_event(30_000, r#"{"event":"grant"}"#);
         assert!(recorder.stop(), "the writer flushed cleanly");
 
-        let bytes = std::fs::read(&path).unwrap();
+        let bytes = std::fs::read(recorder.path()).unwrap();
         let (info, records) = read_recording(bytes.as_slice()).unwrap();
         assert_eq!(records.len(), 3);
         assert!(info.has_audio);
@@ -222,7 +235,7 @@ mod tests {
     #[test]
     fn stop_is_idempotent_and_writes_are_noops_afterwards() {
         let path = temp_path("idempotent");
-        let mut recorder = SessionRecorder::start(path.clone()).unwrap();
+        let recorder = SessionRecorder::start(path.clone()).unwrap();
         recorder.write_video(10, b"a");
         assert!(recorder.stop());
         assert!(recorder.stop(), "second stop reports clean too");
@@ -235,10 +248,12 @@ mod tests {
     fn an_uncreatable_path_fails_start_instead_of_losing_frames() {
         // A directory cannot be opened as a file; start must refuse loudly.
         let dir = std::env::temp_dir();
-        assert!(SessionRecorder::start(dir.join("x")).is_err() || {
-            // On platforms where create succeeded over an existing dir entry
-            // (should not happen), clean up best-effort.
-            true
-        });
+        assert!(
+            SessionRecorder::start(dir.join("x")).is_err() || {
+                // On platforms where create succeeded over an existing dir entry
+                // (should not happen), clean up best-effort.
+                true
+            }
+        );
     }
 }

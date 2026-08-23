@@ -211,6 +211,7 @@ pub async fn accept_audio_media_stream(
 ///
 /// Deliberately the same shape minus the keyframe byte as the video payload:
 /// audio has no keyframes, and the codec re-syncs from any packet.
+#[must_use]
 pub fn encode_audio_payload(chunk: &lumepeer_media::audio::AudioChunk) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + chunk.data.len());
     out.extend_from_slice(&chunk.timestamp_us.to_le_bytes());

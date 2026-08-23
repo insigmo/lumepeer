@@ -26,7 +26,7 @@
 
 use std::time::Duration;
 
-use crate::error::{MediaError, Result};
+use crate::error::Result;
 use lumepeer_core::constants::{AUDIO_CHANNELS, AUDIO_FRAME_MS, AUDIO_SAMPLE_RATE_HZ};
 
 /// Samples per channel of one capture chunk: the Opus frame the encoder eats.
@@ -81,13 +81,13 @@ pub trait AudioCapturer: Send + std::fmt::Debug {
 pub(crate) fn capture_timestamp_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// How long one blocking read may take before the backend is considered
 /// stuck. Generous on purpose: a chunk itself is 20 ms of audio, but a device
 /// resuming from suspend may legitimately be late once.
-pub(crate) const READ_TIMEOUT: Duration = Duration::from_millis(2_000);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(all(target_os = "windows", feature = "audio-capture"))]
 mod windows_wasapi;
@@ -136,7 +136,7 @@ pub fn platform_audio_capturer() -> Result<Box<dyn AudioCapturer>> {
         ),
     )))]
     {
-        Err(MediaError::CaptureUnavailable(
+        Err(crate::error::MediaError::CaptureUnavailable(
             "no audio capture backend is compiled in for this target".to_owned(),
         ))
     }
@@ -157,36 +157,50 @@ pub fn to_wire_pcm(input: &[f32], input_rate: u32, input_channels: usize) -> Vec
     if frames == 0 {
         return vec![0; SAMPLES_PER_CHUNK * channels];
     }
-    // Output frames per input frame as a float step on the input timeline.
-    let step = f64::from(input_rate) / f64::from(AUDIO_SAMPLE_RATE_HZ);
-    let mut out = Vec::with_capacity(SAMPLES_PER_CHUNK * channels);
-    for o in 0..SAMPLES_PER_CHUNK {
-        let pos = f64::from(o as u32) * step;
-        let i = pos.floor();
-        let frac = (pos - i) as f32;
-        let i0 = (i as usize).min(frames - 1);
-        let i1 = (i0 + 1).min(frames - 1);
-        for c in 0..channels {
-            // An input with fewer channels than stereo is spread by re-reading
-            // its last channel rather than panicking; more channels than two
-            // simply drop the extras (desktop mixes are stereo anyway).
-            let src_c = c.min(input_channels - 1);
-            let s0 = input[i0 * input_channels + src_c];
-            let s1 = input[i1 * input_channels + src_c];
-            let mixed = s0 + (s1 - s0) * frac;
-            // Clamp rather than wrap: a hot mix saturates, it does not fold.
-            // Scale by 32767 so ±1.0 maps onto the full ±32767 range; −32768
-            // stays reachable through the explicit min below.
-            let clamped = (mixed.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
-            out.push(clamped.max(i16::MIN));
+    // The resampler is exact by construction: `pos` stays within
+    // `0..=frames`, the index casts cannot leave that range, and the f32
+    // narrowing only feeds interpolation of samples already in `f32`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "index/interpolation math bounded by construction, see above"
+    )]
+    {
+        // Output frames per input frame as a float step on the input timeline.
+        let step = f64::from(input_rate) / f64::from(AUDIO_SAMPLE_RATE_HZ);
+        let mut out = Vec::with_capacity(SAMPLES_PER_CHUNK * channels);
+        for o in 0..SAMPLES_PER_CHUNK {
+            let pos = f64::from(u32::try_from(o).unwrap_or(0)) * step;
+            let i = pos.floor();
+            let frac = (pos - i) as f32;
+            let i0 = (i as usize).min(frames - 1);
+            let i1 = (i0 + 1).min(frames - 1);
+            for c in 0..channels {
+                // An input with fewer channels than stereo is spread by re-reading
+                // its last channel rather than panicking; more channels than two
+                // simply drop the extras (desktop mixes are stereo anyway).
+                let src_c = c.min(input_channels - 1);
+                let s0 = input[i0 * input_channels + src_c];
+                let s1 = input[i1 * input_channels + src_c];
+                let mixed = s0 + (s1 - s0) * frac;
+                // Clamp rather than wrap: a hot mix saturates, it does not fold.
+                // Scale by 32767 so ±1.0 maps onto the full ±32767 range.
+                let clamped = (mixed.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+                out.push(clamped);
+            }
         }
+        out
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::cast_precision_loss,
+        reason = "a failed assumption must fail the test; test indices are tiny"
+    )]
 
     use super::*;
 

@@ -19,8 +19,8 @@
 //! same justification standard as ADR 0012 (WASAPI is raw FFI with no safe
 // binding) and every block carries a SAFETY note.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Media::Audio::{
     self as wasapi, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
@@ -28,8 +28,18 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
-use crate::capture_audio::{PcmChunk, READ_TIMEOUT, SAMPLES_PER_CHUNK, capture_timestamp_us, to_wire_pcm};
+use crate::capture_audio::{
+    PcmChunk, READ_TIMEOUT, SAMPLES_PER_CHUNK, capture_timestamp_us, to_wire_pcm,
+};
 use crate::error::{MediaError, Result};
+
+// Only IEEE-float mixes are read: the shared-mode mixer normalizes every
+// modern Windows output path to float32. Anything else would be
+// misinterpreted byte-for-byte, so it is refused loudly (§18).
+// WAVE_FORMAT_IEEE_FLOAT = 3 (mmreg.h); the constant lives in the Multimedia
+// feature this build does not pull in, so name the value once, here, with its
+// source.
+const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
 
 /// COM apartment wrapper: `CoInitializeEx` on build, `CoUninitialize` on drop,
 /// so an abandoned capturer cannot leak its apartment into the calling thread.
@@ -148,36 +158,32 @@ impl crate::capture_audio::AudioCapturer for WasapiLoopbackCapturer {
             let mix_format = client
                 .GetMixFormat()
                 .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            let format = &*mix_format;
+            if u32::from(format.wFormatTag) != WAVE_FORMAT_IEEE_FLOAT && format.cbSize == 0 {
+                return Err(MediaError::CaptureUnavailable(
+                    "the audio mix format is not IEEE float".to_owned(),
+                ));
+            }
+            if usize::from(format.nChannels) == 0 {
+                return Err(MediaError::CaptureUnavailable(
+                    "the audio mix reports zero channels".to_owned(),
+                ));
+            }
+
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
                     wasapi::AUDCLNT_STREAMFLAGS_LOOPBACK,
                     buffer_duration,
                     0,
+                    #[allow(
+                        clippy::clone_on_copy,
+                        reason = "WAVEFORMATEX is a Copy FFI struct; clone reads clearer at the call site"
+                    )]
                     mix_format.clone(),
                     None,
                 )
                 .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-
-            let format = &*mix_format;
-            // Only IEEE-float mixes are read: the shared-mode mixer normalizes
-            // every modern Windows output path to float32. Anything else would
-            // be misinterpreted byte-for-byte, so refuse it loudly (§18).
-            // WAVE_FORMAT_IEEE_FLOAT = 3 (mmreg.h); the constant lives in the
-            // Multimedia feature this build does not pull in, so name the value
-            // once, here, with its source.
-            const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
-            if u32::from(format.wFormatTag) != WAVE_FORMAT_IEEE_FLOAT && format.cbSize == 0 {
-                return Err(MediaError::CaptureUnavailable(
-                    "the audio mix format is not IEEE float".to_owned(),
-                ));
-            }
-            let input_channels = usize::from(format.nChannels);
-            if input_channels == 0 {
-                return Err(MediaError::CaptureUnavailable(
-                    "the audio mix reports zero channels".to_owned(),
-                ));
-            }
 
             let capture: IAudioCaptureClient = client
                 .GetService()
@@ -189,6 +195,7 @@ impl crate::capture_audio::AudioCapturer for WasapiLoopbackCapturer {
             // Copy the fields out of the packed WAVEFORMATEX before logging:
             // taking a reference to a packed field is unaligned (E0793).
             let mix_rate = format.nSamplesPerSec;
+            let input_channels = usize::from(format.nChannels);
             tracing::info!(
                 rate = mix_rate,
                 channels = input_channels,
@@ -230,23 +237,28 @@ impl crate::capture_audio::AudioCapturer for WasapiLoopbackCapturer {
                 let mut flags = 0u32;
                 // SAFETY: all out-pointers are locals; `data` stays valid until
                 // ReleaseBuffer and is read only within that window.
-                #[allow(unsafe_code, reason = "raw WASAPI pull")]
+                #[allow(
+                    unsafe_code,
+                    clippy::borrow_as_ptr,
+                    reason = "raw WASAPI pull; explicit &mut is the API shape"
+                )]
                 unsafe {
-                    state.capture.GetBuffer(
-                        &mut data,
-                        &mut frames,
-                        &mut flags,
-                        None,
-                        None,
-                    )
+                    state
+                        .capture
+                        .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
                 }
                 .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?;
+                // The mix format was verified to be IEEE float32 above, so the
+                // byte buffer handed out here reinterprets as f32 samples.
+                #[allow(
+                    clippy::cast_ptr_alignment,
+                    reason = "mix format checked to be IEEE float32 before Initialize"
+                )]
                 let data_float = data.cast::<f32>();
                 // The flag constants are `i32`-backed newtypes; the wire value
                 // here is a plain u32 bitmask, so normalize once and mask.
                 let flags_u32 = flags;
-                let is_silent =
-                    flags_u32 & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
+                let is_silent = flags_u32 & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0;
                 if frames > 0 {
                     if !is_silent && !data_float.is_null() {
                         // SAFETY: WASAPI hands us `frames * channels` float
@@ -300,7 +312,7 @@ impl crate::capture_audio::AudioCapturer for WasapiLoopbackCapturer {
     }
 
     fn stop(&mut self) {
-        if let Some(mut state) = self.state.take() {
+        if let Some(state) = self.state.take() {
             state.running.store(false, Ordering::Relaxed);
             // SAFETY: stops the client started in `start`.
             #[allow(unsafe_code, reason = "IAudioClient::Stop is raw WASAPI")]
@@ -315,7 +327,7 @@ impl Drop for WasapiLoopbackCapturer {
     fn drop(&mut self) {
         // `AudioCapturer::stop` is in scope through the trait impl above; the
         // explicit path keeps Drop independent of trait imports.
-        if let Some(mut state) = self.state.take() {
+        if let Some(state) = self.state.take() {
             state.running.store(false, Ordering::Relaxed);
             // SAFETY: stops the client started in `start`.
             #[allow(unsafe_code, reason = "IAudioClient::Stop is raw WASAPI")]

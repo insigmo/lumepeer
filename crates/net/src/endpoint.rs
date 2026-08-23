@@ -4,8 +4,8 @@
 //! media load or a file transfer can never delay a revoke on the control
 //! channel.
 
-use iroh::endpoint::presets;
 use iroh::endpoint::Builder as EndpointBuilder;
+use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
 
 use crate::error::{NetError, Result};
