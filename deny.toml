@@ -35,6 +35,13 @@ ignore = [
     "RUSTSEC-2025-0081", # unic-char-range, unmaintained
     "RUSTSEC-2025-0098", # unic-ucd-version, unmaintained
     "RUSTSEC-2025-0100", # unic-ucd-ident, unmaintained
+
+    # audiopus_sys (vendored libopus behind `audio-opus`, ADR 0023) is
+    # unmaintained upstream with no safe upgrade; it is also the reason for the
+    # CMAKE_POLICY_VERSION_MINIMUM=3.5 in ci.yml — its vendored CMake script
+    # declares compatibility with CMake < 3.5. Tracked with the GTK3 stack
+    # above: swap when an maintained Opus binding appears.
+    "RUSTSEC-2026-0150",
 ]
 
 [licenses]

@@ -1102,10 +1102,10 @@ mod tests {
         for index in 0..4u64 {
             let mut source = frame(64, 64, 0x20);
             source.timestamp_us = index * 33_333;
-            let encoded = encoder
+            let output = encoder
                 .encode(&source)
                 .unwrap_or_else(|error| panic!("frame {index} failed to encode: {error}"));
-            assert!(!encoded.data.is_empty(), "frame {index} encoded to nothing");
+            assert!(!output.data.is_empty(), "frame {index} encoded to nothing");
         }
     }
 
