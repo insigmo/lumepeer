@@ -376,8 +376,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1024);
         let payload = vec![0xABu8; FILE_CHUNK_MAX_BYTES.min(4096)];
 
-        let (write_result, read_result) =
-            tokio::join!(write_chunk(&mut client, 42, 0, &payload), read_chunk(&mut server));
+        let (write_result, read_result) = tokio::join!(
+            write_chunk(&mut client, 42, 0, &payload),
+            read_chunk(&mut server)
+        );
         let () = write_result.unwrap();
         let (id, offset, bytes) = read_result.unwrap();
         assert_eq!(id, 42);

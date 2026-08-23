@@ -12,9 +12,9 @@
 //! and it keeps a partially read frame from ever being cancelled by an
 //! outbound write.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::chat::{ChatEntry, ChatLog};
@@ -646,6 +646,9 @@ impl MediaSession {
 /// session replacement — flips the flag and aborts the task.
 struct AudioSession {
     stop: Arc<AtomicBool>,
+    /// The §17 recorder slot, swapped by the actor mid-session; the loop picks
+    /// up whatever is here when it encodes its next packet.
+    recorder: crate::view::SharedRecorder,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -654,6 +657,14 @@ impl AudioSession {
     fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         self.task.abort();
+    }
+
+    /// Swaps the session recorder in or out (§17).
+    fn set_recorder(&mut self, recorder: Option<Arc<crate::recorder::SessionRecorder>>) {
+        *self
+            .recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = recorder;
     }
 }
 
@@ -752,7 +763,7 @@ struct Actor {
     /// Host side: live session recordings keyed by peer (§17). Gated on the
     /// independent `recording` grant; flushed and dropped when the session
     /// ends so no recorder can outlive what it was allowed to record.
-    recorders: HashMap<NodeId, crate::recorder::SessionRecorder>,
+    recorders: HashMap<NodeId, Arc<crate::recorder::SessionRecorder>>,
     /// Host side: platform input adapter, opened on the first authorized event
     /// so a host that never grants `input` never touches it.
     injector: Option<Box<dyn InputInjector>>,
@@ -1082,7 +1093,14 @@ impl Actor {
             Arc::clone(&recorder),
             tag,
         );
-        self.media.insert(peer, MediaSession { task, connection, recorder });
+        self.media.insert(
+            peer,
+            MediaSession {
+                task,
+                connection,
+                recorder,
+            },
+        );
     }
 
     /// Host side: stops sending video to `peer` and drops it as a viewer, which
@@ -1098,7 +1116,7 @@ impl Actor {
         if let Some(session) = self.audio.remove(&peer) {
             session.stop();
         }
-        if let Some(mut recorder) = self.recorders.remove(&peer) {
+        if let Some(recorder) = self.recorders.remove(&peer) {
             recorder.write_event(0, r#"{"event":"record-stop","reason":"session-end"}"#);
             let clean = recorder.stop();
             tracing::info!(peer = %self.label_of(&peer), clean, "recording flushed at session end");
@@ -1477,11 +1495,7 @@ impl Actor {
             ActorCommand::AudioOff { label, reply } => {
                 let _ = reply.send(self.on_audio_toggle(&label, false));
             }
-            ActorCommand::RecordOn {
-                label,
-                path,
-                reply,
-            } => {
+            ActorCommand::RecordOn { label, path, reply } => {
                 let _ = reply.send(self.on_record_toggle(&label, Some(path)));
             }
             ActorCommand::RecordOff { label, reply } => {
@@ -1509,19 +1523,45 @@ impl Actor {
             if self.recorders.contains_key(&peer) {
                 return Ok(()); // already recording this session
             }
-            let recorder =
-                crate::recorder::SessionRecorder::start(std::path::PathBuf::from(path))
-                    .map_err(|error| {
+            let recorder = Arc::new(
+                crate::recorder::SessionRecorder::start(std::path::PathBuf::from(path)).map_err(
+                    |error| {
                         tracing::warn!(peer = %label, %error, "cannot open the recording file");
                         ActorError::Net(NetError::Io(error.to_string()))
-                    })?;
+                    },
+                )?,
+            );
             recorder.write_event(
                 0,
                 &format!(r#"{{"event":"record-start","session":"{label}"}}"#),
             );
+            // Hand the recorder to whichever loops are running for this
+            // session: the video slot is picked up on the next frame; the
+            // audio loop reads its own copy the same way.
+            if let Some(session) = self.media.get_mut(&peer) {
+                *session
+                    .recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::clone(&recorder));
+            }
+            if let Some(audio) = self.audio.get_mut(&peer) {
+                audio.set_recorder(Some(Arc::clone(&recorder)));
+            }
             self.recorders.insert(peer, recorder);
             tracing::info!(peer = %label, "recording started");
-        } else if let Some(mut recorder) = self.recorders.remove(&peer) {
+        } else if let Some(recorder) = self.recorders.remove(&peer) {
+            // Take it out of the live loops first so no new record lands after
+            // the stop event.
+            if let Some(session) = self.media.get_mut(&peer) {
+                *session
+                    .recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+            if let Some(audio) = self.audio.get_mut(&peer) {
+                audio.set_recorder(None);
+            }
             recorder.write_event(0, r#"{"event":"record-stop"}"#);
             let clean = recorder.stop();
             tracing::info!(peer = %label, clean, "recording stopped");
@@ -1552,12 +1592,25 @@ impl Actor {
                 return Err(ActorError::UnknownPeer);
             };
             let stop = Arc::new(AtomicBool::new(false));
+            // The §17 slot starts empty; the actor fills it when a recording
+            // is turned on, and the loop picks it up on its next packet.
+            let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(
+                self.recorders.get(&peer).map(Arc::clone),
+            ));
             let task = crate::view::spawn_audio_loop(
                 session.connection.clone(),
                 Arc::clone(&stop),
+                Arc::clone(&recorder),
                 self.label_of(&peer),
             );
-            self.audio.insert(peer, AudioSession { stop, task });
+            self.audio.insert(
+                peer,
+                AudioSession {
+                    stop,
+                    recorder,
+                    task,
+                },
+            );
             tracing::info!(peer = %label, "audio streaming enabled");
         } else if let Some(session) = self.audio.remove(&peer) {
             session.stop();

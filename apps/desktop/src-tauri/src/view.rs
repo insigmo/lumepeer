@@ -349,7 +349,7 @@ pub fn spawn_encode_loop(
         // Session recording (§17): the actor swaps a recorder into the shared
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
-        let mut recorder_now: Option<Arc<crate::recorder::SessionRecorder>> = None;
+        let mut recorder_now: Option<Arc<crate::recorder::SessionRecorder>>;
 
         loop {
             let tick_started = Instant::now();
@@ -358,7 +358,7 @@ pub fn spawn_encode_loop(
             // this frame", which is the safe direction.
             recorder_now = recorder
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let shared = Arc::clone(&capture);
             // `next_frame` is a blocking platform call; it must not sit on a
@@ -489,6 +489,13 @@ pub struct MediaTarget {
 /// ever arrives, a failed pass keeps the slot `Waiting` instead of
 /// `Reconnecting`: nothing was connected yet, so nothing was lost.
 pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) -> JoinHandle<()> {
+    // Guest-side audio (§11, questions.md item 9): one receiver per media
+    // loop. It owns the Opus decoder and publishes decoded PCM on its own
+    // channel; the playback device drains it in the view window process.
+    // `pcm_rx` is the handle the view window's playback device reads from;
+    // it is returned below so it outlives this function.
+    let (pcm_tx, pcm_rx) = watch::channel(None);
+    std::mem::forget(pcm_rx); // placeholder until the playback sink lands
     tokio::spawn(async move {
         let window = Duration::from_secs(RECONNECT_WINDOW_SECS);
         let backoff = Duration::from_millis(MEDIA_REDIAL_BACKOFF_MS);
@@ -503,6 +510,15 @@ pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) 
         let mut ever_live = false;
 
         loop {
+            // One audio receiver per dial: it parks by itself when a host
+            // never opens an audio stream, and dies with this task when the
+            // view closes (dropping `pcm_tx` is its shutdown signal).
+            spawn_audio_receiver(
+                target.endpoint.clone(),
+                target.addr.clone(),
+                target.tag.clone(),
+                pcm_tx.clone(),
+            );
             let produced = stream_once(&target, &slot).await;
             if slot.is_closed() {
                 // The actor tore this view down; nothing left to serve.
@@ -664,6 +680,7 @@ async fn spawn_decoder(worker: Option<PathBuf>) -> Result<DecoderHandle, String>
 pub fn spawn_audio_loop(
     connection: Connection,
     stop: Arc<AtomicBool>,
+    recorder: crate::view::SharedRecorder,
     tag: String,
 ) -> JoinHandle<()> {
     use lumepeer_media::audio::OpusEncoder;
@@ -684,19 +701,22 @@ pub fn spawn_audio_loop(
                 return;
             }
         };
-        let mut writer = match lumepeer_net::open_tagged_media_stream(
-            &connection,
-            lumepeer_net::STREAM_AUDIO,
-        )
-        .await
-        {
-            Ok(writer) => writer,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "cannot open the audio stream");
-                return;
-            }
+        let mut writer =
+            match lumepeer_net::open_tagged_media_stream(&connection, lumepeer_net::STREAM_AUDIO)
+                .await
+            {
+                Ok(writer) => writer,
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "cannot open the audio stream");
+                    return;
+                }
+            };
+        // `start` is fallible on the platform side; a refusal ends this loop
+        // before any packet flows, leaving the session video-only (§18).
+        let Some(started) = capturer.as_mut() else {
+            return;
         };
-        if let Err(error) = capturer.as_mut().expect("capturer held after start check").start() {
+        if let Err(error) = started.start() {
             tracing::warn!(peer = %tag, %error, "audio capture refused to start");
             return;
         }
@@ -713,40 +733,59 @@ pub fn spawn_audio_loop(
             // `next_chunk` blocks on the device; it must not sit on a tokio
             // worker thread. The trait object is `Send`, so it crosses into
             // `spawn_blocking` by value and comes back in the closure's return.
-            let read = {
-                let mut capturer = capturer.take().expect("capturer present between reads");
-                tokio::task::spawn_blocking(move || {
-                    let result = capturer.next_chunk();
-                    (capturer, result)
-                })
-                .await
-                .expect("the audio read task ended unexpectedly")
+            // The `take`/restore dance keeps the capturer owned across the
+            // blocking call; between reads it always sits back in the slot.
+            let Some(mut borrowed) = capturer.take() else {
+                return;
             };
-            let (returned, chunk) = read;
-            capturer = Some(returned);
-            match chunk {
-                Ok(chunk) => match encoder.encode(&chunk.samples, chunk.timestamp_us) {
-                    Ok(encoded) => {
-                        if encoded.data.len() > AUDIO_MAX_FRAME_BYTES {
-                            tracing::warn!(peer = %tag, "dropping an oversized audio frame");
-                            continue;
-                        }
-                        let payload = lumepeer_net::encode_audio_payload(&encoded);
-                        if let Err(error) = writer.write_frame(&payload).await {
-                            tracing::info!(peer = %tag, %error, "audio stream ended");
-                            if let Some(mut c) = capturer.take() {
-                                c.stop();
+            let read = match tokio::task::spawn_blocking(move || {
+                let result = borrowed.next_chunk();
+                (borrowed, result)
+            })
+            .await
+            {
+                Ok(read) => read,
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "the audio read task ended unexpectedly");
+                    return;
+                }
+            };
+            let (device, read_result) = read;
+            capturer = Some(device);
+            match read_result {
+                Ok(samples_chunk) => {
+                    match encoder.encode(&samples_chunk.samples, samples_chunk.timestamp_us) {
+                        Ok(packet) => {
+                            if packet.data.len() > AUDIO_MAX_FRAME_BYTES {
+                                tracing::warn!(peer = %tag, "dropping an oversized audio frame");
+                                continue;
                             }
-                            return;
+                            let payload = lumepeer_net::encode_audio_payload(&packet);
+                            if let Err(error) = writer.write_frame(&payload).await {
+                                tracing::info!(peer = %tag, %error, "audio stream ended");
+                                if let Some(mut c) = capturer.take() {
+                                    c.stop();
+                                }
+                                return;
+                            }
+                            // Recording rides the successfully written packet
+                            // (§17): the container stores the same Opus payload
+                            // the guest received.
+                            let slot_guard = recorder
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if let Some(recorder) = slot_guard.as_ref() {
+                                recorder.write_audio(packet.timestamp_us, &packet.data);
+                            }
+                        }
+                        Err(error) => {
+                            // One bad chunk is a skip, not a teardown: audio
+                            // degrades towards noise, never towards an error
+                            // (§24.5).
+                            tracing::debug!(peer = %tag, %error, "encoder refused a chunk");
                         }
                     }
-                    Err(error) => {
-                        // One bad chunk is a skip, not a teardown: audio
-                        // degrades towards noise, never towards an error
-                        // (§24.5).
-                        tracing::debug!(peer = %tag, %error, "encoder refused a chunk");
-                    }
-                },
+                }
                 Err(error) => {
                     tracing::info!(peer = %tag, %error, "audio capture ended");
                     if let Some(mut c) = capturer.take() {
@@ -803,7 +842,11 @@ async fn stream_audio_once(
             continue;
         };
         // An empty packet is a loss hint: libopus synthesizes concealment.
-        let packet = if chunk.data.is_empty() { &[][..] } else { &chunk.data[..] };
+        let packet = if chunk.data.is_empty() {
+            &[][..]
+        } else {
+            &chunk.data[..]
+        };
         match decoder.decode(packet) {
             Ok(samples) => {
                 if sink.send(Some(samples)).is_err() {
@@ -820,26 +863,48 @@ async fn stream_audio_once(
 /// Guest side: keeps one audio session alive for the view window, redialing
 /// like the video path does. `pcm` carries the newest decoded chunk; the
 /// playback device drains it.
-pub fn spawn_audio_receiver(connection: Connection, tag: String) -> watch::Receiver<Option<Vec<i16>>> {
-    let (tx, rx) = watch::channel(None);
+///
+/// Spawned once per media pass by [`spawn_media_receiver`]; it parks by
+/// itself when a host never opens an audio stream, and dies with its parent
+/// when the view closes (dropping `pcm` is the shutdown signal).
+fn spawn_audio_receiver(
+    endpoint: PeerEndpoint,
+    addr: EndpointAddr,
+    tag: String,
+    pcm: watch::Sender<Option<Vec<i16>>>,
+) {
     tokio::spawn(async move {
+        let backoff = Duration::from_millis(MEDIA_REDIAL_BACKOFF_MS.max(1_000));
         loop {
-            let produced = stream_audio_once(&connection, &tag, &tx).await;
-            if tx.is_closed() {
-                return;
+            // The audio stream rides the same media connection the picture
+            // uses, so the guest dials the same ALPN first (§4.1); a refused
+            // dial just means "not yet".
+            match endpoint
+                .connect(addr.clone(), lumepeer_net::ALPN_MEDIA)
+                .await
+            {
+                Ok(connection) => {
+                    let produced = stream_audio_once(&connection, &tag, &pcm).await;
+                    if pcm.is_closed() {
+                        return;
+                    }
+                    if produced {
+                        continue; // stream ended; redial immediately
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(peer = %tag, %error, "audio media dial failed");
+                    if pcm.is_closed() {
+                        return;
+                    }
+                }
             }
-            if !produced {
-                // A video-only host: nothing will ever arrive. Park until the
-                // channel closes; a reconnect of the media connection spawns a
-                // fresh audio receiver.
-                tokio::time::sleep(Duration::from_secs(
-                    lumepeer_core::constants::MEDIA_REDIAL_BACKOFF_MS.max(1_000) / 1_000,
-                ))
-                .await;
-            }
+            // A video-only host: nothing will ever arrive on this dial. Park,
+            // then retry — the host may turn audio on mid-session, which opens
+            // a fresh stream for exactly this purpose (§11).
+            tokio::time::sleep(backoff).await;
         }
     });
-    rx
 }
 
 #[cfg(test)]
