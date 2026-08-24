@@ -82,6 +82,76 @@ describe('connect form: one request at a time', () => {
     expect(connectButton().disabled).toBe(false);
   });
 
+  // ADR 0027: the dial runs off the actor loop, so `invite_connect` resolving
+  // now means "the attempt started", not "the handshake landed". The button
+  // has to stay disabled across both waits or the user fires a second attempt
+  // into the first one.
+  it('stays disabled through the dial as well as the decision', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+    view.setConnectPhase('dialing', null);
+    expect(view.isConnecting()).toBe(true);
+    render(view.connectPanel('en'), container);
+    expect(connectButton().disabled).toBe(true);
+
+    view.setConnectPhase('awaiting_consent', null);
+    expect(view.isConnecting()).toBe(true);
+
+    view.setConnectPhase('connected', null);
+    render(view.connectPanel('en'), container);
+    expect(connectButton().disabled).toBe(false);
+  });
+
+  // Before ADR 0027 every transport failure reached the user as one sentence,
+  // which is what sent the field report of ADR 0026 to the wrong machine.
+  it('names the failure it was, not just that there was one', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+    view.setConnectPhase('failed', 'DIAL_FAILED');
+    render(view.connectPanel('en'), container);
+    const message = container.querySelector('.connect-error')?.textContent ?? '';
+    expect(message).toContain('Could not reach');
+    expect(message).not.toContain('DIAL_FAILED');
+  });
+
+  it('falls back to the generic wording for a code it does not know', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+    view.setConnectPhase('failed', 'SOMETHING_NEW');
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('.connect-error')?.textContent).toContain(
+      'ended before it was accepted',
+    );
+  });
+
+  // A fresh attempt must clear what the last one said, or the form shows a
+  // stale failure underneath a live "Connecting..." button.
+  it('clears the previous failure when a new attempt starts', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+    view.setConnectPhase('failed', 'DIAL_FAILED');
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('.connect-error')).not.toBeNull();
+
+    view.setConnectPhase('dialing', null);
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('.connect-error')).toBeNull();
+
+    view.setConnectPhase('connected', null);
+  });
+
   it('ignores a second submit while the first is still outstanding', async () => {
     const view = await load();
     render(view.connectPanel('en'), container);

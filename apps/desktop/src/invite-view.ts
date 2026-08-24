@@ -9,7 +9,7 @@
 
 import { html, type TemplateResult } from 'lit-html';
 
-import type { Locale } from './i18n';
+import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
 
 const COPIED_FEEDBACK_MS = 1500;
@@ -18,10 +18,30 @@ const CONNECTING_DOT_MAX = 3;
 
 /**
  * How the Rust actor reports this node's own outgoing connect attempt
- * (`connect_status`, §21 punch-list item 6). `awaiting_consent` is the one
- * that matters here: the dial has landed and the far side is deciding.
+ * (`connect_status`, §21 punch-list item 6). Two of these are waits, not
+ * outcomes: `dialing` is this node still trying to reach the host, and
+ * `awaiting_consent` is the dial having landed with the far side deciding.
  */
-export type ConnectPhase = 'idle' | 'awaiting_consent' | 'connected' | 'denied' | 'failed';
+export type ConnectPhase =
+  | 'idle'
+  | 'dialing'
+  | 'awaiting_consent'
+  | 'connected'
+  | 'denied'
+  | 'failed';
+
+/**
+ * §18 code the actor attaches to a failed attempt, so the form can say which
+ * failure it was instead of one generic sentence (ADR 0027). An unrecognised
+ * code falls back to the generic wording rather than showing the raw code.
+ */
+const FAILURE_TEXT: Record<string, TranslationKey> = {
+  DIAL_FAILED: 'invite.unreachable',
+  BAD_TICKET: 'invite.badTicket',
+  OFFLINE: 'invite.offline',
+  INCOMPATIBLE_VERSION: 'invite.versionMismatch',
+  TRANSPORT_LOST: 'invite.failed',
+};
 
 let lastCode: string | undefined;
 let creatingInvite = false;
@@ -53,27 +73,42 @@ function notify(): void {
  * whole time, which is what stops a second request racing the first.
  */
 export function isConnecting(): boolean {
-  return dialing || phase === 'awaiting_consent';
+  return dialing || phase === 'dialing' || phase === 'awaiting_consent';
 }
 
-/** Called by main.ts on every poll of `connect_status`. */
-export function setConnectPhase(next: ConnectPhase): void {
-  if (next === phase) {
+/**
+ * Called by main.ts on every poll of `connect_status`.
+ *
+ * `code` is the §18 classification of a failure, present only with
+ * `phase: 'failed'`. It exists because the dial no longer runs inside the IPC
+ * call and so can no longer reject it: without this every transport problem
+ * would reach the user as the same sentence (ADR 0027).
+ */
+export function setConnectPhase(next: ConnectPhase, code?: string | null): void {
+  const nextError = failureKey(next, code);
+  if (next === phase && nextError === connectError) {
     return;
   }
   const wasWaiting = isConnecting();
   phase = next;
-  if (next === 'denied') {
-    connectError = 'denied';
-  } else if (next === 'failed') {
-    connectError = 'failed';
-  } else if (next === 'connected') {
-    connectError = undefined;
+  if (nextError !== undefined || next === 'connected' || isConnecting()) {
+    connectError = nextError;
   }
   if (wasWaiting !== isConnecting()) {
     syncConnectingAnimation();
   }
   notify();
+}
+
+/** The message key a phase deserves, or `undefined` when it deserves none. */
+function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | undefined {
+  if (next === 'denied') {
+    return 'invite.denied';
+  }
+  if (next === 'failed') {
+    return (code && FAILURE_TEXT[code]) || 'invite.failed';
+  }
+  return undefined;
 }
 
 async function invoker(): Promise<(cmd: string, args?: unknown) => Promise<unknown>> {
@@ -159,10 +194,11 @@ async function attempt(command: string, args: unknown): Promise<void> {
   try {
     const invoke = await invoker();
     await invoke(command, args);
-    // The handshake landed; the host user has not decided yet. Assume the wait
-    // rather than waiting for the next poll, so the button never flickers back
-    // to enabled in between.
-    phase = 'awaiting_consent';
+    // The attempt is under way — the dial runs off the actor loop and reports
+    // through `connect_status` from here (ADR 0027). Assume the wait rather
+    // than waiting for the next poll, so the button never flickers back to
+    // enabled in between.
+    phase = 'dialing';
   } catch (error) {
     connectError = describeError(error);
     phase = 'failed';
@@ -184,13 +220,14 @@ export async function reconnect(peer: string): Promise<void> {
 
 /** The message under the connect form, if there is one to show. */
 function errorText(locale: Locale): string | undefined {
-  if (connectError === 'denied') {
-    return t(locale, 'invite.denied');
+  if (connectError === undefined) {
+    return undefined;
   }
-  if (connectError === 'failed') {
-    return t(locale, 'invite.failed');
-  }
-  return connectError;
+  // A key set from a phase is localized here; anything else is the message a
+  // synchronously refused IPC call already carried.
+  return connectError.startsWith('invite.')
+    ? t(locale, connectError as TranslationKey)
+    : connectError;
 }
 
 /** Sidebar block: "Your invite code" label, code box + copy, or a create trigger. */

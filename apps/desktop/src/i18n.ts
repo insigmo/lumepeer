@@ -25,6 +25,10 @@ export type TranslationKey =
   | 'invite.connecting'
   | 'invite.denied'
   | 'invite.failed'
+  | 'invite.unreachable'
+  | 'invite.badTicket'
+  | 'invite.offline'
+  | 'invite.versionMismatch'
   | 'status.inputOn'
   | 'status.inputOff'
   | 'status.revoke'
@@ -90,6 +94,12 @@ const en: Dictionary = {
   'invite.connecting': 'Connecting',
   'invite.denied': 'The other device declined the request.',
   'invite.failed': 'The connection ended before it was accepted.',
+  'invite.unreachable':
+    'Could not reach that device. It may be offline, or its invite code may be out of date — ask for a fresh one.',
+  'invite.badTicket': 'That invite code is not valid, or it has expired.',
+  'invite.offline':
+    'This device is not reachable from the internet yet. Wait for the status to turn ready, then try again.',
+  'invite.versionMismatch': 'The other device runs an incompatible version of Lumepeer.',
   'status.inputOn': 'input on',
   'status.inputOff': 'input off',
   'status.revoke': 'Revoke',
@@ -158,6 +168,12 @@ const ar: Dictionary = {
   'invite.connecting': 'جارٍ الاتصال',
   'invite.denied': 'رفض الجهاز الآخر الطلب.',
   'invite.failed': 'انتهى الاتصال قبل قبوله.',
+  'invite.unreachable':
+    'تعذّر الوصول إلى ذلك الجهاز. قد يكون غير متصل، أو أن رمز الدعوة قديم — اطلب رمزًا جديدًا.',
+  'invite.badTicket': 'رمز الدعوة غير صالح أو انتهت صلاحيته.',
+  'invite.offline':
+    'هذا الجهاز غير قابل للوصول من الإنترنت بعد. انتظر حتى تصبح الحالة جاهزة ثم أعد المحاولة.',
+  'invite.versionMismatch': 'يعمل الجهاز الآخر بإصدار غير متوافق من Lumepeer.',
   'status.inputOn': 'الإدخال مفعّل',
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
