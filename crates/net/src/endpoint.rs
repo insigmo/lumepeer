@@ -25,25 +25,25 @@ fn alpn_list() -> Vec<Vec<u8>> {
     SUPPORTED_ALPNS.iter().map(|a| (*a).to_vec()).collect()
 }
 
-/// Environment variable that puts the direct IP transports — the LAN path —
-/// back on. See [`lan_direct_enabled`].
-pub const LAN_DIRECT_ENV: &str = "LUMEPEER_LAN_DIRECT";
+/// Environment variable that takes the direct IP transports away, leaving the
+/// relay as the only route. See [`relay_only_enabled`].
+pub const RELAY_ONLY_ENV: &str = "LUMEPEER_RELAY_ONLY";
 
-/// Whether this process may use direct IP paths (which is what makes two peers
-/// on the same LAN talk without ever leaving it).
+/// Whether this process must ignore direct IP paths and carry every session
+/// over a relay.
 ///
-/// **Temporarily off by default.** WAN connectivity is being verified, and as
-/// long as a direct path exists two machines on one network reach each other
-/// without the relay, so a passing test proves nothing about the internet
-/// path. With the direct transports cleared the only route left is the relay,
-/// i.e. out to the internet and back — which is exactly what has to be proven
-/// to work.
+/// **Off by default**, which is the shipping behaviour: direct paths are what
+/// make a session fast, and clearing them makes every client depend on a relay
+/// link staying healthy — a dependency that cost one release its connectivity
+/// (ADR 0026).
 ///
-/// Nothing is deleted: set `LUMEPEER_LAN_DIRECT=1` (or `true`/`yes`/`on`) and
-/// [`PeerEndpoint::bind`] is the full relay-plus-direct endpoint again.
+/// Set `LUMEPEER_RELAY_ONLY=1` (or `true`/`yes`/`on`) to get the relay-only
+/// endpoint back for a deliberate WAN test: with no IP transport there is no
+/// direct path to hole-punch onto, so two machines that share a network still
+/// have to talk through the internet (ADR 0020).
 #[must_use]
-pub fn lan_direct_enabled() -> bool {
-    match std::env::var(LAN_DIRECT_ENV) {
+pub fn relay_only_enabled() -> bool {
+    match std::env::var(RELAY_ONLY_ENV) {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -59,61 +59,73 @@ pub struct PeerEndpoint {
 }
 
 /// Environment variable overriding the relay URL clients reach for when hole
-/// punching fails (docs/relay-deployment.md). Unset means iroh's default
-/// public relay fleet.
-const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
+/// punching fails (docs/relay-deployment.md). It wins over the configured
+/// relay; with neither set, iroh's default public relay fleet is used.
+pub const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
 
-/// Applies `LUMEPEER_RELAY_URL` to a builder when set (§7 fallback path,
-/// docs/relay-deployment.md). A malformed URL is ignored with an error log:
+/// Points a builder at a specific relay: `LUMEPEER_RELAY_URL` first, then
+/// whatever `[network].relay_url` of the config carried (§7 fallback path,
+/// docs/relay-deployment.md). Neither means iroh's public fleet.
+///
+/// A malformed URL is ignored with a warning rather than failing the bind:
 /// binding must keep working offline, and the endpoint logs which relay it
-/// actually uses either way.
-fn with_relay_override(builder: EndpointBuilder) -> EndpointBuilder {
-    match std::env::var(RELAY_URL_ENV) {
-        Err(_) => builder,
-        Ok(url) => match url.parse::<RelayUrl>() {
-            Ok(relay) => builder.relay_mode(RelayMode::custom([relay])),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %url,
-                    "ignoring LUMEPEER_RELAY_URL: not a valid relay URL"
-                );
-                builder
-            }
+/// actually reached either way.
+fn with_relay(builder: EndpointBuilder, configured: Option<&str>) -> EndpointBuilder {
+    let (source, url) = match std::env::var(RELAY_URL_ENV) {
+        Ok(from_env) => (RELAY_URL_ENV, from_env),
+        Err(_) => match configured {
+            Some(from_config) => ("[network].relay_url", from_config.to_owned()),
+            None => return builder,
         },
+    };
+    match url.parse::<RelayUrl>() {
+        Ok(relay) => {
+            tracing::info!(%url, %source, "using a configured relay");
+            builder.relay_mode(RelayMode::custom([relay]))
+        }
+        Err(error) => {
+            tracing::warn!(%error, %url, %source, "ignoring the relay: not a valid relay URL");
+            builder
+        }
     }
 }
 
 impl PeerEndpoint {
     /// Binds an endpoint using the long-term identity from the OS keystore
-    /// (§7, §11.2), with relays and address lookup enabled.
+    /// (§7, §11.2), with relays, address lookup and direct IP paths enabled.
     ///
-    /// Which transports it gets is decided by [`lan_direct_enabled`]: today
-    /// that means [`Self::bind_relay_only`] unless `LUMEPEER_LAN_DIRECT` is
-    /// set, in which case it is [`Self::bind_with_lan`].
+    /// `relay_url` is the relay from the configuration file, if the caller
+    /// found one; `LUMEPEER_RELAY_URL` still wins over it.
+    ///
+    /// Which transports it gets is decided by [`relay_only_enabled`]: the
+    /// default is [`Self::bind_with_lan`], and only an explicit
+    /// `LUMEPEER_RELAY_ONLY` selects [`Self::bind_relay_only`].
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
-    pub async fn bind(secret_key: iroh::SecretKey) -> Result<Self> {
-        if lan_direct_enabled() {
-            Self::bind_with_lan(secret_key).await
+    pub async fn bind(secret_key: iroh::SecretKey, relay_url: Option<&str>) -> Result<Self> {
+        if relay_only_enabled() {
+            Self::bind_relay_only(secret_key, relay_url).await
         } else {
-            Self::bind_relay_only(secret_key).await
+            Self::bind_with_lan(secret_key, relay_url).await
         }
     }
 
     /// Binds the full endpoint: relays, address lookup **and** direct IP
-    /// paths, so two peers on one network can hole-punch onto a LAN path and
-    /// never touch the relay. This is the shipping behaviour; it is reached
-    /// through [`Self::bind`] only while `LUMEPEER_LAN_DIRECT` is set.
+    /// paths, so two peers can hole-punch onto a direct path and only fall
+    /// back to a relay when that fails (§5, `prefer_direct = true`). This is
+    /// what [`Self::bind`] does unless `LUMEPEER_RELAY_ONLY` says otherwise.
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
-    pub async fn bind_with_lan(secret_key: iroh::SecretKey) -> Result<Self> {
+    pub async fn bind_with_lan(
+        secret_key: iroh::SecretKey,
+        relay_url: Option<&str>,
+    ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key)
             .alpns(alpn_list());
-        builder = with_relay_override(builder);
+        builder = with_relay(builder, relay_url);
         let inner = builder
             .bind()
             .await
@@ -130,14 +142,21 @@ impl PeerEndpoint {
     /// path, and it makes the address in an invite ticket relay-only, since
     /// `EndpointAddr` can then hold nothing else.
     ///
+    /// Opt-in only (`LUMEPEER_RELAY_ONLY`): as the shipping default it made
+    /// every session hostage to one relay link, which is how v0.0.14 reached
+    /// users unable to connect at all (ADR 0026).
+    ///
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
-    pub async fn bind_relay_only(secret_key: iroh::SecretKey) -> Result<Self> {
+    pub async fn bind_relay_only(
+        secret_key: iroh::SecretKey,
+        relay_url: Option<&str>,
+    ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .secret_key(secret_key)
             .alpns(alpn_list());
-        builder = with_relay_override(builder);
+        builder = with_relay(builder, relay_url);
         let inner = builder
             .bind()
             .await

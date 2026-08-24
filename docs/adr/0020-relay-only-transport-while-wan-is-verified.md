@@ -1,7 +1,13 @@
 # ADR 0020 — Relay-only transport while the WAN path is being verified
 
-Status: accepted (temporary)
+Status: superseded by [ADR 0026](0026-direct-paths-by-default-and-a-diagnosable-release.md)
 Date: 2026-08-20
+
+> The temporary default recorded here shipped in v0.0.14 and left every
+> installed client dependent on one relay link. ADR 0026 reverts it: direct
+> paths are the default again and relay-only is opt-in via
+> `LUMEPEER_RELAY_ONLY` (or `prefer_direct = false`). Everything below is the
+> reasoning as it stood, kept because the question it answers will come back.
 
 ## Context
 
@@ -76,9 +82,8 @@ transport available to either side.
 
 ## Reverting
 
-Delete the `lan_direct_enabled()` branch in `PeerEndpoint::bind` so it calls
-`bind_with_lan` unconditionally, and drop `LAN_DIRECT_ENV`. Keep
-`bind_relay_only` and `wan_probe`: a relay-only mode that can be turned on is
-how this question gets answered the next time it is asked. Keep the
-`NetError::Offline` guard on invite issuance — it is not part of this
-experiment.
+Done in ADR 0026, as planned here: `PeerEndpoint::bind` calls `bind_with_lan`
+unless asked otherwise, `LAN_DIRECT_ENV` is gone, and `bind_relay_only` plus
+`wan_probe` stayed — turned on by `LUMEPEER_RELAY_ONLY` (or `prefer_direct =
+false` in the config, which is now read). The `NetError::Offline` guard on
+invite issuance stayed too; it was never part of the experiment.

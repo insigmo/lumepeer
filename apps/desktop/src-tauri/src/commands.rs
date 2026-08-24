@@ -98,6 +98,15 @@ impl IpcError {
                 "INCOMPATIBLE_VERSION",
                 "the host speaks an incompatible protocol version",
             ),
+            // Transport, not verdict. This is what *this* side observed — a
+            // stream that stopped — so saying so leaks nothing about why the
+            // far end did anything, and it keeps a flapping link from being
+            // reported as a rejection, which sends the user hunting on the
+            // wrong machine (ADR 0026).
+            NetError::Io(_) => (
+                "TRANSPORT_LOST",
+                "the connection dropped before the session was set up — check the network and try again",
+            ),
             _ => ("REJECTED", "the host refused the connection"),
         };
         Self {

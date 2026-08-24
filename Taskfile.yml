@@ -11,7 +11,10 @@ vars:
   # client built without them starts, pairs and consents normally and
   # reports "no capture backend" instead of showing a picture (§18).
   LINUX_MEDIA_FEATURES: capture-x11,encode-openh264
-  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf
+  # Both encoders: Media Foundation needs hardware support the host may not
+  # have, and without the openh264 software fallback such a host reports
+  # "no usable encoder" and the guest never gets a picture.
+  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-openh264
   # macOS has no hardware encoder wired up yet (encode::select_encoder only
   # implements the Media Foundation one), so the openh264 software fallback
   # is what an Apple host encodes with; without it select_encoder errors and

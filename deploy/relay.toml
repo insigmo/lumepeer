@@ -1,0 +1,35 @@
+# Configuration for the self-hosted Iroh relay (docs/relay-deployment.md).
+#
+# Read by `iroh-relay --config-path`; the field names are those of the 1.0
+# relay's own config, so anything not listed here keeps that binary's default.
+# Replace `relay.example.com` with the DNS name that points at this machine and
+# put a reachable address in `contact` before starting it.
+
+# Forward traffic between peers. Set to false for a holepunch-only relay: it
+# then answers address discovery and nothing else, which costs no bandwidth
+# but leaves peers behind symmetric NATs with no fallback at all.
+enable_relay = true
+
+# Answer QUIC address discovery on udp/7842. This is what lets a peer learn
+# how the internet sees it, and it is the difference between hole punching
+# working and every session falling back onto this relay's uplink.
+enable_quic_addr_discovery = true
+
+[tls]
+cert_mode = "LetsEncrypt"
+hostname = "relay.example.com"
+contact = "admin@example.com"
+# Certificates are persisted in the named volume, so a restart does not ask
+# Let's Encrypt for a new one and walk into their rate limit.
+cert_dir = "/data/certs"
+# Staging certificates are not trusted by clients; keep this true unless you
+# are deliberately testing the ACME plumbing.
+prod_tls = true
+
+[limits.client.rx]
+# Bounds a single client rather than the server: a peer that floods the relay
+# is slowed down and everyone else is unaffected. A steady 4 MB/s with an
+# 8 MB burst sits above ABR_MAX_BITRATE_KBPS (12 Mbit/s) with room for the
+# burst a keyframe makes, so a normal session never touches it.
+bytes_per_second = 4_000_000
+max_burst_bytes = 8_000_000

@@ -8,9 +8,10 @@
 //! simplified imitation of it does. What it leaves out is everything above the
 //! control channel: no consent UI, no capture, no media.
 //!
-//! By default `PeerEndpoint::bind` clears the direct IP transports (see
-//! [`lumepeer_net::endpoint::lan_direct_enabled`]), so the session can only be
-//! carried by the relay — out to the internet and back. That is the point: two
+//! Set `LUMEPEER_RELAY_ONLY=1` (see
+//! [`lumepeer_net::endpoint::relay_only_enabled`]) to clear the direct IP
+//! transports, so the session can only be carried by the relay — out to the
+//! internet and back. That is how this probe answers the WAN question: two
 //! machines on one LAN otherwise reach each other without the internet being
 //! involved at all, and the test would prove nothing.
 //!
@@ -31,7 +32,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
 use lumepeer_core::protocol::MessageKind;
-use lumepeer_net::endpoint::lan_direct_enabled;
+use lumepeer_net::endpoint::relay_only_enabled;
 use lumepeer_net::{InviteTicket, PeerEndpoint};
 
 /// How long to wait for a relay before giving up on the whole probe.
@@ -79,15 +80,15 @@ async fn main() {
 async fn bind() -> Result<(PeerEndpoint, SigningKey), String> {
     println!(
         "MODE {}",
-        if lan_direct_enabled() {
-            "lan+relay (LUMEPEER_LAN_DIRECT is set)"
+        if relay_only_enabled() {
+            "relay-only (LUMEPEER_RELAY_ONLY is set: no direct IP transports)"
         } else {
-            "relay-only (no direct IP transports)"
+            "direct+relay"
         }
     );
     let secret = iroh::SecretKey::generate();
     let identity = SigningKey::from_bytes(&secret.to_bytes());
-    let endpoint = PeerEndpoint::bind(secret)
+    let endpoint = PeerEndpoint::bind(secret, None)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     println!("NODE {}", endpoint.node_id());

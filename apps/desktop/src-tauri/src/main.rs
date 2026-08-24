@@ -12,7 +12,9 @@
 )]
 
 mod commands;
+mod config;
 mod connection_history;
+mod logging;
 mod network;
 mod recorder;
 mod view;
@@ -26,7 +28,16 @@ pub struct AppState {
 }
 
 fn main() {
-    init_tracing();
+    // Configuration first: it decides where the log file goes, and tracing has
+    // to be installed before anything worth logging happens (§5.1, §16.1).
+    let (settings, notes) = config::Settings::load();
+    let log_file = logging::init(&settings);
+    for note in notes {
+        tracing::info!("{note}");
+    }
+    if let Some(path) = log_file {
+        tracing::info!(path = %path.display(), "logging to file");
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -62,7 +73,7 @@ fn main() {
             use tauri::Manager as _;
 
             let network = runtime
-                .block_on(network::spawn_actor(app.handle().clone()))
+                .block_on(network::spawn_actor(app.handle().clone(), &settings))
                 .unwrap_or_else(|error| {
                     eprintln!("fatal: failed to bind the network endpoint: {error}");
                     std::process::exit(1);
@@ -100,19 +111,4 @@ fn main() {
             eprintln!("fatal: failed to start the application: {error}");
             std::process::exit(1);
         });
-}
-
-/// Human-readable logs in development, structured JSON in release (§16.1).
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if cfg!(debug_assertions) {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    } else {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    }
 }

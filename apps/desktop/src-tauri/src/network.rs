@@ -27,7 +27,7 @@ use lumepeer_core::protocol::{
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_media::capture::{
-    CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_capturer,
+    CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
 use lumepeer_net::keystore::load_or_create;
@@ -1769,6 +1769,18 @@ impl Actor {
             tracing::warn!("refusing to issue an invite: the endpoint has no dialable address yet");
             return Err(ActorError::Net(NetError::Offline));
         }
+        // With direct paths on (ADR 0026) the address set fills up from the
+        // local interfaces long before a relay is reached, so an invite issued
+        // in that window is dialable across the room and nowhere else. It is
+        // still worth issuing — a LAN-only deployment is legitimate — but it
+        // is exactly the "works locally, not over the internet" report of ADR
+        // 0020, so it is said out loud here rather than discovered on the
+        // guest's machine minutes later.
+        if addr.relay_urls().next().is_none() {
+            tracing::warn!(
+                "issuing an invite with no relay address: this code is dialable from the local network only until the endpoint reaches a relay"
+            );
+        }
         tracing::info!(addrs = ?addr.addrs, "issuing an invite");
         let issued = InviteTicket::issue(&self.identity, &addr, role, now);
         match issued {
@@ -2055,18 +2067,26 @@ fn machine_id() -> String {
     String::new()
 }
 
-pub async fn spawn_actor(app: tauri::AppHandle) -> Result<ActorHandle, NetError> {
+pub async fn spawn_actor(
+    app: tauri::AppHandle,
+    settings: &crate::config::Settings,
+) -> Result<ActorHandle, NetError> {
     let store = open_keystore()?;
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
-    let endpoint = PeerEndpoint::bind(secret_key).await?;
-    if lumepeer_net::endpoint::lan_direct_enabled() {
-        tracing::info!("transport: relay + direct IP paths (LUMEPEER_LAN_DIRECT is set)");
-    } else {
+    let relay = settings.relay_url();
+    // Relay-only is a WAN test, never the default: with the IP transports
+    // cleared every session lives or dies with one relay link, and a client
+    // whose relay flaps cannot connect at all (ADR 0026).
+    let endpoint = if settings.relay_only() {
         tracing::info!(
-            "transport: relay only — direct IP paths are off, so every session goes over the internet. Set LUMEPEER_LAN_DIRECT=1 to put the LAN path back."
+            "transport: relay only — direct IP paths are off, so every session goes over the internet"
         );
-    }
+        PeerEndpoint::bind_relay_only(secret_key, relay).await?
+    } else {
+        tracing::info!("transport: direct IP paths preferred, relay as the fallback");
+        PeerEndpoint::bind_with_lan(secret_key, relay).await?
+    };
     let history_path = connection_history_path(&app);
 
     let handle = spawn_actor_with(
@@ -2103,8 +2123,9 @@ fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     }
 }
 
-/// Builds the host's media side: the capture controller, plus whether this
-/// platform gave a capture backend at all.
+/// Builds the host's media side: the capture controller, whether this platform
+/// gave a capture backend at all, and the injector when it can only come from
+/// the same session as the pixels (ADR 0010).
 ///
 /// A missing backend must not stop the app from starting or from accepting a
 /// session: consent, input and the rest of the control channel work regardless
@@ -2122,16 +2143,18 @@ pub fn default_capture() -> HostMedia {
         )))
     }
 
-    match platform_capturer() {
-        Ok(capturer) => HostMedia {
+    match platform_backend() {
+        Ok((capturer, injector)) => HostMedia {
             capture: controller(capturer),
             health: Arc::new(MediaHealth::healthy()),
+            injector,
         },
         Err(error) => {
             tracing::warn!(%error, "no capture backend on this platform: sessions stay blank");
             HostMedia {
                 capture: controller(Box::new(StubCapturer::default())),
                 health: Arc::new(MediaHealth::without_capture()),
+                injector: None,
             }
         }
     }
@@ -2149,7 +2172,11 @@ pub fn spawn_actor_with(
     media: HostMedia,
     history_path: Option<std::path::PathBuf>,
 ) -> ActorHandle {
-    let HostMedia { capture, health } = media;
+    let HostMedia {
+        capture,
+        health,
+        injector,
+    } = media;
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
     let (faults_tx, faults_rx) = mpsc::channel(8);
@@ -2177,7 +2204,7 @@ pub fn spawn_actor_with(
         media: std::collections::HashMap::new(),
         audio: std::collections::HashMap::new(),
         recorders: HashMap::new(),
-        injector: None,
+        injector,
         views: std::collections::HashMap::new(),
         host_addrs: std::collections::HashMap::new(),
         host_invites: std::collections::HashMap::new(),
@@ -2261,6 +2288,7 @@ mod tests {
         HostMedia {
             capture: Arc::clone(capture),
             health: Arc::new(MediaHealth::healthy()),
+            injector: None,
         }
     }
 
@@ -2850,6 +2878,7 @@ mod tests {
             HostMedia {
                 capture: Arc::clone(&capture),
                 health: Arc::new(MediaHealth::without_capture()),
+                injector: None,
             },
         )
         .await;

@@ -22,26 +22,30 @@ implementation. iroh already contains production relay infrastructure
 
 ```sh
 cd deploy
-cat > .env <<'EOF'
-RELAY_HOST=relay.example.com
-RELAY_CONTACT=admin@example.com
-EOF
+# Set `hostname` to the DNS name pointing at this machine and `contact` to an
+# address Let's Encrypt can reach:
+$EDITOR relay.toml
 docker compose up -d
 ```
+
+The 1.0 relay binary takes exactly two arguments — `--dev` and
+`--config-path` — so everything else lives in `deploy/relay.toml`, which the
+compose file mounts read-only.
 
 Requirements:
 
 | Requirement | Why |
 | --- | --- |
-| DNS A/AAAA record for `RELAY_HOST` | ACME certificate issuance and client discovery |
-| Port 80 reachable from the internet | Let's Encrypt HTTP-01 challenge |
-| Port 443 reachable from the internet | Client relaying traffic over TLS |
+| DNS A/AAAA record for the `hostname` in `relay.toml` | ACME certificate issuance and client discovery |
+| Port 80/tcp reachable from the internet | Let's Encrypt HTTP-01 challenge and the captive-portal probe |
+| Port 443/tcp reachable from the internet | Client relaying traffic over TLS |
+| Port 7842/udp reachable from the internet | QUIC address discovery — how a peer learns its own public address, which is what makes hole punching succeed |
 
 Verify:
 
 ```sh
-curl -f https://relay.example.com/ping   # -> "pong"
-docker compose logs iroh-relay           # look for "cert acquired"
+curl -f https://relay.example.com/ping   # -> "pong" (HTTPS only; port 80 serves the probe)
+docker compose logs iroh-relay           # look for the ACME certificate being acquired
 ```
 
 ## Pointing clients at your relay
@@ -57,9 +61,16 @@ one, set:
 relay_url = "https://relay.example.com"
 ```
 
-`config/local.toml` (gitignored) is the right place per machine. No secret
-ever belongs there or in the relay config: the relay holds no keys that can
-decrypt anything.
+`config/local.toml` (gitignored) is the right place per machine when running
+from a checkout. An **installed** client reads, in order, `config/default.toml`
+next to its executable, then the per-user file — `%APPDATA%\io.insigmo.lumepeer\config.toml`
+on Windows, `~/Library/Application Support/io.insigmo.lumepeer/config.toml` on
+macOS, `$XDG_CONFIG_HOME/io.insigmo.lumepeer/config.toml` on Linux — with later
+files winning key by key (ADR 0026). `LUMEPEER_RELAY_URL` overrides all of
+them, and `LUMEPEER_CONFIG` names one more file to read last.
+
+No secret ever belongs there or in the relay config: the relay holds no keys
+that can decrypt anything.
 
 ## Operating notes
 
@@ -70,10 +81,13 @@ decrypt anything.
 - **Monitoring**: `/ping` answers `pong` over HTTPS when healthy;
   `/metrics` serves Prometheus counters (connections, bytes relayed) if you
   enable it with `--metrics`.
-- **Version pinning**: the compose file pins an image tag. Upgrades are a
-  normal `image:` bump + `docker compose up -d`; relays are stateless, so
-  a restart drops only the sessions currently *relayed* through it — those
-  peers re-establish via the reconnect window of §10.
+- **Version pinning**: the compose file pins the image tag to the `iroh`
+  version of the workspace manifest (`=1.0.2` today). This is not cosmetic —
+  the relay protocol changed across the 0.9x → 1.0 line, so a mismatched relay
+  does not serve these clients at all. Bump both in one PR, as §5 requires of
+  every iroh pin. Relays are otherwise stateless, so a restart drops only the
+  sessions currently *relayed* through it — those peers re-establish via the
+  reconnect window of §10.
 - **Multiple relays**: clients take one `relay_url`. For geo redundancy run
   one relay per region and hand out region-appropriate configs; no special
   clustering exists or is needed.

@@ -31,7 +31,7 @@ use lumepeer_core::constants::{
 };
 use lumepeer_core::protocol::MediaUnavailableReason;
 use lumepeer_media::abr::{AbrController, ReceiverFeedback};
-use lumepeer_media::capture::CaptureController;
+use lumepeer_media::capture::{CaptureController, InputInjector};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
 use lumepeer_media::scale::fit_within_budget;
@@ -140,18 +140,25 @@ impl MediaHealth {
     }
 }
 
-/// The host's media side as one value: the shared capture controller, and
-/// what is known about whether this machine can produce a picture at all.
+/// The host's media side as one value: the shared capture controller, what is
+/// known about whether this machine can produce a picture at all, and — on the
+/// one platform that cannot build the two apart — the matching injector.
 ///
-/// They travel together because they are decided together — the same
-/// `platform_capturer()` call that picks the controller's backend is what
-/// tells the host it has none.
-#[derive(Debug, Clone)]
+/// They travel together because they are decided together: the same
+/// `platform_backend()` call that picks the controller's backend is what tells
+/// the host it has none, and on the Wayland portal path it is also the only
+/// call that can produce an injector for the session capture just negotiated
+/// (ADR 0010).
+#[derive(Debug)]
 pub struct HostMedia {
     /// Controller every encode loop pulls frames from.
     pub capture: SharedCapture,
     /// What this host knows about its own ability to produce a picture.
     pub health: Arc<MediaHealth>,
+    /// Injector paired with `capture`, on platforms where input has to come
+    /// from the same session as the pixels. `None` everywhere else, which
+    /// leaves the actor building one lazily on the first input event (§18).
+    pub injector: Option<Box<dyn InputInjector>>,
 }
 
 /// What an encode loop reports back when it cannot produce a picture at all.
