@@ -75,6 +75,8 @@ button {
 /* ---------- Title bar ---------- */
 .title-bar {
   background: var(--titlebar-bg);
+  user-select: none;
+  cursor: default;
   border-block-end: 1px solid var(--border-subtle);
   display: flex;
   align-items: center;
@@ -91,6 +93,15 @@ button {
   font-size: var(--fs-body);
   font-weight: 600;
   color: var(--text-heading);
+  /* Fill the free space so the whole strip left of the window controls drags. */
+  flex: 1;
+  min-width: 0;
+}
+
+/* The drag region is matched against the mousedown target, so the logo and the
+   product name must not be targets of their own. */
+.title-bar-left > * {
+  pointer-events: none;
 }
 
 .title-bar-controls {
