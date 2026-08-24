@@ -21,7 +21,9 @@ use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::ClipboardSync;
 use lumepeer_core::consent::{Grants, Role};
 use lumepeer_core::constants::{CONTROL_HANDSHAKE_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES};
-use lumepeer_core::protocol::{InputEventPayload, MessageKind};
+use lumepeer_core::protocol::{
+    FEATURE_MEDIA_UNAVAILABLE, InputEventPayload, MediaUnavailableReason, MessageKind,
+};
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_media::capture::{
@@ -36,8 +38,9 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
 use crate::view::{
-    MediaTarget, SharedCapture, ViewSlot, ViewWindows, encode_view_response, lock_capture,
-    slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
+    HostMedia, MediaFault, MediaHealth, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
+    ViewWindows, encode_view_response, lock_capture, slot_for_poll, spawn_encode_loop,
+    spawn_media_receiver, window_label,
 };
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
@@ -275,6 +278,9 @@ pub struct ActorHandle {
     /// when `PeerEndpoint::online()` first resolves (see `spawn_actor`) —
     /// this crate never observes a relay going back offline.
     online: Arc<AtomicBool>,
+    /// What this host knows about its own ability to produce a picture.
+    /// Shared with the actor, which is what learns of an encoder fault.
+    health: Arc<MediaHealth>,
 }
 
 impl ActorHandle {
@@ -290,6 +296,13 @@ impl ActorHandle {
     #[must_use]
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
+    }
+
+    /// What this host can do about producing a picture, for the status the UI
+    /// shows its own operator (§18). Carries no authorization of its own.
+    #[must_use]
+    pub fn media_health(&self) -> &MediaHealth {
+        &self.health
     }
 
     /// Snapshot of every pending and active session.
@@ -612,6 +625,13 @@ struct ConnectionHandle {
     /// outbound sender alone only ends the writer task; the reader would sit
     /// in `recv` until the far end noticed.
     connection: iroh::endpoint::Connection,
+    /// Whether this peer's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
+    ///
+    /// A peer that did not must never be sent `MessageKind::MediaUnavailable`:
+    /// it speaks an older minor, where that discriminant does not exist, and
+    /// an undecodable frame closes the connection (§9.1). Always false on the
+    /// guest side, which never sends the message at all.
+    announces_media_faults: bool,
 }
 
 /// Host side: one running capture/encode loop, plus the connection it writes
@@ -681,6 +701,13 @@ struct ViewState {
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
+    /// The other end of `slot`, shared with the media task.
+    ///
+    /// Held here too because one thing the window has to show does not come
+    /// from the media pipeline at all: a host announcing it cannot produce a
+    /// picture says so on the *control* stream, which only the actor reads
+    /// (docs/adr/0024).
+    slot_tx: Arc<watch::Sender<ViewSlot>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -693,6 +720,8 @@ enum ActorEvent {
         connection: Box<ControlConnection>,
         peer: NodeId,
         ticket: InviteTicket,
+        /// Whether the guest's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
+        announces_media_faults: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -719,6 +748,8 @@ enum Accepted {
         connection: Box<ControlConnection>,
         peer: NodeId,
         ticket: Box<InviteTicket>,
+        /// Whether the guest's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
+        announces_media_faults: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -750,6 +781,13 @@ struct Actor {
     /// from the per-connection tasks.
     events_tx: mpsc::Sender<ActorEvent>,
     events_rx: mpsc::Receiver<ActorEvent>,
+    /// Encode loops report here when they cannot produce a picture at all.
+    /// Separate from `events_tx` so `crate::view` stays free of the actor's
+    /// own event type (§18, docs/adr/0024).
+    faults_tx: mpsc::Sender<MediaFault>,
+    faults_rx: mpsc::Receiver<MediaFault>,
+    /// What this host knows about its own ability to produce a picture.
+    health: Arc<MediaHealth>,
     notify: broadcast::Sender<ActorNotification>,
     /// Host side: the single "capture only with a viewer" gate of §8.1/§11,
     /// shared with every encode loop.
@@ -868,6 +906,11 @@ impl Actor {
                         self.handle_event(event);
                     }
                 }
+                fault = self.faults_rx.recv() => {
+                    if let Some((peer, reason)) = fault {
+                        self.on_media_fault(peer, reason);
+                    }
+                }
             }
         }
     }
@@ -934,6 +977,10 @@ impl Actor {
                     return None;
                 }
                 Some(Accepted::Control {
+                    announces_media_faults: hello
+                        .features
+                        .iter()
+                        .any(|feature| feature == FEATURE_MEDIA_UNAVAILABLE),
                     connection: Box::new(control),
                     peer,
                     ticket: Box::new(ticket),
@@ -952,9 +999,11 @@ impl Actor {
                     connection,
                     peer,
                     ticket,
+                    announces_media_faults,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
+                    announces_media_faults,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -973,7 +1022,7 @@ impl Actor {
     /// This is what makes a stored connection *live* rather than merely
     /// retained: without the reader, nothing would ever observe a
     /// `ConsentGrant` on the guest side or a closed stream on either side.
-    fn adopt(&mut self, connection: ControlConnection, peer: NodeId) {
+    fn adopt(&mut self, connection: ControlConnection, peer: NodeId, announces_media_faults: bool) {
         self.next_connection_id = self.next_connection_id.wrapping_add(1);
         let id = self.next_connection_id;
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
@@ -1026,6 +1075,7 @@ impl Actor {
                 id,
                 outbound: outbound_tx,
                 connection: quic,
+                announces_media_faults,
             },
         );
     }
@@ -1050,7 +1100,8 @@ impl Actor {
                 connection,
                 peer,
                 ticket,
-            } => self.on_handshaked(*connection, peer, &ticket),
+                announces_media_faults,
+            } => self.on_handshaked(*connection, peer, &ticket, announces_media_faults),
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
             ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
             ActorEvent::MediaAccepted { connection, peer } => {
@@ -1085,6 +1136,19 @@ impl Actor {
         if let Some(previous) = self.media.remove(&peer) {
             previous.stop();
         }
+        // §18: a host that cannot produce a picture says so, instead of
+        // accepting a media connection it will never write a frame on and
+        // leaving the guest to time the session out and blame the network
+        // (docs/adr/0024). Dropping `connection` here closes it.
+        if let Some(reason) = self.health.fault() {
+            tracing::warn!(
+                peer = %tag,
+                ?reason,
+                "refusing a media connection this host cannot feed"
+            );
+            self.announce_media_fault(peer, reason);
+            return;
+        }
         tracing::info!(peer = %tag, "media connection accepted; starting the encode loop");
         let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(None));
         let task = spawn_encode_loop(
@@ -1092,6 +1156,8 @@ impl Actor {
             Arc::clone(&self.capture),
             Arc::clone(&recorder),
             tag,
+            peer,
+            self.faults_tx.clone(),
         );
         self.media.insert(
             peer,
@@ -1101,6 +1167,66 @@ impl Actor {
                 recorder,
             },
         );
+    }
+
+    /// Host side: an encode loop found it cannot produce a picture at all.
+    ///
+    /// Recorded on this host first. A missing encoder is a property of the
+    /// machine, not of whichever peer happened to ask for it first, so the
+    /// operator's own status must keep saying so after this session ends.
+    fn on_media_fault(&mut self, peer: NodeId, reason: MediaUnavailableReason) {
+        self.health.record(reason);
+        // The loop has already returned; its media connection has nothing
+        // left to carry, and dropping the entry closes it.
+        self.media.remove(&peer);
+        self.announce_media_fault(peer, reason);
+    }
+
+    /// Host side: tells `peer` that this session will carry no picture, and
+    /// why — but only if its `Hello` said it understands the message (§9.1).
+    ///
+    /// A guest that did not is left exactly where it was before this existed:
+    /// a window that waits, and the reason in this host's log. Sending it
+    /// anyway would put a discriminant its minor does not know on the wire,
+    /// and an undecodable control frame closes the connection (§9.1) — a
+    /// strictly worse outcome than the missing picture.
+    fn announce_media_fault(&mut self, peer: NodeId, reason: MediaUnavailableReason) {
+        let announces = self
+            .connections
+            .get(&peer)
+            .is_some_and(|c| c.announces_media_faults);
+        if !announces {
+            tracing::debug!(
+                peer = %self.label_of(&peer),
+                ?reason,
+                "not announcing: this guest does not speak MediaUnavailable"
+            );
+            return;
+        }
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            ?reason,
+            "telling the guest this host cannot produce a picture"
+        );
+        self.send_to(&peer, MessageKind::MediaUnavailable(reason));
+    }
+
+    /// Guest side: the host says this session will never carry a picture.
+    ///
+    /// Not a revoke and not a failure of this connection: the control session
+    /// and every grant on it stay as they are, and the window stays open with
+    /// the real reason on it. What ends is the waiting — the receiver's
+    /// recovery pass has nothing to reconnect to, so it is stopped rather
+    /// than left to time out and report a connection that was never lost.
+    fn on_media_unavailable(&mut self, peer: NodeId, reason: MediaUnavailableReason) {
+        let tag = self.label_of(&peer);
+        let Some(state) = self.views.get(&peer) else {
+            return;
+        };
+        tracing::warn!(peer = %tag, ?reason, "the host cannot produce a picture for this session");
+        state.task.abort();
+        let status = ViewStatus::from(reason);
+        state.slot_tx.send_modify(|slot| slot.status = status);
     }
 
     /// Host side: stops sending video to `peer` and drops it as a viewer, which
@@ -1148,6 +1274,10 @@ impl Actor {
 
         let label = window_label(&tag);
         let (slot_tx, slot_rx) = watch::channel(ViewSlot::waiting());
+        // Shared rather than handed over: the media task writes pictures into
+        // it, and the actor writes the one status that does not come from the
+        // media pipeline at all (`MediaUnavailable`, docs/adr/0024).
+        let slot_tx = Arc::new(slot_tx);
         let task = spawn_media_receiver(
             MediaTarget {
                 endpoint: self.endpoint.clone(),
@@ -1155,7 +1285,7 @@ impl Actor {
                 tag: tag.clone(),
                 worker: None,
             },
-            slot_tx,
+            Arc::clone(&slot_tx),
         );
         self.views.insert(
             peer,
@@ -1164,6 +1294,7 @@ impl Actor {
                 role,
                 grants,
                 slot: slot_rx,
+                slot_tx,
                 task,
             },
         );
@@ -1264,6 +1395,7 @@ impl Actor {
         connection: ControlConnection,
         peer: NodeId,
         ticket: &InviteTicket,
+        announces_media_faults: bool,
     ) {
         let tag = self.label_of(&peer);
         // Single-use enforcement runs here, on the actor's own thread, so two
@@ -1286,7 +1418,7 @@ impl Actor {
             return;
         }
         tracing::info!(peer = %tag, "consent request queued");
-        self.adopt(connection, peer);
+        self.adopt(connection, peer, announces_media_faults);
         let _ = self.notify.send(ActorNotification::ConsentRequested);
         self.rebuild_labels_and_snapshot();
     }
@@ -1374,6 +1506,8 @@ impl Actor {
                     }
                 }
             }
+            // Guest side: the host announced it has no picture to send.
+            MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
             // Everything else belongs to a phase this build does not run yet.
             // Nothing a peer sends may ever grant itself consent (§2.3).
             ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
@@ -1752,14 +1886,22 @@ impl Actor {
         let peer = self.resolve(label)?;
         self.sessions.grant(peer, role).map_err(ActorError::Core)?;
         self.send_to(&peer, MessageKind::ConsentGrant(role));
-        if self.sessions.grants(&peer).is_some_and(|g| g.view)
-            && let Err(error) = lock_capture(&self.capture).add_viewer(peer)
-        {
-            tracing::warn!(
-                peer = %label,
-                %error,
-                "consent granted but this platform cannot capture"
-            );
+        if self.sessions.grants(&peer).is_some_and(|g| g.view) {
+            if let Err(error) = lock_capture(&self.capture).add_viewer(peer) {
+                tracing::warn!(
+                    peer = %label,
+                    %error,
+                    "consent granted but this platform cannot capture"
+                );
+            }
+            // Announced here rather than waiting for the guest's media dial:
+            // the guest opens its window on the `ConsentGrant` this function
+            // just queued, and the control stream is reliable and ordered, so
+            // the reason arrives as that window's first news instead of a
+            // reconnect window later (§18).
+            if let Some(reason) = self.health.fault() {
+                self.announce_media_fault(peer, reason);
+            }
         }
         tracing::info!(peer = %label, ?role, "consent granted");
         Ok(())
@@ -1832,8 +1974,12 @@ impl Actor {
             .map_err(ActorError::Net)?;
         let proof = postcard::to_allocvec(&ticket)
             .map_err(|_| ActorError::Net(NetError::MalformedTicket))?;
+        // The one feature this build advertises: it understands a host
+        // saying it cannot produce a picture. An older host ignores the
+        // string (§9.1) and simply never sends the message.
+        let features = vec![FEATURE_MEDIA_UNAVAILABLE.to_owned()];
         let control =
-            lumepeer_net::guest_handshake(connection, ticket.allowed_request, proof, Vec::new())
+            lumepeer_net::guest_handshake(connection, ticket.allowed_request, proof, features)
                 .await
                 .map_err(ActorError::Net)?;
         let peer = control.peer();
@@ -1846,7 +1992,9 @@ impl Actor {
         self.host_invites.insert(peer, raw.to_owned());
         self.connect_phase = ConnectPhase::AwaitingConsent;
         self.connect_peer = Some(peer);
-        self.adopt(control, peer);
+        // Guest side: this node is the one that *receives* `MediaUnavailable`,
+        // so there is no peer capability to remember here.
+        self.adopt(control, peer, false);
         Ok(())
     }
 }
@@ -1955,39 +2103,56 @@ fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     }
 }
 
-/// Builds the host's capture controller, falling back to a capturer that
-/// produces nothing when the platform has no backend compiled in.
+/// Builds the host's media side: the capture controller, plus whether this
+/// platform gave a capture backend at all.
 ///
 /// A missing backend must not stop the app from starting or from accepting a
-/// session: consent, input and the rest of the control channel work regardless,
-/// and the guest is told there is no picture rather than being disconnected
-/// (§18).
+/// session: consent, input and the rest of the control channel work regardless
+/// (§18). What it must not do either is stay a log line — the fallback
+/// capturer produces nothing forever, which is exactly the silent degradation
+/// §18 forbids. So the absence is recorded in [`MediaHealth`], where this
+/// host's own status screen and the guest's `MediaUnavailable` both read it
+/// (docs/adr/0024).
 #[must_use]
-pub fn default_capture() -> SharedCapture {
-    let capturer = platform_capturer().unwrap_or_else(|error| {
-        tracing::warn!(%error, "no capture backend on this platform: sessions stay blank");
-        Box::new(StubCapturer::default())
-    });
-    Arc::new(std::sync::Mutex::new(CaptureController::new(
-        capturer,
-        CaptureTarget::PrimaryDisplay,
-    )))
+pub fn default_capture() -> HostMedia {
+    fn controller(capturer: Box<dyn lumepeer_media::capture::ScreenCapturer>) -> SharedCapture {
+        Arc::new(std::sync::Mutex::new(CaptureController::new(
+            capturer,
+            CaptureTarget::PrimaryDisplay,
+        )))
+    }
+
+    match platform_capturer() {
+        Ok(capturer) => HostMedia {
+            capture: controller(capturer),
+            health: Arc::new(MediaHealth::healthy()),
+        },
+        Err(error) => {
+            tracing::warn!(%error, "no capture backend on this platform: sessions stay blank");
+            HostMedia {
+                capture: controller(Box::new(StubCapturer::default())),
+                health: Arc::new(MediaHealth::without_capture()),
+            }
+        }
+    }
 }
 
 /// Spawns the actor over an already bound endpoint. Split out of
 /// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
-/// relay or a Tauri window: `windows` and `capture` are the two seams that
+/// relay or a Tauri window: `windows` and `media` are the two seams that
 /// would otherwise need one.
 #[must_use]
 pub fn spawn_actor_with(
     endpoint: PeerEndpoint,
     identity: SigningKey,
     windows: Arc<dyn ViewWindows>,
-    capture: SharedCapture,
+    media: HostMedia,
     history_path: Option<std::path::PathBuf>,
 ) -> ActorHandle {
+    let HostMedia { capture, health } = media;
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
+    let (faults_tx, faults_rx) = mpsc::channel(8);
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
@@ -2004,6 +2169,9 @@ pub fn spawn_actor_with(
         handshake_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
         events_tx,
         events_rx,
+        faults_tx,
+        faults_rx,
+        health: Arc::clone(&health),
         notify: notify.clone(),
         capture,
         media: std::collections::HashMap::new(),
@@ -2026,6 +2194,7 @@ pub fn spawn_actor_with(
         tx,
         notify,
         online: Arc::new(AtomicBool::new(false)),
+        health,
     }
 }
 
@@ -2086,6 +2255,15 @@ mod tests {
         )))
     }
 
+    /// A host that has a capture backend, like every machine the other tests
+    /// pretend to run on.
+    fn test_media(capture: &SharedCapture) -> HostMedia {
+        HostMedia {
+            capture: Arc::clone(capture),
+            health: Arc::new(MediaHealth::healthy()),
+        }
+    }
+
     /// [`ViewWindows`] that records what the actor asked for, so the guest side
     /// of a grant can be asserted without a Tauri runtime.
     #[derive(Debug, Default)]
@@ -2131,18 +2309,23 @@ mod tests {
         SharedCapture,
         Arc<dyn ViewWindows>,
     ) {
+        let capture = test_capture();
+        let media = test_media(&capture);
+        let (handle, endpoint) = actor_with_media(Arc::clone(&windows), media).await;
+        (handle, endpoint, capture, windows)
+    }
+
+    /// The seam every actor in these tests is built through: `media` is what
+    /// decides whether this host believes it can produce a picture at all.
+    async fn actor_with_media(
+        windows: Arc<dyn ViewWindows>,
+        media: HostMedia,
+    ) -> (ActorHandle, PeerEndpoint) {
         let secret = iroh::SecretKey::generate();
         let identity = SigningKey::from_bytes(&secret.to_bytes());
         let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
-        let capture = test_capture();
-        let handle = spawn_actor_with(
-            endpoint.clone(),
-            identity,
-            Arc::clone(&windows),
-            Arc::clone(&capture),
-            None,
-        );
-        (handle, endpoint, capture, windows)
+        let handle = spawn_actor_with(endpoint.clone(), identity, windows, media, None);
+        (handle, endpoint)
     }
 
     /// Polls until `predicate` holds, or fails the test.
@@ -2652,6 +2835,73 @@ mod tests {
             guest.view_frame(peer_label, 0).await,
             Err(ActorError::UnknownPeer)
         ));
+    }
+
+    /// §18, docs/adr/0024: a host with no capture backend must say so, on the
+    /// wire and on its own status, instead of leaving the guest to sit out the
+    /// reconnect window and then be told the connection failed.
+    ///
+    /// The session itself is untouched: this is not a revoke.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_host_with_no_capture_backend_tells_the_guest_why() {
+        let capture = test_capture();
+        let (host, _host_endpoint) = actor_with_media(
+            Arc::new(DetachedViewWindows),
+            HostMedia {
+                capture: Arc::clone(&capture),
+                health: Arc::new(MediaHealth::without_capture()),
+            },
+        )
+        .await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, _input) = recorder.opened().remove(0);
+
+        // Well inside `RECONNECT_WINDOW_SECS`, which is what the guest used to
+        // spend waiting before being told the wrong thing.
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let frame = guest.view_frame(peer_label.clone(), 0).await.unwrap();
+            if frame[0] == ViewStatus::NoCapture.code() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guest was never told why there is no picture (status {})",
+                frame[0]
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Not a revoke: the grant, the session and the viewer registration all
+        // stand, and the guest can still drive the session it was given.
+        let rows = host.status().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r.state == SessionStateDto::Active),
+            "announcing a missing backend must not end the session"
+        );
+        assert_eq!(viewers(&capture), 1);
+
+        // The operator's own screen says it too, before anyone else reports it.
+        assert!(!host.media_health().can_capture());
+        assert!(host.media_health().can_encode());
+        assert!(
+            guest.media_health().can_capture(),
+            "the fault belongs to the host that has it, not to whoever heard about it"
+        );
     }
 
     /// A `ViewOnly` session must not be able to forward input, and the guest

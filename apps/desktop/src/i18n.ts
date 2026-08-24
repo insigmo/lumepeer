@@ -38,6 +38,8 @@ export type TranslationKey =
   | 'status.role.fullControl'
   | 'status.ready'
   | 'status.notReady'
+  | 'status.noCapture'
+  | 'status.noEncoder'
   | 'titlebar.minimize'
   | 'titlebar.maximize'
   | 'titlebar.close'
@@ -57,6 +59,10 @@ export type TranslationKey =
   | 'view.failed.title'
   | 'view.failed.body'
   | 'view.failed.dismiss'
+  | 'view.unavailable.title'
+  | 'view.unavailable.noCapture'
+  | 'view.unavailable.noEncoder'
+  | 'view.unavailable.dismiss'
   | 'chat.logLabel'
   | 'chat.inputLabel'
   | 'chat.inputPlaceholder'
@@ -97,6 +103,10 @@ const en: Dictionary = {
   'status.role.fullControl': 'full control',
   'status.ready': 'Ready to connect',
   'status.notReady': 'Not ready to connect',
+  'status.noCapture':
+    'This device has no screen capture support, so anyone you invite will see nothing. Sessions still connect, and input still works.',
+  'status.noEncoder':
+    'This device has no video encoder, so anyone you invite will see nothing. Sessions still connect, and input still works.',
   'titlebar.minimize': 'Minimize',
   'titlebar.maximize': 'Maximize',
   'titlebar.close': 'Close',
@@ -116,6 +126,12 @@ const en: Dictionary = {
   'view.failed.title': 'Connection lost',
   'view.failed.body': 'The remote screen could not be reconnected, so the session has ended.',
   'view.failed.dismiss': 'Close',
+  'view.unavailable.title': 'No picture from this device',
+  'view.unavailable.noCapture':
+    'The other device has no screen capture support, so it cannot send its screen. The connection itself is fine.',
+  'view.unavailable.noEncoder':
+    'The other device has no video encoder, so it cannot send its screen. The connection itself is fine.',
+  'view.unavailable.dismiss': 'Close',
   'chat.logLabel': 'Chat',
   'chat.inputLabel': 'Chat message',
   'chat.inputPlaceholder': 'Type a message…',
@@ -155,6 +171,10 @@ const ar: Dictionary = {
   'status.role.fullControl': 'تحكم كامل',
   'status.ready': 'جاهز للاتصال',
   'status.notReady': 'غير جاهز للاتصال',
+  'status.noCapture':
+    'لا يدعم هذا الجهاز التقاط الشاشة، لذلك لن يرى من تدعوه أي صورة. تظل الجلسات تتصل ويظل الإدخال يعمل.',
+  'status.noEncoder':
+    'لا يوجد في هذا الجهاز مُرمِّز فيديو، لذلك لن يرى من تدعوه أي صورة. تظل الجلسات تتصل ويظل الإدخال يعمل.',
   'titlebar.minimize': 'تصغير',
   'titlebar.maximize': 'تكبير',
   'titlebar.close': 'إغلاق',
@@ -174,6 +194,12 @@ const ar: Dictionary = {
   'view.failed.title': 'انقطع الاتصال',
   'view.failed.body': 'تعذّرت إعادة الاتصال بالشاشة البعيدة، لذلك انتهت الجلسة.',
   'view.failed.dismiss': 'إغلاق',
+  'view.unavailable.title': 'لا توجد صورة من هذا الجهاز',
+  'view.unavailable.noCapture':
+    'لا يدعم الجهاز الآخر التقاط الشاشة، لذلك لا يمكنه إرسال شاشته. الاتصال نفسه سليم.',
+  'view.unavailable.noEncoder':
+    'لا يوجد في الجهاز الآخر مُرمِّز فيديو، لذلك لا يمكنه إرسال شاشته. الاتصال نفسه سليم.',
+  'view.unavailable.dismiss': 'إغلاق',
   'chat.logLabel': 'المحادثة',
   'chat.inputLabel': 'رسالة المحادثة',
   'chat.inputPlaceholder': 'اكتب رسالة…',

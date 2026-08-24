@@ -24,17 +24,19 @@ use std::time::{Duration, Instant};
 
 use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
+use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     AUDIO_MAX_FRAME_BYTES, ENCODE_DEFAULT_FPS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
     RECONNECT_WINDOW_SECS,
 };
+use lumepeer_core::protocol::MediaUnavailableReason;
 use lumepeer_media::abr::{AbrController, ReceiverFeedback};
 use lumepeer_media::capture::CaptureController;
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
 use lumepeer_media::scale::fit_within_budget;
 use lumepeer_net::{PeerEndpoint, accept_media_stream, open_media_stream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 /// Milliseconds in a second, for turning `ENCODE_DEFAULT_FPS` into a delay.
@@ -60,6 +62,105 @@ pub fn lock_capture(capture: &SharedCapture) -> MutexGuard<'_, CaptureController
         poisoned.into_inner()
     })
 }
+
+/// What this host can actually do about producing a picture, as far as it
+/// knows so far (§18: a missing backend is announced, not silently degraded
+/// into a screen that stays blank forever).
+///
+/// Two facts with two different lifetimes. Whether a capture backend exists
+/// is settled at startup by what this build was compiled with and what
+/// platform it runs on, so it is known before anyone connects. An encoder, by
+/// contrast, is only ever built inside a session, so its absence can only be
+/// learned the first time a guest asks for one — until then `can_encode` is
+/// the honest "nothing has said otherwise yet".
+///
+/// Read by the `network_status` IPC command: the operator who is about to
+/// share their screen finds out on their own machine, instead of the guest
+/// discovering it a reconnect window later as a generic "connection lost".
+#[derive(Debug, Default)]
+pub struct MediaHealth {
+    capture_missing: AtomicBool,
+    encoder_missing: AtomicBool,
+}
+
+impl MediaHealth {
+    /// Health of a host that has a capture backend and has not yet had an
+    /// encoder fail on it.
+    #[must_use]
+    pub fn healthy() -> Self {
+        Self::default()
+    }
+
+    /// Health of a host whose platform gave no capture backend at all.
+    #[must_use]
+    pub fn without_capture() -> Self {
+        Self {
+            capture_missing: AtomicBool::new(true),
+            encoder_missing: AtomicBool::new(false),
+        }
+    }
+
+    /// Records a fault a session just ran into.
+    pub fn record(&self, reason: MediaUnavailableReason) {
+        match reason {
+            MediaUnavailableReason::NoCaptureBackend => {
+                self.capture_missing.store(true, Ordering::Relaxed);
+            }
+            MediaUnavailableReason::NoEncoder => {
+                self.encoder_missing.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Whether this host has a screen-capture backend.
+    #[must_use]
+    pub fn can_capture(&self) -> bool {
+        !self.capture_missing.load(Ordering::Relaxed)
+    }
+
+    /// Whether this host has, as far as it has been asked, a video encoder.
+    #[must_use]
+    pub fn can_encode(&self) -> bool {
+        !self.encoder_missing.load(Ordering::Relaxed)
+    }
+
+    /// The reason to announce, if this host cannot produce a picture.
+    ///
+    /// Capture first: with no backend the encoder is never even reached, so
+    /// reporting the encoder there would name the wrong cause.
+    #[must_use]
+    pub fn fault(&self) -> Option<MediaUnavailableReason> {
+        if !self.can_capture() {
+            Some(MediaUnavailableReason::NoCaptureBackend)
+        } else if !self.can_encode() {
+            Some(MediaUnavailableReason::NoEncoder)
+        } else {
+            None
+        }
+    }
+}
+
+/// The host's media side as one value: the shared capture controller, and
+/// what is known about whether this machine can produce a picture at all.
+///
+/// They travel together because they are decided together — the same
+/// `platform_capturer()` call that picks the controller's backend is what
+/// tells the host it has none.
+#[derive(Debug, Clone)]
+pub struct HostMedia {
+    /// Controller every encode loop pulls frames from.
+    pub capture: SharedCapture,
+    /// What this host knows about its own ability to produce a picture.
+    pub health: Arc<MediaHealth>,
+}
+
+/// What an encode loop reports back when it cannot produce a picture at all.
+///
+/// The loop holds only the peer's `rd/media/1` connection; the control stream
+/// that has to carry `MediaUnavailable` belongs to the actor, and so does the
+/// decision about whether that peer speaks the message at all. So the fault
+/// travels back to the actor rather than being written from here.
+pub type MediaFault = (NodeId, MediaUnavailableReason);
 
 /// Bytes of the per-frame header on the media wire: keyframe flag plus the
 /// capture timestamp the decoder copies back onto the picture.
@@ -109,17 +210,42 @@ pub enum ViewStatus {
     Reconnecting,
     /// The recovery pass elapsed without a frame. Terminal.
     Failed,
+    /// The host said it has no screen-capture backend, so this session will
+    /// never carry a picture. Terminal, and distinct from `Failed`: nothing
+    /// was lost and nothing is worth retrying (§18).
+    NoCapture,
+    /// The host said it has no video encoder. Terminal, same as `NoCapture`.
+    NoEncoder,
+}
+
+impl From<MediaUnavailableReason> for ViewStatus {
+    fn from(reason: MediaUnavailableReason) -> Self {
+        match reason {
+            MediaUnavailableReason::NoCaptureBackend => Self::NoCapture,
+            MediaUnavailableReason::NoEncoder => Self::NoEncoder,
+        }
+    }
 }
 
 impl ViewStatus {
     /// Wire value carried in the first byte of the IPC frame response.
-    const fn code(self) -> u8 {
+    #[must_use]
+    pub const fn code(self) -> u8 {
         match self {
             Self::Waiting => 0,
             Self::Live => 1,
             Self::Reconnecting => 2,
             Self::Failed => 3,
+            Self::NoCapture => 4,
+            Self::NoEncoder => 5,
         }
+    }
+
+    /// Whether the pipeline behind this status has stopped for good, so the
+    /// guest has nothing left to wait for.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Failed | Self::NoCapture | Self::NoEncoder)
     }
 }
 
@@ -320,6 +446,8 @@ pub fn spawn_encode_loop(
     capture: SharedCapture,
     recorder: SharedRecorder,
     tag: String,
+    peer: NodeId,
+    faults: mpsc::Sender<MediaFault>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut writer = match open_media_stream(&connection).await {
@@ -332,10 +460,14 @@ pub fn spawn_encode_loop(
         let mut encoder = match select_encoder(EncoderConfig::default()) {
             Ok(encoder) => encoder,
             Err(error) => {
-                // §18: no silent degradation. The guest keeps its window and
-                // its "waiting for the first frame" state, and the log says
-                // why no frame will ever come.
+                // §18: no silent degradation. The log alone was not enough —
+                // it left the guest waiting out the whole reconnect window for
+                // a frame that could never come, and then blaming the
+                // connection. The fault goes back to the actor, which tells
+                // both this host's own UI and the guest what is actually
+                // wrong (docs/adr/0024).
                 tracing::warn!(peer = %tag, %error, "no encoder available: this session stays blank");
+                let _ = faults.send((peer, MediaUnavailableReason::NoEncoder)).await;
                 return;
             }
         };
@@ -488,7 +620,10 @@ pub struct MediaTarget {
 /// one-shot allowance rather than a lifetime total. Before the first frame
 /// ever arrives, a failed pass keeps the slot `Waiting` instead of
 /// `Reconnecting`: nothing was connected yet, so nothing was lost.
-pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) -> JoinHandle<()> {
+pub fn spawn_media_receiver(
+    target: MediaTarget,
+    slot: Arc<watch::Sender<ViewSlot>>,
+) -> JoinHandle<()> {
     // Guest-side audio (§11, questions.md item 9): one receiver per media
     // loop. It owns the Opus decoder and publishes decoded PCM on its own
     // channel; the playback device drains it in the view window process.
@@ -551,7 +686,11 @@ pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) 
 /// Replaces the slot's status, keeping whatever picture is already there so a
 /// "reconnecting" state stays non-blocking over the last frame.
 fn set_status(slot: &watch::Sender<ViewSlot>, status: ViewStatus) {
-    slot.send_modify(|current| current.status = status);
+    slot.send_modify(|current| {
+        if !current.status.is_terminal() {
+            current.status = status;
+        }
+    });
 }
 
 /// One media attempt: dial, decode until something fails.
@@ -954,7 +1093,7 @@ mod tests {
                 tag: "test-peer".to_owned(),
                 worker: None,
             },
-            slot_tx,
+            Arc::new(slot_tx),
         );
 
         // Comfortably longer than the audio dial's own head start: it used to
@@ -1101,6 +1240,72 @@ mod tests {
         let interval = Duration::from_millis(100);
         let feedback = write_congestion_feedback(Duration::from_millis(150), interval, 1_000);
         assert!((feedback.loss - 0.5).abs() < 0.01);
+    }
+
+    /// §18, docs/adr/0024: the two "no picture" states are their own terminal
+    /// statuses, so the window can say the connection is fine and the host
+    /// cannot send a picture — instead of `Failed`, which says the opposite.
+    #[test]
+    fn a_host_fault_maps_to_its_own_terminal_status() {
+        assert_eq!(
+            ViewStatus::from(MediaUnavailableReason::NoCaptureBackend),
+            ViewStatus::NoCapture
+        );
+        assert_eq!(
+            ViewStatus::from(MediaUnavailableReason::NoEncoder),
+            ViewStatus::NoEncoder
+        );
+        assert_eq!(ViewStatus::NoCapture.code(), 4);
+        assert_eq!(ViewStatus::NoEncoder.code(), 5);
+        assert!(ViewStatus::NoCapture.is_terminal());
+        assert!(ViewStatus::NoEncoder.is_terminal());
+        assert!(ViewStatus::Failed.is_terminal());
+        assert!(!ViewStatus::Waiting.is_terminal());
+        assert!(!ViewStatus::Reconnecting.is_terminal());
+        assert!(!ViewStatus::Live.is_terminal());
+    }
+
+    /// The actor writes the host's reason into the slot and then aborts the
+    /// media task; an abort only lands at the next await, so the task's
+    /// wind-down must not be able to paint over that reason.
+    #[test]
+    fn a_terminal_status_survives_the_media_task_winding_down() {
+        let (slot, _rx) = watch::channel(ViewSlot::waiting());
+        slot.send_modify(|current| current.status = ViewStatus::NoEncoder);
+
+        set_status(&slot, ViewStatus::Reconnecting);
+        assert_eq!(slot.borrow().status, ViewStatus::NoEncoder);
+        set_status(&slot, ViewStatus::Failed);
+        assert_eq!(slot.borrow().status, ViewStatus::NoEncoder);
+    }
+
+    /// A host reports what it knows: the capture backend at startup, the
+    /// encoder only once a session has actually asked for one.
+    #[test]
+    fn media_health_reports_the_fault_that_comes_first() {
+        let healthy = MediaHealth::healthy();
+        assert!(healthy.can_capture());
+        assert!(healthy.can_encode());
+        assert_eq!(healthy.fault(), None);
+
+        healthy.record(MediaUnavailableReason::NoEncoder);
+        assert!(healthy.can_capture());
+        assert!(!healthy.can_encode());
+        assert_eq!(healthy.fault(), Some(MediaUnavailableReason::NoEncoder));
+
+        let blind = MediaHealth::without_capture();
+        assert!(!blind.can_capture());
+        assert_eq!(
+            blind.fault(),
+            Some(MediaUnavailableReason::NoCaptureBackend)
+        );
+        // With no backend the encoder is never reached, so a stray encoder
+        // fault must not become the reason the guest is given.
+        blind.record(MediaUnavailableReason::NoEncoder);
+        assert_eq!(
+            blind.fault(),
+            Some(MediaUnavailableReason::NoCaptureBackend)
+        );
     }
 
     #[test]

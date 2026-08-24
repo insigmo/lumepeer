@@ -17,9 +17,27 @@ import { t } from './i18n';
 
 /// Pipeline health as reported in the first byte of a `view_next_frame`
 /// response.
-export type ViewStatus = 'waiting' | 'live' | 'reconnecting' | 'failed';
+///
+/// `no-capture` and `no-encoder` are the host saying it cannot produce a
+/// picture at all — a different thing from `failed`, which is a connection
+/// that was lost. Nothing was lost in those two, and nothing is worth
+/// retrying, so the window says so instead of blaming the network.
+export type ViewStatus =
+  | 'waiting'
+  | 'live'
+  | 'reconnecting'
+  | 'failed'
+  | 'no-capture'
+  | 'no-encoder';
 
-const STATUS_BY_CODE: readonly ViewStatus[] = ['waiting', 'live', 'reconnecting', 'failed'];
+const STATUS_BY_CODE: readonly ViewStatus[] = [
+  'waiting',
+  'live',
+  'reconnecting',
+  'failed',
+  'no-capture',
+  'no-encoder',
+];
 
 /** Bytes of the fixed header every `view_next_frame` response carries. */
 export const VIEW_RESPONSE_HEADER_BYTES = 18;
@@ -267,24 +285,50 @@ function clampDelta(value: number): number {
  * Status overlay of the view window.
  *
  * `waiting` and `reconnecting` are inline and non-blocking — the last picture
- * stays visible underneath, because neither is a revoke. `failed` is the one
- * terminal state and is the modal the connection-health policy calls for: the
- * only way out of it is ending the session, which is what closing the window
+ * stays visible underneath, because neither is a revoke. The terminal states
+ * are modals, which is what the connection-health policy calls for: the only
+ * way out of one is ending the session, which is what closing the window
  * already means.
+ *
+ * The two "no picture" states get their own text rather than reusing
+ * `failed`: telling someone the connection was lost when the host simply has
+ * no capture backend sends them to debug a network that is working fine.
  */
 export function viewOverlay(status: ViewStatus, locale: Locale, onDismiss: () => void): TemplateResult {
   if (status === 'live') {
     return html``;
   }
   if (status === 'failed') {
-    return html`
-      <div class="view-modal" role="alertdialog" aria-modal="true" aria-labelledby="view-error-title">
-        <h2 id="view-error-title">${t(locale, 'view.failed.title')}</h2>
-        <p>${t(locale, 'view.failed.body')}</p>
-        <button type="button" autofocus @click=${onDismiss}>${t(locale, 'view.failed.dismiss')}</button>
-      </div>
-    `;
+    return terminalModal(
+      t(locale, 'view.failed.title'),
+      t(locale, 'view.failed.body'),
+      t(locale, 'view.failed.dismiss'),
+      onDismiss,
+    );
+  }
+  if (status === 'no-capture' || status === 'no-encoder') {
+    return terminalModal(
+      t(locale, 'view.unavailable.title'),
+      t(locale, status === 'no-capture' ? 'view.unavailable.noCapture' : 'view.unavailable.noEncoder'),
+      t(locale, 'view.unavailable.dismiss'),
+      onDismiss,
+    );
   }
   const key = status === 'waiting' ? 'view.waiting' : 'view.reconnecting';
   return html`<p class="view-banner" role="status" aria-live="polite">${t(locale, key)}</p>`;
+}
+
+function terminalModal(
+  title: string,
+  body: string,
+  dismiss: string,
+  onDismiss: () => void,
+): TemplateResult {
+  return html`
+    <div class="view-modal" role="alertdialog" aria-modal="true" aria-labelledby="view-error-title">
+      <h2 id="view-error-title">${title}</h2>
+      <p>${body}</p>
+      <button type="button" autofocus @click=${onDismiss}>${dismiss}</button>
+    </div>
+  `;
 }

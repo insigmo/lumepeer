@@ -7,7 +7,9 @@ Design doc §17.2. Holds the protocol golden vectors: valid and invalid
 ## Golden vectors
 
 `golden_vectors.txt` holds frozen wire encodings of `MessageEnvelope` for
-`PROTOCOL_MAJOR` 1 / `PROTOCOL_MINOR` 0, plus inputs that must stay rejected.
+`PROTOCOL_MAJOR` 1 / `PROTOCOL_MINOR` 2, plus inputs that must stay rejected.
+Vectors from earlier minors are still there byte for byte: each minor appended
+its new kinds as the last enum variants, so no existing discriminant moved.
 `tests/integration/tests/protocol_golden.rs` checks that every valid vector
 still parses and re-encodes to the same bytes, and that every invalid one is
 still refused.

@@ -49,3 +49,9 @@ valid minor1_file_abort abababababababababababababababab00001c0700
 valid minor1_file_chunk_ack abababababababababababababababab00001d07802000
 invalid trailing_garbage abababababababababababababababab000001010000ff
 invalid bad_direction_byte abababababababababababababababab0700010100
+
+# --- Frozen for PROTOCOL_MINOR 2: the host telling a guest that this session
+# --- will never carry a picture (docs/adr/0024). Host to guest only, and only
+# --- to a guest whose Hello advertised the "media-unavailable" feature string.
+valid minor2_media_unavailable_no_capture abababababababababababababababab00001e0000
+valid minor2_media_unavailable_no_encoder abababababababababababababababab00001e0100
