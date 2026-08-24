@@ -78,6 +78,10 @@ mod dxgi {
         DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME, DXGI_OUTPUT_DESC, IDXGIAdapter1, IDXGIFactory1,
         IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW,
+        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, SRCCOPY, SelectObject,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
@@ -87,7 +91,7 @@ mod dxgi {
         VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT,
         VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
     };
-    use windows::core::Interface as _;
+    use windows::core::{Interface as _, PCWSTR};
 
     use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
 
@@ -114,6 +118,91 @@ mod dxgi {
     /// this is a real wait rather than a poll interval.
     fn acquire_timeout_ms() -> u32 {
         MILLIS_PER_SEC / u32::from(ENCODE_DEFAULT_FPS.max(1))
+    }
+
+    /// One GDI `BitBlt` of the monitor named by a DXGI `DeviceName`
+    /// (`\\.\DISPLAY1` and friends) into a tightly packed BGRA8 buffer.
+    ///
+    /// This is the "give a freshly attached viewer something real" path: it
+    /// reads whatever is on screen right now, with no dependence on presents,
+    /// which is exactly what Desktop Duplication cannot do before its first
+    /// real one. It runs once per duplication, on the frame clock, so the
+    /// extra copy is amortized to nothing.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureInterrupted`] if any GDI step fails; the encode
+    /// loop treats that like any other capture error and retries from a
+    /// fresh duplication.
+    fn gdi_snapshot(device_name: &[u16; 32], width: i32, height: i32) -> Result<Vec<u8>> {
+        // SAFETY: every call below takes plain values or owns what it
+        // creates; the DCs and bitmap are released on every exit path via
+        // `DeleteDC`/`DeleteObject`, and `SelectObject`'s return value is
+        // deliberately left selected — the DC dies immediately afterwards.
+        unsafe {
+            let dc = CreateDCW(
+                PCWSTR::null(),
+                PCWSTR(device_name.as_ptr()),
+                PCWSTR::null(),
+                None,
+            );
+            if dc.is_invalid() {
+                return Err(MediaError::CaptureInterrupted(
+                    "GDI could not open a DC for this display".to_owned(),
+                ));
+            }
+
+            let bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>())
+                        .unwrap_or(u32::MAX),
+                    biWidth: width,
+                    // A negative height asks for top-down rows, which is the
+                    // order both Desktop Duplication and the wire format use;
+                    // bottom-up GDI order would ship the picture flipped.
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let section = CreateDIBSection(
+                Some(dc),
+                core::ptr::from_ref(&bi),
+                DIB_RGB_COLORS,
+                &raw mut bits,
+                None,
+                0,
+            )
+            .map_err(|e| MediaError::CaptureInterrupted(format!("CreateDIBSection failed: {e}")))?;
+            let memory_dc = CreateCompatibleDC(Some(dc));
+            let old = SelectObject(memory_dc, section.into());
+
+            let blitted = BitBlt(memory_dc, 0, 0, width, height, Some(dc), 0, 0, SRCCOPY).is_ok();
+
+            let bytes = usize::try_from(width).unwrap_or(0)
+                * usize::try_from(height).unwrap_or(0)
+                * BYTES_PER_PIXEL;
+            let data = if blitted && !bits.is_null() {
+                Some(std::slice::from_raw_parts(bits.cast::<u8>(), bytes).to_vec())
+            } else {
+                None
+            };
+
+            SelectObject(memory_dc, old);
+            let _ = DeleteObject(section.into());
+            let _ = DeleteDC(memory_dc);
+            let _ = DeleteDC(dc);
+
+            match data {
+                Some(data) => Ok(data),
+                None => Err(MediaError::CaptureInterrupted(
+                    "the GDI snapshot BitBlt failed".to_owned(),
+                )),
+            }
+        }
     }
 
     /// One attached monitor, with the adapter that drives it.
@@ -277,6 +366,19 @@ mod dxgi {
         /// redraw the cursor at its new spot without leaving a trail of
         /// previous positions baked into the picture.
         last_frame_data: Option<Vec<u8>>,
+        /// The DXGI `DeviceName` of the duplicated monitor
+        /// (`\\.\DISPLAY1` and friends), so the one-shot first-frame GDI
+        /// snapshot can address the same display Desktop Duplication was
+        /// opened for.
+        device_name: [u16; 32],
+        /// Whether no frame has been handed out yet. Desktop Duplication's
+        /// surface is uninitialized garbage until its first real present
+        /// (ADR 0012), but a freshly attached viewer must see *something*
+        /// immediately — a static desktop may not present again for minutes.
+        /// The very first `next_frame` therefore answers with a plain GDI
+        /// snapshot instead; from the second frame on, duplication alone
+        /// drives delivery (§11.1).
+        awaiting_first_frame: bool,
         started_at: Instant,
     }
 
@@ -343,7 +445,19 @@ mod dxgi {
 
             // SAFETY: GetDesc returns the duplication's description by value
             // and reads nothing this side owns.
-            let mode = unsafe { duplication.GetDesc() }.ModeDesc;
+            let desc = unsafe { duplication.GetDesc() };
+            let mode = desc.ModeDesc;
+            // The GDI first-frame snapshot has to address the same display
+            // this duplication was opened for; the duplication description
+            // does not carry a device name, but the output's own does.
+            //
+            // SAFETY: GetDesc returns the output's description by value; it
+            // reads nothing this side owns.
+            let output_desc = unsafe { monitor.output.GetDesc() }.map_err(|e| {
+                MediaError::CaptureUnavailable(format!(
+                    "the duplicated display reported no description: {e}"
+                ))
+            })?;
             // The mode size is only a starting point: a rotated desktop and a
             // resolution change both show up in the acquired texture's own
             // description, which `frame_from` re-reads every frame and which
@@ -359,12 +473,31 @@ mod dxgi {
                 pointer_shape: None,
                 pointer_position: None,
                 last_frame_data: None,
+                device_name: output_desc.DeviceName,
+                awaiting_first_frame: true,
                 started_at: Instant::now(),
             })
         }
 
         /// One `AcquireNextFrame`/`ReleaseFrame` cycle.
         fn next_frame(&mut self) -> Result<Option<Frame>> {
+            // The very first frame a viewer sees must be the screen as it is
+            // *now*, not whenever the desktop next happens to present (a
+            // static desktop may not present for minutes, and ADR 0012 rules
+            // out trusting the uninitialized pre-present surface). One GDI
+            // snapshot answers that; from here on duplication drives
+            // delivery.
+            if self.awaiting_first_frame {
+                let data = gdi_snapshot(
+                    &self.device_name,
+                    self.staging.width.cast_signed(),
+                    self.staging.height.cast_signed(),
+                )?;
+                self.last_frame_data = Some(data.clone());
+                self.awaiting_first_frame = false;
+                return Ok(self.finish_frame(data));
+            }
+
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             // SAFETY: both out-parameters are locals that outlive the call.
@@ -1333,23 +1466,14 @@ mod dxgi {
                 return;
             }
 
-            // A completely static desktop legitimately presents nothing, so
-            // poll for a bounded while rather than demanding the first call
-            // produce a frame.
-            let mut frame = None;
-            for _ in 0..POLL_ATTEMPTS {
-                match capturer.next_frame() {
-                    Ok(Some(f)) => {
-                        frame = Some(f);
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(e) => panic!("capture failed on a live desktop: {e}"),
-                }
-            }
-            let Some(frame) = frame else {
-                eprintln!("skipping: this desktop presented nothing while the test ran");
-                return;
+            // The first frame is the contract this backend exists to keep:
+            // whatever the desktop's present clock is doing, a freshly started
+            // capturer answers with the screen as it is right now (the GDI
+            // snapshot path), never with "nothing changed yet".
+            let frame = match capturer.next_frame() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => panic!("the first frame after start cannot be a duplicate"),
+                Err(e) => panic!("capture failed on a live desktop: {e}"),
             };
 
             assert!(frame.width > 0 && frame.height > 0);
