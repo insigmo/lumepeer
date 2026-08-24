@@ -181,7 +181,10 @@ pub mod windows;
 /// Kept as an inline module so the file list of §6 stays exact.
 #[cfg(feature = "encode-openh264")]
 pub mod software {
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig as H264Config, FrameRate, FrameType};
+    use lumepeer_core::constants::ENCODE_MAX_SOFTWARE_THREADS;
+    use openh264::encoder::{
+        BitRate, Complexity, Encoder, EncoderConfig as H264Config, FrameRate, FrameType, UsageType,
+    };
     use openh264::formats::{BgraSliceU8, YUVBuffer};
 
     use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoEncoder};
@@ -190,6 +193,19 @@ pub mod software {
 
     /// Bits per kilobit, for the kbps of §14 against the bps of the codec API.
     const BITS_PER_KBIT: u32 = 1000;
+
+    /// Encoder threads to ask for: what the machine has, capped by
+    /// [`ENCODE_MAX_SOFTWARE_THREADS`] (§14).
+    ///
+    /// Never 0, which openh264 reads as "decide for me" and which in practice
+    /// left the encoder single-threaded on a machine with plenty of cores —
+    /// the difference between a usable picture and a slideshow on a host with
+    /// no hardware encoder (ADR 0027).
+    fn software_threads() -> u16 {
+        let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let available = u16::try_from(available).unwrap_or(u16::MAX);
+        available.clamp(1, ENCODE_MAX_SOFTWARE_THREADS)
+    }
 
     /// H.264 encoder backed by Cisco's `openh264`.
     pub struct OpenH264Encoder {
@@ -222,14 +238,32 @@ pub mod software {
                 .bitrate(BitRate::from_bps(
                     config.bitrate_kbps.saturating_mul(BITS_PER_KBIT),
                 ))
-                .max_frame_rate(FrameRate::from_hz(f32::from(config.fps)));
+                .max_frame_rate(FrameRate::from_hz(f32::from(config.fps)))
+                // What this encoder is actually looking at. The default,
+                // `CameraVideoRealTime`, tunes for a noisy camera image:
+                // motion search and rate control that a desktop — flat fills,
+                // sharp text, most of the screen identical between frames —
+                // pays for and gets nothing from. `ScreenContentRealTime` is
+                // the mode openh264 has for exactly this, and it is both
+                // faster and sharper on text (ADR 0027).
+                .usage_type(UsageType::ScreenContentRealTime)
+                // A remote desktop is a latency product. Medium complexity
+                // buys quality per bit that nobody watching their own machine
+                // from another country would trade a frame rate for.
+                .complexity(Complexity::Low)
+                .num_threads(software_threads());
             Encoder::with_api_config(openh264::OpenH264API::from_source(), h264)
                 .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))
         }
 
         /// Crops to even dimensions: 4:2:0 subsampling has no odd rows or
         /// columns, and the conversion asserts on them.
-        fn even_bgra(frame: &Frame) -> Result<(Vec<u8>, usize, usize)> {
+        ///
+        /// Borrows when the picture is already even, which every real screen
+        /// mode is: the copy this used to make unconditionally was a full
+        /// frame — 8 MiB at 1080p — on the encoder's own hot path, spent to
+        /// produce a byte-for-byte duplicate (ADR 0027).
+        fn even_bgra(frame: &Frame) -> Result<(std::borrow::Cow<'_, [u8]>, usize, usize)> {
             if frame.format != PixelFormat::Bgra8 {
                 return Err(MediaError::Encode(format!(
                     "openh264 fallback expects BGRA8 input, got {:?}",
@@ -247,12 +281,19 @@ pub mod software {
             if frame.data.len() < src_stride * height {
                 return Err(MediaError::Encode("frame buffer is short".to_owned()));
             }
+            if src_stride == dst_stride {
+                return Ok((
+                    std::borrow::Cow::Borrowed(&frame.data[..dst_stride * height]),
+                    width,
+                    height,
+                ));
+            }
             let mut cropped = Vec::with_capacity(dst_stride * height);
             for row in 0..height {
                 let start = row * src_stride;
                 cropped.extend_from_slice(&frame.data[start..start + dst_stride]);
             }
-            Ok((cropped, width, height))
+            Ok((std::borrow::Cow::Owned(cropped), width, height))
         }
     }
 

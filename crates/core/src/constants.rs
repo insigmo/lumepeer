@@ -37,7 +37,39 @@ pub const PING_INTERVAL_SECS: u64 = 20;
 /// Deadline for one accepted connection to complete the control handshake
 /// before the host drops it, so a peer that connects and then goes silent
 /// cannot tie up a task (§9.1, §18).
+///
+/// This covers only the `Hello`/`HelloAck` exchange, which is one round trip
+/// on a connection that is already up. Getting the connection up is bounded
+/// separately by [`INCOMING_ACCEPT_TIMEOUT_SECS`], because the two are not the
+/// same kind of wait at all (ADR 0027).
 pub const CONTROL_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+/// Deadline for an accepted incoming connection to finish its **QUIC**
+/// handshake, before any control frame is expected of it (§9.1, §18).
+///
+/// Deliberately longer than a guest's own dial budget. A guest that is still
+/// hole-punching has not gone silent — it is working — and a host that gives
+/// up first turns a slow path into a failed session while the far side is
+/// still trying (ADR 0027).
+pub const INCOMING_ACCEPT_TIMEOUT_SECS: u64 = 20;
+/// Attempts one outgoing connect makes before it is reported as failed
+/// (§7, ADR 0027).
+///
+/// A first attempt races whatever the host's address set said when the invite
+/// was issued: a relay the host has since moved off, a hole punch that has not
+/// landed, a discovery record that is a few seconds stale. Each of those is
+/// gone by the next attempt, and a user who has to re-paste the code cannot
+/// tell any of them from a dead host.
+pub const DIAL_ATTEMPTS: u32 = 3;
+/// Pause between the attempts of [`DIAL_ATTEMPTS`], long enough for iroh's own
+/// discovery to have republished, short enough not to read as a hang.
+pub const DIAL_RETRY_BACKOFF_MS: u64 = 750;
+/// Bound on one attempt of [`DIAL_ATTEMPTS`] — dial *and* handshake together.
+///
+/// Without it a single attempt can hold the whole budget: a connection that
+/// comes up over a relay link which then dies takes iroh's full dial timeout
+/// plus the handshake's own stall before it gives up, and the retry that would
+/// have worked never runs (ADR 0027).
+pub const CONNECT_ATTEMPT_TIMEOUT_SECS: u64 = 20;
 /// Handshakes the host will run concurrently. Beyond this, further incoming
 /// connections are closed immediately rather than queued (§3.2).
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;
@@ -84,6 +116,16 @@ pub const SHORT_LINK_RESOLVE_RATE_PER_MIN: u32 = 30;
 pub const CLOCK_ROLLBACK_ACTIVE_SESSION_CUTOFF_SECS: u64 = 10 * 60;
 /// Default encoder frame rate (§11).
 pub const ENCODE_DEFAULT_FPS: u8 = 30;
+/// Ceiling on the worker threads the software H.264 encoder may use (§11,
+/// ADR 0027).
+///
+/// Only the fallback encoder needs this: a hardware MFT does its own
+/// scheduling. What it bounds is a host with no hardware encoder, where
+/// `openh264` on one thread produced single-digit frame rates at 1080p while
+/// the rest of the machine sat idle. Capped rather than "all cores" because
+/// the host is someone's working machine, not a transcoding farm, and §15
+/// budgets the session, not the box.
+pub const ENCODE_MAX_SOFTWARE_THREADS: u16 = 4;
 /// Default encoder bitrate (§11).
 pub const ENCODE_DEFAULT_BITRATE_KBPS: u32 = 4_000;
 /// Lower bound of the adaptive bitrate range (§11).

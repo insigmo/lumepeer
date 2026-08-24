@@ -74,45 +74,61 @@ impl IpcError {
     /// mismatch collapses into `REJECTED` on purpose, so a stranger probing a
     /// ticket learns nothing about *why* it failed.
     fn net(error: &lumepeer_net::NetError) -> Self {
-        use lumepeer_core::CoreError;
-        use lumepeer_net::NetError;
-
-        let (code, message) = match *error {
-            NetError::MalformedTicket | NetError::InvalidTicket => {
-                ("BAD_TICKET", "the invite is not valid or has expired")
-            }
-            NetError::AlreadyConnected => (
-                "ALREADY_CONNECTED",
-                "you are already connected to this device",
-            ),
-            NetError::Dial(_) | NetError::Endpoint(_) => {
-                ("DIAL_FAILED", "the host could not be reached")
-            }
-            // This device, not the peer: nothing is wrong with the invite or
-            // the far side, so it must not read like a rejection.
-            NetError::Offline => (
-                "OFFLINE",
-                "this device is not reachable from the internet yet — wait for the status to turn ready, then try again",
-            ),
-            NetError::Framing(CoreError::IncompatibleVersion { .. }) => (
-                "INCOMPATIBLE_VERSION",
-                "the host speaks an incompatible protocol version",
-            ),
-            // Transport, not verdict. This is what *this* side observed — a
-            // stream that stopped — so saying so leaks nothing about why the
-            // far end did anything, and it keeps a flapping link from being
-            // reported as a rejection, which sends the user hunting on the
-            // wrong machine (ADR 0026).
-            NetError::Io(_) => (
-                "TRANSPORT_LOST",
-                "the connection dropped before the session was set up — check the network and try again",
-            ),
-            _ => ("REJECTED", "the host refused the connection"),
-        };
+        let (code, message) = classify_net(error);
         Self {
             code,
             message: message.to_owned(),
         }
+    }
+}
+
+/// The §18 code of a transport failure, without its message.
+///
+/// The dial now runs off the actor loop, so a failure can no longer be the
+/// IPC call's own `Err`: the actor keeps this code instead and `connect_status`
+/// hands it to the webview, which owns the wording in the user's language
+/// (ADR 0027). Same classification as [`IpcError::net`], so nothing is
+/// disclosed here that the error channel would not have disclosed anyway.
+pub fn net_error_code(error: &lumepeer_net::NetError) -> &'static str {
+    classify_net(error).0
+}
+
+/// Maps a transport failure onto the (code, message) pair of §18.
+fn classify_net(error: &lumepeer_net::NetError) -> (&'static str, &'static str) {
+    use lumepeer_core::CoreError;
+    use lumepeer_net::NetError;
+
+    match *error {
+        NetError::MalformedTicket | NetError::InvalidTicket => {
+            ("BAD_TICKET", "the invite is not valid or has expired")
+        }
+        NetError::AlreadyConnected => (
+            "ALREADY_CONNECTED",
+            "you are already connected to this device",
+        ),
+        NetError::Dial(_) | NetError::Endpoint(_) => {
+            ("DIAL_FAILED", "the host could not be reached")
+        }
+        // This device, not the peer: nothing is wrong with the invite or
+        // the far side, so it must not read like a rejection.
+        NetError::Offline => (
+            "OFFLINE",
+            "this device is not reachable from the internet yet — wait for the status to turn ready, then try again",
+        ),
+        NetError::Framing(CoreError::IncompatibleVersion { .. }) => (
+            "INCOMPATIBLE_VERSION",
+            "the host speaks an incompatible protocol version",
+        ),
+        // Transport, not verdict. This is what *this* side observed — a
+        // stream that stopped — so saying so leaks nothing about why the
+        // far end did anything, and it keeps a flapping link from being
+        // reported as a rejection, which sends the user hunting on the
+        // wrong machine (ADR 0026).
+        NetError::Io(_) => (
+            "TRANSPORT_LOST",
+            "the connection dropped before the session was set up — check the network and try again",
+        ),
+        _ => ("REJECTED", "the host refused the connection"),
     }
 }
 
@@ -282,11 +298,19 @@ pub struct HistoryConnectArgs {
 /// punch-list item 6).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectStatusDto {
-    /// One of `idle`, `awaiting_consent`, `connected`, `denied`, `failed`.
+    /// One of `idle`, `dialing`, `awaiting_consent`, `connected`, `denied`,
+    /// `failed`.
     pub phase: &'static str,
-    /// Whether a decision is still outstanding on the far side, which is what
-    /// keeps the Connect button disabled.
+    /// Whether an attempt is still in flight — dialing, or waiting on the far
+    /// side's decision — which is what keeps the Connect button disabled.
     pub pending: bool,
+    /// §18 code of the last failure, set only alongside `phase: "failed"`.
+    ///
+    /// Present because the dial runs off the actor loop and can no longer
+    /// fail the IPC call it started from: without it every transport problem
+    /// would reach the user as one undifferentiated "could not connect", which
+    /// is the report ADR 0026 was written about (ADR 0027).
+    pub code: Option<&'static str>,
 }
 
 /// Whether this host is ready to accept incoming connections.
@@ -435,10 +459,11 @@ pub async fn connect_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<ConnectStatusDto, IpcError> {
     check_window(&window)?;
-    let phase = state.network.connect_state().await?;
+    let (phase, code) = state.network.connect_state().await?;
     Ok(ConnectStatusDto {
         phase: phase.as_str(),
         pending: phase.is_pending(),
+        code,
     })
 }
 
@@ -460,7 +485,13 @@ pub async fn invite_create(
     })
 }
 
-/// Connects to the host named by `args.ticket`.
+/// Starts connecting to the host named by `args.ticket`.
+///
+/// Returns as soon as the attempt is under way, not when it lands: the dial
+/// itself runs off the actor loop so that it cannot freeze the app that
+/// started it (ADR 0027). An invite that is malformed, expired or already
+/// connected still fails here, synchronously — everything after that is
+/// reported through `connect_status`.
 ///
 /// # Errors
 /// Rejects calls from other windows; propagates [`ActorError`].
@@ -591,7 +622,7 @@ pub async fn view_next_frame(
     args: ViewArgs,
 ) -> Result<tauri::ipc::Response, IpcError> {
     check_view_window(&window, &args.peer)?;
-    let bytes = state.network.view_frame(args.peer, args.since_us).await?;
+    let bytes = state.network.view_frame(&args.peer, args.since_us)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 

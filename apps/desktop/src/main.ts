@@ -166,7 +166,7 @@ async function refresh(): Promise<void> {
       invoke<SessionStatus[]>('session_status'),
       invoke<HistoryEntry[]>('connection_history'),
       invoke<{ ready: boolean; can_capture: boolean; can_encode: boolean }>('network_status'),
-      invoke<{ phase: ConnectPhase; pending: boolean }>('connect_status'),
+      invoke<{ phase: ConnectPhase; pending: boolean; code: string | null }>('connect_status'),
     ]);
     sessions = sessionResult;
     history = historyResult;
@@ -181,7 +181,7 @@ async function refresh(): Promise<void> {
     }
     // The connect form's own wait: a dial that returned is not a session yet,
     // and only the actor knows whether the far side has decided (§21 item 6).
-    setConnectPhase(connectResult.phase);
+    setConnectPhase(connectResult.phase, connectResult.code);
   } catch (error) {
     console.error('refresh failed:', error);
   }

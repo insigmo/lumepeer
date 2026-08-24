@@ -20,7 +20,10 @@ use ed25519_dalek::SigningKey;
 use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::ClipboardSync;
 use lumepeer_core::consent::{Grants, Role};
-use lumepeer_core::constants::{CONTROL_HANDSHAKE_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES};
+use lumepeer_core::constants::{
+    CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
+    DIAL_RETRY_BACKOFF_MS, INCOMING_ACCEPT_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES,
+};
 use lumepeer_core::protocol::{
     FEATURE_MEDIA_UNAVAILABLE, InputEventPayload, MediaUnavailableReason, MessageKind,
 };
@@ -46,6 +49,28 @@ use crate::view::{
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
 const NOTIFY_CAPACITY: usize = 32;
+
+/// What a view window needs to paint one frame, readable without the actor.
+///
+/// The picture already lives in a `watch` channel the media task writes and
+/// nothing else mutates, so serving a frame poll never needed the actor's own
+/// thread — it only ever went through the mailbox because that was where the
+/// grant lived. Routing it there put every frame of every view window behind
+/// whatever else the actor was doing, which at 30 fps is the difference
+/// between a remote desktop and a slideshow (ADR 0027).
+///
+/// This widens nothing (§2.3). `input` is a copy the *actor* writes, on grant
+/// and on revoke, of a decision `lumepeer-core` already made; a reader here
+/// can only observe it. The entry is removed before the window is told to
+/// close, so a poll racing a revoke reads either the live grant or nothing.
+#[derive(Debug, Clone)]
+struct ViewFeed {
+    slot: watch::Receiver<ViewSlot>,
+    input: Arc<AtomicBool>,
+}
+
+/// Live view feeds by window label, shared between the actor and the IPC layer.
+type ViewFeeds = Arc<std::sync::RwLock<HashMap<String, ViewFeed>>>;
 
 /// State of one session as the webview needs to know it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -93,6 +118,14 @@ pub struct InviteDto {
 pub enum ConnectPhase {
     /// Nothing outgoing in flight.
     Idle,
+    /// The dial is in flight: the ticket parsed, and this node is trying to
+    /// reach the host it names (ADR 0027).
+    ///
+    /// A phase of its own because the dial no longer happens inside the IPC
+    /// call. `invite_connect` returns as soon as the attempt has *started*, so
+    /// without this the form would have nothing to stay disabled on between
+    /// the click and the host's `Hello` landing.
+    Dialing,
     /// Connected to the host; its user has not decided yet.
     AwaitingConsent,
     /// The host granted and the view window is open.
@@ -108,7 +141,7 @@ impl ConnectPhase {
     /// and a second attempt would only race it.
     #[must_use]
     pub const fn is_pending(self) -> bool {
-        matches!(self, Self::AwaitingConsent)
+        matches!(self, Self::Dialing | Self::AwaitingConsent)
     }
 
     /// Stable wire string for the webview.
@@ -116,6 +149,7 @@ impl ConnectPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Dialing => "dialing",
             Self::AwaitingConsent => "awaiting_consent",
             Self::Connected => "connected",
             Self::Denied => "denied",
@@ -183,9 +217,10 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Guest side: how this node's own outgoing connect attempt is going.
+    /// Guest side: how this node's own outgoing connect attempt is going, and
+    /// the §18 code of the last failure if it ended in one.
     ConnectState {
-        reply: oneshot::Sender<ConnectPhase>,
+        reply: oneshot::Sender<(ConnectPhase, Option<&'static str>)>,
     },
     Grant {
         label: String,
@@ -203,15 +238,6 @@ enum ActorCommand {
     InviteConnect {
         ticket: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
-    },
-    /// Guest side: newest decoded picture for one view window, already encoded
-    /// as the binary IPC response of `view_next_frame`.
-    ViewFrame {
-        label: String,
-        /// Timestamp of the picture the caller already has, or 0 for none.
-        /// Matching the current frame skips re-serializing its pixels.
-        since_us: u64,
-        reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
     },
     /// Guest side: one input event to forward to the host being viewed.
     Input {
@@ -281,6 +307,10 @@ pub struct ActorHandle {
     /// What this host knows about its own ability to produce a picture.
     /// Shared with the actor, which is what learns of an encoder fault.
     health: Arc<MediaHealth>,
+    /// Guest side: one entry per open view window, so `view_frame` can serve a
+    /// picture without queueing behind the actor's mailbox (ADR 0027).
+    /// Written only by the actor.
+    views: ViewFeeds,
 }
 
 impl ActorHandle {
@@ -351,7 +381,7 @@ impl ActorHandle {
     ///
     /// # Errors
     /// [`ActorError::ChannelClosed`] if the actor task is gone.
-    pub async fn connect_state(&self) -> Result<ConnectPhase, ActorError> {
+    pub async fn connect_state(&self) -> Result<(ConnectPhase, Option<&'static str>), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ConnectState { reply })
@@ -424,20 +454,26 @@ impl ActorHandle {
     /// current frame (§15: a caller polling faster than the video updates
     /// should not pay for re-serializing an unchanged picture).
     ///
+    /// Read straight from the shared feed rather than through the actor's
+    /// mailbox: a frame poll is a read of state the actor does not have to be
+    /// consulted about, and making it wait for the actor is what made a busy
+    /// app drop the picture (ADR 0027).
+    ///
     /// # Errors
-    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`;
-    /// [`ActorError::ChannelClosed`] if the actor is gone.
-    pub async fn view_frame(&self, label: String, since_us: u64) -> Result<Vec<u8>, ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(ActorCommand::ViewFrame {
-                label,
-                since_us,
-                reply,
-            })
-            .await
-            .map_err(|_| ActorError::ChannelClosed)?;
-        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`.
+    pub fn view_frame(&self, label: &str, since_us: u64) -> Result<Vec<u8>, ActorError> {
+        let feed = self
+            .views
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .cloned()
+            .ok_or(ActorError::UnknownPeer)?;
+        let response = slot_for_poll(&feed.slot.borrow(), since_us);
+        Ok(encode_view_response(
+            &response,
+            feed.input.load(Ordering::Relaxed),
+        ))
     }
 
     /// Forwards one input event to the host behind `label`.
@@ -698,6 +734,9 @@ struct ViewState {
     /// Grants as the host last announced them. Advisory on this side: the host
     /// re-checks every event (§2.3).
     grants: Grants,
+    /// `grants.input` as the frame poll reads it, without the actor. Written
+    /// here, on grant and on role change; the entry is removed on revoke.
+    input: Arc<AtomicBool>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -738,6 +777,21 @@ enum ActorEvent {
     MediaAccepted {
         connection: Box<iroh::endpoint::Connection>,
         peer: NodeId,
+    },
+    /// Guest side: an outgoing dial started by [`Actor::spawn_dial`] finished,
+    /// one way or the other (ADR 0027).
+    ///
+    /// The dial runs off the actor loop, so this is how its result gets back
+    /// to the one thread allowed to store a connection or move the connect
+    /// phase. `peer` is what the ticket claimed, which is also what the
+    /// handshake proved when `result` is `Ok`.
+    Dialed {
+        peer: NodeId,
+        /// The invite code the dial used, kept so a successful connection can
+        /// still be recorded in the remembered-hosts list (ADR 0016).
+        code: String,
+        addr: Box<iroh::EndpointAddr>,
+        result: Result<Box<ControlConnection>, NetError>,
     },
 }
 
@@ -807,6 +861,10 @@ struct Actor {
     injector: Option<Box<dyn InputInjector>>,
     /// Guest side: one open view window per host being watched.
     views: std::collections::HashMap<NodeId, ViewState>,
+    /// The same windows as `views`, in the form the IPC layer reads directly.
+    /// Kept in step by `start_view` and `stop_view`, which are the only two
+    /// places a view begins or ends.
+    view_feeds: ViewFeeds,
     /// Guest side: dialable address per host, remembered from its invite so the
     /// media dial does not have to wait for discovery.
     host_addrs: std::collections::HashMap<NodeId, iroh::EndpointAddr>,
@@ -829,6 +887,14 @@ struct Actor {
     connect_phase: ConnectPhase,
     /// Host the phase above is about, once the dial has resolved one.
     connect_peer: Option<NodeId>,
+    /// Why the last attempt failed, as the §18 code the UI shows. Set only
+    /// alongside `ConnectPhase::Failed`; cleared when a new attempt starts.
+    ///
+    /// The dial no longer runs inside the IPC call, so its error cannot come
+    /// back as the call's own `Err` any more — without this the user would be
+    /// told "could not connect" and nothing else, which is the report ADR 0026
+    /// was written about (ADR 0027).
+    connect_failure: Option<&'static str>,
 }
 
 impl Actor {
@@ -893,7 +959,7 @@ impl Actor {
             tokio::select! {
                 command = self.rx.recv() => {
                     let Some(command) = command else { break };
-                    self.handle_command(command).await;
+                    self.handle_command(command);
                 }
                 // Single await, so losing this race cannot drop a connection
                 // that is already half accepted.
@@ -931,66 +997,34 @@ impl Actor {
         let salt = self.install_salt;
         tokio::spawn(async move {
             let _permit = permit;
-            let deadline = std::time::Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS);
-            let Ok(outcome) = tokio::time::timeout(deadline, async move {
-                let connection = PeerEndpoint::finish_accept(incoming).await.ok()?;
-                let peer = connection.remote_id();
-                let tag = peer_tag(&salt, &peer);
-                match Channel::from_alpn(connection.alpn()) {
-                    Some(Channel::Control) => {}
-                    // Media is authenticated here and authorized by the actor:
-                    // this task cannot see whether the peer holds a live,
-                    // granted control session, and guessing would be a way to
-                    // widen a grant outside `lumepeer-core` (§2.3).
-                    Some(Channel::Media) => {
-                        return Some(Accepted::Media {
-                            connection: Box::new(connection),
-                            peer,
-                        });
-                    }
-                    // An unauthenticated peer must not be able to park a file
-                    // connection in the control handshake's read (§4.1).
-                    Some(Channel::File) | None => {
-                        tracing::warn!(peer = %tag, "closing a non-control connection");
-                        connection.close(
-                            lumepeer_net::connection::CLOSE_MALFORMED.into(),
-                            lumepeer_net::error::close_code::MALFORMED.as_bytes(),
-                        );
-                        return None;
-                    }
-                }
-                let (control, hello) = match lumepeer_net::host_handshake(connection).await {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        tracing::warn!(peer = %tag, %error, "control handshake failed");
-                        return None;
-                    }
-                };
-                let Ok(ticket) = postcard::from_bytes::<InviteTicket>(&hello.invite_proof) else {
-                    tracing::warn!(peer = %tag, "invite proof is not a ticket");
-                    control.close_with(&NetError::InvalidTicket);
-                    return None;
-                };
-                if let Err(error) = ticket.verify(&verifying_key, unix_now()) {
-                    tracing::warn!(peer = %tag, %error, "invite ticket did not verify");
-                    control.close_with(&NetError::InvalidTicket);
-                    return None;
-                }
-                Some(Accepted::Control {
-                    announces_media_faults: hello
-                        .features
-                        .iter()
-                        .any(|feature| feature == FEATURE_MEDIA_UNAVAILABLE),
-                    connection: Box::new(control),
-                    peer,
-                    ticket: Box::new(ticket),
-                })
+            // Two deadlines, not one. Finishing the QUIC handshake is a
+            // network wait whose length is the far side's hole punching, and
+            // it used to share the ten seconds meant for a single control
+            // round trip — so a guest that was still working got dropped by
+            // the host just before it would have arrived, and both sides then
+            // reported a failure neither had caused (ADR 0027).
+            let accept_deadline = std::time::Duration::from_secs(INCOMING_ACCEPT_TIMEOUT_SECS);
+            let handshake_deadline = std::time::Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS);
+            let Ok(connection) = tokio::time::timeout(accept_deadline, async move {
+                PeerEndpoint::finish_accept(incoming).await.ok()
             })
             .await
             else {
                 tracing::warn!(
+                    timeout_secs = INCOMING_ACCEPT_TIMEOUT_SECS,
+                    "dropping an incoming connection that did not finish its QUIC handshake in time"
+                );
+                return;
+            };
+            let Ok(outcome) = tokio::time::timeout(
+                handshake_deadline,
+                classify_incoming(connection, &verifying_key, &salt),
+            )
+            .await
+            else {
+                tracing::warn!(
                     timeout_secs = CONTROL_HANDSHAKE_TIMEOUT_SECS,
-                    "dropping an incoming connection that did not finish its handshake in time"
+                    "dropping an incoming connection that did not finish its control handshake in time"
                 );
                 return;
             };
@@ -1107,6 +1141,12 @@ impl Actor {
             ActorEvent::MediaAccepted { connection, peer } => {
                 self.on_media_accepted(*connection, peer);
             }
+            ActorEvent::Dialed {
+                peer,
+                code,
+                addr,
+                result,
+            } => self.on_dialed(peer, code, *addr, result),
         }
     }
 
@@ -1264,6 +1304,10 @@ impl Actor {
         if let Some(state) = self.views.get_mut(&peer) {
             state.grants = grants;
             state.role = role;
+            // The feed carries the live grant, so a role change has to reach it
+            // before the next frame is served — the window stops accepting
+            // input on the very next poll (§8.1).
+            state.input.store(grants.input, Ordering::Relaxed);
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
             return;
         }
@@ -1287,12 +1331,27 @@ impl Actor {
             },
             Arc::clone(&slot_tx),
         );
+        let input = Arc::new(AtomicBool::new(grants.input));
+        // Keyed by the peer tag: that is the only name the view window knows
+        // itself by across IPC — `view_next_frame` takes `peer`, and the
+        // window label is derived from it, not the other way round.
+        self.view_feeds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                tag.clone(),
+                ViewFeed {
+                    slot: slot_rx.clone(),
+                    input: Arc::clone(&input),
+                },
+            );
         self.views.insert(
             peer,
             ViewState {
                 label: label.clone(),
                 role,
                 grants,
+                input,
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -1314,6 +1373,13 @@ impl Actor {
         let Some(state) = self.views.remove(&peer) else {
             return;
         };
+        // Taken out before the window is told to close, so a frame poll racing
+        // a revoke can only read the live grant or nothing at all — never a
+        // grant that has just been withdrawn (§8.1).
+        self.view_feeds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.label_of(&peer));
         // Dropping the receiver already tells the media task to stop; aborting
         // makes sure a decoder does not outlive the session it belonged to
         // (§8.1).
@@ -1347,6 +1413,12 @@ impl Actor {
     /// is simply idle rather than a failure worth putting on screen.
     fn settle_connect(&mut self, peer: NodeId, outcome: ConnectPhase) {
         if self.connect_peer != Some(peer) {
+            return;
+        }
+        // A dial is still in flight towards this very peer: whatever just
+        // ended belongs to an older connection, and settling now would report
+        // an outcome for an attempt that has not produced one yet.
+        if self.connect_phase == ConnectPhase::Dialing && outcome != ConnectPhase::Connected {
             return;
         }
         if outcome == ConnectPhase::Connected {
@@ -1543,7 +1615,10 @@ impl Actor {
         self.rebuild_labels_and_snapshot();
     }
 
-    async fn handle_command(&mut self, command: ActorCommand) {
+    /// Not `async` any more, and that is the property worth keeping: the loop
+    /// awaits this, so anything that blocks here blocks the whole actor. The
+    /// dial was the last thing in it that talked to the network (ADR 0027).
+    fn handle_command(&mut self, command: ActorCommand) {
         match command {
             ActorCommand::Status { reply } => {
                 let snapshot = self.rebuild_labels_and_snapshot();
@@ -1554,7 +1629,7 @@ impl Actor {
             }
             ActorCommand::HistoryConnect { label, reply } => {
                 let result = match self.history.code_of(&label).map(ToOwned::to_owned) {
-                    Some(code) => self.connect_with_ticket(&code).await,
+                    Some(code) => self.spawn_dial(&code),
                     None => Err(ActorError::UnknownPeer),
                 };
                 if let Err(ActorError::Net(ref error)) = result {
@@ -1563,7 +1638,7 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::ConnectState { reply } => {
-                let _ = reply.send(self.connect_phase);
+                let _ = reply.send((self.connect_phase, self.connect_failure));
             }
             ActorCommand::Grant { label, role, reply } => {
                 let result = self.on_grant(&label, role);
@@ -1583,22 +1658,10 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::InviteConnect { ticket, reply } => {
-                let result = self.connect_with_ticket(&ticket).await;
+                let result = self.spawn_dial(&ticket);
                 if let Err(ActorError::Net(ref error)) = result {
-                    tracing::warn!(%error, "invite connect failed");
+                    tracing::warn!(%error, "invite connect refused before dialing");
                 }
-                let _ = reply.send(result);
-            }
-            ActorCommand::ViewFrame {
-                label,
-                since_us,
-                reply,
-            } => {
-                let result = self.resolve(&label).and_then(|peer| {
-                    let state = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
-                    let response = slot_for_poll(&state.slot.borrow(), since_us);
-                    Ok(encode_view_response(&response, state.grants.input))
-                });
                 let _ = reply.send(result);
             }
             ActorCommand::Input {
@@ -1964,10 +2027,19 @@ impl Actor {
         Ok(())
     }
 
-    /// Guest side: dial the host named by the ticket, run the handshake and
-    /// **keep** the connection. Dropping it here would close the QUIC
-    /// connection under it and the host's `ConsentGrant` would never arrive.
-    async fn connect_with_ticket(&mut self, raw: &str) -> Result<(), ActorError> {
+    /// Guest side: validate the invite here, then run the dial and the
+    /// handshake **off** the actor loop (ADR 0027).
+    ///
+    /// Everything this can decide without touching the network is decided
+    /// synchronously, so a bad code or a duplicate still fails the IPC call
+    /// outright and the user is told which it was. The part that talks to the
+    /// network is the part that can take fifteen seconds, and it must not run
+    /// here: `run` awaits `handle_command`, so a dial on this thread stops the
+    /// actor accepting incoming connections, delivering `ConsentGrant`s,
+    /// serving the status the UI polls once a second and answering the view
+    /// window's frame poll. That is the "the app freezes and then says it
+    /// could not connect" report this fixes.
+    fn spawn_dial(&mut self, raw: &str) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
         // Dialing a host this node is already talking to would replace the live
@@ -1979,21 +2051,69 @@ impl Actor {
             tracing::info!(peer = %self.label_of(&addr.id), "already connected to this host");
             return Err(ActorError::Net(NetError::AlreadyConnected));
         }
-        let connection = self
-            .endpoint
-            .connect_control(addr.clone())
-            .await
-            .map_err(ActorError::Net)?;
+        // A dial already in flight owns `connect_phase`. Letting a second one
+        // start would leave two tasks racing to report an outcome into one
+        // slot, and the loser would overwrite the winner.
+        if self.connect_phase == ConnectPhase::Dialing {
+            tracing::info!("a connect attempt is already in flight");
+            return Err(ActorError::Net(NetError::AlreadyConnected));
+        }
         let proof = postcard::to_allocvec(&ticket)
             .map_err(|_| ActorError::Net(NetError::MalformedTicket))?;
-        // The one feature this build advertises: it understands a host
-        // saying it cannot produce a picture. An older host ignores the
-        // string (§9.1) and simply never sends the message.
-        let features = vec![FEATURE_MEDIA_UNAVAILABLE.to_owned()];
-        let control =
-            lumepeer_net::guest_handshake(connection, ticket.allowed_request, proof, features)
-                .await
-                .map_err(ActorError::Net)?;
+
+        self.connect_phase = ConnectPhase::Dialing;
+        self.connect_peer = Some(addr.id);
+        self.connect_failure = None;
+
+        let endpoint = self.endpoint.clone();
+        let tx = self.events_tx.clone();
+        let tag = self.label_of(&addr.id);
+        let code = raw.to_owned();
+        let role = ticket.allowed_request;
+        let target = addr.clone();
+        tokio::spawn(async move {
+            let result = dial_with_retries(&endpoint, &target, role, proof, &tag).await;
+            let _ = tx
+                .send(ActorEvent::Dialed {
+                    peer: target.id,
+                    code,
+                    addr: Box::new(target),
+                    result: result.map(Box::new),
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    /// Guest side: takes the outcome of [`Self::spawn_dial`] on the actor's own
+    /// thread, which is the only one allowed to store a connection.
+    fn on_dialed(
+        &mut self,
+        peer: NodeId,
+        code: String,
+        addr: iroh::EndpointAddr,
+        result: Result<Box<ControlConnection>, NetError>,
+    ) {
+        let tag = self.label_of(&peer);
+        // The attempt this reports on has been superseded — the user started
+        // another one, or the session it belonged to is already gone. Dropping
+        // the connection here closes it, which is what we want: nothing is
+        // waiting for it.
+        if self.connect_peer != Some(peer) {
+            tracing::info!(peer = %tag, "discarding the result of a superseded dial");
+            return;
+        }
+        let control = match result {
+            Ok(control) => *control,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "invite connect failed");
+                self.connect_failure = Some(crate::commands::net_error_code(&error));
+                self.connect_phase = ConnectPhase::Failed;
+                self.connect_peer = None;
+                return;
+            }
+        };
+        // The handshake proves who answered; the ticket only claimed it.
         let peer = control.peer();
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
@@ -2001,14 +2121,166 @@ impl Actor {
         self.host_addrs.insert(peer, addr);
         // Remembered so the history row written when this session ends can dial
         // the same host again (ADR 0016).
-        self.host_invites.insert(peer, raw.to_owned());
+        self.host_invites.insert(peer, code);
         self.connect_phase = ConnectPhase::AwaitingConsent;
         self.connect_peer = Some(peer);
         // Guest side: this node is the one that *receives* `MediaUnavailable`,
         // so there is no peer capability to remember here.
         self.adopt(control, peer, false);
-        Ok(())
     }
+}
+
+/// Sorts one accepted connection by ALPN and, if it is control, runs the host
+/// handshake and verifies the invite it carries (§4.1, §9.1, §18).
+///
+/// Authenticates; authorizes nothing. Whether a media connection may exist,
+/// and whether a verified ticket may become a session, are questions only the
+/// actor can answer, because only the actor can read `SessionManager` (§2.3).
+async fn classify_incoming(
+    connection: Option<iroh::endpoint::Connection>,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    salt: &[u8; 32],
+) -> Option<Accepted> {
+    let connection = connection?;
+    let peer = connection.remote_id();
+    let tag = peer_tag(salt, &peer);
+    match Channel::from_alpn(connection.alpn()) {
+        Some(Channel::Control) => {}
+        // Media is authenticated here and authorized by the actor: this task
+        // cannot see whether the peer holds a live, granted control session,
+        // and guessing would be a way to widen a grant outside
+        // `lumepeer-core` (§2.3).
+        Some(Channel::Media) => {
+            return Some(Accepted::Media {
+                connection: Box::new(connection),
+                peer,
+            });
+        }
+        // An unauthenticated peer must not be able to park a file connection
+        // in the control handshake's read (§4.1).
+        Some(Channel::File) | None => {
+            tracing::warn!(peer = %tag, "closing a non-control connection");
+            connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+            return None;
+        }
+    }
+    let (control, hello) = match lumepeer_net::host_handshake(connection).await {
+        Ok(pair) => pair,
+        Err(error) => {
+            tracing::warn!(peer = %tag, %error, "control handshake failed");
+            return None;
+        }
+    };
+    let Ok(ticket) = postcard::from_bytes::<InviteTicket>(&hello.invite_proof) else {
+        tracing::warn!(peer = %tag, "invite proof is not a ticket");
+        control.close_with(&NetError::InvalidTicket);
+        return None;
+    };
+    if let Err(error) = ticket.verify(verifying_key, unix_now()) {
+        tracing::warn!(peer = %tag, %error, "invite ticket did not verify");
+        control.close_with(&NetError::InvalidTicket);
+        return None;
+    }
+    Some(Accepted::Control {
+        announces_media_faults: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_MEDIA_UNAVAILABLE),
+        connection: Box::new(control),
+        peer,
+        ticket: Box::new(ticket),
+    })
+}
+
+/// One outgoing control connection — dial and handshake — retried up to
+/// [`DIAL_ATTEMPTS`] times.
+///
+/// The retry is not decoration. A ticket carries the address set the host had
+/// when it read the code out, and by the time a human has pasted it the host
+/// may have moved to another relay, its NAT binding may have changed, or its
+/// discovery record may not have propagated yet. iroh repairs all of that by
+/// itself — but only if something connects again, and until now the only thing
+/// that did was the user, who cannot tell a stale address from a dead host
+/// (ADR 0027).
+///
+/// The handshake is retried too, and that is the case this was actually
+/// written for. Between these two machines the failure is not a dial that
+/// never lands: it is a connection that comes up over the host's relay link
+/// and then loses it mid-`Hello` —
+///
+/// ```text
+/// host   21:36:41  issuing an invite  addrs={Relay(euc1-1), …}
+/// host   21:36:45  home is now relay use1-1, was Some(euc1-1)
+/// host   21:36:52  dropping an incoming connection that did not finish its control handshake in time
+/// host   21:36:57  Lost connection to relay server: Ping timeout
+/// guest  21:36:59  invite connect failed: stream i/o failed: connection lost
+/// ```
+///
+/// — which is [`NetError::Io`]: this side's own observation that a stream
+/// stopped, not anybody's decision, and the very thing a second attempt fixes
+/// because by then the host is on a relay it can hold, or a direct path has
+/// been punched. What is *not* retried is an answer: a bad ticket, a version
+/// mismatch or a refusal is a verdict, and asking again only collects it twice.
+async fn dial_with_retries(
+    endpoint: &PeerEndpoint,
+    addr: &iroh::EndpointAddr,
+    role: Role,
+    proof: Vec<u8>,
+    tag: &str,
+) -> Result<ControlConnection, NetError> {
+    let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
+    let mut last = NetError::Dial("no attempt was made".to_owned());
+    for attempt in 1..=DIAL_ATTEMPTS {
+        let outcome = tokio::time::timeout(
+            attempt_budget,
+            connect_once(endpoint, addr, role, proof.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(NetError::Dial(format!(
+                "no answer within {CONNECT_ATTEMPT_TIMEOUT_SECS}s"
+            )))
+        });
+        let error = match outcome {
+            Ok(control) => return Ok(control),
+            Err(error) => error,
+        };
+        let retryable = matches!(error, NetError::Dial(_) | NetError::Io(_));
+        tracing::warn!(
+            peer = %tag,
+            %error,
+            attempt,
+            of = DIAL_ATTEMPTS,
+            retryable,
+            "connect attempt failed"
+        );
+        if !retryable {
+            return Err(error);
+        }
+        last = error;
+        if attempt < DIAL_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(DIAL_RETRY_BACKOFF_MS)).await;
+        }
+    }
+    Err(last)
+}
+
+/// One attempt: dial the control ALPN and run the guest half of the handshake.
+async fn connect_once(
+    endpoint: &PeerEndpoint,
+    addr: &iroh::EndpointAddr,
+    role: Role,
+    proof: Vec<u8>,
+) -> Result<ControlConnection, NetError> {
+    let connection = endpoint.connect_control(addr.clone()).await?;
+    // The one feature this build advertises: it understands a host saying it
+    // cannot produce a picture. An older host ignores the string (§9.1) and
+    // simply never sends the message.
+    let features = vec![FEATURE_MEDIA_UNAVAILABLE.to_owned()];
+    lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
 
 /// Binds the endpoint from the OS keystore identity and spawns the actor.
@@ -2179,6 +2451,7 @@ pub fn spawn_actor_with(
     } = media;
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
+    let view_feeds: ViewFeeds = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let (faults_tx, faults_rx) = mpsc::channel(8);
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
@@ -2206,6 +2479,7 @@ pub fn spawn_actor_with(
         recorders: HashMap::new(),
         injector,
         views: std::collections::HashMap::new(),
+        view_feeds: Arc::clone(&view_feeds),
         host_addrs: std::collections::HashMap::new(),
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
@@ -2215,6 +2489,7 @@ pub fn spawn_actor_with(
         history: ConnectionHistory::open(history_path),
         connect_phase: ConnectPhase::Idle,
         connect_peer: None,
+        connect_failure: None,
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -2222,6 +2497,7 @@ pub fn spawn_actor_with(
         notify,
         online: Arc::new(AtomicBool::new(false)),
         health,
+        views: view_feeds,
     }
 }
 
@@ -2400,7 +2676,7 @@ mod tests {
     async fn wait_for_phase(handle: &ActorHandle, want: ConnectPhase) {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
-            let phase = handle.connect_state().await.unwrap();
+            let (phase, _) = handle.connect_state().await.unwrap();
             if phase == want {
                 return;
             }
@@ -2658,26 +2934,71 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        assert_eq!(guest.connect_state().await.unwrap(), ConnectPhase::Idle);
+        assert_eq!(guest.connect_state().await.unwrap().0, ConnectPhase::Idle);
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
-        assert_eq!(
-            guest.connect_state().await.unwrap(),
-            ConnectPhase::AwaitingConsent,
+        // `invite_connect` returns when the attempt starts, not when it lands
+        // (ADR 0027), so the form has to stay disabled through both waits —
+        // the dial and then the host's decision.
+        assert!(
+            guest.connect_state().await.unwrap().0.is_pending(),
+            "the attempt is in flight from the moment it is started"
+        );
+        wait_for_phase(&guest, ConnectPhase::AwaitingConsent).await;
+        assert!(
+            guest.connect_state().await.unwrap().0.is_pending(),
             "the handshake is done but nobody has decided yet"
         );
-        assert!(guest.connect_state().await.unwrap().is_pending());
 
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
         host.grant(label.clone(), Role::ViewOnly).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::Connected).await;
-        assert!(!guest.connect_state().await.unwrap().is_pending());
+        assert!(!guest.connect_state().await.unwrap().0.is_pending());
 
         host.revoke(label).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::Idle).await;
+    }
+
+    /// ADR 0027: a dial that is going nowhere must not take the app with it.
+    ///
+    /// Before the dial moved off the actor loop, `handle_command` awaited it,
+    /// so for as long as iroh kept trying — up to fifteen seconds per attempt
+    /// — nothing else the actor owns could make progress: no incoming
+    /// connection was accepted, no `ConsentGrant` was delivered, and the four
+    /// commands the UI polls once a second all queued behind it. The app
+    /// looked frozen and then said it could not connect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dial_in_flight_does_not_stall_the_actor() {
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        // A host that exists on paper and answers nothing: the ticket verifies,
+        // the address is in a range that goes nowhere, so the dial runs its
+        // full budget.
+        let (unreachable, _endpoint, _capture) = actor().await;
+        let invite = unreachable.invite_create(Role::ViewOnly).await.unwrap();
+        drop(unreachable);
+
+        guest.invite_connect(invite.code).await.unwrap();
+        assert_eq!(
+            guest.connect_state().await.unwrap().0,
+            ConnectPhase::Dialing,
+            "the attempt is in flight, and saying so is what keeps the form disabled"
+        );
+
+        // The assertion that matters: every other command still answers while
+        // that dial is outstanding.
+        for _ in 0..5 {
+            tokio::time::timeout(Duration::from_secs(2), guest.status())
+                .await
+                .expect("the actor must still answer while a dial is in flight")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), guest.history())
+                .await
+                .expect("the actor must still answer while a dial is in flight")
+                .unwrap();
+        }
     }
 
     /// A host that says no has to say it in a way the guest's form can show:
@@ -2723,7 +3044,7 @@ mod tests {
         );
 
         assert_eq!(
-            guest.connect_state().await.unwrap(),
+            guest.connect_state().await.unwrap().0,
             ConnectPhase::Connected,
             "the refused second dial must not disturb the live session"
         );
@@ -2837,7 +3158,7 @@ mod tests {
         assert_eq!(window_label, crate::view::window_label(&peer_label));
         assert!(input, "FullControl carries a live input grant");
 
-        let frame = guest.view_frame(peer_label.clone(), 0).await.unwrap();
+        let frame = guest.view_frame(&peer_label, 0).unwrap();
         assert_eq!(
             frame.len(),
             crate::view::VIEW_RESPONSE_HEADER_BYTES,
@@ -2860,7 +3181,7 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            guest.view_frame(peer_label, 0).await,
+            guest.view_frame(&peer_label, 0),
             Err(ActorError::UnknownPeer)
         ));
     }
@@ -2903,7 +3224,7 @@ mod tests {
         // spend waiting before being told the wrong thing.
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
-            let frame = guest.view_frame(peer_label.clone(), 0).await.unwrap();
+            let frame = guest.view_frame(&peer_label, 0).unwrap();
             if frame[0] == ViewStatus::NoCapture.code() {
                 break;
             }
@@ -2959,7 +3280,7 @@ mod tests {
             guest.input(peer_label.clone(), pointer_event(3, 4)).await,
             Err(ActorError::Core(CoreError::NotPermitted))
         ));
-        let frame = guest.view_frame(peer_label, 0).await.unwrap();
+        let frame = guest.view_frame(&peer_label, 0).unwrap();
         assert_eq!(frame[1], 0);
     }
 
@@ -2977,7 +3298,7 @@ mod tests {
             Err(ActorError::UnknownPeer)
         ));
         assert!(matches!(
-            host.view_frame("deadbeefdeadbeef".to_owned(), 0).await,
+            host.view_frame("deadbeefdeadbeef", 0),
             Err(ActorError::UnknownPeer)
         ));
         assert!(matches!(
