@@ -1,50 +1,48 @@
-version: "3.8"
-
 # Self-hosted Iroh relay for Lumepeer (docs/relay-deployment.md).
 #
 # The relay is dumb by design: it only forwards encrypted QUIC packets
 # between peers that already know each other's public keys, so hosting one
-# adds availability, never trust (§7). This compose file runs the official
-# `iroh-relay` image with production flags:
+# adds availability, never trust (§7).
 #
-#   --dev off                 refuse to run without TLS certs (production mode)
-#   --hostname $RELAY_HOST    DNS name the cert is requested for
-#   --cert-mode acme          Let's Encrypt via the HTTP-01 challenge, which
-#                             is why port 80 must be reachable from outside
-#   --http-request-limit ...  bound per-request size; the relay is not a file server
+# The image tag tracks the `iroh = "=1.0.2"` pin of the workspace manifest,
+# and moving one without the other is a protocol mismatch, not a version
+# skew: a 0.9x relay does not serve 1.0 clients at all. Bump both in the same
+# PR, the way §5 treats every other iroh pin.
 #
-# What you must set (in a .env file next to this compose file, gitignored):
-#   RELAY_HOST=relay.example.com     DNS A/AAAA record pointing at this host
-#   RELAY_CONTACT=admin@example.com  abuse/contact shown in relay responses
+# Configuration is a file, not flags. The 1.0 relay binary takes exactly two
+# arguments — `--dev` and `--config-path` — so everything to set lives in
+# `relay.toml` next to this file: the hostname whose DNS record points here,
+# the ACME contact address, and the per-client limits.
 #
-# Open in the firewall: 80/tcp (ACME challenge), 443/tcp (client relaying).
-# Nothing else needs exposing; hosts and guests talk P2P once hole punching
-# succeeds and only fall back to this relay when they cannot.
+# Open in the firewall: 80/tcp (ACME challenge), 443/tcp (client relaying),
+# 7842/udp (QUIC address discovery — this is what tells a peer how the world
+# sees it, which is what makes hole punching succeed and keeps sessions off
+# the relay in the first place). Nothing else needs exposing.
 
 services:
   iroh-relay:
-    image: n0computer/iroh-relay:v0.90.0
+    image: n0computer/iroh-relay:v1.0.2
     container_name: lumepeer-relay
     restart: unless-stopped
     ports:
-      - "80:80/tcp"     # ACME HTTP-01 challenge only
-      - "443:443/tcp"   # relayed client traffic over TLS
+      - "80:80/tcp" # ACME HTTP-01 challenge only
+      - "443:443/tcp" # relayed client traffic over TLS
+      - "7842:7842/udp" # QUIC address discovery
     volumes:
       - relay-data:/data
-    environment:
-      - RELAY_HOST=${RELAY_HOST:?set RELAY_HOST in .env}
-      - RELAY_CONTACT=${RELAY_CONTACT:-}
+      - ./relay.toml:/config/relay.toml:ro
     command:
-      - "--dev"
-      - "off"
-      - "--hostname"
-      - "${RELAY_HOST}"
-      - "--cert-mode"
-      - "acme"
-      - "--acme-domains"
-      - "${RELAY_HOST}"
-      - "--contact"
-      - "${RELAY_CONTACT}"
+      - "--config-path"
+      - "/config/relay.toml"
+    healthcheck:
+      # With TLS configured, port 80 keeps serving only the captive-portal
+      # probe; `/ping` lives on the HTTPS socket. `/generate_204` is therefore
+      # the one check that needs no certificate.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/generate_204"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   relay-data:

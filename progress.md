@@ -138,3 +138,45 @@
 - Скрипты-помощники в `%TEMP%`: `connect-guest.py`, `full-cycle.py`,
   `check-view.py`, `check-frames.py`, `analyze-log.py`, `invite-new.json`.
   Скриншоты живой сессии — в скретчпаде сессии (`view.png`, `view2.png`).
+
+---
+
+## ✅ Релизная сборка: почему инвайт «не долетал» (2026-08-24, вечер)
+
+Установленные с GitHub клиенты 0.0.14 на двух машинах в разных сетях не
+соединялись; гость видел **«the host refused the connection»**, хотя хост
+ничего не отклонял. Разобрано до конца, зафиксировано в
+[ADR 0026](docs/adr/0026-direct-paths-by-default-and-a-diagnosable-release.md).
+
+### Что показал `wan_probe` (реальный стек, без UI)
+
+| Хост | Гость | Транспорт | Итог |
+| --- | --- | --- | --- |
+| эта машина | эта машина | relay-only | ok, relay rtt 118 мс |
+| beta | эта машина | relay-only | `dial failed: timed out` |
+| эта машина | beta | relay-only | хост ok (тикет проверен, grant отправлен), гость `stream i/o failed: connection lost` |
+| эта машина | beta | relay-only, `use1-1` | то же самое |
+
+С `iroh=debug` на beta причина явная и повторяемая: `Lost connection to relay
+server: Ping timeout` через ~16 с после начала обмена данными и дальше каждые
+~20 с, одинаково на euc1-1 и use1-1. На простое тот же TCP:443 висит
+`ESTABLISHED` сколько угодно; `tailscale netcheck` на beta показывает UDP: true,
+NAT без привязки к адресату, DERP 91–96 мс. Рвёт связь что-то по пути beta
+(Keenetic/провайдер) — но продукт от этого лежал целиком, потому что
+установленная сборка была relay-only (ADR 0020 уехал в релиз).
+
+### Четыре починки в коде (все в ADR 0026)
+
+1. Прямые пути снова по умолчанию; relay-only — opt-in `LUMEPEER_RELAY_ONLY`
+   (или `prefer_direct = false`). `LUMEPEER_LAN_DIRECT` больше нет.
+2. Релизная сборка пишет JSON-лог в файл с ротацией (§16.1) — до этого stdout
+   у `windows_subsystem = "windows"` вёл в никуда, и диагностика была невозможна.
+3. `NetError::Io` → отдельный IPC-код `TRANSPORT_LOST` вместо `REJECTED`.
+4. Windows-релиз собирается с обоими кодерами (`encode-mf,encode-openh264`).
+   Именно этого не хватало: после починки транспорта сессия поднялась, а
+   картинки не было — `no hardware encoder and the openh264 fallback is not
+   built in`, раз в секунду в течение всего окна восстановления гостя.
+5. Конфиг наконец читается (`config.rs`): `[network].relay_url`,
+   `prefer_direct`, `[logging].directory`. Плюс `deploy/` починен — образ релея
+   был `v0.90.0` с флагами, которых в iroh 1.0 нет; теперь `v1.0.2` и
+   `relay.toml`.

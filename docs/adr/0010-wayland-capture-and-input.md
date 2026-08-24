@@ -3,6 +3,9 @@
 Status: accepted
 Date: 2026-08-14
 Supersedes: ADR 0003 (Wayland half)
+Amended by: ADR 0025 (`platform_backend()` is added alongside
+`platform_capturer()`/`platform_injector()` rather than replacing them, so the
+Windows and macOS branches those gained after this ADR survive)
 
 ## Context
 

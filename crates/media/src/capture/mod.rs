@@ -25,6 +25,12 @@ pub mod linux_x11;
 
 #[cfg(all(target_os = "linux", not(target_os = "android")))]
 pub mod linux_wayland;
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "capture-portal"
+))]
+pub(crate) mod pipewire_stream;
 
 /// What the platform allows besides pixels (§11.1, §18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,6 +257,53 @@ pub fn detect_session_type() -> SessionType {
     )
 }
 
+/// The platform's capture backend and, where the two cannot be built apart,
+/// the injector that shares its session (§11, ADR 0010).
+///
+/// The injector is optional rather than a [`NoInputInjector`]: "this platform
+/// builds input separately" and "this platform has no input" are different
+/// facts, and only the first one leaves [`platform_injector`] worth calling.
+pub type PlatformBackend = (Box<dyn ScreenCapturer>, Option<Box<dyn InputInjector>>);
+
+/// Opens the capture backend, together with an input injector when the
+/// platform requires the two to come from one session (§11, ADR 0010).
+///
+/// Only the Wayland portal path returns `Some` injector, and it has to: the
+/// `RemoteDesktop` `notify_*` calls need the very `Session` handle that
+/// `SelectDevices`/`Start` ran on, so building an injector separately there
+/// would raise a second consent dialog and then inject into a session capture
+/// never claimed. Every other platform returns `None` and keeps building its
+/// injector lazily through [`platform_injector`] — which is what lets a host
+/// with no input adapter still run view-only instead of failing the session
+/// (§18).
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when no capture backend is compiled in
+/// for this target.
+pub fn platform_backend() -> Result<PlatformBackend> {
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-portal"
+    ))]
+    {
+        // `Unknown` goes to the portal too: with no signal either way the
+        // portal is the path that asks the user, and a wrong guess towards
+        // X11 would capture nothing on a Wayland desktop (§18).
+        if matches!(
+            detect_session_type(),
+            SessionType::Wayland | SessionType::Unknown
+        ) {
+            let (capturer, injector) = linux_wayland::WaylandPortalCapturer::paired_with_injector();
+            return Ok((
+                Box::new(capturer) as Box<dyn ScreenCapturer>,
+                Some(Box::new(injector) as Box<dyn InputInjector>),
+            ));
+        }
+    }
+    Ok((platform_capturer()?, None))
+}
+
 /// Opens the capture backend of the current platform.
 ///
 /// # Errors
@@ -267,6 +320,19 @@ pub fn platform_capturer() -> Result<Box<dyn ScreenCapturer>> {
         // fails unless Xwayland is reachable, and the error says so.
         Ok(Box::new(linux_x11::X11Capturer::new()))
     }
+    // Portal-only Linux build: no X11 to prefer, so the portal is the
+    // capture path. Callers that also need input must go through
+    // [`platform_backend`] instead — an injector built separately here would
+    // negotiate its own portal session (ADR 0010).
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-portal",
+        not(feature = "capture-x11")
+    ))]
+    {
+        Ok(Box::new(linux_wayland::WaylandPortalCapturer::new()))
+    }
     #[cfg(all(target_os = "windows", feature = "capture-windows"))]
     {
         Ok(Box::new(windows::WindowsCapturer::new()))
@@ -280,6 +346,11 @@ pub fn platform_capturer() -> Result<Box<dyn ScreenCapturer>> {
             target_os = "linux",
             not(target_os = "android"),
             feature = "capture-x11"
+        ),
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "capture-portal"
         ),
         all(target_os = "windows", feature = "capture-windows"),
         all(target_os = "macos", feature = "capture-screencapturekit"),

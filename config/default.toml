@@ -9,12 +9,23 @@ max_worker_threads = 4
 
 [network]
 # Relay fallback is part of the Iroh defaults; direct connections are preferred.
+# Setting this to false clears the direct IP transports outright, so every
+# packet of every session goes through a relay — the WAN test of ADR 0020, and
+# never a shipping default: it makes the session depend on one relay link
+# staying healthy (ADR 0026).
 prefer_direct = true
+# Relay peers fall back to when hole punching fails. Unset means iroh's public
+# fleet. Point it at your own relay (docs/relay-deployment.md) when the public
+# one is not reachable from where your clients are:
+# relay_url = "https://relay.example.com"
 
 [logging]
 # Human-readable on stdout in development, structured JSON to file in
 # production; rotation follows LOG_ROTATION_DAYS / LOG_ROTATION_MAX_MIB (§16.1).
 format = "auto"
+# Relative paths are resolved under the per-user data directory, not the
+# working directory: an installed client is started from a directory it may
+# not write to. Windows: %LOCALAPPDATA%\io.insigmo.lumepeer\logs.
 directory = "logs"
 
 [license]

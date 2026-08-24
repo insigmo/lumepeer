@@ -149,6 +149,13 @@ jobs:
       # ask for them ships a client that pairs and consents normally and
       # then never produces a picture — the guest sits on "waiting for the
       # remote screen" until its recovery window elapses (§18).
+      #
+      # Windows carries *both* encoders on purpose. `encode-mf` is Media
+      # Foundation, which needs a hardware encoder the machine may simply not
+      # have; without the `encode-openh264` software fallback next to it,
+      # `select_encoder` fails on such a host with "no usable encoder" and the
+      # session stays blank forever. That is not hypothetical: it is what
+      # v0.0.14 did on a desktop with no hardware H.264 encoder.
       matrix:
         include:
           - name: linux-amd64 (deb/rpm)
@@ -162,11 +169,11 @@ jobs:
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: capture-windows,encode-mf
+            features: capture-windows,encode-mf,encode-openh264
           - name: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            features: capture-windows,encode-mf
+            features: capture-windows,encode-mf,encode-openh264
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
