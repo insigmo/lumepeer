@@ -21,6 +21,10 @@
       "identifier": "core:window:allow-toggle-maximize",
       "allow": [{ "label": "main" }]
     },
+    {
+      "identifier": "core:window:allow-start-dragging",
+      "allow": [{ "label": "main" }]
+    },
     "updater:default",
     "allow-session-grant",
     "allow-session-revoke",

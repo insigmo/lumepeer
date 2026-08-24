@@ -3,6 +3,11 @@
 // The main window is created with decorations: false (tauri.conf.json), so
 // this is the only way left to minimize/maximize/close it — the window
 // controls here are a functional replacement for the OS ones, not decoration.
+//
+// data-tauri-drag-region is the other half of that replacement: a mousedown on
+// an element carrying it starts a window drag, and a double click toggles
+// maximize. It needs core:window:allow-start-dragging in the main window
+// capability, otherwise the drag is denied and the bar feels dead.
 
 import { html, type TemplateResult } from 'lit-html';
 
@@ -28,7 +33,7 @@ async function closeWindow(): Promise<void> {
 export function titleBar(locale: Locale): TemplateResult {
   return html`
     <div class="title-bar" data-tauri-drag-region>
-      <div class="title-bar-left">${logoMark()}<span>Lumepeer</span></div>
+      <div class="title-bar-left" data-tauri-drag-region>${logoMark()}<span>Lumepeer</span></div>
       <div class="title-bar-controls">
         <button type="button" aria-label=${t(locale, 'titlebar.minimize')} @click=${() => void minimize()}>
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
