@@ -115,6 +115,12 @@ describe('view window: frame decoding', () => {
     expect(() => decodeViewFrame(new ArrayBuffer(4))).toThrow();
   });
 
+  // Codes 4 and 5 are `ViewStatus::NoCapture` / `NoEncoder` in view.rs.
+  it('decodes the two host-fault statuses', () => {
+    expect(decodeViewFrame(response({ status: 4, input: false, width: 0, height: 0 })).status).toBe('no-capture');
+    expect(decodeViewFrame(response({ status: 5, input: false, width: 0, height: 0 })).status).toBe('no-encoder');
+  });
+
   it('refuses an unknown status byte', () => {
     expect(() => decodeViewFrame(response({ status: 9, input: false, width: 0, height: 0 }))).toThrow();
   });
@@ -266,6 +272,23 @@ describe('view window: status overlay', () => {
     }
   });
 
+  it('says the host cannot send a picture instead of blaming the connection', () => {
+    for (const [status, fragment] of [
+      ['no-capture', 'screen capture'],
+      ['no-encoder', 'video encoder'],
+    ] as [ViewStatus, string][]) {
+      const dismissed = vi.fn();
+      render(viewOverlay(status, 'en', dismissed), container);
+      const modal = container.querySelector('[role="alertdialog"]');
+      expect(modal?.getAttribute('aria-modal')).toBe('true');
+      // The distinction that matters: this is not a lost connection.
+      expect(container.textContent).toContain(fragment);
+      expect(container.textContent).not.toContain('Connection lost');
+      container.querySelector('button')?.click();
+      expect(dismissed).toHaveBeenCalledOnce();
+    }
+  });
+
   it('makes the terminal failure a modal whose only action ends the session', () => {
     const dismissed = vi.fn();
     render(viewOverlay('failed', 'en', dismissed), container);
@@ -279,7 +302,13 @@ describe('view window: status overlay', () => {
   });
 
   for (const locale of SUPPORTED_LOCALES) {
-    for (const status of ['waiting', 'reconnecting', 'failed'] as ViewStatus[]) {
+    for (const status of [
+      'waiting',
+      'reconnecting',
+      'failed',
+      'no-capture',
+      'no-encoder',
+    ] as ViewStatus[]) {
       it(`has no axe violations (${status}, ${locale})`, async () => {
         render(viewOverlay(status, locale, noop), container);
         const results = await axe.run(container, {

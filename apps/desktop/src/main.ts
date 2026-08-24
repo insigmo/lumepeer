@@ -4,7 +4,7 @@
 // on weak hardware, so no React/Vue/Angular. The UI never decides anything —
 // it renders what the Rust core reports and forwards the host's clicks back.
 
-import { html, render } from 'lit-html';
+import { html, nothing, render, type TemplateResult } from 'lit-html';
 
 import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { consentDialog } from './consent-dialog';
@@ -35,6 +35,26 @@ let locale: Locale = detectLocale(navigator);
 let sessions: SessionStatus[] = [];
 let history: HistoryEntry[] = [];
 let networkReady = false;
+// What this machine can do about producing a picture. Both true until
+// `network_status` says otherwise, so a host that is fine shows no warning.
+let canCapture = true;
+let canEncode = true;
+
+/**
+ * Warns the operator that people they invite will see nothing.
+ *
+ * The session still connects and input still works, so this is a warning and
+ * not an error state — but it has to be on this screen: without it the only
+ * symptom is on the *guest's* screen, a minute later, as a connection failure
+ * that never happened.
+ */
+function mediaWarning(): TemplateResult | typeof nothing {
+  if (canCapture && canEncode) {
+    return nothing;
+  }
+  const key = canCapture ? 'status.noEncoder' : 'status.noCapture';
+  return html`<p class="media-warning" role="status" aria-live="polite">${t(locale, key)}</p>`;
+}
 
 // Host-side chat with one peer at a time. The panel is the same chat.ts
 // component the view window mounts; only the placement differs. The poll's
@@ -118,7 +138,7 @@ function renderNow(): void {
               </div>
             </aside>
             <main class="main-panel">
-              ${connectPanel(locale)}
+              ${mediaWarning()} ${connectPanel(locale)}
               <div class="main-divider"></div>
               ${sessionStatus(
                 activeSessions,
@@ -145,12 +165,14 @@ async function refresh(): Promise<void> {
     const [sessionResult, historyResult, networkResult, connectResult] = await Promise.all([
       invoke<SessionStatus[]>('session_status'),
       invoke<HistoryEntry[]>('connection_history'),
-      invoke<{ ready: boolean }>('network_status'),
+      invoke<{ ready: boolean; can_capture: boolean; can_encode: boolean }>('network_status'),
       invoke<{ phase: ConnectPhase; pending: boolean }>('connect_status'),
     ]);
     sessions = sessionResult;
     history = historyResult;
     networkReady = networkResult.ready;
+    canCapture = networkResult.can_capture;
+    canEncode = networkResult.can_encode;
     // The peer the drawer is open on ended its session: close rather than
     // leave a transcript poll spinning on a dead label (the poll itself stops
     // on the first IPC error, but this keeps the UI honest immediately).

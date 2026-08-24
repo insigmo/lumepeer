@@ -286,6 +286,16 @@ pub struct NetworkStatusDto {
     /// True once the local endpoint has reached a relay and is dialable
     /// from outside the LAN.
     pub ready: bool,
+    /// False when this machine has no screen-capture backend at all: it can
+    /// still accept a session, grant consent and take input, but it can never
+    /// send a picture (§18, docs/adr/0024).
+    pub can_capture: bool,
+    /// False once a session has found this machine has no video encoder.
+    ///
+    /// True until then rather than "checked and fine": an encoder is only
+    /// ever built inside a session, so nothing has been asked yet on a host
+    /// nobody has connected to.
+    pub can_encode: bool,
 }
 
 /// License state for the UI.
@@ -456,7 +466,14 @@ pub async fn invite_connect(
     Ok(())
 }
 
-/// Reports whether this host is ready to accept incoming connections.
+/// Reports whether this host is ready to accept incoming connections, and
+/// whether it can actually produce a picture if one does (§18).
+///
+/// The second part is why this command exists at all beyond the relay pill:
+/// an operator sharing their screen from a machine with no capture backend
+/// used to learn nothing, while the guest waited out a reconnect window and
+/// was then told the connection had failed. Both sides now say what is really
+/// wrong (docs/adr/0024).
 ///
 /// # Errors
 /// Rejects calls from other windows.
@@ -466,8 +483,11 @@ pub fn network_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<NetworkStatusDto, IpcError> {
     check_window(&window)?;
+    let health = state.network.media_health();
     Ok(NetworkStatusDto {
         ready: state.network.online(),
+        can_capture: health.can_capture(),
+        can_encode: health.can_encode(),
     })
 }
 

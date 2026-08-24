@@ -45,7 +45,21 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `FileAbort` and `FileChunkAck` after `ResumeHello`; added per-message
 /// limit checks in `MessageEnvelope::decode`. Existing variants kept their
 /// discriminants, so a MINOR 0 peer decodes every old message unchanged.
-pub const PROTOCOL_MINOR: u16 = 1;
+///
+/// 2: appended [`MessageKind::MediaUnavailable`] after `FileChunkAck`. A host
+/// only sends it to a guest whose `Hello` advertised
+/// [`FEATURE_MEDIA_UNAVAILABLE`], so an older peer — which would treat the
+/// unknown discriminant as malformed and close the connection (§9.1) — never
+/// sees it. See `docs/adr/0024-host-media-unavailable-wire-message.md`.
+pub const PROTOCOL_MINOR: u16 = 2;
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::MediaUnavailable`].
+///
+/// §9.1 makes unknown feature strings ignorable, which is what lets a guest
+/// advertise this to an older host with no risk; the host side of the same
+/// rule is that it must not send the message unless it saw this string.
+pub const FEATURE_MEDIA_UNAVAILABLE: &str = "media-unavailable";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -221,6 +235,31 @@ pub enum MessageKind {
         /// Number of leading bytes now durably received.
         offset: u64,
     },
+    /// Host to guest: this session will never carry a picture, and why (§18).
+    ///
+    /// Not a revoke and not an error: the control session and every grant on
+    /// it stay exactly as they are. What it ends is the guest's *waiting* —
+    /// a media pipeline that cannot start has nothing to reconnect to, so the
+    /// guest stops its recovery pass instead of sitting out the reconnect
+    /// window and then blaming the connection.
+    ///
+    /// New in minor 2, and appended last on purpose: every discriminant
+    /// before it keeps the value the golden vectors of §17.2 froze.
+    MediaUnavailable(MediaUnavailableReason),
+}
+
+/// Why a host cannot produce media (§18).
+///
+/// A closed set, not a free-text reason: this crosses onto a screen the
+/// host's operator does not control, and §15 keeps host-identifying detail
+/// (device names, driver versions, paths) off the wire. The guest turns it
+/// into localized text of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaUnavailableReason {
+    /// The host has no screen-capture backend for its platform.
+    NoCaptureBackend,
+    /// The host has no video encoder it can build.
+    NoEncoder,
 }
 
 /// Pixel geometry plus RGBA payload of one cursor shape (§11).
@@ -457,6 +496,51 @@ mod tests {
             MessageEnvelope::decode(&oversized),
             Err(CoreError::FrameSize { .. })
         ));
+    }
+
+    #[test]
+    fn media_unavailable_survives_a_roundtrip() {
+        for reason in [
+            MediaUnavailableReason::NoCaptureBackend,
+            MediaUnavailableReason::NoEncoder,
+        ] {
+            let original = envelope(MessageKind::MediaUnavailable(reason));
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    /// The new kind of minor 2 must sit *after* every kind an earlier minor
+    /// froze: the golden vectors of §17.2 encode those discriminants
+    /// literally.
+    #[test]
+    fn the_new_kind_did_not_move_an_older_discriminant() {
+        // Byte 18 is the kind discriminant: 16 session id bytes, direction,
+        // then a single-byte `seq` of 0.
+        let kind_byte = |kind| envelope(kind).encode().unwrap()[18];
+
+        assert_eq!(
+            kind_byte(MessageKind::ResumeHello {
+                session_id: [0u8; 16],
+                last_received_seq: 0,
+            }),
+            18,
+            "the last minor-0 kind moved"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::FileChunkAck {
+                transfer_id: 0,
+                offset: 0,
+            }),
+            29,
+            "the last minor-1 kind moved"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::MediaUnavailable(
+                MediaUnavailableReason::NoEncoder
+            )),
+            30,
+        );
     }
 
     #[test]
