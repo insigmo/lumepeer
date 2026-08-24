@@ -510,16 +510,9 @@ pub fn spawn_media_receiver(target: MediaTarget, slot: watch::Sender<ViewSlot>) 
         let mut ever_live = false;
 
         loop {
-            // One audio receiver per dial: it parks by itself when a host
-            // never opens an audio stream, and dies with this task when the
-            // view closes (dropping `pcm_tx` is its shutdown signal).
-            spawn_audio_receiver(
-                target.endpoint.clone(),
-                target.addr.clone(),
-                target.tag.clone(),
-                pcm_tx.clone(),
-            );
-            let produced = stream_once(&target, &slot).await;
+            // Audio rides the very connection `stream_once` dials, so its
+            // receiver is started in there, once per pass, and ends with it.
+            let produced = stream_once(&target, &slot, &pcm_tx).await;
             if slot.is_closed() {
                 // The actor tore this view down; nothing left to serve.
                 return;
@@ -565,7 +558,11 @@ fn set_status(slot: &watch::Sender<ViewSlot>, status: ViewStatus) {
 ///
 /// Returns whether at least one picture reached `slot`, which is what decides
 /// if the recovery budget is refreshed.
-async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bool {
+async fn stream_once(
+    target: &MediaTarget,
+    slot: &watch::Sender<ViewSlot>,
+    pcm: &watch::Sender<Option<Vec<i16>>>,
+) -> bool {
     let connection = match target
         .endpoint
         .connect(target.addr.clone(), lumepeer_net::ALPN_MEDIA)
@@ -584,6 +581,7 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
             return false;
         }
     };
+    let _audio = spawn_audio_pass(connection.clone(), target.tag.clone(), pcm.clone());
 
     // The sandboxed worker is spawned only once there is something to decode:
     // a session that never produces a frame must not leave a decoder process
@@ -860,51 +858,48 @@ async fn stream_audio_once(
     }
 }
 
-/// Guest side: keeps one audio session alive for the view window, redialing
-/// like the video path does. `pcm` carries the newest decoded chunk; the
-/// playback device drains it.
+/// Ends the task it owns when the media pass that started it does.
 ///
-/// Spawned once per media pass by [`spawn_media_receiver`]; it parks by
-/// itself when a host never opens an audio stream, and dies with its parent
-/// when the view closes (dropping `pcm` is the shutdown signal).
-fn spawn_audio_receiver(
-    endpoint: PeerEndpoint,
-    addr: EndpointAddr,
+/// A stream reader must never outlive the connection it reads from: a leaked
+/// one keeps a dead pass's task alive and is started again by the next pass,
+/// so passes accumulate readers instead of replacing them.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Guest side: accepts the host's tagged audio stream on the media connection
+/// the picture already rides, for as long as that pass lasts. `pcm` carries
+/// the newest decoded chunk; the playback device drains it.
+///
+/// One per media pass, started by [`stream_once`] once the picture's stream
+/// has been taken, and aborted with the pass. It parks by itself when a host
+/// never opens an audio stream — audio is opt-in on the host and may be
+/// turned on mid-session, which opens a fresh stream for exactly this
+/// purpose (§11).
+fn spawn_audio_pass(
+    connection: Connection,
     tag: String,
     pcm: watch::Sender<Option<Vec<i16>>>,
-) {
-    tokio::spawn(async move {
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
         let backoff = Duration::from_millis(MEDIA_REDIAL_BACKOFF_MS.max(1_000));
         loop {
-            // The audio stream rides the same media connection the picture
-            // uses, so the guest dials the same ALPN first (§4.1); a refused
-            // dial just means "not yet".
-            match endpoint
-                .connect(addr.clone(), lumepeer_net::ALPN_MEDIA)
-                .await
-            {
-                Ok(connection) => {
-                    let produced = stream_audio_once(&connection, &tag, &pcm).await;
-                    if pcm.is_closed() {
-                        return;
-                    }
-                    if produced {
-                        continue; // stream ended; redial immediately
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(peer = %tag, %error, "audio media dial failed");
-                    if pcm.is_closed() {
-                        return;
-                    }
-                }
+            let produced = stream_audio_once(&connection, &tag, &pcm).await;
+            if pcm.is_closed() {
+                return;
             }
-            // A video-only host: nothing will ever arrive on this dial. Park,
-            // then retry — the host may turn audio on mid-session, which opens
-            // a fresh stream for exactly this purpose (§11).
-            tokio::time::sleep(backoff).await;
+            // A stream that carried audio and then ended may be followed by
+            // another one — the host user toggling audio off and on again.
+            // One that never arrived means a video-only host: park, retry.
+            if !produced {
+                tokio::time::sleep(backoff).await;
+            }
         }
-    });
+    }))
 }
 
 #[cfg(test)]
@@ -912,6 +907,68 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
+
+    /// Audio must ride the media connection the picture already dialed
+    /// (§4.1, §11), and this is what goes wrong when it does not: a second
+    /// `rd/media/1` connection is indistinguishable, on the host, from the
+    /// same guest redialing, so the host replaces the media session — killing
+    /// the encode loop that was about to feed the picture. The guest then
+    /// redials, dials audio again, and the session never delivers a frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_media_pass_dials_one_connection() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let host = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let addr = host.addr();
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&dials);
+        let accepting = tokio::spawn(async move {
+            // Everything accepted is held: a dropped connection would end the
+            // guest's pass and start a new one, which is not what is measured
+            // here.
+            let mut held = Vec::new();
+            while let Some(Ok(connection)) = host.accept().await {
+                counted.fetch_add(1, Ordering::Relaxed);
+                let mut writer = open_media_stream(&connection).await.unwrap();
+                // One frame too short to be a picture: it opens the stream on
+                // the wire, so the guest's video path gets past `accept_uni`
+                // and starts its audio pass, without pulling a decoder worker
+                // into a unit test.
+                writer.write_frame(&[0u8]).await.unwrap();
+                held.push((connection, writer));
+            }
+        });
+
+        let (slot_tx, _slot_rx) = watch::channel(ViewSlot::waiting());
+        let receiver = spawn_media_receiver(
+            MediaTarget {
+                endpoint: guest.clone(),
+                addr,
+                tag: "test-peer".to_owned(),
+                worker: None,
+            },
+            slot_tx,
+        );
+
+        // Comfortably longer than the audio dial's own head start: it used to
+        // fire in the same breath as the video one.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            dials.load(Ordering::Relaxed),
+            1,
+            "one media pass must occupy exactly one media connection"
+        );
+
+        receiver.abort();
+        accepting.abort();
+    }
 
     #[test]
     fn a_media_payload_round_trips() {
