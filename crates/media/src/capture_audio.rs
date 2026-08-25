@@ -81,6 +81,34 @@ pub trait AudioCapturer: Send + std::fmt::Debug {
     fn stop(&mut self);
 }
 
+/// Guest-side microphone capture backend (§11; ADR 0028).
+///
+/// The same contract as [`AudioCapturer`], pointed at the microphone instead
+/// of the output mix: one trait so the guest's mic loop stays backend-agnostic
+/// exactly like the host's audio loop. A platform without a compiled-in
+/// backend refuses in [`platform_mic_capturer`], and the session runs without
+/// guest audio rather than pretending (§18).
+pub trait MicCapturer: Send + std::fmt::Debug {
+    /// Starts capturing the default microphone.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureUnavailable`] when no input device exists or the
+    /// backend was not compiled in; [`MediaError::PermissionDenied`] when the
+    /// platform refused microphone access.
+    fn start(&mut self) -> Result<()>;
+
+    /// Blocks until the next `AUDIO_FRAME_MS` chunk is available.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureInterrupted`] once the stream is gone (device
+    /// unplugged, capture stopped); the caller stops the loop on the first
+    /// one.
+    fn next_chunk(&mut self) -> Result<PcmChunk>;
+
+    /// Stops capturing. Idempotent.
+    fn stop(&mut self);
+}
+
 /// Wall-clock microseconds for capture timestamps. The monotonic instant is
 /// what orders chunks; the absolute epoch value is what the recording
 /// container stores, and a session never spans a clock adjustment large
@@ -118,6 +146,12 @@ mod windows_wasapi;
 
 #[cfg(all(target_os = "windows", feature = "audio-capture"))]
 pub use windows_wasapi::WasapiLoopbackCapturer;
+
+#[cfg(all(target_os = "windows", feature = "audio-capture"))]
+mod windows_mic;
+
+#[cfg(all(target_os = "windows", feature = "audio-capture"))]
+pub use windows_mic::WasapiMicCapturer;
 
 #[cfg(all(
     target_os = "linux",
@@ -162,6 +196,24 @@ pub fn platform_audio_capturer() -> Result<Box<dyn AudioCapturer>> {
     {
         Err(crate::error::MediaError::CaptureUnavailable(
             "no audio capture backend is compiled in for this target".to_owned(),
+        ))
+    }
+}
+
+/// Opens the microphone backend of the current platform (§11; ADR 0028).
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when no backend is compiled in for this
+/// target — the session runs without guest audio and the log says why (§18).
+pub fn platform_mic_capturer() -> Result<Box<dyn MicCapturer>> {
+    #[cfg(all(target_os = "windows", feature = "audio-capture"))]
+    {
+        Ok(Box::new(windows_mic::WasapiMicCapturer::new()))
+    }
+    #[cfg(not(all(target_os = "windows", feature = "audio-capture")))]
+    {
+        Err(crate::error::MediaError::CaptureUnavailable(
+            "no microphone backend is compiled in for this target".to_owned(),
         ))
     }
 }

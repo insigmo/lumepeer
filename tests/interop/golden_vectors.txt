@@ -55,3 +55,11 @@ invalid bad_direction_byte abababababababababababababababab0700010100
 # --- to a guest whose Hello advertised the "media-unavailable" feature string.
 valid minor2_media_unavailable_no_capture abababababababababababababababab00001e0000
 valid minor2_media_unavailable_no_encoder abababababababababababababababab00001e0100
+
+# --- Frozen for PROTOCOL_MINOR 3: the guest asking the host to deliver the
+# --- Secure Attention Sequence (docs/adr/0028). Guest to host only, and only
+# --- from a session whose input grant is live; the host answers SasAck, and
+# --- only to a guest whose Hello advertised the "remote-sas" feature string.
+valid minor3_sas_request abababababababababababababababab01001f00
+valid minor3_sas_ack_delivered abababababababababababababababab0000200100
+valid minor3_sas_ack_refused abababababababababababababababab0000200000

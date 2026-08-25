@@ -1088,6 +1088,50 @@ mod dxgi {
         pub fn display_count() -> Result<usize> {
             attached_monitors().map(|monitors| monitors.len())
         }
+
+        /// Every display this host can capture, in the order
+        /// [`CaptureTarget::Display`] indexes (§11 `MonitorsList`; ADR 0028).
+        ///
+        /// # Errors
+        /// [`MediaError::CaptureUnavailable`] if DXGI cannot be reached at all.
+        pub fn attached_monitors_info() -> Result<Vec<crate::capture::HostMonitor>> {
+            let monitors = attached_monitors()?;
+            Ok(monitors
+                .iter()
+                .enumerate()
+                .map(|(index, monitor)| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "enumeration index, far below u32::MAX"
+                    )]
+                    crate::capture::HostMonitor {
+                        id: index as u32,
+                        // DesktopCoordinates are i32 RECT edges; a monitor
+                        // rectangle is non-degenerate, and saturating on the
+                        // subtraction keeps a broken driver report a zero
+                        // size instead of a wrapped one.
+                        width: u32::try_from(
+                            monitor
+                                .desc
+                                .DesktopCoordinates
+                                .right
+                                .saturating_sub(monitor.desc.DesktopCoordinates.left),
+                        )
+                        .unwrap_or(0),
+                        height: u32::try_from(
+                            monitor
+                                .desc
+                                .DesktopCoordinates
+                                .bottom
+                                .saturating_sub(monitor.desc.DesktopCoordinates.top),
+                        )
+                        .unwrap_or(0),
+                        primary: monitor.is_primary(),
+                    }
+                })
+                .collect())
+        }
     }
 
     impl ScreenCapturer for WindowsCapturer {
@@ -1715,6 +1759,22 @@ mod stub {
         #[must_use]
         pub const fn new() -> Self {
             Self { _private: () }
+        }
+
+        /// Not built in: the stub cannot enumerate anything (ADR 0028).
+        ///
+        /// # Errors
+        /// Always [`MediaError::CaptureUnavailable`].
+        pub fn attached_monitors_info() -> Result<Vec<crate::capture::HostMonitor>> {
+            Err(not_built_in())
+        }
+
+        /// Not built in: the stub cannot enumerate anything (ADR 0028).
+        ///
+        /// # Errors
+        /// Always [`MediaError::CaptureUnavailable`].
+        pub fn display_count() -> Result<usize> {
+            Err(not_built_in())
         }
     }
 

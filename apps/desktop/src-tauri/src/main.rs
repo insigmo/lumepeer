@@ -105,6 +105,11 @@ fn main() {
             commands::clipboard_pull,
             commands::audio_toggle,
             commands::recording_toggle,
+            commands::mic_toggle,
+            commands::sas_request,
+            commands::sas_available,
+            commands::monitor_select,
+            commands::monitors_list,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

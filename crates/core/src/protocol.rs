@@ -51,7 +51,14 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// [`FEATURE_MEDIA_UNAVAILABLE`], so an older peer — which would treat the
 /// unknown discriminant as malformed and close the connection (§9.1) — never
 /// sees it. See `docs/adr/0024-host-media-unavailable-wire-message.md`.
-pub const PROTOCOL_MINOR: u16 = 2;
+///
+/// 3: appended [`MessageKind::SasRequest`] after `MediaUnavailable`. A guest
+/// sends it only when it holds the `input` grant, and the host only acts on
+/// it from a session whose `input` grant is live — the same per-event
+/// re-check every injected key gets (§8.1). A host that cannot honor it
+/// answers [`MessageKind::SasAck`] with `false` rather than staying silent.
+/// See `docs/adr/0028-remote-sas-and-view-toolbar.md`.
+pub const PROTOCOL_MINOR: u16 = 3;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -60,6 +67,15 @@ pub const PROTOCOL_MINOR: u16 = 2;
 /// advertise this to an older host with no risk; the host side of the same
 /// rule is that it must not send the message unless it saw this string.
 pub const FEATURE_MEDIA_UNAVAILABLE: &str = "media-unavailable";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::SasAck`].
+///
+/// Same compatibility shape as [`FEATURE_MEDIA_UNAVAILABLE`]: a host must
+/// never send the ack to a peer that did not advertise the string, because
+/// that peer decodes the unknown discriminant as malformed and closes the
+/// connection (§9.1).
+pub const FEATURE_REMOTE_SAS: &str = "remote-sas";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -246,6 +262,27 @@ pub enum MessageKind {
     /// New in minor 2, and appended last on purpose: every discriminant
     /// before it keeps the value the golden vectors of §17.2 froze.
     MediaUnavailable(MediaUnavailableReason),
+    /// Guest to host: deliver the Secure Attention Sequence (Ctrl+Alt+Del)
+    /// to the host user (§11). New in minor 3.
+    ///
+    /// The host treats this like any other input event: it is acted on only
+    /// from a session whose `input` grant is live right now, and the host
+    /// answers [`MessageKind::SasAck`] saying whether it actually managed to
+    /// synthesize the sequence — on a platform with no SAS mechanism the
+    /// answer is an honest `false`, never a silent success.
+    SasRequest,
+    /// Host to guest: the answer to [`MessageKind::SasRequest`] (§11). New
+    /// in minor 3.
+    ///
+    /// `true` means the sequence was delivered to the host OS; `false` means
+    /// it was refused or is impossible here (no SAS mechanism, no `input`
+    /// grant, non-Windows host). Sent only to a guest whose `Hello`
+    /// advertised [`FEATURE_REMOTE_SAS`], for the same minor-version reason
+    /// `MediaUnavailable` rides behind its feature string.
+    SasAck {
+        /// Whether the sequence reached the host OS.
+        delivered: bool,
+    },
 }
 
 /// Why a host cannot produce media (§18).
@@ -540,6 +577,11 @@ mod tests {
                 MediaUnavailableReason::NoEncoder
             )),
             30,
+        );
+        assert_eq!(
+            kind_byte(MessageKind::SasRequest),
+            31,
+            "the minor-3 kind must be appended after MediaUnavailable"
         );
     }
 

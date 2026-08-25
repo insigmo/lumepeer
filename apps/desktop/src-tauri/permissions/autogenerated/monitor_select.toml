@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-monitor-select"
+description = "Enables the monitor_select command without any pre-configured scope."
+commands.allow = ["monitor_select"]
+
+[[permission]]
+identifier = "deny-monitor-select"
+description = "Denies the monitor_select command without any pre-configured scope."
+commands.deny = ["monitor_select"]

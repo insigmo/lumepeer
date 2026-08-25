@@ -23,8 +23,9 @@ pub use connection::{
 pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, PeerEndpoint};
 pub use error::{NetError, Result};
 pub use media::{
-    MediaFrameReader, MediaFrameWriter, STREAM_AUDIO, STREAM_VIDEO, accept_audio_media_stream,
-    accept_media_stream, check_media_frame_length, decode_audio_payload, encode_audio_payload,
-    open_media_stream, open_tagged_media_stream,
+    MediaFrameReader, MediaFrameWriter, STREAM_AUDIO, STREAM_MIC, STREAM_VIDEO,
+    accept_audio_media_stream, accept_media_stream, accept_tagged_media_stream,
+    check_media_frame_length, decode_audio_payload, encode_audio_payload, open_media_stream,
+    open_tagged_media_stream,
 };
 pub use ticket::InviteTicket;
