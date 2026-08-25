@@ -72,7 +72,22 @@ export type TranslationKey =
   | 'chat.inputPlaceholder'
   | 'chat.send'
   | 'chat.open'
-  | 'chat.close';
+  | 'chat.close'
+  | 'toolbar.dragHandle'
+  | 'toolbar.settings'
+  | 'toolbar.settings.resolution'
+  | 'toolbar.settings.placeholder'
+  | 'toolbar.resolution.native'
+  | 'toolbar.resolution.1080p'
+  | 'toolbar.resolution.720p'
+  | 'toolbar.monitors'
+  | 'toolbar.monitors.empty'
+  | 'toolbar.monitors.entry'
+  | 'toolbar.chat'
+  | 'toolbar.mic'
+  | 'toolbar.cad'
+  | 'toolbar.collapse'
+  | 'toolbar.expand';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -148,6 +163,21 @@ const en: Dictionary = {
   'chat.send': 'Send',
   'chat.open': 'Chat',
   'chat.close': 'Close chat',
+  'toolbar.dragHandle': 'Drag toolbar',
+  'toolbar.settings': 'Settings',
+  'toolbar.settings.resolution': 'Screen resolution',
+  'toolbar.settings.placeholder': 'More settings are on the way.',
+  'toolbar.resolution.native': 'Native',
+  'toolbar.resolution.1080p': '1080p',
+  'toolbar.resolution.720p': '720p',
+  'toolbar.monitors': 'Choose screen',
+  'toolbar.monitors.empty': 'The host has not announced any screens yet.',
+  'toolbar.monitors.entry': (arg) => `Screen ${arg}`,
+  'toolbar.chat': 'Chat',
+  'toolbar.mic': 'Microphone',
+  'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.collapse': 'Collapse',
+  'toolbar.expand': 'Expand',
 };
 
 const ar: Dictionary = {
@@ -222,6 +252,21 @@ const ar: Dictionary = {
   'chat.send': 'إرسال',
   'chat.open': 'المحادثة',
   'chat.close': 'إغلاق المحادثة',
+  'toolbar.dragHandle': 'اسحب شريط الأدوات',
+  'toolbar.settings': 'الإعدادات',
+  'toolbar.settings.resolution': 'دقة الشاشة',
+  'toolbar.settings.placeholder': 'المزيد من الإعدادات قادم.',
+  'toolbar.resolution.native': 'الأصلية',
+  'toolbar.resolution.1080p': '1080p',
+  'toolbar.resolution.720p': '720p',
+  'toolbar.monitors': 'اختيار الشاشة',
+  'toolbar.monitors.empty': 'لم يعلن المضيف عن أي شاشات بعد.',
+  'toolbar.monitors.entry': (arg) => `الشاشة ${arg}`,
+  'toolbar.chat': 'المحادثة',
+  'toolbar.mic': 'الميكروفون',
+  'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.collapse': 'طي',
+  'toolbar.expand': 'توسيع',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

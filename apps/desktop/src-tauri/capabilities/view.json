@@ -18,6 +18,13 @@
     "allow-input-pointer-move",
     "allow-input-press",
     "allow-input-wheel",
+    "allow-chat-send",
+    "allow-chat-transcript",
+    "allow-mic-toggle",
+    "allow-sas-request",
+    "allow-sas-available",
+    "allow-monitor-select",
+    "allow-monitors-list",
     "allow-session-revoke"
   ]
 }

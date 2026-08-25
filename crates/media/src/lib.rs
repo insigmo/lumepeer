@@ -33,7 +33,9 @@ pub mod decode;
 pub mod encode;
 pub mod error;
 pub mod jitter;
+pub mod playout;
 pub mod record;
+pub mod sas;
 pub mod scale;
 
 pub use error::{MediaError, Result};

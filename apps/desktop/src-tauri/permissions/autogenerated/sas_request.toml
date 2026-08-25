@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sas-request"
+description = "Enables the sas_request command without any pre-configured scope."
+commands.allow = ["sas_request"]
+
+[[permission]]
+identifier = "deny-sas-request"
+description = "Denies the sas_request command without any pre-configured scope."
+commands.deny = ["sas_request"]

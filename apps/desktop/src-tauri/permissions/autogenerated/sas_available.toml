@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sas-available"
+description = "Enables the sas_available command without any pre-configured scope."
+commands.allow = ["sas_available"]
+
+[[permission]]
+identifier = "deny-sas-available"
+description = "Denies the sas_available command without any pre-configured scope."
+commands.deny = ["sas_available"]

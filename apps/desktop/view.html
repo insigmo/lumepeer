@@ -107,6 +107,111 @@
         background: #1c1c22;
         box-shadow: 0 0 0 100vmax rgb(0 0 0 / 60%);
       }
+      /* Floating session toolbar (§11). Sits on top of the picture, follows
+         the drag handle, and collapses to a single pill. */
+      #toolbar-root {
+        position: absolute;
+        z-index: 30;
+      }
+      .toolbar {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.15rem;
+        padding: 0.2rem;
+        background: rgb(16 16 20 / 88%);
+        border: 1px solid rgb(255 255 255 / 18%);
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+      }
+      .toolbar-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2rem;
+        height: 2rem;
+        padding: 0;
+        background: transparent;
+        color: #f2f2f5;
+        border: none;
+        border-radius: 0.35rem;
+        cursor: pointer;
+      }
+      .toolbar-btn:hover:not(.is-disabled) {
+        background: rgb(255 255 255 / 12%);
+      }
+      .toolbar-btn:focus-visible {
+        outline: 2px solid #9fd0ff;
+        outline-offset: 1px;
+      }
+      .toolbar-btn.is-active {
+        background: rgb(159 208 255 / 22%);
+      }
+      .toolbar-btn.is-disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .toolbar-handle {
+        cursor: grab;
+      }
+      .toolbar-handle:active {
+        cursor: grabbing;
+      }
+      .toolbar svg {
+        width: 1.1rem;
+        height: 1.1rem;
+        pointer-events: none;
+      }
+      .toolbar-pop {
+        position: absolute;
+        inset-block-start: calc(100% + 0.4rem);
+        inset-inline-start: 0;
+        min-width: 12rem;
+        padding: 0.6rem;
+        background: rgb(16 16 20 / 96%);
+        border: 1px solid rgb(255 255 255 / 18%);
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+        font-size: 0.85rem;
+      }
+      .toolbar-pop-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+      }
+      .toolbar-pop-note {
+        margin: 0.5rem 0 0;
+        color: #9a9aa5;
+        font-size: 0.75rem;
+      }
+      .toolbar-monitor-list {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 0.25rem;
+      }
+      .toolbar-monitor-size {
+        color: #9a9aa5;
+        margin-inline-start: 0.4rem;
+        font-size: 0.75rem;
+      }
+      .toolbar-monitor-list button {
+        width: 100%;
+        text-align: start;
+        padding: 0.35rem 0.5rem;
+        background: transparent;
+        color: inherit;
+        border: 1px solid transparent;
+        border-radius: 0.35rem;
+        cursor: pointer;
+      }
+      .toolbar-monitor-list button:hover {
+        background: rgb(255 255 255 / 12%);
+      }
+      .toolbar-monitor-list button.is-active {
+        border-color: #9fd0ff;
+      }
     </style>
   </head>
   <body>
@@ -114,6 +219,7 @@
       <canvas id="screen" width="1" height="1"></canvas>
       <div id="overlay"></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>
+      <div id="toolbar-root"></div>
     </main>
     <script type="module" src="/src/view.ts"></script>
   </body>

@@ -874,3 +874,134 @@ pub async fn recording_toggle(
     state.network.record_toggle(args.peer, args.path).await?;
     Ok(())
 }
+
+#[derive(Debug, Deserialize)]
+pub struct MicToggleArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// `true` starts the guest's microphone stream (§11; ADR 0028), `false`
+    /// stops it.
+    pub on: bool,
+}
+
+/// Guest side: turns the view window's own microphone towards the watched
+/// host on or off (§11; ADR 0028).
+///
+/// View-window-only by construction — the toolbar lives there — and gated
+/// inside the actor on a live session with a live `input` grant: a guest
+/// whose role was lowered mid-flight cannot open a new mic stream, and an
+/// already-open one is stopped by the actor on the same check.
+///
+/// # Errors
+/// [`IpcError`] when unallowed or refused for lack of the grant.
+#[tauri::command]
+pub async fn mic_toggle(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: MicToggleArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state.network.mic_toggle(args.peer, args.on).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SasRequestArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+}
+
+/// Guest side: asks the watched host to deliver Ctrl+Alt+Del to its user
+/// (§11; ADR 0028).
+///
+/// The `input` grant is re-checked on both sides — here to refuse early, and
+/// on the host authoritatively, per request. The answer arrives on the wire
+/// as `SasAck` and is surfaced in the toolbar; this command's `Ok` only says
+/// the request went out.
+///
+/// # Errors
+/// [`IpcError`] when unallowed or refused for lack of the grant.
+#[tauri::command]
+pub async fn sas_request(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: SasRequestArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state.network.sas_request(args.peer).await?;
+    Ok(())
+}
+
+/// Whether this platform can attempt to deliver the Secure Attention
+/// Sequence at all (§11; ADR 0028). The toolbar grays the button out on a
+/// `false` instead of letting someone press it into a dead end.
+#[tauri::command]
+pub fn sas_available() -> bool {
+    lumepeer_media::sas::sas_available()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MonitorSelectArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Monitor id as announced in `MonitorsList` (§11).
+    pub monitor_id: u32,
+}
+
+/// Guest side: picks which of the host's monitors to watch (§11; ADR 0028).
+///
+/// The host re-checks the `view` grant and the id's range; the next picture
+/// this window receives simply shows the new monitor.
+///
+/// # Errors
+/// [`IpcError`] when unallowed or the id names no announced monitor.
+#[tauri::command]
+pub async fn monitor_select(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: MonitorSelectArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .monitor_select(args.peer, args.monitor_id)
+        .await?;
+    Ok(())
+}
+
+/// DTO of one monitor of the watched host (§11 `MonitorsList`).
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorDto {
+    /// Host-assigned stable id a `monitor_select` call passes back.
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Whether this is the host's primary display.
+    pub primary: bool,
+}
+
+/// Guest side: asks the watched host to announce its monitors and returns
+/// the list (§11; ADR 0028).
+///
+/// # Errors
+/// [`IpcError`] when unallowed or the actor refuses.
+#[tauri::command]
+pub async fn monitors_list(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<Vec<MonitorDto>, IpcError> {
+    check_view_window(&window, &peer)?;
+    let monitors = state.network.monitors_list(peer).await?;
+    Ok(monitors
+        .into_iter()
+        .map(|monitor| MonitorDto {
+            id: monitor.id,
+            width: monitor.width,
+            height: monitor.height,
+            primary: monitor.primary,
+        })
+        .collect())
+}

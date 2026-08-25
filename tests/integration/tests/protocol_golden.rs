@@ -72,7 +72,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 2,
+        PROTOCOL_MINOR, 3,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 

@@ -25,7 +25,7 @@ use lumepeer_core::constants::{
     DIAL_RETRY_BACKOFF_MS, INCOMING_ACCEPT_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES,
 };
 use lumepeer_core::protocol::{
-    FEATURE_MEDIA_UNAVAILABLE, InputEventPayload, MediaUnavailableReason, MessageKind,
+    FEATURE_MEDIA_UNAVAILABLE, InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::{CoreError, NodeId};
@@ -290,6 +290,35 @@ enum ActorCommand {
     RecordOff {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: ask the host to deliver the Secure Attention Sequence
+    /// (Ctrl+Alt+Del) to its user (§11; ADR 0028). The host answers on the
+    /// wire with `SasAck`, and the reply here only says the request went out
+    /// from a session shape that could carry it.
+    SasRequest {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: turn the view window's own microphone towards `label`'s
+    /// host on or off (§11; ADR 0028). Requires a live session with a live
+    /// `input` grant.
+    MicToggle {
+        label: String,
+        on: bool,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: retarget capture at the monitor `label`'s guest picked
+    /// (§11 `MonitorSelect`; ADR 0028). Requires a live `view` grant.
+    MonitorSelect {
+        label: String,
+        monitor_id: u32,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: announce this host's monitors to `label`'s guest
+    /// (§11 `MonitorsList`; ADR 0028). The reply carries what was sent.
+    MonitorsList {
+        label: String,
+        reply: oneshot::Sender<Result<Vec<MonitorInfo>, ActorError>>,
     },
 }
 
@@ -599,6 +628,77 @@ impl ActorHandle {
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
+
+    /// Guest side: asks the host to deliver the Secure Attention Sequence
+    /// (§11; ADR 0028). The `Ok(())` here only means the request was sent
+    /// from a session that could carry it; whether the host actually
+    /// synthesized the sequence arrives on the wire as `SasAck` and is
+    /// surfaced in the view window's own UI.
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without a granted session with a
+    /// live `input` grant; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn sas_request(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::SasRequest { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: retargets capture at `monitor_id` for `label`'s session
+    /// (§11 `MonitorSelect`; ADR 0028). The guest learns nothing back on this
+    /// call — the next picture it receives simply shows the new monitor.
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without a granted view session;
+    /// [`ActorError::Core::Malformed`] when the id names no announced monitor;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn monitor_select(&self, label: String, monitor_id: u32) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::MonitorSelect {
+                label,
+                monitor_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: announces this host's monitors to `label`'s guest
+    /// (§11 `MonitorsList`; ADR 0028). Returns the list that was sent, so the
+    /// caller can show the same numbers the guest will see.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] without a live session;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn monitors_list(&self, label: String) -> Result<Vec<MonitorInfo>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::MonitorsList { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: turns the view window's own microphone towards `label`'s
+    /// host on or off (§11; ADR 0028). Gated inside the actor on a live
+    /// session with a live `input` grant.
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] without a granted session with a
+    /// live `input` grant; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn mic_toggle(&self, label: String, on: bool) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::MicToggle { label, on, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
 }
 
 /// Current Unix time in whole seconds; 0 if the clock is before the epoch.
@@ -668,6 +768,10 @@ struct ConnectionHandle {
     /// an undecodable frame closes the connection (§9.1). Always false on the
     /// guest side, which never sends the message at all.
     announces_media_faults: bool,
+    /// Whether this peer's `Hello` advertised `FEATURE_REMOTE_SAS`, the same
+    /// gate for `MessageKind::SasAck` (§9.1; ADR 0028). Always false on the
+    /// host side, which never sends the request.
+    speaks_remote_sas: bool,
 }
 
 /// Host side: one running capture/encode loop, plus the connection it writes
@@ -724,6 +828,24 @@ impl AudioSession {
     }
 }
 
+/// Host side: one guest-microphone playout loop, with its own stop flag
+/// (§11; ADR 0028).
+///
+/// The guest opens the tagged `M` media stream when its user turns the mic
+/// on; this side accepts it, decodes Opus and pushes PCM into the speakers.
+/// Opt-out is the stream ending (the guest turned the mic off), which the
+/// accept loop notices by itself; the entry here only bounds the task.
+struct MicSession {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MicSession {
+    /// Ends the playout loop.
+    fn stop(self) {
+        self.task.abort();
+    }
+}
+
 /// Guest side: one open remote-view window and the pipeline feeding it.
 struct ViewState {
     /// Tauri window label, `view-{peer label}`.
@@ -748,6 +870,28 @@ struct ViewState {
     /// (docs/adr/0024).
     slot_tx: Arc<watch::Sender<ViewSlot>>,
     task: tokio::task::JoinHandle<()>,
+    /// The media connection the picture rides. Written by the media task
+    /// once dialed, read by the mic toggle; `None` until the first dial
+    /// lands and after the media task ends.
+    media_connection: Arc<std::sync::Mutex<Option<iroh::endpoint::Connection>>>,
+}
+
+impl ViewState {
+    /// The media connection the picture rides, for a second tagged stream
+    /// (the guest's own microphone; §11; ADR 0028).
+    ///
+    /// The mic stream must ride the *same* `rd/media/1` connection as the
+    /// picture: a second connection is indistinguishable on the host from a
+    /// redial, and the host's accept path would replace the encode loop
+    /// (§4.1). `None` means the media task has not landed a dial yet — the
+    /// toolbar's mic press is refused and can be pressed again once a
+    /// picture is showing.
+    fn media_connection(&self) -> Option<iroh::endpoint::Connection> {
+        self.media_connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// What a spawned per-connection task reports back to the main loop.
@@ -761,6 +905,9 @@ enum ActorEvent {
         ticket: InviteTicket,
         /// Whether the guest's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
         announces_media_faults: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_REMOTE_SAS`
+        /// (§9.1; ADR 0028).
+        speaks_remote_sas: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -804,6 +951,9 @@ enum Accepted {
         ticket: Box<InviteTicket>,
         /// Whether the guest's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
         announces_media_faults: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_REMOTE_SAS`
+        /// (§9.1; ADR 0028).
+        speaks_remote_sas: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -852,6 +1002,14 @@ struct Actor {
     /// Opt-in per §11's `AudioStart`; dies with the session like everything
     /// else per-peer.
     audio: std::collections::HashMap<NodeId, AudioSession>,
+    /// Host side: one guest-mic playout loop per peer the guest enabled their
+    /// microphone for (§11; ADR 0028). The guest opens the tagged `M` media
+    /// stream; this side accepts it and plays it on the speakers.
+    guest_mic: std::collections::HashMap<NodeId, MicSession>,
+    /// Whether this peer's `Hello` advertised `FEATURE_REMOTE_SAS`, so a
+    /// `SasAck` may be sent back to it (§9.1: never send what an older minor
+    /// would decode as malformed).
+    speaks_remote_sas: std::collections::HashSet<NodeId>,
     /// Host side: live session recordings keyed by peer (§17). Gated on the
     /// independent `recording` grant; flushed and dropped when the session
     /// ends so no recorder can outlive what it was allowed to record.
@@ -1034,10 +1192,12 @@ impl Actor {
                     peer,
                     ticket,
                     announces_media_faults,
+                    speaks_remote_sas,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
                     announces_media_faults,
+                    speaks_remote_sas,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -1056,7 +1216,13 @@ impl Actor {
     /// This is what makes a stored connection *live* rather than merely
     /// retained: without the reader, nothing would ever observe a
     /// `ConsentGrant` on the guest side or a closed stream on either side.
-    fn adopt(&mut self, connection: ControlConnection, peer: NodeId, announces_media_faults: bool) {
+    fn adopt(
+        &mut self,
+        connection: ControlConnection,
+        peer: NodeId,
+        announces_media_faults: bool,
+        speaks_remote_sas: bool,
+    ) {
         self.next_connection_id = self.next_connection_id.wrapping_add(1);
         let id = self.next_connection_id;
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
@@ -1110,6 +1276,7 @@ impl Actor {
                 outbound: outbound_tx,
                 connection: quic,
                 announces_media_faults,
+                speaks_remote_sas,
             },
         );
     }
@@ -1135,7 +1302,15 @@ impl Actor {
                 peer,
                 ticket,
                 announces_media_faults,
-            } => self.on_handshaked(*connection, peer, &ticket, announces_media_faults),
+                speaks_remote_sas,
+            } => {
+                if speaks_remote_sas {
+                    self.speaks_remote_sas.insert(peer);
+                } else {
+                    self.speaks_remote_sas.remove(&peer);
+                }
+                self.on_handshaked(*connection, peer, &ticket, announces_media_faults);
+            }
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
             ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
             ActorEvent::MediaAccepted { connection, peer } => {
@@ -1195,7 +1370,7 @@ impl Actor {
             connection.clone(),
             Arc::clone(&self.capture),
             Arc::clone(&recorder),
-            tag,
+            tag.clone(),
             peer,
             self.faults_tx.clone(),
         );
@@ -1203,10 +1378,14 @@ impl Actor {
             peer,
             MediaSession {
                 task,
-                connection,
+                connection: connection.clone(),
                 recorder,
             },
         );
+        // The guest-mic pass rides the same connection and parks until the
+        // guest actually opens its tagged `M` stream (§11; ADR 0028); it is
+        // bounded by the media session's own lifetime.
+        crate::view::spawn_guest_mic_pass(connection, tag);
     }
 
     /// Host side: an encode loop found it cannot produce a picture at all.
@@ -1282,6 +1461,9 @@ impl Actor {
         if let Some(session) = self.audio.remove(&peer) {
             session.stop();
         }
+        if let Some(session) = self.guest_mic.remove(&peer) {
+            session.stop();
+        }
         if let Some(recorder) = self.recorders.remove(&peer) {
             recorder.write_event(0, r#"{"event":"record-stop","reason":"session-end"}"#);
             let clean = recorder.stop();
@@ -1322,12 +1504,18 @@ impl Actor {
         // it, and the actor writes the one status that does not come from the
         // media pipeline at all (`MediaUnavailable`, docs/adr/0024).
         let slot_tx = Arc::new(slot_tx);
+        // The media connection lands here once the media task dials, so the
+        // mic toggle can open its tagged stream on the *same* `rd/media/1`
+        // the picture uses (§4.1; ADR 0028).
+        let media_connection: Arc<std::sync::Mutex<Option<iroh::endpoint::Connection>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let task = spawn_media_receiver(
             MediaTarget {
                 endpoint: self.endpoint.clone(),
                 addr,
                 tag: tag.clone(),
                 worker: None,
+                connection_cell: Arc::clone(&media_connection),
             },
             Arc::clone(&slot_tx),
         );
@@ -1355,6 +1543,7 @@ impl Actor {
                 slot: slot_rx,
                 slot_tx,
                 task,
+                media_connection,
             },
         );
         self.windows.open(&label, &tag, grants.input);
@@ -1469,6 +1658,8 @@ impl Actor {
         ticket: &InviteTicket,
         announces_media_faults: bool,
     ) {
+        // `speaks_remote_sas` is already recorded by `handle_event` before
+        // this runs; the parameter list stays untouched here.
         let tag = self.label_of(&peer);
         // Single-use enforcement runs here, on the actor's own thread, so two
         // connections racing the same ticket cannot both win it.
@@ -1490,16 +1681,31 @@ impl Actor {
             return;
         }
         tracing::info!(peer = %tag, "consent request queued");
-        self.adopt(connection, peer, announces_media_faults);
+        self.adopt(
+            connection,
+            peer,
+            announces_media_faults,
+            self.speaks_remote_sas.contains(&peer),
+        );
         let _ = self.notify.send(ActorNotification::ConsentRequested);
         self.rebuild_labels_and_snapshot();
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per message kind reads best; splitting arms into \
+                  helper fns would scatter the protocol across the file"
+    )]
     fn on_inbound(&mut self, peer: NodeId, id: u64, kind: &MessageKind) {
         if self.connections.get(&peer).is_none_or(|c| c.id != id) {
             return;
         }
         let tag = self.label_of(&peer);
+        #[allow(
+            clippy::too_many_lines,
+            reason = "one arm per message kind reads best; splitting arms into \
+                      helper fns would scatter the protocol across the file"
+        )]
         match *kind {
             // Guest side: the host decided.
             MessageKind::ConsentGrant(role) => {
@@ -1580,9 +1786,76 @@ impl Actor {
             }
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
+            // Host side: the guest asks for the Secure Attention Sequence
+            // (§11; ADR 0028). Same per-event re-check as every injected key:
+            // only a live `input` grant acts, everything else is refused.
+            MessageKind::SasRequest => {
+                let permitted = self.sessions.authorize_input(
+                    &peer,
+                    &InputEventPayload {
+                        logical: 0,
+                        scancode: 0,
+                        modifiers: 0,
+                        detail: lumepeer_core::protocol::InputDetail::Press,
+                    },
+                );
+                if permitted.is_err() {
+                    tracing::warn!(peer = %tag, "SAS request without a live input grant; refused");
+                    self.send_sas_ack(peer, false);
+                    return;
+                }
+                match lumepeer_media::sas::send_sas() {
+                    Ok(()) => {
+                        tracing::info!(peer = %tag, "SAS delivered on the guest's request");
+                        self.send_sas_ack(peer, true);
+                    }
+                    Err(reason) => {
+                        tracing::warn!(peer = %tag, %reason, "SAS refused by the host OS");
+                        self.send_sas_ack(peer, false);
+                    }
+                }
+            }
+            // Host side: the guest picked a monitor to watch (§11; ADR 0028).
+            // The id must name a monitor this host announced; anything else is
+            // a malformed request and is dropped with a log line.
+            MessageKind::MonitorSelect { monitor_id } => {
+                if self.media.contains_key(&peer) {
+                    match self.on_monitor_select(&self.label_of(&peer), monitor_id) {
+                        Ok(()) => tracing::info!(peer = %tag, monitor_id, "capture retargeted"),
+                        Err(error) => tracing::warn!(
+                            peer = %tag,
+                            monitor_id,
+                            ?error,
+                            "monitor select refused"
+                        ),
+                    }
+                } else {
+                    tracing::debug!(peer = %tag, monitor_id, "monitor select without a media session");
+                }
+            }
             // Everything else belongs to a phase this build does not run yet.
             // Nothing a peer sends may ever grant itself consent (§2.3).
             ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
+        }
+    }
+
+    /// Sends `SasAck` to `peer`, but only if its `Hello` advertised
+    /// [`lumepeer_core::protocol::FEATURE_REMOTE_SAS`] — an older guest would
+    /// decode the unknown discriminant as malformed and close the connection
+    /// (§9.1).
+    fn send_sas_ack(&mut self, peer: NodeId, delivered: bool) {
+        if self
+            .connections
+            .get(&peer)
+            .is_some_and(|c| c.speaks_remote_sas)
+        {
+            self.send_to(&peer, MessageKind::SasAck { delivered });
+        } else {
+            tracing::debug!(
+                peer = %self.label_of(&peer),
+                delivered,
+                "not acking: this guest does not speak remote-sas"
+            );
         }
     }
 
@@ -1697,6 +1970,22 @@ impl Actor {
             }
             ActorCommand::RecordOff { label, reply } => {
                 let _ = reply.send(self.on_record_toggle(&label, None));
+            }
+            ActorCommand::SasRequest { label, reply } => {
+                let _ = reply.send(self.on_sas_request(&label));
+            }
+            ActorCommand::MicToggle { label, on, reply } => {
+                let _ = reply.send(self.on_mic_toggle(&label, on));
+            }
+            ActorCommand::MonitorSelect {
+                label,
+                monitor_id,
+                reply,
+            } => {
+                let _ = reply.send(self.on_monitor_select(&label, monitor_id));
+            }
+            ActorCommand::MonitorsList { label, reply } => {
+                let _ = reply.send(self.on_monitors_list(&label));
             }
         }
     }
@@ -1814,6 +2103,156 @@ impl Actor {
             tracing::info!(peer = %label, "audio streaming disabled");
         }
         Ok(())
+    }
+
+    /// Guest side: turns the view window's own microphone towards `label`'s
+    /// host on or off (§11; ADR 0028).
+    ///
+    /// The mic is an *input* surface — it carries the guest user's voice, not
+    /// the host's screen — so it is gated on the same live `input` grant the
+    /// keyboard and pointer use, re-checked here at toggle time and by the
+    /// host per request. The stream rides the media connection the picture
+    /// already dialed; without one there is nothing to ride, which is the
+    /// same refusal `audio_toggle` gives.
+    fn on_mic_toggle(&mut self, label: &str, on: bool) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        // The guest's own microphone is a surface that feeds the host, so it
+        // is gated exactly like [`Self::on_input`] (§8.1): a view-only grant
+        // may watch but not speak.
+        let permitted = self
+            .views
+            .get(&peer)
+            .ok_or(ActorError::UnknownPeer)?
+            .grants
+            .input;
+        if !permitted {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        if on {
+            if self.guest_mic.contains_key(&peer) {
+                return Ok(()); // already streaming; idempotent
+            }
+            let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+            // The mic stream rides the media connection the picture already
+            // dialed (§4.1); without one there is nothing to ride yet, and
+            // the toolbar's press is refused — a picture showing means the
+            // cell is populated.
+            let Some(connection) = view.media_connection() else {
+                tracing::debug!(peer = %label, "no media connection yet: mic press refused");
+                return Err(ActorError::UnknownPeer);
+            };
+            let task = crate::view::spawn_mic_loop(connection, self.label_of(&peer));
+            self.guest_mic.insert(peer, MicSession { task });
+            tracing::info!(peer = %label, "guest microphone streaming enabled");
+        } else if let Some(session) = self.guest_mic.remove(&peer) {
+            session.stop();
+            tracing::info!(peer = %label, "guest microphone streaming disabled");
+        }
+        Ok(())
+    }
+
+    /// Guest side: forwards the toolbar's Ctrl+Alt+Del request to the host
+    /// being watched (§11; ADR 0028).
+    ///
+    /// Gated exactly like [`Self::on_input`]: the host re-checks the `input`
+    /// grant per event, but this side refuses to even send without a live
+    /// session that believes it holds the grant. Whether the host actually
+    /// synthesized the sequence arrives as `SasAck` on the wire; this reply
+    /// only covers the send itself.
+    fn on_sas_request(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let permitted = self.sessions.authorize_input(
+            &peer,
+            &InputEventPayload {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: lumepeer_core::protocol::InputDetail::Press,
+            },
+        );
+        if permitted.is_err() {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        self.send_to(&peer, MessageKind::SasRequest);
+        Ok(())
+    }
+
+    /// Host side: retargets capture at `monitor_id` for `label`'s guest
+    /// (§11 `MonitorSelect`; ADR 0028).
+    ///
+    /// The id must be one of this host's own monitors, counted in the same
+    /// DXGI order the announcement uses. Retargeting restarts the capturer on
+    /// the new display; the running encode loop simply picks the new geometry
+    /// up on its next frame, exactly as it would if the user had changed the
+    /// display resolution.
+    fn on_monitor_select(&mut self, label: &str, monitor_id: u32) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        let count = crate::view::host_display_count().map_err(|error| {
+            tracing::warn!(peer = %label, %error, "cannot enumerate this host's monitors");
+            ActorError::Core(CoreError::Malformed)
+        })?;
+        if usize::try_from(monitor_id).is_ok_and(|index| index >= count) {
+            tracing::warn!(peer = %label, monitor_id, count, "monitor id out of range");
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        {
+            let shared = Arc::clone(&self.capture);
+            crate::view::lock_capture(&shared)
+                .set_target(CaptureTarget::Display(monitor_id))
+                .map_err(|error| {
+                    tracing::warn!(
+                        peer = %label,
+                        monitor_id,
+                        %error,
+                        "the capturer refused the new monitor"
+                    );
+                    ActorError::Core(CoreError::NotPermitted)
+                })?;
+        }
+        tracing::info!(peer = %label, monitor_id, "capture retargeted by the guest");
+        Ok(())
+    }
+
+    /// Host side: announces this host's monitors to `label`'s guest
+    /// (§11 `MonitorsList`; ADR 0028). Returns what was sent.
+    fn on_monitors_list(&mut self, label: &str) -> Result<Vec<MonitorInfo>, ActorError> {
+        let peer = self.resolve(label)?;
+        if self.sessions.state(&peer) != SessionState::Active {
+            return Err(ActorError::UnknownPeer);
+        }
+        let monitors = crate::view::host_monitors()
+            .map_err(|error| {
+                tracing::warn!(peer = %label, %error, "cannot enumerate this host's monitors");
+                ActorError::Core(CoreError::Malformed)
+            })?
+            .into_iter()
+            .map(|monitor| MonitorInfo {
+                id: monitor.id,
+                width: monitor.width,
+                height: monitor.height,
+                primary: monitor.primary,
+            })
+            .collect::<Vec<_>>();
+        if let Some(reason) = self.health.fault() {
+            // A host that cannot produce a picture at all has no meaningful
+            // list to give; say so rather than offering monitors that will
+            // never show anything.
+            let _ = reason;
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        self.send_to(
+            &peer,
+            MessageKind::MonitorsList {
+                monitors: monitors.clone(),
+            },
+        );
+        Ok(monitors)
     }
 
     /// Issues an invite for `role`, refusing while the endpoint has no
@@ -2126,7 +2565,7 @@ impl Actor {
         self.connect_peer = Some(peer);
         // Guest side: this node is the one that *receives* `MediaUnavailable`,
         // so there is no peer capability to remember here.
-        self.adopt(control, peer, false);
+        self.adopt(control, peer, false, false);
     }
 }
 
@@ -2189,6 +2628,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_MEDIA_UNAVAILABLE),
+        speaks_remote_sas: hello
+            .features
+            .iter()
+            .any(|feature| feature == lumepeer_core::protocol::FEATURE_REMOTE_SAS),
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -2476,6 +2919,8 @@ pub fn spawn_actor_with(
         capture,
         media: std::collections::HashMap::new(),
         audio: std::collections::HashMap::new(),
+        guest_mic: std::collections::HashMap::new(),
+        speaks_remote_sas: std::collections::HashSet::new(),
         recorders: HashMap::new(),
         injector,
         views: std::collections::HashMap::new(),

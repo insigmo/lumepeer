@@ -160,6 +160,11 @@ pub async fn accept_media_stream(connection: &Connection) -> Result<MediaFrameRe
 pub const STREAM_VIDEO: u8 = b'V';
 /// First (and only) byte of the announcement frame on an audio stream.
 pub const STREAM_AUDIO: u8 = b'A';
+/// First (and only) byte of the announcement frame on a guest-microphone
+/// stream (§11; ADR 0028). The guest is the sender here, the host accepts —
+/// the reverse of [`STREAM_AUDIO`], and a different tag so the host can
+/// never confuse its own outbound stream with one a guest opened.
+pub const STREAM_MIC: u8 = b'M';
 
 /// Host side: opens a media stream and announces it as carrying `kind`.
 ///
@@ -176,6 +181,39 @@ pub async fn open_tagged_media_stream(
     let mut writer = open_media_stream(connection).await?;
     writer.write_frame(&[kind]).await?;
     Ok(writer)
+}
+
+/// Accepts media streams until one announces itself as `wanted`, skipping
+/// anything else (an unknown future kind, or a stream another path already
+/// consumed) (§11; ADR 0028).
+///
+/// The generic counterpart of [`accept_audio_media_stream`], which is this
+/// function pinned to [`STREAM_AUDIO`] for compatibility with its original
+/// call sites.
+///
+/// Returns `None` when the connection closed before such a stream showed
+/// up — the ordinary outcome when the peer never opens one.
+///
+/// # Errors
+/// [`NetError::Io`] propagates when a skipped stream's tag frame cannot be
+/// read; the caller may simply call again.
+pub async fn accept_tagged_media_stream(
+    connection: &Connection,
+    wanted: u8,
+) -> Result<Option<MediaFrameReader<RecvStream>>> {
+    loop {
+        let mut reader = accept_media_stream(connection).await?;
+        // The announcement frame is one byte; anything longer or shorter is
+        // not a tag this build speaks, so skip the stream entirely rather
+        // than guess.
+        match reader.read_frame().await {
+            Ok(tag) if tag.len() == 1 && tag[0] == wanted => return Ok(Some(reader)),
+            Ok(_other) => {
+                tracing::debug!("skipping an unannounced media stream");
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Guest side: accepts media streams until one announces itself as audio,

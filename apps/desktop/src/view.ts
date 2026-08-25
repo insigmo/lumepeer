@@ -11,6 +11,7 @@ import { render } from 'lit-html';
 
 import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
+import { mountToolbar, tauriToolbarCommands } from './toolbar';
 import {
   decodeViewFrame,
   paintFrame,
@@ -121,10 +122,26 @@ function loop(): void {
 async function main(): Promise<void> {
   renderOverlay();
   // The chat panel polls the actor's transcript; it exists only while this
-  // window does, so no explicit teardown beyond the poll's own stop.
+  // window does, so no explicit teardown beyond the poll's own stop. The
+  // toolbar's chat button toggles exactly this panel.
   if (chatPanel) {
     chatPanel.hidden = false;
     startChatPolling(chatPanel, new ChatState(), locale, peer, tauriChatCommands);
+  }
+  // The floating session toolbar (§11): drag handle, settings, monitor
+  // picker, chat toggle, microphone, Ctrl+Alt+Del, collapse. It stops with
+  // the window; nothing here outlives the session.
+  const toolbarRoot = document.querySelector<HTMLElement>('#toolbar-root');
+  if (toolbarRoot && chatPanel) {
+    mountToolbar(toolbarRoot, locale, peer, tauriToolbarCommands, {
+      toggleChat(): boolean {
+        chatPanel.hidden = !chatPanel.hidden;
+        return !chatPanel.hidden;
+      },
+      chatVisible(): boolean {
+        return !chatPanel.hidden;
+      },
+    });
   }
   // The remote host's own right-click menu is part of the picture; the
   // local WebView's native one has no business appearing on top of it.

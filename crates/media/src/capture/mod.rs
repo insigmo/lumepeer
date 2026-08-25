@@ -53,6 +53,64 @@ pub enum CaptureTarget {
     Display(u32),
 }
 
+/// One monitor of this host, for the §11 `MonitorsList` announcement
+/// (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMonitor {
+    /// Stable id a guest passes back in [`CaptureTarget::Display`] — the
+    /// platform's own enumeration index, the same order `Display` uses.
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Whether this is the primary display.
+    pub primary: bool,
+}
+
+/// Every monitor this host can capture, in the order
+/// [`CaptureTarget::Display`] indexes (§11 `MonitorsList`; ADR 0028).
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when the platform cannot enumerate its
+/// displays at all; the caller degrades to a single primary entry only where
+/// the platform itself guarantees one.
+pub fn host_monitors() -> Result<Vec<HostMonitor>> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::WindowsCapturer::attached_monitors_info()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No other backend exposes enumeration yet: report the primary as
+        // the only monitor rather than an empty list, which would read as
+        // "this host has no screens" (§18: degrade honestly, never lie).
+        Ok(vec![HostMonitor {
+            id: 0,
+            width: 0,
+            height: 0,
+            primary: true,
+        }])
+    }
+}
+
+/// How many displays this host can capture — the exclusive upper bound of
+/// [`CaptureTarget::Display`].
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when the platform cannot enumerate its
+/// displays.
+pub fn host_display_count() -> Result<usize> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::WindowsCapturer::display_count()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(1)
+    }
+}
+
 /// Pixel format of a captured frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -426,6 +484,32 @@ impl CaptureController {
             self.capturer.stop();
             self.capturing = false;
         }
+    }
+
+    /// Points capture at a different monitor (§11 `MonitorSelect`; ADR 0028).
+    ///
+    /// A live capture is restarted on the new target immediately, so the
+    /// encode loop's very next frame shows the new display; an idle
+    /// controller only remembers the choice for its next `add_viewer`.
+    ///
+    /// # Errors
+    /// Whatever [`ScreenCapturer::start`] reports for the new target — an id
+    /// past the display count is the caller's malformed request, not a
+    /// silent keep-capturing-the-old-screen.
+    pub fn set_target(&mut self, target: CaptureTarget) -> Result<()> {
+        self.target = target;
+        if self.capturing {
+            // `start` drops the previous duplication first on the platforms
+            // that cap them, so this cannot compete with itself.
+            self.capturer.start(target)?;
+        }
+        Ok(())
+    }
+
+    /// What this controller is pointed at right now.
+    #[must_use]
+    pub const fn target(&self) -> CaptureTarget {
+        self.target
     }
 
     /// Number of viewers currently holding a `view` grant.
