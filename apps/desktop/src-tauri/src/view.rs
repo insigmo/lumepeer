@@ -1220,7 +1220,15 @@ pub fn spawn_guest_mic_pass(connection: Connection, tag: String) -> JoinHandle<(
                 return;
             }
         };
-        let mut player = lumepeer_media::playout::WasapiPlayout::new();
+        // Playback is a platform backend like capture is: a target without
+        // one refuses here and the mic simply stays off (§18).
+        let mut player = match lumepeer_media::playout::platform_player() {
+            Ok(player) => player,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "no playback backend: guest mic stays off");
+                return;
+            }
+        };
         if let Err(error) = player.start() {
             tracing::warn!(peer = %tag, %error, "no playback device: guest mic stays off");
             return;

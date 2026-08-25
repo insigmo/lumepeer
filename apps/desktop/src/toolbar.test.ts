@@ -4,7 +4,6 @@
 // toggling, the resolution placeholder, the monitor picker, and the mic/CAD
 // command paths. Every command is a spy, so the state machine is tested
 // without Tauri — the same shape `chat.test.ts` uses.
-import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -145,10 +144,10 @@ describe('the floating session toolbar', () => {
     draw(state);
     const options = container.querySelectorAll('[data-testid="toolbar-monitor-option"]');
     expect(options).toHaveLength(2);
-    expect(options[0].textContent).toContain('Screen 1');
-    expect(options[1].textContent).toContain('Screen 2');
+    expect(options[0]?.textContent).toContain('Screen 1');
+    expect(options[1]?.textContent).toContain('Screen 2');
     // The active monitor is marked for the screen reader and the eye.
-    expect(options[1].getAttribute('aria-pressed')).toBe('true');
+    expect(options[1]?.getAttribute('aria-pressed')).toBe('true');
   });
 
   it('the monitor button shows the ordinal of the watched monitor', () => {
