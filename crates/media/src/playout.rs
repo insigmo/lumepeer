@@ -12,11 +12,21 @@
 //! of [`crate::capture_audio::to_wire_pcm`], kept local so the wire format
 //! stays decided by the same constants. A silent chunk is real silence, so
 //! gaps in the sender's clock never click.
+//!
+//! WASAPI is the only backend today, so everything below it is gated on
+//! Windows behind the [`AudioPlayer`] trait, exactly as
+//! [`crate::capture_audio`] gates its capturers: other targets get a refusal
+//! from [`platform_player`] and run without guest audio (§18). The
+//! conversion helper is platform-independent and always tested.
 
+#[cfg(target_os = "windows")]
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(target_os = "windows")]
 use windows::Win32::Media::Audio::{self as wasapi, IAudioClient, IAudioRenderClient};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
 use crate::error::{MediaError, Result};
@@ -25,16 +35,62 @@ use lumepeer_core::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ};
 // Only IEEE-float mixes are written, mirroring the capture side: the
 // shared-mode mixer normalizes every modern Windows render path to float32.
 // WAVE_FORMAT_IEEE_FLOAT = 3 (mmreg.h).
+#[cfg(target_os = "windows")]
 const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
 
 /// How long one blocking push may wait for buffer space before the device is
 /// considered stuck. Generous on purpose: a chunk is 20 ms of audio, but a
 /// device resuming from suspend may legitimately be late once.
+#[cfg(target_os = "windows")]
 const PLAYBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Playback backend contract, the mirror of [`crate::capture_audio::AudioCapturer`].
+///
+/// One trait so the mic-playback loop stays backend-agnostic: WASAPI is the
+/// only implementation today, and a platform without one refuses in
+/// [`platform_player`] rather than swallowing the audio (§18).
+pub trait AudioPlayer: Send + std::fmt::Debug {
+    /// Opens the default output device.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureUnavailable`] when no output device exists or the
+    /// backend was not compiled in for this target.
+    fn start(&mut self) -> Result<()>;
+
+    /// Hands one wire-format PCM chunk (48 kHz s16 stereo, §11) to the mixer.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureInterrupted`] once the device is gone or
+    /// [`stop`](Self::stop) has run.
+    fn push(&mut self, samples: &[i16], timestamp_us: u64) -> Result<()>;
+
+    /// Stops playback and releases the device. Idempotent.
+    fn stop(&mut self);
+}
+
+/// Opens the playback backend of the current platform (§11; ADR 0028).
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when no backend is compiled in for this
+/// target — the guest's microphone stays silent and the log says why (§18).
+pub fn platform_player() -> Result<Box<dyn AudioPlayer>> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(WasapiPlayout::new()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(MediaError::CaptureUnavailable(
+            "no audio playback backend is compiled in for this target".to_owned(),
+        ))
+    }
+}
+
 /// COM apartment wrapper: `CoInitializeEx` on build, `CoUninitialize` on drop.
+#[cfg(target_os = "windows")]
 struct ComGuard;
 
+#[cfg(target_os = "windows")]
 impl ComGuard {
     fn init() -> Result<Self> {
         // SAFETY: plain FFI call into ole32; no pointers involved beyond the
@@ -55,6 +111,7 @@ impl ComGuard {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl Drop for ComGuard {
     fn drop(&mut self) {
         // SAFETY: balances exactly one successful CoInitializeEx above.
@@ -68,6 +125,7 @@ impl Drop for ComGuard {
     }
 }
 
+#[cfg(target_os = "windows")]
 struct PlayoutState {
     _com: ComGuard,
     client: IAudioClient,
@@ -86,13 +144,16 @@ struct PlayoutState {
     reason = "COM interface handles carry no thread affinity under COINIT_MULTITHREADED; \
               the pointer is moved between threads, never aliased"
 )]
+#[cfg(target_os = "windows")]
 unsafe impl Send for PlayoutState {}
 
 /// Shared-mode render player of the default console output device.
+#[cfg(target_os = "windows")]
 pub struct WasapiPlayout {
     state: Option<PlayoutState>,
 }
 
+#[cfg(target_os = "windows")]
 impl std::fmt::Debug for WasapiPlayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasapiPlayout")
@@ -101,12 +162,14 @@ impl std::fmt::Debug for WasapiPlayout {
     }
 }
 
+#[cfg(target_os = "windows")]
 impl Default for WasapiPlayout {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(target_os = "windows")]
 impl WasapiPlayout {
     /// Builds an idle player; nothing opens until [`start`].
     #[must_use]
@@ -329,6 +392,22 @@ impl WasapiPlayout {
     }
 }
 
+#[cfg(target_os = "windows")]
+impl AudioPlayer for WasapiPlayout {
+    fn start(&mut self) -> Result<()> {
+        Self::start(self)
+    }
+
+    fn push(&mut self, samples: &[i16], timestamp_us: u64) -> Result<()> {
+        Self::push(self, samples, timestamp_us)
+    }
+
+    fn stop(&mut self) {
+        Self::stop(self);
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl Drop for WasapiPlayout {
     fn drop(&mut self) {
         self.stop();
