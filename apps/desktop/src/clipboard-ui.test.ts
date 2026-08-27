@@ -11,7 +11,31 @@ import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CLIPBOARD_NOTE_MS, sessionStatus, type SessionStatus } from './session-status';
-import { renderToolbar, ToolbarState, type ToolbarCommands } from './toolbar';
+import {
+  renderToolbar,
+  ToolbarState,
+  type ToolbarCommands,
+  type ToolbarHooks,
+} from './toolbar';
+
+/**
+ * The window state the toolbar reads but does not own. None of it matters to
+ * what this file tests — only that the toolbar has somewhere to read it from.
+ */
+function toolbarHooks(): ToolbarHooks {
+  return {
+    toggleChat: () => true,
+    chatVisible: () => false,
+    displayMode: () => 'fit',
+    setDisplayMode: () => {},
+    fullscreen: () => false,
+    toggleFullscreen: () => {},
+    cursorChannel: () => false,
+    localCursor: () => true,
+    toggleLocalCursor: () => {},
+    bind: () => {},
+  };
+}
 
 const invoke = vi.fn().mockResolvedValue(undefined);
 
@@ -109,11 +133,14 @@ describe("the guest toolbar's clipboard button", () => {
       container,
       new ToolbarState(),
       'en',
-      { toggleChat: () => true, chatVisible: () => false },
+      toolbarHooks(),
       {
         toggleCollapsed: () => {},
         openPopover: () => {},
         setResolution: () => {},
+        setDisplayMode: () => {},
+        toggleFullscreen: () => {},
+        toggleLocalCursor: () => {},
         toggleMic: () => {},
         sendCad: () => {},
         askToRecord: () => {},
@@ -158,10 +185,7 @@ describe("the guest toolbar's clipboard button", () => {
     });
     const fake = commands();
     const { mountToolbar } = await import('./toolbar');
-    const stop = mountToolbar(container, 'en', 'host-99', fake, {
-      toggleChat: () => true,
-      chatVisible: () => false,
-    });
+    const stop = mountToolbar(container, 'en', 'host-99', fake, toolbarHooks());
     container
       .querySelector<HTMLButtonElement>('[data-testid="toolbar-clipboard"]')
       ?.click();

@@ -17,6 +17,8 @@ import { html, render, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
+import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
 /** One host monitor as the IPC `monitors_list` returns it. */
 export interface MonitorDto {
@@ -126,12 +128,47 @@ export class ToolbarState {
   recordAsked = false;
 }
 
+/** What the toolbar hands back to whoever mounted it, once, at mount. */
+export interface ToolbarControls {
+  /** Re-render, after state the toolbar shows but does not own has changed. */
+  redraw(): void;
+  /** Collapse or expand — the same thing the button does, for the hotkey. */
+  toggleCollapsed(): void;
+}
+
 /** Callbacks the toolbar needs beyond IPC. */
 export interface ToolbarHooks {
   /** Show or hide the chat panel; returns the new visible state. */
   toggleChat(): boolean;
   /** Whether the chat panel is visible right now. */
   chatVisible(): boolean;
+  /**
+   * How the picture is laid out right now (§11).
+   *
+   * Read, never held: the window owns the layout, because the same three
+   * modes are reachable from a hotkey that never goes through here.
+   */
+  displayMode(): DisplayMode;
+  /** Asks the window to lay the picture out differently. */
+  setDisplayMode(mode: DisplayMode): void;
+  /** Whether the window is full screen right now. */
+  fullscreen(): boolean;
+  /** Asks the window to enter or leave full screen. */
+  toggleFullscreen(): void;
+  /**
+   * Whether this host sends its cursor on its own channel (§11).
+   *
+   * `false` means the host is still drawing the cursor into the picture, and
+   * the switch below has nothing to switch: turning a local overlay on would
+   * put a second cursor next to the real one.
+   */
+  cursorChannel(): boolean;
+  /** Whether the local cursor overlay is being drawn right now. */
+  localCursor(): boolean;
+  /** Turns the local cursor overlay on or off. */
+  toggleLocalCursor(): void;
+  /** Handed the controls above once, at mount. */
+  bind(controls: ToolbarControls): void;
 }
 
 const ICONS = {
@@ -145,6 +182,8 @@ const ICONS = {
   clipboard: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="8" height="11" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M6.5 3V2h3v1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   record: html`<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" fill="currentColor"/><circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>`,
   cad: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6V4.5A1.5 1.5 0 0 1 4.5 3H6m4 0h1.5A1.5 1.5 0 0 1 13 4.5V6m0 4v1.5a1.5 1.5 0 0 1-1.5 1.5H10M6 13H4.5A1.5 1.5 0 0 1 3 11.5V10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
+  fullscreen: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
+  fullscreenExit: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   collapse: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   expand: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
 };
@@ -165,6 +204,9 @@ export function renderToolbar(
     toggleCollapsed(): void;
     openPopover(which: 'settings' | 'monitors' | null): void;
     setResolution(value: string): void;
+    setDisplayMode(mode: DisplayMode): void;
+    toggleFullscreen(): void;
+    toggleLocalCursor(): void;
     toggleMic(): void;
     sendCad(): void;
     askToRecord(): void;
@@ -197,7 +239,48 @@ export function renderToolbar(
                 )}
               </select>
             </label>
+            <label class="toolbar-pop-row">
+              <span>${t(locale, 'toolbar.settings.displayMode')}</span>
+              <select
+                data-testid="toolbar-display-mode"
+                @change=${(event: Event) =>
+                  actions.setDisplayMode((event.target as HTMLSelectElement).value as DisplayMode)}
+              >
+                ${DISPLAY_MODES.map(
+                  (mode) =>
+                    html`<option value=${mode} ?selected=${mode === hooks.displayMode()}>
+                      ${t(locale, `toolbar.display.${mode}` as TranslationKeyAlias)}
+                    </option>`,
+                )}
+              </select>
+            </label>
+            ${hooks.cursorChannel()
+              ? html`
+                  <label class="toolbar-pop-row">
+                    <span>${t(locale, 'toolbar.settings.localCursor')}</span>
+                    <input
+                      type="checkbox"
+                      data-testid="toolbar-local-cursor"
+                      .checked=${hooks.localCursor()}
+                      @change=${actions.toggleLocalCursor}
+                    />
+                  </label>
+                `
+              : html`<p class="toolbar-pop-note" data-testid="toolbar-cursor-embedded">
+                  ${t(locale, 'toolbar.settings.cursorEmbedded')}
+                </p>`}
             <p class="toolbar-pop-note">${t(locale, 'toolbar.settings.placeholder')}</p>
+            <!-- A hotkey nobody can see is indistinguishable from a bug, so
+                 the chords this window keeps for itself are listed here (§11). -->
+            <h3 class="toolbar-pop-heading">${t(locale, 'toolbar.hotkeys')}</h3>
+            <dl class="toolbar-hotkeys" data-testid="toolbar-hotkeys">
+              ${HOTKEYS.map(
+                (entry) => html`
+                  <dt>${hotkeyLabel(entry.code)}</dt>
+                  <dd>${t(locale, `toolbar.hotkey.${entry.action}` as TranslationKeyAlias)}</dd>
+                `,
+              )}
+            </dl>
           </div>
         `
       : html``;
@@ -338,6 +421,17 @@ export function renderToolbar(
         </button>
         <button
           type="button"
+          class="toolbar-btn ${hooks.fullscreen() ? 'is-active' : ''}"
+          data-testid="toolbar-fullscreen"
+          aria-label=${t(locale, hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen')}
+          title=${t(locale, hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen')}
+          aria-pressed=${hooks.fullscreen() ? 'true' : 'false'}
+          @click=${actions.toggleFullscreen}
+        >
+          ${hooks.fullscreen() ? ICONS.fullscreenExit : ICONS.fullscreen}
+        </button>
+        <button
+          type="button"
           class="toolbar-btn"
           data-testid="toolbar-collapse"
           aria-label=${t(locale, 'toolbar.collapse')}
@@ -463,6 +557,20 @@ export function mountToolbar(
       }
       draw();
     },
+    setDisplayMode(mode: DisplayMode): void {
+      // The window owns the layout; this only asks, and then redraws to show
+      // whatever the window settled on.
+      hooks.setDisplayMode(mode);
+      draw();
+    },
+    toggleFullscreen(): void {
+      hooks.toggleFullscreen();
+      draw();
+    },
+    toggleLocalCursor(): void {
+      hooks.toggleLocalCursor();
+      draw();
+    },
     toggleMic(): void {
       const next = !state.micOn;
       void commands
@@ -557,6 +665,13 @@ export function mountToolbar(
       paint();
     },
   };
+
+  // The window drives the layout and full screen from its own hotkeys too, so
+  // it needs a way to bring the toolbar back in step with what it just did.
+  hooks.bind({
+    redraw: draw,
+    toggleCollapsed: actions.toggleCollapsed,
+  });
 
   // Whether the host can even try the SAS: off-Windows hosts cannot, and the
   // button says so instead of letting someone press it into a dead end.

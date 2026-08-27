@@ -16,6 +16,7 @@
 
 use lumepeer_core::constants::MAX_PICTURE_PIXELS;
 
+use crate::abr::FULL_SCALE_PERCENT;
 use crate::capture::{Frame, PixelFormat};
 
 /// Bytes per pixel of [`PixelFormat::Bgra8`].
@@ -53,6 +54,62 @@ pub fn target_size(width: u32, height: u32) -> Option<(u32, u32)> {
         return None;
     }
     Some((target_width, target_height))
+}
+
+/// Target dimensions for a picture reduced to `percent` of each axis, or
+/// `None` when nothing would change.
+///
+/// The third rung of the adaptive ladder (§11; ADR 0037), and the only one
+/// that touches pixels. Both axes are rounded down to an even number for the
+/// same 4:2:0 reason [`target_size`] does, and neither is allowed below 2:
+/// an encoder handed a 1-pixel axis fails the frame rather than sending a
+/// smaller one.
+#[must_use]
+pub fn scaled_size(width: u32, height: u32, percent: u32) -> Option<(u32, u32)> {
+    if percent >= FULL_SCALE_PERCENT || width < 2 || height < 2 {
+        return None;
+    }
+    let even = |value: u32| -> u32 {
+        let scaled = (u64::from(value) * u64::from(percent) / u64::from(FULL_SCALE_PERCENT))
+            .try_into()
+            .unwrap_or(u32::MAX);
+        (scaled & !1).max(2)
+    };
+    let (target_width, target_height) = (even(width), even(height));
+    if target_width >= width && target_height >= height {
+        return None;
+    }
+    Some((target_width, target_height))
+}
+
+/// Reduces `frame` to `percent` of each axis, or returns it unchanged.
+///
+/// Applied before [`fit_within_budget`], not instead of it: this one is the
+/// adaptive rung the host chose, that one is the hard ceiling of §15 that no
+/// choice may exceed.
+#[must_use]
+pub fn scale_to_percent(frame: Frame, percent: u32) -> Frame {
+    if frame.format != PixelFormat::Bgra8 {
+        return frame;
+    }
+    let Some((width, height)) = scaled_size(frame.width, frame.height, percent) else {
+        return frame;
+    };
+    let expected = (frame.width as usize)
+        .saturating_mul(frame.height as usize)
+        .saturating_mul(BGRA_BYTES);
+    if frame.data.len() < expected {
+        // Same reasoning as `fit_within_budget`: a short buffer is not this
+        // module's to interpret.
+        return frame;
+    }
+    Frame {
+        data: box_downscale(&frame.data, frame.width, frame.height, width, height),
+        width,
+        height,
+        format: frame.format,
+        timestamp_us: frame.timestamp_us,
+    }
 }
 
 /// Downscales `frame` to fit [`MAX_PICTURE_PIXELS`], or returns it unchanged.
@@ -214,6 +271,37 @@ mod tests {
         assert_eq!(reduced.height, 1080);
         assert_eq!(reduced.data.len(), 1920 * 1080 * BGRA_BYTES);
         assert!(reduced.data.iter().all(|byte| *byte == 0x40));
+    }
+
+    #[test]
+    fn the_adaptive_rung_reduces_both_axes_and_keeps_them_even() {
+        assert_eq!(scaled_size(1920, 1080, 50), Some((960, 540)));
+        assert_eq!(scaled_size(1920, 1080, 75), Some((1440, 810)));
+        assert_eq!(
+            scaled_size(1920, 1080, 100),
+            None,
+            "full scale changes nothing"
+        );
+        assert_eq!(
+            scaled_size(1, 1, 50),
+            None,
+            "a picture this small cannot shrink"
+        );
+        for percent in [50u32, 75] {
+            let (width, height) = scaled_size(1366, 768, percent).expect("this shrinks");
+            assert_eq!(width % 2, 0);
+            assert_eq!(height % 2, 0);
+            assert!(width >= 2 && height >= 2);
+        }
+    }
+
+    #[test]
+    fn scaling_to_a_percent_rewrites_the_frame_and_keeps_its_timestamp() {
+        let reduced = scale_to_percent(frame(64, 32, 0x30), 50);
+        assert_eq!((reduced.width, reduced.height), (32, 16));
+        assert_eq!(reduced.timestamp_us, 7);
+        assert_eq!(reduced.data.len(), 32 * 16 * BGRA_BYTES);
+        assert!(reduced.data.iter().all(|byte| *byte == 0x30));
     }
 
     #[test]

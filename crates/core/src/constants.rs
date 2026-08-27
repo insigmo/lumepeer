@@ -34,6 +34,24 @@ pub const MAX_PENDING_CONSENTS: usize = 3;
 pub const RECONNECT_WINDOW_SECS: u64 = 60;
 /// Control-channel keepalive interval (§9.1).
 pub const PING_INTERVAL_SECS: u64 = 20;
+/// Smoothing factor of the exponentially weighted moving average that turns
+/// individual `Ping`/`Pong` round trips into the RTT the UI shows (§11, §18).
+///
+/// Not in the design doc: §9.1 fixes the keepalive interval but says nothing
+/// about how the measurement it carries is reported. A raw sample jumps with
+/// every retransmit and scheduling hiccup, and a number that jumps is a number
+/// nobody can act on. 0.25 keeps roughly the last four probes in view — about
+/// a minute and a half at [`PING_INTERVAL_SECS`] — which is slow enough to be
+/// readable and fast enough to notice a path that just got worse.
+pub const RTT_EWMA_ALPHA: f32 = 0.25;
+/// Largest round trip, in milliseconds, that is taken as a measurement rather
+/// than as a broken clock (§18).
+///
+/// A `Pong` that comes back after this either crossed a suspended machine or
+/// was never really a round trip at all, and folding it into the
+/// [`RTT_EWMA_ALPHA`] average would poison the reading for minutes. Above it
+/// the sample is dropped and the previous average stands.
+pub const RTT_MAX_PLAUSIBLE_MS: u32 = 60_000;
 /// Deadline for one accepted connection to complete the control handshake
 /// before the host drops it, so a peer that connects and then goes silent
 /// cannot tie up a task (§9.1, §18).
@@ -153,8 +171,62 @@ pub const ABR_MIN_BITRATE_KBPS: u32 = 300;
 pub const ABR_MAX_BITRATE_KBPS: u32 = 12_000;
 /// Receiver feedback interval sent by the guest (§11).
 pub const ABR_FEEDBACK_INTERVAL_MS: u32 = 500;
-/// Maximum rate at which the host applies bitrate changes (§11).
+/// How long the host keeps treating a guest's last
+/// [`ABR_FEEDBACK_INTERVAL_MS`] report as the truth about the link before it
+/// falls back to judging congestion by its own write latency (§11; ADR 0015,
+/// ADR 0037).
+///
+/// Deliberately several report intervals: reports ride the control channel
+/// while pictures ride `rd/media/1`, so one late report is ordinary and must
+/// not flip the host between two disagreeing congestion signals every second.
+/// Long enough for that, short enough that a guest which stops reporting
+/// entirely — an old peer, a wedged view — gets the host-local estimate back
+/// rather than a quality target frozen where it happened to be.
+pub const ABR_FEEDBACK_STALE_AFTER_MS: u64 = 2_000;
+/// Maximum rate at which the host applies quality changes (§11).
+///
+/// Named for the bitrate because that is the only knob §11 has, and it now
+/// covers frame rate and resolution as well (ADR 0037): the ceiling is one
+/// change of the *whole* target per second, not one per knob. Ripple from
+/// three knobs moving independently reads worse than a steadily lower
+/// picture.
 pub const ABR_ADJUST_MAX_RATE_PER_SEC: u32 = 1;
+/// Lower bound of the adaptive frame rate, the second rung of the degradation
+/// ladder (§11; ADR 0037).
+///
+/// Not in the design doc: §11 adapts the bitrate only. Below this a desktop
+/// stops reading as a live screen and starts reading as a broken one, which is
+/// the failure `ABR_MIN_BITRATE_KBPS` exists to prevent on its own axis.
+pub const ABR_MIN_FPS: u8 = 10;
+/// Lower bound of the adaptive picture scale, in percent of the captured
+/// size — the third and last rung of the ladder (§11; ADR 0037).
+///
+/// Half of each axis is a quarter of the pixels, which is as far as a remote
+/// desktop can be reduced and still have readable text.
+pub const ABR_MIN_SCALE_PERCENT: u32 = 50;
+/// Step, in percent, by which the adaptive picture scale moves (§11; ADR 0037).
+pub const ABR_SCALE_STEP_PERCENT: u32 = 25;
+/// Step, in frames per second, by which the adaptive frame rate moves
+/// (§11; ADR 0037).
+pub const ABR_FPS_STEP: u8 = 5;
+/// Fraction of the current bitrate target, in percent, that observed goodput
+/// must fall under before the host treats the link as unable to carry what it
+/// is sending (§11; ADR 0037).
+///
+/// `rd/media/1` is a reliable ordered QUIC stream, so a guest never reports
+/// lost bytes — the honest congestion signal it *can* report is that less
+/// arrived per second than was sent. The margin keeps an idle screen, which
+/// legitimately produces far less than the target, from reading as congestion:
+/// goodput is only consulted while frames are actually flowing.
+pub const ABR_GOODPUT_SHORTFALL_PERCENT: u32 = 70;
+/// Shortest interval between two keyframes the host will force on a guest's
+/// request (§11).
+///
+/// Not in the design doc: §11 has the request, not a budget for it. A keyframe
+/// is the most expensive frame in the stream, so a guest that asks on every
+/// frame would turn the request into a way to make the host send nothing else.
+/// The host honours at most one request per interval and drops the rest.
+pub const KEYFRAME_MIN_INTERVAL_MS: u64 = 1_000;
 /// Log rotation by age (§16.1).
 pub const LOG_ROTATION_DAYS: u32 = 7;
 /// Log rotation by size (§16.1).

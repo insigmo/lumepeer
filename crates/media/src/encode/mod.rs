@@ -75,6 +75,20 @@ pub trait VideoEncoder: Send {
     /// [`MediaError::Encode`] if the backend refuses the change.
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()>;
 
+    /// Makes the next encoded frame an intra frame, so a decoder that joined
+    /// mid-stream or lost more than it could conceal has something to start
+    /// from (§11's `KeyframeRequest`).
+    ///
+    /// A request, not a guarantee about any particular frame: the backend
+    /// emits one at the next opportunity. The caller is responsible for the
+    /// `KEYFRAME_MIN_INTERVAL_MS` budget — a keyframe is the most expensive
+    /// frame in the stream, so nothing downstream may be allowed to ask for
+    /// one per frame.
+    ///
+    /// # Errors
+    /// [`MediaError::Encode`] if the backend has no way to force one.
+    fn request_keyframe(&mut self) -> Result<()>;
+
     /// Which backend is in use, for telemetry and the UI.
     fn kind(&self) -> EncoderKind;
 }
@@ -312,6 +326,11 @@ pub mod software {
             })
         }
 
+        fn request_keyframe(&mut self) -> Result<()> {
+            self.inner.force_intra_frame();
+            Ok(())
+        }
+
         fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
             if bitrate_kbps == self.config.bitrate_kbps {
                 return Ok(());
@@ -364,6 +383,20 @@ pub mod software {
         fn odd_dimensions_are_cropped_rather_than_panicking() {
             let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
             assert!(encoder.encode(&frame(65, 33, 0x40)).is_ok());
+        }
+
+        #[test]
+        fn a_requested_keyframe_actually_arrives_on_the_next_frame() {
+            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            // The first frame of a stream is a keyframe on its own, so the
+            // claim is only testable from the second one onwards.
+            assert!(encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe);
+            assert!(!encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe);
+            encoder.request_keyframe().unwrap();
+            assert!(
+                encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe,
+                "the encoder ignored a keyframe request"
+            );
         }
 
         #[test]

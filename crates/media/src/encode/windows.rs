@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use lumepeer_core::constants::ENCODE_HW_EVENT_TIMEOUT_MS;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
-    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
+    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
     MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
@@ -49,6 +49,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
+use windows::Win32::System::Variant::VARIANT;
 use windows::core::Interface as _;
 
 use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder};
@@ -258,6 +259,24 @@ impl VideoEncoder for MediaFoundationEncoder {
                 }
             }
         }
+    }
+
+    fn request_keyframe(&mut self) -> Result<()> {
+        // See `encode`: re-asserts MTA membership on whatever thread calls
+        // this before touching the transform.
+        ensure_com_initialized()?;
+        // `ICodecAPI` is the documented way to ask an encoder MFT for an IDR
+        // (MSDN, `CODECAPI_AVEncVideoForceKeyFrame`): it takes effect on the
+        // next frame submitted and clears itself afterwards, which is exactly
+        // the "at the next opportunity" the request means.
+        let codec: ICodecAPI = self.transform.cast().map_err(|e| {
+            MediaError::Encode(format!("this encoder MFT exposes no ICodecAPI: {e}"))
+        })?;
+        let force = VARIANT::from(true);
+        // SAFETY: both arguments are locals that outlive the call, and
+        // `SetValue` only reads them.
+        unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &raw const force) }
+            .map_err(|e| MediaError::Encode(format!("forcing a keyframe was refused: {e}")))
     }
 
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {

@@ -5,27 +5,55 @@
 // that created the window. The label is the pseudonym of §15, never a NodeId.
 //
 // This file is only wiring: everything with a decision in it lives in
-// `view-window.ts`, which the tests drive directly.
+// `view-window.ts` and `view-hotkeys.ts`, which the tests drive directly.
 
 import { render } from 'lit-html';
 
 import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
-import { mountToolbar, tauriToolbarCommands } from './toolbar';
+import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
+import { installHotkeys } from './view-hotkeys';
 import {
+  clampPan,
+  cursorPlacement,
+  decodeCursorShape,
   decodeViewFrame,
+  defaultLayout,
+  displaySize,
+  installPan,
+  nextDisplayMode,
+  paintCursor,
   paintFrame,
+  pictureBox,
   recordingBadge,
   suppressContextMenu,
   ViewInput,
   viewOverlay,
+  zoomBy,
+  type Box,
+  type CursorShape,
+  type DisplayMode,
   type InputSink,
+  type ViewLayout,
   type ViewStatus,
 } from './view-window';
+
+/**
+ * How often the window asks whether the host's cursor changed.
+ *
+ * Not a frame rate: the *position* is local and instant, and only the bitmap
+ * comes from the host. A quarter of a second is well under the time it takes
+ * to notice a shape is wrong, and two orders of magnitude cheaper than asking
+ * with every frame.
+ */
+const CURSOR_POLL_INTERVAL_MS = 250;
 
 const params = new URLSearchParams(window.location.search);
 const peer = params.get('peer') ?? '';
 const canvas = document.querySelector<HTMLCanvasElement>('#screen');
+const cursorLayer = document.querySelector<HTMLCanvasElement>('#cursor');
+const surface = document.querySelector<HTMLElement>('#view');
+const toolbarRootElement = document.querySelector<HTMLElement>('#toolbar-root');
 const overlay = document.querySelector<HTMLElement>('#overlay');
 const recordingIndicator = document.querySelector<HTMLElement>('#recording-indicator');
 const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
@@ -61,7 +89,157 @@ const sink: InputSink = {
   },
 };
 
-const input = canvas ? new ViewInput(canvas, sink) : undefined;
+// How the picture is laid out, and the size of the last frame it was laid out
+// for. Both live here rather than in `view-window.ts` because they are window
+// state, not a decision: every rule about them is a pure function over there.
+let layout: ViewLayout = defaultLayout();
+let frameSize = { width: 0, height: 0 };
+let fullscreen = false;
+let toolbar: ToolbarControls | null = null;
+// The host's cursor, once it has announced one. A host that still draws the
+// cursor into the picture announces none, and this stays null — which is what
+// keeps the overlay off rather than putting a second cursor on screen (§11).
+let cursor: CursorShape | null = null;
+// Whether the overlay is drawn at all. Only meaningful once a shape has
+// arrived: without one there is nothing to turn off, and the toolbar says so
+// by disabling the switch.
+let localCursor = true;
+// The last pointer position inside the window, which is where the cursor is
+// drawn. Local by design: a cursor that moved with the video would lag by the
+// round trip, and removing that lag is the whole reason for the channel.
+let pointerAt: { x: number; y: number } | null = null;
+
+function viewportBox(): Box {
+  if (!surface) {
+    return { left: 0, top: 0, width: 0, height: 0 };
+  }
+  const rect = surface.getBoundingClientRect();
+  return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+}
+
+/** Where the picture is on screen right now, for the pointer mapping. */
+function currentPictureBox(): Box {
+  return pictureBox(layout, frameSize, viewportBox(), window.devicePixelRatio || 1);
+}
+
+/** Whether this session carries the host's cursor on its own channel. */
+function cursorChannelLive(): boolean {
+  return cursor !== null;
+}
+
+/**
+ * Moves the cursor layer to the pointer, or hides it.
+ *
+ * Hidden whenever there is nothing honest to draw: no shape from the host, the
+ * operator turned the overlay off, or the pointer is not over the picture.
+ */
+function placeCursor(): void {
+  if (!cursorLayer) {
+    return;
+  }
+  const visible = cursor !== null && localCursor && pointerAt !== null;
+  cursorLayer.hidden = !visible;
+  if (!visible || !cursor || !pointerAt) {
+    return;
+  }
+  const box = cursorPlacement(pointerAt, cursor, currentPictureBox(), frameSize);
+  const viewport = viewportBox();
+  cursorLayer.style.left = `${box.left - viewport.left}px`;
+  cursorLayer.style.top = `${box.top - viewport.top}px`;
+  cursorLayer.style.width = `${box.width}px`;
+  cursorLayer.style.height = `${box.height}px`;
+}
+
+/**
+ * Asks the actor whether the host has announced a different cursor.
+ *
+ * Polled on its own interval rather than with every frame: a cursor changes
+ * when a pointer crosses a text field, not thirty times a second, and the
+ * sequence number means an unchanged one costs a header and nothing else.
+ */
+async function pollCursor(): Promise<void> {
+  if (stopped || !cursorLayer) {
+    return;
+  }
+  try {
+    const invoke = await invoker();
+    const response = await invoke('view_cursor', {
+      args: { peer, since_seq: cursor?.seq ?? 0 },
+    });
+    const next = decodeCursorShape(response as ArrayBuffer);
+    // A sequence of 0 is a host that announces no cursor: it is still drawing
+    // one into the picture, and drawing a second here would be worse than the
+    // latency this channel exists to remove.
+    if (next.seq === 0) {
+      cursor = null;
+      placeCursor();
+      toolbar?.redraw();
+      return;
+    }
+    if (next.seq !== cursor?.seq && paintCursor(cursorLayer, next)) {
+      const arrived = cursor === null;
+      cursor = next;
+      if (arrived) {
+        toolbar?.redraw();
+      }
+    }
+    placeCursor();
+  } catch {
+    // The view is gone, or this host has no cursor channel: nothing to draw
+    // and nothing to say about it.
+  }
+}
+
+/**
+ * Pushes the layout onto the canvas element.
+ *
+ * The element's CSS size and a translate, never `canvas.width`/`canvas.height`:
+ * the backing buffer stays at the frame's own resolution so `putImageData`,
+ * which cannot scale, keeps working unchanged.
+ */
+function applyLayout(): void {
+  if (!canvas) {
+    return;
+  }
+  const viewport = viewportBox();
+  const ratio = window.devicePixelRatio || 1;
+  layout = clampPan(layout, frameSize, viewport, ratio);
+  const size = displaySize(layout, frameSize, viewport, ratio);
+  canvas.style.width = `${size.width}px`;
+  canvas.style.height = `${size.height}px`;
+  canvas.style.maxWidth = 'none';
+  canvas.style.maxHeight = 'none';
+  canvas.style.transform = `translate(${layout.offsetX}px, ${layout.offsetY}px)`;
+  placeCursor();
+}
+
+function setDisplayMode(mode: DisplayMode): void {
+  // A mode change re-centres: the pan that made sense at one size is an
+  // arbitrary offset at another.
+  layout = { ...layout, mode, offsetX: 0, offsetY: 0 };
+  applyLayout();
+  toolbar?.redraw();
+}
+
+function resetView(): void {
+  layout = defaultLayout();
+  applyLayout();
+  placeCursor();
+  toolbar?.redraw();
+}
+
+async function setFullscreen(on: boolean): Promise<void> {
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  await getCurrentWindow().setFullscreen(on);
+  fullscreen = on;
+  // The toolbar is the only way back out with a pointer, so in full screen it
+  // hides itself and comes back on hover or focus rather than disappearing.
+  toolbarRootElement?.classList.toggle('is-autohide', on);
+  applyLayout();
+  toolbar?.redraw();
+}
+
+const input = canvas ? new ViewInput(canvas, sink, document, currentPictureBox) : undefined;
 let status: ViewStatus = 'waiting';
 // Whether the host says it is recording. Repainted only on a change, like the
 // overlay: the badge is on every frame, the DOM work is not.
@@ -120,6 +298,18 @@ async function tick(): Promise<void> {
     }
     if (paintFrame(canvas, frame)) {
       lastPaintedUs = frame.timestampUs;
+      // The remote screen can change resolution mid-session, and every part
+      // of the layout is a function of the frame's size.
+      if (frame.width !== frameSize.width || frame.height !== frameSize.height) {
+        frameSize = { width: frame.width, height: frame.height };
+      }
+      applyLayout();
+      // Nothing to point at while the input grant is withdrawn, so nothing to
+      // draw a pointer for either.
+      if (!frame.input && pointerAt !== null) {
+        pointerAt = null;
+        placeCursor();
+      }
     }
   } catch {
     // The view is gone (session ended, window closing): stop polling rather
@@ -148,11 +338,10 @@ async function main(): Promise<void> {
     startChatPolling(chatPanel, new ChatState(), locale, peer, tauriChatCommands);
   }
   // The floating session toolbar (§11): drag handle, settings, monitor
-  // picker, chat toggle, microphone, Ctrl+Alt+Del, collapse. It stops with
-  // the window; nothing here outlives the session.
-  const toolbarRoot = document.querySelector<HTMLElement>('#toolbar-root');
-  if (toolbarRoot && chatPanel) {
-    mountToolbar(toolbarRoot, locale, peer, tauriToolbarCommands, {
+  // picker, chat toggle, microphone, Ctrl+Alt+Del, full screen, collapse. It
+  // stops with the window; nothing here outlives the session.
+  if (toolbarRootElement && chatPanel) {
+    mountToolbar(toolbarRootElement, locale, peer, tauriToolbarCommands, {
       toggleChat(): boolean {
         chatPanel.hidden = !chatPanel.hidden;
         return !chatPanel.hidden;
@@ -160,8 +349,94 @@ async function main(): Promise<void> {
       chatVisible(): boolean {
         return !chatPanel.hidden;
       },
+      displayMode: () => layout.mode,
+      setDisplayMode,
+      cursorChannel: cursorChannelLive,
+      localCursor: () => localCursor,
+      toggleLocalCursor(): void {
+        localCursor = !localCursor;
+        placeCursor();
+      },
+      fullscreen: () => fullscreen,
+      toggleFullscreen(): void {
+        void setFullscreen(!fullscreen);
+      },
+      bind(controls): void {
+        toolbar = controls;
+      },
     });
   }
+  // Panning and zooming are local: neither reaches the host, and both are
+  // arranged so the plain left button — which does — is never taken.
+  if (surface) {
+    installPan(
+      surface,
+      {
+        layout: () => layout,
+        panBy(dx, dy): void {
+          layout = { ...layout, offsetX: layout.offsetX + dx, offsetY: layout.offsetY + dy };
+          applyLayout();
+        },
+      },
+      document,
+    );
+    surface.addEventListener(
+      'wheel',
+      (event) => {
+        if (!event.ctrlKey) {
+          return;
+        }
+        event.preventDefault();
+        layout = zoomBy(
+          layout,
+          event.deltaY < 0 ? 1 : -1,
+          frameSize,
+          viewportBox(),
+          window.devicePixelRatio || 1,
+        );
+        applyLayout();
+        toolbar?.redraw();
+      },
+      { passive: false },
+    );
+  }
+  window.addEventListener('resize', applyLayout);
+  // Where the local cursor is drawn. Tracked on the surface rather than on the
+  // canvas so the pointer leaving the picture hides it instead of freezing it
+  // at the edge.
+  if (surface) {
+    surface.addEventListener('pointermove', (event) => {
+      pointerAt = { x: event.clientX, y: event.clientY };
+      placeCursor();
+    });
+    surface.addEventListener('pointerleave', () => {
+      pointerAt = null;
+      placeCursor();
+    });
+  }
+  setInterval(() => {
+    void pollCursor();
+  }, CURSOR_POLL_INTERVAL_MS);
+  // Installed before the input forwarder attaches, and in the capture phase,
+  // so a matched chord is marked before it can be sent to the host (§11).
+  installHotkeys(document, {
+    'toggle-fullscreen': () => void setFullscreen(!fullscreen),
+    'cycle-display-mode': () => setDisplayMode(nextDisplayMode(layout.mode)),
+    'reset-view': resetView,
+    'toggle-chat': () => {
+      if (chatPanel) {
+        chatPanel.hidden = !chatPanel.hidden;
+        toolbar?.redraw();
+      }
+    },
+    'send-cad': () => {
+      void tauriToolbarCommands.sasRequest(peer).catch(() => {
+        // Refused by the host or the session ended; the log has it, and
+        // nothing here claims the sequence was delivered.
+      });
+    },
+    'toggle-toolbar': () => toolbar?.toggleCollapsed(),
+  });
   // The remote host's own right-click menu is part of the picture; the
   // local WebView's native one has no business appearing on top of it.
   suppressContextMenu(document);

@@ -79,9 +79,9 @@ fn main() {
         // owns the remote-view windows, and an `AppHandle` only exists once
         // Tauri has set the application up.
         .setup(move |app| {
+            use tauri::Manager as _;
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
-            use tauri::Manager as _;
 
             let network = runtime
                 .block_on(network::spawn_actor(app.handle().clone(), &settings))
@@ -101,7 +101,11 @@ fn main() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().expect("bundled tray icon"))
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .expect("bundled tray icon"),
+                )
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -159,10 +163,12 @@ fn main() {
             commands::history_connect,
             commands::connect_status,
             commands::network_status,
+            commands::connection_stats,
             commands::license_status,
             commands::invite_create,
             commands::invite_connect,
             commands::view_next_frame,
+            commands::view_cursor,
             commands::input_pointer_move,
             commands::input_press,
             commands::input_wheel,

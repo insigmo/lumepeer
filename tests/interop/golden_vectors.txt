@@ -94,3 +94,13 @@ valid minor4_unattended_reject_unavailable abababababababababababababababab00002
 # --- has not been admitted yet, which makes them the least trusted payload the
 # --- control channel carries (§9.1).
 invalid minor4_unattended_auth_overlong_code abababababababababababababababab0100220a6f70656e736573616d65010931313131313131313100
+
+# --- Frozen for PROTOCOL_MINOR 6: the guest telling the host what it actually
+# --- received (docs/adr/0037). Guest to host only, and only towards a host
+# --- that speaks minor 6; a host reads it only from a guest whose Hello
+# --- advertised the "receiver-report" feature string. Nothing in the report is
+# --- range-checked while decoding on purpose — an absurd claim by an
+# --- untrusted peer is a feedback frame to drop where it is used, not a
+# --- malformed frame that tears the session down (§9.1).
+valid minor6_receiver_report_clean abababababababababababababababab010025002ab81700
+valid minor6_receiver_report_congested abababababababababababababababab010125e807fa01ac0200

@@ -9,6 +9,8 @@ import { html, type TemplateResult } from 'lit-html';
 import type { Locale } from './i18n';
 import { t } from './i18n';
 import type { Role } from './consent-dialog';
+import type { ConnectionStats } from './connection-quality';
+import { connectionQuality } from './connection-quality';
 import type { FileCommands, FileTransfers } from './file-transfers';
 import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 
@@ -296,6 +298,14 @@ export function sessionStatus(
    * once must never be a path to a permission (§2.1).
    */
   saveDevice: (peer: string) => TemplateResult | '' = () => '',
+  /**
+   * What each live connection's link actually looks like, by peer label
+   * (§18; ADR 0026).
+   *
+   * Measured, never configured, and absent rather than zeroed while nothing
+   * has measured it: a session with no row here simply shows no pill.
+   */
+  connectionStats: ReadonlyMap<string, ConnectionStats> = new Map(),
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -364,6 +374,9 @@ export function sessionStatus(
                   <button type="button" class="revoke-btn" @click=${() => void revoke(session.peer_label)}>
                     ${t(locale, 'status.revoke')}
                   </button>
+                  ${session.state === 'active'
+                    ? connectionQuality(connectionStats.get(session.peer_label), locale)
+                    : ''}
                   ${session.state === 'active' ? grantSwitches(session, locale, onRefresh) : ''}
                   ${session.state === 'active'
                     ? recordingRow(

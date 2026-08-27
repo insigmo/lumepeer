@@ -93,10 +93,15 @@ mod dxgi {
     };
     use windows::core::{Interface as _, PCWSTR};
 
-    use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
+    use lumepeer_core::protocol::{
+        CursorShapeData, InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE,
+    };
+
+    use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
 
     use crate::capture::{
         CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
+        cursor_shape as bounded_cursor_shape,
     };
     use crate::error::{MediaError, Result};
 
@@ -356,6 +361,19 @@ mod dxgi {
         /// frames because a shape update is only reported when it changes,
         /// not on every acquire (MSDN, `PointerShapeBufferSize`).
         pointer_shape: Option<PointerShape>,
+        /// Bumped each time Desktop Duplication reports a *new* bitmap.
+        ///
+        /// The DXGI reply carries no identity for a shape, so this stands in
+        /// for one: [`ScreenCapturer::cursor_shape`] answers "unchanged" by
+        /// comparing this against what it last handed out, rather than by
+        /// comparing up to `MAX_CURSOR_SHAPE_PIXELS` of pixels every frame.
+        pointer_shape_seq: u64,
+        /// `pointer_shape_seq` of the shape already sent to the guest.
+        reported_shape_seq: Option<u64>,
+        /// Whether the cursor is drawn into the frames this backend produces.
+        /// Turned off when the guest has said it will draw the cursor itself
+        /// (§11; `FEATURE_CURSOR_SHAPE`).
+        embed_cursor: bool,
         /// Top-left corner to draw `pointer_shape` at, in this monitor's
         /// frame coordinates, or `None` while the OS reports the pointer
         /// hidden. Already hotspot-adjusted by DXGI (MSDN,
@@ -471,6 +489,9 @@ mod dxgi {
                 staging,
                 last_hash: None,
                 pointer_shape: None,
+                pointer_shape_seq: 0,
+                reported_shape_seq: None,
+                embed_cursor: true,
                 pointer_position: None,
                 last_frame_data: None,
                 device_name: output_desc.DeviceName,
@@ -547,6 +568,7 @@ mod dxgi {
                     &self.duplication,
                     info.PointerShapeBufferSize,
                 )?);
+                self.pointer_shape_seq = self.pointer_shape_seq.wrapping_add(1);
             }
             if info.LastMouseUpdateTime != 0 {
                 self.pointer_position = info.PointerPosition.Visible.as_bool().then_some((
@@ -640,7 +662,10 @@ mod dxgi {
         /// §11.1's "identical to the previous one" holds even with the
         /// cursor included.
         fn finish_frame(&mut self, mut data: Vec<u8>) -> Option<Frame> {
-            if let (Some(pos), Some(shape)) = (self.pointer_position, self.pointer_shape.as_ref()) {
+            if self.embed_cursor
+                && let (Some(pos), Some(shape)) =
+                    (self.pointer_position, self.pointer_shape.as_ref())
+            {
                 composite_pointer(
                     &mut data,
                     self.staging.width,
@@ -1164,6 +1189,164 @@ mod dxgi {
             // time an injector sees it (§2.3, §11).
             InputCapability::Full
         }
+
+        fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+            let active = self.active.as_mut()?;
+            if active.reported_shape_seq == Some(active.pointer_shape_seq) {
+                return None;
+            }
+            let shape = to_cursor_shape(active.pointer_shape.as_ref()?)?;
+            // Recorded only once the shape passed the bound of §14: one that
+            // was refused must be reconsidered if a later frame reports it.
+            active.reported_shape_seq = Some(active.pointer_shape_seq);
+            Some(shape)
+        }
+
+        fn set_cursor_embedded(&mut self, embedded: bool) {
+            if let Some(active) = self.active.as_mut()
+                && active.embed_cursor != embedded
+            {
+                active.embed_cursor = embedded;
+                // The picture genuinely changed: the next frame either gains
+                // or loses a cursor, and the §11.1 hash must not call it a
+                // duplicate.
+                active.last_hash = None;
+            }
+        }
+    }
+
+    /// Turns a DXGI cursor bitmap into the premultiplied BGRA of §11's
+    /// `CursorShapeData`, or `None` when it is not a shape that can travel.
+    ///
+    /// Three encodings arrive here and only one of them is already what the
+    /// wire wants:
+    ///
+    /// - `COLOR` is 32bpp BGRA with **straight** alpha, so it is premultiplied
+    ///   on the way out. Skipping that step doubles the brightness of every
+    ///   antialiased edge on the guest's screen.
+    /// - `MASKED_COLOR` reuses the alpha byte as a 1-bit AND mask: clear means
+    ///   draw the colour opaque, set means XOR it onto whatever is behind.
+    /// - `MONOCHROME` is a 1bpp AND mask stacked above a 1bpp XOR mask, so its
+    ///   reported height is twice the cursor's.
+    ///
+    /// XOR is the case an RGBA overlay cannot express at all: it is a function
+    /// of the pixels underneath, and the guest is drawing on a layer above the
+    /// video where those are not available. Every remote-desktop client has to
+    /// choose, and this one renders an inverting pixel as opaque black —
+    /// the overwhelmingly common inverting cursor is the text I-beam, and it
+    /// sits over a light background almost every time it is used. The
+    /// alternative is not "better colours", it is keeping the cursor composited
+    /// into the video, which is exactly what a host without this channel does.
+    fn to_cursor_shape(shape: &PointerShape) -> Option<CursorShapeData> {
+        // Before the conversion buffer is sized, not after: §14's bound is
+        // checked on both sides of the wire, and this is the side that would
+        // otherwise allocate first and refuse second.
+        let area = (shape.width as usize).checked_mul(shape.height as usize)?;
+        if area == 0 || area > MAX_CURSOR_SHAPE_PIXELS {
+            return None;
+        }
+        let kind = shape.kind;
+        if kind == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0.cast_unsigned() {
+            return monochrome_cursor(shape);
+        }
+        let masked = kind
+            == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR
+                .0
+                .cast_unsigned();
+        if !masked && kind != DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned() {
+            // A shape type this DXGI version does not document. Sending
+            // nothing keeps the guest's overlay empty, which is honest;
+            // guessing at the layout would draw noise over the picture.
+            return None;
+        }
+        color_cursor(shape, masked)
+    }
+
+    /// `COLOR` and `MASKED_COLOR`, both 32bpp with the same geometry.
+    fn color_cursor(shape: &PointerShape, masked: bool) -> Option<CursorShapeData> {
+        let (width, height) = (shape.width, shape.height);
+        let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * BYTES_PER_PIXEL);
+        for row in 0..height {
+            let row_start = (row * shape.pitch) as usize;
+            for column in 0..width {
+                let offset = row_start + (column as usize) * BYTES_PER_PIXEL;
+                let source = shape.pixels.get(offset..offset + BYTES_PER_PIXEL)?;
+                if masked {
+                    // Alpha is an AND mask here, not alpha: clear draws the
+                    // colour, set inverts what is behind (see `to_cursor_shape`).
+                    let opaque = source[3] == 0;
+                    if opaque {
+                        pixels.extend_from_slice(&[source[0], source[1], source[2], 0xFF]);
+                    } else {
+                        pixels.extend_from_slice(&[0, 0, 0, 0xFF]);
+                    }
+                } else {
+                    let alpha = u16::from(source[3]);
+                    for channel in source.iter().take(3) {
+                        pixels.push(premultiply(*channel, alpha));
+                    }
+                    pixels.push(source[3]);
+                }
+            }
+        }
+        bounded_cursor_shape(
+            u16::try_from(width).ok()?,
+            u16::try_from(height).ok()?,
+            0,
+            0,
+            pixels,
+        )
+    }
+
+    /// `MONOCHROME`: a 1bpp AND mask stacked directly above a 1bpp XOR mask,
+    /// so the reported height is twice the cursor's.
+    ///
+    /// Halving the height is the step `composite_monochrome` also takes and
+    /// the one that is easiest to lose when this logic is moved; without it
+    /// the shape is twice as tall as the cursor and its bottom half is the
+    /// XOR mask drawn as if it were pixels.
+    fn monochrome_cursor(shape: &PointerShape) -> Option<CursorShapeData> {
+        let height = shape.height / 2;
+        let width = shape.width;
+        let mut pixels = Vec::with_capacity((width as usize) * (height as usize) * BYTES_PER_PIXEL);
+        for row in 0..height {
+            let and_row = (row * shape.pitch) as usize;
+            let xor_row = ((row + height) * shape.pitch) as usize;
+            for column in 0..width {
+                let byte_index = (column / 8) as usize;
+                let bit = 7 - (column % 8);
+                let and_byte = *shape.pixels.get(and_row + byte_index)?;
+                let xor_byte = *shape.pixels.get(xor_row + byte_index)?;
+                let and_bit = (and_byte >> bit) & 1;
+                let xor_bit = (xor_byte >> bit) & 1;
+                // Opaque white where the XOR mask paints through a clear AND
+                // bit, transparent where the AND bit alone is set, and opaque
+                // black for both the plain-black case and the inverting one
+                // (see `to_cursor_shape` for why inversion lands here).
+                pixels.extend_from_slice(match (and_bit, xor_bit) {
+                    (0, 1) => &[0xFF, 0xFF, 0xFF, 0xFF],
+                    (1, 0) => &[0, 0, 0, 0],
+                    _ => &[0, 0, 0, 0xFF],
+                });
+            }
+        }
+        bounded_cursor_shape(
+            u16::try_from(width).ok()?,
+            u16::try_from(height).ok()?,
+            0,
+            0,
+            pixels,
+        )
+    }
+
+    /// One straight-alpha channel, premultiplied.
+    fn premultiply(channel: u8, alpha: u16) -> u8 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a product of two bytes divided by 255 is itself a byte"
+        )]
+        let scaled = (u16::from(channel) * alpha / 255) as u8;
+        scaled
     }
 
     /// Extra mouse buttons carried in `MOUSEINPUT.mouseData` alongside
@@ -1410,7 +1593,11 @@ mod dxgi {
 
     #[cfg(test)]
     mod tests {
-        #![allow(clippy::unwrap_used)]
+        #![allow(
+            clippy::unwrap_used,
+            clippy::expect_used,
+            reason = "a failed assumption must fail the test"
+        )]
 
         use std::sync::Mutex;
 
@@ -1439,6 +1626,119 @@ mod dxgi {
             // A plain character code point is not a named key: `key` sends it
             // through `KEYEVENTF_UNICODE` instead.
             assert_eq!(named_key_vk(u32::from(b'a')), None);
+        }
+
+        /// `COLOR` arrives with straight alpha and the wire wants it
+        /// premultiplied. Skipping that step is invisible on the opaque
+        /// pixels and doubles the brightness of every antialiased edge.
+        #[test]
+        fn a_colour_cursor_is_premultiplied_on_the_way_out() {
+            // Two pixels: opaque red, and half-transparent red.
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 2,
+                height: 1,
+                pitch: 8,
+                pixels: vec![0, 0, 255, 255, 0, 0, 255, 128],
+            };
+            let converted = to_cursor_shape(&shape).expect("a 2x1 colour cursor is a valid shape");
+            assert_eq!((converted.width, converted.height), (2, 1));
+            assert_eq!(&converted.rgba[..4], &[0, 0, 255, 255]);
+            // 255 * 128 / 255 == 128, and the alpha byte is untouched.
+            assert_eq!(&converted.rgba[4..], &[0, 0, 128, 128]);
+        }
+
+        /// `MASKED_COLOR` has no alpha at all: the fourth byte is a 1-bit AND
+        /// mask, and reading it as alpha would make every cursor drawn this
+        /// way almost invisible.
+        #[test]
+        fn a_masked_colour_cursor_is_opaque_where_the_mask_is_clear() {
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR
+                    .0
+                    .cast_unsigned(),
+                width: 2,
+                height: 1,
+                pitch: 8,
+                pixels: vec![10, 20, 30, 0, 10, 20, 30, 0xFF],
+            };
+            let converted = to_cursor_shape(&shape).expect("a 2x1 masked cursor is a valid shape");
+            assert_eq!(&converted.rgba[..4], &[10, 20, 30, 0xFF]);
+            // The inverting half is rendered opaque rather than dropped.
+            assert_eq!(converted.rgba[7], 0xFF);
+        }
+
+        /// The monochrome trap: DXGI reports a height that is twice the
+        /// cursor's, because the XOR mask is stacked under the AND mask.
+        /// Losing the halving gives a shape twice as tall with the mask drawn
+        /// into its bottom half.
+        #[test]
+        fn a_monochrome_cursor_is_half_the_height_dxgi_reports() {
+            // 8x2 reported, so a 8x1 cursor. AND row then XOR row, 1bpp with
+            // one byte per row.
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0.cast_unsigned(),
+                width: 8,
+                height: 2,
+                pitch: 1,
+                // AND: 0b1100_0000 — the first two pixels are "leave alone".
+                // XOR: 0b1010_0000 — pixel 0 inverts, pixel 2 is white.
+                pixels: vec![0b1100_0000, 0b1010_0000],
+            };
+            let converted = to_cursor_shape(&shape).expect("a monochrome cursor is a valid shape");
+            assert_eq!((converted.width, converted.height), (8, 1));
+            assert_eq!(converted.rgba.len(), 8 * 4);
+            // AND=1, XOR=1: the inverting case, rendered opaque black.
+            assert_eq!(&converted.rgba[0..4], &[0, 0, 0, 0xFF]);
+            // AND=1, XOR=0: transparent.
+            assert_eq!(&converted.rgba[4..8], &[0, 0, 0, 0]);
+            // AND=0, XOR=1: opaque white.
+            assert_eq!(&converted.rgba[8..12], &[0xFF, 0xFF, 0xFF, 0xFF]);
+            // AND=0, XOR=0: opaque black.
+            assert_eq!(&converted.rgba[12..16], &[0, 0, 0, 0xFF]);
+        }
+
+        /// A shape type this DXGI version does not document produces nothing
+        /// rather than a guess: the guest's overlay stays empty, which is
+        /// honest, instead of drawing noise over the picture.
+        #[test]
+        fn an_unknown_shape_type_produces_no_cursor_at_all() {
+            let shape = PointerShape {
+                kind: 0xDEAD_BEEF,
+                width: 1,
+                height: 1,
+                pitch: 4,
+                pixels: vec![0, 0, 0, 0],
+            };
+            assert!(to_cursor_shape(&shape).is_none());
+        }
+
+        /// The bound of §14 is checked before the shape leaves this backend,
+        /// not only on the way back in.
+        #[test]
+        fn a_cursor_over_the_pixel_bound_is_refused_before_it_is_sent() {
+            let side = 256u32; // 65536 pixels, four times MAX_CURSOR_SHAPE_PIXELS.
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: side,
+                height: side,
+                pitch: side * 4,
+                pixels: vec![0u8; (side * side * 4) as usize],
+            };
+            assert!(to_cursor_shape(&shape).is_none());
+        }
+
+        /// A truncated buffer is a shape to drop, never an index past the end.
+        #[test]
+        fn a_short_cursor_buffer_is_refused_rather_than_indexed_out_of_bounds() {
+            let shape = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 4,
+                height: 4,
+                pitch: 16,
+                pixels: vec![0u8; 8],
+            };
+            assert!(to_cursor_shape(&shape).is_none());
         }
 
         /// A capture backend must never claim it is running when it is not.

@@ -13,7 +13,11 @@ import {
   renderToolbar,
   type MonitorDto,
   type ToolbarCommands,
+  type ToolbarControls,
+  type ToolbarHooks,
 } from './toolbar';
+import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
+import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
@@ -56,41 +60,88 @@ function fakeCommands(): ToolbarCommands & {
   return commands;
 }
 
+/**
+ * The window state the toolbar reads but does not own: chat visibility, the
+ * display mode and full screen. Held here so a test can assert on what the
+ * toolbar asked for rather than on what it decided.
+ */
+type FakeHooks = ToolbarHooks & {
+  mode: DisplayMode;
+  isFullscreen: boolean;
+  hasCursorChannel: boolean;
+  drawsLocalCursor: boolean;
+  controls: ToolbarControls | null;
+};
+
+function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
+  const hooks: FakeHooks = {
+    mode: 'fit',
+    isFullscreen: false,
+    hasCursorChannel: true,
+    drawsLocalCursor: true,
+    controls: null,
+    toggleChat: () => true,
+    chatVisible: () => true,
+    displayMode: () => hooks.mode,
+    setDisplayMode: (mode) => {
+      hooks.mode = mode;
+    },
+    fullscreen: () => hooks.isFullscreen,
+    toggleFullscreen: () => {
+      hooks.isFullscreen = !hooks.isFullscreen;
+    },
+    cursorChannel: () => hooks.hasCursorChannel,
+    localCursor: () => hooks.drawsLocalCursor,
+    toggleLocalCursor: () => {
+      hooks.drawsLocalCursor = !hooks.drawsLocalCursor;
+    },
+    bind: (controls) => {
+      hooks.controls = controls;
+    },
+    ...overrides,
+  };
+  return hooks;
+}
+
 function draw(
   state: Parameters<typeof renderToolbar>[1],
   commands: ToolbarCommands = fakeCommands(),
+  hooks: ToolbarHooks = fakeHooks(),
 ): void {
-  renderToolbar(
-    container,
-    state,
-    'en',
-    {
-      toggleChat: () => true,
-      chatVisible: () => true,
+  renderToolbar(container, state, 'en', hooks, {
+    toggleCollapsed: () => {
+      state.collapsed = !state.collapsed;
+      draw(state, commands, hooks);
     },
-    {
-      toggleCollapsed: () => {
-        state.collapsed = !state.collapsed;
-        draw(state, commands);
-      },
-      openPopover: (which) => {
-        state.openPopover = which;
-        draw(state, commands);
-      },
-      setResolution: (value) => {
-        state.resolution = value;
-        draw(state, commands);
-      },
-      toggleMic: () => {},
-      sendCad: () => {},
-      askToRecord: () => {},
-      sendClipboard: () => {},
-      sendFile: () => {},
-      pickMonitor: () => {},
-      beginDrag: () => {},
-      nudge: () => {},
+    openPopover: (which) => {
+      state.openPopover = which;
+      draw(state, commands, hooks);
     },
-  );
+    setResolution: (value) => {
+      state.resolution = value;
+      draw(state, commands, hooks);
+    },
+    setDisplayMode: (mode) => {
+      hooks.setDisplayMode(mode);
+      draw(state, commands, hooks);
+    },
+    toggleFullscreen: () => {
+      hooks.toggleFullscreen();
+      draw(state, commands, hooks);
+    },
+    toggleLocalCursor: () => {
+      hooks.toggleLocalCursor();
+      draw(state, commands, hooks);
+    },
+    toggleMic: () => {},
+    sendCad: () => {},
+    askToRecord: () => {},
+    sendClipboard: () => {},
+    sendFile: () => {},
+    pickMonitor: () => {},
+    beginDrag: () => {},
+    nudge: () => {},
+  });
 }
 
 describe('the floating session toolbar', () => {
@@ -123,7 +174,7 @@ describe('the floating session toolbar', () => {
       'en',
       'host-ab12',
       commands,
-      { toggleChat: () => true, chatVisible: () => false },
+      fakeHooks({ chatVisible: () => false }),
     );
     try {
       const button = container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]');
@@ -150,7 +201,7 @@ describe('the floating session toolbar', () => {
       'en',
       'host-ab12',
       commands,
-      { toggleChat: () => true, chatVisible: () => false },
+      fakeHooks({ chatVisible: () => false }),
     );
     try {
       container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]')?.click();
@@ -164,6 +215,107 @@ describe('the floating session toolbar', () => {
     }
   });
 
+  it('offers full screen, and says which way the press goes', () => {
+    const hooks = fakeHooks();
+    const state = { collapsed: false, openPopover: null, sasReady: true } as Parameters<
+      typeof renderToolbar
+    >[1];
+    draw(state, fakeCommands(), hooks);
+
+    const button = (): HTMLButtonElement | null =>
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-fullscreen"]');
+    expect(button()?.getAttribute('aria-pressed')).toBe('false');
+    expect(button()?.getAttribute('aria-label')).toBe(t('en', 'toolbar.fullscreen'));
+
+    button()?.click();
+    expect(hooks.isFullscreen).toBe(true);
+    // The label follows the state, so the way back out is named rather than
+    // guessed at — full screen hides the window chrome that would say it.
+    expect(button()?.getAttribute('aria-pressed')).toBe('true');
+    expect(button()?.getAttribute('aria-label')).toBe(t('en', 'toolbar.fullscreen.exit'));
+  });
+
+  it('offers every display mode and asks the window rather than deciding', () => {
+    const hooks = fakeHooks();
+    const state = { collapsed: false, openPopover: 'settings', sasReady: true } as Parameters<
+      typeof renderToolbar
+    >[1];
+    draw(state, fakeCommands(), hooks);
+
+    const select = container.querySelector<HTMLSelectElement>(
+      '[data-testid="toolbar-display-mode"]',
+    );
+    expect(select).not.toBeNull();
+    expect(Array.from(select?.options ?? []).map((option) => option.value)).toEqual([
+      ...DISPLAY_MODES,
+    ]);
+    expect(select?.value).toBe('fit');
+
+    if (select) {
+      select.value = 'actual';
+      select.dispatchEvent(new Event('change'));
+    }
+    expect(hooks.mode).toBe('actual');
+  });
+
+  it('offers the local-cursor switch only where the host sends a cursor', () => {
+    const hooks = fakeHooks();
+    const state = { collapsed: false, openPopover: 'settings', sasReady: true } as Parameters<
+      typeof renderToolbar
+    >[1];
+    draw(state, fakeCommands(), hooks);
+
+    const toggle = (): HTMLInputElement | null =>
+      container.querySelector<HTMLInputElement>('[data-testid="toolbar-local-cursor"]');
+    expect(toggle()?.checked).toBe(true);
+    toggle()?.click();
+    expect(hooks.drawsLocalCursor).toBe(false);
+    expect(toggle()?.checked).toBe(false);
+  });
+
+  it('says the pointer is inside the picture when the host cannot separate it', () => {
+    // §11: on such a host there is nothing to switch, and offering a switch
+    // that would draw a second cursor is worse than offering none.
+    const hooks = fakeHooks();
+    hooks.hasCursorChannel = false;
+    const state = { collapsed: false, openPopover: 'settings', sasReady: true } as Parameters<
+      typeof renderToolbar
+    >[1];
+    draw(state, fakeCommands(), hooks);
+    expect(container.querySelector('[data-testid="toolbar-local-cursor"]')).toBeNull();
+    expect(
+      container.querySelector('[data-testid="toolbar-cursor-embedded"]')?.textContent?.trim(),
+    ).toBe(t('en', 'toolbar.settings.cursorEmbedded'));
+  });
+
+  it('lists the client hotkeys, because an invisible one is a bug', () => {
+    const state = { collapsed: false, openPopover: 'settings', sasReady: true } as Parameters<
+      typeof renderToolbar
+    >[1];
+    draw(state);
+    const list = container.querySelector('[data-testid="toolbar-hotkeys"]');
+    expect(list).not.toBeNull();
+    for (const entry of HOTKEYS) {
+      expect(list?.textContent).toContain(hotkeyLabel(entry.code));
+    }
+  });
+
+  it('hands the window controls it can drive the toolbar with', () => {
+    const hooks = fakeHooks();
+    const commands = fakeCommands();
+    const stop = mountToolbar(container, 'en', 'host-ab12', commands, hooks);
+    try {
+      expect(hooks.controls).not.toBeNull();
+      expect(container.querySelector('[data-testid="toolbar-collapse"]')).not.toBeNull();
+      // The `toggle-toolbar` hotkey goes through exactly this.
+      hooks.controls?.toggleCollapsed();
+      expect(container.querySelector('[data-testid="toolbar-expand"]')).not.toBeNull();
+      expect(container.querySelector('[data-testid="toolbar-collapse"]')).toBeNull();
+    } finally {
+      stop();
+    }
+  });
+
   it('collapsed hides every control but the handle and the expand button', () => {
     const state = { collapsed: true, openPopover: null } as Parameters<
       typeof renderToolbar
@@ -172,6 +324,7 @@ describe('the floating session toolbar', () => {
     expect(container.querySelector('[data-testid="toolbar-expand"]')).not.toBeNull();
     for (const id of [
       'toolbar-settings',
+      'toolbar-fullscreen',
       'toolbar-monitors',
       'toolbar-chat',
       'toolbar-mic',

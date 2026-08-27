@@ -6,6 +6,11 @@
 //! The file-transfer rows were added with `FileTransferStart` (ADR 0032): the
 //! per-message bounds of §9.2 are checked on a live connection, where the only
 //! thing wrong with the frame is its size.
+//!
+//! The cursor row is the same shape of test for a different payload: a bitmap
+//! whose geometry contradicts its own pixel buffer is the one message on this
+//! channel where believing the sender means indexing past the end of an
+//! allocation.
 
 #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
@@ -18,7 +23,7 @@ use lumepeer_core::constants::{
     UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use lumepeer_core::protocol::{
-    Direction, MessageEnvelope, MessageKind, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    CursorShapeData, Direction, MessageEnvelope, MessageKind, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use lumepeer_net::endpoint::PeerEndpoint;
 use lumepeer_net::error::NetError;
@@ -318,4 +323,65 @@ async fn credentials_exactly_at_their_bounds_are_ordinary_traffic() {
     control.connection().close(0u32.into(), b"done");
     guest.close().await;
     host.close().await;
+}
+
+/// §11: a cursor whose geometry contradicts its own pixel buffer is refused
+/// while decoding, and no truncation of a valid one gets through either.
+///
+/// The bytes are built by hand and then damaged, because `encode` cannot
+/// produce them: the check that matters is the one on the receiving side,
+/// where the numbers came from someone else. `MessageEnvelope::decode` is the
+/// same function the control connection runs on every inbound frame, so what
+/// is proven here is what happens on the wire — and what must never happen is
+/// a panic, an allocation sized from the sender's claim, or a shape that is
+/// believed.
+#[test]
+fn a_damaged_cursor_frame_is_refused_rather_than_believed() {
+    let honest = MessageEnvelope {
+        session_id: [3u8; 16],
+        direction: Direction::HostToGuest,
+        seq: 0,
+        kind: MessageKind::CursorShape {
+            shape: CursorShapeData {
+                width: 8,
+                height: 8,
+                hotspot_x: 1,
+                hotspot_y: 1,
+                rgba: vec![0x5A; 8 * 8 * 4],
+            },
+        },
+        body: Vec::new(),
+    };
+    let bytes = honest.encode().unwrap();
+    assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), honest);
+
+    // Every prefix of a valid frame: each one is either an incomplete value
+    // or a shape whose payload no longer matches its geometry.
+    for cut in 1..bytes.len() {
+        assert!(
+            MessageEnvelope::decode(&bytes[..cut]).is_err(),
+            "a cursor frame truncated to {cut} bytes was accepted"
+        );
+    }
+
+    // And every single-byte corruption of the header, which is where the
+    // geometry and the payload length live. Anything that still parses must
+    // parse into a shape whose pixels match what it claims — the one thing
+    // the rest of the pipeline is allowed to assume.
+    for index in 0..bytes.len().min(64) {
+        for flip in [0x01u8, 0x80, 0xFF] {
+            let mut damaged = bytes.clone();
+            damaged[index] ^= flip;
+            if let Ok(envelope) = MessageEnvelope::decode(&damaged)
+                && let MessageKind::CursorShape { shape } = envelope.kind
+            {
+                assert_eq!(
+                    shape.rgba.len(),
+                    usize::from(shape.width) * usize::from(shape.height) * 4,
+                    "a decoded cursor disagreed with its own geometry"
+                );
+                assert!(shape.hotspot_x < shape.width && shape.hotspot_y < shape.height);
+            }
+        }
+    }
 }

@@ -53,6 +53,211 @@ export const POINTER_BUTTON_LOGICAL_BASE = 0xf0000000;
 /** Normalized pointer coordinate space of the protocol: 0..=65535. */
 const POINTER_RANGE = 65535;
 
+/**
+ * How the remote picture is laid out inside the window (§11).
+ *
+ * - `fit` scales the picture to the window, preserving its aspect ratio.
+ * - `actual` is one frame pixel to one *device* pixel, which is what makes
+ *   "1:1" mean the same thing on a HiDPI screen as on any other.
+ * - `scaled` is whatever the operator asked for, with the same device-pixel
+ *   unit as `actual`.
+ */
+export type DisplayMode = 'fit' | 'actual' | 'scaled';
+
+/** The display modes in the order the cycle hotkey walks them. */
+export const DISPLAY_MODES: readonly DisplayMode[] = ['fit', 'actual', 'scaled'];
+
+/** Narrowest and widest zoom the operator may ask for. */
+export const MIN_SCALE = 0.25;
+export const MAX_SCALE = 4;
+
+/** How much one wheel notch or one zoom press moves the scale. */
+export const SCALE_STEP = 0.25;
+
+/** Everything about where the picture is and how big it is drawn. */
+export interface ViewLayout {
+  mode: DisplayMode;
+  /**
+   * Device pixels per frame pixel, used by `scaled`.
+   *
+   * Deliberately *not* CSS pixels: at `1` on a 2x screen the picture would be
+   * drawn at half its real resolution and "1:1" would be a lie.
+   */
+  scale: number;
+  /** Pan, in CSS pixels, away from the centred position. */
+  offsetX: number;
+  offsetY: number;
+}
+
+/** A rectangle in the same coordinates `MouseEvent.clientX/Y` use. */
+export interface Box {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** The layout a freshly opened window starts in. */
+export function defaultLayout(): ViewLayout {
+  return { mode: 'fit', scale: 1, offsetX: 0, offsetY: 0 };
+}
+
+/**
+ * Device pixels per frame pixel for this layout.
+ *
+ * `fit` is computed from the window; the other two are the operator's own
+ * number, and `actual` is the special case of it being exactly one.
+ */
+export function effectiveScale(
+  layout: ViewLayout,
+  frame: { width: number; height: number },
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+): number {
+  if (frame.width <= 0 || frame.height <= 0) {
+    return 1;
+  }
+  if (layout.mode === 'actual') {
+    return 1;
+  }
+  if (layout.mode === 'scaled') {
+    return clamp(layout.scale, MIN_SCALE, MAX_SCALE);
+  }
+  const scale = Math.min(
+    (viewport.width * devicePixelRatio) / frame.width,
+    (viewport.height * devicePixelRatio) / frame.height,
+  );
+  return scale > 0 && Number.isFinite(scale) ? scale : 1;
+}
+
+/**
+ * The CSS size the canvas *element* must be given.
+ *
+ * The element's size, never `canvas.width`/`canvas.height`: the backing buffer
+ * has to stay at the frame's own resolution, or `putImageData` — which cannot
+ * scale — would have to be replaced by a per-frame manual resample.
+ */
+export function displaySize(
+  layout: ViewLayout,
+  frame: { width: number; height: number },
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+): { width: number; height: number } {
+  const scale = effectiveScale(layout, frame, viewport, devicePixelRatio);
+  return {
+    width: (frame.width * scale) / devicePixelRatio,
+    height: (frame.height * scale) / devicePixelRatio,
+  };
+}
+
+/**
+ * Where the picture actually sits on screen: centred in the viewport, then
+ * moved by the pan.
+ *
+ * This is the geometry {@link remotePointer} needs, and computing it here
+ * rather than reading it back off the DOM is what makes every display mode
+ * testable in jsdom, which has no layout at all.
+ */
+export function pictureBox(
+  layout: ViewLayout,
+  frame: { width: number; height: number },
+  viewport: Box,
+  devicePixelRatio: number,
+): Box {
+  const { width, height } = displaySize(layout, frame, viewport, devicePixelRatio);
+  return {
+    left: viewport.left + (viewport.width - width) / 2 + layout.offsetX,
+    top: viewport.top + (viewport.height - height) / 2 + layout.offsetY,
+    width,
+    height,
+  };
+}
+
+/**
+ * Maps a pointer position in window coordinates onto the protocol's
+ * normalized remote coordinate space.
+ *
+ * The one place the conversion happens, and the reason it is a function of an
+ * explicit box rather than of the canvas: the moment the picture can be zoomed
+ * and panned, "the canvas fills the window" stops being true, and a mapping
+ * that assumed it would send the host coordinates that are wrong by exactly
+ * the pan — silently, with no error anywhere.
+ *
+ * `null` for a point outside the picture: there is no remote pixel under it,
+ * and clamping to the edge would report a click the operator did not make.
+ */
+export function remotePointer(
+  clientX: number,
+  clientY: number,
+  picture: Box,
+): { x: number; y: number } | null {
+  if (picture.width <= 0 || picture.height <= 0) {
+    return null;
+  }
+  const x = ((clientX - picture.left) / picture.width) * POINTER_RANGE;
+  const y = ((clientY - picture.top) / picture.height) * POINTER_RANGE;
+  if (x < 0 || y < 0 || x > POINTER_RANGE || y > POINTER_RANGE) {
+    return null;
+  }
+  return { x: clampCoordinate(x), y: clampCoordinate(y) };
+}
+
+/**
+ * The pan needed to keep the picture reachable: never so far that none of it
+ * is on screen.
+ *
+ * A picture smaller than the window cannot be panned at all — there is
+ * nothing off-screen to bring into view, and letting it drift would only lose
+ * it.
+ */
+export function clampPan(
+  layout: ViewLayout,
+  frame: { width: number; height: number },
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+): ViewLayout {
+  const { width, height } = displaySize(layout, frame, viewport, devicePixelRatio);
+  const limitX = Math.max(0, (width - viewport.width) / 2);
+  const limitY = Math.max(0, (height - viewport.height) / 2);
+  return {
+    ...layout,
+    offsetX: clamp(layout.offsetX, -limitX, limitX),
+    offsetY: clamp(layout.offsetY, -limitY, limitY),
+  };
+}
+
+/**
+ * Applies a zoom step, switching the layout into `scaled` and keeping the
+ * scale the operator was already looking at as the starting point.
+ *
+ * Zooming out of `fit` from `fit`'s own scale is what makes the first press
+ * feel like a nudge rather than a jump.
+ */
+export function zoomBy(
+  layout: ViewLayout,
+  steps: number,
+  frame: { width: number; height: number },
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+): ViewLayout {
+  const from = effectiveScale(layout, frame, viewport, devicePixelRatio);
+  return {
+    ...layout,
+    mode: 'scaled',
+    scale: clamp(from + steps * SCALE_STEP, MIN_SCALE, MAX_SCALE),
+  };
+}
+
+/** The next mode in {@link DISPLAY_MODES}, wrapping round. */
+export function nextDisplayMode(mode: DisplayMode): DisplayMode {
+  const index = DISPLAY_MODES.indexOf(mode);
+  return DISPLAY_MODES[(index + 1) % DISPLAY_MODES.length] ?? 'fit';
+}
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
 export interface ViewFrame {
   status: ViewStatus;
   /** Whether the session's `input` grant is live right now. */
@@ -129,6 +334,118 @@ export function paintFrame(canvas: HTMLCanvasElement, frame: ViewFrame): boolean
   );
   context.putImageData(new ImageData(exact, frame.width, frame.height), 0, 0);
   return true;
+}
+
+/** Bytes of the fixed header every `view_cursor` response carries. */
+export const CURSOR_RESPONSE_HEADER_BYTES = 12;
+
+/**
+ * The host's cursor, as the `view_cursor` IPC call describes it.
+ *
+ * `seq` is 0 when the host has announced no cursor at all — it is still
+ * drawing one into the picture — and the overlay must stay empty, because two
+ * cursors are worse than one that lags (§11).
+ */
+export interface CursorShape {
+  seq: number;
+  width: number;
+  height: number;
+  hotspotX: number;
+  hotspotY: number;
+  /** Premultiplied BGRA, or empty when this poll carried no new pixels. */
+  pixels: Uint8ClampedArray;
+}
+
+/**
+ * Parses the binary response of `view_cursor`.
+ *
+ * Layout, little endian:
+ * `seq:u32 | width:u16 | height:u16 | hotspot_x:u16 | hotspot_y:u16 | BGRA8`.
+ */
+export function decodeCursorShape(buffer: ArrayBuffer): CursorShape {
+  if (buffer.byteLength < CURSOR_RESPONSE_HEADER_BYTES) {
+    throw new Error(
+      `cursor response is ${buffer.byteLength} bytes, expected at least ${CURSOR_RESPONSE_HEADER_BYTES}`,
+    );
+  }
+  const header = new DataView(buffer, 0, CURSOR_RESPONSE_HEADER_BYTES);
+  return {
+    seq: header.getUint32(0, true),
+    width: header.getUint16(4, true),
+    height: header.getUint16(6, true),
+    hotspotX: header.getUint16(8, true),
+    hotspotY: header.getUint16(10, true),
+    pixels: new Uint8ClampedArray(buffer, CURSOR_RESPONSE_HEADER_BYTES),
+  };
+}
+
+/**
+ * Paints the host's cursor onto its own layer, at its own size.
+ *
+ * A separate canvas rather than the video one: drawn into the same context it
+ * would have to be erased by hand on every frame, and the picture underneath
+ * repaints thirty times a second while the cursor changes when someone crosses
+ * a text field.
+ *
+ * The bytes arrive as premultiplied BGRA (see `CursorShapeData::rgba`); the
+ * canvas wants straight RGBA, so the channels are swapped and the colour is
+ * divided back out by the alpha. Skipping the un-premultiply leaves every
+ * antialiased edge too dark against a light background.
+ *
+ * Returns whether anything was painted.
+ */
+export function paintCursor(canvas: HTMLCanvasElement, cursor: CursorShape): boolean {
+  const pixelCount = cursor.width * cursor.height;
+  if (pixelCount === 0 || cursor.pixels.length < pixelCount * 4) {
+    return false;
+  }
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return false;
+  }
+  if (canvas.width !== cursor.width || canvas.height !== cursor.height) {
+    canvas.width = cursor.width;
+    canvas.height = cursor.height;
+  }
+  const rgba = new Uint8ClampedArray(pixelCount * 4);
+  for (let index = 0; index < pixelCount; index += 1) {
+    const at = index * 4;
+    const alpha = cursor.pixels[at + 3] ?? 0;
+    const scale = alpha === 0 ? 0 : 255 / alpha;
+    rgba[at] = Math.min(255, (cursor.pixels[at + 2] ?? 0) * scale);
+    rgba[at + 1] = Math.min(255, (cursor.pixels[at + 1] ?? 0) * scale);
+    rgba[at + 2] = Math.min(255, (cursor.pixels[at] ?? 0) * scale);
+    rgba[at + 3] = alpha;
+  }
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.putImageData(new ImageData(rgba, cursor.width, cursor.height), 0, 0);
+  return true;
+}
+
+/**
+ * Where the cursor layer belongs on screen, in client coordinates.
+ *
+ * The hotspot is the point that has to sit under the pointer, not the shape's
+ * top-left: an arrow's hotspot is its tip and an I-beam's is its middle, so
+ * placing the bitmap by its corner puts every cursor a few pixels off in a
+ * direction that changes with the cursor.
+ *
+ * The shape is drawn at the picture's own scale, so it grows and shrinks with
+ * the display mode rather than staying a fixed size over a zoomed screen.
+ */
+export function cursorPlacement(
+  pointer: { x: number; y: number },
+  cursor: CursorShape,
+  picture: Box,
+  frame: { width: number; height: number },
+): { left: number; top: number; width: number; height: number } {
+  const scale = frame.width > 0 ? picture.width / frame.width : 1;
+  return {
+    left: pointer.x - cursor.hotspotX * scale,
+    top: pointer.y - cursor.hotspotY * scale,
+    width: cursor.width * scale,
+    height: cursor.height * scale,
+  };
 }
 
 /** Where forwarded input events go. The entry point wires this to Tauri IPC. */
@@ -216,30 +533,50 @@ export function suppressContextMenu(target: EventTarget): void {
  * Listeners are attached on `setEnabled(true)` and fully removed on
  * `setEnabled(false)`: a session whose role was lowered mid-flight must stop
  * *producing* events, not merely have them rejected further down (§8.1).
+ *
+ * Where the picture is on screen comes from `geometry`, not from the element:
+ * the mapping has to agree with whatever the display mode and the pan did, and
+ * reading it back off the DOM would tie the one piece of arithmetic that can go
+ * silently wrong to a layout engine no test has.
  */
 export class ViewInput {
   private attached = false;
 
   private readonly onPointerMove = (event: PointerEvent): void => {
-    const rect = this.surface.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) {
+    const remote = remotePointer(event.clientX, event.clientY, this.geometry());
+    // Outside the picture: there is no remote pixel under the pointer, and
+    // reporting the nearest edge would be a move the operator did not make.
+    if (!remote) {
       return;
     }
-    const x = ((event.clientX - rect.left) / rect.width) * POINTER_RANGE;
-    const y = ((event.clientY - rect.top) / rect.height) * POINTER_RANGE;
-    this.sink.pointerMove(clampCoordinate(x), clampCoordinate(y), modifiersOf(event));
+    this.sink.pointerMove(remote.x, remote.y, modifiersOf(event));
   };
 
   private readonly onPointerDown = (event: PointerEvent): void => {
+    // The middle button pans locally and never reaches the host, which is
+    // what makes panning possible at all: the left button belongs to the
+    // remote machine. `defaultPrevented` covers the other pan gesture —
+    // space with the left button — which `installPan` claims in the capture
+    // phase before this listener runs.
+    if (event.button === POINTER_BUTTON_PAN || event.defaultPrevented) {
+      return;
+    }
     this.sink.press(logicalOfButton(event.button), 0, modifiersOf(event), true);
   };
 
   private readonly onPointerUp = (event: PointerEvent): void => {
+    if (event.button === POINTER_BUTTON_PAN || event.defaultPrevented) {
+      return;
+    }
     this.sink.press(logicalOfButton(event.button), 0, modifiersOf(event), false);
   };
 
   private readonly onWheel = (event: WheelEvent): void => {
     event.preventDefault();
+    // Ctrl+wheel zooms locally (§11) and is not scrolling the remote machine.
+    if (event.ctrlKey) {
+      return;
+    }
     this.sink.wheel(clampDelta(event.deltaX), clampDelta(event.deltaY), modifiersOf(event));
   };
 
@@ -251,6 +588,14 @@ export class ViewInput {
     private readonly surface: HTMLElement,
     private readonly sink: InputSink,
     private readonly keyboard: EventTarget = surface.ownerDocument ?? document,
+    /**
+     * Where the picture is right now, in client coordinates.
+     *
+     * Defaults to the element's own box, which is correct while the picture
+     * fills it; a window that zooms and pans supplies {@link pictureBox}
+     * instead.
+     */
+    private readonly geometry: () => Box = () => surface.getBoundingClientRect(),
   ) {}
 
   get enabled(): boolean {
@@ -280,6 +625,11 @@ export class ViewInput {
   }
 
   private forwardKey(event: KeyboardEvent, pressed: boolean): void {
+    // A client hotkey has already been handled and marked; forwarding it too
+    // would deliver half a chord to the remote machine (§11).
+    if (event.defaultPrevented) {
+      return;
+    }
     const logical = logicalOfKey(event.key);
     if (logical === undefined) {
       return;
@@ -287,6 +637,98 @@ export class ViewInput {
     event.preventDefault();
     this.sink.press(logical, 0, modifiersOf(event), pressed);
   }
+}
+
+/** Pointer button that pans locally instead of reaching the host: middle. */
+export const POINTER_BUTTON_PAN = 1;
+
+/** What a pan gesture needs to know and to change. */
+export interface PanHost {
+  /** The layout as it stands. */
+  layout(): ViewLayout;
+  /** Moves the picture by `dx`/`dy` CSS pixels. */
+  panBy(dx: number, dy: number): void;
+}
+
+/**
+ * Wires local panning onto `surface`: middle-button drag, or space held with
+ * the left button.
+ *
+ * Never the plain left button. That one is the remote machine's, and a pan
+ * gesture that stole it would make the picture unusable for the thing it is
+ * there for.
+ *
+ * The pointer half takes nothing from the host: the middle button is not
+ * forwarded at all, and a space-drag is claimed in the capture phase so the
+ * left press never reaches {@link ViewInput}. The space *key* is a different
+ * matter — it is a real key the operator pressed and it still travels, which
+ * is why the middle button is the gesture the help text names first.
+ *
+ * Returns a teardown for the listeners it installs.
+ */
+export function installPan(surface: HTMLElement, host: PanHost, keyboard: EventTarget): () => void {
+  let spaceHeld = false;
+  let dragging: { x: number; y: number } | null = null;
+
+  const isPanGesture = (event: PointerEvent): boolean =>
+    event.button === POINTER_BUTTON_PAN || (spaceHeld && event.button === 0);
+
+  const onKeyDown = (event: Event): void => {
+    if ((event as KeyboardEvent).code === 'Space') {
+      spaceHeld = true;
+    }
+  };
+  const onKeyUp = (event: Event): void => {
+    if ((event as KeyboardEvent).code === 'Space') {
+      spaceHeld = false;
+    }
+  };
+  const onPointerDown = (event: Event): void => {
+    const pointer = event as PointerEvent;
+    if (!isPanGesture(pointer)) {
+      return;
+    }
+    // Marks the event so the input forwarder skips it: a space-drag that also
+    // clicked the remote machine would be worse than no pan at all.
+    pointer.preventDefault();
+    dragging = { x: pointer.clientX, y: pointer.clientY };
+    surface.setPointerCapture?.(pointer.pointerId);
+  };
+  const onPointerMove = (event: Event): void => {
+    if (!dragging) {
+      return;
+    }
+    const pointer = event as PointerEvent;
+    host.panBy(pointer.clientX - dragging.x, pointer.clientY - dragging.y);
+    dragging = { x: pointer.clientX, y: pointer.clientY };
+  };
+  const onPointerUp = (event: Event): void => {
+    if (!dragging) {
+      return;
+    }
+    // The release that ends a pan is claimed too, or the host would get a
+    // button release for a press it never saw.
+    event.preventDefault();
+    dragging = null;
+  };
+
+  // Capture phase for the two that have to beat the input forwarder attached
+  // to the canvas underneath; the rest are ordinary.
+  keyboard.addEventListener('keydown', onKeyDown);
+  keyboard.addEventListener('keyup', onKeyUp);
+  surface.addEventListener('pointerdown', onPointerDown, true);
+  surface.addEventListener('pointermove', onPointerMove);
+  surface.addEventListener('pointerup', onPointerUp, true);
+  surface.addEventListener('pointercancel', onPointerUp, true);
+
+  return () => {
+    keyboard.removeEventListener('keydown', onKeyDown);
+    keyboard.removeEventListener('keyup', onKeyUp);
+    surface.removeEventListener('pointerdown', onPointerDown, true);
+    surface.removeEventListener('pointermove', onPointerMove);
+    surface.removeEventListener('pointerup', onPointerUp, true);
+    surface.removeEventListener('pointercancel', onPointerUp, true);
+  };
 }
 
 function clampCoordinate(value: number): number {

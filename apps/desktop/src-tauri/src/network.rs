@@ -15,6 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::address_book::AddressEntry;
@@ -25,11 +26,13 @@ use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role}
 use lumepeer_core::constants::{
     CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
     DIAL_RETRY_BACKOFF_MS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
-    INCOMING_ACCEPT_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS,
+    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
+    MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
 };
 use lumepeer_core::protocol::{
-    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_UNATTENDED, InputEventPayload,
-    MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
+    CursorShapeData, FEATURE_CURSOR_SHAPE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
+    FEATURE_RECEIVER_REPORT, FEATURE_UNATTENDED, InputEventPayload, MediaUnavailableReason,
+    MessageKind, MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -51,9 +54,9 @@ use crate::address_book_store::AddressBookStore;
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
 use crate::unattended_store::UnattendedStore;
 use crate::view::{
-    HostMedia, MediaFault, MediaHealth, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
-    ViewWindows, encode_view_response, lock_capture, slot_for_poll, spawn_encode_loop,
-    spawn_media_receiver, window_label,
+    CursorFeed, EncodeControl, HostMedia, MediaFault, MediaHealth, MediaReport, MediaTarget,
+    SharedCapture, ViewSlot, ViewStatus, ViewWindows, encode_cursor_response, encode_view_response,
+    lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
 /// First `PROTOCOL_MINOR` that carries `MessageKind::FileTransferStart`, and
@@ -64,9 +67,183 @@ use crate::view::{
 /// to read, because `HelloAck` does not carry one.
 const FILE_TRANSFER_MINOR: u16 = 5;
 
+/// First `PROTOCOL_MINOR` that carries `MessageKind::ReceiverReport`, and
+/// therefore the floor for reporting reception to a host (§9.1; ADR 0037).
+///
+/// Guest side only, exactly like [`FILE_TRANSFER_MINOR`]: a host reads the
+/// guest's `FEATURE_RECEIVER_REPORT` string instead, which is the more precise
+/// signal, and `HelloAck` carries no feature list for the guest to read.
+const RECEIVER_REPORT_MINOR: u16 = 6;
+
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
 const NOTIFY_CAPACITY: usize = 32;
+
+/// Denominator of the permille a `ReceiverReport` carries its loss in.
+const PERMILLE: u16 = 1_000;
+
+/// Capacity of the guest-side media report channel.
+///
+/// Small on purpose: reports supersede one another, so a backlog is worthless
+/// — the newest one always says more than the three behind it. The media loop
+/// drops rather than waits when this is full (§11).
+const REPORT_CAPACITY: usize = 16;
+
+/// Whether a keyframe request may be honoured now, given when this host last
+/// honoured one for the same peer (§11).
+///
+/// Pure, and separate from the actor so the budget can be checked without a
+/// session: this is the whole of what protects the host's uplink from a guest
+/// that asks on every frame.
+fn keyframe_budget_allows(last_honoured: Option<std::time::Instant>) -> bool {
+    let budget = Duration::from_millis(KEYFRAME_MIN_INTERVAL_MS);
+    last_honoured.is_none_or(|at| at.elapsed() >= budget)
+}
+
+/// Blends one round-trip sample into the running average of [`RTT_EWMA_ALPHA`].
+///
+/// Pure, and separate from [`RttTracker`] so the smoothing can be checked
+/// without a clock: this is the whole of what the constant means.
+fn ewma_rtt(previous: Option<f32>, sample_ms: f32) -> f32 {
+    previous.map_or(sample_ms, |previous| {
+        previous + RTT_EWMA_ALPHA * (sample_ms - previous)
+    })
+}
+
+/// One peer's control-channel round trip, measured by `Ping`/`Pong` (§9.1).
+///
+/// Not a liveness watchdog. QUIC and `RECONNECT_WINDOW_SECS` already decide
+/// when a session is gone; a missing `Pong` here costs a measurement and
+/// nothing else, which is why an unanswered ping is simply overwritten by the
+/// next one.
+#[derive(Debug, Default)]
+struct RttTracker {
+    /// The nonce this side is waiting on, and when it went out.
+    outstanding: Option<(u64, std::time::Instant)>,
+    /// Smoothed round trip in milliseconds; `None` until the first sample.
+    smoothed_ms: Option<f32>,
+}
+
+impl RttTracker {
+    /// Records that `nonce` has just gone out.
+    fn sent(&mut self, nonce: u64) {
+        self.outstanding = Some((nonce, std::time::Instant::now()));
+    }
+
+    /// Folds a returned nonce into the average, and returns the new value.
+    ///
+    /// `None` — and no change at all — for a nonce this side is not waiting
+    /// on, and for a sample beyond [`RTT_MAX_PLAUSIBLE_MS`]. Both are silent:
+    /// a peer echoing something else is not an error worth a log line, and a
+    /// round trip that spans a suspended machine is not a measurement.
+    fn pong(&mut self, nonce: u64) -> Option<u32> {
+        let (expected, sent_at) = self.outstanding?;
+        if nonce != expected {
+            return None;
+        }
+        self.outstanding = None;
+        let sample = u32::try_from(sent_at.elapsed().as_millis()).unwrap_or(u32::MAX);
+        if sample > RTT_MAX_PLAUSIBLE_MS {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a millisecond count under RTT_MAX_PLAUSIBLE_MS is exact in f32"
+        )]
+        let smoothed = ewma_rtt(self.smoothed_ms, sample as f32);
+        self.smoothed_ms = Some(smoothed);
+        self.smoothed()
+    }
+
+    /// The smoothed round trip, rounded to whole milliseconds.
+    fn smoothed(&self) -> Option<u32> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the average of non-negative samples under RTT_MAX_PLAUSIBLE_MS \
+                      is non-negative and far inside u32"
+        )]
+        self.smoothed_ms.map(|ms| ms.round() as u32)
+    }
+}
+
+/// How a peer is actually being reached, as iroh reports it rather than as the
+/// settings intended (§18; ADR 0026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Every open path is a direct IP path.
+    Direct,
+    /// Every open path goes through a relay.
+    Relay,
+    /// Both kinds are open; which one carries the next packet is iroh's.
+    Mixed,
+    /// The connection has no open path to report — it is coming up, or going
+    /// away.
+    Unknown,
+}
+
+impl PathKind {
+    /// Stable identifier for the webview, which turns it into localized text.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+            Self::Mixed => "mixed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classifies a live connection's open paths, and names the relay's region
+/// when one is in use.
+///
+/// The region, never the address. A relay URL is a hostname the *host's*
+/// network chose to reach, and §15 keeps that class of detail off a screen the
+/// host does not control: what a person needs in order to know where they are
+/// is "through a relay, roughly there", not an address they could look up. An
+/// IP-literal relay has no region at all and gets `None` rather than an
+/// invented one.
+fn path_of(connection: &iroh::endpoint::Connection) -> (PathKind, Option<String>) {
+    let mut direct = false;
+    let mut relay = false;
+    let mut region = None;
+    for path in &connection.paths() {
+        if path.is_ip() {
+            direct = true;
+        }
+        if path.is_relay() {
+            relay = true;
+            if region.is_none()
+                && let iroh::TransportAddr::Relay(url) = path.remote_addr()
+            {
+                region = relay_region(url);
+            }
+        }
+    }
+    let kind = match (direct, relay) {
+        (true, true) => PathKind::Mixed,
+        (true, false) => PathKind::Direct,
+        (false, true) => PathKind::Relay,
+        (false, false) => PathKind::Unknown,
+    };
+    (kind, region)
+}
+
+/// The leading DNS label of a relay URL, which is the region in every relay
+/// naming scheme this ships against, or `None` when the URL names a bare
+/// address.
+fn relay_region(url: &iroh::RelayUrl) -> Option<String> {
+    let host = url.host_str()?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let (label, rest) = host.split_once('.')?;
+    if label.is_empty() || rest.is_empty() {
+        return None;
+    }
+    Some(label.to_owned())
+}
 
 /// What a view window needs to paint one frame, readable without the actor.
 ///
@@ -91,6 +268,11 @@ struct ViewFeed {
     /// cannot know what the far side writes to disk, so the indicator it shows
     /// is the host's own statement and nothing else.
     recording: Arc<AtomicBool>,
+    /// The host's cursor, when it announced one (§11's `CursorShape`).
+    ///
+    /// `None` means this host is still drawing the cursor into the picture,
+    /// which is exactly what tells the window not to draw a second one.
+    cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
 }
 
 /// Live view feeds by window label, shared between the actor and the IPC layer.
@@ -104,6 +286,35 @@ pub enum SessionStateDto {
     Pending,
     /// Consent granted, grants are live.
     Active,
+}
+
+/// What one live connection's link looks like right now (§18; ADR 0026,
+/// ADR 0037).
+///
+/// Everything in here is measured, not configured: the round trip comes from
+/// this session's own `Ping`/`Pong`, the path from iroh's open paths, and loss
+/// and goodput from whichever side is receiving pictures. A field is `None`
+/// when nothing has measured it yet — never a zero standing in for "unknown",
+/// which is the one thing a diagnostics panel must not say.
+#[derive(Debug, Clone)]
+pub struct ConnectionStats {
+    /// Pseudonymized peer label (§15).
+    pub label: String,
+    /// Smoothed control-channel round trip, in milliseconds.
+    pub rtt_ms: Option<u32>,
+    /// Share of frames the receiver could not turn into a picture, permille.
+    pub loss_permille: Option<u16>,
+    /// Media throughput the receiver observed, in kilobits per second.
+    pub goodput_kbps: Option<u32>,
+    /// Whether this peer is reached directly, through a relay, or both.
+    pub path: PathKind,
+    /// Region of the relay in use, when one is; never its address (§15).
+    pub relay_region: Option<String>,
+    /// Encoder bitrate this host is sending at; `None` on the guest side,
+    /// which is not the one encoding.
+    pub bitrate_kbps: Option<u32>,
+    /// Frame rate this host is sending at; `None` on the guest side.
+    pub fps: Option<u8>,
 }
 
 /// One row of the status list the webview polls.
@@ -367,6 +578,10 @@ enum ActorCommand {
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
         reply: oneshot::Sender<ConnectSnapshot>,
+    },
+    /// What every live connection's link actually looks like (§18).
+    ConnectionStats {
+        reply: oneshot::Sender<Vec<ConnectionStats>>,
     },
     Grant {
         label: String,
@@ -650,6 +865,20 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// What every live connection's link actually looks like: round trip,
+    /// path type, loss, goodput and the quality target being sent (§18).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn connection_stats(&self) -> Result<Vec<ConnectionStats>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ConnectionStats { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     /// How this node's own outgoing connect attempt is going.
     ///
     /// # Errors
@@ -748,6 +977,30 @@ impl ActorHandle {
             feed.input.load(Ordering::Relaxed),
             feed.recording.load(Ordering::Relaxed),
         ))
+    }
+
+    /// The host's cursor for a view window, as raw bytes (§11).
+    ///
+    /// Answered off the actor loop for the same reason `view_frame` is: it is
+    /// a read of a cell the control task writes and nothing else mutates, and
+    /// routing it through the mailbox would put it behind whatever the actor
+    /// is doing. Nothing is widened — the entry disappears with the view.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`.
+    pub fn view_cursor(&self, label: &str, since_seq: u32) -> Result<Vec<u8>, ActorError> {
+        let feed = self
+            .views
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .cloned()
+            .ok_or(ActorError::UnknownPeer)?;
+        let cursor = feed
+            .cursor
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(encode_cursor_response(cursor.as_ref(), since_seq))
     }
 
     /// Forwards one input event to the host behind `label`.
@@ -1514,6 +1767,21 @@ struct ConnectionHandle {
     speaks_unattended: bool,
 }
 
+/// Whether this build may send `ReceiverReport` towards a peer, from the only
+/// two signals each side actually has (§9.1; ADR 0037).
+///
+/// A host learns it from the guest's `Hello` feature string; a guest has no
+/// feature list to read, because `HelloAck` carries none, so it goes by the
+/// minor version instead — the same asymmetry `FILE_TRANSFER_MINOR` documents.
+#[derive(Debug, Clone, Copy, Default)]
+struct ReceiverReports {
+    /// Host side: the guest advertised [`FEATURE_RECEIVER_REPORT`].
+    from_peer: bool,
+    /// Guest side: the host answered with a minor of at least
+    /// [`RECEIVER_REPORT_MINOR`].
+    to_peer: bool,
+}
+
 /// Host side: one running capture/encode loop, plus the connection it writes
 /// on, so a revoke can stop both without waiting for the loop to notice.
 /// `recorder` is the §17 slot the actor swaps a session recorder into; it
@@ -1526,6 +1794,10 @@ struct MediaSession {
         reason = "kept for the actor to swap recorders into mid-session"
     )]
     recorder: crate::view::SharedRecorder,
+    /// The keyframe requests and receiver reports this peer sends, and the
+    /// quality target the loop settled on, in the one place both sides can
+    /// reach (§11; ADR 0037).
+    control: EncodeControl,
 }
 
 impl MediaSession {
@@ -1602,6 +1874,10 @@ struct ViewState {
     /// Whether the host announced it is recording, as the frame poll reads it
     /// (§17). Written when a `RecordAck` arrives.
     recording: Arc<AtomicBool>,
+    /// The host's cursor, as the cursor poll reads it (§11). Written when a
+    /// `CursorShape` arrives, and never inferred: a host that composites its
+    /// cursor into the picture sends none, and this stays `None`.
+    cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -1657,6 +1933,12 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED`
         /// (§9.1; ADR 0033).
         speaks_unattended: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_RECEIVER_REPORT`
+        /// (§9.1; ADR 0037).
+        speaks_receiver_report: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_CURSOR_SHAPE`
+        /// (§11), so this host may stop compositing the cursor for it.
+        speaks_cursor_shape: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -1711,6 +1993,12 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED`
         /// (§9.1; ADR 0033).
         speaks_unattended: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_RECEIVER_REPORT`
+        /// (§9.1; ADR 0037).
+        speaks_receiver_report: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_CURSOR_SHAPE`
+        /// (§11).
+        speaks_cursor_shape: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -1753,6 +2041,33 @@ struct Actor {
     /// own event type (§18, docs/adr/0024).
     faults_tx: mpsc::Sender<MediaFault>,
     faults_rx: mpsc::Receiver<MediaFault>,
+    /// Guest side: media receivers report what they got here, for the same
+    /// reason faults have their own channel — a decode loop has no control
+    /// connection of its own, and only the actor may write on one (§2.3).
+    reports_tx: mpsc::Sender<(NodeId, MediaReport)>,
+    reports_rx: mpsc::Receiver<(NodeId, MediaReport)>,
+    /// Per-peer control-channel round trip, from this session's own
+    /// `Ping`/`Pong` (§9.1).
+    rtt: std::collections::HashMap<NodeId, RttTracker>,
+    /// Newest `(loss_permille, goodput_kbps)` known for a peer's link.
+    ///
+    /// Written on whichever side is receiving pictures: the host stores what
+    /// the guest reported, the guest stores what it measured itself. Neither
+    /// invents the other's half.
+    reception: std::collections::HashMap<NodeId, (u16, u32)>,
+    /// Host side: when this host last honoured a `KeyframeRequest` from a
+    /// peer, so a guest cannot decide what the uplink is spent on (§11).
+    last_keyframe: std::collections::HashMap<NodeId, std::time::Instant>,
+    /// Which side of the `ReceiverReport` exchange each peer can speak
+    /// (§9.1; ADR 0037).
+    receiver_reports: std::collections::HashMap<NodeId, ReceiverReports>,
+    /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
+    /// which may therefore be sent one (§11).
+    speaks_cursor_shape: std::collections::HashSet<NodeId>,
+    /// Host side: cursor shapes the encode loops picked up, on their way to
+    /// the control channel only this thread may write (§2.3).
+    cursors_tx: mpsc::Sender<(NodeId, CursorShapeData)>,
+    cursors_rx: mpsc::Receiver<(NodeId, CursorShapeData)>,
     /// What this host knows about its own ability to produce a picture.
     health: Arc<MediaHealth>,
     notify: broadcast::Sender<ActorNotification>,
@@ -1967,6 +2282,11 @@ impl Actor {
     }
 
     async fn run(mut self) {
+        // The keepalive of §9.1, and the only source of the round trip the
+        // diagnostics panel shows. It fires immediately on the first tick,
+        // which is what gets a number on screen without a 20-second wait.
+        let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = self.rx.recv() => {
@@ -1994,8 +2314,194 @@ impl Actor {
                         self.on_local_clipboard(&text);
                     }
                 }
+                report = self.reports_rx.recv() => {
+                    if let Some((peer, report)) = report {
+                        self.on_media_report(peer, report);
+                    }
+                }
+                cursor = self.cursors_rx.recv() => {
+                    if let Some((peer, shape)) = cursor {
+                        self.on_cursor_shape(peer, shape);
+                    }
+                }
+                _ = ping.tick() => self.send_pings(),
             }
         }
+    }
+
+    /// Sends one `Ping` to every live connection and remembers its nonce.
+    ///
+    /// A ping that was never answered is simply replaced: this is a
+    /// measurement, not a second liveness watchdog on top of QUIC's own and
+    /// `RECONNECT_WINDOW_SECS` (§9.1, §10).
+    fn send_pings(&mut self) {
+        let peers: Vec<NodeId> = self.connections.keys().copied().collect();
+        for peer in peers {
+            let nonce = rand::rng().next_u64();
+            self.rtt.entry(peer).or_default().sent(nonce);
+            self.send_to(&peer, MessageKind::Ping(nonce));
+        }
+    }
+
+    /// Guest side: turns what the media receiver measured into the control
+    /// messages only this thread may write (§2.3).
+    ///
+    /// A report reaches the host only when the host can decode it: an older
+    /// peer would read the unknown discriminant as a malformed frame and close
+    /// the connection (§9.1), so a link to one keeps the host-local estimate
+    /// of ADR 0015 and nothing is lost but precision.
+    fn on_media_report(&mut self, peer: NodeId, report: MediaReport) {
+        match report {
+            MediaReport::Feedback {
+                loss_permille,
+                goodput_kbps,
+            } => {
+                // Kept whatever the far side speaks: this is also what this
+                // node's own diagnostics panel shows about the link it is
+                // watching.
+                self.reception.insert(peer, (loss_permille, goodput_kbps));
+                if !self.may_report_to(&peer) {
+                    return;
+                }
+                let rtt_ms = self.rtt.get(&peer).and_then(RttTracker::smoothed);
+                self.send_to(
+                    &peer,
+                    MessageKind::ReceiverReport {
+                        loss_permille,
+                        rtt_ms: rtt_ms.unwrap_or(0),
+                        goodput_kbps,
+                    },
+                );
+            }
+            MediaReport::KeyframeNeeded => {
+                self.send_to(&peer, MessageKind::KeyframeRequest);
+            }
+        }
+    }
+
+    /// Host side: one changed cursor shape, on its way to the guest drawing
+    /// it (§11).
+    ///
+    /// Only ever sent to a peer that advertised `FEATURE_CURSOR_SHAPE`: a
+    /// guest that cannot draw a cursor and is no longer sent one in the
+    /// picture would have no cursor at all.
+    fn on_cursor_shape(&mut self, peer: NodeId, shape: CursorShapeData) {
+        if !self.speaks_cursor_shape.contains(&peer) {
+            return;
+        }
+        self.send_to(&peer, MessageKind::CursorShape { shape });
+    }
+
+    /// Host side: whether the cursor may travel on its own channel right now.
+    ///
+    /// One capture backend feeds every viewer, so this is an all-or-nothing
+    /// decision, and it takes two things of *every* peer currently receiving a
+    /// picture:
+    ///
+    /// - it advertised `FEATURE_CURSOR_SHAPE`, so it can draw the cursor. One
+    ///   older guest among them and the cursor goes back into the frame for
+    ///   all of them: a guest that cannot draw it must never be left with a
+    ///   screen that has no pointer on it.
+    /// - it holds the `input` grant, so the pointer it would draw is the one
+    ///   it is moving. A view-only guest is watching someone else work, and
+    ///   drawing at its own pointer would show a cursor that has nothing to do
+    ///   with the one on the host's screen — worse than the latency the
+    ///   channel exists to remove (ADR 0038).
+    fn refresh_cursor_embedding(&mut self) {
+        let separate = !self.media.is_empty()
+            && self.media.keys().all(|peer| {
+                self.speaks_cursor_shape.contains(peer)
+                    && self.sessions.grants(peer).is_some_and(|g| g.input)
+            });
+        lock_capture(&self.capture).set_cursor_embedded(!separate);
+    }
+
+    /// Guest side: whether `peer` speaks minor 6 and can decode a
+    /// `ReceiverReport` at all (§9.1; ADR 0037).
+    fn may_report_to(&self, peer: &NodeId) -> bool {
+        self.receiver_reports
+            .get(peer)
+            .is_some_and(|speaks| speaks.to_peer)
+    }
+
+    /// Host side: honours a guest's `KeyframeRequest`, at most once per
+    /// [`KEYFRAME_MIN_INTERVAL_MS`].
+    ///
+    /// The budget lives here rather than in the encode loop because this is
+    /// the only place that knows *which* peer asked. Without it a guest could
+    /// hold the host at one keyframe per frame, which is a guest deciding what
+    /// the host's uplink is spent on (§11).
+    fn on_keyframe_request(&mut self, peer: NodeId) {
+        let Some(session) = self.media.get(&peer) else {
+            tracing::debug!(
+                peer = %self.label_of(&peer),
+                "keyframe request without a media session; ignored"
+            );
+            return;
+        };
+        if !keyframe_budget_allows(self.last_keyframe.get(&peer).copied()) {
+            tracing::debug!(peer = %self.label_of(&peer), "keyframe request rate limited");
+            return;
+        }
+        session.control.request_keyframe();
+        self.last_keyframe.insert(peer, std::time::Instant::now());
+    }
+
+    /// Host side: hands a guest's report to the encode loop feeding it (§11).
+    ///
+    /// Range-checked here and nowhere else, because here is where it stops
+    /// being a claim by an untrusted peer and starts being an input to the
+    /// controller: a loss outside `0.0..=1.0` or an implausible round trip is
+    /// a frame of feedback to drop, not a reason to disbelieve the session
+    /// (§9.1).
+    fn on_receiver_report(&mut self, peer: NodeId, loss_permille: u16, rtt_ms: u32, goodput: u32) {
+        let tag = self.label_of(&peer);
+        if !self
+            .receiver_reports
+            .get(&peer)
+            .is_some_and(|speaks| speaks.from_peer)
+        {
+            tracing::debug!(peer = %tag, "receiver report from a peer that never advertised one");
+            return;
+        }
+        if loss_permille > PERMILLE || rtt_ms > RTT_MAX_PLAUSIBLE_MS {
+            tracing::warn!(peer = %tag, loss_permille, rtt_ms, "dropping an implausible receiver report");
+            return;
+        }
+        self.reception.insert(peer, (loss_permille, goodput));
+        let Some(session) = self.media.get(&peer) else {
+            tracing::debug!(peer = %tag, "receiver report without a media session; recorded only");
+            return;
+        };
+        session
+            .control
+            .report(lumepeer_media::abr::ReceiverFeedback {
+                loss: f32::from(loss_permille) / f32::from(PERMILLE),
+                rtt_ms,
+                goodput_kbps: goodput,
+            });
+    }
+
+    /// What every live connection's link actually looks like (§18).
+    fn connection_stats(&self) -> Vec<ConnectionStats> {
+        self.connections
+            .iter()
+            .map(|(peer, handle)| {
+                let (path, relay_region) = path_of(&handle.connection);
+                let reception = self.reception.get(peer).copied();
+                let target = self.media.get(peer).map(|session| session.control.target());
+                ConnectionStats {
+                    label: peer_tag(&self.install_salt, peer),
+                    rtt_ms: self.rtt.get(peer).and_then(RttTracker::smoothed),
+                    loss_permille: reception.map(|(loss, _)| loss),
+                    goodput_kbps: reception.map(|(_, goodput)| goodput),
+                    path,
+                    relay_region,
+                    bitrate_kbps: target.map(|t| t.bitrate_kbps),
+                    fps: target.map(|t| t.fps),
+                }
+            })
+            .collect()
     }
 
     /// Finishes the QUIC handshake, checks the ALPN and runs the control
@@ -2054,6 +2560,8 @@ impl Actor {
                     speaks_remote_sas,
                     speaks_file_transfer,
                     speaks_unattended,
+                    speaks_receiver_report,
+                    speaks_cursor_shape,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
@@ -2061,6 +2569,8 @@ impl Actor {
                     speaks_remote_sas,
                     speaks_file_transfer,
                     speaks_unattended,
+                    speaks_receiver_report,
+                    speaks_cursor_shape,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -2173,7 +2683,18 @@ impl Actor {
                 speaks_remote_sas,
                 speaks_file_transfer,
                 speaks_unattended,
+                speaks_receiver_report,
+                speaks_cursor_shape,
             } => {
+                // Host side of the exchange: whether this guest's own reports
+                // may be read at all (ADR 0037). The guest side is recorded in
+                // `on_dialed`, from the `HelloAck` minor.
+                self.receiver_reports.entry(peer).or_default().from_peer = speaks_receiver_report;
+                if speaks_cursor_shape {
+                    self.speaks_cursor_shape.insert(peer);
+                } else {
+                    self.speaks_cursor_shape.remove(&peer);
+                }
                 if speaks_unattended {
                     self.speaks_unattended.insert(peer);
                 } else {
@@ -2247,6 +2768,13 @@ impl Actor {
         }
         tracing::info!(peer = %tag, "media connection accepted; starting the encode loop");
         let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(None));
+        // The cursor channel exists only for a guest that said it will draw
+        // the cursor itself; without it the loop never even reads the shape.
+        let cursors = self
+            .speaks_cursor_shape
+            .contains(&peer)
+            .then(|| self.cursors_tx.clone());
+        let control = EncodeControl::new(peer, cursors);
         let task = spawn_encode_loop(
             connection.clone(),
             Arc::clone(&self.capture),
@@ -2254,6 +2782,7 @@ impl Actor {
             tag.clone(),
             peer,
             self.faults_tx.clone(),
+            control.clone(),
         );
         self.media.insert(
             peer,
@@ -2261,8 +2790,12 @@ impl Actor {
                 task,
                 connection: connection.clone(),
                 recorder,
+                control,
             },
         );
+        // One capture backend feeds every viewer, so whether the cursor is
+        // drawn into the frame is decided across all of them, not per session.
+        self.refresh_cursor_embedding();
         // The guest-mic pass rides the same connection and parks until the
         // guest actually opens its tagged `M` stream (§11; ADR 0028); it is
         // bounded by the media session's own lifetime.
@@ -2365,6 +2898,9 @@ impl Actor {
         self.record_requests.remove(&peer);
         self.record_request_rate.forget(&peer);
         lock_capture(&self.capture).remove_viewer(&peer);
+        // With one viewer fewer, whether the cursor may stay out of the frame
+        // is a different question than it was a moment ago.
+        self.refresh_cursor_embedding();
     }
 
     /// Guest side: opens the view window for a host that just granted, or
@@ -2408,6 +2944,8 @@ impl Actor {
             MediaTarget {
                 endpoint: self.endpoint.clone(),
                 addr,
+                peer,
+                reports: self.reports_tx.clone(),
                 tag: tag.clone(),
                 worker: None,
                 connection_cell: Arc::clone(&media_connection),
@@ -2419,6 +2957,11 @@ impl Actor {
         // recording is running because the host said so, never because this
         // side guessed (§17).
         let recording = Arc::new(AtomicBool::new(false));
+        // Starts empty for the same reason: a host that composites its cursor
+        // into the picture never announces one, and an overlay drawn on a
+        // guess would be a second cursor next to the real one (§11).
+        let cursor: Arc<std::sync::RwLock<Option<CursorFeed>>> =
+            Arc::new(std::sync::RwLock::new(None));
         // Keyed by the peer tag: that is the only name the view window knows
         // itself by across IPC — `view_next_frame` takes `peer`, and the
         // window label is derived from it, not the other way round.
@@ -2431,6 +2974,7 @@ impl Actor {
                     slot: slot_rx.clone(),
                     input: Arc::clone(&input),
                     recording: Arc::clone(&recording),
+                    cursor: Arc::clone(&cursor),
                 },
             );
         self.views.insert(
@@ -2441,6 +2985,7 @@ impl Actor {
                 grants,
                 input,
                 recording,
+                cursor,
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -2849,6 +3394,52 @@ impl Actor {
                 tracing::info!(peer = %tag, "the peer aborted a transfer");
                 self.cancel_transfer(peer, transfer_id);
             }
+            // Keepalive of §9.1, both directions. Answered immediately and
+            // with the same value: the sender is the only side that can turn
+            // it into a round trip, because it is the only side that knows
+            // when the nonce went out.
+            MessageKind::Ping(nonce) => self.send_to(&peer, MessageKind::Pong(nonce)),
+            // The other half. A nonce this side is not waiting on — a stale
+            // one from before a reconnect, or a value the peer made up — is
+            // ignored without a log line: it is not an error, it is simply not
+            // a measurement.
+            MessageKind::Pong(nonce) => {
+                if let Some(rtt_ms) = self.rtt.entry(peer).or_default().pong(nonce) {
+                    tracing::debug!(peer = %tag, rtt_ms, "round trip measured");
+                }
+            }
+            // Host side: the guest's decoder has nothing to decode against
+            // (§11). Rate-limited here, on the side whose uplink pays for it.
+            MessageKind::KeyframeRequest => self.on_keyframe_request(peer),
+            // Guest side: the host announced its cursor, which also says the
+            // picture no longer contains one and drawing it is this side's
+            // job now (§11). Geometry was already checked while decoding, so
+            // what is left is only that a view exists to draw it.
+            MessageKind::CursorShape { ref shape } => {
+                let Some(state) = self.views.get(&peer) else {
+                    tracing::debug!(peer = %tag, "cursor shape without a view; ignored");
+                    return;
+                };
+                let mut cursor = state
+                    .cursor
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let seq = cursor.as_ref().map_or(0, |current| current.seq);
+                *cursor = Some(CursorFeed {
+                    // Wrapping rather than saturating: the window compares for
+                    // inequality, never for order, so a wrap is one extra
+                    // repaint and never a shape that stops updating.
+                    seq: seq.wrapping_add(1).max(1),
+                    shape: shape.clone(),
+                });
+            }
+            // Host side: what the guest actually received, which is what §11's
+            // adaptation was always specified to run on (ADR 0037).
+            MessageKind::ReceiverReport {
+                loss_permille,
+                rtt_ms,
+                goodput_kbps,
+            } => self.on_receiver_report(peer, loss_permille, rtt_ms, goodput_kbps),
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
             // Guest side: this host wants credentials rather than a dialog
@@ -3019,6 +3610,14 @@ impl Actor {
         // pending flag left over from an older one (§8; ADR 0033).
         self.unattended_pending.remove(&peer);
         self.speaks_unattended.remove(&peer);
+        self.speaks_cursor_shape.remove(&peer);
+        // Link measurements belong to the connection that produced them: a
+        // later connection to the same device measures its own path, and must
+        // not inherit a round trip taken over one that no longer exists.
+        self.rtt.remove(&peer);
+        self.reception.remove(&peer);
+        self.last_keyframe.remove(&peer);
+        self.receiver_reports.remove(&peer);
         // Chat and clipboard state are per-session by design (§15): nothing
         // about a past peer survives its connection here.
         self.chat.drop_transcript(&peer);
@@ -3071,6 +3670,9 @@ impl Actor {
                     tracing::warn!(%error, "reconnecting to a remembered host failed");
                 }
                 let _ = reply.send(result);
+            }
+            ActorCommand::ConnectionStats { reply } => {
+                let _ = reply.send(self.connection_stats());
             }
             ActorCommand::ConnectState { reply } => {
                 let _ = reply.send(ConnectSnapshot {
@@ -4519,6 +5121,9 @@ impl Actor {
         }
         tracing::info!(peer = %label, ?role, "consent granted");
         self.refresh_clipboard_watch();
+        // A role change moves the `input` grant, and that is one of the two
+        // things the cursor channel is decided on (§11).
+        self.refresh_cursor_embedding();
         Ok(())
     }
 
@@ -4953,6 +5558,12 @@ impl Actor {
         } else {
             self.speaks_file_transfer.remove(&peer);
         }
+        // Same reasoning for the receiver reports this node is about to start
+        // producing: only the host's minor says whether it can decode one, and
+        // sending one it cannot would close the connection over a diagnostic
+        // (§9.1; ADR 0037).
+        self.receiver_reports.entry(peer).or_default().to_peer =
+            control.peer_minor() >= RECEIVER_REPORT_MINOR;
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -5261,6 +5872,14 @@ async fn classify_incoming(
         return None;
     }
     Some(Accepted::Control {
+        speaks_receiver_report: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_RECEIVER_REPORT),
+        speaks_cursor_shape: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_CURSOR_SHAPE),
         announces_media_faults: hello
             .features
             .iter()
@@ -5371,6 +5990,8 @@ async fn connect_once(
         FEATURE_MEDIA_UNAVAILABLE.to_owned(),
         FEATURE_FILE_TRANSFER.to_owned(),
         FEATURE_UNATTENDED.to_owned(),
+        FEATURE_RECEIVER_REPORT.to_owned(),
+        FEATURE_CURSOR_SHAPE.to_owned(),
     ];
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
@@ -5592,6 +6213,12 @@ impl ActorStores {
 /// relay or a Tauri window: `windows`, `media` and `clipboard` are the three
 /// seams that would otherwise need one.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one struct literal naming every field of the actor's state; \
+              splitting it would only move field initializers out of the one \
+              place that shows what the actor owns"
+)]
 pub fn spawn_actor_with(
     endpoint: PeerEndpoint,
     identity: SigningKey,
@@ -5624,6 +6251,8 @@ pub fn spawn_actor_with(
     let (events_tx, events_rx) = mpsc::channel(32);
     let view_feeds: ViewFeeds = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let (faults_tx, faults_rx) = mpsc::channel(8);
+    let (reports_tx, reports_rx) = mpsc::channel(REPORT_CAPACITY);
+    let (cursors_tx, cursors_rx) = mpsc::channel(REPORT_CAPACITY);
     // Deliberately shallow: a backed-up actor should re-detect the current
     // clipboard on the next poll, not work through a queue of everything the
     // user copied while it was busy.
@@ -5647,6 +6276,15 @@ pub fn spawn_actor_with(
         events_rx,
         faults_tx,
         faults_rx,
+        reports_tx,
+        reports_rx,
+        rtt: std::collections::HashMap::new(),
+        reception: std::collections::HashMap::new(),
+        last_keyframe: std::collections::HashMap::new(),
+        receiver_reports: std::collections::HashMap::new(),
+        speaks_cursor_shape: std::collections::HashSet::new(),
+        cursors_tx,
+        cursors_rx,
         health: Arc::clone(&health),
         notify: notify.clone(),
         capture,
@@ -5720,6 +6358,112 @@ mod tests {
 
     /// Anything slower than this on loopback means the test is stuck.
     const TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// The whole of what `RTT_EWMA_ALPHA` means, checked without a clock.
+    #[test]
+    fn the_first_sample_is_the_average_and_later_ones_are_blended_into_it() {
+        assert!((ewma_rtt(None, 100.0) - 100.0).abs() < f32::EPSILON);
+        // One quarter of the way from 100 to 200 at an alpha of 0.25.
+        let blended = ewma_rtt(Some(100.0), 200.0);
+        assert!(
+            (blended - (100.0 + RTT_EWMA_ALPHA * 100.0)).abs() < 0.01,
+            "smoothing did not follow RTT_EWMA_ALPHA: {blended}"
+        );
+        // A steady link converges on its own value rather than drifting.
+        let mut average = 50.0;
+        for _ in 0..64 {
+            average = ewma_rtt(Some(average), 50.0);
+        }
+        assert!((average - 50.0).abs() < 0.01);
+    }
+
+    /// A round trip is only a round trip for the nonce this side is waiting
+    /// on. Anything else — a stale echo, a value the peer made up — is not a
+    /// measurement, and must neither be counted nor treated as an error.
+    #[test]
+    fn a_foreign_nonce_is_ignored_without_disturbing_the_average() {
+        let mut tracker = RttTracker::default();
+        tracker.sent(7);
+        assert_eq!(tracker.pong(9), None, "a foreign nonce must not measure");
+        assert_eq!(tracker.smoothed(), None, "and must not produce an average");
+        // The outstanding ping is still outstanding: the right answer still
+        // works after the wrong one.
+        assert!(tracker.pong(7).is_some());
+        let after_the_real_one = tracker.smoothed();
+        assert!(after_the_real_one.is_some());
+        // And a second echo of an already-answered nonce changes nothing.
+        assert_eq!(tracker.pong(7), None);
+        assert_eq!(tracker.smoothed(), after_the_real_one);
+    }
+
+    /// A guest that asks on every frame must not be able to decide what the
+    /// host's uplink is spent on: a keyframe is the most expensive frame in
+    /// the stream, so a burst of requests buys exactly one (§11).
+    #[test]
+    fn a_burst_of_keyframe_requests_is_honoured_once() {
+        let mut last_honoured: Option<std::time::Instant> = None;
+        let mut honoured = 0u32;
+        for _ in 0..1_000 {
+            if keyframe_budget_allows(last_honoured) {
+                honoured += 1;
+                last_honoured = Some(std::time::Instant::now());
+            }
+        }
+        assert_eq!(honoured, 1, "the keyframe budget let a burst through");
+    }
+
+    /// And the budget is a wall clock, not a one-shot: a decoder that loses
+    /// its reference a minute later must still be able to ask.
+    #[test]
+    fn the_keyframe_budget_reopens_once_the_interval_has_passed() {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_millis(KEYFRAME_MIN_INTERVAL_MS * 2))
+            .expect("the process has not been running since the epoch");
+        assert!(keyframe_budget_allows(Some(long_ago)));
+        assert!(
+            keyframe_budget_allows(None),
+            "a first request is never refused"
+        );
+    }
+
+    /// A `Pong` for a ping that was never sent is the same non-event.
+    #[test]
+    fn a_pong_nobody_asked_for_measures_nothing() {
+        let mut tracker = RttTracker::default();
+        assert_eq!(tracker.pong(1), None);
+        assert_eq!(tracker.smoothed(), None);
+    }
+
+    /// A relay URL identifies the *host's* network, and §15 keeps that off a
+    /// screen the host does not control: the region is enough to say where
+    /// someone is, and a bare address has no region at all.
+    #[test]
+    fn only_a_relay_region_is_ever_exposed_never_an_address() {
+        let region = |raw: &str| {
+            raw.parse::<iroh::RelayUrl>()
+                .ok()
+                .and_then(|url| relay_region(&url))
+        };
+        assert_eq!(
+            region("https://euw1-1.relay.example./"),
+            Some("euw1-1".to_owned())
+        );
+        assert_eq!(
+            region("https://192.0.2.10:4433/"),
+            None,
+            "a bare IPv4 has no region"
+        );
+        assert_eq!(
+            region("https://[2001:db8::1]:4433/"),
+            None,
+            "nor a bare IPv6"
+        );
+        assert_eq!(
+            region("https://localhost/"),
+            None,
+            "nor a single-label name"
+        );
+    }
 
     /// Capturer that never produces a picture but does start and stop, so the
     /// viewer bookkeeping of `CaptureController` is exercised on a machine with

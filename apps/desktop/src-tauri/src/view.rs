@@ -26,21 +26,197 @@ use iroh::EndpointAddr;
 use iroh::endpoint::Connection;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
-    AUDIO_MAX_FRAME_BYTES, ENCODE_DEFAULT_FPS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
+    ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
+    KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
     RECONNECT_WINDOW_SECS,
 };
-use lumepeer_core::protocol::MediaUnavailableReason;
-use lumepeer_media::abr::{AbrController, ReceiverFeedback};
+use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
+use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback};
 use lumepeer_media::capture::{CaptureController, InputInjector};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
-use lumepeer_media::scale::fit_within_budget;
+use lumepeer_media::scale::{fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerEndpoint, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-/// Milliseconds in a second, for turning `ENCODE_DEFAULT_FPS` into a delay.
+/// Milliseconds in a second, for turning a frame rate into a delay.
 const MILLIS_PER_SEC: u64 = 1_000;
+
+/// Permille, for turning a share of frames into the integer the wire carries.
+const PERMILLE: u64 = 1_000;
+
+/// Bits in a byte, for turning received bytes into kilobits per second.
+const BITS_PER_BYTE: u64 = 8;
+
+/// Host side: what the actor may say to a running encode loop, and what the
+/// loop says back (§11).
+///
+/// A shared cell rather than a channel for most of it, because none of that is
+/// a stream of events: a keyframe request that arrives twice before the next
+/// frame is still one keyframe, a receiver report supersedes the one before
+/// it, and the current target is a fact the actor reads whenever the UI asks.
+/// The cursor is the exception and is a real channel — every shape matters,
+/// and one dropped is one the guest draws with until the next change.
+///
+/// Nothing here authorizes anything: the actor has already decided that this
+/// peer holds a live `view` grant before an encode loop exists at all (§2.3).
+#[derive(Debug, Clone)]
+pub struct EncodeControl {
+    /// Who this loop is feeding, so its cursor updates can be named.
+    peer: NodeId,
+    /// Where cursor shapes go. `None` while the guest has not asked for the
+    /// separate channel, which is also what keeps a loop that will never send
+    /// one from reading the cursor at all.
+    cursors: Option<mpsc::Sender<(NodeId, CursorShapeData)>>,
+    /// Raised by the actor when a guest asked for a keyframe *and* the request
+    /// passed the host's own `KEYFRAME_MIN_INTERVAL_MS` budget. Cleared by the
+    /// loop when it acts on it.
+    keyframe: Arc<AtomicBool>,
+    /// The guest's newest receiver report, with the moment it landed. Taken by
+    /// the loop; the timestamp is what lets it tell "the guest is quiet right
+    /// now" from "this guest never reports at all".
+    feedback: Arc<Mutex<Option<(ReceiverFeedback, Instant)>>>,
+    /// What the loop is encoding at right now, for the connection-quality
+    /// panel of §18. Written by the loop, read by the actor.
+    target: Arc<Mutex<QualityTarget>>,
+}
+
+impl EncodeControl {
+    /// A control surface for `peer`, with the cursor channel on only when the
+    /// guest said it will draw the cursor itself (§11; `FEATURE_CURSOR_SHAPE`).
+    #[must_use]
+    pub fn new(peer: NodeId, cursors: Option<mpsc::Sender<(NodeId, CursorShapeData)>>) -> Self {
+        Self {
+            peer,
+            cursors,
+            keyframe: Arc::new(AtomicBool::new(false)),
+            feedback: Arc::new(Mutex::new(None)),
+            target: Arc::new(Mutex::new(QualityTarget::default())),
+        }
+    }
+
+    /// Whether this session carries the cursor on its own channel.
+    #[must_use]
+    pub const fn cursor_channel(&self) -> bool {
+        self.cursors.is_some()
+    }
+
+    /// Hands one changed shape to the actor, dropping it rather than stalling
+    /// the encode loop when the actor is busy.
+    fn send_cursor(&self, shape: CursorShapeData) {
+        if let Some(cursors) = &self.cursors
+            && cursors.try_send((self.peer, shape)).is_err()
+        {
+            tracing::debug!("dropping a cursor shape: the actor is backed up");
+        }
+    }
+
+    /// Asks the loop for an intra frame on its next encode.
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Relaxed);
+    }
+
+    /// Hands the loop what the guest says it received.
+    pub fn report(&self, feedback: ReceiverFeedback) {
+        *self
+            .feedback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((feedback, Instant::now()));
+    }
+
+    /// What the loop is encoding at right now.
+    #[must_use]
+    pub fn target(&self) -> QualityTarget {
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Takes a pending keyframe request, if there is one.
+    fn take_keyframe_request(&self) -> bool {
+        self.keyframe.swap(false, Ordering::Relaxed)
+    }
+
+    /// Takes the newest receiver report, if one has not been consumed yet.
+    fn take_feedback(&self) -> Option<(ReceiverFeedback, Instant)> {
+        self.feedback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Publishes what the loop settled on.
+    fn publish(&self, target: QualityTarget) {
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = target;
+    }
+}
+
+/// Bytes of the fixed header every `view_cursor` response carries:
+/// `seq:u32 | width:u16 | height:u16 | hotspot_x:u16 | hotspot_y:u16`.
+pub const CURSOR_RESPONSE_HEADER_BYTES: usize = 12;
+
+/// Guest side: the host's cursor as the view window needs it (§11).
+///
+/// `seq` is a counter, not a timestamp: the window polls with the one it has
+/// and gets pixels back only when the host has since announced a different
+/// shape. A cursor is at most `MAX_CURSOR_SHAPE_PIXELS`, but it changes every
+/// time a pointer crosses a text field, and re-serializing it into every poll
+/// would be a second video channel for a picture nobody asked to move.
+#[derive(Debug, Clone)]
+pub struct CursorFeed {
+    /// Bumped on every shape the host announces; starts at 1, so 0 is "the
+    /// window has seen nothing yet" and can never collide with a real shape.
+    pub seq: u32,
+    /// The newest shape, in the premultiplied BGRA of §11.
+    pub shape: CursorShapeData,
+}
+
+/// Serializes a cursor for `view_cursor`.
+///
+/// Pixels are omitted when `since_seq` already names the current shape, and
+/// the whole body is just the header when the host has announced none — which
+/// is what tells the window to draw nothing, because on that host the cursor
+/// is still in the picture.
+#[must_use]
+pub fn encode_cursor_response(cursor: Option<&CursorFeed>, since_seq: u32) -> Vec<u8> {
+    let Some(cursor) = cursor else {
+        return vec![0u8; CURSOR_RESPONSE_HEADER_BYTES];
+    };
+    let mut out = Vec::with_capacity(CURSOR_RESPONSE_HEADER_BYTES + cursor.shape.rgba.len());
+    out.extend_from_slice(&cursor.seq.to_le_bytes());
+    out.extend_from_slice(&cursor.shape.width.to_le_bytes());
+    out.extend_from_slice(&cursor.shape.height.to_le_bytes());
+    out.extend_from_slice(&cursor.shape.hotspot_x.to_le_bytes());
+    out.extend_from_slice(&cursor.shape.hotspot_y.to_le_bytes());
+    if cursor.seq != since_seq {
+        out.extend_from_slice(&cursor.shape.rgba);
+    }
+    out
+}
+
+/// Guest side: what the media receiver has to tell the actor, because it can
+/// only be said on the *control* channel the actor alone owns (§11).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MediaReport {
+    /// What this receiver saw over the last `ABR_FEEDBACK_INTERVAL_MS`.
+    /// `rtt_ms` is not in here: the media task has no round trip of its own
+    /// to measure, and the actor already has the control channel's.
+    Feedback {
+        /// Share of frames the decoder could not turn into a picture, in
+        /// permille.
+        loss_permille: u16,
+        /// Media bytes that arrived in the window, as kilobits per second.
+        goodput_kbps: u32,
+    },
+    /// The decoder has nothing to decode against: it just started, or it
+    /// failed on a frame that referenced one it never saw.
+    KeyframeNeeded,
+}
 
 /// One [`CaptureController`] shared by the actor and every encode loop.
 ///
@@ -478,6 +654,12 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
 /// `recorder` is the recording slot of §17: whatever sits in it when a frame
 /// has been written also receives that frame, so starting or stopping a
 /// recording mid-session never restarts the pipeline.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one uninterrupted pass over one frame — capture, scale, encode, \
+              write, record, adapt — and every split would put a step of it \
+              behind a call that hides the order the steps must happen in"
+)]
 pub fn spawn_encode_loop(
     connection: Connection,
     capture: SharedCapture,
@@ -485,6 +667,7 @@ pub fn spawn_encode_loop(
     tag: String,
     peer: NodeId,
     faults: mpsc::Sender<MediaFault>,
+    control: EncodeControl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut writer = match open_media_stream(&connection).await {
@@ -508,13 +691,21 @@ pub fn spawn_encode_loop(
                 return;
             }
         };
-        let interval = Duration::from_millis(MILLIS_PER_SEC / u64::from(ENCODE_DEFAULT_FPS.max(1)));
-        // `rd/media/1` is a reliable, ordered QUIC stream: nothing on it is
-        // ever silently lost the way `ReceiverFeedback.loss` is named for.
-        // The one congestion signal available without a guest-side wire
-        // message is how long each write actually takes relative to the
-        // frame budget — see docs/adr/0015-host-local-abr.md.
+        // Three knobs now, not one: the controller walks bitrate, then frame
+        // rate, then picture scale (ADR 0037). The loop's own pacing is where
+        // the frame rate lives, so `interval` is derived from the target
+        // rather than fixed for the session.
         let mut abr = AbrController::new();
+        let mut target = abr.target();
+        control.publish(target);
+        let mut interval = frame_interval(target.fps);
+        // When the guest last told this side what it actually received. A
+        // guest that reports is the authority on its own link; without one —
+        // an older peer, or one that has gone quiet — the only congestion
+        // signal left is how long each write takes relative to the frame
+        // budget, which is what ADR 0015 settled for.
+        let mut last_report: Option<Instant> = None;
+        let feedback_stale = Duration::from_millis(ABR_FEEDBACK_STALE_AFTER_MS);
         // Session recording (§17): the actor swaps a recorder into the shared
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
@@ -551,11 +742,34 @@ pub fn spawn_encode_loop(
                 }
             };
 
-            // A screen larger than the pipeline's picture budget is reduced
-            // here, before anything downstream has to carry it: the encoder,
-            // the wire, the sandboxed decoder's shared-memory slot and the
-            // guest's canvas all size themselves off this frame (ADR 0018).
-            let frame = fit_within_budget(frame);
+            // Two reductions, in this order and for different reasons. The
+            // adaptive one is the last rung of the ladder the controller may
+            // have reached (ADR 0037) and is a choice about quality; the
+            // budget one is the hard ceiling of §15 that no choice may exceed,
+            // so it goes last and has the final say (ADR 0018).
+            let frame = fit_within_budget(scale_to_percent(frame, target.scale_percent));
+
+            // The cursor rides its own channel when the guest asked for one,
+            // and is read only then: a shape the loop would never send is a
+            // platform call made for nothing. `cursor_shape` answers `None`
+            // for a cursor that has not changed, so this is one comparison on
+            // a steady screen (§11).
+            if control.cursor_channel()
+                && let Some(shape) = lock_capture(&capture).cursor_shape()
+            {
+                control.send_cursor(shape);
+            }
+
+            // A guest that just started decoding, or that lost more than it
+            // could conceal, has nothing to decode against until an intra
+            // frame arrives. The budget on how often this may be asked for is
+            // the actor's (§11) — by the time the flag is up, the request has
+            // already been through it.
+            if control.take_keyframe_request()
+                && let Err(error) = encoder.request_keyframe()
+            {
+                tracing::warn!(peer = %tag, %error, "the encoder refused a keyframe request");
+            }
 
             let bitstream = match encoder.encode(&frame) {
                 Ok(bitstream) => bitstream,
@@ -583,17 +797,61 @@ pub fn spawn_encode_loop(
             if let Some(recorder) = recorder_now.as_ref() {
                 recorder.write_video(bitstream.timestamp_us, &bitstream.data);
             }
-            if let Some(target_kbps) = abr.on_feedback(write_congestion_feedback(
-                write_started.elapsed(),
-                interval,
-                bitstream.data.len(),
-            )) && let Err(error) = encoder.set_bitrate(target_kbps)
+            // The guest's own measurement wins whenever there is a fresh one;
+            // the host-local stand-in only speaks for a link nobody is
+            // reporting on (ADR 0015, ADR 0037).
+            let measured = match control.take_feedback() {
+                Some((feedback, at)) => {
+                    last_report = Some(at);
+                    Some(feedback)
+                }
+                None if last_report.is_none_or(|at| at.elapsed() > feedback_stale) => {
+                    Some(write_congestion_feedback(
+                        write_started.elapsed(),
+                        interval,
+                        bitstream.data.len(),
+                    ))
+                }
+                None => None,
+            };
+            if let Some(feedback) = measured
+                && let Some(next) = abr.on_feedback(feedback)
             {
-                tracing::warn!(peer = %tag, %error, target_kbps, "encoder refused a bitrate change");
+                if next.bitrate_kbps != target.bitrate_kbps
+                    && let Err(error) = encoder.set_bitrate(next.bitrate_kbps)
+                {
+                    tracing::warn!(
+                        peer = %tag,
+                        %error,
+                        target_kbps = next.bitrate_kbps,
+                        "encoder refused a bitrate change"
+                    );
+                }
+                if next.fps != target.fps {
+                    interval = frame_interval(next.fps);
+                }
+                target = next;
+                control.publish(target);
+                tracing::debug!(
+                    peer = %tag,
+                    bitrate_kbps = target.bitrate_kbps,
+                    fps = target.fps,
+                    scale_percent = target.scale_percent,
+                    "quality target moved"
+                );
             }
             sleep_for_the_rest_of(interval, tick_started).await;
         }
     })
+}
+
+/// The pacing delay of one frame at `fps`.
+///
+/// `max(1)` is not defensive noise: the frame rate is clamped by
+/// `ABR_MIN_FPS` upstream, and dividing by a zero that cannot occur would
+/// still be a panic in a loop that must not have one.
+fn frame_interval(fps: u8) -> Duration {
+    Duration::from_millis(MILLIS_PER_SEC / u64::from(fps.max(1)))
 }
 
 /// Sleeps only what's left of `interval` after `tick_started`, instead of
@@ -641,6 +899,13 @@ pub struct MediaTarget {
     /// Host address, remembered from the invite ticket so the media dial does
     /// not depend on discovery having caught up.
     pub addr: EndpointAddr,
+    /// The host being watched. Only ever used to name this loop's own reports
+    /// back to the actor; nothing here can act on it.
+    pub peer: NodeId,
+    /// Where [`MediaReport`]s go. The media loop has no control channel of its
+    /// own — the actor owns the only one — so everything this side has to
+    /// *say* about reception travels through here (§2.3).
+    pub reports: mpsc::Sender<(NodeId, MediaReport)>,
     /// Pseudonymized peer label, for logs (§15).
     pub tag: String,
     /// Decoder worker binary; `None` uses the one next to this executable.
@@ -778,6 +1043,14 @@ async fn stream_once(
     // behind (§8.1, §11.3).
     let mut decoder: Option<DecoderHandle> = None;
     let mut produced = false;
+    // What this pass reports back to the host every `ABR_FEEDBACK_INTERVAL_MS`:
+    // the only two things a receiver on a reliable ordered stream can honestly
+    // measure (ADR 0037).
+    let mut window = ReceptionWindow::new();
+    // Guest-side half of the keyframe budget. The host enforces its own — the
+    // one that actually protects it — but a guest that asks politely is a
+    // guest whose requests are worth honouring.
+    let mut last_keyframe_ask: Option<Instant> = None;
 
     loop {
         let payload = match reader.read_frame().await {
@@ -787,11 +1060,17 @@ async fn stream_once(
                 return produced;
             }
         };
+        window.received(payload.len());
+        if let Some(report) = window.due() {
+            send_report(target, report);
+        }
         let Some(encoded) = decode_media_payload(&payload) else {
             tracing::warn!(peer = %target.tag, "dropping a malformed media payload");
+            window.lost();
             continue;
         };
 
+        let fresh_decoder = decoder.is_none();
         let handle = match decoder.take() {
             Some(handle) => handle,
             None => match spawn_decoder(target.worker.clone()).await {
@@ -802,6 +1081,12 @@ async fn stream_once(
                 }
             },
         };
+        // A decoder that has just started has nothing to decode against: the
+        // stream is mid-flight, and what the host is sending right now almost
+        // certainly references frames this process never saw (§11).
+        if fresh_decoder {
+            ask_for_a_keyframe(target, &mut last_keyframe_ask);
+        }
 
         // `decode` blocks on the worker's pipes; it never runs on a tokio
         // worker thread. The handle travels with the closure and back.
@@ -838,9 +1123,109 @@ async fn stream_once(
             // A bitstream that does not complete a picture yet is normal.
             Ok(None) => {}
             Err(error) => {
+                // The frame is lost as far as this receiver is concerned, and
+                // an intra frame is the only thing that can get it back in
+                // step. Both facts go back to the host: one drives its
+                // adaptation, the other its encoder.
                 tracing::warn!(peer = %target.tag, %error, "decoder failed");
+                window.lost();
+                ask_for_a_keyframe(target, &mut last_keyframe_ask);
                 return produced;
             }
+        }
+    }
+}
+
+/// Sends one report to the actor, dropping it rather than stalling the decode
+/// loop when the actor is busy.
+///
+/// A dropped report costs the host one interval of feedback, which the next
+/// one replaces. A blocked decode loop costs the user their picture.
+fn send_report(target: &MediaTarget, report: MediaReport) {
+    if target.reports.try_send((target.peer, report)).is_err() {
+        tracing::debug!(peer = %target.tag, "dropping a media report: the actor is backed up");
+    }
+}
+
+/// Asks the host for an intra frame, at most once per
+/// [`KEYFRAME_MIN_INTERVAL_MS`].
+///
+/// The host keeps a budget of its own, and that is the one that protects it
+/// (§11). This one keeps a decoder that is failing on every frame from turning
+/// its own trouble into a flood of requests.
+fn ask_for_a_keyframe(target: &MediaTarget, last: &mut Option<Instant>) {
+    let budget = Duration::from_millis(KEYFRAME_MIN_INTERVAL_MS);
+    if last.is_some_and(|at| at.elapsed() < budget) {
+        return;
+    }
+    *last = Some(Instant::now());
+    send_report(target, MediaReport::KeyframeNeeded);
+}
+
+/// Guest side: what arrived over one [`ABR_FEEDBACK_INTERVAL_MS`] window.
+///
+/// Two numbers, and neither is guessed. `rd/media/1` is reliable and ordered,
+/// so bytes are never dropped in transit — what a receiver *can* lose is a
+/// frame it could not turn into a picture, and what it can *measure* is how
+/// much arrived per second. Everything the host wants to know about this link,
+/// it can only learn from these two (ADR 0037).
+#[derive(Debug)]
+struct ReceptionWindow {
+    started: Instant,
+    frames: u64,
+    lost: u64,
+    bytes: u64,
+}
+
+impl ReceptionWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            frames: 0,
+            lost: 0,
+            bytes: 0,
+        }
+    }
+
+    /// One media payload arrived.
+    fn received(&mut self, bytes: usize) {
+        self.frames = self.frames.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    /// One payload could not be turned into a picture.
+    fn lost(&mut self) {
+        self.lost = self.lost.saturating_add(1);
+    }
+
+    /// The report for this window, if it has run its course; starts the next
+    /// window in the same call.
+    fn due(&mut self) -> Option<MediaReport> {
+        let elapsed = self.started.elapsed();
+        if elapsed < Duration::from_millis(u64::from(ABR_FEEDBACK_INTERVAL_MS)) {
+            return None;
+        }
+        let report = self.snapshot(elapsed);
+        *self = Self::new();
+        Some(report)
+    }
+
+    fn snapshot(&self, elapsed: Duration) -> MediaReport {
+        // A window with no frames in it has no loss to report, which is
+        // what `checked_div` returning `None` already says.
+        let loss_permille = self
+            .lost
+            .saturating_mul(PERMILLE)
+            .checked_div(self.frames)
+            .map_or(0, |permille| u16::try_from(permille).unwrap_or(u16::MAX));
+        let millis = u64::try_from(elapsed.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let goodput_kbps =
+            u32::try_from(self.bytes.saturating_mul(BITS_PER_BYTE) / millis).unwrap_or(u32::MAX);
+        MediaReport::Feedback {
+            loss_permille,
+            goodput_kbps,
         }
     }
 }
@@ -1321,10 +1706,16 @@ mod tests {
         });
 
         let (slot_tx, _slot_rx) = watch::channel(ViewSlot::waiting());
+        // The reports channel is held open for the length of the test: a
+        // closed receiver would make every send fail, which is a different
+        // path from the one under test.
+        let (reports, _reports_rx) = mpsc::channel(4);
         let receiver = spawn_media_receiver(
             MediaTarget {
                 endpoint: guest.clone(),
                 addr,
+                peer: guest.node_id(),
+                reports,
                 tag: "test-peer".to_owned(),
                 worker: None,
                 connection_cell: Arc::new(std::sync::Mutex::new(None)),

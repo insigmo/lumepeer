@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-view-cursor"
+description = "Enables the view_cursor command without any pre-configured scope."
+commands.allow = ["view_cursor"]
+
+[[permission]]
+identifier = "deny-view-cursor"
+description = "Denies the view_cursor command without any pre-configured scope."
+commands.deny = ["view_cursor"]

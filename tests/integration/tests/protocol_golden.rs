@@ -4,9 +4,9 @@
 //! `PROTOCOL_MINOR`: an interop partner that passes today must keep passing.
 //! Changing one means bumping the minor version. Each minor so far has only
 //! *added* vectors — minor 2 appended `MediaUnavailable` (docs/adr/0024),
-//! minor 5 appended `FileTransferStart` (docs/adr/0032) — and every earlier
-//! vector is still in the file unchanged, which is the compatibility claim
-//! this test checks.
+//! minor 5 appended `FileTransferStart` (docs/adr/0032), minor 6 appended
+//! `ReceiverReport` (docs/adr/0037) — and every earlier vector is still in
+//! the file unchanged, which is the compatibility claim this test checks.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,
 //! so a stable toolchain still exercises them on every CI run; the nightly
@@ -73,7 +73,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 5,
+        PROTOCOL_MINOR, 6,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 
