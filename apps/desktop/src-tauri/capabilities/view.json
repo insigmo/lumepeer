@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "view-window",
-  "description": "Per-window capability of a remote-view window (design doc §13). Deliberately NOT `core:default`: a window that renders a remote screen and forwards input needs exactly four application commands, its own close (`allow-close` for the close-requested event, `allow-destroy` for the unconditional close the JS API issues once that event is not prevented), and the close-request event that turns closing the window into ending the session. Everything else — filesystem, shell, network, clipboard, other windows' commands — is absent rather than denied, and there are no wildcard entries.",
+  "description": "Per-window capability of a remote-view window (design doc §13). Deliberately NOT `core:default`: a window that renders a remote screen and forwards input needs a short, enumerated list of application commands, its own close (`allow-close` for the close-requested event, `allow-destroy` for the unconditional close the JS API issues once that event is not prevented), and the close-request event that turns closing the window into ending the session. Clipboard and file transfer are named here for §9.2, and named narrowly: `allow-clipboard-push` offers this machine's own clipboard on a deliberate press and cannot read the host's, and the file commands open the OS pickers on the Rust side only. Everything else — filesystem, shell, network, other windows' commands — is absent rather than denied, and there are no wildcard entries.",
   "windows": ["view-*"],
   "local": true,
   "permissions": [
@@ -20,8 +20,14 @@
     "allow-input-wheel",
     "allow-chat-send",
     "allow-chat-transcript",
+    "allow-clipboard-push",
+    "allow-file-offer",
+    "allow-file-accept",
+    "allow-file-abort",
+    "allow-file-transfers",
     "allow-mic-toggle",
     "allow-sas-request",
+    "allow-record-request",
     "allow-sas-available",
     "allow-monitor-select",
     "allow-monitors-list",

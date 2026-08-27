@@ -32,6 +32,20 @@ export type TranslationKey =
   | 'status.inputOn'
   | 'status.inputOff'
   | 'status.revoke'
+  | 'status.grants.heading'
+  | 'status.grants.clipboardRead'
+  | 'status.grants.clipboardWrite'
+  | 'status.grants.fileTransfer'
+  | 'status.grants.recording'
+  | 'status.recording.start'
+  | 'status.recording.stop'
+  | 'status.recording.on'
+  | 'status.recording.needsGrant'
+  | 'status.recording.requested'
+  | 'status.recording.allow'
+  | 'status.recording.decline'
+  | 'status.recording.banner'
+  | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'status.endedJustNow'
   | 'status.endedMinutesAgo'
@@ -67,12 +81,23 @@ export type TranslationKey =
   | 'view.unavailable.noCapture'
   | 'view.unavailable.noEncoder'
   | 'view.unavailable.dismiss'
+  | 'view.recording'
   | 'chat.logLabel'
   | 'chat.inputLabel'
   | 'chat.inputPlaceholder'
   | 'chat.send'
   | 'chat.open'
   | 'chat.close'
+  | 'files.heading'
+  | 'files.send'
+  | 'files.accept'
+  | 'files.decline'
+  | 'files.cancel'
+  | 'files.incoming'
+  | 'files.outgoing'
+  | 'files.state.completed'
+  | 'files.state.cancelled'
+  | 'files.state.failed'
   | 'toolbar.dragHandle'
   | 'toolbar.settings'
   | 'toolbar.settings.resolution'
@@ -86,8 +111,65 @@ export type TranslationKey =
   | 'toolbar.chat'
   | 'toolbar.mic'
   | 'toolbar.cad'
+  | 'toolbar.record'
+  | 'toolbar.record.asked'
+  | 'toolbar.clipboard'
+  | 'toolbar.file'
   | 'toolbar.collapse'
-  | 'toolbar.expand';
+  | 'toolbar.expand'
+  | 'unattended.heading'
+  | 'unattended.explain'
+  | 'unattended.indicator'
+  | 'unattended.state.on'
+  | 'unattended.state.off'
+  | 'unattended.password.label'
+  | 'unattended.password.placeholder'
+  | 'unattended.password.set'
+  | 'unattended.password.change'
+  | 'unattended.password.saved'
+  | 'unattended.disable'
+  | 'unattended.disable.confirm'
+  | 'unattended.totp.label'
+  | 'unattended.totp.on'
+  | 'unattended.totp.off'
+  | 'unattended.totp.secretHeading'
+  | 'unattended.totp.secretBody'
+  | 'unattended.totp.uriLabel'
+  | 'unattended.totp.done'
+  | 'unattended.role.label'
+  | 'unattended.needsTrust'
+  | 'book.heading'
+  | 'book.explain'
+  | 'book.empty'
+  | 'book.name.label'
+  | 'book.tags.label'
+  | 'book.notes.label'
+  | 'book.save'
+  | 'book.remove'
+  | 'book.remove.confirm'
+  | 'book.trusted'
+  | 'book.untrusted'
+  | 'book.trust.confirmTitle'
+  | 'book.trust.confirmBody'
+  | 'book.trust.confirmAction'
+  | 'book.trust.cancel'
+  | 'book.untrust.confirm'
+  | 'book.filter.label'
+  | 'book.filter.all'
+  | 'book.connected'
+  | 'book.addFromSession'
+  | 'creds.heading'
+  | 'creds.body'
+  | 'creds.password.label'
+  | 'creds.password.placeholder'
+  | 'creds.code.label'
+  | 'creds.code.placeholder'
+  | 'creds.submit'
+  | 'creds.checking'
+  | 'creds.badPassword'
+  | 'creds.badCode'
+  | 'creds.lockedOut'
+  | 'creds.unavailable';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -118,6 +200,24 @@ const en: Dictionary = {
   'status.inputOn': 'input on',
   'status.inputOff': 'input off',
   'status.revoke': 'Revoke',
+  // Named as consequences, not as flag names: the person deciding has to be
+  // able to read what the guest gets out of a switch being on (§19 phase 6).
+  'status.grants.heading': 'What this guest may do',
+  'status.grants.clipboardRead': 'Read my clipboard',
+  'status.grants.clipboardWrite': 'Change my clipboard',
+  'status.grants.fileTransfer': 'Send and receive files',
+  'status.grants.recording': 'Let this session be recorded',
+  // The switch above is permission; these are the act. Both sides see an
+  // indicator for as long as a recording runs — §2.2 has no quiet capture.
+  'status.recording.start': 'Record session',
+  'status.recording.stop': 'Stop recording',
+  'status.recording.on': 'Recording',
+  'status.recording.needsGrant': 'Turn on "Let this session be recorded" first.',
+  'status.recording.requested': (peer) => `${peer} asks you to record this session.`,
+  'status.recording.allow': 'Start recording',
+  'status.recording.decline': 'Not now',
+  'status.recording.banner': 'A session is being recorded on this device.',
+  'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'status.endedJustNow': 'Ended just now',
   'status.endedMinutesAgo': (n) => `Ended ${n}m ago`,
@@ -157,12 +257,23 @@ const en: Dictionary = {
   'view.unavailable.noEncoder':
     'The other device has no video encoder, so it cannot send its screen. The connection itself is fine.',
   'view.unavailable.dismiss': 'Close',
+  'view.recording': 'This session is being recorded',
   'chat.logLabel': 'Chat',
   'chat.inputLabel': 'Chat message',
   'chat.inputPlaceholder': 'Type a message…',
   'chat.send': 'Send',
   'chat.open': 'Chat',
   'chat.close': 'Close chat',
+  'files.heading': 'Files',
+  'files.send': 'Send a file',
+  'files.accept': 'Accept',
+  'files.decline': 'Decline',
+  'files.cancel': 'Cancel',
+  'files.incoming': 'Receiving',
+  'files.outgoing': 'Sending',
+  'files.state.completed': 'Done',
+  'files.state.cancelled': 'Cancelled',
+  'files.state.failed': 'Failed',
   'toolbar.dragHandle': 'Drag toolbar',
   'toolbar.settings': 'Settings',
   'toolbar.settings.resolution': 'Screen resolution',
@@ -176,8 +287,65 @@ const en: Dictionary = {
   'toolbar.chat': 'Chat',
   'toolbar.mic': 'Microphone',
   'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.record': 'Ask the host to record this session',
+  'toolbar.record.asked': 'Asked the host to record; waiting for an answer',
+  'toolbar.clipboard': 'Send my clipboard to the host',
+  'toolbar.file': 'Send a file to the host',
   'toolbar.collapse': 'Collapse',
   'toolbar.expand': 'Expand',
+  'unattended.heading': 'Unattended access',
+  'unattended.explain': 'With this on, a device you have marked trusted can start a session by entering this device password — nobody has to be sitting here to approve it. This banner stays up whenever it is on.',
+  'unattended.indicator': 'Unattended access is on: trusted devices can connect with the device password.',
+  'unattended.state.on': 'On',
+  'unattended.state.off': 'Off',
+  'unattended.password.label': 'Device password',
+  'unattended.password.placeholder': 'At least 8 characters',
+  'unattended.password.set': 'Turn on',
+  'unattended.password.change': 'Change password',
+  'unattended.password.saved': 'Password saved',
+  'unattended.disable': 'Turn off',
+  'unattended.disable.confirm': 'Turn unattended access off? The device password and any second factor are deleted, and trusted devices will need someone here to approve them again.',
+  'unattended.totp.label': 'Also require a one-time code',
+  'unattended.totp.on': 'Required',
+  'unattended.totp.off': 'Not required',
+  'unattended.totp.secretHeading': 'Add this to your authenticator app',
+  'unattended.totp.secretBody': 'This is shown once. If you lose it, turn the code off and on again to get a new one.',
+  'unattended.totp.uriLabel': 'Setup link',
+  'unattended.totp.done': 'Done',
+  'unattended.role.label': 'A device that logs in this way gets',
+  'unattended.needsTrust': 'Set a device password first.',
+  'book.heading': 'Saved devices',
+  'book.explain': 'Trusting a device does not let it in on its own. It decides who is allowed to try the device password at all.',
+  'book.empty': 'No devices saved yet. Save a device from a connection to add it here.',
+  'book.name.label': 'Name',
+  'book.tags.label': 'Tags, comma separated',
+  'book.notes.label': 'Note',
+  'book.save': 'Save',
+  'book.remove': 'Forget',
+  'book.remove.confirm': (name) => `Forget ${name}? Any trust it has is removed with it.`,
+  'book.trusted': 'Trusted',
+  'book.untrusted': 'Not trusted',
+  'book.trust.confirmTitle': (name) => `Trust ${name}?`,
+  'book.trust.confirmBody': 'This device will be allowed to start a session by entering the device password, with nobody here to approve it. It still needs the password, and the one-time code if you require one.',
+  'book.trust.confirmAction': 'Yes, trust this device',
+  'book.trust.cancel': 'Cancel',
+  'book.untrust.confirm': (name) => `Stop trusting ${name}? It will need someone here to approve it again.`,
+  'book.filter.label': 'Filter by tag',
+  'book.filter.all': 'All tags',
+  'book.connected': 'Connected now',
+  'book.addFromSession': 'Save this device',
+  'creds.heading': 'This device asks for a password',
+  'creds.body': 'Nobody is at the other end to approve you. Enter the device password its owner gave you.',
+  'creds.password.label': 'Device password',
+  'creds.password.placeholder': 'Device password',
+  'creds.code.label': 'One-time code',
+  'creds.code.placeholder': '6 digits',
+  'creds.submit': 'Sign in',
+  'creds.checking': 'Checking',
+  'creds.badPassword': 'That password was not accepted.',
+  'creds.badCode': 'That code was not accepted.',
+  'creds.lockedOut': (secs) => `Too many attempts. Try again in ${secs} seconds.`,
+  'creds.unavailable': 'This device cannot sign you in that way right now.',
 };
 
 const ar: Dictionary = {
@@ -207,6 +375,20 @@ const ar: Dictionary = {
   'status.inputOn': 'الإدخال مفعّل',
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
+  'status.grants.heading': 'ما الذي يُسمح به لهذا الضيف',
+  'status.grants.clipboardRead': 'قراءة الحافظة الخاصة بي',
+  'status.grants.clipboardWrite': 'تغيير الحافظة الخاصة بي',
+  'status.grants.fileTransfer': 'إرسال الملفات واستقبالها',
+  'status.grants.recording': 'السماح بتسجيل هذه الجلسة',
+  'status.recording.start': 'تسجيل الجلسة',
+  'status.recording.stop': 'إيقاف التسجيل',
+  'status.recording.on': 'جارٍ التسجيل',
+  'status.recording.needsGrant': 'فعّل «السماح بتسجيل هذه الجلسة» أولاً.',
+  'status.recording.requested': (peer) => `${peer} يطلب منك تسجيل هذه الجلسة.`,
+  'status.recording.allow': 'بدء التسجيل',
+  'status.recording.decline': 'ليس الآن',
+  'status.recording.banner': 'يجري تسجيل جلسة على هذا الجهاز.',
+  'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'status.endedJustNow': 'انتهت للتو',
   'status.endedMinutesAgo': (n) => `انتهت قبل ${n} د`,
@@ -246,12 +428,23 @@ const ar: Dictionary = {
   'view.unavailable.noEncoder':
     'لا يوجد في الجهاز الآخر مُرمِّز فيديو، لذلك لا يمكنه إرسال شاشته. الاتصال نفسه سليم.',
   'view.unavailable.dismiss': 'إغلاق',
+  'view.recording': 'يجري تسجيل هذه الجلسة',
   'chat.logLabel': 'المحادثة',
   'chat.inputLabel': 'رسالة المحادثة',
   'chat.inputPlaceholder': 'اكتب رسالة…',
   'chat.send': 'إرسال',
   'chat.open': 'المحادثة',
   'chat.close': 'إغلاق المحادثة',
+  'files.heading': 'الملفات',
+  'files.send': 'إرسال ملف',
+  'files.accept': 'قبول',
+  'files.decline': 'رفض',
+  'files.cancel': 'إلغاء',
+  'files.incoming': 'جارٍ الاستقبال',
+  'files.outgoing': 'جارٍ الإرسال',
+  'files.state.completed': 'تم',
+  'files.state.cancelled': 'أُلغي',
+  'files.state.failed': 'أخفق',
   'toolbar.dragHandle': 'اسحب شريط الأدوات',
   'toolbar.settings': 'الإعدادات',
   'toolbar.settings.resolution': 'دقة الشاشة',
@@ -265,8 +458,65 @@ const ar: Dictionary = {
   'toolbar.chat': 'المحادثة',
   'toolbar.mic': 'الميكروفون',
   'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.record': 'اطلب من المضيف تسجيل هذه الجلسة',
+  'toolbar.record.asked': 'تم إرسال طلب التسجيل؛ في انتظار الرد',
+  'toolbar.clipboard': 'إرسال الحافظة الخاصة بي إلى المضيف',
+  'toolbar.file': 'إرسال ملف إلى المضيف',
   'toolbar.collapse': 'طي',
   'toolbar.expand': 'توسيع',
+  'unattended.heading': 'الوصول دون حضور',
+  'unattended.explain': 'عند تفعيله يمكن لجهاز وثّقته أن يبدأ جلسة بإدخال كلمة مرور هذا الجهاز، دون حاجة إلى موافقة أحد هنا. يبقى هذا التنبيه ظاهرًا ما دام مفعّلًا.',
+  'unattended.indicator': 'الوصول دون حضور مفعّل: يمكن للأجهزة الموثوقة الاتصال بكلمة مرور الجهاز.',
+  'unattended.state.on': 'مفعّل',
+  'unattended.state.off': 'متوقف',
+  'unattended.password.label': 'كلمة مرور الجهاز',
+  'unattended.password.placeholder': '٨ محارف على الأقل',
+  'unattended.password.set': 'تفعيل',
+  'unattended.password.change': 'تغيير كلمة المرور',
+  'unattended.password.saved': 'حُفظت كلمة المرور',
+  'unattended.disable': 'إيقاف',
+  'unattended.disable.confirm': 'إيقاف الوصول دون حضور؟ ستُحذف كلمة مرور الجهاز وأي عامل ثانٍ، وستحتاج الأجهزة الموثوقة إلى موافقة شخص هنا من جديد.',
+  'unattended.totp.label': 'اطلب أيضًا رمزًا لمرة واحدة',
+  'unattended.totp.on': 'مطلوب',
+  'unattended.totp.off': 'غير مطلوب',
+  'unattended.totp.secretHeading': 'أضف هذا إلى تطبيق المصادقة',
+  'unattended.totp.secretBody': 'يُعرض مرة واحدة فقط. إن فقدته فأوقف الرمز ثم فعّله من جديد للحصول على غيره.',
+  'unattended.totp.uriLabel': 'رابط الإعداد',
+  'unattended.totp.done': 'تم',
+  'unattended.role.label': 'الجهاز الذي يدخل بهذه الطريقة يحصل على',
+  'unattended.needsTrust': 'عيّن كلمة مرور الجهاز أولًا.',
+  'book.heading': 'الأجهزة المحفوظة',
+  'book.explain': 'توثيق الجهاز لا يسمح له بالدخول وحده، بل يحدّد من يُسمح له أصلًا بمحاولة إدخال كلمة مرور الجهاز.',
+  'book.empty': 'لا توجد أجهزة محفوظة بعد. احفظ جهازًا من إحدى الجلسات ليظهر هنا.',
+  'book.name.label': 'الاسم',
+  'book.tags.label': 'وسوم مفصولة بفواصل',
+  'book.notes.label': 'ملاحظة',
+  'book.save': 'حفظ',
+  'book.remove': 'إزالة',
+  'book.remove.confirm': (name) => `إزالة ${name}؟ سيُزال معه أي توثيق يملكه.`,
+  'book.trusted': 'موثوق',
+  'book.untrusted': 'غير موثوق',
+  'book.trust.confirmTitle': (name) => `توثيق ${name}؟`,
+  'book.trust.confirmBody': 'سيُسمح لهذا الجهاز ببدء جلسة بإدخال كلمة مرور الجهاز دون موافقة أحد هنا. ويبقى بحاجة إلى كلمة المرور، وإلى الرمز لمرة واحدة إن طلبته.',
+  'book.trust.confirmAction': 'نعم، وثّق هذا الجهاز',
+  'book.trust.cancel': 'إلغاء',
+  'book.untrust.confirm': (name) => `إيقاف توثيق ${name}؟ سيحتاج إلى موافقة شخص هنا من جديد.`,
+  'book.filter.label': 'تصفية حسب الوسم',
+  'book.filter.all': 'كل الوسوم',
+  'book.connected': 'متصل الآن',
+  'book.addFromSession': 'احفظ هذا الجهاز',
+  'creds.heading': 'هذا الجهاز يطلب كلمة مرور',
+  'creds.body': 'لا أحد على الطرف الآخر ليوافق عليك. أدخل كلمة مرور الجهاز التي أعطاك إياها مالكه.',
+  'creds.password.label': 'كلمة مرور الجهاز',
+  'creds.password.placeholder': 'كلمة مرور الجهاز',
+  'creds.code.label': 'رمز لمرة واحدة',
+  'creds.code.placeholder': '٦ أرقام',
+  'creds.submit': 'تسجيل الدخول',
+  'creds.checking': 'جارٍ التحقق',
+  'creds.badPassword': 'لم تُقبل كلمة المرور.',
+  'creds.badCode': 'لم يُقبل الرمز.',
+  'creds.lockedOut': (secs) => `محاولات كثيرة. أعد المحاولة بعد ${secs} ثانية.`,
+  'creds.unavailable': 'لا يستطيع هذا الجهاز تسجيل دخولك بهذه الطريقة الآن.',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

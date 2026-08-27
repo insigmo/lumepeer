@@ -9,12 +9,25 @@ import * as axe from 'axe-core';
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { addressBook, type AddressBookEntry } from './address-book';
 import { consentDialog } from './consent-dialog';
 import { SUPPORTED_LOCALES } from './i18n';
-import { connectPanel, inviteCodePanel } from './invite-view';
+import { connectPanel, credentialsPanel, inviteCodePanel, setConnectPhase } from './invite-view';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
+import { unattendedIndicator, unattendedSettings, type UnattendedStatus } from './unattended-settings';
 import { titleBar } from './title-bar';
+
+// A session the host has granted nothing beyond its role: the four
+// independent grants of §8.2 all start off.
+const noGrants = {
+  clipboard_read: false,
+  clipboard_write: false,
+  file_transfer: false,
+  recording: false,
+  recording_active: false,
+  record_request: false,
+} as const;
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue({ code: 'test-invite-code', expires_at: 0 }),
@@ -48,7 +61,13 @@ describe('accessibility: consent dialog', () => {
     });
 
     it(`has no axe violations with a pending request (${locale})`, async () => {
-      const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
+      const request: SessionStatus = {
+      peer_label: 'guest-ab12',
+      role: 'view_only',
+      input: false,
+      state: 'pending',
+      ...noGrants,
+    };
       render(consentDialog(request, locale), container);
       expect(await auditViolations(container)).toEqual([]);
     });
@@ -64,7 +83,7 @@ describe('accessibility: session status', () => {
 
     it(`has no axe violations with active sessions (${locale})`, async () => {
       const sessions: SessionStatus[] = [
-        { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active' },
+        { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active', ...noGrants },
       ];
       render(sessionStatus(sessions, locale), container);
       expect(await auditViolations(container)).toEqual([]);
@@ -72,13 +91,81 @@ describe('accessibility: session status', () => {
 
     it(`has no axe violations with ended connections in history (${locale})`, async () => {
       const sessions: SessionStatus[] = [
-        { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active' },
+        { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active', ...noGrants },
       ];
       const history: HistoryEntry[] = [
         { peer_label: 'guest-cd34', role: 'view_only', ended_at: Math.floor(Date.now() / 1000) - 120 },
       ];
       render(sessionStatus(sessions, locale, undefined, history), container);
       expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: unattended access', () => {
+  const off: UnattendedStatus = { enabled: false, totp_enabled: false, role: 'view_only' };
+  const on: UnattendedStatus = { enabled: true, totp_enabled: true, role: 'full_control' };
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations in the settings panel, off and on (${locale})`, async () => {
+      render(unattendedSettings(off, locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+
+      render(unattendedSettings(on, locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+
+    it(`has no axe violations in the always-on indicator (${locale})`, async () => {
+      render(unattendedIndicator(on, locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: address book', () => {
+  const entries: AddressBookEntry[] = [
+    {
+      peer_label: 'guest-ab12',
+      name: 'Office workstation',
+      tags: ['work'],
+      notes: 'upstairs',
+      trusted: false,
+      connected: true,
+    },
+    {
+      peer_label: 'guest-cd34',
+      name: 'Home laptop',
+      tags: ['family'],
+      notes: '',
+      trusted: true,
+      connected: false,
+    },
+  ];
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations when empty (${locale})`, async () => {
+      render(addressBook([], locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+
+    it(`has no axe violations with saved devices (${locale})`, async () => {
+      render(addressBook(entries, locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: device credential form', () => {
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations, with and without the code field (${locale})`, async () => {
+      setConnectPhase('awaiting_credentials', null, false);
+      render(credentialsPanel(locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+
+      setConnectPhase('awaiting_credentials', 'UNATTENDED_BAD_CODE', true);
+      render(credentialsPanel(locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+      setConnectPhase('idle');
     });
   }
 });

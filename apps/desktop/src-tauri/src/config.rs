@@ -205,6 +205,15 @@ pub fn data_dir() -> Option<PathBuf> {
     base.map(|dir| dir.join(APP_IDENTIFIER))
 }
 
+/// Directory session recordings are written into (§17).
+///
+/// Under the per-user data directory, never anywhere the webview names: the
+/// untrusted view layer says *whether* to record, and this says where (§2.3).
+#[must_use]
+pub fn recordings_dir() -> Option<PathBuf> {
+    data_dir().map(|base| base.join("recordings"))
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

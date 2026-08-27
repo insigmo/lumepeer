@@ -179,6 +179,14 @@ impl ControlWriter {
 pub struct ControlConnection {
     reader: ControlReader,
     writer: ControlWriter,
+    /// `PROTOCOL_MINOR` the far side announced, from `Hello` or `HelloAck`.
+    ///
+    /// Kept because feature strings only travel one way: a guest advertises
+    /// what it understands in `Hello`, and `HelloAck` carries no feature list
+    /// at all — so the *guest* has nothing but the minor to tell it what the
+    /// host can decode. §9.1 makes that sound: a peer at minor N understands
+    /// every optional message added at or below N.
+    peer_minor: u16,
 }
 
 impl ControlConnection {
@@ -197,6 +205,7 @@ impl ControlConnection {
             Direction::GuestToHost => Direction::HostToGuest,
         };
         Self {
+            peer_minor: 0,
             reader: ControlReader {
                 connection: connection.clone(),
                 session_id,
@@ -223,6 +232,16 @@ impl ControlConnection {
     #[must_use]
     pub fn peer(&self) -> NodeId {
         self.reader.peer()
+    }
+
+    /// `PROTOCOL_MINOR` the far side announced.
+    ///
+    /// Zero until a handshake has run. Guest side this is the host's minor
+    /// from `HelloAck`, which is the only thing a guest ever learns about
+    /// what the host can decode — `HelloAck` carries no feature list (§9.1).
+    #[must_use]
+    pub const fn peer_minor(&self) -> u16 {
+        self.peer_minor
     }
 
     /// Underlying QUIC connection, for the close codes of §18.
@@ -308,7 +327,7 @@ pub async fn guest_handshake(
         .await?;
 
     let envelope = control.reader.reader.read_frame().await?;
-    let MessageKind::HelloAck { major, .. } = envelope.kind else {
+    let MessageKind::HelloAck { major, minor } = envelope.kind else {
         let error = NetError::Framing(CoreError::Malformed);
         control.close_with(&error);
         return Err(error);
@@ -318,6 +337,7 @@ pub async fn guest_handshake(
         control.close_with(&error);
         return Err(error);
     }
+    control.peer_minor = minor;
     control.set_session_id(envelope.session_id);
     Ok(control)
 }

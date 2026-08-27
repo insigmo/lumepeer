@@ -55,6 +55,25 @@ pub struct Grants {
     pub recording: bool,
 }
 
+/// One of the four grants a host may toggle on a session that is already
+/// running, without changing its role (§8.2).
+///
+/// `view` and `input` are deliberately absent: they follow from [`Role`] and
+/// change only through a grant or a revoke, so no caller outside this crate
+/// can hand a guest input without the host picking a controller role for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentGrant {
+    /// Read the host clipboard.
+    ClipboardRead,
+    /// Write the host clipboard.
+    ClipboardWrite,
+    /// Exchange files over `rd/file/1`.
+    FileTransfer,
+    /// Record the session.
+    Recording,
+}
+
 impl Grants {
     /// Grants implied by a role at the moment of `ConsentGrant` (§8.2).
     ///
@@ -68,6 +87,29 @@ impl Grants {
             clipboard_write: false,
             file_transfer: false,
             recording: false,
+        }
+    }
+
+    /// Whether `which` is currently held.
+    #[must_use]
+    pub const fn get(self, which: IndependentGrant) -> bool {
+        // Exhaustive on purpose, with no `_` arm: a seventh permission must
+        // not be able to appear and silently read as denied here (§2.2).
+        match which {
+            IndependentGrant::ClipboardRead => self.clipboard_read,
+            IndependentGrant::ClipboardWrite => self.clipboard_write,
+            IndependentGrant::FileTransfer => self.file_transfer,
+            IndependentGrant::Recording => self.recording,
+        }
+    }
+
+    /// Sets `which` to `allowed`, leaving `view` and `input` untouched.
+    pub fn set(&mut self, which: IndependentGrant, allowed: bool) {
+        match which {
+            IndependentGrant::ClipboardRead => self.clipboard_read = allowed,
+            IndependentGrant::ClipboardWrite => self.clipboard_write = allowed,
+            IndependentGrant::FileTransfer => self.file_transfer = allowed,
+            IndependentGrant::Recording => self.recording = allowed,
         }
     }
 }

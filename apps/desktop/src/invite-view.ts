@@ -26,6 +26,7 @@ export type ConnectPhase =
   | 'idle'
   | 'dialing'
   | 'awaiting_consent'
+  | 'awaiting_credentials'
   | 'connected'
   | 'denied'
   | 'failed';
@@ -41,6 +42,19 @@ const FAILURE_TEXT: Record<string, TranslationKey> = {
   OFFLINE: 'invite.offline',
   INCOMPATIBLE_VERSION: 'invite.versionMismatch',
   TRANSPORT_LOST: 'invite.failed',
+};
+
+/**
+ * What a refused device credential says (§8, §18; ADR 0033).
+ *
+ * The host tells this side which factor to retype and nothing more — never
+ * how close a guess was, and never that one factor was right while the other
+ * was not. These four are the whole vocabulary.
+ */
+const CREDENTIAL_ERROR_TEXT: Record<string, TranslationKey> = {
+  UNATTENDED_BAD_PASSWORD: 'creds.badPassword',
+  UNATTENDED_BAD_CODE: 'creds.badCode',
+  UNATTENDED_UNAVAILABLE: 'creds.unavailable',
 };
 
 let lastCode: string | undefined;
@@ -73,7 +87,20 @@ function notify(): void {
  * whole time, which is what stops a second request racing the first.
  */
 export function isConnecting(): boolean {
-  return dialing || phase === 'dialing' || phase === 'awaiting_consent';
+  return (
+    dialing ||
+    phase === 'dialing' ||
+    phase === 'awaiting_consent' ||
+    phase === 'awaiting_credentials'
+  );
+}
+
+/**
+ * Whether the host asked for device credentials and is waiting on this user
+ * (§8; ADR 0033).
+ */
+export function isAwaitingCredentials(): boolean {
+  return phase === 'awaiting_credentials';
 }
 
 /**
@@ -84,9 +111,27 @@ export function isConnecting(): boolean {
  * call and so can no longer reject it: without this every transport problem
  * would reach the user as the same sentence (ADR 0027).
  */
-export function setConnectPhase(next: ConnectPhase, code?: string | null): void {
+export function setConnectPhase(
+  next: ConnectPhase,
+  code?: string | null,
+  codeRequired = false,
+  retrySecs?: number | null,
+): void {
   const nextError = failureKey(next, code);
-  if (next === phase && nextError === connectError) {
+  const unchanged =
+    next === phase &&
+    nextError === connectError &&
+    codeRequired === credentialCodeRequired &&
+    (retrySecs ?? undefined) === credentialRetrySecs &&
+    (code ?? undefined) === credentialCode;
+  credentialCodeRequired = codeRequired;
+  credentialRetrySecs = retrySecs ?? undefined;
+  credentialCode = next === 'awaiting_credentials' ? (code ?? undefined) : undefined;
+  if (submitting && code) {
+    // The answer came back refused: let the user try again.
+    submitting = false;
+  }
+  if (unchanged) {
     return;
   }
   const wasWaiting = isConnecting();
@@ -100,6 +145,15 @@ export function setConnectPhase(next: ConnectPhase, code?: string | null): void 
   notify();
 }
 
+/** Whether the host's challenge asked for a one-time code as well. */
+let credentialCodeRequired = false;
+/** Seconds the host said to wait, after a lockout. */
+let credentialRetrySecs: number | undefined;
+/** §18 code of the last refused credential, while the form is still up. */
+let credentialCode: string | undefined;
+/** True from the moment credentials are submitted until an answer lands. */
+let submitting = false;
+
 /** The message key a phase deserves, or `undefined` when it deserves none. */
 function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | undefined {
   if (next === 'denied') {
@@ -109,6 +163,92 @@ function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | 
     return (code && FAILURE_TEXT[code]) || 'invite.failed';
   }
   return undefined;
+}
+
+/**
+ * The credential form the host's challenge puts up (§8; ADR 0033).
+ *
+ * The password lives in the field and in the one IPC call that carries it. It
+ * is cleared as soon as that call is made, and nothing in this module keeps a
+ * copy — a wrong password means retyping it, which is the correct trade.
+ */
+export function credentialsPanel(locale: Locale): TemplateResult {
+  const errorKey = credentialCode ? CREDENTIAL_ERROR_TEXT[credentialCode] : undefined;
+  const message =
+    credentialCode === 'UNATTENDED_LOCKED_OUT'
+      ? t(locale, 'creds.lockedOut', String(credentialRetrySecs ?? 0))
+      : errorKey
+        ? t(locale, errorKey)
+        : undefined;
+  return html`
+    <section class="credentials-panel" aria-labelledby="credentials-heading">
+      <h2 id="credentials-heading">${t(locale, 'creds.heading')}</h2>
+      <p class="credentials-body">${t(locale, 'creds.body')}</p>
+      <form
+        class="credentials-form"
+        @submit=${(event: SubmitEvent) => {
+          event.preventDefault();
+          const form = event.target as HTMLFormElement;
+          const passwordField = form.elements.namedItem('device-password') as HTMLInputElement;
+          const codeField = form.elements.namedItem('device-code') as HTMLInputElement | null;
+          const password = passwordField.value;
+          const code = codeField?.value ?? '';
+          passwordField.value = '';
+          if (codeField) {
+            codeField.value = '';
+          }
+          void submitCredentials(password, code);
+        }}
+      >
+        <label for="device-password">${t(locale, 'creds.password.label')}</label>
+        <input
+          id="device-password"
+          name="device-password"
+          type="password"
+          autocomplete="current-password"
+          placeholder=${t(locale, 'creds.password.placeholder')}
+        />
+        ${credentialCodeRequired
+          ? html`
+              <label for="device-code">${t(locale, 'creds.code.label')}</label>
+              <input
+                id="device-code"
+                name="device-code"
+                type="text"
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                placeholder=${t(locale, 'creds.code.placeholder')}
+              />
+            `
+          : ''}
+        <button type="submit" class="credentials-submit" ?disabled=${submitting}>
+          ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
+        </button>
+      </form>
+      ${message
+        ? html`<p class="credentials-error" role="alert" data-testid="credentials-error">${message}</p>`
+        : ''}
+    </section>
+  `;
+}
+
+async function submitCredentials(password: string, code: string): Promise<void> {
+  submitting = true;
+  credentialCode = undefined;
+  notify();
+  try {
+    const invoke = await invoker();
+    await invoke('unattended_submit', {
+      args: { password, code: credentialCodeRequired ? code : null },
+    });
+  } catch (error) {
+    // The call itself failed — the session went away, or nothing was waiting
+    // on a challenge. Whether the *credentials* were right never arrives this
+    // way; it comes back on the wire and through the next status poll.
+    submitting = false;
+    console.error('unattended_submit failed:', describeError(error));
+  }
+  notify();
 }
 
 async function invoker(): Promise<(cmd: string, args?: unknown) => Promise<unknown>> {

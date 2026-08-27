@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-address-book-list"
+description = "Enables the address_book_list command without any pre-configured scope."
+commands.allow = ["address_book_list"]
+
+[[permission]]
+identifier = "deny-address-book-list"
+description = "Denies the address_book_list command without any pre-configured scope."
+commands.deny = ["address_book_list"]

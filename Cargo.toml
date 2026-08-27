@@ -35,6 +35,9 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "io-util",
+    # File-transfer staging (§9.2, ADR 0032): a 500 MiB transfer must not be
+    # written with blocking `std::fs` calls from inside an async task.
+    "fs",
 ] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
@@ -70,6 +73,11 @@ argon2 = "0.5"
 # compatibility requirement towards authenticator apps; nothing else uses it.
 hmac = "0.12"
 sha1 = "0.10"
+# Host clipboard access for §9.2. Deliberately on the Rust side and not a
+# webview plugin: the webview is an untrusted presentation layer (§2.3), so
+# it never gets a handle on the host's clipboard. `image-data` is off — §9.2
+# is text-only for v1, and the feature pulls in the whole `image` stack.
+arboard = { version = "3", default-features = false }
 x11rb = "0.13"          # safe X11 client for the lower-trust Linux capture (§11)
 memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
@@ -78,6 +86,11 @@ libc = "0.2"            # syscall numbers for that filter
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-updater = "2"
+# Native file/directory pickers for §9.2, used **only** from Rust. The
+# webview never gets `dialog:` or `fs:` permissions: `capabilities/view.json`
+# says the view window has no filesystem rights, and a picker that ran in the
+# webview would be exactly that right under another name (ADR 0032).
+tauri-plugin-dialog = "2"
 
 # dev-dependencies
 proptest = "1"

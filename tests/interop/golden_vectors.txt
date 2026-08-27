@@ -63,3 +63,34 @@ valid minor2_media_unavailable_no_encoder abababababababababababababababab00001e
 valid minor3_sas_request abababababababababababababababab01001f00
 valid minor3_sas_ack_delivered abababababababababababababababab0000200100
 valid minor3_sas_ack_refused abababababababababababababababab0000200000
+
+# --- Frozen for PROTOCOL_MINOR 5: the sender naming the transfer it is about
+# --- to push onto rd/file/1 (docs/adr/0032). Either direction — either side of
+# --- a session may offer a file — and only towards a peer whose Hello
+# --- advertised the "file-transfer" feature string. The offer's name, size and
+# --- hash are restated so the receiver can refuse a start that does not
+# --- describe the file it agreed to take.
+valid minor5_file_transfer_start abababababababababababababababab010024070a7265706f72742e706466d209070707070707070707070707070707070707070707070707070707070707070700
+valid minor5_file_transfer_start_host_side abababababababababababababababab00002400016100000000000000000000000000000000000000000000000000000000000000000000
+invalid minor5_file_transfer_start_overlong_name abababababababababababababababab0100240180026e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e01000000000000000000000000000000000000000000000000000000000000000000
+invalid file_offer_over_the_size_limit abababababababababababababababab01000d0178818080fa01000000000000000000000000000000000000000000000000000000000000000000
+
+# --- Frozen for PROTOCOL_MINOR 4: the unattended admission exchange of §8
+# --- (docs/adr/0033). The challenge and the rejection are host to guest, the
+# --- credentials guest to host, and the host offers the challenge only to a
+# --- guest whose Hello advertised the "unattended" feature string and only to
+# --- a device its own address book marks trusted. A success is answered with
+# --- the ordinary ConsentGrant, so there is no "accepted" message to freeze.
+valid minor4_unattended_challenge_password_only abababababababababababababababab0000210000
+valid minor4_unattended_challenge_with_code abababababababababababababababab0000210100
+valid minor4_unattended_auth_password_only abababababababababababababababab0100220a6f70656e736573616d650000
+valid minor4_unattended_auth_with_code abababababababababababababababab0100220a6f70656e736573616d65010632383730383200
+valid minor4_unattended_reject_bad_password abababababababababababababababab0000230000
+valid minor4_unattended_reject_bad_code abababababababababababababababab0000230100
+valid minor4_unattended_reject_locked_out abababababababababababababababab00002302ac0200
+valid minor4_unattended_reject_unavailable abababababababababababababababab0000230300
+# --- A code longer than UNATTENDED_CODE_MAX_BYTES is refused while decoding,
+# --- before anything downstream allocates: credentials arrive from a peer that
+# --- has not been admitted yet, which makes them the least trusted payload the
+# --- control channel carries (§9.1).
+invalid minor4_unattended_auth_overlong_code abababababababababababababababab0100220a6f70656e736573616d65010931313131313131313100

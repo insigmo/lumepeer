@@ -1,5 +1,5 @@
 //! Address book: saved devices, tags, notes and the trusted-device whitelist
-//! (design doc §8; ADR 0022).
+//! (design doc §8; ADR 0023 §3, ADR 0034).
 //!
 //! Deny-by-default applies here too: a device is trusted only after the host
 //! user marked it, and trust is per-`NodeId`, never per-name. The book is
@@ -24,7 +24,10 @@ pub struct AddressEntry {
     #[serde(default)]
     pub notes: String,
     /// Whether this device may connect without answering consent dialogs
-    /// (still subject to the unattended password of ADR 0021).
+    /// (still subject to the unattended password of `crate::unattended`).
+    ///
+    /// Trust narrows *who may try* the password; it is never a way past it
+    /// (ADR 0034).
     #[serde(default)]
     pub trusted: bool,
 }
@@ -51,6 +54,38 @@ impl AddressBook {
 
     fn key_of(peer: &NodeId) -> String {
         data_encoding::BASE32_NOPAD.encode(peer.as_ref())
+    }
+
+    /// Decodes a book key back into the `NodeId` it names.
+    ///
+    /// The inverse of the keying scheme this book is built on, needed by any
+    /// caller that has to turn a stored entry back into a peer — the desktop
+    /// shell does, to pseudonymize it for the UI (§15).
+    ///
+    /// # Errors
+    /// [`crate::CoreError::Malformed`] if `key` is not base32 of a 32-byte
+    /// public key. A hand-edited file is untrusted input like any other: this
+    /// returns an error, never a panic.
+    pub fn peer_of_key(key: &str) -> crate::Result<NodeId> {
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(key.as_bytes())
+            .map_err(|_| crate::CoreError::Malformed)?;
+        let bytes: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| crate::CoreError::Malformed)?;
+        NodeId::from_bytes(&bytes).map_err(|_| crate::CoreError::Malformed)
+    }
+
+    /// All entries whose key still decodes to a peer, in stable id order.
+    ///
+    /// A key that does not decode is skipped rather than fatal: the file is
+    /// editable by the host user, and one bad line must not hide the rest of
+    /// the book.
+    pub fn peers(&self) -> impl Iterator<Item = (NodeId, &AddressEntry)> {
+        self.entries
+            .iter()
+            .filter_map(|(key, entry)| Self::peer_of_key(key).ok().map(|peer| (peer, entry)))
     }
 
     /// Saves or updates a device entry.
@@ -177,6 +212,29 @@ mod tests {
         assert_eq!(restored, book);
         assert!(restored.is_trusted(&peer(1)));
         assert!(!restored.is_trusted(&peer(2)));
+    }
+
+    #[test]
+    fn a_key_round_trips_back_into_the_peer_it_names() {
+        let mut book = AddressBook::new();
+        book.upsert(&peer(1), entry("office", true));
+        book.upsert(&peer(2), entry("home", false));
+
+        let listed: Vec<_> = book.peers().collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|(p, e)| *p == peer(1) && e.trusted));
+        assert!(listed.iter().any(|(p, e)| *p == peer(2) && !e.trusted));
+    }
+
+    #[test]
+    fn a_hand_edited_key_is_skipped_rather_than_fatal() {
+        assert!(AddressBook::peer_of_key("not base32!").is_err());
+        // Well-formed base32 of the wrong length is not a public key either.
+        assert!(AddressBook::peer_of_key("AAAA").is_err());
+
+        let book = AddressBook::from_json(r#"{ "AAAA": { "label": "junk" } }"#).unwrap();
+        assert_eq!(book.len(), 1, "the entry is still stored");
+        assert_eq!(book.peers().count(), 0, "but it names no peer");
     }
 
     #[test]

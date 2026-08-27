@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-address-book-set-trusted"
+description = "Enables the address_book_set_trusted command without any pre-configured scope."
+commands.allow = ["address_book_set_trusted"]
+
+[[permission]]
+identifier = "deny-address-book-set-trusted"
+description = "Denies the address_book_set_trusted command without any pre-configured scope."
+commands.deny = ["address_book_set_trusted"]

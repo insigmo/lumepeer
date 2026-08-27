@@ -1,9 +1,17 @@
-//! Platform keystore for the long-term endpoint identity (design doc §11.2).
+//! Platform keystore for the long-term endpoint identity and the host's other
+//! stored secrets (design doc §11.2).
 //!
 //! The Iroh secret key exists on disk only inside the OS keystore. The
 //! fallback is an encrypted file whose key derives from an OS user-specific
 //! secret, never a plaintext file in the app directory. None of this is a
 //! defence against a local admin on the host machine (§3.1).
+//!
+//! The trait is a named-slot store rather than an identity-shaped one: the
+//! unattended device password (an Argon2id PHC string) and its TOTP secret
+//! live here too, because `CLAUDE.md` forbids secrets in `config/*.toml` and
+//! this is the only place the app has that is not a config file (ADR 0033).
+//! The identity methods are thin wrappers over the slot named
+//! [`IDENTITY_ENTRY`], so every backend implements storage once.
 //!
 //! Phase 1 ships the trait, the in-memory store used by the tests and the
 //! encrypted-file fallback. Of the native backends named in §11.2, macOS
@@ -12,6 +20,7 @@
 //! and [`open`] refuses rather than silently downgrading to the fallback on a
 //! platform that has a real store.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -26,29 +35,91 @@ use crate::error::{NetError, Result};
 /// Keystore entry name under which the endpoint identity is stored.
 pub const IDENTITY_ENTRY: &str = "lumepeer.endpoint.identity";
 
+/// Keystore entry name of the unattended device password (§8).
+///
+/// Holds the Argon2id PHC string, never the password: what is stored is
+/// already a verifier, and it is stored here rather than in `config/` because
+/// a PHC string is still secret material (ADR 0033).
+pub const UNATTENDED_PASSWORD_ENTRY: &str = "lumepeer.unattended.password";
+
+/// Keystore entry name of the role an unattended admission is granted (§8.2).
+///
+/// Not secret — it is a role name — but kept here rather than in `config/`
+/// so it lives and dies with the credentials it applies to: clearing the
+/// password clears this in the same pass, and a stale `FullControl` can never
+/// outlive the password it was chosen for and attach itself to the next one
+/// (ADR 0033).
+pub const UNATTENDED_ROLE_ENTRY: &str = "lumepeer.unattended.role";
+
+/// Keystore entry name of the unattended TOTP secret (§8).
+///
+/// Twenty raw bytes, the shared secret an authenticator app was provisioned
+/// with. Unlike the password slot this one *is* a key: anyone who reads it can
+/// mint valid codes, which is exactly why it is not in a config file.
+pub const UNATTENDED_TOTP_ENTRY: &str = "lumepeer.unattended.totp";
+
 /// Domain separator of the file-fallback key derivation.
 const KDF_CONTEXT: &str = "lumepeer 2026 endpoint identity file keystore";
 
-/// Storage for secret material.
+/// Storage for secret material, addressed by entry name.
+///
+/// A backend implements the three slot operations; the identity helpers below
+/// are provided in terms of them and are not meant to be overridden.
 pub trait Keystore: Send + std::fmt::Debug {
-    /// Loads the endpoint secret key, if one was stored.
+    /// Loads the bytes stored under `entry`.
+    ///
+    /// A slot that was never written is `Ok(None)`, not an error: "nothing
+    /// stored yet" is the first-run state of every one of these entries and
+    /// callers must not have to tell it apart from a broken keystore.
     ///
     /// # Errors
     /// [`NetError::Keystore`] if the platform store is unavailable or refuses
     /// the read.
-    fn load_identity(&self) -> Result<Option<iroh::SecretKey>>;
+    fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Stores `bytes` under `entry`, replacing any previous value.
+    ///
+    /// # Errors
+    /// [`NetError::Keystore`] if the write is refused.
+    fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()>;
+
+    /// Removes whatever is stored under `entry`. Removing an absent entry
+    /// succeeds: the post-condition is "nothing is stored there".
+    ///
+    /// # Errors
+    /// [`NetError::Keystore`] if the delete is refused.
+    fn delete_secret(&self, entry: &str) -> Result<()>;
+
+    /// Loads the endpoint secret key, if one was stored.
+    ///
+    /// # Errors
+    /// [`NetError::Keystore`] as [`Self::load_secret`], or if the stored blob
+    /// is not 32 bytes.
+    fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
+        let Some(bytes) = self.load_secret(IDENTITY_ENTRY)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            NetError::Keystore("the stored identity has the wrong length".to_owned())
+        })?;
+        Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+    }
 
     /// Stores the endpoint secret key, replacing any previous value.
     ///
     /// # Errors
     /// [`NetError::Keystore`] if the write is refused.
-    fn store_identity(&self, key: &iroh::SecretKey) -> Result<()>;
+    fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
+        self.store_secret(IDENTITY_ENTRY, &key.to_bytes())
+    }
 
     /// Removes the stored identity.
     ///
     /// # Errors
     /// [`NetError::Keystore`] if the delete is refused.
-    fn delete_identity(&self) -> Result<()>;
+    fn delete_identity(&self) -> Result<()> {
+        self.delete_secret(IDENTITY_ENTRY)
+    }
 }
 
 /// Loads the stored identity or creates and stores a new one.
@@ -168,12 +239,13 @@ pub mod secret_service_backend {
 
     use secret_service::{EncryptionType, SecretService};
 
-    use super::{IDENTITY_ENTRY, Keystore};
+    use super::Keystore;
     use crate::error::{NetError, Result};
 
-    /// Attribute key under which the identity is filed.
+    /// Attribute key under which every Lumepeer secret is filed; the entry
+    /// name is its value, which is what makes one slot findable.
     const ATTRIBUTE: &str = "lumepeer";
-    /// MIME type of the stored blob: raw key bytes, not text.
+    /// MIME type of the stored blob: raw bytes, not text.
     const CONTENT_TYPE: &str = "application/octet-stream";
 
     /// Keystore backed by the D-Bus Secret Service (gnome-keyring, `KWallet`).
@@ -216,16 +288,16 @@ pub mod secret_service_backend {
             .unwrap_or_else(|_| Err(NetError::Keystore("keystore thread panicked".to_owned())))
         }
 
-        fn attributes() -> HashMap<&'static str, &'static str> {
-            HashMap::from([(ATTRIBUTE, IDENTITY_ENTRY)])
+        fn attributes(entry: &str) -> HashMap<&str, &str> {
+            HashMap::from([(ATTRIBUTE, entry)])
         }
 
-        async fn load() -> Result<Option<iroh::SecretKey>> {
+        async fn load(entry: String) -> Result<Option<Vec<u8>>> {
             let service = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
             let items = service
-                .search_items(Self::attributes())
+                .search_items(Self::attributes(&entry))
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
 
@@ -239,14 +311,10 @@ pub mod secret_service_backend {
                 .get_secret()
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
-
-            let bytes: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
-                NetError::Keystore("the stored identity has the wrong length".to_owned())
-            })?;
-            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+            Ok(Some(secret))
         }
 
-        async fn store(key: iroh::SecretKey) -> Result<()> {
+        async fn store(entry: String, bytes: Vec<u8>) -> Result<()> {
             let service = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
@@ -260,10 +328,10 @@ pub mod secret_service_backend {
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
             collection
                 .create_item(
-                    "Lumepeer endpoint identity",
-                    Self::attributes(),
-                    &key.to_bytes(),
-                    // Replace: an install has exactly one endpoint identity.
+                    &format!("Lumepeer: {entry}"),
+                    Self::attributes(&entry),
+                    &bytes,
+                    // Replace: one slot holds exactly one value.
                     true,
                     CONTENT_TYPE,
                 )
@@ -272,12 +340,12 @@ pub mod secret_service_backend {
             Ok(())
         }
 
-        async fn delete() -> Result<()> {
+        async fn delete(entry: String) -> Result<()> {
             let service = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
             let items = service
-                .search_items(Self::attributes())
+                .search_items(Self::attributes(&entry))
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
             for item in items.unlocked.iter().chain(items.locked.iter()) {
@@ -293,16 +361,16 @@ pub mod secret_service_backend {
     }
 
     impl Keystore for SecretServiceKeystore {
-        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
-            Self::block_on(Self::load())
+        fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
+            Self::block_on(Self::load(entry.to_owned()))
         }
 
-        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
-            Self::block_on(Self::store(key.clone()))
+        fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
+            Self::block_on(Self::store(entry.to_owned(), bytes.to_vec()))
         }
 
-        fn delete_identity(&self) -> Result<()> {
-            Self::block_on(Self::delete())
+        fn delete_secret(&self, entry: &str) -> Result<()> {
+            Self::block_on(Self::delete(entry.to_owned()))
         }
     }
 
@@ -357,7 +425,7 @@ pub mod apple_keychain_backend {
     };
     use security_framework_sys::base::errSecItemNotFound;
 
-    use super::{IDENTITY_ENTRY, Keystore};
+    use super::Keystore;
     use crate::error::{NetError, Result};
 
     /// Keychain service name the identity item is filed under. Matches the
@@ -384,25 +452,21 @@ pub mod apple_keychain_backend {
     }
 
     impl Keystore for AppleKeychainKeystore {
-        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
-            let bytes = match get_generic_password(SERVICE, IDENTITY_ENTRY) {
-                Ok(bytes) => bytes,
-                Err(e) if Self::is_not_found(e) => return Ok(None),
-                Err(e) => return Err(NetError::Keystore(e.to_string())),
-            };
-            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                NetError::Keystore("the stored identity has the wrong length".to_owned())
-            })?;
-            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
+            match get_generic_password(SERVICE, entry) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if Self::is_not_found(e) => Ok(None),
+                Err(e) => Err(NetError::Keystore(e.to_string())),
+            }
         }
 
-        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
-            set_generic_password(SERVICE, IDENTITY_ENTRY, &key.to_bytes())
+        fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
+            set_generic_password(SERVICE, entry, bytes)
                 .map_err(|e| NetError::Keystore(e.to_string()))
         }
 
-        fn delete_identity(&self) -> Result<()> {
-            match delete_generic_password(SERVICE, IDENTITY_ENTRY) {
+        fn delete_secret(&self, entry: &str) -> Result<()> {
+            match delete_generic_password(SERVICE, entry) {
                 Ok(()) => Ok(()),
                 Err(e) if Self::is_not_found(e) => Ok(()),
                 Err(e) => Err(NetError::Keystore(e.to_string())),
@@ -458,7 +522,7 @@ pub mod apple_keychain_backend {
 pub mod windows_credential_manager_backend {
     use keyring::Entry;
 
-    use super::{IDENTITY_ENTRY, Keystore};
+    use super::Keystore;
     use crate::error::{NetError, Result};
 
     /// Credential Manager target service, matching the Tauri bundle
@@ -479,32 +543,28 @@ pub mod windows_credential_manager_backend {
             Self { _private: () }
         }
 
-        fn entry() -> Result<Entry> {
-            Entry::new(SERVICE, IDENTITY_ENTRY).map_err(|e| NetError::Keystore(e.to_string()))
+        fn entry(name: &str) -> Result<Entry> {
+            Entry::new(SERVICE, name).map_err(|e| NetError::Keystore(e.to_string()))
         }
     }
 
     impl Keystore for WindowsCredentialManagerKeystore {
-        fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
-            let bytes = match Self::entry()?.get_secret() {
-                Ok(bytes) => bytes,
-                Err(keyring::Error::NoEntry) => return Ok(None),
-                Err(e) => return Err(NetError::Keystore(e.to_string())),
-            };
-            let bytes: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-                NetError::Keystore("the stored identity has the wrong length".to_owned())
-            })?;
-            Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
+            match Self::entry(entry)?.get_secret() {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(NetError::Keystore(e.to_string())),
+            }
         }
 
-        fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
-            Self::entry()?
-                .set_secret(&key.to_bytes())
+        fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
+            Self::entry(entry)?
+                .set_secret(bytes)
                 .map_err(|e| NetError::Keystore(e.to_string()))
         }
 
-        fn delete_identity(&self) -> Result<()> {
-            match Self::entry()?.delete_credential() {
+        fn delete_secret(&self, entry: &str) -> Result<()> {
+            match Self::entry(entry)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(e) => Err(NetError::Keystore(e.to_string())),
             }
@@ -550,7 +610,7 @@ pub mod windows_credential_manager_backend {
 /// guest sessions that must not leave an identity behind.
 #[derive(Debug, Default)]
 pub struct MemoryKeystore {
-    key: Mutex<Option<iroh::SecretKey>>,
+    slots: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl MemoryKeystore {
@@ -558,45 +618,45 @@ impl MemoryKeystore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            key: Mutex::new(None),
+            slots: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn slots(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Vec<u8>>>> {
+        self.slots
+            .lock()
+            .map_err(|_| NetError::Keystore("memory keystore poisoned".to_owned()))
     }
 }
 
 impl Keystore for MemoryKeystore {
-    fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
-        let guard = self
-            .key
-            .lock()
-            .map_err(|_| NetError::Keystore("memory keystore poisoned".to_owned()))?;
-        Ok(guard.clone())
+    fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.slots()?.get(entry).cloned())
     }
 
-    fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
-        let mut guard = self
-            .key
-            .lock()
-            .map_err(|_| NetError::Keystore("memory keystore poisoned".to_owned()))?;
-        *guard = Some(key.clone());
+    fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
+        self.slots()?.insert(entry.to_owned(), bytes.to_vec());
         Ok(())
     }
 
-    fn delete_identity(&self) -> Result<()> {
-        let mut guard = self
-            .key
-            .lock()
-            .map_err(|_| NetError::Keystore("memory keystore poisoned".to_owned()))?;
-        *guard = None;
+    fn delete_secret(&self, entry: &str) -> Result<()> {
+        self.slots()?.remove(entry);
         Ok(())
     }
 }
 
 /// Encrypted-file fallback of §11.2.
 ///
-/// The file holds `nonce || XChaCha20-Poly1305(secret key)`. The encryption key
-/// is derived with BLAKE3 from an OS user-specific secret, so a copy of the file
-/// alone does not yield the identity. It is explicitly not a defence against a
-/// local admin or against the user's own account (§3.1, §3.3).
+/// The file holds `nonce || XChaCha20-Poly1305(secret bytes)`. The encryption
+/// key is derived with BLAKE3 from an OS user-specific secret, so a copy of the
+/// file alone does not yield the identity. It is explicitly not a defence
+/// against a local admin or against the user's own account (§3.1, §3.3).
+///
+/// One slot is one file. `IDENTITY_ENTRY` keeps the exact path this store was
+/// constructed with, so an install that already has an identity file keeps
+/// reading it; every other entry becomes a sibling file named after the entry.
+/// Entry names are folded down to `[a-z0-9-]` first, which is what stops a name
+/// from ever walking out of the directory.
 #[derive(Debug)]
 pub struct FileKeystore {
     path: PathBuf,
@@ -621,8 +681,29 @@ impl FileKeystore {
         XChaCha20Poly1305::new(&self.key)
     }
 
-    fn write_private(&self, bytes: &[u8]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
+    /// File backing `entry` (see the type's docs for the naming rule).
+    fn path_for(&self, entry: &str) -> PathBuf {
+        if entry == IDENTITY_ENTRY {
+            return self.path.clone();
+        }
+        let mut name: String = entry
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        name.push_str(".bin");
+        self.path
+            .parent()
+            .map_or_else(|| PathBuf::from(&name), |dir| dir.join(&name))
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| NetError::Keystore(e.to_string()))?;
         }
         let mut options = fs::OpenOptions::new();
@@ -633,7 +714,7 @@ impl FileKeystore {
             options.mode(0o600);
         }
         let mut file = options
-            .open(&self.path)
+            .open(path)
             .map_err(|e| NetError::Keystore(e.to_string()))?;
         file.write_all(bytes)
             .map_err(|e| NetError::Keystore(e.to_string()))?;
@@ -652,8 +733,8 @@ impl FileKeystore {
 const NONCE_BYTES: usize = 24;
 
 impl Keystore for FileKeystore {
-    fn load_identity(&self) -> Result<Option<iroh::SecretKey>> {
-        let raw = match fs::read(&self.path) {
+    fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
+        let raw = match fs::read(self.path_for(entry)) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(NetError::Keystore(e.to_string())),
@@ -666,28 +747,24 @@ impl Keystore for FileKeystore {
             .cipher()
             .decrypt(XNonce::from_slice(nonce), ciphertext)
             .map_err(|_| NetError::Keystore("keystore file failed authentication".to_owned()))?;
-        let bytes: [u8; 32] = plain
-            .as_slice()
-            .try_into()
-            .map_err(|_| NetError::Keystore("stored identity has the wrong length".to_owned()))?;
-        Ok(Some(iroh::SecretKey::from_bytes(&bytes)))
+        Ok(Some(plain))
     }
 
-    fn store_identity(&self, key: &iroh::SecretKey) -> Result<()> {
+    fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
         let mut nonce = [0u8; NONCE_BYTES];
         rand::rng().fill_bytes(&mut nonce);
         let ciphertext = self
             .cipher()
-            .encrypt(XNonce::from_slice(&nonce), key.to_bytes().as_slice())
-            .map_err(|_| NetError::Keystore("could not encrypt the identity".to_owned()))?;
+            .encrypt(XNonce::from_slice(&nonce), bytes)
+            .map_err(|_| NetError::Keystore("could not encrypt the secret".to_owned()))?;
         let mut out = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
-        self.write_private(&out)
+        Self::write_private(&self.path_for(entry), &out)
     }
 
-    fn delete_identity(&self) -> Result<()> {
-        match fs::remove_file(&self.path) {
+    fn delete_secret(&self, entry: &str) -> Result<()> {
+        match fs::remove_file(self.path_for(entry)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(NetError::Keystore(e.to_string())),
@@ -760,6 +837,115 @@ mod tests {
         fs::write(&path, &raw).unwrap();
         assert!(matches!(store.load_identity(), Err(NetError::Keystore(_))));
         store.delete_identity().unwrap();
+    }
+
+    /// The slot API is what the unattended password and TOTP secret ride on
+    /// (ADR 0033), so an absent slot must read as "nothing stored", never as a
+    /// failure the caller has to tell apart from a broken keystore.
+    #[test]
+    fn an_absent_slot_is_none_rather_than_an_error() {
+        let memory = MemoryKeystore::new();
+        assert_eq!(memory.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap(), None);
+        // Deleting what was never stored still succeeds: the post-condition is
+        // "nothing is stored there", and it already holds.
+        memory.delete_secret(UNATTENDED_PASSWORD_ENTRY).unwrap();
+
+        let path = temp_path("absent-slot");
+        let file = FileKeystore::new(&path, b"user-specific secret");
+        assert_eq!(file.load_secret(UNATTENDED_TOTP_ENTRY).unwrap(), None);
+        file.delete_secret(UNATTENDED_TOTP_ENTRY).unwrap();
+    }
+
+    #[test]
+    fn slots_round_trip_independently_of_each_other() {
+        let phc = b"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA";
+        let totp = [7u8; 20];
+
+        for store in [
+            Box::new(MemoryKeystore::new()) as Box<dyn Keystore>,
+            Box::new(FileKeystore::new(
+                temp_path("slots"),
+                b"user-specific secret",
+            )),
+        ] {
+            let key = load_or_create(store.as_ref()).unwrap();
+            store.store_secret(UNATTENDED_PASSWORD_ENTRY, phc).unwrap();
+            store.store_secret(UNATTENDED_TOTP_ENTRY, &totp).unwrap();
+
+            assert_eq!(
+                store.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap(),
+                Some(phc.to_vec())
+            );
+            assert_eq!(
+                store.load_secret(UNATTENDED_TOTP_ENTRY).unwrap(),
+                Some(totp.to_vec())
+            );
+
+            // Turning the second factor off must not disturb the password or
+            // the identity: one slot, one value, no shared file to clobber.
+            store.delete_secret(UNATTENDED_TOTP_ENTRY).unwrap();
+            assert_eq!(store.load_secret(UNATTENDED_TOTP_ENTRY).unwrap(), None);
+            assert_eq!(
+                store.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap(),
+                Some(phc.to_vec())
+            );
+            assert_eq!(
+                store.load_identity().unwrap().unwrap().public(),
+                key.public()
+            );
+
+            store.delete_secret(UNATTENDED_PASSWORD_ENTRY).unwrap();
+            store.delete_identity().unwrap();
+        }
+    }
+
+    /// A PHC string is secret material: the fallback file must not be readable
+    /// as text by anyone who copies it out of the app directory (§11.2).
+    #[test]
+    fn a_stored_secret_is_not_plaintext_on_disk_and_lives_in_its_own_file() {
+        let path = temp_path("secret-file");
+        let store = FileKeystore::new(&path, b"user-specific secret");
+        let phc = b"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA";
+        store.store_secret(UNATTENDED_PASSWORD_ENTRY, phc).unwrap();
+
+        let dir = path.parent().unwrap();
+        let files: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        // The identity was never written here, so exactly one file exists and
+        // it is not the identity's.
+        assert_eq!(files.len(), 1);
+        assert_ne!(files[0], path);
+
+        let raw = fs::read(&files[0]).unwrap();
+        assert!(!raw.windows(phc.len()).any(|w| w == phc));
+
+        let reopened = FileKeystore::new(&path, b"user-specific secret");
+        assert_eq!(
+            reopened.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap(),
+            Some(phc.to_vec())
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Entry names reach `path_for` from constants in this crate today, but the
+    /// sanitizing is what guarantees a name can never address a file outside
+    /// the keystore directory.
+    #[test]
+    fn an_entry_name_cannot_walk_out_of_the_keystore_directory() {
+        let path = temp_path("traversal");
+        let store = FileKeystore::new(&path, b"secret");
+        let dir = path.parent().unwrap();
+
+        for hostile in ["../../etc/passwd", "..", "/etc/shadow", "a\\b"] {
+            let resolved = store.path_for(hostile);
+            assert_eq!(
+                resolved.parent(),
+                Some(dir),
+                "{hostile} escaped the keystore directory"
+            );
+        }
     }
 
     #[test]

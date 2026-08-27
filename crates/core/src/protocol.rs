@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::Role;
 use crate::constants::{
-    CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
-    MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+    CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES,
+    MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -58,7 +59,25 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// re-check every injected key gets (§8.1). A host that cannot honor it
 /// answers [`MessageKind::SasAck`] with `false` rather than staying silent.
 /// See `docs/adr/0028-remote-sas-and-view-toolbar.md`.
-pub const PROTOCOL_MINOR: u16 = 3;
+///
+/// 4: appended [`MessageKind::UnattendedChallenge`],
+/// [`MessageKind::UnattendedAuth`] and [`MessageKind::UnattendedReject`] after
+/// `SasAck`, for the unattended-access admission path of §8 — the one way into
+/// a session that has no human at the host to answer a consent dialog. A host
+/// offers the challenge only to a guest whose `Hello` advertised
+/// [`FEATURE_UNATTENDED`], so an older peer keeps seeing the ordinary
+/// `ConsentRequest` path. See
+/// `docs/adr/0033-unattended-admission-and-keystore-secret-slots.md`.
+///
+/// 5: appended [`MessageKind::FileTransferStart`] after `UnattendedReject`.
+/// `FileAbort` and `FileChunkAck` have always been documented as naming a
+/// `transfer_id` "announced in `FileTransferStart`", and no such message
+/// existed — so the two sides had no way to agree on one, and the transfer
+/// engine had nothing to be reached by. A peer sends it only to one whose
+/// `Hello` advertised [`FEATURE_FILE_TRANSFER`], for the same minor-version
+/// reason `MediaUnavailable` rides behind its feature string. See
+/// `docs/adr/0032-file-transfer-start-and-the-lazy-file-connection.md`.
+pub const PROTOCOL_MINOR: u16 = 5;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -76,6 +95,29 @@ pub const FEATURE_MEDIA_UNAVAILABLE: &str = "media-unavailable";
 /// that peer decodes the unknown discriminant as malformed and closes the
 /// connection (§9.1).
 pub const FEATURE_REMOTE_SAS: &str = "remote-sas";
+
+/// `Hello.features` string a guest sends to say it understands the unattended
+/// credential exchange ([`MessageKind::UnattendedChallenge`] and
+/// [`MessageKind::UnattendedReject`]).
+///
+/// Same compatibility shape as [`FEATURE_MEDIA_UNAVAILABLE`], and one step
+/// stronger in consequence: a host that offered the challenge to a guest which
+/// cannot answer it would leave that guest waiting on a consent dialog nobody
+/// is going to see. A host that does not see this string falls back to the
+/// ordinary consent path of §8.1, which asks a human — never the other way
+/// round.
+pub const FEATURE_UNATTENDED: &str = "unattended";
+
+/// `Hello.features` string a peer sends to say it understands
+/// [`MessageKind::FileTransferStart`], and therefore that a file transfer
+/// with it can name a `transfer_id` both sides agree on.
+///
+/// Both sides advertise it and both sides check it: either end of a session
+/// may offer a file (§9.2), so either end may be the one that has to send the
+/// message. Without the string on the far side, an offer is simply never
+/// made — better than a transfer that starts and then cannot be acked,
+/// aborted or resumed.
+pub const FEATURE_FILE_TRANSFER: &str = "file-transfer";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -283,6 +325,87 @@ pub enum MessageKind {
         /// Whether the sequence reached the host OS.
         delivered: bool,
     },
+    /// Host to guest: this host is configured for unattended access, so there
+    /// is nobody here to answer a consent dialog — present credentials
+    /// instead (§8). New in minor 4.
+    ///
+    /// Sent in place of waiting on `ConsentRequest`, and only to a guest whose
+    /// `Hello` advertised [`FEATURE_UNATTENDED`]. Saying whether a second
+    /// factor is expected is a UI necessity, not a disclosure the host is
+    /// careless about: the peer already had to present a valid invite and be
+    /// marked trusted in the host's address book before the challenge is
+    /// offered at all.
+    UnattendedChallenge {
+        /// Whether a one-time code must accompany the password.
+        code_required: bool,
+    },
+    /// Guest to host: the answer to [`MessageKind::UnattendedChallenge`]
+    /// (§8). New in minor 4.
+    ///
+    /// Verified in the host's `crates/core` — `unattended::UnattendedAccess::
+    /// admit` — and nowhere else. The password is at most
+    /// `UNATTENDED_PASSWORD_MAX_BYTES` and the code at most
+    /// `UNATTENDED_CODE_MAX_BYTES`, both checked before allocation on decode.
+    UnattendedAuth {
+        /// The device password, in the clear inside the QUIC/TLS tunnel; the
+        /// host hashes it and never stores it.
+        password: String,
+        /// The one-time code, present only when the challenge asked for one.
+        code: Option<String>,
+    },
+    /// Host to guest: the credentials were refused (§8, §18). New in minor 4.
+    ///
+    /// A success is not answered with this message but with the ordinary
+    /// `ConsentGrant`, so the guest's admission path is the same one an
+    /// attended session takes.
+    UnattendedReject(UnattendedRejection),
+    /// Sender to receiver: the file just accepted is this transfer (§9.2).
+    /// New in minor 5.
+    ///
+    /// Sent after a [`MessageKind::FileAccept`] of `true` and before the
+    /// first chunk reaches `rd/file/1`. It exists because `FileAbort` and
+    /// `FileChunkAck` both name a `transfer_id` that nothing had ever
+    /// assigned: `FileOffer` carries no identifier, so until now the two
+    /// sides could not refer to the same transfer at all.
+    ///
+    /// The offer's three fields are restated rather than implied. An id whose
+    /// meaning is "whichever offer we both believe was accepted last" is
+    /// shared state with no way to check itself, and a receiver has to be
+    /// able to refuse a start that does not describe the file it agreed to —
+    /// which it can only do if the start says what it is starting.
+    FileTransferStart {
+        /// Identifier both sides use for this transfer from here on.
+        transfer_id: u64,
+        /// Basename, as in the offer this starts.
+        name: String,
+        /// Size in bytes, as in the offer this starts.
+        size: u64,
+        /// BLAKE3 of the whole file, as in the offer this starts.
+        hash: [u8; 32],
+    },
+}
+
+/// Why an unattended admission was refused (§8, §18).
+///
+/// A closed set, and deliberately coarse in the same way
+/// `unattended::UnattendedError` is: it never says how close a guess was, and
+/// it never distinguishes "the password was right but the code was not" from
+/// the other way round. `LockedOut` carries only the remaining seconds, which
+/// the guest needs in order to stop retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnattendedRejection {
+    /// The password did not verify, or none was presented.
+    BadPassword,
+    /// The one-time code did not verify, or none was presented.
+    BadCode,
+    /// Every attempt is refused until the lockout expires (§18).
+    LockedOut {
+        /// Seconds until attempts are accepted again.
+        remaining_secs: u64,
+    },
+    /// This host cannot decide right now: unattended access is not configured,
+    /// or its stored credentials are unusable. Not a verdict on the guest.
+    Unavailable,
 }
 
 /// Why a host cannot produce media (§18).
@@ -414,7 +537,8 @@ impl MessageEnvelope {
     /// chat text over `CHAT_MAX_BYTES`, clipboard over `CLIPBOARD_MAX_BYTES`,
     /// a cursor whose pixel count contradicts its geometry or exceeds
     /// `MAX_CURSOR_SHAPE_PIXELS`, more than `MAX_MONITORS_PER_HOST` monitors,
-    /// or a `FileOffer` larger than `FILE_OFFER_MAX_BYTES`.
+    /// a `FileOffer` or `FileTransferStart` over `FILE_OFFER_MAX_BYTES` or
+    /// naming a file over `FILE_NAME_MAX_BYTES`.
     fn check_limits(&self) -> Result<()> {
         match &self.kind {
             MessageKind::Chat { text } => {
@@ -449,8 +573,25 @@ impl MessageEnvelope {
                     }
                 }
             }
-            MessageKind::FileOffer { size, .. } if *size > FILE_OFFER_MAX_BYTES => {
-                return Err(CoreError::Malformed);
+            MessageKind::FileOffer { name, size, .. }
+            | MessageKind::FileTransferStart { name, size, .. } => {
+                if *size > FILE_OFFER_MAX_BYTES || name.len() > FILE_NAME_MAX_BYTES {
+                    return Err(CoreError::Malformed);
+                }
+            }
+            // Credentials arrive from a peer that has not been admitted yet,
+            // which makes this the least trusted payload on the channel: both
+            // fields are bounded before anything downstream allocates (§9.1).
+            MessageKind::UnattendedAuth { password, code } => {
+                if password.len() > UNATTENDED_PASSWORD_MAX_BYTES {
+                    return Err(CoreError::Malformed);
+                }
+                if code
+                    .as_ref()
+                    .is_some_and(|c| c.len() > UNATTENDED_CODE_MAX_BYTES)
+                {
+                    return Err(CoreError::Malformed);
+                }
             }
             _ => {}
         }
@@ -480,7 +621,8 @@ mod tests {
 
     use super::*;
     use crate::constants::{
-        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_MAX_BYTES, FILE_OFFER_MAX_BYTES,
+        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES,
+        FILE_OFFER_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     fn envelope(kind: MessageKind) -> MessageEnvelope {
@@ -583,6 +725,175 @@ mod tests {
             31,
             "the minor-3 kind must be appended after MediaUnavailable"
         );
+        assert_eq!(
+            kind_byte(MessageKind::SasAck { delivered: false }),
+            32,
+            "the last minor-3 kind moved"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::UnattendedChallenge {
+                code_required: false
+            }),
+            33,
+            "the minor-4 kinds must be appended after SasAck"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::FileTransferStart {
+                transfer_id: 0,
+                name: String::new(),
+                size: 0,
+                hash: [0u8; 32],
+            }),
+            36,
+            "the minor-5 kind must be appended after UnattendedReject"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::UnattendedAuth {
+                password: String::new(),
+                code: None,
+            }),
+            34,
+        );
+        assert_eq!(
+            kind_byte(MessageKind::UnattendedReject(
+                UnattendedRejection::BadPassword
+            )),
+            35,
+        );
+    }
+
+    #[test]
+    fn the_unattended_exchange_roundtrips() {
+        let cases = [
+            MessageKind::UnattendedChallenge {
+                code_required: true,
+            },
+            MessageKind::UnattendedChallenge {
+                code_required: false,
+            },
+            MessageKind::UnattendedAuth {
+                password: "correct horse battery staple".to_owned(),
+                code: Some("123456".to_owned()),
+            },
+            MessageKind::UnattendedAuth {
+                password: "no second factor here".to_owned(),
+                code: None,
+            },
+            MessageKind::UnattendedReject(UnattendedRejection::BadPassword),
+            MessageKind::UnattendedReject(UnattendedRejection::BadCode),
+            MessageKind::UnattendedReject(UnattendedRejection::LockedOut {
+                remaining_secs: UNATTENDED_LOCKOUT_DURATION_SECS,
+            }),
+            MessageKind::UnattendedReject(UnattendedRejection::Unavailable),
+        ];
+        for kind in cases {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    /// Credentials arrive from a peer that has not been admitted yet, so both
+    /// fields are bounded at the parse boundary rather than downstream (§9.1).
+    #[test]
+    fn oversized_credentials_are_malformed_not_a_big_allocation() {
+        let long_password = envelope(MessageKind::UnattendedAuth {
+            password: "p".repeat(UNATTENDED_PASSWORD_MAX_BYTES + 1),
+            code: None,
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&long_password.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let long_code = envelope(MessageKind::UnattendedAuth {
+            password: "fine".to_owned(),
+            code: Some("1".repeat(UNATTENDED_CODE_MAX_BYTES + 1)),
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&long_code.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        // Exactly at the limit is still a valid frame: the bound is inclusive.
+        let at_limit = envelope(MessageKind::UnattendedAuth {
+            password: "p".repeat(UNATTENDED_PASSWORD_MAX_BYTES),
+            code: Some("1".repeat(UNATTENDED_CODE_MAX_BYTES)),
+        });
+        assert_eq!(
+            MessageEnvelope::decode(&at_limit.encode().unwrap()).unwrap(),
+            at_limit
+        );
+    }
+
+    /// §9.2: the start message carries the offer back so the receiver can
+    /// check it, and both of the bounds it repeats are enforced on decode.
+    #[test]
+    fn a_transfer_start_roundtrips_and_is_bounded_like_the_offer_it_repeats() {
+        let original = envelope(MessageKind::FileTransferStart {
+            transfer_id: u64::MAX,
+            name: "report.pdf".to_owned(),
+            size: FILE_OFFER_MAX_BYTES,
+            hash: [9u8; 32],
+        });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        // A start claiming more than any offer could have carried is
+        // malformed, exactly as the offer itself would be.
+        let oversized = envelope(MessageKind::FileTransferStart {
+            transfer_id: 1,
+            name: "big".to_owned(),
+            size: FILE_OFFER_MAX_BYTES + 1,
+            hash: [0u8; 32],
+        })
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            MessageEnvelope::decode(&oversized),
+            Err(CoreError::Malformed)
+        ));
+
+        // A name no filesystem could write is refused before anyone tries.
+        let long_name = envelope(MessageKind::FileTransferStart {
+            transfer_id: 1,
+            name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+            size: 1,
+            hash: [0u8; 32],
+        })
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            MessageEnvelope::decode(&long_name),
+            Err(CoreError::Malformed)
+        ));
+        // Exactly at the bound still passes.
+        let at_bound = envelope(MessageKind::FileTransferStart {
+            transfer_id: 1,
+            name: "n".repeat(FILE_NAME_MAX_BYTES),
+            size: 1,
+            hash: [0u8; 32],
+        })
+        .encode()
+        .unwrap();
+        assert!(MessageEnvelope::decode(&at_bound).is_ok());
+    }
+
+    /// The same name bound now covers the offer, which had only ever been
+    /// bounded on its size.
+    #[test]
+    fn an_offer_with_an_unwritable_name_is_malformed() {
+        let bytes = envelope(MessageKind::FileOffer {
+            name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+            size: 1,
+            hash: [0u8; 32],
+        })
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            MessageEnvelope::decode(&bytes),
+            Err(CoreError::Malformed)
+        ));
     }
 
     #[test]

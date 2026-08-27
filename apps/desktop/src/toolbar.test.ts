@@ -6,8 +6,10 @@
 // without Tauri — the same shape `chat.test.ts` uses.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { t } from './i18n';
 import {
   RESOLUTION_CHOICES,
+  mountToolbar,
   renderToolbar,
   type MonitorDto,
   type ToolbarCommands,
@@ -34,13 +36,19 @@ const MONITORS: MonitorDto[] = [
 function fakeCommands(): ToolbarCommands & {
   micToggle: ReturnType<typeof vi.fn>;
   sasRequest: ReturnType<typeof vi.fn>;
+  recordRequest: ReturnType<typeof vi.fn>;
   sasAvailable: ReturnType<typeof vi.fn>;
   monitorsList: ReturnType<typeof vi.fn>;
   monitorSelect: ReturnType<typeof vi.fn>;
+  clipboardPush: ReturnType<typeof vi.fn>;
+  fileOffer: ReturnType<typeof vi.fn>;
 } {
   const commands = {
     micToggle: vi.fn().mockResolvedValue(undefined),
+    clipboardPush: vi.fn().mockResolvedValue(undefined),
+    fileOffer: vi.fn().mockResolvedValue(undefined),
     sasRequest: vi.fn().mockResolvedValue(undefined),
+    recordRequest: vi.fn().mockResolvedValue(undefined),
     sasAvailable: vi.fn().mockResolvedValue(true),
     monitorsList: vi.fn().mockResolvedValue(MONITORS),
     monitorSelect: vi.fn().mockResolvedValue(undefined),
@@ -75,6 +83,9 @@ function draw(
       },
       toggleMic: () => {},
       sendCad: () => {},
+      askToRecord: () => {},
+      sendClipboard: () => {},
+      sendFile: () => {},
       pickMonitor: () => {},
       beginDrag: () => {},
       nudge: () => {},
@@ -94,10 +105,62 @@ describe('the floating session toolbar', () => {
       'toolbar-monitors',
       'toolbar-chat',
       'toolbar-mic',
+      'toolbar-record',
       'toolbar-cad',
       'toolbar-collapse',
     ]) {
       expect(container.querySelector(`[data-testid="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it('offers a record request that asks the host and then stops asking again', async () => {
+    // §17: the guest may ask, and asking is all it can do. The button reports
+    // that the question went out — never that a recording started, which only
+    // the host's own indicator (the badge over the picture) can say.
+    const commands = fakeCommands();
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      { toggleChat: () => true, chatVisible: () => false },
+    );
+    try {
+      const button = container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]');
+      expect(button).not.toBeNull();
+      expect(button?.disabled).toBe(false);
+      button?.click();
+
+      await vi.waitFor(() => expect(commands.recordRequest).toHaveBeenCalledWith('host-ab12'));
+      const asked = container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]');
+      expect(asked?.disabled).toBe(true);
+      expect(asked?.getAttribute('aria-label')).toBe(t('en', 'toolbar.record.asked'));
+      // Nothing here claims a recording is running: that is the host's to say.
+      expect(container.querySelector('[data-testid="view-recording"]')).toBeNull();
+    } finally {
+      stop();
+    }
+  });
+
+  it('offers the button again when the request could not be sent', async () => {
+    const commands = fakeCommands();
+    commands.recordRequest.mockRejectedValueOnce(new Error('no view'));
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      { toggleChat: () => true, chatVisible: () => false },
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]')?.click();
+      await vi.waitFor(() =>
+        expect(
+          container.querySelector<HTMLButtonElement>('[data-testid="toolbar-record"]')?.disabled,
+        ).toBe(false),
+      );
+    } finally {
+      stop();
     }
   });
 
@@ -112,6 +175,7 @@ describe('the floating session toolbar', () => {
       'toolbar-monitors',
       'toolbar-chat',
       'toolbar-mic',
+      'toolbar-record',
       'toolbar-cad',
     ]) {
       expect(container.querySelector(`[data-testid="${id}"]`)).toBeNull();

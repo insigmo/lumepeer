@@ -11,6 +11,7 @@
     reason = "tauri command handlers take Window and State by value"
 )]
 
+use lumepeer_core::consent::IndependentGrant;
 use serde::{Deserialize, Serialize};
 use tauri::Window;
 
@@ -42,6 +43,18 @@ impl IpcError {
         }
     }
 
+    /// The far side runs a protocol minor without the message this needs.
+    ///
+    /// A distinct code rather than a refusal: nothing is denied and nothing
+    /// is broken — the other device is simply older, and the UI should say so
+    /// rather than implying the host said no (§9.1, §18).
+    fn unsupported() -> Self {
+        Self {
+            code: "PEER_TOO_OLD",
+            message: "the other device runs a version without this feature".to_owned(),
+        }
+    }
+
     fn poisoned() -> Self {
         Self {
             code: "STATE_POISONED",
@@ -53,6 +66,18 @@ impl IpcError {
         Self {
             code: "UNKNOWN_PEER",
             message: "no session matches that peer".to_owned(),
+        }
+    }
+
+    /// An unattended-access setting the host tried to make and could not.
+    ///
+    /// Detailed on purpose, unlike the wire rejection a *guest* gets: this is
+    /// the host's own settings screen being told why its own change was
+    /// refused, and nothing here describes a login attempt (§18; ADR 0033).
+    fn unattended(error: &lumepeer_core::unattended::UnattendedError) -> Self {
+        Self {
+            code: "UNATTENDED",
+            message: error.to_string(),
         }
     }
 
@@ -138,7 +163,9 @@ impl From<ActorError> for IpcError {
             ActorError::UnknownPeer => Self::unknown_peer(),
             ActorError::Core(e) => Self::core(&e),
             ActorError::Net(e) => Self::net(&e),
+            ActorError::Unattended(e) => Self::unattended(&e),
             ActorError::ChannelClosed => Self::poisoned(),
+            ActorError::Unsupported => Self::unsupported(),
         }
     }
 }
@@ -260,6 +287,10 @@ pub struct InviteConnectArgs {
 }
 
 /// Snapshot of one session for the status UI.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors `Grants`: §2.2 requires these permissions to stay               independent flags, and folding them here would hide that"
+)]
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatusDto {
     /// Pseudonymized peer label; never a raw `NodeId` (§15).
@@ -270,6 +301,23 @@ pub struct SessionStatusDto {
     pub role: RoleDto,
     /// Whether input injection is currently permitted.
     pub input: bool,
+    /// Whether the guest may read this host's clipboard (§8.2).
+    pub clipboard_read: bool,
+    /// Whether the guest may write this host's clipboard (§8.2).
+    pub clipboard_write: bool,
+    /// Whether the guest may exchange files over `rd/file/1` (§8.2).
+    pub file_transfer: bool,
+    /// Whether this session may be recorded (§8.2).
+    pub recording: bool,
+    /// Whether a recording of this session is being written right now (§17).
+    ///
+    /// Distinct from `recording` above, which is only permission: the
+    /// indicator both sides must show while capture is happening (§2.2) hangs
+    /// off this one.
+    pub recording_active: bool,
+    /// Whether this guest asked to be recorded and is still waiting for the
+    /// host user's answer (§17).
+    pub record_request: bool,
 }
 
 /// One remembered host this node has connected to (§21 punch-list item 5).
@@ -298,8 +346,8 @@ pub struct HistoryConnectArgs {
 /// punch-list item 6).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnectStatusDto {
-    /// One of `idle`, `dialing`, `awaiting_consent`, `connected`, `denied`,
-    /// `failed`.
+    /// One of `idle`, `dialing`, `awaiting_consent`, `awaiting_credentials`,
+    /// `connected`, `denied`, `failed`.
     pub phase: &'static str,
     /// Whether an attempt is still in flight — dialing, or waiting on the far
     /// side's decision — which is what keeps the Connect button disabled.
@@ -311,6 +359,125 @@ pub struct ConnectStatusDto {
     /// would reach the user as one undifferentiated "could not connect", which
     /// is the report ADR 0026 was written about (ADR 0027).
     pub code: Option<&'static str>,
+    /// Whether the host's credential challenge asked for a one-time code, so
+    /// the form knows whether to show the field (§8; ADR 0033).
+    ///
+    /// Only meaningful alongside `phase: "awaiting_credentials"`.
+    pub code_required: bool,
+    /// Seconds to wait before another attempt, after a lockout (§18).
+    ///
+    /// The host's own number, passed through unchanged: this side does not
+    /// count it down and must not pretend to know better than the host that
+    /// is enforcing it.
+    pub retry_secs: Option<u64>,
+}
+
+/// One saved device of the host's address book (§8; ADR 0034).
+#[derive(Debug, Clone, Serialize)]
+pub struct AddressBookEntryDto {
+    /// Pseudonymized peer label; never a raw `NodeId` (§15). Also the handle
+    /// every other address-book command names this device by.
+    pub peer_label: String,
+    /// Name the host user gave this device. Free text: rendered through
+    /// `lit-html`'s escaping, never assembled into HTML by hand.
+    pub name: String,
+    /// Grouping tags the host user typed.
+    pub tags: Vec<String>,
+    /// Free-text note.
+    pub notes: String,
+    /// Whether this device may attempt an unattended login (§8).
+    pub trusted: bool,
+    /// Whether it is connected right now.
+    pub connected: bool,
+}
+
+/// Argument of [`address_book_upsert`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddressBookUpsertArgs {
+    /// Pseudonymized label of the device, from `session_status` or
+    /// `address_book_list`.
+    pub peer: String,
+    /// Name to show it under.
+    pub name: String,
+    /// Grouping tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Free-text note.
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// Argument of [`address_book_remove`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddressBookRemoveArgs {
+    /// Pseudonymized label of the device to forget.
+    pub peer: String,
+}
+
+/// Argument of [`address_book_set_trusted`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddressBookSetTrustedArgs {
+    /// Pseudonymized label of the device.
+    pub peer: String,
+    /// Whether it may attempt an unattended login from now on.
+    pub trusted: bool,
+}
+
+/// What the host's settings screen may know about unattended access (§8).
+///
+/// There is no field here for the password, its hash or the TOTP secret, and
+/// that is the point: the webview cannot be handed what the type cannot carry
+/// (§2.3, §13; ADR 0033).
+#[derive(Debug, Clone, Serialize)]
+pub struct UnattendedStatusDto {
+    /// Whether a device password is set.
+    pub enabled: bool,
+    /// Whether a second factor is required as well.
+    pub totp_enabled: bool,
+    /// Role a successful unattended login is granted.
+    pub role: RoleDto,
+}
+
+/// Argument of [`unattended_set_password`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnattendedSetPasswordArgs {
+    /// The new device password, in the clear from the field the host typed it
+    /// into. It is hashed in `lumepeer-core` and never stored, logged or
+    /// returned in any form.
+    pub password: String,
+}
+
+/// Argument of [`unattended_set_totp`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnattendedSetTotpArgs {
+    /// Whether the second factor should be on.
+    pub enabled: bool,
+}
+
+/// Argument of [`unattended_set_role`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnattendedSetRoleArgs {
+    /// Role a successful unattended login should be granted.
+    pub role: RoleDto,
+}
+
+/// The one-time provisioning payload for an authenticator app (§8).
+#[derive(Debug, Clone, Serialize)]
+pub struct TotpProvisioningDto {
+    /// The shared secret in base32, for typing in by hand.
+    pub secret_base32: String,
+    /// The same secret as an `otpauth://` URI, for a QR code.
+    pub uri: String,
+}
+
+/// Argument of [`unattended_submit`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnattendedSubmitArgs {
+    /// The device password for the host being connected to.
+    pub password: String,
+    /// The one-time code, when the host asked for one.
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 /// Whether this host is ready to accept incoming connections.
@@ -401,8 +568,51 @@ pub async fn session_status(
             state: s.state.into(),
             role: s.role.into(),
             input: s.input,
+            clipboard_read: s.grants.clipboard_read,
+            clipboard_write: s.grants.clipboard_write,
+            file_transfer: s.grants.file_transfer,
+            recording: s.grants.recording,
+            recording_active: s.recording_active,
+            record_request: s.record_request,
         })
         .collect())
+}
+
+/// Argument of [`session_set_grant`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSetGrantArgs {
+    /// Pseudonymized label of the guest whose session is changing.
+    pub peer: String,
+    /// Which of the four independent grants moves (§8.2).
+    pub grant: IndependentGrant,
+    /// Its new state.
+    pub allowed: bool,
+}
+
+/// Host side: turns one independent grant of a running session on or off
+/// (§8.2; ADR 0029).
+///
+/// Main window only, and deliberately not in `capabilities/view.json`: a view
+/// window belongs to a guest's side of a session, and a guest granting itself
+/// the clipboard would be the whole authorization model inverted (§2.3). The
+/// core refuses anything but an active session and cannot reach `view` or
+/// `input` through this path at all.
+///
+/// # Errors
+/// Rejects calls from any other window; propagates [`ActorError`] as an
+/// [`IpcError`].
+#[tauri::command]
+pub async fn session_set_grant(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: SessionSetGrantArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .network
+        .set_grant(args.peer, args.grant, args.allowed)
+        .await?;
+    Ok(())
 }
 
 /// Lists hosts this node has connected to before, most recent first (§21
@@ -459,11 +669,13 @@ pub async fn connect_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<ConnectStatusDto, IpcError> {
     check_window(&window)?;
-    let (phase, code) = state.network.connect_state().await?;
+    let snapshot = state.network.connect_state().await?;
     Ok(ConnectStatusDto {
-        phase: phase.as_str(),
-        pending: phase.is_pending(),
-        code,
+        phase: snapshot.phase.as_str(),
+        pending: snapshot.phase.is_pending(),
+        code: snapshot.code,
+        code_required: snapshot.code_required,
+        retry_secs: snapshot.retry_secs,
     })
 }
 
@@ -529,6 +741,209 @@ pub fn network_status(
         can_capture: health.can_capture(),
         can_encode: health.can_encode(),
     })
+}
+
+/// Lists the host's saved devices (§8; ADR 0034).
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] if the actor
+/// is gone.
+#[tauri::command]
+pub async fn address_book_list(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<AddressBookEntryDto>, IpcError> {
+    check_window(&window)?;
+    let rows = state.network.address_book_list().await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AddressBookEntryDto {
+            peer_label: row.peer_label,
+            name: row.name,
+            tags: row.tags,
+            notes: row.notes,
+            trusted: row.trusted,
+            connected: row.connected,
+        })
+        .collect())
+}
+
+/// Saves or updates one saved device (§8; ADR 0034).
+///
+/// Never changes the trust flag — that is [`address_book_set_trusted`]'s job
+/// alone, so editing a name can never widen what a device may do.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; `UNKNOWN_PEER` if the label
+/// names nothing this run knows about.
+#[tauri::command]
+pub async fn address_book_upsert(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AddressBookUpsertArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .network
+        .address_book_upsert(args.peer, args.name, args.tags, args.notes)
+        .await?;
+    Ok(())
+}
+
+/// Forgets one saved device, and any trust it held (§8; ADR 0034).
+///
+/// # Errors
+/// As [`address_book_upsert`].
+#[tauri::command]
+pub async fn address_book_remove(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AddressBookRemoveArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.address_book_remove(args.peer).await?;
+    Ok(())
+}
+
+/// Marks a device trusted, or withdraws that (§8; ADR 0034).
+///
+/// Trusting a device is what lets it try the unattended device password at
+/// all, so this is a widening of the host's own exposure: it is reachable only
+/// from the main window, it is never called automatically by a successful
+/// connection, and the core logs it as an audit event.
+///
+/// # Errors
+/// As [`address_book_upsert`].
+#[tauri::command]
+pub async fn address_book_set_trusted(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AddressBookSetTrustedArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .network
+        .address_book_set_trusted(args.peer, args.trusted)
+        .await?;
+    Ok(())
+}
+
+/// Reports whether unattended access is on, and how (§8; ADR 0033).
+///
+/// # Errors
+/// Rejects calls from any window but the main one.
+#[tauri::command]
+pub async fn unattended_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<UnattendedStatusDto, IpcError> {
+    check_window(&window)?;
+    let settings = state.network.unattended_status().await?;
+    Ok(UnattendedStatusDto {
+        enabled: settings.enabled,
+        totp_enabled: settings.totp_enabled,
+        role: settings.role.into(),
+    })
+}
+
+/// Sets or replaces the device password, turning unattended access on (§8).
+///
+/// The password travels one way only. It is hashed with Argon2id inside
+/// `lumepeer-core`, the hash goes to the OS keystore, and no command hands
+/// either back — `unattended_status` has no field that could carry them.
+///
+/// # Errors
+/// `UNATTENDED` if the password fails the policy of §8; `WINDOW_NOT_ALLOWED`
+/// from any window but the main one.
+#[tauri::command]
+pub async fn unattended_set_password(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: UnattendedSetPasswordArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.unattended_set_password(args.password).await?;
+    Ok(())
+}
+
+/// Turns unattended access off and forgets both factors (§8).
+///
+/// # Errors
+/// Rejects calls from any window but the main one; propagates a keystore
+/// failure rather than reporting a success that did not persist.
+#[tauri::command]
+pub async fn unattended_disable(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.unattended_disable().await?;
+    Ok(())
+}
+
+/// Turns the second factor on or off (§8).
+///
+/// Turning it on returns the provisioning payload **once**: an authenticator
+/// app cannot be set up without seeing the secret, and nothing keeps a copy
+/// for a second look. Turning it off returns `null`.
+///
+/// # Errors
+/// `UNATTENDED` if no device password is set — a second factor without a
+/// first is not a gate; `WINDOW_NOT_ALLOWED` from any other window.
+#[tauri::command]
+pub async fn unattended_set_totp(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: UnattendedSetTotpArgs,
+) -> Result<Option<TotpProvisioningDto>, IpcError> {
+    check_window(&window)?;
+    let provisioning = state.network.unattended_set_totp(args.enabled).await?;
+    Ok(provisioning.map(|p| TotpProvisioningDto {
+        secret_base32: p.secret_base32,
+        uri: p.uri,
+    }))
+}
+
+/// Chooses the role a successful unattended login is granted (§8.2).
+///
+/// Applies to the next admission; a session already running keeps the grants
+/// it was given.
+///
+/// # Errors
+/// Rejects calls from any window but the main one.
+#[tauri::command]
+pub async fn unattended_set_role(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: UnattendedSetRoleArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.unattended_set_role(args.role.into()).await?;
+    Ok(())
+}
+
+/// Guest side: answers a host's credential challenge (§8; ADR 0033).
+///
+/// `Ok(())` means the answer was sent, not that it was accepted. The verdict
+/// arrives on the wire and shows up in the next `connect_status` poll, which
+/// is also where a refusal's §18 code appears.
+///
+/// # Errors
+/// `CORE` if nothing is waiting on a challenge; `WINDOW_NOT_ALLOWED` from any
+/// window but the main one — a remote-view window has no business collecting
+/// this user's password.
+#[tauri::command]
+pub async fn unattended_submit(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: UnattendedSubmitArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .network
+        .unattended_submit(args.password, args.code)
+        .await?;
+    Ok(())
 }
 
 /// Reports the license state.
@@ -821,6 +1236,159 @@ pub async fn clipboard_pull(
     Ok(state.network.clipboard_pull(peer).await?)
 }
 
+/// Opens the OS file picker and offers whatever the user chose to `peer`
+/// (§9.2; ADR 0032).
+///
+/// The picker runs **here**, in Rust. The webview is never given the `dialog`
+/// or `fs` permissions: `capabilities/view.json` states that a view window
+/// has no filesystem rights, and a picker invoked from the webview would be
+/// that right wearing a different name (§2.3). What crosses the IPC boundary
+/// in the other direction is a peer label and, later, a basename and a byte
+/// count — never a path on this machine (§15).
+///
+/// Cancelling the picker is a success that offered nothing, not an error.
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed, the session holds no
+/// `file_transfer` grant, the peer is too old to name a transfer, or too many
+/// offers are already outstanding.
+#[tauri::command]
+pub async fn file_offer(
+    app: tauri::AppHandle,
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
+    let Some(path) = pick_file(&app).await else {
+        return Ok(());
+    };
+    state.network.file_offer(peer, path).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileAcceptArgs {
+    /// Pseudonymized label of the session partner.
+    pub peer: String,
+    /// Whether to take the file.
+    pub accept: bool,
+}
+
+/// Answers the oldest offer `peer` made (§9.2).
+///
+/// On an acceptance the OS directory picker runs here, for the same reason
+/// the file picker does. The *receiving* user chooses where the file lands;
+/// the sender only ever chose a name, and that name is normalized to a
+/// basename before it is ever joined to the chosen directory.
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed, there is no offer to answer,
+/// or the grant is gone.
+#[tauri::command]
+pub async fn file_accept(
+    app: tauri::AppHandle,
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: FileAcceptArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    let directory = if args.accept {
+        let Some(directory) = pick_directory(&app).await else {
+            // The picker was dismissed: nothing has been answered yet, so the
+            // offer is still there to accept or decline. Saying "declined"
+            // here would answer for the user.
+            return Ok(());
+        };
+        Some(directory)
+    } else {
+        None
+    };
+    state
+        .network
+        .file_accept(args.peer, args.accept, directory)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileAbortArgs {
+    /// Pseudonymized label of the session partner.
+    pub peer: String,
+    /// Transfer to stop, as `file_transfers` reported it.
+    pub transfer_id: u64,
+}
+
+/// Stops one running transfer (§9.2).
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed or no such transfer exists.
+#[tauri::command]
+pub async fn file_abort(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: FileAbortArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    state
+        .network
+        .file_abort(args.peer, args.transfer_id)
+        .await?;
+    Ok(())
+}
+
+/// Every offer waiting for an answer and every transfer in flight.
+///
+/// # Errors
+/// [`IpcError`] when the actor is gone.
+#[tauri::command]
+pub async fn file_transfers(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::network::FileTransfersDto, IpcError> {
+    // Readable from either window: a guest watching its own transfer list is
+    // reading its own side of the session, and every row it can see is one it
+    // is already a party to.
+    if check_window(&window).is_err() && !window.label().starts_with(VIEW_WINDOW_PREFIX) {
+        return Err(IpcError::denied());
+    }
+    Ok(state.network.file_transfers().await?)
+}
+
+/// Runs the OS file picker on a blocking-safe path.
+///
+/// `blocking_pick_file` must not be called from the async runtime's own
+/// threads, so the dialog is driven through its callback and awaited on a
+/// oneshot instead.
+async fn pick_file(app: &tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_file(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    rx.await.ok().flatten().and_then(path_string)
+}
+
+/// Runs the OS directory picker, for where a received file should land.
+async fn pick_directory(app: &tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    rx.await.ok().flatten().and_then(path_string)
+}
+
+/// A picked path as a plain string, or `None` when it is not a local path.
+///
+/// The picker can hand back a content URI on mobile; this build is desktop
+/// only, and a URI is not something the transfer engine can open.
+fn path_string(path: tauri_plugin_dialog::FilePath) -> Option<String> {
+    path.into_path()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AudioToggleArgs {
     /// Pseudonymized label of the guest session to stream audio to.
@@ -852,15 +1420,18 @@ pub async fn audio_toggle(
 pub struct RecordToggleArgs {
     /// Pseudonymized label of the session to record.
     pub peer: String,
-    /// Destination `.lmrc` path chosen by the host user; `None` stops.
-    #[serde(default)]
-    pub path: Option<String>,
+    /// `true` starts the recording, `false` stops it — and, when the guest
+    /// had asked, `false` is also how the host declines.
+    pub on: bool,
 }
 
 /// Host side: starts or stops the session recording of `peer` (§17).
 ///
 /// The `recording` grant is checked inside the actor (§8.2); this command
-/// only carries the host user's choice and the destination path.
+/// carries the host user's choice and nothing else. Where the file lands is
+/// decided in Rust and only reported back: an untrusted view layer does not
+/// pick what path this process writes to (§2.3). Main-window only — the host
+/// records, so a guest's view window has nothing to start.
 ///
 /// # Errors
 /// [`IpcError`] when unallowed or refused for lack of the grant.
@@ -869,9 +1440,35 @@ pub async fn recording_toggle(
     window: Window,
     state: tauri::State<'_, AppState>,
     args: RecordToggleArgs,
-) -> Result<(), IpcError> {
+) -> Result<Option<String>, IpcError> {
     check_window(&window)?;
-    state.network.record_toggle(args.peer, args.path).await?;
+    Ok(state.network.record_toggle(args.peer, args.on).await?)
+}
+
+/// Argument of [`record_request`].
+#[derive(Debug, Deserialize)]
+pub struct RecordRequestArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+}
+
+/// Guest side: asks the host to record the session (§17).
+///
+/// View-window-only by construction — the toolbar lives there. `Ok` means the
+/// request left this node, nothing more: the host user decides, the answer
+/// arrives as `RecordAck`, and a refusal is an ordinary answer rather than an
+/// error. Nothing on this side can start a recording on the host.
+///
+/// # Errors
+/// [`IpcError`] when called from another window, or without a live view.
+#[tauri::command]
+pub async fn record_request(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RecordRequestArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state.network.record_request(args.peer).await?;
     Ok(())
 }
 

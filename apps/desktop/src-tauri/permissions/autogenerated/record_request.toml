@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-record-request"
+description = "Enables the record_request command without any pre-configured scope."
+commands.allow = ["record_request"]
+
+[[permission]]
+identifier = "deny-record-request"
+description = "Denies the record_request command without any pre-configured scope."
+commands.deny = ["record_request"]

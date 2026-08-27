@@ -10,7 +10,9 @@
 //! — frames are dropped from the recording with a counter when the queue is
 //! full (§24.5: degrade towards safety and say so).
 
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
@@ -45,6 +47,12 @@ pub struct SessionRecorder {
     tx: std::sync::Mutex<Option<SyncSender<Record>>>,
     path: PathBuf,
     join: std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), RecordingError>>>>,
+    /// Records the writer never saw because the queue was full.
+    ///
+    /// Counted rather than logged-and-forgotten: a recording with holes in it
+    /// has to be able to say so (§24.5), and the count is what the stop path
+    /// reports to the operator.
+    dropped: AtomicU64,
 }
 
 impl std::fmt::Debug for SessionRecorder {
@@ -67,26 +75,45 @@ impl SessionRecorder {
     /// cannot be created — reported to the caller before any media flows.
     pub fn start(path: PathBuf) -> Result<Self, RecordingError> {
         let file = std::fs::File::create(&path).map_err(|e| RecordingError::Io(e.to_string()))?;
+        Self::start_into(path, file)
+    }
+
+    /// [`Self::start`] against an already-open sink.
+    ///
+    /// The only reason this is split out is the drop policy above: a test has
+    /// to be able to make the writer stall on purpose, and a real disk cannot
+    /// be told to.
+    fn start_into<W: Write + Send + 'static>(
+        path: PathBuf,
+        sink: W,
+    ) -> Result<Self, RecordingError> {
         let (tx, rx) = mpsc::sync_channel::<Record>(QUEUE_CAPACITY);
         let join = std::thread::Builder::new()
             .name("lmrc-writer".to_owned())
-            .spawn(move || run_writer(rx, file))
+            .spawn(move || run_writer(rx, sink))
             .map_err(|_| RecordingError::Io("cannot spawn the writer thread".to_owned()))?;
         Ok(Self {
             tx: std::sync::Mutex::new(Some(tx)),
             path,
             join: std::sync::Mutex::new(Some(join)),
+            dropped: AtomicU64::new(0),
         })
     }
 
     /// Where this recording is being written.
     ///
-    /// Test-only for now: the actor never needs the path after `start`, and
-    /// the round-trip test asserts against it.
-    #[cfg(test)]
+    /// The actor hands this back to the UI so the operator can find the file:
+    /// the path is *chosen* in Rust (§2.3) and only *reported* outwards, never
+    /// accepted from the webview.
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// How many records the queue dropped because the writer fell behind.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Appends one video frame; drops it silently when the writer cannot keep
@@ -123,7 +150,8 @@ impl SessionRecorder {
         if tx.try_send(record).is_err() {
             // Queue full or writer gone: drop rather than block the media
             // loops. The recording loses a frame; the session does not.
-            tracing::debug!("recording queue full; dropping a record");
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::debug!(total, "recording queue full; dropping a record");
         }
     }
 
@@ -134,6 +162,10 @@ impl SessionRecorder {
     /// loop, the audio loop and the actor, and any of them — usually the
     /// actor's teardown — may be the one that ends the recording.
     pub fn stop(&self) -> bool {
+        let dropped = self.dropped();
+        if dropped > 0 {
+            tracing::warn!(dropped, "the recording lost records to a slow disk");
+        }
         self.tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -163,8 +195,8 @@ impl Drop for SessionRecorder {
     clippy::needless_pass_by_value,
     reason = "rx must be owned to end the loop on sender drop"
 )]
-fn run_writer(rx: mpsc::Receiver<Record>, file: std::fs::File) -> Result<(), RecordingError> {
-    let mut writer = RecordingWriter::new(file)?;
+fn run_writer<W: Write>(rx: mpsc::Receiver<Record>, sink: W) -> Result<(), RecordingError> {
+    let mut writer = RecordingWriter::new(sink)?;
     loop {
         match rx.recv_timeout(IDLE_POLL) {
             Ok(record) => write_one(&mut writer, record),
@@ -176,7 +208,7 @@ fn run_writer(rx: mpsc::Receiver<Record>, file: std::fs::File) -> Result<(), Rec
     writer.finish()
 }
 
-fn write_one(writer: &mut RecordingWriter<std::fs::File>, record: Record) {
+fn write_one<W: Write>(writer: &mut RecordingWriter<W>, record: Record) {
     let result = match record {
         Record::Video { timestamp_us, data } => writer.write_video(timestamp_us, &data),
         Record::Audio { timestamp_us, data } => writer.write_audio(timestamp_us, &data),
@@ -242,6 +274,66 @@ mod tests {
         recorder.write_video(20, b"dropped-after-stop");
         assert!(recorder.stop());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// A sink that cannot be written to until the test says so, standing in
+    /// for a disk too slow to keep up with the encode loop.
+    struct StalledSink {
+        gate: std::sync::Arc<std::sync::Mutex<()>>,
+    }
+
+    impl std::io::Write for StalledSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _open = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_full_queue_drops_records_and_counts_them_instead_of_blocking() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let recorder = SessionRecorder::start_into(
+            PathBuf::from("stalled"),
+            StalledSink {
+                gate: std::sync::Arc::clone(&gate),
+            },
+        )
+        .unwrap();
+
+        // The writer thread is stuck on the container header, so nothing is
+        // ever drained: everything past the queue's depth has to be dropped.
+        let sent = QUEUE_CAPACITY + 64;
+        let started = std::time::Instant::now();
+        for i in 0..sent {
+            recorder.write_video(i as u64, b"frame");
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            recorder.dropped() > 0,
+            "a full queue must drop records, not swallow them silently"
+        );
+        assert!(
+            recorder.dropped() >= (sent - QUEUE_CAPACITY - 1) as u64,
+            "every record past the queue depth is dropped: {} of {sent}",
+            recorder.dropped()
+        );
+        // The encode loop must not have been made to wait on the disk.
+        assert!(
+            elapsed < IDLE_POLL,
+            "sending took {elapsed:?}; the media loop was blocked"
+        );
+
+        drop(held);
+        recorder.stop();
     }
 
     #[test]

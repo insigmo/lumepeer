@@ -12,39 +12,57 @@
 //! and it keeps a partially read frame from ever being cancelled by an
 //! outbound write.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ed25519_dalek::SigningKey;
+use lumepeer_core::address_book::AddressEntry;
+use lumepeer_core::audit::AuditEvent;
 use lumepeer_core::chat::{ChatEntry, ChatLog};
-use lumepeer_core::clipboard::ClipboardSync;
-use lumepeer_core::consent::{Grants, Role};
+use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
+use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
     CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
-    DIAL_RETRY_BACKOFF_MS, INCOMING_ACCEPT_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES,
+    DIAL_RETRY_BACKOFF_MS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
+    INCOMING_ACCEPT_TIMEOUT_SECS, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS,
 };
 use lumepeer_core::protocol::{
-    FEATURE_MEDIA_UNAVAILABLE, InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo,
+    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_UNATTENDED, InputEventPayload,
+    MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
+use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_media::capture::{
     CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
-use lumepeer_net::keystore::load_or_create;
+use lumepeer_net::file_transfer::{
+    ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
+};
+use lumepeer_net::keystore::{Keystore, load_or_create};
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use rand::Rng as _;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
+use crate::address_book_store::AddressBookStore;
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
+use crate::unattended_store::UnattendedStore;
 use crate::view::{
     HostMedia, MediaFault, MediaHealth, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
     ViewWindows, encode_view_response, lock_capture, slot_for_poll, spawn_encode_loop,
     spawn_media_receiver, window_label,
 };
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::FileTransferStart`, and
+/// therefore the floor for offering a file to a host (§9.1; ADR 0032).
+///
+/// Guest side only. A host reads the guest's `FEATURE_FILE_TRANSFER` string
+/// instead, which is the more precise signal; the guest has no feature list
+/// to read, because `HelloAck` does not carry one.
+const FILE_TRANSFER_MINOR: u16 = 5;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -67,6 +85,12 @@ const NOTIFY_CAPACITY: usize = 32;
 struct ViewFeed {
     slot: watch::Receiver<ViewSlot>,
     input: Arc<AtomicBool>,
+    /// Whether the host says it is recording this session right now (§17).
+    ///
+    /// Announced by the host as `RecordAck`, never inferred here: the guest
+    /// cannot know what the far side writes to disk, so the indicator it shows
+    /// is the host's own statement and nothing else.
+    recording: Arc<AtomicBool>,
 }
 
 /// Live view feeds by window label, shared between the actor and the IPC layer.
@@ -95,6 +119,22 @@ pub struct SessionSnapshot {
     /// Whether input injection is currently permitted (always `false` for
     /// a pending entry).
     pub input: bool,
+    /// The four independent grants of §8.2, all `false` for a pending entry.
+    ///
+    /// Carried as the whole [`Grants`] value the core holds rather than four
+    /// booleans copied out here: this row shows what the core decided, and a
+    /// second place that assembles the same set is a second place to get it
+    /// wrong.
+    pub grants: Grants,
+    /// Whether a recording of this session is being written right now (§17).
+    ///
+    /// Separate from `grants.recording`: the grant says the host *may* record,
+    /// this says it *is*. The indicator both sides must show hangs off this
+    /// one, so it is read from the live recorder rather than from the grant.
+    pub recording_active: bool,
+    /// Whether this guest has asked to be recorded and is still waiting for an
+    /// answer (§17). Never auto-answered: a person at the host decides.
+    pub record_request: bool,
 }
 
 /// What `invite_create` hands back to the UI.
@@ -104,6 +144,77 @@ pub struct InviteDto {
     pub code: String,
     /// Unix seconds after which the invite is dead.
     pub expires_at: u64,
+}
+
+/// Everything the connect form needs to know about this node's own outgoing
+/// attempt, in one reply.
+///
+/// A struct rather than a tuple because the credential path of §8 added two
+/// fields that only make sense together with the phase, and a four-tuple at
+/// six call sites is how the wrong element gets read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectSnapshot {
+    /// How far the attempt has got.
+    pub phase: ConnectPhase,
+    /// §18 code of the last failure, or of a refused credential.
+    pub code: Option<&'static str>,
+    /// Whether the host's credential challenge asked for a one-time code.
+    pub code_required: bool,
+    /// Seconds the host said to wait before trying again, after a lockout.
+    pub retry_secs: Option<u64>,
+}
+
+/// One address-book device as the UI sees it (§8; ADR 0034).
+///
+/// `peer_label` is the pseudonymized per-run tag `label_of` hands out, the
+/// same one every other panel names a peer by; the raw `NodeId` the book is
+/// keyed on never crosses into the webview (§15). `name`, `tags` and `notes`
+/// are what the host user typed.
+#[derive(Debug, Clone)]
+pub struct AddressBookRow {
+    /// Pseudonymized peer label, never a raw `NodeId`.
+    pub peer_label: String,
+    /// Human name the host gave this device.
+    pub name: String,
+    /// Free-form grouping tags.
+    pub tags: Vec<String>,
+    /// Free-text note.
+    pub notes: String,
+    /// Whether this device may attempt an unattended login at all.
+    pub trusted: bool,
+    /// Whether this device is connected right now, so the UI can say so
+    /// without a second lookup.
+    pub connected: bool,
+}
+
+/// What the host's own settings screen may know about unattended access
+/// (§8; ADR 0033).
+///
+/// Three booleans and a role. The password, its hash and the TOTP secret are
+/// absent by construction: there is no field here that could carry them, which
+/// is a stronger guarantee than remembering not to fill one in (§2.3, §13).
+#[derive(Debug, Clone, Copy)]
+pub struct UnattendedSettings {
+    /// Whether a device password is set and unattended logins may be offered.
+    pub enabled: bool,
+    /// Whether a second factor is part of the gate.
+    pub totp_enabled: bool,
+    /// Role a successful admission is granted.
+    pub role: Role,
+}
+
+/// The one-time provisioning payload for an authenticator app (§8).
+///
+/// Handed to the UI exactly once, at the moment the second factor is turned
+/// on: an app cannot be provisioned without seeing the secret. It is never
+/// re-readable afterwards — `unattended_status` has no field for it — so a
+/// host that loses the app turns the factor off and on again.
+#[derive(Debug, Clone)]
+pub struct TotpProvisioning {
+    /// The shared secret in RFC 4648 base32, for typing in by hand.
+    pub secret_base32: String,
+    /// The same secret as an `otpauth://` URI, for a QR code.
+    pub uri: String,
 }
 
 /// Guest side: how far this node's own outgoing connect attempt has got (§21
@@ -128,6 +239,14 @@ pub enum ConnectPhase {
     Dialing,
     /// Connected to the host; its user has not decided yet.
     AwaitingConsent,
+    /// The host is configured for unattended access and asked for device
+    /// credentials instead of waking a human (§8; ADR 0033).
+    ///
+    /// A phase rather than a flag on `AwaitingConsent`, because the two wait
+    /// on opposite things: `AwaitingConsent` waits on the far side, this one
+    /// waits on *this* user to type a password, and the connect form has to
+    /// show a field rather than a spinner.
+    AwaitingCredentials,
     /// The host granted and the view window is open.
     Connected,
     /// The host refused, or ended the request without granting.
@@ -141,7 +260,10 @@ impl ConnectPhase {
     /// and a second attempt would only race it.
     #[must_use]
     pub const fn is_pending(self) -> bool {
-        matches!(self, Self::Dialing | Self::AwaitingConsent)
+        matches!(
+            self,
+            Self::Dialing | Self::AwaitingConsent | Self::AwaitingCredentials
+        )
     }
 
     /// Stable wire string for the webview.
@@ -151,6 +273,7 @@ impl ConnectPhase {
             Self::Idle => "idle",
             Self::Dialing => "dialing",
             Self::AwaitingConsent => "awaiting_consent",
+            Self::AwaitingCredentials => "awaiting_credentials",
             Self::Connected => "connected",
             Self::Denied => "denied",
             Self::Failed => "failed",
@@ -185,6 +308,14 @@ pub enum ActorNotification {
     /// is delivered through `clipboard_inbound`, never on the notification
     /// bus (§15: notifications are broadcast to every listener).
     ClipboardFromPeer,
+    /// Something about this node's file transfers moved: an offer arrived, one
+    /// was answered, a transfer progressed or ended.
+    ///
+    /// Carries nothing, for the same reason [`Self::ClipboardFromPeer`] does.
+    /// A file name is not as sensitive as a clipboard, but it is still §15
+    /// material and this bus reaches every listener; the UI polls
+    /// `file_transfers` for the detail.
+    FileTransferChanged,
 }
 
 /// Failure returned by an actor call.
@@ -198,8 +329,23 @@ pub enum ActorError {
     Core(CoreError),
     /// A network operation failed.
     Net(NetError),
+    /// An unattended-access operation was refused (§8; ADR 0033).
+    ///
+    /// Only ever produced for the *host's own* settings screen — setting a
+    /// password that fails the policy, for instance. A guest's refused login
+    /// never travels this way: it goes back on the wire as the deliberately
+    /// coarse `MessageKind::UnattendedReject`.
+    Unattended(UnattendedError),
     /// The actor task is gone; the caller's channel op failed.
     ChannelClosed,
+    /// The peer speaks a protocol minor that does not have this message.
+    ///
+    /// Not a refusal and not a fault: §9.1 makes optional messages the
+    /// sender's responsibility to withhold, so the honest answer to "offer
+    /// this file" towards a peer that could not decode `FileTransferStart` is
+    /// that this session cannot do it — never a transfer that starts and then
+    /// cannot be acked, aborted or resumed.
+    Unsupported,
 }
 
 /// One request the actor understands.
@@ -220,7 +366,7 @@ enum ActorCommand {
     /// Guest side: how this node's own outgoing connect attempt is going, and
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
-        reply: oneshot::Sender<(ConnectPhase, Option<&'static str>)>,
+        reply: oneshot::Sender<ConnectSnapshot>,
     },
     Grant {
         label: String,
@@ -263,6 +409,31 @@ enum ActorCommand {
         text: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Either side: offer one local file to the peer (§9.2).
+    FileOffer {
+        label: String,
+        path: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: answer the oldest offer this peer made. `directory` is
+    /// where the receiving user chose to put it, and is ignored on a refusal.
+    FileAccept {
+        label: String,
+        accept: bool,
+        directory: Option<String>,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: stop one transfer that is already running (§9.2).
+    FileAbort {
+        label: String,
+        transfer_id: u64,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: every offer and transfer this node knows about, for the
+    /// UI to draw.
+    FileTransfers {
+        reply: oneshot::Sender<FileTransfersDto>,
+    },
     /// Either side: fetch the newest inbound clipboard payload, if any.
     ClipboardPull {
         label: String,
@@ -279,15 +450,19 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Host side: start recording the session with `label` into `path`
-    /// (§9.2, §17). Requires the independent `recording` grant (§8.2).
-    RecordOn {
+    /// Host side: start or stop recording the session with `label` (§9.2,
+    /// §17). Requires the independent `recording` grant (§8.2).
+    ///
+    /// Starting answers with the path the actor chose; the webview never
+    /// supplies one (§2.3).
+    RecordToggle {
         label: String,
-        path: String,
-        reply: oneshot::Sender<Result<(), ActorError>>,
+        on: bool,
+        reply: oneshot::Sender<Result<Option<String>, ActorError>>,
     },
-    /// Host side: stop the recording and flush it to disk.
-    RecordOff {
+    /// Guest side: ask the host to record the session (§17). The host user
+    /// answers; the guest learns the answer as `RecordAck`.
+    RecordRequest {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
@@ -319,6 +494,75 @@ enum ActorCommand {
     MonitorsList {
         label: String,
         reply: oneshot::Sender<Result<Vec<MonitorInfo>, ActorError>>,
+    },
+    /// Host side: turn one independent grant of `label`'s session on or off
+    /// (§8.2; ADR 0029). Only the host's own main window reaches this.
+    SetGrant {
+        label: String,
+        grant: IndependentGrant,
+        allowed: bool,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: every saved device (§8; ADR 0034).
+    AddressBookList {
+        reply: oneshot::Sender<Vec<AddressBookRow>>,
+    },
+    /// Host side: save or update one device. The peer is named by a label
+    /// that already resolves — a connected session or an existing entry — so
+    /// no `NodeId` ever has to come back from the webview (§13).
+    AddressBookUpsert {
+        label: String,
+        name: String,
+        tags: Vec<String>,
+        notes: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: forget one device.
+    AddressBookRemove {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: mark a device trusted, or withdraw that (§8; ADR 0034).
+    /// Never called by anything but the host's own main window, and never
+    /// automatically.
+    AddressBookSetTrusted {
+        label: String,
+        trusted: bool,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: what the settings screen may know about unattended access.
+    UnattendedStatus {
+        reply: oneshot::Sender<UnattendedSettings>,
+    },
+    /// Host side: set or replace the device password (§8; ADR 0033).
+    UnattendedSetPassword {
+        password: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: turn unattended access off and forget the credentials.
+    UnattendedDisable {
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: turn the second factor on (returning the one-time
+    /// provisioning payload) or off (returning `None`).
+    UnattendedSetTotp {
+        enabled: bool,
+        reply: oneshot::Sender<Result<Option<TotpProvisioning>, ActorError>>,
+    },
+    /// Host side: choose the role a successful admission is granted (§8.2).
+    UnattendedSetRole {
+        role: Role,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: answer the host's `UnattendedChallenge` (§8; ADR 0033).
+    ///
+    /// The password crosses this boundary once, from the field the user typed
+    /// it into to the wire, and is not stored on the way: no field of the
+    /// actor holds it, and the reply says only that it was sent.
+    UnattendedSubmit {
+        password: String,
+        code: Option<String>,
+        reply: oneshot::Sender<Result<(), ActorError>>,
     },
 }
 
@@ -410,7 +654,7 @@ impl ActorHandle {
     ///
     /// # Errors
     /// [`ActorError::ChannelClosed`] if the actor task is gone.
-    pub async fn connect_state(&self) -> Result<(ConnectPhase, Option<&'static str>), ActorError> {
+    pub async fn connect_state(&self) -> Result<ConnectSnapshot, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ConnectState { reply })
@@ -502,6 +746,7 @@ impl ActorHandle {
         Ok(encode_view_response(
             &response,
             feed.input.load(Ordering::Relaxed),
+            feed.recording.load(Ordering::Relaxed),
         ))
     }
 
@@ -557,6 +802,80 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Offers `path` to `label` (§9.2).
+    ///
+    /// Returns as soon as the offer is queued: the file is hashed off the
+    /// actor loop, and a 500 MiB file would otherwise stall everything else
+    /// the actor does (ADR 0027).
+    ///
+    /// # Errors
+    /// [`ActorError::Core`] as `NotPermitted` without the `file_transfer`
+    /// grant, [`ActorError::Unsupported`] towards a peer too old to name a
+    /// transfer, [`ActorError::Net`] as `TooManyTransfers` past
+    /// `MAX_PENDING_FILE_OFFERS`.
+    pub async fn file_offer(&self, label: String, path: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::FileOffer { label, path, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Answers the oldest offer `label` made.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] for an unknown label or with no offer
+    /// outstanding; [`ActorError::Core`] as `NotPermitted` without the grant.
+    pub async fn file_accept(
+        &self,
+        label: String,
+        accept: bool,
+        directory: Option<String>,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::FileAccept {
+                label,
+                accept,
+                directory,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Stops one running transfer with `label`.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] for an unknown label or transfer.
+    pub async fn file_abort(&self, label: String, transfer_id: u64) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::FileAbort {
+                label,
+                transfer_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Every pending offer and running transfer, for the UI to draw.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn file_transfers(&self) -> Result<FileTransfersDto, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::FileTransfers { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     /// Takes the newest inbound clipboard payload from `label`, if any.
     /// Pull semantics keep payloads off the broadcast bus (§15).
     ///
@@ -596,21 +915,41 @@ impl ActorHandle {
     /// Host side: starts or stops the session recording of `label` (§17).
     /// Gated on the independent `recording` grant inside the actor (§8.2).
     ///
+    /// Answers with the file the actor chose when a recording started, so the
+    /// UI can tell the operator where it landed. The destination is decided in
+    /// Rust and only reported outwards: an untrusted view layer does not pick
+    /// where this machine writes files (§2.3).
+    ///
     /// # Errors
-    /// [`ActorError::Core::NotPermitted`] without the recording grant;
-    /// [`ActorError::Net`] when the file cannot be created;
+    /// [`ActorError::Core`] with [`CoreError::NotPermitted`] without the
+    /// recording grant; [`ActorError::Net`] when the file cannot be created;
     /// [`ActorError::ChannelClosed`] if the actor task is gone.
     pub async fn record_toggle(
         &self,
         label: String,
-        path: Option<String>,
-    ) -> Result<(), ActorError> {
+        on: bool,
+    ) -> Result<Option<String>, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(match path {
-                Some(path) => ActorCommand::RecordOn { label, path, reply },
-                None => ActorCommand::RecordOff { label, reply },
-            })
+            .send(ActorCommand::RecordToggle { label, on, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: asks the host behind `label` to record the session (§17).
+    ///
+    /// `Ok(())` only means the request left this node. Whether the host user
+    /// agrees comes back as `RecordAck`, and a refusal is an ordinary answer,
+    /// not an error.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] without a live view onto that host;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn record_request(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RecordRequest { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -683,6 +1022,207 @@ impl ActorHandle {
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
+    /// Host side: every saved device of the address book (§8; ADR 0034).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn address_book_list(&self) -> Result<Vec<AddressBookRow>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::AddressBookList { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Host side: saves or updates one device (§8; ADR 0034).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if the label names nothing this run knows
+    /// about; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn address_book_upsert(
+        &self,
+        label: String,
+        name: String,
+        tags: Vec<String>,
+        notes: String,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::AddressBookUpsert {
+                label,
+                name,
+                tags,
+                notes,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: forgets one device.
+    ///
+    /// # Errors
+    /// As [`Self::address_book_upsert`].
+    pub async fn address_book_remove(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::AddressBookRemove { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: marks a device trusted, or withdraws that (§8; ADR 0034).
+    ///
+    /// # Errors
+    /// As [`Self::address_book_upsert`].
+    pub async fn address_book_set_trusted(
+        &self,
+        label: String,
+        trusted: bool,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::AddressBookSetTrusted {
+                label,
+                trusted,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: what the settings screen may know about unattended access.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn unattended_status(&self) -> Result<UnattendedSettings, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedStatus { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Host side: sets or replaces the device password (§8; ADR 0033).
+    ///
+    /// # Errors
+    /// [`ActorError::Unattended`] if the password fails the policy of §8 or
+    /// the keystore refuses to keep it; [`ActorError::Net`] for a keystore
+    /// that is unavailable.
+    pub async fn unattended_set_password(&self, password: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedSetPassword { password, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: turns unattended access off and forgets the credentials.
+    ///
+    /// # Errors
+    /// [`ActorError::Net`] if the keystore refuses to drop them.
+    pub async fn unattended_disable(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedDisable { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: turns the second factor on or off (§8).
+    ///
+    /// Returns the one-time provisioning payload when turning it on.
+    ///
+    /// # Errors
+    /// [`ActorError::Unattended`] when no password is set — a second factor
+    /// without a first is not a gate; [`ActorError::Net`] if the keystore
+    /// refuses the write.
+    pub async fn unattended_set_totp(
+        &self,
+        enabled: bool,
+    ) -> Result<Option<TotpProvisioning>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedSetTotp { enabled, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: chooses the role a successful admission is granted (§8.2).
+    ///
+    /// # Errors
+    /// [`ActorError::Net`] if the keystore refuses the write.
+    pub async fn unattended_set_role(&self, role: Role) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedSetRole { role, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: answers the host's credential challenge (§8; ADR 0033).
+    ///
+    /// # Errors
+    /// [`ActorError::Core::NotPermitted`] if nothing is waiting on a
+    /// challenge right now; [`ActorError::ChannelClosed`] if the actor is
+    /// gone. Whether the credentials were *right* is not this call's answer:
+    /// it arrives on the wire, as a grant or a rejection, and shows up in
+    /// `connect_status`.
+    pub async fn unattended_submit(
+        &self,
+        password: String,
+        code: Option<String>,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::UnattendedSubmit {
+                password,
+                code,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: turns one independent grant of `label`'s session on or off
+    /// (§8.2; ADR 0029).
+    ///
+    /// The decision is the core's: this only carries the host user's answer to
+    /// [`SessionManager::set_grant`], which refuses anything but an active
+    /// session and never touches `view` or `input`.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] for a label with no session;
+    /// [`ActorError::Core`] as [`SessionManager::set_grant`] returns it;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn set_grant(
+        &self,
+        label: String,
+        grant: IndependentGrant,
+        allowed: bool,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::SetGrant {
+                label,
+                grant,
+                allowed,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
 
     /// Guest side: turns the view window's own microphone towards `label`'s
     /// host on or off (§11; ADR 0028). Gated inside the actor on a live
@@ -724,6 +1264,28 @@ fn peer_tag(install_salt: &[u8; 32], peer: &NodeId) -> String {
     hex_prefix(&hash)
 }
 
+/// File a recording of `label` is written into (§17, §2.3).
+///
+/// The whole path is decided here: the directory from the app's own data
+/// directory, the name from the clock and the peer's pseudonymized label. The
+/// webview never supplies any of it — a view layer that could choose the path
+/// could make this process write a file anywhere it can reach, which is not a
+/// decision an untrusted layer gets to make (§2.3), and the label keeps the
+/// name free of anything that identifies the peer (§15).
+fn recording_path(label: &str) -> Result<std::path::PathBuf, ActorError> {
+    let dir = crate::config::recordings_dir()
+        .ok_or_else(|| ActorError::Net(NetError::Io("no data directory".to_owned())))?;
+    std::fs::create_dir_all(&dir).map_err(|e| ActorError::Net(NetError::Io(e.to_string())))?;
+    // The label is a hex tag already, but it lands in a file name: anything
+    // outside the safe set is dropped rather than trusted to be harmless.
+    let safe: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    Ok(dir.join(format!("session-{}-{safe}.lmrc", unix_now_secs())))
+}
+
 /// Fixed domain-separation salt for [`host_tag`]. Not a secret and not an
 /// install salt: its only job is to keep this hash from colliding with the
 /// per-run `peer_tag` namespace.
@@ -751,6 +1313,179 @@ fn hex_prefix(hash: &[u8; 32]) -> String {
     })
 }
 
+/// One offer this node made, waiting for the peer to answer it.
+///
+/// The path is kept because `FileOffer` deliberately does not carry it: what
+/// crosses the wire is a basename, and where the file actually lives on this
+/// machine is nobody else's business (§15).
+struct OutgoingOffer {
+    path: std::path::PathBuf,
+    name: String,
+    size: u64,
+    hash: [u8; 32],
+}
+
+/// One offer this node accepted, waiting for the sender's
+/// `FileTransferStart` to name it (§9.2; ADR 0032).
+struct AcceptedOffer {
+    name: String,
+    size: u64,
+    hash: [u8; 32],
+    /// Where the verified file goes. Chosen by the *receiving* user: the
+    /// sender picks a name, never a location.
+    destination: std::path::PathBuf,
+}
+
+/// One offer that arrived and is waiting for this user to answer.
+#[derive(Clone)]
+struct PendingOffer {
+    /// Basename, already through `safe_file_name`.
+    name: String,
+    size: u64,
+    hash: [u8; 32],
+}
+
+/// Receiver-side state for one peer, shared with the tasks reading its chunk
+/// streams.
+///
+/// Shared rather than owned by the actor because a 256 KiB chunk must not
+/// travel through the actor's mailbox to be written: at that rate the loop
+/// would spend a transfer doing nothing else, which is the shape of failure
+/// ADR 0027 is about. The lock is held for one `apply_chunk` plus one append.
+#[derive(Default)]
+struct FileInbox {
+    tracker: ReceiveTracker,
+    staged: std::collections::HashMap<TransferId, StagedReceive>,
+    /// Hash to verify, and where the file goes once it does.
+    expected: std::collections::HashMap<TransferId, ([u8; 32], std::path::PathBuf)>,
+}
+
+/// A peer's inbox plus the signal that a transfer has been prepared.
+///
+/// `starts` exists because the control channel and `rd/file/1` are separate
+/// QUIC connections (§4), so nothing orders `FileTransferStart` against the
+/// first chunk. A stream reader that finds an unknown id waits on this rather
+/// than refusing a transfer that is about to be announced. A `watch` and not
+/// a `Notify`: `changed()` is edge-triggered from what this reader last saw,
+/// so a start landing between the check and the wait cannot be missed.
+#[derive(Clone)]
+struct FileChannel {
+    inbox: Arc<tokio::sync::Mutex<FileInbox>>,
+    starts: watch::Sender<u64>,
+}
+
+impl FileChannel {
+    fn new() -> Self {
+        Self {
+            inbox: Arc::new(tokio::sync::Mutex::new(FileInbox::default())),
+            starts: watch::channel(0).0,
+        }
+    }
+
+    /// Announces that one more transfer is now known to the inbox.
+    fn announce_start(&self) {
+        self.starts
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+}
+
+/// One file this node is sending, queued until `rd/file/1` is up.
+struct SendJob {
+    id: TransferId,
+    path: std::path::PathBuf,
+    /// Resume point: the last offset the receiver acked (§10).
+    from: u64,
+}
+
+/// How a transfer ended, as the UI shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferState {
+    /// Bytes are still moving.
+    Running,
+    /// Every byte arrived and the BLAKE3 of the offer matched (§9.2).
+    Completed,
+    /// Either side stopped it. Nothing was exported from staging.
+    Cancelled,
+    /// It ended without being cancelled and without verifying — a hash
+    /// mismatch, a disk that refused, a stream that died.
+    Failed,
+}
+
+/// One transfer as the UI lists it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TransferRow {
+    /// Pseudonymized peer label (§15).
+    pub peer_label: String,
+    /// Identifier both sides agreed on in `FileTransferStart`.
+    pub transfer_id: u64,
+    /// Basename, after normalization on the receiving side.
+    pub name: String,
+    /// Total bytes the offer announced.
+    pub size: u64,
+    /// Bytes moved so far.
+    pub moved: u64,
+    /// Whether this node is the one receiving.
+    pub incoming: bool,
+    /// Where it is up to.
+    pub state: TransferState,
+}
+
+/// One offer waiting for this user's answer, as the UI lists it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct OfferRow {
+    /// Pseudonymized peer label (§15).
+    pub peer_label: String,
+    /// Basename, after normalization.
+    pub name: String,
+    /// Size the offer announced.
+    pub size: u64,
+}
+
+/// Everything the transfer panel draws in one poll.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct FileTransfersDto {
+    /// Offers waiting for this user to accept or decline.
+    pub offers: Vec<OfferRow>,
+    /// Transfers running or recently ended.
+    pub transfers: Vec<TransferRow>,
+}
+
+/// One thing that happened to a transfer, off the actor loop.
+enum FileEvent {
+    /// A local file was measured and hashed and can now be offered.
+    Prepared {
+        peer: NodeId,
+        path: std::path::PathBuf,
+        name: String,
+        size: u64,
+        hash: [u8; 32],
+    },
+    /// The file could not be measured, hashed or named. Nothing was offered.
+    PrepareFailed { peer: NodeId },
+    /// `rd/file/1` towards this peer is up — either this node dialed it, or
+    /// the peer's dial was accepted and authorized.
+    Connected {
+        peer: NodeId,
+        connection: Box<iroh::endpoint::Connection>,
+    },
+    /// The dial failed; anything queued for this peer has nowhere to go.
+    ConnectFailed { peer: NodeId },
+    /// One transfer moved. `moved` is the contiguous byte count, which is
+    /// also the resume point (§10).
+    Progress {
+        peer: NodeId,
+        id: TransferId,
+        moved: u64,
+    },
+    /// One transfer reached an end this side can see.
+    Finished {
+        peer: NodeId,
+        id: TransferId,
+        state: TransferState,
+    },
+}
+
 /// The actor's end of one live control connection.
 struct ConnectionHandle {
     /// Distinguishes generations of connection to the same peer, so a stale
@@ -772,6 +1507,11 @@ struct ConnectionHandle {
     /// gate for `MessageKind::SasAck` (§9.1; ADR 0028). Always false on the
     /// host side, which never sends the request.
     speaks_remote_sas: bool,
+    /// Whether this peer's `Hello` advertised `FEATURE_UNATTENDED`, the same
+    /// gate for `MessageKind::UnattendedChallenge` and `UnattendedReject`
+    /// (§9.1; ADR 0033). Always false on the guest side, which never sends
+    /// either.
+    speaks_unattended: bool,
 }
 
 /// Host side: one running capture/encode loop, plus the connection it writes
@@ -859,6 +1599,9 @@ struct ViewState {
     /// `grants.input` as the frame poll reads it, without the actor. Written
     /// here, on grant and on role change; the entry is removed on revoke.
     input: Arc<AtomicBool>,
+    /// Whether the host announced it is recording, as the frame poll reads it
+    /// (§17). Written when a `RecordAck` arrives.
+    recording: Arc<AtomicBool>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -908,6 +1651,12 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_REMOTE_SAS`
         /// (§9.1; ADR 0028).
         speaks_remote_sas: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_TRANSFER`
+        /// (§9.1; ADR 0032).
+        speaks_file_transfer: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED`
+        /// (§9.1; ADR 0033).
+        speaks_unattended: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -940,6 +1689,8 @@ enum ActorEvent {
         addr: Box<iroh::EndpointAddr>,
         result: Result<Box<ControlConnection>, NetError>,
     },
+    /// Something happened to a file transfer, on one of its own tasks.
+    File(FileEvent),
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -954,9 +1705,21 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_REMOTE_SAS`
         /// (§9.1; ADR 0028).
         speaks_remote_sas: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_TRANSFER`
+        /// (§9.1; ADR 0032).
+        speaks_file_transfer: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED`
+        /// (§9.1; ADR 0033).
+        speaks_unattended: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
+        connection: Box<iroh::endpoint::Connection>,
+        peer: NodeId,
+    },
+    /// File ALPN: authenticated only, nothing decided — exactly like media,
+    /// and for the same reason (§4.1, §2.3).
+    File {
         connection: Box<iroh::endpoint::Connection>,
         peer: NodeId,
     },
@@ -1014,6 +1777,20 @@ struct Actor {
     /// independent `recording` grant; flushed and dropped when the session
     /// ends so no recorder can outlive what it was allowed to record.
     recorders: HashMap<NodeId, Arc<crate::recorder::SessionRecorder>>,
+    /// Host side: guests whose `RecordRequest` is still waiting for the host
+    /// user's answer (§17).
+    ///
+    /// A set, not a queue: a guest that asks twice does not get two dialogs,
+    /// and there is nothing to answer out of order. Cleared when the host
+    /// answers either way, and when the session ends.
+    record_requests: std::collections::HashSet<NodeId>,
+    /// Host side: per-peer budget for `RecordRequest` (§9.2).
+    ///
+    /// The same limiter the consent path uses, on purpose: asking to be
+    /// recorded puts a dialog in front of the host user exactly like asking
+    /// for consent does, so it gets the same per-peer budget rather than a
+    /// second counter with its own rules.
+    record_request_rate: ConsentRateLimiter,
     /// Host side: platform input adapter, opened on the first authorized event
     /// so a host that never grants `input` never touches it.
     injector: Option<Box<dyn InputInjector>>,
@@ -1035,12 +1812,74 @@ struct Actor {
     clipboard: std::collections::HashMap<NodeId, ClipboardSync>,
     /// Newest inbound clipboard payload per peer, for the UI to pull.
     clipboard_inbound: std::collections::HashMap<NodeId, String>,
+    /// Whether this peer's `Hello` (host side) or `HelloAck` minor (guest
+    /// side) says it understands `FileTransferStart` (§9.1; ADR 0032).
+    speaks_file_transfer: std::collections::HashSet<NodeId>,
+    /// The `rd/file/1` connection per peer, opened lazily and only after an
+    /// accepted offer (§4).
+    file_conns: std::collections::HashMap<NodeId, iroh::endpoint::Connection>,
+    /// Peers whose file connection is being dialed right now, so a second
+    /// accepted offer does not start a second dial.
+    file_dialing: std::collections::HashSet<NodeId>,
+    /// Offers this node has made and not yet heard back on.
+    file_offers_out: std::collections::HashMap<NodeId, std::collections::VecDeque<OutgoingOffer>>,
+    /// Offers that arrived and are waiting for this user to answer.
+    file_offers_in: std::collections::HashMap<NodeId, std::collections::VecDeque<PendingOffer>>,
+    /// Offers this user accepted, waiting for the sender to name them.
+    file_accepted: std::collections::HashMap<NodeId, std::collections::VecDeque<AcceptedOffer>>,
+    /// Receiver-side state per peer, shared with its stream readers.
+    file_channels: std::collections::HashMap<NodeId, FileChannel>,
+    /// Sends queued until `rd/file/1` is up.
+    file_pending_sends: std::collections::HashMap<NodeId, Vec<SendJob>>,
+    /// Every transfer this node knows about, keyed by peer and id.
+    file_transfers: std::collections::HashMap<(NodeId, TransferId), TransferRow>,
+    /// Tasks pushing bytes, so an abort can stop one without waiting for the
+    /// stream to notice.
+    file_send_tasks: std::collections::HashMap<(NodeId, TransferId), tokio::task::JoinHandle<()>>,
+    /// Next transfer id this node hands out. The *sender* names a transfer
+    /// (ADR 0032), so this counter is only ever read on the sending side.
+    next_transfer_id: TransferId,
+    /// The machine's own clipboard, on its own thread (§9.2; ADR 0030).
+    /// Reads happen only while a session holds `clipboard_read`; writes are
+    /// how a peer's authorized payload actually lands on this desktop.
+    clipboard_worker: crate::clipboard_os::ClipboardWorker,
+    /// Local clipboard changes the watcher saw, delivered here rather than
+    /// read on the actor loop: an X11 clipboard read is a round trip to
+    /// another application, and one wedged application must not be able to
+    /// delay a revoke (ADR 0027).
+    clipboard_changes: mpsc::Receiver<String>,
     /// How view windows are created and closed.
     windows: Arc<dyn ViewWindows>,
     /// Guest side: hosts this node has connected to before (§21 punch-list
     /// item 5). Nothing is recorded on the host side — see
     /// `connection_history`'s module docs.
     history: ConnectionHistory,
+    /// Host side: the unattended credentials of §8, and the only thing that
+    /// decides an unattended admission (ADR 0033).
+    ///
+    /// Owned by the actor rather than shared, for the same reason
+    /// `SessionManager` is: the lockout counter inside it must see every
+    /// attempt in one order, and a second holder could not be given a copy
+    /// without giving away a second lockout budget with it.
+    unattended: UnattendedAccess,
+    /// Where those credentials are kept between runs (the OS keystore).
+    unattended_store: UnattendedStore,
+    /// Host side: peers that were offered a credential challenge and have not
+    /// been admitted yet. A peer absent from here has its `UnattendedAuth`
+    /// ignored, which is what stops credentials being replayed at a session
+    /// that already exists or at one that was never offered the path.
+    unattended_pending: std::collections::HashSet<NodeId>,
+    /// Whether this peer's `Hello` advertised `FEATURE_UNATTENDED` (§9.1;
+    /// ADR 0033), recorded before `on_handshaked` runs.
+    speaks_unattended: std::collections::HashSet<NodeId>,
+    /// Host side: saved devices and which of them are trusted (§8; ADR 0034).
+    address_book: AddressBookStore,
+    /// Guest side: whether the challenge this node is answering asked for a
+    /// one-time code, so the connect form knows to show the field.
+    connect_code_required: bool,
+    /// Guest side: how long the host said to wait before trying again, from a
+    /// `LockedOut` rejection. Seconds, and only ever the host's own number.
+    connect_retry_secs: Option<u64>,
     /// Guest side: phase of this node's own outgoing connect attempt.
     connect_phase: ConnectPhase,
     /// Host the phase above is about, once the dial has resolved one.
@@ -1086,6 +1925,9 @@ impl Actor {
                 state: SessionStateDto::Pending,
                 role: ticket.requested_role,
                 input: false,
+                grants: Grants::default(),
+                recording_active: false,
+                record_request: false,
             });
         }
         for (peer, role, grants) in self.sessions.active() {
@@ -1099,7 +1941,19 @@ impl Actor {
                 state: SessionStateDto::Active,
                 role,
                 input: grants.input,
+                grants,
+                recording_active: self.recorders.contains_key(&peer),
+                record_request: self.record_requests.contains(&peer),
             });
+        }
+        // Host side: every saved device gets a label too, whether or not it is
+        // connected. Without this the address book panel could list a device
+        // and then fail to act on it: every command names a peer by label, and
+        // a label nothing registered resolves to nothing (§13).
+        let saved: Vec<NodeId> = self.address_book.book().peers().map(|(p, _)| p).collect();
+        for peer in saved {
+            let label = peer_tag(&self.install_salt, &peer);
+            self.labels.insert(label, peer);
         }
         // Guest side: a host being watched has no entry in this node's own
         // `SessionManager` (it is not *our* guest), but its view window still
@@ -1133,6 +1987,11 @@ impl Actor {
                 fault = self.faults_rx.recv() => {
                     if let Some((peer, reason)) = fault {
                         self.on_media_fault(peer, reason);
+                    }
+                }
+                change = self.clipboard_changes.recv() => {
+                    if let Some(text) = change {
+                        self.on_local_clipboard(&text);
                     }
                 }
             }
@@ -1193,15 +2052,22 @@ impl Actor {
                     ticket,
                     announces_media_faults,
                     speaks_remote_sas,
+                    speaks_file_transfer,
+                    speaks_unattended,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
                     announces_media_faults,
                     speaks_remote_sas,
+                    speaks_file_transfer,
+                    speaks_unattended,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
                     ActorEvent::MediaAccepted { connection, peer }
+                }
+                Some(Accepted::File { connection, peer }) => {
+                    ActorEvent::File(FileEvent::Connected { connection, peer })
                 }
                 None => return,
             };
@@ -1222,6 +2088,7 @@ impl Actor {
         peer: NodeId,
         announces_media_faults: bool,
         speaks_remote_sas: bool,
+        speaks_unattended: bool,
     ) {
         self.next_connection_id = self.next_connection_id.wrapping_add(1);
         let id = self.next_connection_id;
@@ -1277,6 +2144,7 @@ impl Actor {
                 connection: quic,
                 announces_media_faults,
                 speaks_remote_sas,
+                speaks_unattended,
             },
         );
     }
@@ -1303,11 +2171,23 @@ impl Actor {
                 ticket,
                 announces_media_faults,
                 speaks_remote_sas,
+                speaks_file_transfer,
+                speaks_unattended,
             } => {
+                if speaks_unattended {
+                    self.speaks_unattended.insert(peer);
+                } else {
+                    self.speaks_unattended.remove(&peer);
+                }
                 if speaks_remote_sas {
                     self.speaks_remote_sas.insert(peer);
                 } else {
                     self.speaks_remote_sas.remove(&peer);
+                }
+                if speaks_file_transfer {
+                    self.speaks_file_transfer.insert(peer);
+                } else {
+                    self.speaks_file_transfer.remove(&peer);
                 }
                 self.on_handshaked(*connection, peer, &ticket, announces_media_faults);
             }
@@ -1322,6 +2202,7 @@ impl Actor {
                 addr,
                 result,
             } => self.on_dialed(peer, code, *addr, result),
+            ActorEvent::File(event) => self.on_file_event(event),
         }
     }
 
@@ -1467,8 +2348,22 @@ impl Actor {
         if let Some(recorder) = self.recorders.remove(&peer) {
             recorder.write_event(0, r#"{"event":"record-stop","reason":"session-end"}"#);
             let clean = recorder.stop();
-            tracing::info!(peer = %self.label_of(&peer), clean, "recording flushed at session end");
+            let dropped = recorder.dropped();
+            tracing::info!(
+                peer = %self.label_of(&peer),
+                clean,
+                dropped,
+                "recording flushed at session end"
+            );
+            tracing::info!(
+                event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
+                "audit"
+            );
         }
+        // A request nobody answered dies with the session it was about, and
+        // the guest's budget goes with it: a new session starts over.
+        self.record_requests.remove(&peer);
+        self.record_request_rate.forget(&peer);
         lock_capture(&self.capture).remove_viewer(&peer);
     }
 
@@ -1520,6 +2415,10 @@ impl Actor {
             Arc::clone(&slot_tx),
         );
         let input = Arc::new(AtomicBool::new(grants.input));
+        // Starts false and only the host can raise it: a view window claims a
+        // recording is running because the host said so, never because this
+        // side guessed (§17).
+        let recording = Arc::new(AtomicBool::new(false));
         // Keyed by the peer tag: that is the only name the view window knows
         // itself by across IPC — `view_next_frame` takes `peer`, and the
         // window label is derived from it, not the other way round.
@@ -1531,6 +2430,7 @@ impl Actor {
                 ViewFeed {
                     slot: slot_rx.clone(),
                     input: Arc::clone(&input),
+                    recording: Arc::clone(&recording),
                 },
             );
         self.views.insert(
@@ -1540,6 +2440,7 @@ impl Actor {
                 role,
                 grants,
                 input,
+                recording,
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -1668,6 +2569,29 @@ impl Actor {
             connection.close_with(&NetError::InvalidTicket);
             return;
         }
+        // A trusted device reaching a host with nobody at it answers to
+        // credentials instead of to a dialog nobody would see (§8; ADR 0033).
+        // The invite still had to verify and still had to be claimed above:
+        // this replaces the human's decision, not the ticket.
+        if self.may_try_unattended(&peer) {
+            let code_required = self.unattended.code_required();
+            self.adopt(
+                connection,
+                peer,
+                announces_media_faults,
+                self.speaks_remote_sas.contains(&peer),
+                true,
+            );
+            self.unattended_pending.insert(peer);
+            self.send_to(&peer, MessageKind::UnattendedChallenge { code_required });
+            tracing::info!(
+                peer = %tag,
+                code_required,
+                "unattended challenge offered to a trusted device"
+            );
+            self.rebuild_labels_and_snapshot();
+            return;
+        }
         // Every connection, first time or reconnect, gets a fresh decision.
         if let Err(error) = self
             .sessions
@@ -1686,9 +2610,112 @@ impl Actor {
             peer,
             announces_media_faults,
             self.speaks_remote_sas.contains(&peer),
+            self.speaks_unattended.contains(&peer),
         );
         let _ = self.notify.send(ActorNotification::ConsentRequested);
         self.rebuild_labels_and_snapshot();
+    }
+
+    /// Sends `UnattendedReject` to `peer`, but only if its `Hello` advertised
+    /// [`FEATURE_UNATTENDED`] — an older guest would decode the unknown
+    /// discriminant as malformed and drop the connection (§9.1).
+    ///
+    /// Nothing that reaches here should ever fail that check, since the
+    /// challenge is offered under the same condition; it is asked again
+    /// because "should never happen" is not how a send gate earns its keep.
+    fn send_unattended_reject(&mut self, peer: NodeId, reason: UnattendedRejection) {
+        if self
+            .connections
+            .get(&peer)
+            .is_some_and(|c| c.speaks_unattended)
+        {
+            self.send_to(&peer, MessageKind::UnattendedReject(reason));
+        } else {
+            tracing::debug!(
+                peer = %self.label_of(&peer),
+                "not refusing on the wire: this guest does not speak unattended"
+            );
+        }
+    }
+
+    /// Whether this connection should be offered the unattended credential
+    /// path of §8 instead of a consent dialog (ADR 0033, ADR 0034).
+    ///
+    /// Three conditions, all of them necessary, none of them sufficient:
+    ///
+    /// - the host user configured a device password at all — without one
+    ///   there is nothing to verify and the gate is off (§8);
+    /// - the host user marked *this device* trusted in the address book.
+    ///   Trust is not a way past the password; it is a way of narrowing who is
+    ///   even allowed to spend attempts against it, and the lockout is a
+    ///   shared budget, so letting anyone with an invite spend it would let a
+    ///   stranger lock the owner out (ADR 0034);
+    /// - the guest can answer a challenge. A peer that never advertised
+    ///   `FEATURE_UNATTENDED` would decode the message as malformed and drop
+    ///   the connection (§9.1), so it takes the ordinary path — which asks a
+    ///   human, the safe direction to fall back in.
+    fn may_try_unattended(&self, peer: &NodeId) -> bool {
+        self.unattended.enabled()
+            && self.address_book.book().is_trusted(peer)
+            && self.speaks_unattended.contains(peer)
+    }
+
+    /// Host side: one guest's answer to the credential challenge (§8).
+    ///
+    /// Everything decided here is decided by `lumepeer-core`: `admit` verifies
+    /// both factors, counts the failure and hands back the role the host
+    /// configured. This function chooses nothing — it routes an answer in and
+    /// a verdict out (§2.1, §2.3).
+    fn on_unattended_auth(&mut self, peer: NodeId, password: &str, code: Option<&str>) {
+        let tag = self.label_of(&peer);
+        if !self.unattended_pending.remove(&peer) {
+            // No challenge was offered on this connection, so there is nothing
+            // to answer. Silence rather than a rejection: an unsolicited
+            // credential message tells this host nothing it should reply to.
+            tracing::warn!(peer = %tag, "unattended credentials without a challenge; ignored");
+            return;
+        }
+        // Trust is re-read here rather than trusted from challenge time: the
+        // host user may have withdrawn it while the guest was typing, and a
+        // decision in flight must not outlive the permission it was taken
+        // under — the same per-event re-check every injected key gets (§8.1).
+        if !self.may_try_unattended(&peer) {
+            tracing::warn!(peer = %tag, "unattended access withdrawn mid-login; refusing");
+            self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
+            return;
+        }
+
+        match self.unattended.admit(Some(password), code) {
+            Ok(role) => {
+                // The audit line records the verdict and nothing else: which
+                // factor was presented, and how nearly it matched, would make
+                // the log the oracle the error type refuses to be (§15).
+                tracing::info!(
+                    peer = %tag,
+                    ?role,
+                    event = ?AuditEvent::UnattendedLogin { accepted: true },
+                    "unattended login accepted"
+                );
+                if let Err(error) = self.grant_role(peer, role) {
+                    tracing::warn!(peer = %tag, ?error, "cannot start the admitted session");
+                    self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
+                    return;
+                }
+                self.rebuild_labels_and_snapshot();
+            }
+            Err(error) => {
+                // Back on the pending list: the lockout inside `admit` is what
+                // bounds retries, and a guest that mistyped a code should not
+                // have to redial to try again.
+                self.unattended_pending.insert(peer);
+                tracing::warn!(
+                    peer = %tag,
+                    event = ?AuditEvent::UnattendedLogin { accepted: false },
+                    "unattended login refused"
+                );
+                self.send_unattended_reject(peer, rejection_of(&error));
+            }
+        }
     }
 
     #[allow(
@@ -1755,28 +2782,43 @@ impl Actor {
                     }
                 }
             }
-            // Clipboard from the peer: §9.2 validation plus grant check on
-            // the receiving side's own copy of the grants; then stage the
-            // payload for the UI to apply and pull.
+            // Clipboard from the peer: §9.2 validation, then the grant
+            // check that belongs to *this* side, then the payload onto this
+            // machine's clipboard.
+            //
+            // The two sides do not ask the same question, and that asymmetry
+            // is the model rather than an oversight (§2.3; ADR 0029, ADR
+            // 0030). A host receiving a guest's clipboard is being written
+            // to, which is `clipboard_write` — and the host holds the only
+            // copy of that grant that decides anything. A guest receiving the
+            // host's clipboard holds no grants at all: the host already
+            // decided, under `clipboard_read`, that this guest may see it.
+            // All the guest can check is that the payload came from a host it
+            // has an open session with, and it checks exactly that.
             MessageKind::ClipboardSync { ref data } => {
-                let granted_to_guest = self
-                    .sessions
-                    .grants(&peer)
-                    .is_some_and(|g| g.clipboard_read);
-                let permitted = self
-                    .views
-                    .get(&peer)
-                    .is_some_and(|v| v.grants.clipboard_write)
-                    || (granted_to_guest && !self.views.contains_key(&peer));
+                let permitted = if self.views.contains_key(&peer) {
+                    true
+                } else {
+                    self.sessions
+                        .grants(&peer)
+                        .is_some_and(|g| clip::permits(g, ClipboardFlow::GuestToHost))
+                };
                 if !permitted {
                     tracing::warn!(peer = %tag, "clipboard update without a grant; ignored");
                     return;
                 }
                 let sync = self.clipboard.entry(peer).or_default();
                 match sync.remote_received(data) {
-                    Ok(text) => {
-                        self.clipboard_inbound
-                            .insert(peer, String::from_utf8_lossy(text).into_owned());
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(bytes).into_owned();
+                        // Onto the real clipboard, from Rust: this is what the
+                        // grant was for, and the webview never gets a handle
+                        // on it (§2.3).
+                        self.clipboard_worker.write(text.clone());
+                        // Staged as well, so the UI can say "a clipboard
+                        // arrived" without the content ever crossing the
+                        // broadcast bus (§15).
+                        self.clipboard_inbound.insert(peer, text);
                         let _ = self.notify.send(ActorNotification::ClipboardFromPeer);
                     }
                     Err(error) => {
@@ -1784,8 +2826,114 @@ impl Actor {
                     }
                 }
             }
+            // File transfer (§9.2; ADR 0032). Every arm re-checks the grant
+            // rather than trusting the last one: a revoke can land between an
+            // offer and its answer, and between an answer and the first byte.
+            MessageKind::FileOffer {
+                ref name,
+                size,
+                hash,
+            } => self.on_file_offer_inbound(peer, name, size, hash),
+            MessageKind::FileAccept(accepted) => self.on_file_accept_inbound(peer, accepted),
+            MessageKind::FileTransferStart {
+                transfer_id,
+                ref name,
+                size,
+                hash,
+            } => self.on_file_transfer_start(peer, transfer_id, name, size, hash),
+            MessageKind::FileChunkAck {
+                transfer_id,
+                offset,
+            } => self.on_file_chunk_ack(peer, transfer_id, offset),
+            MessageKind::FileAbort { transfer_id } => {
+                tracing::info!(peer = %tag, "the peer aborted a transfer");
+                self.cancel_transfer(peer, transfer_id);
+            }
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
+            // Guest side: this host wants credentials rather than a dialog
+            // (§8; ADR 0033). Only ever acted on for the host this node is
+            // actually dialing: an inbound peer has no business telling this
+            // side to collect a password from its user.
+            MessageKind::UnattendedChallenge { code_required } => {
+                if self.connect_peer != Some(peer) {
+                    tracing::warn!(peer = %tag, "unsolicited credential challenge; ignored");
+                    return;
+                }
+                tracing::info!(peer = %tag, code_required, "the host asked for device credentials");
+                self.connect_phase = ConnectPhase::AwaitingCredentials;
+                self.connect_code_required = code_required;
+                self.connect_failure = None;
+                self.connect_retry_secs = None;
+            }
+            // Host side: a guest answered the challenge.
+            MessageKind::UnattendedAuth {
+                ref password,
+                ref code,
+            } => self.on_unattended_auth(peer, password, code.as_deref()),
+            // Guest side: the credentials were refused (§8, §18). The phase
+            // stays on the credential form so the user can try again — except
+            // when the host says it cannot decide at all, which no retry
+            // fixes.
+            MessageKind::UnattendedReject(reason) => {
+                if self.connect_peer != Some(peer) {
+                    return;
+                }
+                let (code, retry_secs) = match reason {
+                    UnattendedRejection::BadPassword => ("UNATTENDED_BAD_PASSWORD", None),
+                    UnattendedRejection::BadCode => ("UNATTENDED_BAD_CODE", None),
+                    UnattendedRejection::LockedOut { remaining_secs } => {
+                        ("UNATTENDED_LOCKED_OUT", Some(remaining_secs))
+                    }
+                    UnattendedRejection::Unavailable => ("UNATTENDED_UNAVAILABLE", None),
+                };
+                tracing::info!(peer = %tag, code, "the host refused the device credentials");
+                self.connect_failure = Some(code);
+                self.connect_retry_secs = retry_secs;
+                if matches!(reason, UnattendedRejection::Unavailable) {
+                    self.connect_phase = ConnectPhase::Failed;
+                    self.connect_peer = None;
+                } else {
+                    self.connect_phase = ConnectPhase::AwaitingCredentials;
+                }
+            }
+            // Host side: the guest asks to be recorded (§17). Nothing here
+            // answers by itself — an automatic yes would make `recording` a
+            // grant a guest could hand itself, which is exactly what §8.2
+            // splits it out to prevent. The request is parked for the host
+            // user, who answers it by starting or refusing the recording.
+            MessageKind::RecordRequest => {
+                if self.sessions.state(&peer) != SessionState::Active {
+                    tracing::warn!(peer = %tag, "record request without an active session; ignored");
+                    return;
+                }
+                // Same budget as a consent request, for the same reason: this
+                // puts a dialog in front of a person (§9.2).
+                if self.record_request_rate.check(peer).is_err() {
+                    tracing::warn!(peer = %tag, "record request rate limited; refused");
+                    self.send_to(&peer, MessageKind::RecordAck(false));
+                    return;
+                }
+                if self.recorders.contains_key(&peer) {
+                    // Already recording: the answer is a fact, not a decision.
+                    self.send_to(&peer, MessageKind::RecordAck(true));
+                    return;
+                }
+                if self.record_requests.insert(peer) {
+                    tracing::info!(peer = %tag, "the guest asked to be recorded");
+                }
+            }
+            // Guest side: the host announced whether it is recording (§17).
+            // This is the only source the view window's indicator has — the
+            // host's own statement, never something this side inferred.
+            MessageKind::RecordAck(recording) => {
+                if let Some(state) = self.views.get(&peer) {
+                    state.recording.store(recording, Ordering::Relaxed);
+                    tracing::info!(peer = %tag, recording, "the host announced its recording state");
+                } else {
+                    tracing::debug!(peer = %tag, recording, "record ack without a view; ignored");
+                }
+            }
             // Host side: the guest asks for the Secure Attention Sequence
             // (§11; ADR 0028). Same per-event re-check as every injected key:
             // only a live `input` grant acts, everything else is refused.
@@ -1865,11 +3013,20 @@ impl Actor {
             return;
         }
         self.connections.remove(&peer);
+        // An unanswered credential challenge dies with the connection that
+        // carried it: a later connection from the same device gets a fresh
+        // challenge, and its `UnattendedAuth` is never accepted against a
+        // pending flag left over from an older one (§8; ADR 0033).
+        self.unattended_pending.remove(&peer);
+        self.speaks_unattended.remove(&peer);
         // Chat and clipboard state are per-session by design (§15): nothing
         // about a past peer survives its connection here.
         self.chat.drop_transcript(&peer);
         self.clipboard.remove(&peer);
         self.clipboard_inbound.remove(&peer);
+        // Staging goes with the session that was allowed to fill it, and
+        // nothing in it is exported on the way out (§8.1, §9.2).
+        self.drop_file_state(peer);
         // Both sides of the media pipeline end with the control connection: the
         // host stops capturing for this viewer, the guest closes its window
         // (and, on the guest, records the host it was watching).
@@ -1884,6 +3041,7 @@ impl Actor {
             let _ = self.sessions.revoke(peer);
         }
         tracing::info!(peer = %label, "peer disconnected");
+        self.refresh_clipboard_watch();
         let _ = self.notify.send(ActorNotification::Disconnected);
         self.rebuild_labels_and_snapshot();
     }
@@ -1891,6 +3049,10 @@ impl Actor {
     /// Not `async` any more, and that is the property worth keeping: the loop
     /// awaits this, so anything that blocks here blocks the whole actor. The
     /// dial was the last thing in it that talked to the network (ADR 0027).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per command reads best; splitting the dispatch would                   hide which commands the actor answers"
+    )]
     fn handle_command(&mut self, command: ActorCommand) {
         match command {
             ActorCommand::Status { reply } => {
@@ -1911,7 +3073,12 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::ConnectState { reply } => {
-                let _ = reply.send((self.connect_phase, self.connect_failure));
+                let _ = reply.send(ConnectSnapshot {
+                    phase: self.connect_phase,
+                    code: self.connect_failure,
+                    code_required: self.connect_code_required,
+                    retry_secs: self.connect_retry_secs,
+                });
             }
             ActorCommand::Grant { label, role, reply } => {
                 let result = self.on_grant(&label, role);
@@ -1959,17 +3126,41 @@ impl Actor {
             ActorCommand::ClipboardPull { label, reply } => {
                 let _ = reply.send(self.on_clipboard_pull(&label));
             }
+            ActorCommand::FileOffer { label, path, reply } => {
+                let result = self.on_file_offer(&label, path);
+                let _ = reply.send(result);
+            }
+            ActorCommand::FileAccept {
+                label,
+                accept,
+                directory,
+                reply,
+            } => {
+                let result = self.on_file_accept(&label, accept, directory);
+                let _ = reply.send(result);
+            }
+            ActorCommand::FileAbort {
+                label,
+                transfer_id,
+                reply,
+            } => {
+                let result = self.on_file_abort(&label, transfer_id);
+                let _ = reply.send(result);
+            }
+            ActorCommand::FileTransfers { reply } => {
+                let _ = reply.send(self.file_transfers_dto());
+            }
             ActorCommand::AudioOn { label, reply } => {
                 let _ = reply.send(self.on_audio_toggle(&label, true));
             }
             ActorCommand::AudioOff { label, reply } => {
                 let _ = reply.send(self.on_audio_toggle(&label, false));
             }
-            ActorCommand::RecordOn { label, path, reply } => {
-                let _ = reply.send(self.on_record_toggle(&label, Some(path)));
+            ActorCommand::RecordToggle { label, on, reply } => {
+                let _ = reply.send(self.on_record_toggle(&label, on));
             }
-            ActorCommand::RecordOff { label, reply } => {
-                let _ = reply.send(self.on_record_toggle(&label, None));
+            ActorCommand::RecordRequest { label, reply } => {
+                let _ = reply.send(self.on_record_request(&label));
             }
             ActorCommand::SasRequest { label, reply } => {
                 let _ = reply.send(self.on_sas_request(&label));
@@ -1987,6 +3178,66 @@ impl Actor {
             ActorCommand::MonitorsList { label, reply } => {
                 let _ = reply.send(self.on_monitors_list(&label));
             }
+            ActorCommand::SetGrant {
+                label,
+                grant,
+                allowed,
+                reply,
+            } => {
+                let _ = reply.send(self.on_set_grant(&label, grant, allowed));
+            }
+            ActorCommand::AddressBookList { reply } => {
+                let _ = reply.send(self.on_address_book_list());
+            }
+            ActorCommand::AddressBookUpsert {
+                label,
+                name,
+                tags,
+                notes,
+                reply,
+            } => {
+                let result = self.on_address_book_upsert(&label, name, tags, notes);
+                self.rebuild_labels_and_snapshot();
+                let _ = reply.send(result);
+            }
+            ActorCommand::AddressBookRemove { label, reply } => {
+                let result = self.on_address_book_remove(&label);
+                self.rebuild_labels_and_snapshot();
+                let _ = reply.send(result);
+            }
+            ActorCommand::AddressBookSetTrusted {
+                label,
+                trusted,
+                reply,
+            } => {
+                let _ = reply.send(self.on_address_book_set_trusted(&label, trusted));
+            }
+            ActorCommand::UnattendedStatus { reply } => {
+                let _ = reply.send(UnattendedSettings {
+                    enabled: self.unattended.enabled(),
+                    totp_enabled: self.unattended.code_required(),
+                    role: self.unattended.role(),
+                });
+            }
+            ActorCommand::UnattendedSetPassword { password, reply } => {
+                let _ = reply.send(self.on_unattended_set_password(&password));
+            }
+            ActorCommand::UnattendedDisable { reply } => {
+                let _ = reply.send(self.on_unattended_disable());
+            }
+            ActorCommand::UnattendedSetTotp { enabled, reply } => {
+                let _ = reply.send(self.on_unattended_set_totp(enabled));
+            }
+            ActorCommand::UnattendedSetRole { role, reply } => {
+                let _ = reply.send(self.on_unattended_set_role(role));
+            }
+            ActorCommand::UnattendedSubmit {
+                password,
+                code,
+                reply,
+            } => {
+                let _ = reply.send(self.on_unattended_submit(&password, code));
+            }
         }
     }
 
@@ -1994,28 +3245,42 @@ impl Actor {
     ///
     /// Gated on the independent `recording` grant (§8.2): a session that was
     /// granted view/input/clipboard but not `recording` cannot be recorded,
-    /// no matter what the UI asks. The file lands only where the host user
-    /// chose; the guest is never told recording state changed beyond what the
-    /// §15 log policy already allows.
-    fn on_record_toggle(&mut self, label: &str, path: Option<String>) -> Result<(), ActorError> {
+    /// no matter what the UI asks.
+    ///
+    /// The destination is decided here and only reported back (§2.3): the
+    /// webview is the untrusted view layer, so it says *whether* to record and
+    /// never *where* the file lands. Starting answers with the path so the
+    /// operator can find it; stopping answers with `None`.
+    ///
+    /// Both sides are told. The host sees its own indicator through
+    /// `session_status`; the guest is sent `RecordAck`, which is also the
+    /// answer to a pending `RecordRequest` when there is one. There is no
+    /// recording anybody is not told about (§2.2: no hidden capture).
+    fn on_record_toggle(&mut self, label: &str, on: bool) -> Result<Option<String>, ActorError> {
         let peer = self.resolve(label)?;
-        if let Some(path) = path {
+        if on {
             let permitted = self.connections.contains_key(&peer)
                 && self.sessions.state(&peer) == SessionState::Active
                 && self.sessions.grants(&peer).is_some_and(|g| g.recording);
             if !permitted {
+                // A refusal answers a waiting guest too: leaving the request
+                // pending would hide the decision the host just made.
+                if self.record_requests.remove(&peer) {
+                    self.send_to(&peer, MessageKind::RecordAck(false));
+                }
                 return Err(ActorError::Core(CoreError::NotPermitted));
             }
-            if self.recorders.contains_key(&peer) {
-                return Ok(()); // already recording this session
+            if let Some(running) = self.recorders.get(&peer) {
+                // Already recording this session: idempotent, and the path is
+                // still the answer so a second press cannot look like failure.
+                return Ok(Some(running.path().to_string_lossy().into_owned()));
             }
+            let path = recording_path(label)?;
             let recorder = Arc::new(
-                crate::recorder::SessionRecorder::start(std::path::PathBuf::from(path)).map_err(
-                    |error| {
-                        tracing::warn!(peer = %label, %error, "cannot open the recording file");
-                        ActorError::Net(NetError::Io(error.to_string()))
-                    },
-                )?,
+                crate::recorder::SessionRecorder::start(path.clone()).map_err(|error| {
+                    tracing::warn!(peer = %label, %error, "cannot open the recording file");
+                    ActorError::Net(NetError::Io(error.to_string()))
+                })?,
             );
             recorder.write_event(
                 0,
@@ -2035,23 +3300,66 @@ impl Actor {
                 audio.set_recorder(Some(Arc::clone(&recorder)));
             }
             self.recorders.insert(peer, recorder);
-            tracing::info!(peer = %label, "recording started");
-        } else if let Some(recorder) = self.recorders.remove(&peer) {
-            // Take it out of the live loops first so no new record lands after
-            // the stop event.
-            if let Some(session) = self.media.get_mut(&peer) {
-                *session
-                    .recorder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.record_requests.remove(&peer);
+            // The guest is told either way, whether or not it asked: the
+            // indicator on its screen is this message.
+            self.send_to(&peer, MessageKind::RecordAck(true));
+            // §15 keeps paths out of the audit log; the event says that
+            // recording started, not where it is being written.
+            tracing::info!(
+                peer = %label,
+                event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: true },
+                "recording started"
+            );
+            Ok(Some(path.to_string_lossy().into_owned()))
+        } else {
+            if let Some(recorder) = self.recorders.remove(&peer) {
+                // Take it out of the live loops first so no new record lands
+                // after the stop event.
+                if let Some(session) = self.media.get_mut(&peer) {
+                    *session
+                        .recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+                if let Some(audio) = self.audio.get_mut(&peer) {
+                    audio.set_recorder(None);
+                }
+                recorder.write_event(0, r#"{"event":"record-stop"}"#);
+                let clean = recorder.stop();
+                let dropped = recorder.dropped();
+                tracing::info!(
+                    peer = %label,
+                    clean,
+                    dropped,
+                    event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
+                    "recording stopped"
+                );
             }
-            if let Some(audio) = self.audio.get_mut(&peer) {
-                audio.set_recorder(None);
+            // Off is also how the host declines a pending request: either way
+            // the guest ends up being told nothing is being recorded.
+            let asked = self.record_requests.remove(&peer);
+            if asked || self.connections.contains_key(&peer) {
+                self.send_to(&peer, MessageKind::RecordAck(false));
             }
-            recorder.write_event(0, r#"{"event":"record-stop"}"#);
-            let clean = recorder.stop();
-            tracing::info!(peer = %label, clean, "recording stopped");
+            Ok(None)
         }
+    }
+
+    /// Guest side: asks the host behind `label` to record the session (§17).
+    ///
+    /// Nothing is decided here and nothing is started: this only puts the
+    /// question in front of the person at the host, who answers with
+    /// `RecordAck`. A guest cannot record a host's screen by asking twice.
+    fn on_record_request(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        // Only from a session this node is actually watching: a guest with no
+        // view has nothing to ask about, and a host must not be able to send
+        // this to its own guest.
+        if !self.views.contains_key(&peer) {
+            return Err(ActorError::UnknownPeer);
+        }
+        self.send_to(&peer, MessageKind::RecordRequest);
         Ok(())
     }
 
@@ -2346,27 +3654,24 @@ impl Actor {
         Ok(stored)
     }
 
-    /// Push the local clipboard to `label`, gated on this side's own copy of
-    /// the clipboard grants (§8.2): a host pushes only with
-    /// `clipboard_read` of that guest session, a guest only with
-    /// `clipboard_write` announced by the host. The host re-checks.
+    /// Push the local clipboard to `label` (§9.2).
+    ///
+    /// On the host this is a grant decision: handing this desktop's clipboard
+    /// to a guest is exactly what `clipboard_read` means, and the session has
+    /// to hold it. On the guest there is no grant to consult, because a guest
+    /// is given none (ADR 0029). What stands in for one is that this path
+    /// runs only from a deliberate press in the guest's own view window: the
+    /// guest's clipboard is the guest's to offer, and whether the host
+    /// *accepts* it is decided on arrival, against `clipboard_write`, by the
+    /// only core entitled to decide it.
     fn on_clipboard_push(&mut self, label: &str, text: &str) -> Result<(), ActorError> {
-        use lumepeer_core::clipboard as clip;
         let peer = self.resolve(label)?;
-        let permitted = if self.host_addrs.contains_key(&peer) {
-            // This node dialed the peer: it is the guest. Sending our
-            // clipboard *to* the host writes there, so the grant needed is
-            // the one the host gave us for writing its clipboard... which is
-            // exactly `clipboard_write`.
-            self.views
-                .get(&peer)
-                .is_some_and(|v| v.grants.clipboard_write)
+        let permitted = if self.views.contains_key(&peer) {
+            true
         } else {
-            // Host side: handing our clipboard out reads it, so the session
-            // must carry `clipboard_read`.
             self.sessions
                 .grants(&peer)
-                .is_some_and(|g| g.clipboard_read)
+                .is_some_and(|g| clip::permits(g, ClipboardFlow::HostToGuest))
         };
         if !permitted {
             return Err(ActorError::Core(CoreError::NotPermitted));
@@ -2390,6 +3695,788 @@ impl Actor {
         Ok(())
     }
 
+    /// This desktop's clipboard changed and at least one session is allowed
+    /// to see it (§8.2, §9.2).
+    ///
+    /// Only the host side runs a watcher, so every recipient here is a guest
+    /// whose session carries `clipboard_read`. A session that does not carry
+    /// it is skipped without a word: the change is not an error, it simply is
+    /// not that session's to receive.
+    fn on_local_clipboard(&mut self, text: &str) {
+        let recipients: Vec<NodeId> = self
+            .sessions
+            .active()
+            .into_iter()
+            .filter(|(peer, _, grants)| {
+                self.sessions.state(peer) == SessionState::Active
+                    && clip::permits(*grants, ClipboardFlow::HostToGuest)
+            })
+            .map(|(peer, _, _)| peer)
+            .collect();
+        for peer in recipients {
+            let label = self.label_of(&peer);
+            if let Err(error) = self.on_clipboard_push(&label, text) {
+                // Only the fact and the pseudonymized peer are logged; the
+                // content of a clipboard never reaches a log line (§15).
+                tracing::debug!(peer = %label, ?error, "clipboard change not sent to this session");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // File transfer (§9.2, §4; ADR 0032)
+    // ---------------------------------------------------------------------
+
+    /// Whether this node may exchange files with `peer` right now.
+    ///
+    /// The same asymmetry as the clipboard, and for the same reason (§2.3;
+    /// ADR 0029, ADR 0030). A host holds the `file_transfer` grant and is the
+    /// only side whose answer decides anything. A guest holds no grants of
+    /// its own, so all it can check is that it still has an open view with
+    /// that host — it may *offer*, and the host refuses on arrival if the
+    /// grant is not live.
+    fn may_transfer_files(&self, peer: &NodeId) -> bool {
+        if self.views.contains_key(peer) {
+            return true;
+        }
+        self.sessions.state(peer) == SessionState::Active
+            && self
+                .sessions
+                .grants(peer)
+                .is_some_and(|grants| grants.file_transfer)
+    }
+
+    /// The shared receiver-side state for `peer`, created on first use.
+    fn file_channel(&mut self, peer: NodeId) -> FileChannel {
+        self.file_channels
+            .entry(peer)
+            .or_insert_with(FileChannel::new)
+            .clone()
+    }
+
+    /// Records one file action in the audit log (§15).
+    ///
+    /// The tag and the pseudonymized peer, and nothing else: a file name is
+    /// exactly what §15 keeps out of this log.
+    fn audit_file(&self, peer: &NodeId, action: &'static str) {
+        let event = lumepeer_core::audit::AuditEvent::FileAction { action };
+        tracing::info!(peer = %self.label_of(peer), ?event, "file transfer");
+    }
+
+    /// Either side: offer one local file to `label` (§9.2).
+    ///
+    /// Nothing is read here. Measuring and hashing up to
+    /// `FILE_OFFER_MAX_BYTES` runs on its own task and comes back as
+    /// [`FileEvent::Prepared`]; doing it inline would stop the actor
+    /// answering anything else for the length of a disk pass (ADR 0027).
+    fn on_file_offer(&mut self, label: &str, path: String) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.may_transfer_files(&peer) {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        if !self.speaks_file_transfer.contains(&peer) {
+            return Err(ActorError::Unsupported);
+        }
+        if self.outstanding_offers(&peer) >= MAX_PENDING_FILE_OFFERS {
+            return Err(ActorError::Net(NetError::TooManyTransfers));
+        }
+        let events = self.events_tx.clone();
+        let tag = label.to_owned();
+        tokio::spawn(async move {
+            let path = std::path::PathBuf::from(path);
+            let event = match prepare_offer(&path).await {
+                Ok((name, size, hash)) => FileEvent::Prepared {
+                    peer,
+                    path,
+                    name,
+                    size,
+                    hash,
+                },
+                Err(error) => {
+                    // The path is this user's own and stays out of the log,
+                    // like every other file name (§15).
+                    tracing::warn!(peer = %tag, %error, "a file could not be offered");
+                    FileEvent::PrepareFailed { peer }
+                }
+            };
+            let _ = events.send(ActorEvent::File(event)).await;
+        });
+        Ok(())
+    }
+
+    /// Offers to `peer` that are either being hashed or already announced.
+    fn outstanding_offers(&self, peer: &NodeId) -> usize {
+        self.file_offers_out.get(peer).map_or(0, VecDeque::len)
+    }
+
+    /// Either side: answer the oldest offer `label` made (§9.2).
+    fn on_file_accept(
+        &mut self,
+        label: &str,
+        accept: bool,
+        directory: Option<String>,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let offer = self
+            .file_offers_in
+            .get_mut(&peer)
+            .and_then(VecDeque::pop_front)
+            .ok_or(ActorError::UnknownPeer)?;
+        if !accept {
+            // §4: a refused offer opens nothing at all. There is no
+            // connection to tear down afterwards because there never was one.
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            self.audit_file(&peer, "offer-declined");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return Ok(());
+        }
+        if !self.may_transfer_files(&peer) {
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        let directory = directory
+            .map(std::path::PathBuf::from)
+            .ok_or(ActorError::Core(CoreError::Malformed))?;
+        let destination = unique_destination(&directory, &offer.name);
+        self.file_accepted
+            .entry(peer)
+            .or_default()
+            .push_back(AcceptedOffer {
+                name: offer.name,
+                size: offer.size,
+                hash: offer.hash,
+                destination,
+            });
+        self.send_to(&peer, MessageKind::FileAccept(true));
+        self.audit_file(&peer, "offer-accepted");
+        // The receiving side opens the connection when it is the guest; a
+        // host has no address to dial and waits for the guest's (§4, ADR
+        // 0026). Either way this is the first moment `rd/file/1` may exist.
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+        Ok(())
+    }
+
+    /// Either side: stop one running transfer (§9.2).
+    fn on_file_abort(&mut self, label: &str, transfer_id: TransferId) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.file_transfers.contains_key(&(peer, transfer_id)) {
+            return Err(ActorError::UnknownPeer);
+        }
+        self.send_to(&peer, MessageKind::FileAbort { transfer_id });
+        self.cancel_transfer(peer, transfer_id);
+        Ok(())
+    }
+
+    /// Ends one transfer on this side: the send task stops, staging is
+    /// removed, and nothing is exported (§9.2).
+    fn cancel_transfer(&mut self, peer: NodeId, transfer_id: TransferId) {
+        if let Some(task) = self.file_send_tasks.remove(&(peer, transfer_id)) {
+            task.abort();
+        }
+        if let Some(row) = self.file_transfers.get_mut(&(peer, transfer_id))
+            && row.state == TransferState::Running
+        {
+            row.state = TransferState::Cancelled;
+        }
+        if let Some(channel) = self.file_channels.get(&peer).cloned() {
+            tokio::spawn(async move {
+                let mut inbox = channel.inbox.lock().await;
+                inbox.tracker.cancel(transfer_id);
+                inbox.expected.remove(&transfer_id);
+                if let Some(staged) = inbox.staged.remove(&transfer_id) {
+                    staged.discard().await;
+                }
+            });
+        }
+        self.audit_file(&peer, "transfer-cancelled");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// The offers and transfers the UI draws.
+    fn file_transfers_dto(&self) -> FileTransfersDto {
+        let mut offers: Vec<OfferRow> = Vec::new();
+        for (peer, queue) in &self.file_offers_in {
+            let peer_label = self.label_of(peer);
+            for offer in queue {
+                offers.push(OfferRow {
+                    peer_label: peer_label.clone(),
+                    name: offer.name.clone(),
+                    size: offer.size,
+                });
+            }
+        }
+        let mut transfers: Vec<TransferRow> = self.file_transfers.values().cloned().collect();
+        transfers.sort_by_key(|row| row.transfer_id);
+        FileTransfersDto { offers, transfers }
+    }
+
+    /// The peer's `rd/file/1` connection, if there is still one that is up.
+    ///
+    /// A connection the far side closed — or that a withdrawn `file_transfer`
+    /// grant closed on this side — stays in the map until something looks at
+    /// it: QUIC reports the close on use, not through a callback the actor
+    /// could listen to. So every point of use asks here, and a dead entry is
+    /// evicted rather than handed out. Without it the first teardown would be
+    /// permanent: `ensure_file_connection` would keep finding an entry, never
+    /// dial again, and every later transfer would wait on a connection that
+    /// accepts nothing.
+    fn live_file_connection(&mut self, peer: NodeId) -> Option<iroh::endpoint::Connection> {
+        let connection = self.file_conns.get(&peer)?;
+        if connection.close_reason().is_some() {
+            tracing::debug!(peer = %self.label_of(&peer), "dropping a closed file connection");
+            self.file_conns.remove(&peer);
+            return None;
+        }
+        Some(connection.clone())
+    }
+
+    /// Opens `rd/file/1` towards `peer`, if this side is the one that can.
+    ///
+    /// Only the node that dialed the control connection dials this one: the
+    /// host was dialed and holds no address for the guest, exactly as with
+    /// `rd/media/1` (§4.1, ADR 0026). On the host the connection therefore
+    /// arrives rather than being made, and anything queued waits for it.
+    fn ensure_file_connection(&mut self, peer: NodeId) {
+        if self.live_file_connection(peer).is_some() {
+            self.start_pending_sends(peer);
+            return;
+        }
+        if self.file_dialing.contains(&peer) {
+            return;
+        }
+        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+            return;
+        };
+        self.file_dialing.insert(peer);
+        let endpoint = self.endpoint.clone();
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        tokio::spawn(async move {
+            let event = match endpoint.connect(addr, lumepeer_net::ALPN_FILE).await {
+                Ok(connection) => FileEvent::Connected {
+                    peer,
+                    connection: Box::new(connection),
+                },
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "could not open the file connection");
+                    FileEvent::ConnectFailed { peer }
+                }
+            };
+            let _ = events.send(ActorEvent::File(event)).await;
+        });
+    }
+
+    /// Starts every send that was waiting for the connection.
+    fn start_pending_sends(&mut self, peer: NodeId) {
+        let Some(connection) = self.live_file_connection(peer) else {
+            return;
+        };
+        for job in self.file_pending_sends.remove(&peer).unwrap_or_default() {
+            self.spawn_send(peer, connection.clone(), job);
+        }
+    }
+
+    /// Pushes one file onto its own unidirectional stream.
+    ///
+    /// One stream per transfer, so three concurrent transfers cannot
+    /// interleave into a single ordered stream and make the slowest of them
+    /// the speed of all three. Progress goes back through `try_send`: a
+    /// dropped progress update costs a UI frame, and blocking a transfer on
+    /// the actor's mailbox would cost the transfer.
+    fn spawn_send(&mut self, peer: NodeId, connection: iroh::endpoint::Connection, job: SendJob) {
+        let events = self.events_tx.clone();
+        let progress = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        let id = job.id;
+        let task = tokio::spawn(async move {
+            let mut send = match connection.open_uni().await {
+                Ok(send) => send,
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "could not open a file stream");
+                    let _ = events
+                        .send(ActorEvent::File(FileEvent::Finished {
+                            peer,
+                            id,
+                            state: TransferState::Failed,
+                        }))
+                        .await;
+                    return;
+                }
+            };
+            let result = send_file(&mut send, id, &job.path, job.from, |at| {
+                let _ = progress.try_send(ActorEvent::File(FileEvent::Progress {
+                    peer,
+                    id,
+                    moved: at,
+                }));
+            })
+            .await;
+            match result {
+                Ok(()) => {
+                    // Finishing the stream is what tells the far side there
+                    // are no more chunks. Completion itself is *not* claimed
+                    // here: only the receiver can say the hash matched, and
+                    // it says so with a final `FileChunkAck` at the full size.
+                    let _ = send.finish();
+                }
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "a file send ended early");
+                    let _ = events
+                        .send(ActorEvent::File(FileEvent::Finished {
+                            peer,
+                            id,
+                            state: TransferState::Failed,
+                        }))
+                        .await;
+                }
+            }
+        });
+        self.file_send_tasks.insert((peer, id), task);
+    }
+
+    /// Reads every chunk stream a peer opens on its file connection.
+    fn spawn_file_reader(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+        let channel = self.file_channel(peer);
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        tokio::spawn(async move {
+            loop {
+                let Ok(recv) = connection.accept_uni().await else {
+                    tracing::debug!(peer = %tag, "the file connection ended");
+                    return;
+                };
+                tokio::spawn(read_transfer_stream(
+                    recv,
+                    channel.clone(),
+                    peer,
+                    tag.clone(),
+                    events.clone(),
+                ));
+            }
+        });
+    }
+
+    /// One thing that happened to a transfer, back on the actor's own thread.
+    fn on_file_event(&mut self, event: FileEvent) {
+        match event {
+            FileEvent::Prepared {
+                peer,
+                path,
+                name,
+                size,
+                hash,
+            } => self.on_offer_prepared(peer, path, name, size, hash),
+            FileEvent::PrepareFailed { peer } | FileEvent::ConnectFailed { peer } => {
+                self.file_dialing.remove(&peer);
+                self.file_pending_sends.remove(&peer);
+                let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            }
+            FileEvent::Connected { peer, connection } => self.on_file_connected(peer, *connection),
+            FileEvent::Progress { peer, id, moved } => self.on_file_progress(peer, id, moved),
+            FileEvent::Finished { peer, id, state } => self.on_file_finished(peer, id, state),
+        }
+    }
+
+    /// A local file finished hashing and can be announced (§9.2).
+    fn on_offer_prepared(
+        &mut self,
+        peer: NodeId,
+        path: std::path::PathBuf,
+        name: String,
+        size: u64,
+        hash: [u8; 32],
+    ) {
+        // Re-checked rather than assumed: hashing a large file takes long
+        // enough for a revoke to land in the middle of it.
+        if !self.may_transfer_files(&peer)
+            || self.outstanding_offers(&peer) >= MAX_PENDING_FILE_OFFERS
+        {
+            tracing::warn!(peer = %self.label_of(&peer), "dropping a prepared offer");
+            return;
+        }
+        self.send_to(
+            &peer,
+            MessageKind::FileOffer {
+                name: name.clone(),
+                size,
+                hash,
+            },
+        );
+        self.file_offers_out
+            .entry(peer)
+            .or_default()
+            .push_back(OutgoingOffer {
+                path,
+                name,
+                size,
+                hash,
+            });
+        self.audit_file(&peer, "offer-sent");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// `rd/file/1` towards `peer` is up (§4).
+    ///
+    /// Authorized here and nowhere else, on the one thread that can read
+    /// `SessionManager`. A connection from a peer with no live granted
+    /// session carrying `file_transfer` is closed on the spot, which is what
+    /// keeps the accept path safe now that it no longer refuses every file
+    /// connection unconditionally.
+    fn on_file_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+        self.file_dialing.remove(&peer);
+        let tag = self.label_of(&peer);
+        if !self.connections.contains_key(&peer) || !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %tag, "refusing a file connection without a granted session");
+            connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+            return;
+        }
+        if let Some(previous) = self.file_conns.insert(peer, connection.clone()) {
+            previous.close(0u32.into(), b"replaced");
+        }
+        self.spawn_file_reader(peer, connection);
+        self.start_pending_sends(peer);
+    }
+
+    /// Bytes moved on a transfer this node is receiving or sending.
+    fn on_file_progress(&mut self, peer: NodeId, id: TransferId, moved: u64) {
+        let Some(row) = self.file_transfers.get_mut(&(peer, id)) else {
+            return;
+        };
+        row.moved = moved;
+        let incoming = row.incoming;
+        let size = row.size;
+        if incoming && moved < size {
+            // The receiver's running ack, which is also the resume point the
+            // sender picks up from after a reconnect (§10). The ack at the
+            // full size is deliberately not sent here: it is sent once the
+            // hash has been verified, so that "the sender saw size" and "the
+            // file is on disk" cannot come apart.
+            self.send_to(
+                &peer,
+                MessageKind::FileChunkAck {
+                    transfer_id: id,
+                    offset: moved,
+                },
+            );
+        }
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// A transfer ended on this side.
+    fn on_file_finished(&mut self, peer: NodeId, id: TransferId, state: TransferState) {
+        let Some(row) = self.file_transfers.get_mut(&(peer, id)) else {
+            return;
+        };
+        row.state = state;
+        let incoming = row.incoming;
+        let size = row.size;
+        if state == TransferState::Completed {
+            row.moved = size;
+        }
+        self.file_send_tasks.remove(&(peer, id));
+        if incoming {
+            match state {
+                // Sent only now: this ack means "verified and on disk", which
+                // is the only completion the sender can honestly report.
+                TransferState::Completed => self.send_to(
+                    &peer,
+                    MessageKind::FileChunkAck {
+                        transfer_id: id,
+                        offset: size,
+                    },
+                ),
+                TransferState::Failed | TransferState::Cancelled => {
+                    self.send_to(&peer, MessageKind::FileAbort { transfer_id: id });
+                }
+                TransferState::Running => {}
+            }
+        }
+        self.audit_file(
+            &peer,
+            match state {
+                TransferState::Completed => "transfer-completed",
+                TransferState::Cancelled => "transfer-cancelled",
+                TransferState::Failed => "transfer-failed",
+                TransferState::Running => "transfer-running",
+            },
+        );
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `FileOffer`: someone wants to send this node a file (§9.2).
+    fn on_file_offer_inbound(&mut self, peer: NodeId, name: &str, size: u64, hash: [u8; 32]) {
+        let tag = self.label_of(&peer);
+        if !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %tag, "a file offer without a grant; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        // The name is the sender's, which is to say an attacker's. Anything
+        // that is not a plain basename is declined rather than repaired
+        // (§18): a rewritten name is a file the user did not agree to, under
+        // a name neither side chose.
+        let Some(name) = safe_file_name(name) else {
+            tracing::warn!(peer = %tag, "a file offer whose name is not a plain basename; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        };
+        if size > FILE_OFFER_MAX_BYTES {
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        let queue = self.file_offers_in.entry(peer).or_default();
+        if queue.len() >= MAX_PENDING_FILE_OFFERS {
+            tracing::warn!(peer = %tag, "declining an offer past the pending limit");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        queue.push_back(PendingOffer { name, size, hash });
+        self.audit_file(&peer, "offer-received");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `FileAccept`: the peer answered this node's oldest offer.
+    fn on_file_accept_inbound(&mut self, peer: NodeId, accepted: bool) {
+        let tag = self.label_of(&peer);
+        let Some(offer) = self
+            .file_offers_out
+            .get_mut(&peer)
+            .and_then(VecDeque::pop_front)
+        else {
+            tracing::warn!(peer = %tag, "a file answer with no offer outstanding");
+            return;
+        };
+        if !accepted {
+            self.audit_file(&peer, "offer-refused");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return;
+        }
+        if !self.may_transfer_files(&peer) {
+            return;
+        }
+        let id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        self.send_to(
+            &peer,
+            MessageKind::FileTransferStart {
+                transfer_id: id,
+                name: offer.name.clone(),
+                size: offer.size,
+                hash: offer.hash,
+            },
+        );
+        self.file_transfers.insert(
+            (peer, id),
+            TransferRow {
+                peer_label: tag,
+                transfer_id: id,
+                name: offer.name,
+                size: offer.size,
+                moved: 0,
+                incoming: false,
+                state: TransferState::Running,
+            },
+        );
+        self.file_pending_sends
+            .entry(peer)
+            .or_default()
+            .push(SendJob {
+                id,
+                path: offer.path,
+                from: 0,
+            });
+        self.ensure_file_connection(peer);
+        self.audit_file(&peer, "transfer-started");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `FileTransferStart`: the sender names the transfer it is about
+    /// to push (§9.2; ADR 0032).
+    fn on_file_transfer_start(
+        &mut self,
+        peer: NodeId,
+        transfer_id: TransferId,
+        name: &str,
+        size: u64,
+        hash: [u8; 32],
+    ) {
+        let tag = self.label_of(&peer);
+        if !self.may_transfer_files(&peer) {
+            self.send_to(&peer, MessageKind::FileAbort { transfer_id });
+            return;
+        }
+        let Some(accepted) = self
+            .file_accepted
+            .get_mut(&peer)
+            .and_then(VecDeque::pop_front)
+        else {
+            tracing::warn!(peer = %tag, "a transfer start with no accepted offer behind it");
+            self.send_to(&peer, MessageKind::FileAbort { transfer_id });
+            return;
+        };
+        // This is why the start restates the offer: without it the id would
+        // mean "whichever offer we both believe was accepted last", and a
+        // sender could start a different file under an answer given for this
+        // one.
+        if accepted.name != name || accepted.size != size || accepted.hash != hash {
+            tracing::warn!(peer = %tag, "a transfer start that does not describe the accepted offer");
+            self.send_to(&peer, MessageKind::FileAbort { transfer_id });
+            return;
+        }
+        self.file_transfers.insert(
+            (peer, transfer_id),
+            TransferRow {
+                peer_label: tag.clone(),
+                transfer_id,
+                name: accepted.name,
+                size,
+                moved: 0,
+                incoming: true,
+                state: TransferState::Running,
+            },
+        );
+        let channel = self.file_channel(peer);
+        let events = self.events_tx.clone();
+        let destination = accepted.destination;
+        tokio::spawn(async move {
+            let mut inbox = channel.inbox.lock().await;
+            if let Err(error) = inbox.tracker.begin_with(transfer_id, size) {
+                tracing::warn!(peer = %tag, %error, "refusing a transfer");
+                drop(inbox);
+                let _ = events
+                    .send(ActorEvent::File(FileEvent::Finished {
+                        peer,
+                        id: transfer_id,
+                        state: TransferState::Failed,
+                    }))
+                    .await;
+                return;
+            }
+            // Staging lives beside the destination, so exporting is a rename
+            // on one volume rather than a second pass over the whole file —
+            // and an unwritable destination fails at the first chunk instead
+            // of after the last one (§9.2).
+            let directory = destination.parent().map_or_else(
+                || std::path::PathBuf::from("."),
+                std::path::Path::to_path_buf,
+            );
+            match StagedReceive::create(&directory, transfer_id).await {
+                Ok(staged) => {
+                    inbox.staged.insert(transfer_id, staged);
+                    inbox.expected.insert(transfer_id, (hash, destination));
+                    drop(inbox);
+                    channel.announce_start();
+                }
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "no staging file for this transfer");
+                    inbox.tracker.cancel(transfer_id);
+                    drop(inbox);
+                    let _ = events
+                        .send(ActorEvent::File(FileEvent::Finished {
+                            peer,
+                            id: transfer_id,
+                            state: TransferState::Failed,
+                        }))
+                        .await;
+                }
+            }
+        });
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `FileChunkAck`: the receiver reports its resume point, and at
+    /// the full size, its verified completion (§9.2, §10).
+    fn on_file_chunk_ack(&mut self, peer: NodeId, transfer_id: TransferId, offset: u64) {
+        let Some(row) = self.file_transfers.get_mut(&(peer, transfer_id)) else {
+            return;
+        };
+        if row.incoming {
+            return;
+        }
+        row.moved = offset.min(row.size);
+        if offset >= row.size {
+            row.state = TransferState::Completed;
+            self.file_send_tasks.remove(&(peer, transfer_id));
+            self.audit_file(&peer, "transfer-completed");
+        }
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Every file connection, offer, staging file and transfer of one peer,
+    /// gone (§8.1).
+    ///
+    /// Called from every path that ends a session or the connection under it.
+    /// Nothing is exported on the way out: a transfer that was still running
+    /// when the grant behind it ended is a transfer that was never finished
+    /// being allowed. The peer's `FEATURE_FILE_TRANSFER` advertisement goes
+    /// too, because it is a fact about a connection that is on its way out;
+    /// [`Self::abandon_file_transfers`] is the variant for a grant that ends
+    /// while the connection lives on.
+    fn drop_file_state(&mut self, peer: NodeId) {
+        self.abandon_file_transfers(peer);
+        self.speaks_file_transfer.remove(&peer);
+    }
+
+    /// The same teardown, minus the peer's feature advertisement (§8.1).
+    ///
+    /// This is what withdrawing `file_transfer` from a *live* session runs:
+    /// the connection stays up and the guest still speaks the feature, so
+    /// only what the grant paid for goes — the `rd/file/1` connection, the
+    /// offers on both sides, the running sends and every staging file, none
+    /// of it exported.
+    fn abandon_file_transfers(&mut self, peer: NodeId) {
+        if let Some(connection) = self.file_conns.remove(&peer) {
+            connection.close(0u32.into(), b"session ended");
+        }
+        self.file_dialing.remove(&peer);
+        self.file_offers_in.remove(&peer);
+        self.file_offers_out.remove(&peer);
+        self.file_accepted.remove(&peer);
+        self.file_pending_sends.remove(&peer);
+        self.file_send_tasks.retain(|(p, _), task| {
+            if *p == peer {
+                task.abort();
+                false
+            } else {
+                true
+            }
+        });
+        self.file_transfers.retain(|(p, _), _| *p != peer);
+        if let Some(channel) = self.file_channels.remove(&peer) {
+            tokio::spawn(async move {
+                let mut inbox = channel.inbox.lock().await;
+                let ids: Vec<TransferId> = inbox.staged.keys().copied().collect();
+                for id in ids {
+                    inbox.tracker.cancel(id);
+                    if let Some(staged) = inbox.staged.remove(&id) {
+                        staged.discard().await;
+                    }
+                }
+                inbox.expected.clear();
+            });
+        }
+    }
+
+    /// Starts or stops the clipboard watcher to match what the live sessions
+    /// currently allow (§8.1 applied to §9.2).
+    ///
+    /// The rule is the one that keeps capture off when nobody is watching:
+    /// with no session holding `clipboard_read`, this desktop's clipboard is
+    /// not read at all — not read and discarded. Called from every place a
+    /// grant, a session or a connection can change.
+    fn refresh_clipboard_watch(&self) {
+        let needed = self.sessions.active().into_iter().any(|(peer, _, grants)| {
+            self.sessions.state(&peer) == SessionState::Active
+                && clip::permits(grants, ClipboardFlow::HostToGuest)
+        });
+        self.clipboard_worker.set_watching(needed);
+    }
+
     /// Host side: grants `role` and, if it carries `view`, registers the peer
     /// as a viewer — which is what starts capture (§8.1, §11).
     ///
@@ -2398,6 +4485,19 @@ impl Actor {
     /// picture rather than being refused a session it did ask for (§18).
     fn on_grant(&mut self, label: &str, role: Role) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
+        self.grant_role(peer, role)
+    }
+
+    /// Starts a granted session, whichever decision produced it.
+    ///
+    /// Split out of [`Self::on_grant`] so the unattended path of §8 reaches
+    /// exactly the same code as the host user's own click: one place decides
+    /// (`lumepeer-core`), one place acts on the decision, and an admission
+    /// that skipped the dialog cannot end up with a different session shape
+    /// than one that did not (ADR 0033).
+    fn grant_role(&mut self, peer: NodeId, role: Role) -> Result<(), ActorError> {
+        let label = self.label_of(&peer);
+        let label = label.as_str();
         self.sessions.grant(peer, role).map_err(ActorError::Core)?;
         self.send_to(&peer, MessageKind::ConsentGrant(role));
         if self.sessions.grants(&peer).is_some_and(|g| g.view) {
@@ -2418,6 +4518,7 @@ impl Actor {
             }
         }
         tracing::info!(peer = %label, ?role, "consent granted");
+        self.refresh_clipboard_watch();
         Ok(())
     }
 
@@ -2432,6 +4533,7 @@ impl Actor {
         if self.views.contains_key(&peer) {
             tracing::info!(peer = %label, "leaving a session from the view window");
             self.settle_connect(peer, ConnectPhase::Idle);
+            self.drop_file_state(peer);
             // Records the host into the remembered list on its way out.
             self.stop_view(peer);
             self.host_addrs.remove(&peer);
@@ -2445,7 +4547,283 @@ impl Actor {
         self.sessions.revoke(peer).map_err(ActorError::Core)?;
         self.send_to(&peer, MessageKind::ConsentRevoke);
         self.stop_media(peer);
+        // A revoked session cannot be one of the reasons the clipboard is
+        // being watched, and the last one leaving stops the poll outright.
+        self.clipboard.remove(&peer);
+        self.clipboard_inbound.remove(&peer);
+        self.refresh_clipboard_watch();
+        // §4 in the direction that matters: a revoke must not have to wait
+        // for a 500 MiB transfer to finish before it takes effect, so the
+        // file connection is closed here and now.
+        self.drop_file_state(peer);
         tracing::info!(peer = %label, "consent revoked");
+        Ok(())
+    }
+
+    /// Host side: turns one independent grant of `label`'s session on or off
+    /// (§8.2; ADR 0029).
+    ///
+    /// Nothing is decided here and nothing goes out on the wire: grants are
+    /// not a wire concept, each side checks its own copy, and the guest simply
+    /// finds the next clipboard or file attempt permitted or refused. The
+    /// audit event the core hands back is logged rather than dropped so the
+    /// host has a record of widening its own session (§15).
+    ///
+    /// Switching a grant *off* is the half that has to reach further than the
+    /// next attempt. A grant already being spent — a clipboard being polled,
+    /// a transfer moving bytes, a recording being written — has to stop when
+    /// the switch does, or the host would watch the permission go and the
+    /// activity continue. That is §4's rule about a revoke not queueing behind
+    /// a 500 MiB transfer, applied to the finer switch beside it.
+    fn on_set_grant(
+        &mut self,
+        label: &str,
+        grant: IndependentGrant,
+        allowed: bool,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let event = self
+            .sessions
+            .set_grant(peer, grant, allowed)
+            .map_err(ActorError::Core)?;
+        // The label is already the pseudonymized tag; the raw `NodeId` never
+        // reaches a log line (§15).
+        tracing::info!(peer = %label, ?event, "an independent grant changed");
+        // `clipboard_read` is what decides whether this desktop's clipboard
+        // is read at all, so the watcher follows the switch immediately
+        // rather than on the next session change (ADR 0030).
+        self.refresh_clipboard_watch();
+        if !allowed {
+            // Exhaustive on purpose, with no `_` arm, for the reason
+            // `Grants::get` gives: a fifth independent grant must not be able
+            // to appear and quietly keep running after it is switched off.
+            match grant {
+                IndependentGrant::FileTransfer => self.abandon_file_transfers(peer),
+                // Idempotent, and the guest is told the recording stopped by
+                // the same `RecordAck(false)` a manual stop sends.
+                IndependentGrant::Recording => {
+                    let _ = self.on_record_toggle(label, false)?;
+                }
+                // `clipboard_read` is already handled above: the watcher is
+                // what "spending" that grant looks like, and it has stopped.
+                // `clipboard_write` is spent by the peer, not here, and every
+                // inbound payload is checked against the live grant as it
+                // arrives.
+                IndependentGrant::ClipboardRead | IndependentGrant::ClipboardWrite => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Host side: the address book as the UI sees it (§8; ADR 0034).
+    ///
+    /// The raw `NodeId` each entry is keyed on stays here: what goes out is
+    /// the same pseudonymized label every other panel names a peer by (§15).
+    /// An entry whose key no longer decodes is skipped by `peers()` rather
+    /// than shown as a device nothing can act on.
+    fn on_address_book_list(&self) -> Vec<AddressBookRow> {
+        self.address_book
+            .book()
+            .peers()
+            .map(|(peer, entry)| AddressBookRow {
+                peer_label: self.label_of(&peer),
+                name: entry.label.clone(),
+                tags: entry.tags.clone(),
+                notes: entry.notes.clone(),
+                trusted: entry.trusted,
+                connected: self.connections.contains_key(&peer),
+            })
+            .collect()
+    }
+
+    /// Host side: saves or updates one device, keeping its trust flag.
+    ///
+    /// Trust is never set here, not even for a device that already has it
+    /// withdrawn and back: editing a name must not be a path to a permission,
+    /// so this preserves whatever `set_trusted` last decided and changes
+    /// nothing else (§2.1).
+    fn on_address_book_upsert(
+        &mut self,
+        label: &str,
+        name: String,
+        tags: Vec<String>,
+        notes: String,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let trusted = self.address_book.book().is_trusted(&peer);
+        self.address_book.upsert(
+            &peer,
+            AddressEntry {
+                label: name,
+                tags,
+                notes,
+                trusted,
+            },
+        );
+        tracing::info!(peer = %label, trusted, "address book entry saved");
+        Ok(())
+    }
+
+    /// Host side: forgets one device, and with it any trust it held.
+    fn on_address_book_remove(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.address_book.remove(&peer) {
+            return Err(ActorError::UnknownPeer);
+        }
+        tracing::info!(peer = %label, "address book entry removed");
+        Ok(())
+    }
+
+    /// Host side: marks a device trusted, or withdraws that (§8; ADR 0034).
+    ///
+    /// The only place in the process where the trust flag moves, and it is
+    /// reachable only from the host's own main window. Nothing about a
+    /// successful connection, an invite or a login ever calls it: trust is
+    /// something the host user decides in advance, never something a peer can
+    /// earn by turning up.
+    fn on_address_book_set_trusted(
+        &mut self,
+        label: &str,
+        trusted: bool,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let Some(now) = self.address_book.set_trusted(&peer, trusted) else {
+            return Err(ActorError::UnknownPeer);
+        };
+        // Widening the host's own exposure, so it is logged like a grant
+        // change (§15); the label is already the pseudonymized tag, and the
+        // device's name and notes stay out of the log as host-identifying
+        // free text.
+        tracing::info!(
+            peer = %label,
+            event = ?AuditEvent::DeviceTrustChanged { trusted: now },
+            "device trust changed"
+        );
+        Ok(())
+    }
+
+    /// Host side: sets or replaces the device password (§8; ADR 0033).
+    ///
+    /// The policy check is `lumepeer-core`'s, and the hash never leaves it in
+    /// any other form: what lands in the keystore is the PHC string the core
+    /// produced. A keystore that refuses the write undoes the change rather
+    /// than leaving the host with a password only this process knows —
+    /// discovering that after a restart is the worst moment to discover it.
+    fn on_unattended_set_password(&mut self, password: &str) -> Result<(), ActorError> {
+        let previous = self.unattended.stored_secret().map(ToOwned::to_owned);
+        self.unattended
+            .set_password(password)
+            .map_err(ActorError::Unattended)?;
+        if let Err(error) = self.unattended_store.save_password(&self.unattended) {
+            match previous {
+                Some(phc) => self.unattended.restore_password_hash(&phc),
+                None => self.unattended.disable(),
+            }
+            return Err(ActorError::Net(error));
+        }
+        tracing::info!("the unattended device password was set");
+        Ok(())
+    }
+
+    /// Host side: turns unattended access off and forgets both factors.
+    ///
+    /// Sessions already granted through it are left alone: they were granted,
+    /// and ending them is what `session_revoke` is for. What stops is any
+    /// *further* admission — including one already in flight, which is why the
+    /// pending set is cleared here too.
+    fn on_unattended_disable(&mut self) -> Result<(), ActorError> {
+        self.unattended.disable();
+        self.unattended_pending.clear();
+        self.unattended_store.clear().map_err(ActorError::Net)?;
+        tracing::info!("unattended access turned off");
+        Ok(())
+    }
+
+    /// Host side: turns the second factor on or off (§8).
+    ///
+    /// Turning it on mints a fresh 20-byte secret from the platform CSPRNG and
+    /// hands it back once, because an authenticator app cannot be provisioned
+    /// without seeing it. Nothing keeps a copy for the UI to ask for again.
+    fn on_unattended_set_totp(
+        &mut self,
+        enabled: bool,
+    ) -> Result<Option<TotpProvisioning>, ActorError> {
+        if !enabled {
+            self.unattended.clear_totp_secret();
+            self.unattended_store
+                .save_totp(&self.unattended)
+                .map_err(ActorError::Net)?;
+            tracing::info!("the unattended second factor was turned off");
+            return Ok(None);
+        }
+        if !self.unattended.enabled() {
+            // A second factor without a first is not a gate: refuse rather
+            // than store a secret that could never be reached (§2.1).
+            return Err(ActorError::Unattended(UnattendedError::NotConfigured));
+        }
+        let previous = self.unattended.stored_totp_secret().copied();
+        let mut secret = [0u8; 20];
+        rand::rng().fill_bytes(&mut secret);
+        self.unattended.set_totp_secret(secret);
+        if let Err(error) = self.unattended_store.save_totp(&self.unattended) {
+            match previous {
+                Some(old) => self.unattended.set_totp_secret(old),
+                None => self.unattended.clear_totp_secret(),
+            }
+            return Err(ActorError::Net(error));
+        }
+        let totp = self
+            .unattended
+            .totp()
+            .ok_or(ActorError::Unattended(UnattendedError::NotConfigured))?;
+        tracing::info!("the unattended second factor was turned on");
+        Ok(Some(TotpProvisioning {
+            secret_base32: totp.secret_base32(),
+            // A fixed account name, never this machine's: the URI is meant to
+            // be shown on screen and photographed (§15).
+            uri: totp.provisioning_uri("device"),
+        }))
+    }
+
+    /// Host side: chooses the role a successful admission is granted (§8.2).
+    ///
+    /// Takes effect on the next admission. A session already running keeps the
+    /// snapshot it was granted under, the same rule that stops a policy edit
+    /// widening a live session.
+    fn on_unattended_set_role(&mut self, role: Role) -> Result<(), ActorError> {
+        let previous = self.unattended.role();
+        self.unattended.set_role(role);
+        if let Err(error) = self.unattended_store.save_role(&self.unattended) {
+            self.unattended.set_role(previous);
+            return Err(ActorError::Net(error));
+        }
+        tracing::info!(?role, "the unattended role was set");
+        Ok(())
+    }
+
+    /// Guest side: answers the host's credential challenge (§8; ADR 0033).
+    ///
+    /// The password reaches the wire and stops there: no field of this actor
+    /// holds it afterwards, and the reply says only that it went out. Whether
+    /// it was right comes back as a grant or a rejection.
+    fn on_unattended_submit(
+        &mut self,
+        password: &str,
+        code: Option<String>,
+    ) -> Result<(), ActorError> {
+        if self.connect_phase != ConnectPhase::AwaitingCredentials {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        let peer = self.connect_peer.ok_or(ActorError::UnknownPeer)?;
+        self.connect_failure = None;
+        self.connect_retry_secs = None;
+        self.send_to(
+            &peer,
+            MessageKind::UnattendedAuth {
+                password: password.to_owned(),
+                code,
+            },
+        );
         Ok(())
     }
 
@@ -2565,7 +4943,253 @@ impl Actor {
         self.connect_peer = Some(peer);
         // Guest side: this node is the one that *receives* `MediaUnavailable`,
         // so there is no peer capability to remember here.
-        self.adopt(control, peer, false, false);
+        //
+        // File transfer is the exception, and the minor is all there is to go
+        // on: `HelloAck` carries no feature list, so what a *host* understands
+        // can only be read off its protocol minor (§9.1; ADR 0032). Either
+        // side may offer a file, so the guest does have to know.
+        if control.peer_minor() >= FILE_TRANSFER_MINOR {
+            self.speaks_file_transfer.insert(peer);
+        } else {
+            self.speaks_file_transfer.remove(&peer);
+        }
+        self.adopt(control, peer, false, false, false);
+    }
+}
+
+/// Measures, names and hashes one local file for a `FileOffer` (§9.2).
+///
+/// Runs on its own task: hashing `FILE_OFFER_MAX_BYTES` is a full disk pass,
+/// and the actor loop is not where a disk pass belongs (ADR 0027).
+async fn prepare_offer(path: &std::path::Path) -> Result<(String, u64, [u8; 32]), NetError> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| NetError::Io(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(NetError::Io("not a regular file".to_owned()));
+    }
+    let size = meta.len();
+    if size > FILE_OFFER_MAX_BYTES {
+        return Err(NetError::Io("over the offer size limit".to_owned()));
+    }
+    // The same normalization the receiver will apply. Refusing here means a
+    // file this machine cannot name safely is never offered, rather than
+    // being declined on the far side for reasons the sender cannot see.
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(safe_file_name)
+        .ok_or_else(|| NetError::Io("the file has no name that can be offered".to_owned()))?;
+    let hash = hash_file(path).await?;
+    Ok((name, size, hash))
+}
+
+/// Picks a path in `directory` for `name` that is not already taken.
+///
+/// A transfer must never quietly replace a file the user already had. The
+/// suffix goes before the extension so the result still opens in the same
+/// application.
+fn unique_destination(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let candidate = directory.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_owned();
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    for n in 1..1000u32 {
+        let candidate = directory.join(format!("{stem} ({n}){extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // A directory with a thousand copies of one name is not a case worth more
+    // code: the last candidate is returned and the export fails loudly.
+    directory.join(format!("{stem} (1000){extension}"))
+}
+
+/// Reads one transfer's chunks off a unidirectional file stream.
+///
+/// Everything here runs away from the actor: a 256 KiB chunk is written to
+/// staging under the peer's own lock, and only a byte count goes back through
+/// the mailbox.
+async fn read_transfer_stream(
+    mut recv: iroh::endpoint::RecvStream,
+    channel: FileChannel,
+    peer: NodeId,
+    tag: String,
+    events: mpsc::Sender<ActorEvent>,
+) {
+    let mut current: Option<TransferId> = None;
+    loop {
+        let (id, offset, bytes) = match read_chunk(&mut recv).await {
+            Ok(chunk) => chunk,
+            Err(NetError::TruncatedStream(_) | NetError::Io(_)) => break,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "a file chunk was refused");
+                break;
+            }
+        };
+        if !wait_for_start(&channel, id).await {
+            tracing::warn!(peer = %tag, "chunks arrived for a transfer that was never announced");
+            return;
+        }
+        let mut inbox = channel.inbox.lock().await;
+        // Accounting first, bytes second: `apply_chunk` is what refuses a gap,
+        // an overrun and a transfer that already ended, and nothing reaches
+        // the disk until it has said yes (§3.2, §9.2).
+        if let Err(error) = inbox.tracker.apply_chunk(id, offset, bytes.len()) {
+            tracing::warn!(peer = %tag, %error, "a file chunk did not fit its transfer");
+            drop(inbox);
+            let _ = events
+                .send(ActorEvent::File(FileEvent::Finished {
+                    peer,
+                    id,
+                    state: TransferState::Failed,
+                }))
+                .await;
+            return;
+        }
+        if let Some(staged) = inbox.staged.get_mut(&id)
+            && let Err(error) = staged.append(&bytes).await
+        {
+            tracing::warn!(peer = %tag, %error, "a chunk could not be staged");
+            inbox.tracker.cancel(id);
+            drop(inbox);
+            let _ = events
+                .send(ActorEvent::File(FileEvent::Finished {
+                    peer,
+                    id,
+                    state: TransferState::Failed,
+                }))
+                .await;
+            return;
+        }
+        inbox.tracker.hash_chunk(id, &bytes);
+        let received = inbox.tracker.state(id).map_or(0, |state| state.received);
+        let complete = inbox
+            .tracker
+            .state(id)
+            .is_some_and(|state| state.received == state.total);
+        drop(inbox);
+        current = Some(id);
+        let _ = events
+            .send(ActorEvent::File(FileEvent::Progress {
+                peer,
+                id,
+                moved: received,
+            }))
+            .await;
+        if complete {
+            finish_transfer(&channel, id, peer, &events).await;
+            return;
+        }
+    }
+    // The stream ended without the transfer completing. That is a drop, not a
+    // failure: the tracker keeps what arrived, and a sender coming back picks
+    // up from the last ack rather than from zero (§10).
+    if let Some(id) = current {
+        tracing::debug!(peer = %tag, transfer = id, "a file stream ended mid-transfer");
+    }
+}
+
+/// Waits until `id` has been announced by a `FileTransferStart`.
+///
+/// The control channel and `rd/file/1` are separate QUIC connections (§4), so
+/// nothing orders the announcement against the first chunk. Returns `false`
+/// when the wait ran out, which aborts this stream and nothing else.
+async fn wait_for_start(channel: &FileChannel, id: TransferId) -> bool {
+    let mut starts = channel.starts.subscribe();
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(FILE_TRANSFER_START_TIMEOUT_SECS);
+    loop {
+        if channel.inbox.lock().await.expected.contains_key(&id) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        // `changed()` is edge-triggered from what this receiver last saw, so a
+        // start landing between the check above and this wait cannot be lost.
+        if tokio::time::timeout(remaining, starts.changed())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+}
+
+/// Verifies a completed transfer and exports it, or leaves nothing behind.
+async fn finish_transfer(
+    channel: &FileChannel,
+    id: TransferId,
+    peer: NodeId,
+    events: &mpsc::Sender<ActorEvent>,
+) {
+    let mut inbox = channel.inbox.lock().await;
+    let Some((expected, destination)) = inbox.expected.remove(&id) else {
+        return;
+    };
+    let verified = inbox.tracker.finish(id, expected);
+    let staged = inbox.staged.remove(&id);
+    drop(inbox);
+
+    let state = match (verified, staged) {
+        (true, Some(staged)) => match staged.export(&destination).await {
+            Ok(()) => TransferState::Completed,
+            Err(error) => {
+                tracing::warn!(%error, "a verified transfer could not be exported");
+                TransferState::Failed
+            }
+        },
+        // The hash did not match the offer. Nothing leaves staging (§9.2):
+        // a file under the expected name that is not the expected file is
+        // worse than no file at all.
+        (false, Some(staged)) => {
+            staged.discard().await;
+            TransferState::Failed
+        }
+        (_, None) => TransferState::Failed,
+    };
+    let _ = events
+        .send(ActorEvent::File(FileEvent::Finished { peer, id, state }))
+        .await;
+}
+
+/// The wire form of an unattended refusal (§8, §18).
+///
+/// Deliberately lossy in one direction only: "a password was required but not
+/// presented" and "the password was wrong" collapse into the same answer, as
+/// do the two code cases, because the difference is only useful to somebody
+/// probing the gate. Nothing collapses that the guest needs in order to act —
+/// which factor to retype, and how long a lockout has left, both survive.
+const fn rejection_of(error: &UnattendedError) -> UnattendedRejection {
+    match *error {
+        UnattendedError::BadPassword | UnattendedError::MissingPassword => {
+            UnattendedRejection::BadPassword
+        }
+        UnattendedError::BadCode | UnattendedError::MissingCode => UnattendedRejection::BadCode,
+        UnattendedError::LockedOut { remaining_secs } => {
+            UnattendedRejection::LockedOut { remaining_secs }
+        }
+        // Not a verdict on the guest: this host cannot decide at all. The
+        // password policy error cannot reach here — it is raised only when the
+        // *host* sets a password — but it is mapped rather than left to a
+        // catch-all so a new variant has to be thought about.
+        UnattendedError::NotConfigured
+        | UnattendedError::CorruptStore
+        | UnattendedError::SaltGeneration
+        | UnattendedError::PasswordPolicy { .. } => UnattendedRejection::Unavailable,
     }
 }
 
@@ -2595,10 +5219,23 @@ async fn classify_incoming(
                 peer,
             });
         }
-        // An unauthenticated peer must not be able to park a file connection
-        // in the control handshake's read (§4.1).
-        Some(Channel::File) | None => {
-            tracing::warn!(peer = %tag, "closing a non-control connection");
+        // Authenticated here and authorized by the actor, exactly like
+        // media: this task cannot see whether the peer holds a live session
+        // carrying `file_transfer`, and guessing would widen a grant outside
+        // `lumepeer-core` (§2.3). What has not changed is the invariant the
+        // old unconditional close protected — an unauthenticated peer must
+        // not be able to park a file connection in the control handshake's
+        // read (§4.1). It still cannot: the ALPN is decided before any read,
+        // this arm never runs the handshake, and the actor closes the
+        // connection on the spot unless a granted session already exists.
+        Some(Channel::File) => {
+            return Some(Accepted::File {
+                connection: Box::new(connection),
+                peer,
+            });
+        }
+        None => {
+            tracing::warn!(peer = %tag, "closing a connection on an unknown ALPN");
             connection.close(
                 lumepeer_net::connection::CLOSE_MALFORMED.into(),
                 lumepeer_net::error::close_code::MALFORMED.as_bytes(),
@@ -2632,6 +5269,14 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == lumepeer_core::protocol::FEATURE_REMOTE_SAS),
+        speaks_file_transfer: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_FILE_TRANSFER),
+        speaks_unattended: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_UNATTENDED),
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -2719,10 +5364,14 @@ async fn connect_once(
     proof: Vec<u8>,
 ) -> Result<ControlConnection, NetError> {
     let connection = endpoint.connect_control(addr.clone()).await?;
-    // The one feature this build advertises: it understands a host saying it
-    // cannot produce a picture. An older host ignores the string (§9.1) and
-    // simply never sends the message.
-    let features = vec![FEATURE_MEDIA_UNAVAILABLE.to_owned()];
+    // What this build understands, for a host to decide what it may send.
+    // An older host ignores an unknown string (§9.1) and simply never sends
+    // the message behind it.
+    let features = vec![
+        FEATURE_MEDIA_UNAVAILABLE.to_owned(),
+        FEATURE_FILE_TRANSFER.to_owned(),
+        FEATURE_UNATTENDED.to_owned(),
+    ];
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
 
@@ -2802,14 +5451,22 @@ pub async fn spawn_actor(
         tracing::info!("transport: direct IP paths preferred, relay as the fallback");
         PeerEndpoint::bind_with_lan(secret_key, relay).await?
     };
-    let history_path = connection_history_path(&app);
+    let stores = ActorStores {
+        history_path: connection_history_path(&app),
+        address_book_path: address_book_path(),
+        // The same keystore the identity came from: the unattended password
+        // hash and TOTP secret are secret material and `CLAUDE.md` keeps
+        // secrets out of `config/*.toml` (§11.2; ADR 0033).
+        keystore: store,
+    };
 
     let handle = spawn_actor_with(
         endpoint.clone(),
         identity,
         Arc::new(crate::view::TauriViewWindows::new(app)),
         default_capture(),
-        history_path,
+        crate::clipboard_os::platform_clipboard(),
+        stores,
     );
 
     tokio::spawn({
@@ -2827,6 +5484,21 @@ pub async fn spawn_actor(
 /// Where the connection history file lives, if the app data directory can be
 /// resolved at all. `None` degrades the feature to in-memory-only for this
 /// run rather than failing startup over a convenience list (§18).
+/// Where the host's address book lives, if the config directory resolves at
+/// all. `None` degrades the book to in-memory-only for this run, which trusts
+/// nobody — the safe direction (§18; ADR 0034).
+///
+/// Alongside the other configuration rather than in the app data directory:
+/// it is host-owned policy, in the same place `config/control_policy.toml`
+/// lives, and it holds no secrets (a `NodeId` is a public key).
+fn address_book_path() -> Option<std::path::PathBuf> {
+    let Some(dir) = crate::config::config_dir() else {
+        tracing::warn!("cannot resolve the config directory; the address book will not persist");
+        return None;
+    };
+    Some(dir.join("address_book.json"))
+}
+
 fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     use tauri::Manager as _;
     match app.path().app_local_data_dir() {
@@ -2875,18 +5547,74 @@ pub fn default_capture() -> HostMedia {
     }
 }
 
+/// Everything an actor keeps between runs, in one argument.
+///
+/// Grouped rather than passed one by one so the seam stays one thing: a test
+/// builds an actor that persists nothing ([`ActorStores::in_memory`]), and the
+/// real application builds one that persists everything, without either of
+/// them growing an argument list nobody can read.
+pub struct ActorStores {
+    /// Guest side: where the remembered-hosts list lives (ADR 0016).
+    pub history_path: Option<std::path::PathBuf>,
+    /// Host side: where the address book lives (§8; ADR 0034).
+    pub address_book_path: Option<std::path::PathBuf>,
+    /// Where the unattended credentials live (§8; ADR 0033). The OS keystore
+    /// in the real application, an in-memory stand-in in tests — never a
+    /// config file, which `CLAUDE.md` rules out for secrets.
+    pub keystore: Box<dyn Keystore>,
+}
+
+impl std::fmt::Debug for ActorStores {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActorStores")
+            .field("history_path", &self.history_path)
+            .field("address_book_path", &self.address_book_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActorStores {
+    /// Stores that keep nothing after the process ends: no history file, no
+    /// address book file, and an in-memory keystore.
+    #[cfg(test)]
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            history_path: None,
+            address_book_path: None,
+            keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
+        }
+    }
+}
+
 /// Spawns the actor over an already bound endpoint. Split out of
 /// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
-/// relay or a Tauri window: `windows` and `media` are the two seams that
-/// would otherwise need one.
+/// relay or a Tauri window: `windows`, `media` and `clipboard` are the three
+/// seams that would otherwise need one.
 #[must_use]
 pub fn spawn_actor_with(
     endpoint: PeerEndpoint,
     identity: SigningKey,
     windows: Arc<dyn ViewWindows>,
     media: HostMedia,
-    history_path: Option<std::path::PathBuf>,
+    clipboard: crate::clipboard_os::ClipboardFactory,
+    stores: ActorStores,
 ) -> ActorHandle {
+    let ActorStores {
+        history_path,
+        address_book_path,
+        keystore,
+    } = stores;
+    let unattended_store = UnattendedStore::new(keystore);
+    let mut unattended = UnattendedAccess::new();
+    unattended_store.restore(&mut unattended);
+    if unattended.enabled() {
+        tracing::info!(
+            code_required = unattended.code_required(),
+            role = ?unattended.role(),
+            "unattended access is on: trusted devices may log in with the device password"
+        );
+    }
     let HostMedia {
         capture,
         health,
@@ -2896,6 +5624,11 @@ pub fn spawn_actor_with(
     let (events_tx, events_rx) = mpsc::channel(32);
     let view_feeds: ViewFeeds = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let (faults_tx, faults_rx) = mpsc::channel(8);
+    // Deliberately shallow: a backed-up actor should re-detect the current
+    // clipboard on the next poll, not work through a queue of everything the
+    // user copied while it was busy.
+    let (clipboard_tx, clipboard_changes) = mpsc::channel(4);
+    let clipboard_worker = crate::clipboard_os::spawn(clipboard, clipboard_tx);
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
@@ -2922,16 +5655,38 @@ pub fn spawn_actor_with(
         guest_mic: std::collections::HashMap::new(),
         speaks_remote_sas: std::collections::HashSet::new(),
         recorders: HashMap::new(),
+        record_requests: std::collections::HashSet::new(),
+        record_request_rate: ConsentRateLimiter::new(),
         injector,
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
         host_addrs: std::collections::HashMap::new(),
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
+        speaks_file_transfer: std::collections::HashSet::new(),
+        file_conns: std::collections::HashMap::new(),
+        file_dialing: std::collections::HashSet::new(),
+        file_offers_out: std::collections::HashMap::new(),
+        file_offers_in: std::collections::HashMap::new(),
+        file_accepted: std::collections::HashMap::new(),
+        file_channels: std::collections::HashMap::new(),
+        file_pending_sends: std::collections::HashMap::new(),
+        file_transfers: std::collections::HashMap::new(),
+        file_send_tasks: std::collections::HashMap::new(),
+        next_transfer_id: 0,
         clipboard: std::collections::HashMap::new(),
         clipboard_inbound: std::collections::HashMap::new(),
+        clipboard_worker,
+        clipboard_changes,
         windows,
         history: ConnectionHistory::open(history_path),
+        unattended,
+        unattended_store,
+        unattended_pending: std::collections::HashSet::new(),
+        speaks_unattended: std::collections::HashSet::new(),
+        address_book: AddressBookStore::open(address_book_path),
+        connect_code_required: false,
+        connect_retry_secs: None,
         connect_phase: ConnectPhase::Idle,
         connect_peer: None,
         connect_failure: None,
@@ -2960,6 +5715,7 @@ mod tests {
     use lumepeer_media::error::{MediaError, Result as MediaResult};
 
     use super::*;
+    use crate::clipboard_os::testing::{SharedTestClipboard, test_clipboard};
     use crate::view::DetachedViewWindows;
 
     /// Anything slower than this on loopback means the test is stuck.
@@ -3064,6 +5820,27 @@ mod tests {
         (handle, endpoint, capture, windows)
     }
 
+    /// An actor whose machine clipboard the test drives and inspects.
+    async fn actor_with_clipboard(
+        windows: Arc<dyn ViewWindows>,
+    ) -> (ActorHandle, SharedTestClipboard) {
+        let capture = test_capture();
+        let media = test_media(&capture);
+        let (factory, clipboard) = test_clipboard();
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
+        let handle = spawn_actor_with(
+            endpoint,
+            identity,
+            windows,
+            media,
+            factory,
+            ActorStores::in_memory(),
+        );
+        (handle, clipboard)
+    }
+
     /// The seam every actor in these tests is built through: `media` is what
     /// decides whether this host believes it can produce a picture at all.
     async fn actor_with_media(
@@ -3073,8 +5850,546 @@ mod tests {
         let secret = iroh::SecretKey::generate();
         let identity = SigningKey::from_bytes(&secret.to_bytes());
         let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
-        let handle = spawn_actor_with(endpoint.clone(), identity, windows, media, None);
+        let handle = spawn_actor_with(
+            endpoint.clone(),
+            identity,
+            windows,
+            media,
+            crate::clipboard_os::no_clipboard(),
+            ActorStores::in_memory(),
+        );
         (handle, endpoint)
+    }
+
+    /// Poll rounds to wait through before concluding that nothing happened.
+    /// Three, because one is the baseline read and one more is the earliest a
+    /// change could be noticed.
+    const QUIET_ROUNDS: u64 = 4;
+
+    async fn a_few_poll_rounds() {
+        tokio::time::sleep(Duration::from_millis(
+            lumepeer_core::constants::CLIPBOARD_POLL_INTERVAL_MS * QUIET_ROUNDS,
+        ))
+        .await;
+    }
+
+    fn clipboard_writes(state: &SharedTestClipboard) -> Vec<String> {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .writes
+            .clone()
+    }
+
+    fn set_clipboard(state: &SharedTestClipboard, text: &str) {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .text = Some(text.to_owned());
+    }
+
+    /// Brings up a host and a guest with a live `ViewOnly` session, and
+    /// returns both handles, both clipboards and the labels each side knows
+    /// the other by.
+    struct ClipboardPair {
+        host: ActorHandle,
+        host_clipboard: SharedTestClipboard,
+        guest: ActorHandle,
+        guest_clipboard: SharedTestClipboard,
+        /// Label the host knows the guest by.
+        guest_label: String,
+        /// Label the guest knows the host by.
+        host_label: String,
+    }
+
+    async fn clipboard_pair() -> ClipboardPair {
+        let (host, host_clipboard) = actor_with_clipboard(Arc::new(DetachedViewWindows)).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, guest_clipboard) =
+            actor_with_clipboard(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
+
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input) = recorder.opened().remove(0);
+
+        ClipboardPair {
+            host,
+            host_clipboard,
+            guest,
+            guest_clipboard,
+            guest_label,
+            host_label,
+        }
+    }
+
+    /// A scratch directory for one test, removed when it goes out of scope.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(what: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "lumepeer-actor-{what}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A host and a guest with a live `ViewOnly` session, plus the labels each
+    /// knows the other by.
+    ///
+    /// The endpoints are not returned: the actor owns a clone of the one it
+    /// was spawned with, so this side's copy has nothing left to hold.
+    async fn file_pair() -> (ActorHandle, ActorHandle, String, String) {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input) = recorder.opened().remove(0);
+        (host, guest, guest_label, host_label)
+    }
+
+    /// Polls `file_transfers` the way the panel does, until `ready` holds.
+    async fn wait_for_files(
+        handle: &ActorHandle,
+        what: &str,
+        mut ready: impl FnMut(&FileTransfersDto) -> bool,
+    ) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if ready(&handle.file_transfers().await.unwrap()) {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// §9.2 and §4 through the actor: a granted host offers a file, the guest
+    /// accepts it into a directory of its own choosing, `rd/file/1` opens for
+    /// the first time, and the file lands verified under the offered basename.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_granted_session_moves_a_file_end_to_end() {
+        let scratch = Scratch::new("e2e");
+        let source = scratch.join("report.pdf");
+        let bytes: Vec<u8> = (0..40_000u32)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let inbox = scratch.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        let (host, guest, guest_label, host_label) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+
+        host.file_offer(guest_label, source.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the offer never reached the guest", |files| {
+            files.offers.len() == 1 && files.offers[0].name == "report.pdf"
+        })
+        .await;
+
+        guest
+            .file_accept(host_label, true, Some(inbox.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        // The sender only claims completion once the receiver's final ack says
+        // the hash matched and the file is on disk.
+        wait_for_files(&host, "the transfer never completed", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.state == TransferState::Completed)
+        })
+        .await;
+        let landed = inbox.join("report.pdf");
+        assert!(landed.exists(), "the file never appeared");
+        assert_eq!(std::fs::read(&landed).unwrap(), bytes);
+        // And nothing of the staging file survived the export.
+        let leftovers: Vec<_> = std::fs::read_dir(&inbox)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.file_name()))
+            .filter(|name| name.to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging outlived the transfer");
+    }
+
+    /// §8.1 and §4: switching `file_transfer` back off takes the file
+    /// connection and every transfer with it, rather than leaving what the
+    /// grant paid for running until the session happens to end.
+    ///
+    /// The second half matters as much as the first: the withdrawal must cost
+    /// nothing permanent, so the host can switch the grant on again and the
+    /// next file still moves. Only the grant went — not the peer's
+    /// `FEATURE_FILE_TRANSFER` advertisement, which is a fact about a
+    /// connection that is still up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn withdrawing_the_grant_ends_the_transfers_and_can_be_given_back() {
+        let scratch = Scratch::new("withdrawn");
+        let first = scratch.join("first.pdf");
+        std::fs::write(&first, b"the one that was allowed").unwrap();
+        let second = scratch.join("second.pdf");
+        std::fs::write(&second, b"the one after the switch came back").unwrap();
+        let inbox = scratch.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        let (host, guest, guest_label, host_label) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        host.file_offer(guest_label.clone(), first.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the offer never reached the guest", |files| {
+            files.offers.len() == 1
+        })
+        .await;
+        guest
+            .file_accept(
+                host_label.clone(),
+                true,
+                Some(inbox.to_string_lossy().into_owned()),
+            )
+            .await
+            .unwrap();
+        wait_for_files(&host, "the transfer never started", |files| {
+            !files.transfers.is_empty()
+        })
+        .await;
+
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, false)
+            .await
+            .unwrap();
+
+        // The host's whole file world for this peer is gone the moment the
+        // switch moves — not on the next offer, and not when the session ends.
+        let after = host.file_transfers().await.unwrap();
+        assert!(
+            after.transfers.is_empty() && after.offers.is_empty(),
+            "the withdrawal left transfers behind"
+        );
+        // And a new offer is refused by the core, as it was before the grant.
+        assert!(matches!(
+            host.file_offer(guest_label.clone(), second.to_string_lossy().into_owned())
+                .await,
+            Err(ActorError::Core(CoreError::NotPermitted))
+        ));
+
+        // Given back, the path works again: the teardown took the grant, not
+        // the guest's ability to speak the feature.
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        host.file_offer(guest_label, second.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the second offer never arrived", |files| {
+            files.offers.iter().any(|row| row.name == "second.pdf")
+        })
+        .await;
+        guest
+            .file_accept(host_label, true, Some(inbox.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        wait_for_files(&host, "the second transfer never completed", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.state == TransferState::Completed)
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(inbox.join("second.pdf")).unwrap(),
+            b"the one after the switch came back"
+        );
+    }
+
+    /// §8.2: without the `file_transfer` grant nothing is offered at all. The
+    /// refusal comes from the host's own core, before any byte or connection
+    /// exists — and the same file goes through once the host decides.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offer_without_the_grant_is_refused_by_the_core() {
+        let scratch = Scratch::new("nogrant");
+        let source = scratch.join("report.pdf");
+        std::fs::write(&source, b"anything at all").unwrap();
+        let path = source.to_string_lossy().into_owned();
+
+        let (host, guest, guest_label, _host_label) = file_pair().await;
+        assert!(matches!(
+            host.file_offer(guest_label.clone(), path.clone()).await,
+            Err(ActorError::Core(CoreError::NotPermitted))
+        ));
+        a_few_poll_rounds().await;
+        assert!(guest.file_transfers().await.unwrap().offers.is_empty());
+
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        host.file_offer(guest_label, path).await.unwrap();
+        wait_for_files(&guest, "the offer never reached the guest", |files| {
+            files.offers.len() == 1
+        })
+        .await;
+    }
+
+    /// §9.2: a declined offer leaves nothing behind on either side, and the
+    /// receiving directory stays exactly as empty as it was (§4: no file
+    /// connection is opened for an offer nobody took).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declined_offer_moves_no_bytes() {
+        let scratch = Scratch::new("declined");
+        let source = scratch.join("report.pdf");
+        std::fs::write(&source, b"never travels").unwrap();
+        let inbox = scratch.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+
+        let (host, guest, guest_label, host_label) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        host.file_offer(guest_label, source.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the offer never reached the guest", |files| {
+            files.offers.len() == 1
+        })
+        .await;
+
+        guest.file_accept(host_label, false, None).await.unwrap();
+
+        a_few_poll_rounds().await;
+        assert!(guest.file_transfers().await.unwrap().offers.is_empty());
+        assert!(
+            host.file_transfers().await.unwrap().transfers.is_empty(),
+            "a declined offer started a transfer"
+        );
+        assert_eq!(
+            std::fs::read_dir(&inbox).unwrap().count(),
+            0,
+            "a declined offer wrote something"
+        );
+    }
+
+    /// §8.1 applied to §9.2: a granted session is not a licence to read the
+    /// host user's clipboard. Until `clipboard_read` is on, the clipboard is
+    /// not read at all — the assertion is on the read count, not on what was
+    /// sent, because "read it and threw it away" is not the rule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_granted_session_alone_never_reads_the_hosts_clipboard() {
+        let pair = clipboard_pair().await;
+        set_clipboard(&pair.host_clipboard, "a password, probably");
+
+        a_few_poll_rounds().await;
+        let reads = pair
+            .host_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        assert_eq!(reads, 0, "the clipboard was read without a grant");
+        assert!(clipboard_writes(&pair.guest_clipboard).is_empty());
+    }
+
+    /// The host-to-guest direction end to end: `clipboard_read` turns the
+    /// watcher on, a copy on the host lands on the guest's own clipboard, and
+    /// turning the grant back off stops it again mid-session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_read_grant_carries_the_hosts_clipboard_to_the_guest() {
+        let pair = clipboard_pair().await;
+        set_clipboard(&pair.host_clipboard, "before the grant");
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardRead,
+                true,
+            )
+            .await
+            .unwrap();
+        // Whatever predates the decision stays put: the host allowed the guest
+        // to see what it copies, not what it had copied.
+        a_few_poll_rounds().await;
+        assert!(clipboard_writes(&pair.guest_clipboard).is_empty());
+
+        set_clipboard(&pair.host_clipboard, "after the grant");
+        wait_until("the guest never received the host clipboard", || {
+            clipboard_writes(&pair.guest_clipboard) == vec!["after the grant".to_owned()]
+        })
+        .await;
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardRead,
+                false,
+            )
+            .await
+            .unwrap();
+        set_clipboard(&pair.host_clipboard, "after the switch went off");
+        a_few_poll_rounds().await;
+        assert_eq!(
+            clipboard_writes(&pair.guest_clipboard),
+            vec!["after the grant".to_owned()],
+            "the clipboard kept flowing after the grant was withdrawn"
+        );
+    }
+
+    /// The guest-to-host direction: the guest may always *offer*, and the
+    /// host's core is what decides. Without `clipboard_write` the payload is
+    /// dropped on arrival; with it, it reaches the host's real clipboard.
+    ///
+    /// This is the check that used to be reversed: the host was reading
+    /// `clipboard_read` for a payload written *to* it, so a host that had
+    /// turned exactly the right switch on saw nothing happen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard() {
+        let pair = clipboard_pair().await;
+
+        pair.guest
+            .clipboard_push(pair.host_label.clone(), "from the guest".to_owned())
+            .await
+            .unwrap();
+        a_few_poll_rounds().await;
+        assert!(
+            clipboard_writes(&pair.host_clipboard).is_empty(),
+            "a guest changed the host clipboard with no grant"
+        );
+        assert_eq!(
+            pair.host
+                .clipboard_pull(pair.guest_label.clone())
+                .await
+                .unwrap(),
+            None
+        );
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+        pair.guest
+            .clipboard_push(pair.host_label.clone(), "now allowed".to_owned())
+            .await
+            .unwrap();
+        wait_until("the host clipboard never changed", || {
+            clipboard_writes(&pair.host_clipboard) == vec!["now allowed".to_owned()]
+        })
+        .await;
+        assert_eq!(
+            pair.host.clipboard_pull(pair.guest_label).await.unwrap(),
+            Some("now allowed".to_owned()),
+            "the UI has no way to say a clipboard arrived"
+        );
+    }
+
+    /// Each direction needs its own grant, and holding one is not holding the
+    /// other (§2.2). `clipboard_write` alone must not start the host's
+    /// watcher, and must not carry the host's clipboard anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_write_grant_does_not_let_the_guest_read_the_host() {
+        let pair = clipboard_pair().await;
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+
+        set_clipboard(&pair.host_clipboard, "host side secret");
+        a_few_poll_rounds().await;
+        let reads = pair
+            .host_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        assert_eq!(reads, 0, "clipboard_write started a read watcher");
+        assert!(clipboard_writes(&pair.guest_clipboard).is_empty());
+    }
+
+    /// A revoke takes the watcher with it, without waiting for the session's
+    /// transport to notice (§8.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoke_stops_the_clipboard_watcher() {
+        let pair = clipboard_pair().await;
+        set_clipboard(&pair.host_clipboard, "before the grant");
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardRead,
+                true,
+            )
+            .await
+            .unwrap();
+        // Let the baseline round happen before changing anything, so the
+        // change below is unambiguously a change.
+        a_few_poll_rounds().await;
+        set_clipboard(&pair.host_clipboard, "while granted");
+        wait_until("the guest never received the host clipboard", || {
+            !clipboard_writes(&pair.guest_clipboard).is_empty()
+        })
+        .await;
+
+        pair.host.revoke(pair.guest_label).await.unwrap();
+        let before = pair
+            .host_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        a_few_poll_rounds().await;
+        let after = pair
+            .host_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        assert_eq!(
+            before, after,
+            "the clipboard was still being read after a revoke"
+        );
     }
 
     /// Polls until `predicate` holds, or fails the test.
@@ -3121,7 +6436,7 @@ mod tests {
     async fn wait_for_phase(handle: &ActorHandle, want: ConnectPhase) {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
-            let (phase, _) = handle.connect_state().await.unwrap();
+            let phase = handle.connect_state().await.unwrap().phase;
             if phase == want {
                 return;
             }
@@ -3144,6 +6459,421 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "no pending session");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Brings a guest to the point of holding a session with `host`, so its
+    /// pseudonymized label is known and it can be put in the address book.
+    ///
+    /// The first visit always goes through the ordinary consent path: a
+    /// device cannot be trusted before the host has ever seen it, which is
+    /// the whole shape of §8's model (ADR 0034).
+    async fn introduce(host: &ActorHandle, guest: &ActorHandle) -> String {
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_for_phase(guest, ConnectPhase::Connected).await;
+        // Saved while the session is live, because that is the only moment the
+        // host knows this device at all: a label is minted from a pending or
+        // active session, and the book is what keeps it resolvable afterwards.
+        host.address_book_upsert(
+            label.clone(),
+            "office".to_owned(),
+            Vec::new(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        // End the visit; what stays behind is the book entry, still untrusted.
+        host.revoke(label.clone()).await.unwrap();
+        wait_for_phase(guest, ConnectPhase::Idle).await;
+        label
+    }
+
+    /// The password every unattended test in this module logs in with. Over
+    /// `UNATTENDED_PASSWORD_MIN_BYTES`, because the core refuses anything
+    /// shorter (ADR 0033).
+    const DEVICE_PASSWORD: &str = "correct horse battery staple";
+
+    /// A host with unattended access on and `guest` saved and trusted.
+    async fn trusted_host(host: &ActorHandle, guest: &ActorHandle) -> String {
+        let label = introduce(host, guest).await;
+        host.unattended_set_password(DEVICE_PASSWORD.to_owned())
+            .await
+            .unwrap();
+        host.address_book_set_trusted(label.clone(), true)
+            .await
+            .unwrap();
+        label
+    }
+
+    /// §8: a trusted device reaching a host with nobody at it is asked for the
+    /// device password, and a correct one starts the session without any human
+    /// ever seeing a dialog (ADR 0033).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trusted_device_signs_in_with_the_device_password() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+
+        // The challenge, not a consent dialog.
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        let state = guest.connect_state().await.unwrap();
+        assert!(!state.code_required, "no second factor was configured");
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.state != SessionStateDto::Pending),
+            "a trusted device must not also queue a consent request"
+        );
+
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        let rows = host.status().await.unwrap();
+        let session = rows
+            .iter()
+            .find(|row| row.label == label && row.state == SessionStateDto::Active)
+            .expect("the admitted session is active on the host");
+        assert_eq!(session.role, Role::ViewOnly, "the host's configured role");
+    }
+
+    /// §8.2: passing the password is admission, not a blanket permission. The
+    /// four independent grants of ADR 0029 stay off, exactly as they would
+    /// after a consent dialog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unattended_login_grants_none_of_the_four_independent_grants() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+        host.unattended_set_role(Role::FullControl).await.unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        let rows = host.status().await.unwrap();
+        let session = rows
+            .iter()
+            .find(|row| row.label == label && row.state == SessionStateDto::Active)
+            .expect("the admitted session is active");
+        // The role the host chose is honored...
+        assert_eq!(session.role, Role::FullControl);
+        assert!(session.input, "FullControl implies input");
+        // ...and implies nothing else (§2.2).
+        assert!(!session.grants.clipboard_read);
+        assert!(!session.grants.clipboard_write);
+        assert!(!session.grants.file_transfer);
+        assert!(!session.grants.recording);
+    }
+
+    /// The gate of ADR 0034: trust decides who may *try* the password. A saved
+    /// but untrusted device gets the ordinary consent dialog, exactly as if
+    /// unattended access were off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_untrusted_device_gets_the_consent_dialog_not_the_password_prompt() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+        // Trust withdrawn; the password is still set.
+        host.address_book_set_trusted(label.clone(), false)
+            .await
+            .unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+
+        let pending = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        assert_eq!(pending, label);
+        // Waited for rather than sampled: the host queueing the request and
+        // the guest settling into its phase are two nodes' worth of scheduling
+        // apart, and a single read here is a race that only shows up on a busy
+        // machine. A guest sent down the credential path never arrives, so the
+        // wait fails the test rather than hiding the fault.
+        wait_for_phase(&guest, ConnectPhase::AwaitingConsent).await;
+    }
+
+    /// A device that was never saved at all is never trusted, whatever else is
+    /// configured: `is_trusted` answers `false` for everything absent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_device_that_is_not_in_the_book_gets_the_consent_dialog() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        host.unattended_set_password(DEVICE_PASSWORD.to_owned())
+            .await
+            .unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+
+        tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingConsent).await;
+    }
+
+    /// §18: a wrong password is refused with the coarse code and nothing else,
+    /// the form stays up, and the session never starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_password_is_refused_and_starts_no_session() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+
+        guest
+            .unattended_submit("not the password at all".to_owned(), None)
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let state = guest.connect_state().await.unwrap();
+            if state.code == Some("UNATTENDED_BAD_PASSWORD") {
+                // Still on the form: a mistyped password is retryable, and the
+                // lockout inside the core is what bounds the retries.
+                assert_eq!(state.phase, ConnectPhase::AwaitingCredentials);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no refusal arrived: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.label != label || row.state != SessionStateDto::Active),
+            "a refused login must not leave a session behind"
+        );
+    }
+
+    use lumepeer_core::constants::UNATTENDED_MAX_FAILED_ATTEMPTS;
+
+    /// Polls the connect state until the host's refusal carries `want`.
+    async fn wait_for_refusal(handle: &ActorHandle, want: &str) -> ConnectSnapshot {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let state = handle.connect_state().await.unwrap();
+            if state.code == Some(want) {
+                return state;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "wanted {want}, stuck at {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The lockout is the only thing bounding guesses, so it has to hold
+    /// across attempts and then refuse the correct password too.
+    ///
+    /// The counter lives in the host's `UnattendedAccess`, which outlives
+    /// every connection; the only per-connection state the credential path
+    /// keeps is `unattended_pending`, a membership set that grants a peer the
+    /// right to be *heard*, never a budget. So hanging up and dialing again
+    /// buys an attacker nothing, and there is no second counter anywhere to
+    /// disagree with this one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lockout_refuses_even_the_right_password() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+
+        for _ in 0..UNATTENDED_MAX_FAILED_ATTEMPTS {
+            guest
+                .unattended_submit("not the password".to_owned(), None)
+                .await
+                .unwrap();
+            // Each refusal leaves the guest on the form: a mistyped password
+            // is retryable, and this is the budget being spent.
+            wait_for_refusal(&guest, "UNATTENDED_BAD_PASSWORD").await;
+        }
+
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .await
+            .unwrap();
+        let state = wait_for_refusal(&guest, "UNATTENDED_LOCKED_OUT").await;
+        assert!(
+            state.retry_secs.is_some_and(|secs| {
+                secs > 0 && secs <= lumepeer_core::constants::UNATTENDED_LOCKOUT_DURATION_SECS
+            }),
+            "the guest is told how long to wait, within the configured lockout: {state:?}"
+        );
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.label != label || row.state != SessionStateDto::Active),
+            "the right password must not admit anyone during a lockout"
+        );
+    }
+
+    /// Turning unattended access off puts the host back on the consent path
+    /// even for a device that is still marked trusted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turning_unattended_access_off_returns_the_host_to_the_consent_path() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+        host.unattended_disable().await.unwrap();
+
+        let status = host.unattended_status().await.unwrap();
+        assert!(!status.enabled);
+        assert!(!status.totp_enabled);
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let pending = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        assert_eq!(pending, label);
+    }
+
+    /// The second factor cannot be armed without a first, and the settings a
+    /// host does make are what `unattended_status` reports back — never the
+    /// password itself, which the type cannot carry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_settings_surface_reports_state_and_never_credentials() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+
+        let status = host.unattended_status().await.unwrap();
+        assert!(!status.enabled);
+        assert_eq!(status.role, Role::ViewOnly, "deny-by-default");
+
+        // A second factor before a password is refused.
+        assert!(host.unattended_set_totp(true).await.is_err());
+
+        // A password below the policy floor is refused, and changes nothing.
+        assert!(
+            host.unattended_set_password("short".to_owned())
+                .await
+                .is_err()
+        );
+        assert!(!host.unattended_status().await.unwrap().enabled);
+
+        host.unattended_set_password(DEVICE_PASSWORD.to_owned())
+            .await
+            .unwrap();
+        let provisioning = host.unattended_set_totp(true).await.unwrap().unwrap();
+        assert!(!provisioning.secret_base32.is_empty());
+        assert!(provisioning.uri.starts_with("otpauth://totp/Lumepeer:"));
+
+        let status = host.unattended_status().await.unwrap();
+        assert!(status.enabled);
+        assert!(status.totp_enabled);
+    }
+
+    /// A trusted device with the second factor on is told to bring a code, and
+    /// a password alone is not enough.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_factor_is_announced_and_enforced() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let _label = trusted_host(&host, &guest).await;
+        host.unattended_set_totp(true).await.unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        assert!(
+            guest.connect_state().await.unwrap().code_required,
+            "the challenge has to say a code is expected, or the guest cannot supply one"
+        );
+
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let state = guest.connect_state().await.unwrap();
+            if state.code == Some("UNATTENDED_BAD_CODE") {
+                assert_eq!(state.phase, ConnectPhase::AwaitingCredentials);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a missing code was not refused: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Saving a device is not trusting it (§2.1): the entry lands untrusted
+    /// and only `address_book_set_trusted` moves the flag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_a_device_never_trusts_it() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = introduce(&host, &guest).await;
+
+        host.address_book_upsert(
+            label.clone(),
+            "office".to_owned(),
+            vec!["work".to_owned()],
+            "note".to_owned(),
+        )
+        .await
+        .unwrap();
+        let rows = host.address_book_list().await.unwrap();
+        let row = rows.iter().find(|r| r.peer_label == label).unwrap();
+        assert!(!row.trusted, "a saved device starts untrusted");
+        assert_eq!(row.name, "office");
+        assert_eq!(row.tags, vec!["work".to_owned()]);
+
+        host.address_book_set_trusted(label.clone(), true)
+            .await
+            .unwrap();
+        // Editing the entry afterwards must not disturb the flag either way.
+        host.address_book_upsert(
+            label.clone(),
+            "office 2".to_owned(),
+            Vec::new(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let rows = host.address_book_list().await.unwrap();
+        let row = rows.iter().find(|r| r.peer_label == label).unwrap();
+        assert!(row.trusted, "editing a name must not withdraw trust");
+        assert_eq!(row.name, "office 2");
+
+        // Forgetting takes the trust with it.
+        host.address_book_remove(label.clone()).await.unwrap();
+        assert!(host.address_book_list().await.unwrap().is_empty());
+        assert!(host.address_book_remove(label).await.is_err());
     }
 
     /// C1: the guest actor must keep its `ControlConnection` after the
@@ -3379,7 +7109,10 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        assert_eq!(guest.connect_state().await.unwrap().0, ConnectPhase::Idle);
+        assert_eq!(
+            guest.connect_state().await.unwrap().phase,
+            ConnectPhase::Idle
+        );
 
         let invite = host.invite_create(Role::ViewOnly).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
@@ -3387,12 +7120,12 @@ mod tests {
         // (ADR 0027), so the form has to stay disabled through both waits —
         // the dial and then the host's decision.
         assert!(
-            guest.connect_state().await.unwrap().0.is_pending(),
+            guest.connect_state().await.unwrap().phase.is_pending(),
             "the attempt is in flight from the moment it is started"
         );
         wait_for_phase(&guest, ConnectPhase::AwaitingConsent).await;
         assert!(
-            guest.connect_state().await.unwrap().0.is_pending(),
+            guest.connect_state().await.unwrap().phase.is_pending(),
             "the handshake is done but nobody has decided yet"
         );
 
@@ -3401,7 +7134,7 @@ mod tests {
             .unwrap();
         host.grant(label.clone(), Role::ViewOnly).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::Connected).await;
-        assert!(!guest.connect_state().await.unwrap().0.is_pending());
+        assert!(!guest.connect_state().await.unwrap().phase.is_pending());
 
         host.revoke(label).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::Idle).await;
@@ -3427,7 +7160,7 @@ mod tests {
 
         guest.invite_connect(invite.code).await.unwrap();
         assert_eq!(
-            guest.connect_state().await.unwrap().0,
+            guest.connect_state().await.unwrap().phase,
             ConnectPhase::Dialing,
             "the attempt is in flight, and saying so is what keeps the form disabled"
         );
@@ -3489,7 +7222,7 @@ mod tests {
         );
 
         assert_eq!(
-            guest.connect_state().await.unwrap().0,
+            guest.connect_state().await.unwrap().phase,
             ConnectPhase::Connected,
             "the refused second dial must not disturb the live session"
         );
@@ -3727,6 +7460,259 @@ mod tests {
         ));
         let frame = guest.view_frame(&peer_label, 0).unwrap();
         assert_eq!(frame[1], 0);
+    }
+
+    /// One session row of `handle`, waited for rather than assumed.
+    async fn wait_for_row(
+        handle: &ActorHandle,
+        label: &str,
+        what: &str,
+        mut predicate: impl FnMut(&SessionSnapshot) -> bool,
+    ) -> SessionSnapshot {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let rows = handle.status().await.unwrap();
+            if let Some(row) = rows.iter().find(|r| r.label == label)
+                && predicate(row)
+            {
+                return row.clone();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// §8.2 applied to §17: a granted session is not a licence to record it.
+    /// The `recording` grant is a separate decision, and without it the toggle
+    /// is refused before any file is opened.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_without_the_grant_is_refused_before_a_file_is_opened() {
+        let pair = clipboard_pair().await;
+
+        let refused = pair
+            .host
+            .record_toggle(pair.guest_label.clone(), true)
+            .await;
+        assert!(matches!(
+            refused,
+            Err(ActorError::Core(CoreError::NotPermitted))
+        ));
+        let row = wait_for_row(&pair.host, &pair.guest_label, "no session row", |_| true).await;
+        assert!(
+            !row.recording_active,
+            "a refused toggle started a recording"
+        );
+        // The guest is told nothing changed, so its indicator stays dark.
+        let frame = pair.guest.view_frame(&pair.host_label, 0).unwrap();
+        assert_eq!(frame[1] & crate::view::VIEW_FLAG_RECORDING, 0);
+    }
+
+    /// The whole §17 host path: the grant, the toggle, the file Rust chose,
+    /// the indicator on both sides, and a second press that changes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_granted_recording_lands_where_rust_chose_and_toggling_twice_is_idempotent() {
+        let pair = clipboard_pair().await;
+        pair.host
+            .set_grant(pair.guest_label.clone(), IndependentGrant::Recording, true)
+            .await
+            .unwrap();
+
+        let path = pair
+            .host
+            .record_toggle(pair.guest_label.clone(), true)
+            .await
+            .unwrap()
+            .expect("a started recording answers with its path");
+        let path = std::path::PathBuf::from(path);
+        assert!(path.exists(), "no file at the path the actor reported");
+        assert_eq!(
+            path.extension().and_then(std::ffi::OsStr::to_str),
+            Some("lmrc")
+        );
+        // Chosen by Rust, under this app's own data directory (§2.3).
+        assert!(path.starts_with(crate::config::recordings_dir().unwrap()));
+
+        let again = pair
+            .host
+            .record_toggle(pair.guest_label.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.map(std::path::PathBuf::from),
+            Some(path.clone()),
+            "a second start opened a second file"
+        );
+
+        let row = wait_for_row(
+            &pair.host,
+            &pair.guest_label,
+            "recording never showed",
+            |r| r.recording_active,
+        )
+        .await;
+        assert!(row.grants.recording);
+        // No hidden capture (§2.2): the guest is told, over the wire, without
+        // having asked.
+        wait_until("the guest was never told it is being recorded", || {
+            pair.guest
+                .view_frame(&pair.host_label, 0)
+                .is_ok_and(|frame| frame[1] & crate::view::VIEW_FLAG_RECORDING != 0)
+        })
+        .await;
+
+        assert!(
+            pair.host
+                .record_toggle(pair.guest_label.clone(), false)
+                .await
+                .unwrap()
+                .is_none(),
+            "stopping reports no path"
+        );
+        wait_until("the guest was never told the recording stopped", || {
+            pair.guest
+                .view_frame(&pair.host_label, 0)
+                .is_ok_and(|frame| frame[1] & crate::view::VIEW_FLAG_RECORDING == 0)
+        })
+        .await;
+
+        // The flushed file is a readable container carrying both events.
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, records) = lumepeer_media::record::read_recording(bytes.as_slice()).unwrap();
+        let lines: Vec<String> = records
+            .iter()
+            .filter_map(|r| match r {
+                lumepeer_media::record::Record::Event { line, .. } => Some(line.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|l| l.contains("record-start")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("record-stop")), "{lines:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §2.2 applied to §17: taking the `recording` grant back stops the
+    /// recording that was running under it, and the guest's indicator goes
+    /// dark with it.
+    ///
+    /// Anything else would be the hidden capture the whole feature is written
+    /// against: a host user who moves the switch off has to be able to read
+    /// "nothing is being recorded" off the same panel, not "nothing new will
+    /// be allowed to start".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn withdrawing_the_grant_stops_a_running_recording() {
+        let pair = clipboard_pair().await;
+        pair.host
+            .set_grant(pair.guest_label.clone(), IndependentGrant::Recording, true)
+            .await
+            .unwrap();
+        let path = pair
+            .host
+            .record_toggle(pair.guest_label.clone(), true)
+            .await
+            .unwrap()
+            .expect("a started recording answers with its path");
+        let path = std::path::PathBuf::from(path);
+        wait_until("the guest was never told it is being recorded", || {
+            pair.guest
+                .view_frame(&pair.host_label, 0)
+                .is_ok_and(|frame| frame[1] & crate::view::VIEW_FLAG_RECORDING != 0)
+        })
+        .await;
+
+        pair.host
+            .set_grant(pair.guest_label.clone(), IndependentGrant::Recording, false)
+            .await
+            .unwrap();
+
+        let row = wait_for_row(
+            &pair.host,
+            &pair.guest_label,
+            "the recording outlived its grant",
+            |r| !r.recording_active,
+        )
+        .await;
+        assert!(!row.grants.recording);
+        wait_until("the guest was never told the recording stopped", || {
+            pair.guest
+                .view_frame(&pair.host_label, 0)
+                .is_ok_and(|frame| frame[1] & crate::view::VIEW_FLAG_RECORDING == 0)
+        })
+        .await;
+        // Stopped, not abandoned: the file was closed properly and carries the
+        // stop event, so what was recorded while it was allowed stays readable.
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, records) = lumepeer_media::record::read_recording(bytes.as_slice()).unwrap();
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                lumepeer_media::record::Record::Event { line, .. } if line.contains("record-stop")
+            )),
+            "the withdrawn recording was never closed off"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// §17's request half: a guest may *ask*, and asking decides nothing. The
+    /// host user answers, and a refusal is an ordinary answer the guest is
+    /// told about rather than an error or a silence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guests_request_waits_for_the_host_and_never_records_by_itself() {
+        let pair = clipboard_pair().await;
+
+        pair.guest
+            .record_request(pair.host_label.clone())
+            .await
+            .unwrap();
+        let row = wait_for_row(
+            &pair.host,
+            &pair.guest_label,
+            "the request never arrived",
+            |r| r.record_request,
+        )
+        .await;
+        assert!(
+            !row.grants.recording && !row.recording_active,
+            "asking granted itself a recording"
+        );
+
+        // Asking again does not queue a second dialog.
+        for _ in 0..3 {
+            pair.guest
+                .record_request(pair.host_label.clone())
+                .await
+                .unwrap();
+        }
+        a_few_poll_rounds().await;
+        let rows = pair.host.status().await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.label == pair.guest_label && r.record_request)
+                .count(),
+            1
+        );
+
+        // The host declines: the request clears, nothing was recorded, and the
+        // guest's indicator never lit.
+        assert!(
+            pair.host
+                .record_toggle(pair.guest_label.clone(), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let row = wait_for_row(
+            &pair.host,
+            &pair.guest_label,
+            "the request never cleared",
+            |r| !r.record_request,
+        )
+        .await;
+        assert!(!row.recording_active);
+        let frame = pair.guest.view_frame(&pair.host_label, 0).unwrap();
+        assert_eq!(frame[1] & crate::view::VIEW_FLAG_RECORDING, 0);
     }
 
     /// Unknown labels are refused cleanly, with no panic and no peer parsing.

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-file-transfers"
+description = "Enables the file_transfers command without any pre-configured scope."
+commands.allow = ["file_transfers"]
+
+[[permission]]
+identifier = "deny-file-transfers"
+description = "Denies the file_transfers command without any pre-configured scope."
+commands.deny = ["file_transfers"]

@@ -492,11 +492,52 @@ button {
 .connections-list li {
   display: flex;
   align-items: center;
+  /* The grant switches take a line of their own under the peer row rather
+     than squeezing into it. */
+  flex-wrap: wrap;
   gap: 10px;
   padding: 10px 12px;
   border: 1px solid var(--border-subtle);
   border-radius: 9px;
   background: var(--panel-bg);
+}
+
+.connections-list .session-grants {
+  flex-basis: 100%;
+  margin: 0;
+  padding: 8px 10px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--sidebar-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.connections-list .session-grants legend {
+  padding: 0 4px;
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.connections-list .grant-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-micro);
+  color: var(--text-heading);
+  cursor: pointer;
+}
+
+.connections-list .grant-row input {
+  margin: 0;
+  cursor: pointer;
+}
+
+.connections-list .grant-row input:focus-visible {
+  outline: 2px solid var(--blue-solid);
+  outline-offset: 1px;
 }
 
 .connections-list .peer-label {
@@ -507,6 +548,75 @@ button {
 .connections-list .peer-meta {
   color: var(--text-secondary);
   font-size: var(--fs-micro);
+}
+
+/* The fact that a clipboard synced, never its content (§15). */
+.connections-list .clipboard-note {
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+/* File transfer (§9.2): names and sizes, never paths. */
+.connections-list .file-panel {
+  flex-basis: 100%;
+  margin-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+}
+
+.connections-list .file-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.connections-list .file-panel h3 {
+  margin: 0;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.connections-list .file-offers,
+.connections-list .file-transfers {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.connections-list .file-offers li,
+.connections-list .file-transfers li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-micro);
+}
+
+.connections-list .file-name {
+  font-weight: 600;
+  color: var(--text-heading);
+  overflow-wrap: anywhere;
+}
+
+.connections-list .file-size,
+.connections-list .file-direction,
+.connections-list .file-state {
+  color: var(--text-secondary);
+}
+
+.connections-list .file-panel progress {
+  flex: 1;
+  min-width: 60px;
+  height: 6px;
 }
 
 .connections-list .chat-open-btn {
@@ -795,4 +905,325 @@ button {
 
 .consent-actions .consent-action-full:hover {
   background: var(--blue-solid-hover);
+}
+
+/* Session recording (§17). Permission is the switch in `.session-grants`;
+   these are the act, and the indicator that goes with it. Neither the banner
+   nor the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
+   about what the person at this machine sees without going looking. */
+.recording-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  background: var(--red-tint);
+  color: var(--red);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.recording-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--red);
+}
+
+.connections-list .session-recording {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.connections-list .record-btn {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
+  color: var(--text-heading);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.connections-list .record-btn:disabled {
+  color: var(--text-secondary);
+  cursor: not-allowed;
+}
+
+.connections-list .record-btn.is-recording {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.connections-list .recording-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--red);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+/* The file name only, and only while a recording runs: §15 keeps paths off
+   surfaces that stay on screen, and the full path is available on hover for
+   the operator who needs it. */
+.connections-list .recording-path {
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14rem;
+}
+
+.connections-list .record-request {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--sidebar-bg);
+  font-size: var(--fs-micro);
+}
+
+.connections-list .record-allow,
+.connections-list .record-deny {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
+  color: var(--text-heading);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 5px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.connections-list .record-allow {
+  margin-inline-start: auto;
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* Unattended access (§8; ADR 0033) and the host address book (ADR 0034). */
+
+/* The banner that says an unattended login is possible. It has no dismiss
+   control on purpose: "no hidden capture" means the host machine says so on
+   its own screen for as long as the door is open, and the only way to make
+   this go away is to turn the feature off. */
+.unattended-indicator {
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--amber, #c8891f);
+  border-inline-start-width: 3px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--amber, #c8891f) 8%, transparent);
+  color: var(--text-heading);
+  font-size: var(--fs-micro);
+}
+
+.unattended-panel,
+.address-book,
+.credentials-panel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--sidebar-bg);
+}
+
+.unattended-panel h3,
+.address-book h3,
+.credentials-panel h2 {
+  margin: 0 0 4px;
+  font-size: var(--fs-body);
+}
+
+.unattended-explain,
+.address-book-explain,
+.credentials-body,
+.totp-note,
+.unattended-hint {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+}
+
+.unattended-state {
+  margin: 0 0 10px;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.unattended-password,
+.credentials-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.unattended-password input,
+.credentials-form input,
+.unattended-panel select,
+.address-book select {
+  flex: 1 1 160px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  font: inherit;
+  font-size: var(--fs-micro);
+}
+
+.unattended-save,
+.unattended-disable,
+.credentials-submit,
+.totp-done,
+.book-forget,
+.book-save-btn,
+.trust-accept,
+.trust-cancel {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
+  color: var(--text-heading);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.unattended-disable,
+.trust-accept {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.unattended-totp,
+.book-trust {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+  font-size: var(--fs-micro);
+}
+
+.unattended-saved,
+.unattended-error,
+.credentials-error {
+  margin: 4px 0 8px;
+  font-size: var(--fs-micro);
+}
+
+.unattended-error,
+.credentials-error {
+  color: var(--red);
+}
+
+/* Shown once, when the second factor is turned on: the secret has to be
+   readable and selectable, because the authenticator app is often on another
+   machine and typing is the only way across. */
+.totp-sheet {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: 7px;
+}
+
+.totp-secret {
+  display: block;
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--code-bg, #f4f4f5);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--fs-micro);
+  word-break: break-all;
+  user-select: all;
+}
+
+.totp-uri {
+  width: 100%;
+  margin: 4px 0 8px;
+}
+
+.address-book-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.book-row {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 0;
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--fs-micro);
+}
+
+.book-name {
+  font-weight: 600;
+}
+
+.book-tag {
+  padding: 2px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-muted);
+}
+
+.book-note {
+  flex-basis: 100%;
+  color: var(--text-muted);
+}
+
+.book-forget {
+  margin-inline-start: auto;
+}
+
+/* Trusting a device widens what a remote machine may do without anyone here,
+   so it gets a real dialog rather than a checkbox that has already moved. */
+.trust-confirm {
+  flex-basis: 100%;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.trust-confirm h4 {
+  margin: 0 0 4px;
+  font-size: var(--fs-micro);
+}
+
+.trust-confirm p {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+}
+
+.trust-confirm-actions {
+  display: flex;
+  gap: 8px;
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-file-offer"
+description = "Enables the file_offer command without any pre-configured scope."
+commands.allow = ["file_offer"]
+
+[[permission]]
+identifier = "deny-file-offer"
+description = "Denies the file_offer command without any pre-configured scope."
+commands.deny = ["file_offer"]

@@ -34,7 +34,11 @@ instead of installing latest.
   only thing that authorizes; neither the UI nor the guest can widen a grant.
 - `view`, `input`, `clipboard_read`, `clipboard_write`, `file_transfer` and
   `recording` are independent. `FullControl` does not imply recording or files.
-- No unattended access, no hidden capture, no bypassing OS permission prompts.
+- No hidden capture, no bypassing OS permission prompts. Unattended access is
+  supported (ADR 0033): a trusted device can sign in with a device password
+  and an optional one-time code instead of waking someone. The host shows a
+  banner it cannot dismiss while that is on, and the session it gets is an
+  ordinary one — a role, and none of the independent grants.
 - Every numeric constant lives in `crates/core/src/constants.rs` (§14). Magic
   numbers duplicating them are a defect.
 

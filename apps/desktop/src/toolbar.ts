@@ -29,7 +29,32 @@ export interface MonitorDto {
 /** How the toolbar talks to Tauri; injectable for tests. */
 export interface ToolbarCommands {
   micToggle(peer: string, on: boolean): Promise<void>;
+  /**
+   * Offers this machine's clipboard to the host.
+   *
+   * Only ever called from the press below. A guest holds no clipboard grant
+   * of its own (ADR 0029), so nothing here decides that the host may have the
+   * text — the host's core does, against `clipboard_write`, when it arrives.
+   * What the press decides is the half that is the guest's to decide: whether
+   * to offer their own clipboard at all.
+   */
+  clipboardPush(peer: string, text: string): Promise<void>;
+  /**
+   * Opens the OS file picker on the Rust side and offers what was chosen.
+   *
+   * No path crosses the IPC boundary in either direction: this window never
+   * learns one and never supplies one (§2.3; ADR 0032).
+   */
+  fileOffer(peer: string): Promise<void>;
   sasRequest(peer: string): Promise<void>;
+  /**
+   * Asks the host to record the session (§17).
+   *
+   * Nothing here decides it. The host user answers, and the answer shows up
+   * as the recording badge going on — or as nothing happening at all, which
+   * is a refusal and an ordinary outcome rather than an error.
+   */
+  recordRequest(peer: string): Promise<void>;
   sasAvailable(): Promise<boolean>;
   monitorsList(peer: string): Promise<MonitorDto[]>;
   monitorSelect(peer: string, monitorId: number): Promise<void>;
@@ -41,9 +66,21 @@ export const tauriToolbarCommands: ToolbarCommands = {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('mic_toggle', { args: { peer, on } });
   },
+  async clipboardPush(peer, text) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('clipboard_push', { args: { peer, text } });
+  },
+  async fileOffer(peer) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('file_offer', { peer });
+  },
   async sasRequest(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('sas_request', { args: { peer } });
+  },
+  async recordRequest(peer) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('record_request', { args: { peer } });
   },
   async sasAvailable() {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -78,6 +115,15 @@ export class ToolbarState {
   activeMonitor: number | null = null;
   /** Placeholder resolution choice; recorded only (§11 stub). */
   resolution: string = RESOLUTION_CHOICES[0] ?? 'native';
+  /**
+   * Whether a recording request has already been sent this session.
+   *
+   * Only so the button can stop inviting a second press while the first is
+   * unanswered. It is not a claim about the host's decision, and it never
+   * turns into one: the badge over the picture is the only thing that says
+   * whether a recording is running.
+   */
+  recordAsked = false;
 }
 
 /** Callbacks the toolbar needs beyond IPC. */
@@ -95,6 +141,9 @@ const ICONS = {
   chat: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   mic: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   micOff: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2M3 3l10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
+  file: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6L9 2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><path d="M9 2v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
+  clipboard: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="8" height="11" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M6.5 3V2h3v1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
+  record: html`<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" fill="currentColor"/><circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>`,
   cad: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6V4.5A1.5 1.5 0 0 1 4.5 3H6m4 0h1.5A1.5 1.5 0 0 1 13 4.5V6m0 4v1.5a1.5 1.5 0 0 1-1.5 1.5H10M6 13H4.5A1.5 1.5 0 0 1 3 11.5V10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   collapse: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   expand: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
@@ -118,6 +167,9 @@ export function renderToolbar(
     setResolution(value: string): void;
     toggleMic(): void;
     sendCad(): void;
+    askToRecord(): void;
+    sendClipboard(): void;
+    sendFile(): void;
     pickMonitor(id: number): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
@@ -241,6 +293,37 @@ export function renderToolbar(
           @click=${actions.toggleMic}
         >
           ${state.micOn ? ICONS.mic : ICONS.micOff}
+        </button>
+        <button
+          type="button"
+          class="toolbar-btn"
+          data-testid="toolbar-file"
+          aria-label=${t(locale, 'toolbar.file')}
+          title=${t(locale, 'toolbar.file')}
+          @click=${actions.sendFile}
+        >
+          ${ICONS.file}
+        </button>
+        <button
+          type="button"
+          class="toolbar-btn"
+          data-testid="toolbar-clipboard"
+          aria-label=${t(locale, 'toolbar.clipboard')}
+          title=${t(locale, 'toolbar.clipboard')}
+          @click=${actions.sendClipboard}
+        >
+          ${ICONS.clipboard}
+        </button>
+        <button
+          type="button"
+          class="toolbar-btn ${state.recordAsked ? 'is-active' : ''}"
+          data-testid="toolbar-record"
+          aria-label=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
+          title=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
+          ?disabled=${state.recordAsked}
+          @click=${actions.askToRecord}
+        >
+          ${ICONS.record}
         </button>
         <button
           type="button"
@@ -399,6 +482,37 @@ export function mountToolbar(
         // The host answered SasAck(false) or the session ended; the button
         // stays enabled but the failure is visible in the log, not silent.
       });
+    },
+    askToRecord(): void {
+      state.recordAsked = true;
+      draw();
+      void commands.recordRequest(peer).catch(() => {
+        // The request never left (no live view, or the session ended): offer
+        // the button again rather than leave it looking like someone is
+        // considering a question nobody was asked.
+        state.recordAsked = false;
+        draw();
+      });
+    },
+    sendFile(): void {
+      void commands.fileOffer(peer).catch(() => {
+        // The picker was dismissed, the host has no `file_transfer` grant, or
+        // it runs a version without the message: nothing was offered, and
+        // nothing here claims otherwise.
+      });
+    },
+    sendClipboard(): void {
+      // The guest's own clipboard, read from the guest's own window on the
+      // guest's own press. The *host* clipboard is never reachable from a
+      // webview — that one is read and written by the Rust actor alone
+      // (§2.3; ADR 0030).
+      void navigator.clipboard
+        ?.readText()
+        .then((text) => (text ? commands.clipboardPush(peer, text) : undefined))
+        .catch(() => {
+          // No clipboard permission, an empty clipboard, or a host that
+          // refused: nothing was sent, and nothing is claimed to have been.
+        });
     },
     pickMonitor(id: number): void {
       void commands
