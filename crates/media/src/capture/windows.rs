@@ -1230,10 +1230,16 @@ mod dxgi {
             // is retained past this call.
             let sent = unsafe { SendInput(inputs, size) };
             if sent as usize != inputs.len() {
-                return Err(MediaError::InputUnavailable(
-                    "SendInput did not accept every synthesized event (desktop locked or blocked by UIPI?)"
-                        .to_owned(),
-                ));
+                // The Win32 error code is the only thing that tells UIPI
+                // rejection (desktop locked, elevated foreground window, a
+                // secure desktop from UAC) apart from every other cause; the
+                // previous message swallowed it, which made this failure mode
+                // indistinguishable from any other in the log (§18).
+                let last_error = unsafe { windows::Win32::Foundation::GetLastError() };
+                return Err(MediaError::InputUnavailable(format!(
+                    "SendInput accepted {sent} of {} synthesized events (GetLastError = {last_error:?}; desktop locked or blocked by UIPI?)",
+                    inputs.len()
+                )));
             }
             Ok(())
         }

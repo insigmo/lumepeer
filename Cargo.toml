@@ -83,7 +83,7 @@ memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
 libc = "0.2"            # syscall numbers for that filter
 
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-updater = "2"
 # Native file/directory pickers for §9.2, used **only** from Rust. The

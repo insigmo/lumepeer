@@ -127,8 +127,8 @@ export function setConnectPhase(
   credentialCodeRequired = codeRequired;
   credentialRetrySecs = retrySecs ?? undefined;
   credentialCode = next === 'awaiting_credentials' ? (code ?? undefined) : undefined;
-  if (submitting && code) {
-    // The answer came back refused: let the user try again.
+  if (submitting && next !== 'awaiting_credentials') {
+    // The answer landed, refused or not: let a later attempt submit again.
     submitting = false;
   }
   if (unchanged) {
