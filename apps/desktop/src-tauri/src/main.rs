@@ -135,6 +135,8 @@ fn main() {
             commands::sas_available,
             commands::monitor_select,
             commands::monitors_list,
+            commands::recordings_list,
+            commands::recording_export,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

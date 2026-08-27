@@ -123,6 +123,67 @@ jobs:
       - name: Keystore against a session keyring
         run: dbus-run-session -- cargo test -p lumepeer-net --features secret-service
 
+  # A whole session, end to end, on hardware CI actually has: two full builds
+  # of the desktop app on one Xvfb display, pairing over real iroh endpoints
+  # and a real QUIC connection, recording the host's own screen and exporting
+  # it (§19; ADR 0036). Everything the unit and actor tests cannot reach —
+  # Tauri's ACL, the webview's IPC surface, capture and encode on a live
+  # display, and the files the export leaves on disk — is only ever exercised
+  # here.
+  e2e:
+    name: two-node stand (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # The desktop build's own list (see `build` above), plus what a live
+          # session needs: Xvfb for the display, nasm for openh264's assembly,
+          # and the X11 headers for capture and input injection.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libclang-dev xvfb nasm libx11-dev libxtst-dev
+      - name: Let WebKit start its sandbox
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+        # which WebKitGTK's web process needs to sandbox itself. Without this
+        # the webview never loads and every step of the stand times out on a
+        # window that is up but blank.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+        working-directory: apps/desktop
+      - run: npm run build
+        working-directory: apps/desktop
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-pilot-cli@0.7.2
+      - name: Build the decoder-worker sidecar for this target
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
+          cargo build -p lumepeer-decoder-worker
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp target/debug/lumepeer-decoder-worker "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${TRIPLE}"
+      - name: Build the app with the pilot bridge
+        # `pilot` is debug-only and never in a release binary (main.rs gates it
+        # on debug_assertions as well as on the feature), which is exactly why
+        # the stand runs against a debug build.
+        run: cargo build -p lumepeer-desktop --features pilot,capture-x11,encode-openh264,decode-openh264
+      - name: Run the two-node stand under Xvfb
+        # Through `bash` rather than as an executable: the repository is edited
+        # from Windows too, where git does not carry an exec bit to set.
+        run: xvfb-run -a --server-args="-screen 0 1280x800x24" bash e2e/ci-stand.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-artifacts
+          path: target/e2e
+          retention-days: 14
+
   # The fuzz targets live outside the workspace and need nightly, so they get
   # their own job. A build is enough per commit; longer runs belong to the
   # release checklist (§21).

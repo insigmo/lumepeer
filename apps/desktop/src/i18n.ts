@@ -45,6 +45,16 @@ export type TranslationKey =
   | 'status.recording.allow'
   | 'status.recording.decline'
   | 'status.recording.banner'
+  | 'recordings.heading'
+  | 'recordings.empty'
+  | 'recordings.export'
+  | 'recordings.exportAgain'
+  | 'recordings.exporting'
+  | 'recordings.exportedTo'
+  | 'recordings.exportedNothing'
+  | 'recordings.exportFailed'
+  | 'recordings.megabytes'
+  | 'recordings.kilobytes'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'status.endedJustNow'
@@ -217,6 +227,16 @@ const en: Dictionary = {
   'status.recording.allow': 'Start recording',
   'status.recording.decline': 'Not now',
   'status.recording.banner': 'A session is being recorded on this device.',
+  'recordings.heading': 'Recordings on this device',
+  'recordings.empty': 'Nothing has been recorded on this device yet.',
+  'recordings.export': 'Export',
+  'recordings.exportAgain': 'Export again',
+  'recordings.exporting': 'Exporting...',
+  'recordings.exportedTo': (tracks) => `Exported: ${tracks}`,
+  'recordings.exportedNothing': 'This recording holds no picture and no sound.',
+  'recordings.exportFailed': 'The export failed. Nothing was written.',
+  'recordings.megabytes': (size) => `${size} MB`,
+  'recordings.kilobytes': (size) => `${size} kB`,
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'status.endedJustNow': 'Ended just now',
@@ -388,6 +408,16 @@ const ar: Dictionary = {
   'status.recording.allow': 'بدء التسجيل',
   'status.recording.decline': 'ليس الآن',
   'status.recording.banner': 'يجري تسجيل جلسة على هذا الجهاز.',
+  'recordings.heading': 'التسجيلات على هذا الجهاز',
+  'recordings.empty': 'لم يُسجَّل شيء على هذا الجهاز بعد.',
+  'recordings.export': 'تصدير',
+  'recordings.exportAgain': 'تصدير مرة أخرى',
+  'recordings.exporting': 'جارٍ التصدير...',
+  'recordings.exportedTo': (tracks) => `تم التصدير: ${tracks}`,
+  'recordings.exportedNothing': 'لا يحتوي هذا التسجيل على صورة ولا صوت.',
+  'recordings.exportFailed': 'فشل التصدير. لم يُكتب أي ملف.',
+  'recordings.megabytes': (size) => `${size} م.ب`,
+  'recordings.kilobytes': (size) => `${size} ك.ب`,
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'status.endedJustNow': 'انتهت للتو',

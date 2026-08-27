@@ -1602,3 +1602,311 @@ pub async fn monitors_list(
         })
         .collect())
 }
+
+/// One recording this device has written, as the host's own screen sees it
+/// (§9.2, §17; ADR 0031, ADR 0035).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordingDto {
+    /// File name inside the app's recordings directory, never a path.
+    ///
+    /// A name is all the webview gets and all it may hand back: the directory
+    /// is this process's own and is joined on the Rust side, so no string
+    /// from the view layer can point the export at a file elsewhere (§2.3).
+    pub name: String,
+    /// Size on disk in bytes.
+    pub bytes: u64,
+    /// Unix seconds of the last write, for ordering and for showing an age.
+    pub modified: u64,
+    /// Whether an export of this recording already sits in `exports/`.
+    pub exported: bool,
+}
+
+/// Directory the exports of §9.2 are written into, under the recordings
+/// directory so one folder holds a session's recording and what came out of
+/// it.
+const EXPORTS_SUBDIR: &str = "exports";
+
+/// Extension of a session recording (`lumepeer_media::record`).
+const RECORDING_EXTENSION: &str = "lmrc";
+
+/// The recordings directory, or the §18 error for a machine with no per-user
+/// data directory at all.
+fn recordings_dir() -> Result<std::path::PathBuf, IpcError> {
+    crate::config::recordings_dir().ok_or(IpcError {
+        code: "NO_DATA_DIR",
+        message: "this machine has no per-user data directory".to_owned(),
+    })
+}
+
+/// Rejects anything that is not a plain recording file name.
+///
+/// The check is deliberately whole-string rather than a scan for `..`: a name
+/// passes only if it is exactly its own `file_name()` and carries the
+/// recording extension, so a separator, a drive letter, a parent segment or
+/// an absolute path all fail on the same rule. Where this process reads and
+/// writes is not a decision the untrusted view layer takes (§2.3).
+fn recording_file_name(name: &str) -> Result<&str, IpcError> {
+    let path = std::path::Path::new(name);
+    let plain = path.file_name().and_then(std::ffi::OsStr::to_str) == Some(name);
+    let is_recording = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(RECORDING_EXTENSION));
+    if plain && is_recording {
+        Ok(name)
+    } else {
+        Err(IpcError {
+            code: "BAD_RECORDING",
+            message: "not the name of a recording of this device".to_owned(),
+        })
+    }
+}
+
+/// Host side: the recordings this device has written (§9.2, §17; ADR 0035).
+///
+/// Reads the app's own recordings directory and nothing else — the webview
+/// names no path here either, it only receives names. A missing directory is
+/// an empty list rather than an error: a host that has never recorded has
+/// nothing to show, which is not a failure.
+///
+/// Main-window only: recordings belong to the machine that wrote them, and a
+/// guest's view window has no business enumerating them.
+///
+/// # Errors
+/// [`IpcError`] when called from another window, or when this machine has no
+/// per-user data directory.
+#[tauri::command]
+pub async fn recordings_list(window: Window) -> Result<Vec<RecordingDto>, IpcError> {
+    check_window(&window)?;
+    let dir = recordings_dir()?;
+    let exports = dir.join(EXPORTS_SUBDIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut recordings: Vec<RecordingDto> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = recording_file_name(path.file_name()?.to_str()?)
+                .ok()?
+                .to_owned();
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let stem = path.file_stem()?.to_str()?;
+            let exported = exports
+                .join(format!(
+                    "{stem}.{}",
+                    lumepeer_media::export::VIDEO_EXTENSION
+                ))
+                .exists()
+                || exports
+                    .join(format!(
+                        "{stem}.{}",
+                        lumepeer_media::export::AUDIO_EXTENSION
+                    ))
+                    .exists();
+            Some(RecordingDto {
+                name,
+                bytes: meta.len(),
+                modified: modified_unix_secs(&meta),
+                exported,
+            })
+        })
+        .collect();
+    // Newest first: the recording someone just stopped is the one they are
+    // looking for.
+    recordings.sort_unstable_by(|a, b| b.modified.cmp(&a.modified).then(a.name.cmp(&b.name)));
+    Ok(recordings)
+}
+
+/// Last-write time of `meta` in unix seconds, `0` where the platform has none.
+fn modified_unix_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Argument of [`recording_export`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordingExportArgs {
+    /// Name of the recording, as a previous [`recordings_list`] reported it.
+    pub name: String,
+}
+
+/// What one export produced, for the panel that asked for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportDto {
+    /// Directory both files were written into, shown so the host can find
+    /// them. Travels outwards only, exactly like a recording's own path.
+    pub dir: String,
+    /// File name of the H.264 elementary stream, when the recording had
+    /// video.
+    pub video: Option<String>,
+    /// File name of the Ogg Opus stream, when the recording had audio.
+    pub audio: Option<String>,
+    /// Video records written.
+    pub video_frames: u64,
+    /// Opus packets written.
+    pub audio_packets: u64,
+    /// Event records skipped: the action log is not a media track (§15).
+    pub events_skipped: u64,
+}
+
+/// Host side: exports one of this device's recordings into files a player can
+/// open (§9.2; ADR 0031, ADR 0035).
+///
+/// Local from end to end: it reads a file this process wrote, writes two next
+/// to it, and touches no session, no peer and no grant. The `recording` grant
+/// governed *making* the recording; what the host does afterwards with its own
+/// file is not a decision a guest ever had a say in.
+///
+/// Main-window only, and the name is validated before it is joined onto the
+/// recordings directory ([`recording_file_name`]).
+///
+/// # Errors
+/// [`IpcError`] when called from another window, when `name` is not a plain
+/// recording name, or when the recording cannot be read or the export
+/// written.
+#[tauri::command]
+pub async fn recording_export(
+    window: Window,
+    args: RecordingExportArgs,
+) -> Result<ExportDto, IpcError> {
+    check_window(&window)?;
+    let dir = recordings_dir()?;
+    let source = dir.join(recording_file_name(&args.name)?);
+    let out_dir = dir.join(EXPORTS_SUBDIR);
+    // Off the async runtime: an hour-long session is a streaming read of a
+    // file that can run to gigabytes, and the IPC executor is shared with
+    // every other command, including a revoke.
+    let out_for_task = out_dir.clone();
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        lumepeer_media::export::export_file(&source, &out_for_task)
+    })
+    .await
+    .map_err(|_| IpcError {
+        code: "EXPORT",
+        message: "the export did not finish".to_owned(),
+    })?
+    .map_err(|error| IpcError {
+        code: "EXPORT",
+        // Safe to show: `RecordingError` carries a format complaint or an I/O
+        // string about this machine's own file, and names no peer (§15).
+        message: error.to_string(),
+    })?;
+    Ok(ExportDto {
+        dir: out_dir.to_string_lossy().into_owned(),
+        video: file_name_of(output.video.as_deref()),
+        audio: file_name_of(output.audio.as_deref()),
+        video_frames: output.summary.video_frames,
+        audio_packets: output.summary.audio_packets,
+        events_skipped: output.summary.events_skipped,
+    })
+}
+
+/// File name of an exported track, dropping the directory the DTO already
+/// carries once.
+fn file_name_of(path: Option<&std::path::Path>) -> Option<String> {
+    path.and_then(std::path::Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        reason = "a failed assumption must fail the test"
+    )]
+
+    use super::*;
+
+    #[test]
+    fn a_plain_recording_name_passes() {
+        assert_eq!(
+            recording_file_name("session-1700000000-ab12cd.lmrc").unwrap(),
+            "session-1700000000-ab12cd.lmrc"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_a_path_is_refused() {
+        for name in [
+            "../secrets.lmrc",
+            "sub/dir.lmrc",
+            "sub\\dir.lmrc",
+            "/etc/passwd.lmrc",
+            "..",
+            "",
+        ] {
+            assert_eq!(
+                recording_file_name(name).unwrap_err().code,
+                "BAD_RECORDING",
+                "{name} was not refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_recording_is_refused() {
+        for name in ["notes.txt", "session.lmrc.txt", "session", "session."] {
+            assert_eq!(
+                recording_file_name(name).unwrap_err().code,
+                "BAD_RECORDING",
+                "{name} was not refused"
+            );
+        }
+    }
+
+    /// Every command Tauri is told to handle must also be declared to
+    /// `tauri-build`, or no `allow-<name>` permission is generated for it and
+    /// the capability file naming it fails the build — but only once someone
+    /// deletes the stale autogenerated `.toml` a previous build left behind.
+    /// That drift is invisible until then, which is exactly why it is a test.
+    #[test]
+    fn every_handled_command_is_declared_to_tauri_build() {
+        let declared = command_list(
+            include_str!("../build.rs"),
+            "const COMMANDS: &[&str] = &[",
+            "];",
+        );
+        let handled: Vec<String> =
+            command_list(include_str!("main.rs"), "tauri::generate_handler![", "])")
+                .into_iter()
+                .map(|line| line.trim_start_matches("commands::").to_owned())
+                .collect();
+        assert!(!handled.is_empty(), "no handled commands were parsed");
+        for command in &handled {
+            assert!(
+                declared.contains(command),
+                "{command} is in generate_handler! but not in build.rs COMMANDS"
+            );
+        }
+        for command in &declared {
+            assert!(
+                handled.contains(command),
+                "{command} is declared in build.rs COMMANDS but is never handled"
+            );
+        }
+    }
+
+    /// The entries of a bracketed list in a source file, unquoted and without
+    /// their trailing commas.
+    fn command_list(source: &str, open: &str, close: &str) -> Vec<String> {
+        source
+            .split_once(open)
+            .expect("list opener")
+            .1
+            .split_once(close)
+            .expect("list terminator")
+            .0
+            .lines()
+            .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .map(str::to_owned)
+            .collect()
+    }
+}

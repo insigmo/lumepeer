@@ -28,6 +28,12 @@ import {
   type ConnectPhase,
 } from './invite-view';
 import { logoMark } from './logo';
+import {
+  onRecordingsStateChange,
+  recordingsPanel,
+  tauriRecordingsCommands,
+  type RecordingEntry,
+} from './recordings';
 import type { FileTransfers } from './file-transfers';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
@@ -67,6 +73,10 @@ const clipboardSyncedAt = new Map<string, number>();
 // what the actor answered when the recording started: the path is chosen in
 // Rust and shown here, never chosen here (§2.3).
 const recordingPaths = new Map<string, string>();
+// What this device has recorded, from the last poll (§9.2; ADR 0035). Names
+// only: the directory they live in stays in Rust, and the export takes one
+// of these names back rather than a path.
+let recordings: RecordingEntry[] = [];
 // Offers waiting for an answer and transfers in flight, from the last poll.
 let files: FileTransfers = { offers: [], transfers: [] };
 
@@ -210,6 +220,8 @@ function renderNow(): void {
                 (peer) => saveDeviceButton(peer, locale, () => void refresh()),
               )}
               <div class="main-divider"></div>
+              ${recordingsPanel(recordings, locale, tauriRecordingsCommands, () => void refresh())}
+              <div class="main-divider"></div>
               ${addressBook(savedDevices, locale, () => void refresh())}
               ${unattendedSettings(unattended, locale, () => void refresh())}
             </main>
@@ -277,6 +289,13 @@ async function refresh(): Promise<void> {
     } catch (error) {
       console.error('file_transfers failed:', error);
     }
+    // Same reasoning, and the same isolation: a directory that cannot be read
+    // must not cost the session list its refresh.
+    try {
+      recordings = await invoke<RecordingEntry[]>('recordings_list');
+    } catch (error) {
+      console.error('recordings_list failed:', error);
+    }
     sessions = sessionResult;
     history = historyResult;
     unattended = unattendedResult;
@@ -324,6 +343,7 @@ export function setLocale(next: Locale): void {
 onInviteStateChange(renderNow);
 onUnattendedStateChange(renderNow);
 onAddressBookStateChange(renderNow);
+onRecordingsStateChange(renderNow);
 
 renderNow();
 void refresh();

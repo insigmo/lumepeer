@@ -13,6 +13,7 @@ import { addressBook, type AddressBookEntry } from './address-book';
 import { consentDialog } from './consent-dialog';
 import { SUPPORTED_LOCALES } from './i18n';
 import { connectPanel, credentialsPanel, inviteCodePanel, setConnectPhase } from './invite-view';
+import { recordingsPanel, type RecordingEntry } from './recordings';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
 import { unattendedIndicator, unattendedSettings, type UnattendedStatus } from './unattended-settings';
@@ -150,6 +151,29 @@ describe('accessibility: address book', () => {
 
     it(`has no axe violations with saved devices (${locale})`, async () => {
       render(addressBook(entries, locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: recordings panel', () => {
+  const recordings: RecordingEntry[] = [
+    {
+      name: 'session-1700000000-ab12cd.lmrc',
+      bytes: 5 * 1024 * 1024,
+      modified: 1700000000,
+      exported: false,
+    },
+  ];
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations when empty (${locale})`, async () => {
+      render(recordingsPanel([], locale), container);
+      expect(await auditViolations(container)).toEqual([]);
+    });
+
+    it(`has no axe violations with recordings to export (${locale})`, async () => {
+      render(recordingsPanel(recordings, locale), container);
       expect(await auditViolations(container)).toEqual([]);
     });
   }

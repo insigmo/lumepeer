@@ -44,6 +44,13 @@ const COMMANDS: &[&str] = &[
     "audio_toggle",
     "recording_toggle",
     "record_request",
+    "mic_toggle",
+    "sas_request",
+    "sas_available",
+    "monitor_select",
+    "monitors_list",
+    "recordings_list",
+    "recording_export",
 ];
 
 fn main() {
