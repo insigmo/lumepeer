@@ -42,7 +42,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": false
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "deb": {
+        "depends": ["libpipewire-0.3-0"],
+        "recommends": ["xdg-desktop-portal", "pipewire"]
+      },
+      "rpm": {
+        "depends": ["pipewire-libs"],
+        "recommends": ["xdg-desktop-portal", "pipewire"]
+      }
+    }
   },
   "plugins": {
     "updater": {

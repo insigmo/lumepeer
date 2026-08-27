@@ -105,22 +105,47 @@ pub trait VideoEncoder: Send {
 /// implemented, so this deliberately reports `None` for `VideoCodec::Av1`
 /// here rather than reusing the H.264 answer for a codec it never checked
 /// (that mismatch is exactly the bug §11's mutual-hardware-support rule for
-/// AV1 exists to prevent). `VideoToolbox`, `MediaCodec` and VA-API bindings
-/// remain phase 4 work (§19), so this is `None` on every other platform.
+/// AV1 exists to prevent).
+///
+/// On Linux, with `encode-vaapi` built in, [`linux_vaapi`] does the same
+/// thing through VA-API: opens a DRM display, creates an H.264
+/// `VAEntrypointEncSlice` config, allocates NV12 surfaces and creates the
+/// encode context, reporting [`EncoderKind::Hardware`] only when all of that
+/// actually succeeds (ADR 0040). It too answers `None` for
+/// [`VideoCodec::Av1`] explicitly rather than reusing its H.264 answer:
+/// AV1 over VA-API is a different profile with different parameter buffers,
+/// and nothing here has checked it.
+///
+/// `VideoToolbox` and `MediaCodec` remain phase 4 work (§19), so this is
+/// `None` on macOS and Android.
 #[must_use]
 pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
+    // AV1 is refused up front, on every platform, rather than once per
+    // backend: no backend implements an AV1 probe, and the failure mode this
+    // guards against — handing back an H.264 answer to an AV1 question — is
+    // one that a new backend would reintroduce silently if the check lived
+    // inside each of them.
+    if config.codec != VideoCodec::H264 {
+        return None;
+    }
+
     #[cfg(all(target_os = "windows", feature = "encode-mf"))]
     {
-        if config.codec == VideoCodec::H264 && windows::hardware_h264_available(config) {
+        if windows::hardware_h264_available(config) {
             return Some(EncoderKind::Hardware);
         }
-        None
     }
-    #[cfg(not(all(target_os = "windows", feature = "encode-mf")))]
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "encode-vaapi"
+    ))]
     {
-        let _ = config;
-        None
+        if linux_vaapi::hardware_h264_available(config) {
+            return Some(EncoderKind::Hardware);
+        }
     }
+    None
 }
 
 /// Selects an encoder: hardware if available, otherwise the software fallback
@@ -149,11 +174,37 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
             return windows::MediaFoundationEncoder::new(config)
                 .map(|e| Box::new(e) as Box<dyn VideoEncoder>);
         }
-        // Every other platform's `probe_hardware` above is hardcoded `None`,
-        // so this arm is unreachable there; it stays as an honest error
-        // rather than a silent fallback if that ever changes without wiring
-        // up a constructor here too.
-        #[cfg(not(all(target_os = "windows", feature = "encode-mf")))]
+        #[cfg(all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "encode-vaapi"
+        ))]
+        {
+            tracing::info!("hardware H.264 encoder available, using VA-API (§18)");
+            // Deliberately not `?`: a probe that succeeded and a constructor
+            // that then failed is a driver that changed its mind between two
+            // calls a microsecond apart — rare, but a session is worth more
+            // than being right about it, so it falls through to openh264
+            // below with a log line rather than failing (§18, ADR 0040).
+            match linux_vaapi::VaapiEncoder::new(config) {
+                Ok(encoder) => return Ok(Box::new(encoder) as Box<dyn VideoEncoder>),
+                Err(error) => {
+                    tracing::info!(%error, "the VA-API encoder probed available but would not build; falling back to openh264");
+                }
+            }
+        }
+        // A platform whose `probe_hardware` above can return `Hardware` but
+        // that has no constructor wired up here would silently encode with
+        // the software fallback while reporting hardware. This arm exists so
+        // that mistake is an error instead.
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "encode-mf"),
+            all(
+                target_os = "linux",
+                not(target_os = "android"),
+                feature = "encode-vaapi"
+            ),
+        )))]
         {
             return Err(MediaError::EncoderUnavailable(
                 "hardware encoder probing reported a backend that is not implemented yet"
@@ -174,6 +225,26 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         ))
     }
 }
+
+/// BGRA/NV12 conversion shared by every hardware backend.
+#[cfg(any(
+    all(target_os = "windows", feature = "encode-mf"),
+    all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "encode-vaapi"
+    ),
+))]
+mod nv12;
+
+/// VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4;
+/// ADR 0040).
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "encode-vaapi"
+))]
+pub mod linux_vaapi;
 
 /// Windows Media Foundation hardware H.264 encoder (§5.1, §11, §18/§19 phase
 /// 4; ADR 0011).

@@ -103,7 +103,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm xvfb libx11-dev libxtst-dev libdbus-1-dev gnome-keyring libpipewire-0.3-dev libclang-dev
+          sudo apt-get install -y nasm xvfb libx11-dev libxtst-dev libdbus-1-dev gnome-keyring libpipewire-0.3-dev libclang-dev libva-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -112,10 +112,35 @@ jobs:
       - run: cargo build -p lumepeer-decoder-worker
       - run: cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D warnings
       - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
+      # The set a Linux .deb actually ships (Taskfile.yml's
+      # LINUX_MEDIA_FEATURES plus the audio backends the desktop crate's
+      # Linux target table adds). The three lines above check the features
+      # one at a time, which is what catches a missing `dep:` in a feature
+      # declaration; this one checks them together, which is what catches a
+      # module that only compiles when some *other* feature happens to be on
+      # — the bug that left `audio-capture-pipewire` unbuildable on its own
+      # (ADR 0039).
+      - name: Clippy the whole shipped Linux feature set
+        run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
+      # The VA-API encoder is deliberately not in the shipped feature set
+      # (a .deb must install on a machine with no VA-API at all), so it gets
+      # its own line. CI has no encode-capable GPU, which is the case the
+      # probe test is most worth running in: it asserts that
+      # `hardware_h264_available` and construction agree, and here both must
+      # be `false` and `select_encoder` must fall back to openh264 (ADR 0040).
+      - name: Clippy and test the VA-API encoder
+        run: |
+          cargo clippy -p lumepeer-media --all-targets --features encode-vaapi -- -D warnings
+          cargo test -p lumepeer-media --features encode-vaapi,encode-openh264 --lib encode::
       - name: Test the media pipeline under Xvfb
         # LUMEPEER_TEST_XTEST enables the input injection test, which is only
-        # safe against a throwaway display like this one.
-        run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,encode-openh264
+        # safe against a throwaway display like this one. It also gates the
+        # monitor-enumeration test, which needs a real X server to have any
+        # RandR outputs to enumerate. Nothing here needs a sound server: the
+        # PipeWire backends' tests cover the chunking and format arithmetic,
+        # which is the part with the bugs in it, and a CI runner has no
+        # graph to connect to (ADR 0039).
+        run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire
       - name: Capture, encode and sandboxed decode end to end
         run: xvfb-run -a cargo test -p lumepeer-integration-tests --test media_pipeline
       - name: Error matrix (§18)

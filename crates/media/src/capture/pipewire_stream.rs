@@ -7,14 +7,14 @@
 //! something calls `quit()`).
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::capture::linux_wayland::portal::StreamSize;
 use crate::capture::{Frame, PixelFormat};
 use crate::error::{MediaError, Result};
 
-/// Packs a raw row-strided buffer into a tightly-packed BGRx `Frame`,
+/// Packs a raw row-strided buffer into a tightly-packed `BGRx` `Frame`,
 /// deduplicating against `last_hash` the same way `linux_x11.rs` does.
 ///
 /// Returns `None` when the frame is identical to the last one handed out, or
@@ -106,7 +106,7 @@ impl PipeWireFrameThread {
     /// returns — the thread publishes the negotiated width/height into it
     /// from `param_changed` so `WaylandPortalInjector` can scale pointer
     /// coordinates correctly.
-    pub fn spawn(node_id: u32, stream_size: Arc<StreamSize>) -> Result<Self> {
+    pub(crate) fn spawn(node_id: u32, stream_size: Arc<StreamSize>) -> Result<Self> {
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<Shutdown>();
 
@@ -156,8 +156,13 @@ impl PipeWireFrameThread {
         // Cross-thread shutdown: dropping `PipeWireFrameThread` sends
         // `Shutdown`, which this attaches to the loop as an IO source.
         let _shutdown_listener = {
-            let mainloop = mainloop.clone();
-            shutdown_rx.attach(mainloop.loop_(), move |Shutdown| mainloop.quit())
+            // Two handles, deliberately: `attach` borrows the `LoopRef` for as
+            // long as the returned listener lives, so the loop it is taken
+            // from has to be the outer `mainloop` that outlives this block —
+            // and the closure needs an owned handle of its own to call
+            // `quit()` on. One clone cannot be both.
+            let quit = mainloop.clone();
+            shutdown_rx.attach(mainloop.loop_(), move |Shutdown| quit.quit())
         };
 
         let props = pipewire::properties::properties! {
@@ -204,7 +209,10 @@ impl PipeWireFrameThread {
                 let Some(data) = datas.first_mut() else {
                     return;
                 };
-                let stride = data.chunk().stride().max(0) as usize;
+                // `max(0)` already excluded the negative half, so the
+                // cast has no sign to lose; clippy cannot see that through
+                // the method call.
+                let stride = usize::try_from(data.chunk().stride().max(0)).unwrap_or(0);
                 let Some(bytes) = data.data() else { return };
 
                 if let Some(frame) = pack_frame(
@@ -264,11 +272,11 @@ impl PipeWireFrameThread {
 
     /// Drains the next available frame, or `None` if nothing new has
     /// arrived, matching `ScreenCapturer::next_frame`'s "no change" contract.
-    pub fn try_recv_frame(&self) -> Option<Frame> {
-        match self.frames.try_recv() {
-            Ok(frame) => Some(frame),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+    pub(crate) fn try_recv_frame(&self) -> Option<Frame> {
+        // Both error arms — nothing queued, and the producer thread gone —
+        // are "no new frame right now" to the caller, which is exactly what
+        // `ok()` collapses them to.
+        self.frames.try_recv().ok()
     }
 }
 

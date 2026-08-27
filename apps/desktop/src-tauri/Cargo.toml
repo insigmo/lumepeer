@@ -24,6 +24,7 @@ default = []
 # reports "no capture backend" instead of showing a picture (§18).
 capture-x11 = ["lumepeer-media/capture-x11"]
 capture-portal = ["lumepeer-media/capture-portal"]
+audio-capture-pipewire = ["lumepeer-media/audio-capture-pipewire"]
 capture-scap = ["lumepeer-media/capture-scap"]
 capture-windows = ["lumepeer-media/capture-windows"]
 capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
@@ -70,4 +71,14 @@ tracing-subscriber.workspace = true
 # that making them unconditional here would slow down every Windows/macOS
 # build, including ones that never touch capture.
 [target.'cfg(target_os = "linux")'.dependencies]
-lumepeer-media = { workspace = true, features = ["capture-x11"] }
+# `audio-capture-pipewire` sits here rather than in the shared section above
+# for the same reason `capture-x11` does: it is the Linux half of a feature
+# pair whose Windows half (`audio-capture`, WASAPI) is already unconditional
+# there. Without it a Linux host captures no desktop audio and a Linux guest
+# hears nothing — `audio-capture` is `windows/Win32_Media_Audio` and does
+# exactly nothing off Windows, so the shared section alone left Linux silent
+# in both directions.
+lumepeer-media = { workspace = true, features = [
+    "capture-x11",
+    "audio-capture-pipewire",
+] }

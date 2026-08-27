@@ -128,7 +128,7 @@ impl ScreenCapturer for WaylandPortalCapturer {
                 .stream
                 .as_ref()
                 .ok_or_else(|| MediaError::CaptureUnavailable("capturer not started".to_owned()))?;
-            return Ok(stream.try_recv_frame());
+            Ok(stream.try_recv_frame())
         }
         #[cfg(not(feature = "capture-portal"))]
         Err(MediaError::CaptureUnavailable(
@@ -155,11 +155,11 @@ impl ScreenCapturer for WaylandPortalCapturer {
                 .shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            return guard
+            guard
                 .as_ref()
                 .map_or(InputCapability::PortalRemoteDesktop, |h| {
                     h.input_capability()
-                });
+                })
         }
         #[cfg(not(feature = "capture-portal"))]
         InputCapability::PortalRemoteDesktop
@@ -368,6 +368,11 @@ pub mod portal {
                 .store(width, std::sync::atomic::Ordering::Relaxed);
             self.height
                 .store(height, std::sync::atomic::Ordering::Relaxed);
+            // Also published process-wide, for `last_stream_size` below.
+            LAST_STREAM_SIZE.store(
+                (u64::from(width) << u32::BITS) | u64::from(height),
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         /// Called from the injector before scaling a pointer coordinate.
@@ -379,6 +384,32 @@ pub mod portal {
                 self.height.load(std::sync::atomic::Ordering::Relaxed),
             )
         }
+    }
+
+    /// Size of the most recently negotiated portal stream, packed as
+    /// `width << 32 | height`, or 0 while nothing has been negotiated.
+    ///
+    /// Process-global on purpose. [`crate::capture::host_monitors`] is a free
+    /// function with no handle on the live capturer, and on a Wayland session
+    /// the only truthful answer to "how big is the screen this guest sees" is
+    /// the size the portal actually negotiated — asking again would mean a
+    /// second consent dialog for a question the running session already
+    /// answered (ADR 0028).
+    static LAST_STREAM_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The negotiated portal stream's size, or `None` before the first frame
+    /// of the first session has fixed a format.
+    #[must_use]
+    pub fn last_stream_size() -> Option<(u32, u32)> {
+        let packed = LAST_STREAM_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+        if packed == 0 {
+            return None;
+        }
+        // Both halves came from a `u32` in `StreamSize::set`, so neither
+        // narrowing can lose anything.
+        let width = u32::try_from(packed >> u32::BITS).unwrap_or(0);
+        let height = u32::try_from(packed & u64::from(u32::MAX)).unwrap_or(0);
+        (width > 0 && height > 0).then_some((width, height))
     }
 
     /// Live portal session: the negotiated grant plus everything needed to
@@ -638,8 +669,11 @@ mod tests {
     #[cfg(feature = "capture-portal")]
     #[test]
     fn normalized_coordinates_map_onto_the_stream() {
-        assert_eq!(WaylandPortalInjector::to_stream(0, 1920), 0.0);
-        assert_eq!(WaylandPortalInjector::to_stream(u16::MAX, 1920), 1920.0);
+        // Both ends are exact by construction — 0 maps to 0 and u16::MAX to
+        // the full width — so these compare against an epsilon rather than
+        // with `==` only to satisfy the crate-wide `float_cmp` lint.
+        assert!(WaylandPortalInjector::to_stream(0, 1920).abs() < f64::EPSILON);
+        assert!((WaylandPortalInjector::to_stream(u16::MAX, 1920) - 1920.0).abs() < f64::EPSILON);
         assert!((WaylandPortalInjector::to_stream(32_767, 1920) - 959.5).abs() < 1.0);
     }
 
@@ -666,6 +700,7 @@ mod tests {
     #[cfg(feature = "capture-portal")]
     #[test]
     fn injecting_before_negotiation_refuses_rather_than_silently_dropping() {
+        use crate::capture::InputInjector;
         use lumepeer_core::protocol::{InputDetail, InputEventPayload};
 
         let shared = std::sync::Arc::new(std::sync::Mutex::new(None));
