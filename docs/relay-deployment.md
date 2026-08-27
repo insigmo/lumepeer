@@ -34,12 +34,12 @@ compose file mounts read-only.
 
 Requirements:
 
-| Requirement | Why |
-| --- | --- |
-| DNS A/AAAA record for the `hostname` in `relay.toml` | ACME certificate issuance and client discovery |
-| Port 80/tcp reachable from the internet | Let's Encrypt HTTP-01 challenge and the captive-portal probe |
-| Port 443/tcp reachable from the internet | Client relaying traffic over TLS |
-| Port 7842/udp reachable from the internet | QUIC address discovery — how a peer learns its own public address, which is what makes hole punching succeed |
+| Requirement                                          | Why                                                                                                          |
+|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| DNS A/AAAA record for the `hostname` in `relay.toml` | ACME certificate issuance and client discovery                                                               |
+| Port 80/tcp reachable from the internet              | Let's Encrypt HTTP-01 challenge and the captive-portal probe                                                 |
+| Port 443/tcp reachable from the internet             | Client relaying traffic over TLS                                                                             |
+| Port 7842/udp reachable from the internet            | QUIC address discovery — how a peer learns its own public address, which is what makes hole punching succeed |
 
 Verify:
 

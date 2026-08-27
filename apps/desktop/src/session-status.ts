@@ -9,15 +9,45 @@ import { html, type TemplateResult } from 'lit-html';
 import type { Locale } from './i18n';
 import { t } from './i18n';
 import type { Role } from './consent-dialog';
+import type { FileCommands, FileTransfers } from './file-transfers';
+import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 
 export type SessionState = 'pending' | 'active';
+
+/**
+ * The four permissions of §8.2 the host can move on a session that is already
+ * running. `view` and `input` are absent on purpose: they follow the role, and
+ * this window has no way to reach them.
+ */
+export type IndependentGrant = 'clipboard_read' | 'clipboard_write' | 'file_transfer' | 'recording';
 
 export interface SessionStatus {
   peer_label: string;
   role: Role;
   input: boolean;
   state: SessionState;
+  clipboard_read: boolean;
+  clipboard_write: boolean;
+  file_transfer: boolean;
+  recording: boolean;
+  /**
+   * Whether a recording is being written right now (§17).
+   *
+   * Not the same as `recording`, which is only permission. The indicator both
+   * sides must show hangs off this one.
+   */
+  recording_active: boolean;
+  /** Whether this guest asked to be recorded and is still waiting (§17). */
+  record_request: boolean;
 }
+
+/**
+ * How long the "clipboard synced" note stays up after a payload arrives.
+ *
+ * Long enough to be noticed between two one-second polls, short enough that
+ * the row does not keep claiming something that happened a minute ago.
+ */
+export const CLIPBOARD_NOTE_MS = 4000;
 
 /**
  * One row of `connection_history` (§21 punch-list item 5): a host this device
@@ -36,6 +66,170 @@ export interface HistoryEntry {
 async function revoke(peer: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('session_revoke', { args: { peer } });
+}
+
+async function setGrant(peer: string, grant: IndependentGrant, allowed: boolean): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('session_set_grant', { args: { peer, grant, allowed } });
+}
+
+/**
+ * Starts or stops the recording of `peer` (§17).
+ *
+ * Answers with the file the *actor* chose. The webview never names a path:
+ * where this machine writes is not a decision the untrusted view layer takes
+ * (§2.3), so the path only ever travels outwards, to be shown.
+ */
+async function toggleRecording(peer: string, on: boolean): Promise<string | null> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return (await invoke('recording_toggle', { args: { peer, on } })) as string | null;
+}
+
+/**
+ * The switches, in the order they are shown. The label says what the guest
+ * gets, so that turning one on is a decision about a consequence rather than
+ * about a flag name (§2.2, §19 phase 6).
+ */
+const GRANT_ROWS: readonly {
+  grant: IndependentGrant;
+  key:
+    | 'status.grants.clipboardRead'
+    | 'status.grants.clipboardWrite'
+    | 'status.grants.fileTransfer'
+    | 'status.grants.recording';
+  held: (session: SessionStatus) => boolean;
+}[] = [
+  { grant: 'clipboard_read', key: 'status.grants.clipboardRead', held: (s) => s.clipboard_read },
+  { grant: 'clipboard_write', key: 'status.grants.clipboardWrite', held: (s) => s.clipboard_write },
+  { grant: 'file_transfer', key: 'status.grants.fileTransfer', held: (s) => s.file_transfer },
+  { grant: 'recording', key: 'status.grants.recording', held: (s) => s.recording },
+];
+
+/**
+ * The four independent grants of one active session.
+ *
+ * Nothing is toggled locally: the checkbox shows what the last `session_status`
+ * said the core holds, the click asks the core to change it, and `onChange`
+ * re-polls. A switch that looks on while the host refused would be the one
+ * lie this panel must never tell.
+ */
+function grantSwitches(
+  session: SessionStatus,
+  locale: Locale,
+  onChange: () => void,
+): TemplateResult {
+  return html`
+    <fieldset class="session-grants">
+      <legend>${t(locale, 'status.grants.heading')}</legend>
+      ${GRANT_ROWS.map(
+        (row) => html`
+          <label class="grant-row">
+            <input
+              type="checkbox"
+              .checked=${row.held(session)}
+              aria-label=${`${t(locale, row.key)}: ${session.peer_label}`}
+              @change=${(event: Event) => {
+                const allowed = (event.target as HTMLInputElement).checked;
+                void setGrant(session.peer_label, row.grant, allowed).then(onChange, (error: unknown) => {
+                  console.error('session_set_grant failed:', error);
+                  onChange();
+                });
+              }}
+            />
+            <span>${t(locale, row.key)}</span>
+          </label>
+        `,
+      )}
+    </fieldset>
+  `;
+}
+
+/**
+ * The recording row of one active session (§17).
+ *
+ * Three things in one place, because they are one decision: whether recording
+ * is permitted at all (the grant switch above), whether it is running, and —
+ * while a guest is waiting — whether to say yes. The button is unreachable
+ * without the `recording` grant: the host turns the permission on first and
+ * records second, and nothing here can skip that order.
+ */
+function recordingRow(
+  session: SessionStatus,
+  locale: Locale,
+  onChange: () => void,
+  path: string | undefined,
+  onPath: (peer: string, path: string | null) => void,
+): TemplateResult {
+  const peer = session.peer_label;
+  const running = session.recording_active;
+  const change = (promise: Promise<string | null>): void => {
+    void promise.then(
+      (next) => {
+        onPath(peer, next);
+        onChange();
+      },
+      (error: unknown) => {
+        // Refused, or the session ended between poll and press: re-poll rather
+        // than leave a button claiming something the core did not do.
+        console.error('recording_toggle failed:', error);
+        onChange();
+      },
+    );
+  };
+  return html`
+    <div class="session-recording">
+      <button
+        type="button"
+        class="record-btn ${running ? 'is-recording' : ''}"
+        data-testid="record-toggle"
+        ?disabled=${!session.recording}
+        aria-pressed=${running ? 'true' : 'false'}
+        title=${session.recording ? '' : t(locale, 'status.recording.needsGrant')}
+        @click=${() => change(toggleRecording(peer, !running))}
+      >
+        ${t(locale, running ? 'status.recording.stop' : 'status.recording.start')}
+      </button>
+      ${running
+        ? html`<span class="recording-indicator" role="status" data-testid="recording-indicator">
+            <span class="recording-dot" aria-hidden="true"></span>${t(locale, 'status.recording.on')}
+          </span>`
+        : ''}
+      ${running && path
+        ? html`<span class="recording-path" data-testid="recording-path" title=${path}
+            >${path.split(/[\\/]/).pop() ?? path}</span
+          >`
+        : ''}
+    </div>
+    ${session.record_request
+      ? html`
+          <div class="record-request" role="status" data-testid="record-request">
+            <span>${t(locale, 'status.recording.requested', peer)}</span>
+            <button
+              type="button"
+              class="record-allow"
+              data-testid="record-allow"
+              @click=${() =>
+                change(
+                  (session.recording
+                    ? Promise.resolve()
+                    : setGrant(peer, 'recording', true)
+                  ).then(() => toggleRecording(peer, true)),
+                )}
+            >
+              ${t(locale, 'status.recording.allow')}
+            </button>
+            <button
+              type="button"
+              class="record-deny"
+              data-testid="record-deny"
+              @click=${() => change(toggleRecording(peer, false))}
+            >
+              ${t(locale, 'status.recording.decline')}
+            </button>
+          </div>
+        `
+      : ''}
+  `;
 }
 
 const MINUTE_SECS = 60;
@@ -71,6 +265,37 @@ export function sessionStatus(
   onReconnect: (peer: string) => void = () => {},
   reconnectDisabled = false,
   onOpenChat: (peer: string) => void = () => {},
+  /**
+   * When each peer last synced a clipboard, in `Date.now()` milliseconds.
+   *
+   * The *fact* only. §15 keeps clipboard content out of the audit log and out
+   * of telemetry, and a panel that is always on screen is neither of those but
+   * is read by whoever walks past the machine — so the content stays where it
+   * belongs, on the clipboard.
+   */
+  clipboardSyncedAt: ReadonlyMap<string, number> = new Map(),
+  /** Offers and transfers as the last `file_transfers` poll reported them. */
+  files: FileTransfers = { offers: [], transfers: [] },
+  /** How the file panel reaches the actor; injectable for tests. */
+  fileCommands: FileCommands = tauriFileCommands,
+  /**
+   * Where each running recording is being written, by peer label.
+   *
+   * Filled from what the actor answered when the recording started — the path
+   * is chosen in Rust and only shown here, never the other way round (§2.3).
+   */
+  recordingPaths: ReadonlyMap<string, string> = new Map(),
+  /** Told the path of a recording that just started, or `null` when one stopped. */
+  onRecordingPath: (peer: string, path: string | null) => void = () => {},
+  /**
+   * Renders the "save this device" control for an active session, so a host
+   * can put a guest it recognises into the address book (§8; ADR 0034).
+   *
+   * Saving only saves. The entry lands untrusted, and trusting it is a
+   * separate, confirmed decision on the address-book panel — having connected
+   * once must never be a path to a permission (§2.1).
+   */
+  saveDevice: (peer: string) => TemplateResult | '' = () => '',
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -118,6 +343,11 @@ export function sessionStatus(
                   <span class="peer-label">${session.peer_label}</span>
                   <span class="peer-meta">${t(locale, roleKey[session.role])}</span>
                   <span class="peer-meta">${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span>
+                  ${Date.now() - (clipboardSyncedAt.get(session.peer_label) ?? 0) < CLIPBOARD_NOTE_MS
+                    ? html`<span class="clipboard-note" role="status" data-testid="clipboard-note"
+                        >${t(locale, 'status.clipboardSynced')}</span
+                      >`
+                    : ''}
                   ${session.state === 'active'
                     ? html`
                         <button
@@ -130,9 +360,23 @@ export function sessionStatus(
                         </button>
                       `
                     : ''}
+                  ${session.state === 'active' ? saveDevice(session.peer_label) : ''}
                   <button type="button" class="revoke-btn" @click=${() => void revoke(session.peer_label)}>
                     ${t(locale, 'status.revoke')}
                   </button>
+                  ${session.state === 'active' ? grantSwitches(session, locale, onRefresh) : ''}
+                  ${session.state === 'active'
+                    ? recordingRow(
+                        session,
+                        locale,
+                        onRefresh,
+                        recordingPaths.get(session.peer_label),
+                        onRecordingPath,
+                      )
+                    : ''}
+                  ${session.state === 'active' && session.file_transfer
+                    ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
+                    : ''}
                 </li>
               `,
             )}

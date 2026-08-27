@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unattended-disable"
+description = "Enables the unattended_disable command without any pre-configured scope."
+commands.allow = ["unattended_disable"]
+
+[[permission]]
+identifier = "deny-unattended-disable"
+description = "Denies the unattended_disable command without any pre-configured scope."
+commands.deny = ["unattended_disable"]

@@ -15,6 +15,7 @@ import { mountToolbar, tauriToolbarCommands } from './toolbar';
 import {
   decodeViewFrame,
   paintFrame,
+  recordingBadge,
   suppressContextMenu,
   ViewInput,
   viewOverlay,
@@ -26,6 +27,7 @@ const params = new URLSearchParams(window.location.search);
 const peer = params.get('peer') ?? '';
 const canvas = document.querySelector<HTMLCanvasElement>('#screen');
 const overlay = document.querySelector<HTMLElement>('#overlay');
+const recordingIndicator = document.querySelector<HTMLElement>('#recording-indicator');
 const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
 const locale: Locale = detectLocale(navigator);
 
@@ -61,6 +63,9 @@ const sink: InputSink = {
 
 const input = canvas ? new ViewInput(canvas, sink) : undefined;
 let status: ViewStatus = 'waiting';
+// Whether the host says it is recording. Repainted only on a change, like the
+// overlay: the badge is on every frame, the DOM work is not.
+let recording = false;
 let stopped = false;
 // Timestamp of the picture already painted, or 0 for none — sent back as
 // `since_us` so the actor can skip re-serializing pixels this window
@@ -77,6 +82,13 @@ function renderOverlay(): void {
     }),
     overlay,
   );
+}
+
+function renderRecording(): void {
+  if (!recordingIndicator) {
+    return;
+  }
+  render(recordingBadge(recording, locale), recordingIndicator);
 }
 
 async function closeWindow(): Promise<void> {
@@ -100,6 +112,12 @@ async function tick(): Promise<void> {
     // The grant is live: a host that lowered the role mid-session takes the
     // listeners away again on the very next frame (§8.1).
     input?.setEnabled(frame.input);
+    // The host is the only one who knows, and it says so on every frame: a
+    // recording that started a moment ago is on screen a moment later (§17).
+    if (frame.recording !== recording) {
+      recording = frame.recording;
+      renderRecording();
+    }
     if (paintFrame(canvas, frame)) {
       lastPaintedUs = frame.timestampUs;
     }
@@ -121,6 +139,7 @@ function loop(): void {
 
 async function main(): Promise<void> {
   renderOverlay();
+  renderRecording();
   // The chat panel polls the actor's transcript; it exists only while this
   // window does, so no explicit teardown beyond the poll's own stop. The
   // toolbar's chat button toggles exactly this panel.

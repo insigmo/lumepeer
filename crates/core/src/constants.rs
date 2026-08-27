@@ -96,8 +96,27 @@ pub const SHORT_LINK_TTL_SECS: u64 = 600;
 pub const SHORT_LINK_ID_BITS: usize = 128;
 /// Maximum clipboard payload, text/plain UTF-8 only (§9.2).
 pub const CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
+/// How often the desktop host re-reads its own clipboard while at least one
+/// session holds a clipboard grant (§9.2; ADR 0030).
+///
+/// Not in the design doc: §9.2 assumes a clipboard *change* is observable,
+/// and no cross-platform API delivers one. Polling is the substitute, so the
+/// number is a latency/cost trade rather than a protocol value — fast enough
+/// that copy-then-paste feels immediate, slow enough that an idle granted
+/// session is not reading the user's clipboard hundreds of times a minute.
+/// The poll runs only while a grant is live; without one the clipboard is
+/// never read at all.
+pub const CLIPBOARD_POLL_INTERVAL_MS: u64 = 500;
 /// Maximum size of a single offered file (§9.2).
 pub const FILE_OFFER_MAX_BYTES: u64 = 500 * 1024 * 1024;
+/// Maximum byte length of the file name in a `FileOffer` or a
+/// `FileTransferStart` (§9.2; ADR 0032).
+///
+/// Not in the design doc: §9.2 bounds the file, not its name. 255 is the
+/// per-component limit of every filesystem this ships on, so a longer name
+/// could not be written down anyway — and a name is untrusted input that ends
+/// up as a path, which is the one place a missing bound is worth having.
+pub const FILE_NAME_MAX_BYTES: usize = 255;
 /// Maximum number of pending file offers per session (§9.2).
 pub const MAX_PENDING_FILE_OFFERS: usize = 3;
 /// Idle desktop RSS budget (§15).
@@ -184,6 +203,15 @@ pub const FILE_CHUNK_MAX_BYTES: usize = 256 * 1024;
 /// Maximum concurrent file transfers per session (§9.2). Mirrors
 /// `MAX_PENDING_FILE_OFFERS` for the transfer phase that follows an offer.
 pub const MAX_CONCURRENT_FILE_TRANSFERS: usize = 3;
+/// How long a chunk stream on `rd/file/1` waits for the `FileTransferStart`
+/// that names its transfer before giving up (§9.2; ADR 0032).
+///
+/// Not in the design doc: it exists because the control channel and the file
+/// channel are separate QUIC connections (§4), so nothing orders the start
+/// message against the first chunk. The wait is short — this is two messages
+/// the same peer sent at the same moment, not a network round trip — and
+/// timing out aborts one transfer rather than the connection.
+pub const FILE_TRANSFER_START_TIMEOUT_SECS: u64 = 15;
 
 /// Time step of the RFC 6238 TOTP second factor (§8; ADR 0021). 30 s is what
 /// every mainstream authenticator app defaults to.
@@ -194,3 +222,23 @@ pub const UNATTENDED_MAX_FAILED_ATTEMPTS: u32 = 5;
 /// How long the host refuses every unattended verification once the failure
 /// limit is reached (§18).
 pub const UNATTENDED_LOCKOUT_DURATION_SECS: u64 = 300;
+
+/// Shortest device password the host will accept when setting one (§8).
+///
+/// §8 fixes the lockout but not a strength policy, and leaving one out would
+/// be a policy decision made by omission: five attempts per
+/// `UNATTENDED_LOCKOUT_DURATION_SECS` is only a meaningful defence if the
+/// secret has enough room in it to be worth guessing at that rate. Eight bytes
+/// is the floor, not a recommendation (ADR 0033).
+pub const UNATTENDED_PASSWORD_MIN_BYTES: usize = 8;
+/// Longest device password an unattended credential message may carry (§8;
+/// §9.1 allocation-DoS check at the parse boundary). Generous enough for a
+/// passphrase, far below `MAX_CONTROL_FRAME_BYTES`.
+pub const UNATTENDED_PASSWORD_MAX_BYTES: usize = 1024;
+/// Longest one-time code an unattended credential message may carry (§8).
+///
+/// Codes are six digits today (`unattended::Totp`), and verification insists
+/// on exactly that. The wire limit leaves a little room on purpose, so a peer
+/// sending a longer code fails verification with a coarse `BadCode` instead of
+/// having its connection torn down as a malformed frame.
+pub const UNATTENDED_CODE_MAX_BYTES: usize = 8;

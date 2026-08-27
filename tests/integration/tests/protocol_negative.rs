@@ -2,6 +2,10 @@
 //!
 //! Phase 1 covers the two rows that the handshake itself owns: a protocol major
 //! mismatch and an oversized frame. The remaining rows of §18 belong to phase 4.
+//!
+//! The file-transfer rows were added with `FileTransferStart` (ADR 0032): the
+//! per-message bounds of §9.2 are checked on a live connection, where the only
+//! thing wrong with the frame is its size.
 
 #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
@@ -9,14 +13,17 @@ use std::time::Duration;
 
 use lumepeer_core::CoreError;
 use lumepeer_core::consent::Role;
-use lumepeer_core::constants::MAX_CONTROL_FRAME_BYTES;
+use lumepeer_core::constants::{
+    FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, UNATTENDED_CODE_MAX_BYTES,
+    UNATTENDED_PASSWORD_MAX_BYTES,
+};
 use lumepeer_core::protocol::{
     Direction, MessageEnvelope, MessageKind, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 use lumepeer_net::endpoint::PeerEndpoint;
 use lumepeer_net::error::NetError;
 use lumepeer_net::framing::FrameWriter;
-use lumepeer_net::host_handshake;
+use lumepeer_net::{guest_handshake, host_handshake};
 use tokio::io::AsyncWriteExt as _;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -114,6 +121,201 @@ async fn an_oversized_frame_is_refused_on_its_length_prefix() {
         NetError::Framing(CoreError::FrameSize { size }) if size == MAX_CONTROL_FRAME_BYTES + 1
     ));
 
+    guest.close().await;
+    host.close().await;
+}
+
+/// §9.2, §18: the two bounds `FileTransferStart` repeats from the offer are
+/// enforced on the wire, not merely documented (ADR 0032).
+///
+/// The message is sent *after* a completed handshake on purpose. A malformed
+/// frame sent instead of `Hello` would be refused for being the wrong message,
+/// which proves nothing about the limit; refused as the next message on an
+/// established connection, the only thing wrong with it is its size.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_start_past_its_bounds_is_refused_on_a_live_connection() {
+    for kind in [
+        MessageKind::FileTransferStart {
+            transfer_id: 1,
+            // One byte past what any filesystem this ships on can write.
+            name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+            size: 1,
+            hash: [0u8; 32],
+        },
+        MessageKind::FileTransferStart {
+            transfer_id: 1,
+            name: "report.pdf".to_owned(),
+            size: FILE_OFFER_MAX_BYTES + 1,
+            hash: [0u8; 32],
+        },
+        // The same bound now covers the offer, which had only ever been
+        // bounded on its size.
+        MessageKind::FileOffer {
+            name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+            size: 1,
+            hash: [0u8; 32],
+        },
+    ] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        control.send(kind).await.unwrap();
+
+        let refused = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, NetError::Framing(CoreError::Malformed)),
+            "an over-limit file message was accepted: {refused:?}"
+        );
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
+}
+
+/// The mirror of the test above: at the bound, both messages are ordinary
+/// traffic. A limit that also refused the largest legal value would be a
+/// different limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_start_exactly_at_its_bounds_is_ordinary_traffic() {
+    let (host, guest) = host_and_guest().await;
+    let addr = host.addr();
+
+    let host_side = tokio::spawn({
+        let host = host.clone();
+        async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let (mut control, _) = host_handshake(connection).await.unwrap();
+            control.recv().await
+        }
+    });
+
+    let connection = guest.connect_control(addr).await.unwrap();
+    let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+        .await
+        .unwrap();
+    let at_bound = MessageKind::FileTransferStart {
+        transfer_id: 1,
+        name: "n".repeat(FILE_NAME_MAX_BYTES),
+        size: FILE_OFFER_MAX_BYTES,
+        hash: [7u8; 32],
+    };
+    control.send(at_bound.clone()).await.unwrap();
+
+    let received = tokio::time::timeout(TIMEOUT, host_side)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.kind, at_bound);
+
+    control.connection().close(0u32.into(), b"done");
+    guest.close().await;
+    host.close().await;
+}
+
+/// §9.1: device credentials arrive from a peer that has not been admitted
+/// yet, which makes them the least trusted payload the control channel
+/// carries. Both fields are bounded while decoding, before anything
+/// downstream allocates (ADR 0033).
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_device_credentials_are_refused_while_decoding() {
+    for kind in [
+        MessageKind::UnattendedAuth {
+            password: "p".repeat(UNATTENDED_PASSWORD_MAX_BYTES + 1),
+            code: None,
+        },
+        MessageKind::UnattendedAuth {
+            password: "fine".to_owned(),
+            code: Some("1".repeat(UNATTENDED_CODE_MAX_BYTES + 1)),
+        },
+    ] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        control.send(kind).await.unwrap();
+
+        let refused = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, NetError::Framing(CoreError::Malformed)),
+            "over-limit credentials were accepted: {refused:?}"
+        );
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
+}
+
+/// The mirror: a password and a code exactly at their bounds are ordinary
+/// traffic, and the gate refuses them on their merits rather than the wire
+/// refusing them on their size.
+#[tokio::test(flavor = "multi_thread")]
+async fn credentials_exactly_at_their_bounds_are_ordinary_traffic() {
+    let (host, guest) = host_and_guest().await;
+    let addr = host.addr();
+
+    let host_side = tokio::spawn({
+        let host = host.clone();
+        async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let (mut control, _) = host_handshake(connection).await.unwrap();
+            control.recv().await
+        }
+    });
+
+    let connection = guest.connect_control(addr).await.unwrap();
+    let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+        .await
+        .unwrap();
+    let at_bound = MessageKind::UnattendedAuth {
+        password: "p".repeat(UNATTENDED_PASSWORD_MAX_BYTES),
+        code: Some("1".repeat(UNATTENDED_CODE_MAX_BYTES)),
+    };
+    control.send(at_bound.clone()).await.unwrap();
+
+    let received = tokio::time::timeout(TIMEOUT, host_side)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.kind, at_bound);
+
+    control.connection().close(0u32.into(), b"done");
     guest.close().await;
     host.close().await;
 }

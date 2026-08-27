@@ -6,10 +6,23 @@
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { addressBook, type AddressBookEntry } from './address-book';
 import { consentDialog } from './consent-dialog';
 import { connectPanel, inviteCodePanel } from './invite-view';
 import type { SessionStatus } from './session-status';
 import { titleBar } from './title-bar';
+import { unattendedSettings, type UnattendedStatus } from './unattended-settings';
+
+// A session the host has granted nothing beyond its role: the four
+// independent grants of §8.2 all start off.
+const noGrants = {
+  clipboard_read: false,
+  clipboard_write: false,
+  file_transfer: false,
+  recording: false,
+  recording_active: false,
+  record_request: false,
+} as const;
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn().mockResolvedValue({ code: 'test-invite-code', expires_at: 0 }),
@@ -32,7 +45,13 @@ function focusables(root: HTMLElement): HTMLButtonElement[] {
 
 describe('keyboard navigation: consent dialog', () => {
   it('every action is a real <button>, reachable by Tab, none disabled or tabindex=-1', () => {
-    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
+    const request: SessionStatus = {
+      peer_label: 'guest-ab12',
+      role: 'view_only',
+      input: false,
+      state: 'pending',
+      ...noGrants,
+    };
     render(consentDialog(request, 'en'), container);
 
     const buttons = focusables(container);
@@ -44,12 +63,59 @@ describe('keyboard navigation: consent dialog', () => {
   });
 
   it('the deny action is first in DOM order and carries autofocus, so a keyboard/screen-reader user lands on the safe default', () => {
-    const request: SessionStatus = { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' };
+    const request: SessionStatus = {
+      peer_label: 'guest-ab12',
+      role: 'view_only',
+      input: false,
+      state: 'pending',
+      ...noGrants,
+    };
     render(consentDialog(request, 'en'), container);
 
     const buttons = focusables(container);
     expect(buttons[0]?.textContent?.trim()).toBe('Deny');
     expect(buttons[0]?.autofocus).toBe(true);
+  });
+});
+
+describe('keyboard navigation: unattended access and the address book', () => {
+  const on: UnattendedStatus = { enabled: true, totp_enabled: false, role: 'view_only' };
+
+  it('every settings control is reachable by Tab and none is taken out of the order', () => {
+    render(unattendedSettings(on, 'en'), container);
+
+    const controls = Array.from(
+      container.querySelectorAll<HTMLElement>('button, input, select'),
+    );
+    expect(controls.length).toBeGreaterThan(0);
+    for (const control of controls) {
+      expect(control.tabIndex).not.toBe(-1);
+    }
+  });
+
+  it('the trust confirmation puts focus on the safe answer, not on the one that grants', () => {
+    const entry: AddressBookEntry = {
+      peer_label: 'guest-ab12',
+      name: 'Office workstation',
+      tags: [],
+      notes: '',
+      trusted: false,
+      connected: false,
+    };
+    render(addressBook([entry], 'en'), container);
+    container.querySelector<HTMLInputElement>('.book-trust input')?.click();
+    render(addressBook([entry], 'en'), container);
+
+    const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('.trust-confirm button'));
+    expect(buttons).toHaveLength(2);
+    // Cancel comes first in DOM order and carries autofocus: a keyboard or
+    // screen-reader user lands on the answer that grants nothing.
+    expect(buttons[0]?.className).toContain('trust-cancel');
+    expect(buttons[0]?.autofocus).toBe(true);
+    for (const button of buttons) {
+      expect(button.disabled).toBe(false);
+      expect(button.tabIndex).not.toBe(-1);
+    }
   });
 });
 

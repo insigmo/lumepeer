@@ -11,8 +11,10 @@ use std::time::{Duration, Instant};
 use rand::Rng as _;
 
 use crate::NodeId;
+use crate::audit::AuditEvent;
 pub use crate::consent::{
-    ConsentQueue, ConsentRateLimiter, ConsentTicket, ControlAction, ControlPolicy, Grants, Role,
+    ConsentQueue, ConsentRateLimiter, ConsentTicket, ControlAction, ControlPolicy, Grants,
+    IndependentGrant, Role,
 };
 use crate::constants::RECONNECT_WINDOW_SECS;
 use crate::error::{CoreError, Result};
@@ -227,6 +229,40 @@ impl SessionManager {
         } else {
             Err(CoreError::UnknownPeer)
         }
+    }
+
+    /// Turns one independent grant of `peer` on or off (§8.2).
+    ///
+    /// Only the four grants of [`IndependentGrant`] can move this way: `view`
+    /// and `input` follow the role and change only through [`Self::grant`] and
+    /// [`Self::revoke`], so no caller can widen a session into a controller
+    /// behind the host's back. The change applies to this session's own
+    /// snapshot and dies with it — [`Self::revoke`] drops the whole session,
+    /// and the next [`Self::grant`] starts again from [`Grants::from_role`],
+    /// which grants none of the four.
+    ///
+    /// Returns the [`AuditEvent`] the caller is expected to append: the
+    /// manager holds no sink of its own (§15).
+    ///
+    /// # Errors
+    /// - [`CoreError::UnknownPeer`] if the peer holds no session.
+    /// - [`CoreError::NotPermitted`] if the session is not `Active`; a
+    ///   pending, reconnecting or ended session is never widened.
+    pub fn set_grant(
+        &mut self,
+        peer: NodeId,
+        which: IndependentGrant,
+        allowed: bool,
+    ) -> Result<AuditEvent> {
+        let session = self.sessions.get_mut(&peer).ok_or(CoreError::UnknownPeer)?;
+        if session.state != SessionState::Active {
+            return Err(CoreError::NotPermitted);
+        }
+        session.grants.set(which, allowed);
+        Ok(AuditEvent::GrantChanged {
+            grant: which,
+            enabled: allowed,
+        })
     }
 
     /// Number of guests currently holding grants, controller included (§8.2).
@@ -709,7 +745,131 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
+    const ALL_INDEPENDENT: [IndependentGrant; 4] = [
+        IndependentGrant::ClipboardRead,
+        IndependentGrant::ClipboardWrite,
+        IndependentGrant::FileTransfer,
+        IndependentGrant::Recording,
+    ];
+
+    #[test]
+    fn every_independent_grant_can_be_turned_on_and_off() {
+        for which in ALL_INDEPENDENT {
+            let mut manager = SessionManager::new();
+            manager.grant(peer(1), Role::ViewOnly).unwrap();
+            assert!(!manager.grants(&peer(1)).unwrap().get(which));
+
+            let event = manager.set_grant(peer(1), which, true).unwrap();
+            assert_eq!(
+                event,
+                AuditEvent::GrantChanged {
+                    grant: which,
+                    enabled: true
+                }
+            );
+            assert!(manager.grants(&peer(1)).unwrap().get(which));
+            // One grant moving leaves the other three where they were.
+            for other in ALL_INDEPENDENT.into_iter().filter(|o| *o != which) {
+                assert!(!manager.grants(&peer(1)).unwrap().get(other));
+            }
+
+            manager.set_grant(peer(1), which, false).unwrap();
+            assert!(!manager.grants(&peer(1)).unwrap().get(which));
+        }
+    }
+
+    #[test]
+    fn a_grant_never_reaches_view_or_input() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::ViewOnly).unwrap();
+        for which in ALL_INDEPENDENT {
+            manager.set_grant(peer(1), which, true).unwrap();
+        }
+        let grants = manager.grants(&peer(1)).unwrap();
+        assert!(grants.view);
+        assert!(!grants.input);
+        assert!(matches!(
+            manager.authorize_input(&peer(1), &key_event()),
+            Err(CoreError::NotPermitted)
+        ));
+    }
+
+    #[test]
+    fn only_an_active_session_takes_a_grant() {
+        let mut manager = SessionManager::new();
+        // Unknown peer: nothing to widen.
+        assert!(matches!(
+            manager.set_grant(peer(1), IndependentGrant::FileTransfer, true),
+            Err(CoreError::UnknownPeer)
+        ));
+
+        // Pending consent is not a session yet.
+        manager.request_consent_as(peer(1), Role::ViewOnly).unwrap();
+        assert!(matches!(
+            manager.set_grant(peer(1), IndependentGrant::FileTransfer, true),
+            Err(CoreError::UnknownPeer)
+        ));
+
+        // Inside the reconnect window the picture is not on screen; a grant
+        // made here would land on a session nobody is watching.
+        manager.grant(peer(1), Role::ViewOnly).unwrap();
+        manager.on_disconnect(peer(1)).unwrap();
+        assert!(matches!(
+            manager.set_grant(peer(1), IndependentGrant::FileTransfer, true),
+            Err(CoreError::NotPermitted)
+        ));
+
+        // Ended: revoke removed the session outright.
+        manager.revoke(peer(1)).unwrap();
+        assert!(matches!(
+            manager.set_grant(peer(1), IndependentGrant::FileTransfer, true),
+            Err(CoreError::UnknownPeer)
+        ));
+    }
+
+    #[test]
+    fn revoke_drops_independent_grants_and_a_new_grant_does_not_restore_them() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        manager
+            .set_grant(peer(1), IndependentGrant::FileTransfer, true)
+            .unwrap();
+        manager
+            .set_grant(peer(1), IndependentGrant::Recording, true)
+            .unwrap();
+
+        manager.revoke(peer(1)).unwrap();
+        assert_eq!(manager.grants(&peer(1)), None);
+
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        assert_eq!(
+            manager.grants(&peer(1)),
+            Some(Grants::from_role(Role::FullControl))
+        );
+    }
+
     proptest! {
+        /// No sequence of `set_grant` can reach `view` or `input`: those two
+        /// follow the role, and this is the property the split of §8.2 into a
+        /// role plus four independent grants exists to hold.
+        #[test]
+        fn set_grant_never_moves_view_or_input(
+            role_index in 0usize..3,
+            steps in prop::collection::vec((0usize..ALL_INDEPENDENT.len(), any::<bool>()), 0..24),
+        ) {
+            let role = [Role::ViewOnly, Role::ControlLimited, Role::FullControl][role_index];
+            let mut manager = SessionManager::new();
+            manager.grant(peer(1), role).unwrap();
+            let expected = Grants::from_role(role);
+
+            for (which, allowed) in steps {
+                manager.set_grant(peer(1), ALL_INDEPENDENT[which], allowed).unwrap();
+                let grants = manager.grants(&peer(1)).unwrap();
+                prop_assert_eq!(grants.view, expected.view);
+                prop_assert_eq!(grants.input, expected.input);
+            }
+        }
+
         /// Only the edges drawn in §8.1 are accepted, in both directions of the
         /// pair, and every state may end.
         #[test]

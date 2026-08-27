@@ -9,8 +9,19 @@ import { describe, expect, it, vi } from 'vitest';
 import type { SessionStatus } from './session-status';
 import { sessionStatus } from './session-status';
 
+// A session the host has granted nothing beyond its role: the four
+// independent grants of §8.2 all start off.
+const noGrants = {
+  clipboard_read: false,
+  clipboard_write: false,
+  file_transfer: false,
+  recording: false,
+  recording_active: false,
+  record_request: false,
+} as const;
+
 const active: SessionStatus[] = [
-  { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active' },
+  { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active', ...noGrants },
 ];
 
 function renderList(onOpenChat: (peer: string) => void = () => {}): HTMLElement {
@@ -35,7 +46,7 @@ describe('host chat entry', () => {
 
   it('pending sessions get no Chat button — nothing is granted yet', () => {
     const pending: SessionStatus[] = [
-      { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending' },
+      { peer_label: 'guest-ab12', role: 'view_only', input: false, state: 'pending', ...noGrants },
     ];
     const container = document.createElement('div');
     document.body.appendChild(container);

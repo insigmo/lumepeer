@@ -61,6 +61,11 @@ allow = [
     "OpenSSL",
     "Unlicense",
     "CC0-1.0",
+    # Boost Software License 1.0: OSI-approved and permissive, with no notice
+    # requirement for binary distribution at all — strictly less demanding
+    # than MIT, which is already on this list. Reaches the tree through
+    # `arboard`'s Windows clipboard backend (`clipboard-win`, `error-code`).
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 

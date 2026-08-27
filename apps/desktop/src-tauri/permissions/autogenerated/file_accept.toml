@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-file-accept"
+description = "Enables the file_accept command without any pre-configured scope."
+commands.allow = ["file_accept"]
+
+[[permission]]
+identifier = "deny-file-accept"
+description = "Denies the file_accept command without any pre-configured scope."
+commands.deny = ["file_accept"]

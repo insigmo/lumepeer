@@ -42,6 +42,11 @@ const STATUS_BY_CODE: readonly ViewStatus[] = [
 /** Bytes of the fixed header every `view_next_frame` response carries. */
 export const VIEW_RESPONSE_HEADER_BYTES = 18;
 
+/** Flags byte bit: the session's `input` grant is live right now. */
+export const VIEW_FLAG_INPUT = 0b01;
+/** Flags byte bit: the host says it is recording this session (§17). */
+export const VIEW_FLAG_RECORDING = 0b10;
+
 /** Logical identifiers at or above this value are pointer buttons, not keys. */
 export const POINTER_BUTTON_LOGICAL_BASE = 0xf0000000;
 
@@ -52,6 +57,15 @@ export interface ViewFrame {
   status: ViewStatus;
   /** Whether the session's `input` grant is live right now. */
   input: boolean;
+  /**
+   * Whether the host says it is recording this session (§17).
+   *
+   * The host's own statement, arriving on every frame like `input` does.
+   * Nothing on this side infers it, and nothing on this side can turn the
+   * indicator off while the host still says otherwise — "no hidden capture"
+   * is the rule the badge exists for (§2.2).
+   */
+  recording: boolean;
   width: number;
   height: number;
   timestampUs: number;
@@ -63,7 +77,7 @@ export interface ViewFrame {
  * Parses the binary response of `view_next_frame`.
  *
  * Layout, little endian:
- * `status:u8 | input:u8 | width:u32 | height:u32 | timestamp_us:u64 | RGBA8`.
+ * `status:u8 | flags:u8 | width:u32 | height:u32 | timestamp_us:u64 | RGBA8`.
  */
 export function decodeViewFrame(buffer: ArrayBuffer): ViewFrame {
   if (buffer.byteLength < VIEW_RESPONSE_HEADER_BYTES) {
@@ -74,9 +88,11 @@ export function decodeViewFrame(buffer: ArrayBuffer): ViewFrame {
   if (!status) {
     throw new Error(`unknown view status ${header.getUint8(0)}`);
   }
+  const flags = header.getUint8(1);
   return {
     status,
-    input: header.getUint8(1) === 1,
+    input: (flags & VIEW_FLAG_INPUT) !== 0,
+    recording: (flags & VIEW_FLAG_RECORDING) !== 0,
     width: header.getUint32(2, true),
     height: header.getUint32(6, true),
     // The timestamp only ever orders frames; Number is exact well past any
@@ -316,6 +332,25 @@ export function viewOverlay(status: ViewStatus, locale: Locale, onDismiss: () =>
   }
   const key = status === 'waiting' ? 'view.waiting' : 'view.reconnecting';
   return html`<p class="view-banner" role="status" aria-live="polite">${t(locale, key)}</p>`;
+}
+
+/**
+ * The recording badge of §17, shown while the host says it is recording.
+ *
+ * Separate from the toolbar on purpose: the toolbar collapses and can be
+ * dragged out of the way, and an indicator someone can put away is not an
+ * indicator. This one only goes away when the recording does.
+ */
+export function recordingBadge(recording: boolean, locale: Locale): TemplateResult {
+  if (!recording) {
+    return html``;
+  }
+  return html`
+    <p class="view-recording" role="status" aria-live="polite" data-testid="view-recording">
+      <span class="view-recording-dot" aria-hidden="true"></span>
+      ${t(locale, 'view.recording')}
+    </p>
+  `;
 }
 
 function terminalModal(

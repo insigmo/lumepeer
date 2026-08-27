@@ -32,6 +32,7 @@ pub mod capture_audio;
 pub mod decode;
 pub mod encode;
 pub mod error;
+pub mod export;
 pub mod jitter;
 pub mod playout;
 pub mod record;

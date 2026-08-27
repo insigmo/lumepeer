@@ -250,44 +250,84 @@ pub struct ContainerInfo {
     pub version: u16,
 }
 
-/// Reads a whole recording into records. A truncated tail yields the valid
-/// prefix and is reported rather than treated as corruption — an interrupted
-/// session must still be replayable (the reason the format is append-only).
+/// Streaming reader over the records of one `.lmrc` file.
 ///
-/// # Errors
-/// [`RecordingError::BadHeader`] for wrong magic/version;
-/// [`RecordingError::Corrupt`] for a bad record *in the middle* of the file
-/// (not at the trailing edge).
-pub fn read_recording<R: Read>(
-    mut reader: R,
-) -> Result<(ContainerInfo, Vec<Record>), RecordingError> {
-    let mut header = [0u8; HEADER_BYTES];
-    reader.read_exact(&mut header).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            RecordingError::BadHeader
-        } else {
-            RecordingError::Io(e.to_string())
+/// The whole-file [`read_recording`] is written on top of this, and so is the
+/// exporter (`crate::export`): an export must not have to hold a session's
+/// worth of video in memory to write it back out, so the one parser everything
+/// shares hands back one record at a time.
+///
+/// A truncated tail ends the stream instead of failing it — an interrupted
+/// session must still be replayable, which is the reason the format is
+/// append-only in the first place.
+#[derive(Debug)]
+pub struct RecordReader<R: Read> {
+    inner: R,
+    version: u16,
+    /// Set once the stream has ended (cleanly or at a torn tail), so a caller
+    /// that keeps polling gets `None` rather than a second read attempt.
+    ended: bool,
+}
+
+impl<R: Read> RecordReader<R> {
+    /// Reads and validates the container header.
+    ///
+    /// # Errors
+    /// [`RecordingError::BadHeader`] for wrong magic or a version newer than
+    /// [`RECORD_FORMAT_VERSION`]; [`RecordingError::Io`] otherwise.
+    pub fn new(mut inner: R) -> Result<Self, RecordingError> {
+        let mut header = [0u8; HEADER_BYTES];
+        inner.read_exact(&mut header).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                RecordingError::BadHeader
+            } else {
+                RecordingError::Io(e.to_string())
+            }
+        })?;
+        if header[0..4] != MAGIC {
+            return Err(RecordingError::BadHeader);
         }
-    })?;
-    if header[0..4] != MAGIC {
-        return Err(RecordingError::BadHeader);
+        let version = u16::from_be_bytes([header[4], header[5]]);
+        if version > RECORD_FORMAT_VERSION {
+            return Err(RecordingError::BadHeader);
+        }
+        Ok(Self {
+            inner,
+            version,
+            ended: false,
+        })
     }
-    let version = u16::from_be_bytes([header[4], header[5]]);
-    if version > RECORD_FORMAT_VERSION {
-        return Err(RecordingError::BadHeader);
+
+    /// Format version read from the header.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
     }
-    let mut has_audio = false;
-    let mut records = Vec::new();
-    loop {
+
+    /// Next record, or `None` at the end of the stream — including a tail torn
+    /// off by an interrupted session.
+    ///
+    /// # Errors
+    /// [`RecordingError::Corrupt`] for a bad record *in the middle* of the
+    /// file (not at the trailing edge); [`RecordingError::Io`] for a read
+    /// failure that is not the end of the file.
+    pub fn next_record(&mut self) -> Result<Option<Record>, RecordingError> {
+        if self.ended {
+            return Ok(None);
+        }
         let mut preamble = [0u8; RECORD_PREAMBLE_BYTES];
-        match reader.read_exact(&mut preamble) {
+        match self.inner.read_exact(&mut preamble) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 // Clean end exactly on a boundary, or a torn tail after a
                 // partial write: both end the stream here.
-                return Ok((ContainerInfo { has_audio, version }, records));
+                self.ended = true;
+                return Ok(None);
             }
-            Err(e) => return Err(RecordingError::Io(e.to_string())),
+            Err(e) => {
+                self.ended = true;
+                return Err(RecordingError::Io(e.to_string()));
+            }
         }
         let kind = preamble[0];
         let mut ts_bytes = [0u8; 8];
@@ -296,40 +336,67 @@ pub fn read_recording<R: Read>(
         let mut len_bytes = [0u8; 4];
         len_bytes.copy_from_slice(&preamble[12..16]);
         let len = u32::from_be_bytes(len_bytes) as usize;
-        let cap = max_payload_for(kind);
         match kind {
             KIND_VIDEO | KIND_AUDIO | KIND_EVENT => {}
-            _ => return Err(RecordingError::Corrupt("unknown record kind")),
+            _ => {
+                self.ended = true;
+                return Err(RecordingError::Corrupt("unknown record kind"));
+            }
         }
-        if len == 0 || len > cap {
+        if len == 0 || len > max_payload_for(kind) {
+            self.ended = true;
             return Err(RecordingError::Corrupt("record length out of bounds"));
         }
         let mut payload = vec![0u8; len];
-        if let Err(e) = reader.read_exact(&mut payload) {
+        if let Err(e) = self.inner.read_exact(&mut payload) {
+            self.ended = true;
             if e.kind() == io::ErrorKind::UnexpectedEof {
-                // Torn tail mid-record: keep everything before it.
-                return Ok((ContainerInfo { has_audio, version }, records));
+                // Torn tail mid-record: everything before it stays valid.
+                return Ok(None);
             }
             return Err(RecordingError::Io(e.to_string()));
         }
-        records.push(match kind {
+        Ok(Some(match kind {
             KIND_VIDEO => Record::Video {
                 t_us,
                 data: payload,
             },
-            KIND_AUDIO => {
-                has_audio = true;
-                Record::Audio {
-                    t_us,
-                    data: payload,
-                }
-            }
-            _ => match String::from_utf8(payload) {
-                Ok(line) => Record::Event { t_us, line },
-                Err(_) => return Err(RecordingError::Corrupt("event line is not UTF-8")),
+            KIND_AUDIO => Record::Audio {
+                t_us,
+                data: payload,
             },
-        });
+            _ => {
+                let Ok(line) = String::from_utf8(payload) else {
+                    self.ended = true;
+                    return Err(RecordingError::Corrupt("event line is not UTF-8"));
+                };
+                Record::Event { t_us, line }
+            }
+        }))
     }
+}
+
+/// Reads a whole recording into records. A truncated tail yields the valid
+/// prefix and is reported rather than treated as corruption — an interrupted
+/// session must still be replayable (the reason the format is append-only).
+///
+/// Buffers the whole file: callers that only stream through the records once
+/// — the exporter above all — want [`RecordReader`] instead.
+///
+/// # Errors
+/// [`RecordingError::BadHeader`] for wrong magic/version;
+/// [`RecordingError::Corrupt`] for a bad record *in the middle* of the file
+/// (not at the trailing edge).
+pub fn read_recording<R: Read>(reader: R) -> Result<(ContainerInfo, Vec<Record>), RecordingError> {
+    let mut reader = RecordReader::new(reader)?;
+    let version = reader.version();
+    let mut has_audio = false;
+    let mut records = Vec::new();
+    while let Some(record) = reader.next_record()? {
+        has_audio |= matches!(record, Record::Audio { .. });
+        records.push(record);
+    }
+    Ok((ContainerInfo { has_audio, version }, records))
 }
 
 #[cfg(test)]

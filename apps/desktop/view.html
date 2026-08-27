@@ -43,6 +43,31 @@
         background: rgb(0 0 0 / 70%);
         text-align: center;
       }
+      /* Recording indicator (§17). Top-centre, above everything, and with no
+         way to dismiss it: an indicator someone can put away is not one. */
+      .view-recording {
+        position: absolute;
+        inset-inline: 0;
+        inset-block-start: 0;
+        z-index: 40;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.4rem;
+        margin: 0;
+        padding: 0.35rem 1rem;
+        background: rgb(150 20 30 / 88%);
+        font-size: 0.85rem;
+        font-weight: 600;
+        pointer-events: none;
+      }
+      .view-recording-dot {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 50%;
+        background: #ff5a5a;
+        box-shadow: 0 0 0.4rem #ff5a5a;
+      }
       #chat-panel {
         position: absolute;
         inset-block-end: 0;
@@ -218,6 +243,7 @@
     <main id="view">
       <canvas id="screen" width="1" height="1"></canvas>
       <div id="overlay"></div>
+      <div id="recording-indicator"></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>
       <div id="toolbar-root"></div>
     </main>

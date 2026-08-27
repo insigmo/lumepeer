@@ -29,6 +29,17 @@
     "allow-session-grant",
     "allow-session-revoke",
     "allow-session-status",
+    "allow-session-set-grant",
+    "allow-address-book-list",
+    "allow-address-book-upsert",
+    "allow-address-book-remove",
+    "allow-address-book-set-trusted",
+    "allow-unattended-status",
+    "allow-unattended-set-password",
+    "allow-unattended-disable",
+    "allow-unattended-set-totp",
+    "allow-unattended-set-role",
+    "allow-unattended-submit",
     "allow-connection-history",
     "allow-history-connect",
     "allow-connect-status",
@@ -40,6 +51,11 @@
     "allow-chat-transcript",
     "allow-clipboard-push",
     "allow-clipboard-pull",
-    "allow-audio-toggle"
+    "allow-file-offer",
+    "allow-file-accept",
+    "allow-file-abort",
+    "allow-file-transfers",
+    "allow-audio-toggle",
+    "allow-recording-toggle"
   ]
 }

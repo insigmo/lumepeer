@@ -6,13 +6,21 @@
 
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 
+import {
+  addressBook,
+  onAddressBookStateChange,
+  saveDeviceButton,
+  type AddressBookEntry,
+} from './address-book';
 import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { consentDialog } from './consent-dialog';
 import { detectLocale, dirOf, type Locale } from './i18n';
 import { t } from './i18n';
 import {
   connectPanel,
+  credentialsPanel,
   inviteCodePanel,
+  isAwaitingCredentials,
   isConnecting,
   onInviteStateChange,
   reconnect,
@@ -20,9 +28,16 @@ import {
   type ConnectPhase,
 } from './invite-view';
 import { logoMark } from './logo';
+import type { FileTransfers } from './file-transfers';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
+import {
+  onUnattendedStateChange,
+  unattendedIndicator,
+  unattendedSettings,
+  type UnattendedStatus,
+} from './unattended-settings';
 
 const root = document.querySelector('#app');
 const chatPanel = document.querySelector<HTMLElement>('#host-chat-panel');
@@ -35,10 +50,25 @@ let locale: Locale = detectLocale(navigator);
 let sessions: SessionStatus[] = [];
 let history: HistoryEntry[] = [];
 let networkReady = false;
+// Host-side unattended access and address book (§8; ADR 0033, ADR 0034).
+// Both start from the safest reading: access off, nobody trusted. A poll that
+// fails leaves them there rather than claiming something is on.
+let unattended: UnattendedStatus = { enabled: false, totp_enabled: false, role: 'view_only' };
+let savedDevices: AddressBookEntry[] = [];
 // What this machine can do about producing a picture. Both true until
 // `network_status` says otherwise, so a host that is fine shows no warning.
 let canCapture = true;
 let canEncode = true;
+// When each peer last synced a clipboard, by pseudonymized label. Only the
+// timestamp is kept: `clipboard_pull` hands back the text, and this is where
+// that text stops — nothing renders it and nothing stores it (§15).
+const clipboardSyncedAt = new Map<string, number>();
+// Where each running recording is being written, by peer label. Filled from
+// what the actor answered when the recording started: the path is chosen in
+// Rust and shown here, never chosen here (§2.3).
+const recordingPaths = new Map<string, string>();
+// Offers waiting for an answer and transfers in flight, from the last poll.
+let files: FileTransfers = { offers: [], transfers: [] };
 
 /**
  * Warns the operator that people they invite will see nothing.
@@ -48,6 +78,23 @@ let canEncode = true;
  * symptom is on the *guest's* screen, a minute later, as a connection failure
  * that never happened.
  */
+/**
+ * Says, unconditionally, that this device is recording somebody (§17).
+ *
+ * Sits next to the media warning rather than inside the session list because
+ * it must be visible whether or not the list is scrolled to the session doing
+ * the recording. "No hidden capture" is a rule about what the person at this
+ * machine can see without looking for it (§2.2).
+ */
+function recordingBanner(): TemplateResult | typeof nothing {
+  if (!sessions.some((session) => session.recording_active)) {
+    return nothing;
+  }
+  return html`<p class="recording-banner" role="status" aria-live="polite" data-testid="recording-banner">
+    <span class="recording-dot" aria-hidden="true"></span>${t(locale, 'status.recording.banner')}
+  </p>`;
+}
+
 function mediaWarning(): TemplateResult | typeof nothing {
   if (canCapture && canEncode) {
     return nothing;
@@ -138,7 +185,8 @@ function renderNow(): void {
               </div>
             </aside>
             <main class="main-panel">
-              ${mediaWarning()} ${connectPanel(locale)}
+              ${unattendedIndicator(unattended, locale)} ${recordingBanner()} ${mediaWarning()}
+              ${isAwaitingCredentials() ? credentialsPanel(locale) : ''} ${connectPanel(locale)}
               <div class="main-divider"></div>
               ${sessionStatus(
                 activeSessions,
@@ -148,7 +196,22 @@ function renderNow(): void {
                 (peer) => void reconnect(peer),
                 isConnecting(),
                 openChat,
+                clipboardSyncedAt,
+                files,
+                undefined,
+                recordingPaths,
+                (peer, path) => {
+                  if (path === null) {
+                    recordingPaths.delete(peer);
+                  } else {
+                    recordingPaths.set(peer, path);
+                  }
+                },
+                (peer) => saveDeviceButton(peer, locale, () => void refresh()),
               )}
+              <div class="main-divider"></div>
+              ${addressBook(savedDevices, locale, () => void refresh())}
+              ${unattendedSettings(unattended, locale, () => void refresh())}
             </main>
           </div>
         </div>
@@ -159,17 +222,65 @@ function renderNow(): void {
   );
 }
 
+/**
+ * Asks each active session whether a clipboard arrived since the last poll.
+ *
+ * A pull rather than a broadcast, and the returned text is dropped on the
+ * floor here: it has already been applied to this machine's clipboard by the
+ * Rust actor, and putting it on any surface the UI can render — or into the
+ * event bus every listener sees — is exactly what §15 rules out for clipboard
+ * content.
+ */
+async function noteClipboardArrivals(
+  invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>,
+): Promise<void> {
+  const active = sessions.filter((session) => session.state === 'active');
+  for (const peer of active.map((session) => session.peer_label)) {
+    try {
+      if ((await invoke<string | null>('clipboard_pull', { peer })) !== null) {
+        clipboardSyncedAt.set(peer, Date.now());
+      }
+    } catch {
+      // The session ended between the two calls; nothing to note.
+    }
+  }
+  for (const peer of [...clipboardSyncedAt.keys()]) {
+    if (!active.some((session) => session.peer_label === peer)) {
+      clipboardSyncedAt.delete(peer);
+    }
+  }
+}
+
 async function refresh(): Promise<void> {
   try {
     const { invoke } = await import('@tauri-apps/api/core');
-    const [sessionResult, historyResult, networkResult, connectResult] = await Promise.all([
-      invoke<SessionStatus[]>('session_status'),
-      invoke<HistoryEntry[]>('connection_history'),
-      invoke<{ ready: boolean; can_capture: boolean; can_encode: boolean }>('network_status'),
-      invoke<{ phase: ConnectPhase; pending: boolean; code: string | null }>('connect_status'),
-    ]);
+    const [sessionResult, historyResult, networkResult, connectResult, unattendedResult, bookResult] =
+      await Promise.all([
+        invoke<SessionStatus[]>('session_status'),
+        invoke<HistoryEntry[]>('connection_history'),
+        invoke<{ ready: boolean; can_capture: boolean; can_encode: boolean }>('network_status'),
+        invoke<{
+          phase: ConnectPhase;
+          pending: boolean;
+          code: string | null;
+          code_required: boolean;
+          retry_secs: number | null;
+        }>('connect_status'),
+        invoke<UnattendedStatus>('unattended_status'),
+        invoke<AddressBookEntry[]>('address_book_list'),
+      ]);
+    // Its own call rather than part of the batch above: a transfer list is
+    // only interesting once a session exists, and a failure here must not
+    // cost the session list its refresh.
+    try {
+      files = await invoke<FileTransfers>('file_transfers');
+    } catch (error) {
+      console.error('file_transfers failed:', error);
+    }
     sessions = sessionResult;
     history = historyResult;
+    unattended = unattendedResult;
+    savedDevices = bookResult;
     networkReady = networkResult.ready;
     canCapture = networkResult.can_capture;
     canEncode = networkResult.can_encode;
@@ -179,9 +290,22 @@ async function refresh(): Promise<void> {
     if (chatPeer && !sessions.some((s) => s.state === 'active' && s.peer_label === chatPeer)) {
       closeChat();
     }
+    // A recording cannot outlive the session it covers (§8.2), so neither may
+    // the path shown for it.
+    for (const peer of [...recordingPaths.keys()]) {
+      if (!sessions.some((s) => s.peer_label === peer && s.recording_active)) {
+        recordingPaths.delete(peer);
+      }
+    }
     // The connect form's own wait: a dial that returned is not a session yet,
     // and only the actor knows whether the far side has decided (§21 item 6).
-    setConnectPhase(connectResult.phase, connectResult.code);
+    setConnectPhase(
+      connectResult.phase,
+      connectResult.code,
+      connectResult.code_required,
+      connectResult.retry_secs,
+    );
+    await noteClipboardArrivals(invoke);
   } catch (error) {
     console.error('refresh failed:', error);
   }
@@ -198,6 +322,8 @@ export function setLocale(next: Locale): void {
 }
 
 onInviteStateChange(renderNow);
+onUnattendedStateChange(renderNow);
+onAddressBookStateChange(renderNow);
 
 renderNow();
 void refresh();

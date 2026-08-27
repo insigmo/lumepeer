@@ -11,12 +11,15 @@
     reason = "binary crate: `pub` marks the IPC surface of §13, not a library API"
 )]
 
+mod address_book_store;
+mod clipboard_os;
 mod commands;
 mod config;
 mod connection_history;
 mod logging;
 mod network;
 mod recorder;
+mod unattended_store;
 mod view;
 
 /// State shared by every IPC command: a handle into the network actor.
@@ -51,8 +54,14 @@ fn main() {
         unused_mut,
         reason = "only reassigned when built with --features pilot (debug-only tauri-pilot wiring below)"
     )]
-    let mut builder =
-        tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build());
+    // The dialog plugin is registered so the *Rust* side can open the OS
+    // file and directory pickers for §9.2. No `dialog:` permission appears in
+    // any capability file, so the webview cannot invoke it: registering a
+    // plugin makes it available to this process, not to the untrusted
+    // presentation layer (§2.3; ADR 0032).
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init());
 
     // Local cross-platform debugging aid, never in a release binary: gated
     // on both the non-default `pilot` Cargo feature and debug_assertions.
@@ -88,6 +97,17 @@ fn main() {
             commands::session_grant,
             commands::session_revoke,
             commands::session_status,
+            commands::session_set_grant,
+            commands::address_book_list,
+            commands::address_book_upsert,
+            commands::address_book_remove,
+            commands::address_book_set_trusted,
+            commands::unattended_status,
+            commands::unattended_set_password,
+            commands::unattended_disable,
+            commands::unattended_set_totp,
+            commands::unattended_set_role,
+            commands::unattended_submit,
             commands::connection_history,
             commands::history_connect,
             commands::connect_status,
@@ -103,8 +123,13 @@ fn main() {
             commands::chat_transcript,
             commands::clipboard_push,
             commands::clipboard_pull,
+            commands::file_offer,
+            commands::file_accept,
+            commands::file_abort,
+            commands::file_transfers,
             commands::audio_toggle,
             commands::recording_toggle,
+            commands::record_request,
             commands::mic_toggle,
             commands::sas_request,
             commands::sas_available,

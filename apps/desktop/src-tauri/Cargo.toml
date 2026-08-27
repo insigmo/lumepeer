@@ -42,6 +42,7 @@ pilot = ["dep:tauri-plugin-pilot"]
 tauri-build.workspace = true
 
 [dependencies]
+arboard.workspace = true
 lumepeer-core.workspace = true
 lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
 lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] }
@@ -50,6 +51,7 @@ iroh.workspace = true
 postcard.workspace = true
 rand.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tauri-plugin-updater.workspace = true
 tauri-plugin-pilot = { version = "0.7.2", optional = true }
 tokio.workspace = true

@@ -16,8 +16,51 @@
 //!   who may sync (`crates/core` stays the only authorization surface); it
 //!   refuses payloads that violate §9.2 regardless of grants.
 
+use crate::consent::{Grants, IndependentGrant};
 use crate::constants::CLIPBOARD_MAX_BYTES;
 use crate::error::{CoreError, Result};
+
+/// Which way one clipboard payload travels (§8.2).
+///
+/// The two grants of §2.2 are named for what the *guest* gets, and each of
+/// them covers one direction of travel. Both ends of a flow have to agree on
+/// which grant that is: the sender decides whether to put a payload on the
+/// wire and the receiver decides whether to act on one, and if those two
+/// decisions read different flags the clipboard silently half-works — it
+/// travels and is then dropped, with a grant switched on and nothing to show
+/// for it.
+///
+/// So the mapping lives here, in the one crate allowed to decide it, and
+/// both sides ask [`permits`] rather than each spelling the rule out again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardFlow {
+    /// The host's clipboard goes to the guest: the guest is *reading* it.
+    HostToGuest,
+    /// The guest's clipboard goes to the host: the guest is *writing* it.
+    GuestToHost,
+}
+
+impl ClipboardFlow {
+    /// The one grant this direction of travel needs (§8.2).
+    #[must_use]
+    pub const fn grant(self) -> IndependentGrant {
+        match self {
+            Self::HostToGuest => IndependentGrant::ClipboardRead,
+            Self::GuestToHost => IndependentGrant::ClipboardWrite,
+        }
+    }
+}
+
+/// Whether `grants` permit a clipboard payload to travel in `flow` (§8.2).
+///
+/// `grants` are the *host's* session grants, which are the only copy that
+/// decides anything: a guest holds no clipboard grants of its own (ADR 0029,
+/// ADR 0030). The host asks this twice per session — before putting its own
+/// clipboard on the wire, and before acting on one that arrived.
+#[must_use]
+pub const fn permits(grants: Grants, flow: ClipboardFlow) -> bool {
+    grants.get(flow.grant())
+}
 
 /// Validates an outbound/inbound clipboard payload against §9.2.
 ///
@@ -157,6 +200,24 @@ mod tests {
         ));
         // Nothing was remembered, so a same-content local copy still travels.
         assert_eq!(sync.local_changed(&big).err().map(|_| ()), Some(()));
+    }
+
+    #[test]
+    fn each_direction_needs_its_own_grant_and_only_its_own() {
+        let mut read_only = Grants::from_role(crate::consent::Role::ViewOnly);
+        read_only.set(IndependentGrant::ClipboardRead, true);
+        assert!(permits(read_only, ClipboardFlow::HostToGuest));
+        assert!(!permits(read_only, ClipboardFlow::GuestToHost));
+
+        let mut write_only = Grants::from_role(crate::consent::Role::ViewOnly);
+        write_only.set(IndependentGrant::ClipboardWrite, true);
+        assert!(permits(write_only, ClipboardFlow::GuestToHost));
+        assert!(!permits(write_only, ClipboardFlow::HostToGuest));
+
+        // A role implies neither, however much control it carries (§2.2).
+        let full = Grants::from_role(crate::consent::Role::FullControl);
+        assert!(!permits(full, ClipboardFlow::HostToGuest));
+        assert!(!permits(full, ClipboardFlow::GuestToHost));
     }
 
     #[test]

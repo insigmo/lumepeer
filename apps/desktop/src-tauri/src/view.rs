@@ -328,22 +328,32 @@ pub fn slot_for_poll(current: &ViewSlot, since_us: u64) -> ViewSlot {
 /// Bytes of the header [`encode_view_response`] always emits.
 pub const VIEW_RESPONSE_HEADER_BYTES: usize = 18;
 
+/// Flags byte bit: the session's `input` grant is live right now.
+pub const VIEW_FLAG_INPUT: u8 = 0b0000_0001;
+/// Flags byte bit: the host says it is recording this session (§17).
+pub const VIEW_FLAG_RECORDING: u8 = 0b0000_0010;
+
 /// Serializes a slot for `view_next_frame`'s binary IPC response.
 ///
-/// Layout, little endian: `status | input | width | height | timestamp_us |
+/// Layout, little endian: `status | flags | width | height | timestamp_us |
 /// RGBA8 pixels`. Binary rather than JSON because a 1080p picture is ~8 MB and
 /// base64-ing it per frame would dominate the frame budget of §15.
 ///
-/// `input` rides along on every frame instead of being fetched once at window
-/// load: the grant is live, so a later `session_grant` that lowers the role has
-/// to be able to take the guest's input listeners away again (§8.1).
+/// The flags byte rides along on every frame instead of being fetched once at
+/// window load. `input` has to, because the grant is live: a later
+/// `session_grant` that lowers the role must be able to take the guest's input
+/// listeners away again (§8.1). `recording` has to for the same reason from
+/// the other direction — the indicator §2.2 requires cannot be a thing the
+/// window was told once and might now be wrong about.
 #[must_use]
-pub fn encode_view_response(slot: &ViewSlot, input: bool) -> Vec<u8> {
+pub fn encode_view_response(slot: &ViewSlot, input: bool, recording: bool) -> Vec<u8> {
     let frame = slot.frame.as_ref();
     let pixels = frame.map_or(&[][..], |f| f.data.as_slice());
     let mut out = Vec::with_capacity(VIEW_RESPONSE_HEADER_BYTES + pixels.len());
     out.push(slot.status.code());
-    out.push(u8::from(input));
+    out.push(
+        if input { VIEW_FLAG_INPUT } else { 0 } | if recording { VIEW_FLAG_RECORDING } else { 0 },
+    );
     out.extend_from_slice(&frame.map_or(0, |f| f.width).to_le_bytes());
     out.extend_from_slice(&frame.map_or(0, |f| f.height).to_le_bytes());
     out.extend_from_slice(&frame.map_or(0, |f| f.timestamp_us).to_le_bytes());
@@ -1356,14 +1366,14 @@ mod tests {
 
     #[test]
     fn the_frame_response_carries_the_header_even_with_no_frame() {
-        let bytes = encode_view_response(&ViewSlot::waiting(), false);
+        let bytes = encode_view_response(&ViewSlot::waiting(), false, false);
         assert_eq!(bytes.len(), VIEW_RESPONSE_HEADER_BYTES);
         assert_eq!(bytes[0], ViewStatus::Waiting.code());
         assert_eq!(bytes[1], 0);
     }
 
     #[test]
-    fn the_frame_response_carries_pixels_and_the_live_input_grant() {
+    fn the_frame_response_carries_pixels_and_the_live_flags() {
         let slot = ViewSlot {
             status: ViewStatus::Live,
             frame: Some(DecodedFrame {
@@ -1373,9 +1383,9 @@ mod tests {
                 data: vec![1, 2, 3, 4, 5, 6, 7, 8],
             }),
         };
-        let bytes = encode_view_response(&slot, true);
+        let bytes = encode_view_response(&slot, true, false);
         assert_eq!(bytes[0], ViewStatus::Live.code());
-        assert_eq!(bytes[1], 1);
+        assert_eq!(bytes[1], VIEW_FLAG_INPUT);
         assert_eq!(u32::from_le_bytes(bytes[2..6].try_into().unwrap()), 2);
         assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), 1);
         assert_eq!(u64::from_le_bytes(bytes[10..18].try_into().unwrap()), 7);
@@ -1383,6 +1393,13 @@ mod tests {
             &bytes[VIEW_RESPONSE_HEADER_BYTES..],
             &[1, 2, 3, 4, 5, 6, 7, 8]
         );
+
+        // The two flags are independent: a view-only session being recorded
+        // must be able to say so without claiming an input grant it lacks.
+        let recorded = encode_view_response(&slot, false, true);
+        assert_eq!(recorded[1], VIEW_FLAG_RECORDING);
+        let both = encode_view_response(&slot, true, true);
+        assert_eq!(both[1], VIEW_FLAG_INPUT | VIEW_FLAG_RECORDING);
     }
 
     #[test]
@@ -1535,14 +1552,14 @@ mod tests {
     }
 
     #[test]
-    fn status_and_input_stay_live_on_every_poll_even_when_pixels_are_skipped() {
+    fn status_and_flags_stay_live_on_every_poll_even_when_pixels_are_skipped() {
         let mut current = slot_with_frame(7);
         current.status = ViewStatus::Reconnecting;
         let polled = slot_for_poll(&current, 7);
         assert_eq!(polled.status, ViewStatus::Reconnecting);
-        let bytes = encode_view_response(&polled, true);
+        let bytes = encode_view_response(&polled, true, true);
         assert_eq!(bytes[0], ViewStatus::Reconnecting.code());
-        assert_eq!(bytes[1], 1);
+        assert_eq!(bytes[1], VIEW_FLAG_INPUT | VIEW_FLAG_RECORDING);
         assert_eq!(
             bytes.len(),
             VIEW_RESPONSE_HEADER_BYTES,
