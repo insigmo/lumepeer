@@ -79,6 +79,8 @@ fn main() {
         // owns the remote-view windows, and an `AppHandle` only exists once
         // Tauri has set the application up.
         .setup(move |app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::TrayIconBuilder;
             use tauri::Manager as _;
 
             let network = runtime
@@ -91,7 +93,52 @@ fn main() {
             // The runtime owns every actor and connection task; dropping it
             // here would abort all of them.
             app.manage(runtime);
+
+            // Closing the window must not stop remote sessions: the app keeps
+            // running in the tray, and the window close handler below hides
+            // rather than destroys it.
+            let show_item = MenuItem::with_id(app, "show", "Show Lumepeer", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().expect("bundled tray icon"))
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "quit" => app.exit(0),
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Closing the window hides it instead of quitting: lumepeer keeps
+            // serving remote sessions from the tray until "Quit" is chosen.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::session_grant,
