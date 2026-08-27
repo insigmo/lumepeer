@@ -2,16 +2,17 @@
 # E2E smoke test of the desktop client on a remote Linux VM over SSH
 # (docs/e2e-testing.md; questions.md item 4).
 #
-# Usage:   e2e/run-on-vm.sh <host> <session-type>
-#          e2e/run-on-vm.sh beta@192.168.40.128 x11
-#          e2e/run-on-vm.sh beta@192.168.40.130 wayland
+# Usage:   e2e/run-on-vm.sh <session-type>
+#          e2e/run-on-vm.sh x11       — one app, the declarative smoke scenario
+#          e2e/run-on-vm.sh wayland   — the same, on the Wayland VM
+#          e2e/run-on-vm.sh stand     — the two-node stand CI runs (ADR 0036)
 #
 # The script runs ON the VM (scp it there or pipe it through ssh bash).
 # It syncs nothing: `task remote:e2e:<type>` in Taskfile.yml does the sync,
 # then invokes this.
 set -euo pipefail
 
-SESSION_TYPE="${1:?usage: run-on-vm.sh <x11|wayland>}"
+SESSION_TYPE="${1:?usage: run-on-vm.sh <x11|wayland|stand>}"
 cd ~/lumepeer
 
 # nvm + cargo env, exactly like lumepeer-env.sh does for task-driven builds.
@@ -24,8 +25,8 @@ echo "== building frontend =="
 
 echo "== building debug app with pilot =="
 case "$SESSION_TYPE" in
-  x11)     MEDIA_FEATURES="capture-x11,encode-openh264,decode-openh264" ;;
-  wayland) MEDIA_FEATURES="encode-openh264,decode-openh264" ;; # portal capture is opt-in at runtime
+  x11|stand) MEDIA_FEATURES="capture-x11,encode-openh264,decode-openh264" ;;
+  wayland)   MEDIA_FEATURES="encode-openh264,decode-openh264" ;; # portal capture is opt-in at runtime
   *) echo "unknown session type: $SESSION_TYPE" >&2; exit 2 ;;
 esac
 cargo build -p lumepeer-desktop --features pilot,"$MEDIA_FEATURES"
@@ -34,7 +35,13 @@ BIN=target/debug/lumepeer-desktop
 test -x "$BIN"
 
 echo "== locating the graphical session ($SESSION_TYPE) =="
-if [ "$SESSION_TYPE" = "wayland" ]; then
+if [ "$SESSION_TYPE" = "stand" ]; then
+  # The stand starts and stops its own two apps, so all it needs from here is
+  # a display to put them on.
+  DISPLAY_VALUE="$(ls /tmp/.X11-unix/ 2>/dev/null | grep -o '^X[0-9]*$' | head -1 | tr -d 'X')"
+  DISPLAY_VALUE=":${DISPLAY_VALUE:-0}"
+  SESSION_ENV=( env "DISPLAY=${DISPLAY_VALUE}" )
+elif [ "$SESSION_TYPE" = "wayland" ]; then
   WAYLAND_DISPLAY_VALUE="$(ls /run/user/$(id -u)/ 2>/dev/null | grep -o '^wayland-[0-9]*' | head -1 || true)"
   test -n "$WAYLAND_DISPLAY_VALUE" || { echo "no Wayland display found; is the Wayland session up?" >&2; exit 3; }
   SESSION_ENV=( env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY_VALUE"
@@ -47,6 +54,13 @@ else
 fi
 echo "session env: ${SESSION_ENV[*]}"
 
+if [ "$SESSION_TYPE" = "stand" ]; then
+  echo "== running the two-node stand =="
+  pkill -f 'lumepeer-desktop' 2>/dev/null || true
+  mkdir -p target/e2e
+  exec "${SESSION_ENV[@]}"     LUMEPEER_BIN="target/debug/lumepeer-desktop"     E2E_OUT="target/e2e"     bash e2e/ci-stand.sh
+fi
+
 echo "== headless identity: encrypted-file keystore =="
 # A session reached only over SSH never ran PAM's keyring unlock, so the
 # Secret Service default collection is locked and every call ends in
@@ -57,12 +71,24 @@ export LUMEPEER_KEYSTORE=file
 export LUMEPEER_KEYSTORE_PATH="$HOME/.local/share/lumepeer/e2e-identity.keystore"
 mkdir -p "$(dirname "$LUMEPEER_KEYSTORE_PATH")"
 
+echo "== serving the webview bundle at the dev URL =="
+# A debug build loads `build.devUrl` rather than the bundle compiled into it
+# (`cfg(dev)`), and the pilot bridge exists only in a debug build — so the
+# bundle has to be reachable at that URL or the window comes up blank. Same
+# reasoning, and the same server, as e2e/ci-stand.sh.
+DEV_URL="$(python3 -c "import json; print(json.load(open('apps/desktop/src-tauri/tauri.conf.json'))['build']['devUrl'])")"
+DEV_PORT="${DEV_URL##*:}"; DEV_PORT="${DEV_PORT%%/*}"
+(cd apps/desktop/dist && exec python3 -m http.server "$DEV_PORT" --bind ::) > /tmp/lumepeer-e2e-bundle.log 2>&1 &
+BUNDLE_PID=$!
+trap 'kill $BUNDLE_PID 2>/dev/null || true' EXIT
+sleep 2
+
 echo "== launching app under the session =="
 pkill -f 'lumepeer-desktop' 2>/dev/null || true
 sleep 1
 "${SESSION_ENV[@]}" "$BIN" > /tmp/lumepeer-e2e-app.log 2>&1 &
 APP_PID=$!
-trap 'kill $APP_PID 2>/dev/null || true' EXIT
+trap 'kill $APP_PID $BUNDLE_PID 2>/dev/null || true' EXIT
 
 # Wait for the tauri-pilot socket to answer.
 echo "== waiting for pilot socket =="

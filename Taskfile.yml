@@ -486,6 +486,17 @@ tasks:
         ssh {{.LINUX_HOST}} "mkdir -p ~/lumepeer && tar -xf /tmp/lumepeer-e2e-tree.tar -C ~/lumepeer"
         ssh {{.LINUX_HOST}} "bash -s x11" < e2e/run-on-vm.sh
 
+  e2e:stand:
+    desc: >-
+      Run the two-node stand (e2e/ci-stand.sh) on the X11 Linux VM over SSH —
+      the same scenario CI runs, against a display you can watch.
+    deps: [e2e:sync-common]
+    cmds:
+      - scp -q target/e2e/tree.tar {{.LINUX_HOST}}:/tmp/lumepeer-e2e-tree.tar
+      - |
+        ssh {{.LINUX_HOST}} "mkdir -p ~/lumepeer && tar -xf /tmp/lumepeer-e2e-tree.tar -C ~/lumepeer"
+        ssh {{.LINUX_HOST}} "bash -s stand" < e2e/run-on-vm.sh
+
   e2e:wayland:
     desc: Run the desktop E2E smoke scenario on the Wayland Linux VM over SSH.
     deps: [e2e:sync-common]

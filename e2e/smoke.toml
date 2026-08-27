@@ -6,14 +6,23 @@
 # assert-url, wait, screenshot, ... The assertions cover what a session-less
 # app can honestly show: the window is alive, the new chat/clipboard IPC
 # commands exist and answer with the documented shapes.
+#
+# IPC goes through `window.__TAURI_INTERNALS__.invoke`, not `window.__TAURI__`:
+# this app leaves `withGlobalTauri` off, so the convenience global is absent
+# from its webview by design. A whole session, two nodes and the export are in
+# e2e/ci-stand.sh instead (ADR 0036).
 
 [scenario]
 name = "lumepeer-smoke"
 
 [[step]]
 name = "main-window-url"
+# "localhost" rather than "index.html": a debug build — the only kind that
+# carries the pilot bridge — loads `build.devUrl` (http://localhost:5173/),
+# while a release build serves the embedded bundle from tauri://localhost.
+# Both contain this; neither always contains a file name.
 action = "assert-url"
-expected = "index.html"
+expected = "localhost"
 
 [[step]]
 name = "dom-ready"
@@ -24,13 +33,13 @@ script = "document.readyState"
 name = "chat-input-command-exists"
 # An unknown command rejects; `chat_transcript` must resolve for any label.
 action = "eval"
-script = "window.__TAURI__.core.invoke('chat_transcript', { peer: 'e2e-no-such-peer' }).then(() => 'ok').catch((e) => 'ERR:' + e)"
+script = "window.__TAURI_INTERNALS__.invoke('chat_transcript', { peer: 'e2e-no-such-peer' }).then(() => 'ok').catch((e) => 'ERR:' + e)"
 expected = "ok"
 
 [[step]]
 name = "clipboard-pull-empty-for-unknown-peer"
 action = "eval"
-script = "window.__TAURI__.core.invoke('clipboard_pull', { peer: 'e2e-no-such-peer' }).then((v) => v === null ? 'null' : 'payload:' + v).catch((e) => 'ERR:' + e)"
+script = "window.__TAURI_INTERNALS__.invoke('clipboard_pull', { peer: 'e2e-no-such-peer' }).then((v) => v === null ? 'null' : 'payload:' + v).catch((e) => 'ERR:' + e)"
 expected = "null"
 
 [[step]]
@@ -38,16 +47,16 @@ name = "chat-send-refuses-unknown-peer"
 # Deny-by-default: sending to a peer that is not in session state must fail
 # with the structured refusal, not hang and not succeed silently.
 action = "eval"
-script = "window.__TAURI__.core.invoke('chat_send', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
+script = "window.__TAURI_INTERNALS__.invoke('chat_send', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
 expected = "UNKNOWN_PEER"
 
 [[step]]
 name = "clipboard-push-refused-without-grant"
 action = "eval"
-script = "window.__TAURI__.core.invoke('clipboard_push', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
+script = "window.__TAURI_INTERNALS__.invoke('clipboard_push', { args: { peer: 'e2e-no-such-peer', text: 'hi' } }).then(() => 'UNEXPECTED-OK').catch((e) => String(e.code || e))"
 expected = "UNKNOWN_PEER"
 
 [[step]]
 name = "screenshot-main"
 action = "screenshot"
-path = "/tmp/lumepeer-e2e-main.png"
+path = "target/e2e/smoke-main.png"

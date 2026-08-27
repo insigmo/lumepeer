@@ -56,6 +56,8 @@
     "allow-file-abort",
     "allow-file-transfers",
     "allow-audio-toggle",
-    "allow-recording-toggle"
+    "allow-recording-toggle",
+    "allow-recordings-list",
+    "allow-recording-export"
   ]
 }
