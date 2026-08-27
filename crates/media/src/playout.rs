@@ -13,11 +13,14 @@
 //! stays decided by the same constants. A silent chunk is real silence, so
 //! gaps in the sender's clock never click.
 //!
-//! WASAPI is the only backend today, so everything below it is gated on
-//! Windows behind the [`AudioPlayer`] trait, exactly as
-//! [`crate::capture_audio`] gates its capturers: other targets get a refusal
-//! from [`platform_player`] and run without guest audio (§18). The
-//! conversion helper is platform-independent and always tested.
+//! Two backends today, gated behind the [`AudioPlayer`] trait exactly as
+//! [`crate::capture_audio`] gates its capturers: WASAPI on Windows, and
+//! PipeWire on Linux (module [`linux_pipewire`], `feature =
+//! "audio-capture-pipewire"` — the same feature that carries the capture
+//! direction, because it is the same binding set). macOS has none yet and
+//! gets a refusal from [`platform_player`], running without guest audio and
+//! saying so (§18). The conversion helper is platform-independent and always
+//! tested.
 
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
@@ -29,6 +32,17 @@ use windows::Win32::Media::Audio::{self as wasapi, IAudioClient, IAudioRenderCli
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
+// Every non-doc use of `MediaError` in this file is inside the Windows
+// backend or the "no backend" arm of `platform_player`, so a Linux build with
+// PipeWire compiled in uses the name only in doc links.
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ),
+    allow(unused_imports, reason = "used in doc links on this configuration")
+)]
 use crate::error::{MediaError, Result};
 use lumepeer_core::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ};
 
@@ -68,6 +82,21 @@ pub trait AudioPlayer: Send + std::fmt::Debug {
     fn stop(&mut self);
 }
 
+/// PipeWire playback for Linux (§11; ADR 0023, ADR 0028).
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "audio-capture-pipewire"
+))]
+pub mod linux_pipewire;
+
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "audio-capture-pipewire"
+))]
+pub use linux_pipewire::PipewirePlayout;
+
 /// Opens the playback backend of the current platform (§11; ADR 0028).
 ///
 /// # Errors
@@ -78,7 +107,22 @@ pub fn platform_player() -> Result<Box<dyn AudioPlayer>> {
     {
         Ok(Box::new(WasapiPlayout::new()))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ))]
+    {
+        Ok(Box::new(linux_pipewire::PipewirePlayout::new()))
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "audio-capture-pipewire"
+        ),
+    )))]
     {
         Err(MediaError::CaptureUnavailable(
             "no audio playback backend is compiled in for this target".to_owned(),

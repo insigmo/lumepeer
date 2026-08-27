@@ -81,11 +81,110 @@ pub fn host_monitors() -> Result<Vec<HostMonitor>> {
     {
         windows::WindowsCapturer::attached_monitors_info()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        linux_host_monitors()
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_os = "android"))
+    )))]
     {
         // No other backend exposes enumeration yet: report the primary as
         // the only monitor rather than an empty list, which would read as
         // "this host has no screens" (§18: degrade honestly, never lie).
+        Ok(vec![HostMonitor {
+            id: 0,
+            width: 0,
+            height: 0,
+            primary: true,
+        }])
+    }
+}
+
+/// The primary head's size as X reports it, or `None` when this build has no
+/// X11 backend to ask.
+///
+/// Only ever the Wayland path's pre-negotiation estimate: on a Wayland
+/// session Xwayland reports the compositor's own outputs, so this is the same
+/// geometry the portal would hand back — available without raising a dialog
+/// for it (ADR 0028).
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "capture-portal"
+))]
+fn x11_primary_size() -> Option<(u32, u32)> {
+    #[cfg(feature = "capture-x11")]
+    {
+        linux_x11::host_monitors().ok().and_then(|monitors| {
+            monitors
+                .iter()
+                .find(|monitor| monitor.primary)
+                .or_else(|| monitors.first())
+                .map(|monitor| (monitor.width, monitor.height))
+        })
+    }
+    #[cfg(not(feature = "capture-x11"))]
+    {
+        None
+    }
+}
+
+/// Linux monitor enumeration, which is two different answers because Linux is
+/// two different capture paths (ADR 0028).
+///
+/// On a Wayland session the list is always exactly **one** entry, and that is
+/// not a limitation to be fixed later: a portal session grants one stream,
+/// chosen by the user in the portal's own dialog, and the guest's
+/// `MonitorSelect` cannot move it. Announcing three monitors there would
+/// promise a choice `CaptureTarget::Display` has no way to honour — the
+/// contract this list carries is "these are the ids `Display` indexes", so a
+/// path where `Display` is inert must announce one.
+///
+/// On an X11 session it is the `RandR` head list, in the order
+/// `CaptureTarget::Display` indexes.
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when the X11 path is the one in use and
+/// there is no display to connect to.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the X11 arm below genuinely errors; a portal-only build is the one               configuration where every arm succeeds, and the signature has to               match `host_monitors` across all of them"
+)]
+fn linux_host_monitors() -> Result<Vec<HostMonitor>> {
+    #[cfg(feature = "capture-portal")]
+    if matches!(
+        detect_session_type(),
+        SessionType::Wayland | SessionType::Unknown
+    ) {
+        // Preference order, all three honest: the size the portal actually
+        // negotiated; failing that the primary head as Xwayland's `RandR`
+        // reports it, which is the same compositor's own geometry and needs
+        // no dialog; failing that zeros, which is what "nothing has told us
+        // yet" looks like.
+        let size = linux_wayland::portal::last_stream_size().or_else(x11_primary_size);
+        let (width, height) = size.unwrap_or((0, 0));
+        if width == 0 || height == 0 {
+            tracing::debug!(
+                "no portal stream negotiated yet and no X fallback: reporting an unsized monitor"
+            );
+        }
+        return Ok(vec![HostMonitor {
+            id: 0,
+            width,
+            height,
+            primary: true,
+        }]);
+    }
+
+    #[cfg(feature = "capture-x11")]
+    {
+        linux_x11::host_monitors()
+    }
+    #[cfg(not(feature = "capture-x11"))]
+    {
         Ok(vec![HostMonitor {
             id: 0,
             width: 0,
@@ -106,7 +205,17 @@ pub fn host_display_count() -> Result<usize> {
     {
         windows::WindowsCapturer::display_count()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        // Derived from the same list rather than counted separately: the two
+        // must agree, because this is the bound `MonitorSelect` is range
+        // checked against and that list is what the guest picked from.
+        linux_host_monitors().map(|monitors| monitors.len())
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_os = "android"))
+    )))]
     {
         Ok(1)
     }

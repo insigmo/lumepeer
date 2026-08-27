@@ -10,7 +10,11 @@ vars:
   # needs no platform SDK (X11 headers, DXGI/D3D11 bindings, openh264); a
   # client built without them starts, pairs and consents normally and
   # reports "no capture backend" instead of showing a picture (§18).
-  LINUX_MEDIA_FEATURES: capture-x11,encode-openh264
+  # Both capture paths in one binary: `capture::detect_session_type` picks at
+  # runtime, so a single .deb has to carry X11 and the Wayland portal (ADR
+  # 0010, ADR 0039). Dropping either one leaves half the Linux desktops with
+  # no picture.
+  LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-openh264
   # Both encoders: Media Foundation needs hardware support the host may not
   # have, and without the openh264 software fallback such a host reports
   # "no usable encoder" and the guest never gets a picture.

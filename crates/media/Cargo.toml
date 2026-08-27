@@ -35,6 +35,13 @@ capture-screencapturekit = [
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
+# VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4; ADR
+# 0031). Same convention as encode-mf: `cargo build --workspace` needs no
+# platform SDK, and `cros-libva` is declared optional in the Linux target
+# table so the feature is inert everywhere else. Deliberately NOT part of the
+# shipped Linux feature set: a .deb must install and run on a machine with no
+# VA-API at all, falling back to openh264 (§18).
+encode-vaapi = ["dep:cros-libva"]
 # Opus audio encode/decode (§5.1; ADR 0023). audiopus_sys vendors libopus and
 # builds it with cmake — the same precedent as openh264-sys — so the default
 # build still needs no platform SDK. Without this feature every audio entry
@@ -45,11 +52,13 @@ audio-opus = ["dep:opus"]
 # Windows (see below), so this feature only adds the WASAPI/COM binding
 # modules the capturer needs on top of what the decoder sandbox requires.
 audio-capture = ["windows/Win32_Media_Audio"]
-# PipeWire monitor capture on Linux (questions.md item 8, ADR 0023). The
-# `pipewire` dependency is already optional under the Linux target table
-# (pulled in by `capture-portal`); this feature reuses it rather than adding a
-# second binding set.
-audio-capture-pipewire = []
+# PipeWire desktop-audio capture and playback on Linux (questions.md item 8,
+# ADR 0023). Reuses the same `pipewire` binding set `capture-portal` pulls in
+# rather than adding a second one — but names it as its own dependency, so a
+# build that wants Linux audio without the Wayland capture path still gets the
+# crate. Declaring nothing here and free-riding on `capture-portal` is what
+# made this feature unbuildable on its own.
+audio-capture-pipewire = ["dep:pipewire"]
 # The decoder worker links openh264 itself; this only affects the media crate.
 decode-openh264 = ["dep:openh264"]
 # Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19
@@ -97,9 +106,21 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ], optional = true }
 # `xfixes` is what makes the pointer visible: X11's `GetImage` never contains
 # it, so without the extension an X11 host shares a screen with no cursor at
-# all (§11).
-x11rb = { workspace = true, optional = true, features = ["xtest", "xfixes"] }
+# all (§11). `randr` is what makes a second monitor visible: a multi-head X
+# display is one X screen spanning every head, so `setup.roots` reports one
+# monitor on a three-monitor machine and RandR 1.5's `GetMonitors` is the
+# request that reports the heads themselves (ADR 0028).
+x11rb = { workspace = true, optional = true, features = [
+    "xtest",
+    "xfixes",
+    "randr",
+] }
 pipewire = { version = "0.8", optional = true }
+# Safe libva bindings for the VA-API encoder (ADR 0040). BSD-3-Clause, which
+# `deny.toml`'s allowlist already carries. Intel and AMD only by design:
+# NVIDIA encode is NVENC, a separate SDK under separate terms, and is a
+# deliberately separate decision.
+cros-libva = { version = "0.0.13", optional = true }
 
 # ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in
 # (§11, ADR 0013), all optional and pulled in only by

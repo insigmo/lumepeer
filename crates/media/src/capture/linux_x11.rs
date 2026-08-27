@@ -17,9 +17,12 @@
 //! back between presents, so compositing twice onto it would leave a trail,
 //! while every `GetImage` here is a fresh, cursor-free buffer.
 
-use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, MAX_CURSOR_SHAPE_PIXELS};
+use lumepeer_core::constants::{
+    ENCODE_DEFAULT_FPS, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+};
 use lumepeer_core::protocol::CursorShapeData;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Screen};
 use x11rb::rust_connection::RustConnection;
@@ -40,6 +43,14 @@ const BGRA_BYTES: usize = 4;
 /// Opaque alpha.
 const OPAQUE: u16 = 255;
 
+/// `RandR` version this backend asks for. `GetMonitors` is a 1.5 request, and
+/// 1.5 is what every X server shipped since 2015 answers; an older server
+/// simply fails `QueryVersion` and monitor enumeration falls back to the X
+/// screen (ADR 0028).
+const RANDR_MAJOR: u32 = 1;
+/// See [`RANDR_MAJOR`].
+const RANDR_MINOR: u32 = 5;
+
 /// XFIXES version this backend asks for. 1.0 is where `GetCursorImage`
 /// appeared, and nothing here needs anything later.
 const XFIXES_MAJOR: u32 = 1;
@@ -48,7 +59,11 @@ const XFIXES_MINOR: u32 = 0;
 /// The host's pointer, as XFIXES reports it.
 #[derive(Debug, Clone)]
 struct Pointer {
-    /// Top-left of the shape on the root window.
+    /// Top-left of the shape on the *captured frame*, not on the root
+    /// window: XFIXES reports root coordinates, and [`Active::read_pointer`]
+    /// subtracts the captured monitor's origin so that a cursor on another
+    /// head lands outside the frame and `composite_pointer` clips it away
+    /// (ADR 0028).
     x: i16,
     y: i16,
     width: u16,
@@ -63,11 +78,141 @@ struct Pointer {
     serial: u32,
 }
 
+/// One capturable rectangle of this X display, in `RandR`'s own reply order.
+///
+/// `RandR` monitors, not X screens: on every desktop shipped this decade a
+/// multi-head setup is one X screen spanning every head, so `setup.roots`
+/// has a single entry covering the whole virtual desktop and enumerating it
+/// would report "one monitor" on a three-monitor machine. `RandR` 1.5's
+/// `GetMonitors` is the request that reports the heads themselves, and the
+/// order it replies in is the order [`CaptureTarget::Display`] indexes
+/// (ADR 0028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MonitorRect {
+    /// Left edge on the root window, which is where `GetImage` reads from.
+    pub x: i16,
+    /// Top edge on the root window.
+    pub y: i16,
+    /// Width in pixels.
+    pub width: u16,
+    /// Height in pixels.
+    pub height: u16,
+    /// Whether `RandR` marks this the primary head.
+    pub primary: bool,
+}
+
+/// Every active `RandR` monitor of `screen`, or the X screen itself when `RandR`
+/// cannot answer.
+///
+/// Never an error and never empty: an X server that refuses `GetMonitors`
+/// (too old, or the extension not built in) still has a root window with a
+/// size, and reporting that one rectangle is the honest degraded answer —
+/// the same thing this backend captured before `RandR` was consulted at all.
+/// Capped at [`MAX_MONITORS_PER_HOST`], which is the bound
+/// `MessageEnvelope::check_limits` rejects a `MonitorsList` for exceeding:
+/// truncating here costs the ninth monitor, while not truncating costs the
+/// guest the whole list.
+pub(crate) fn monitor_rects(connection: &RustConnection, screen: &Screen) -> Vec<MonitorRect> {
+    let fallback = || {
+        vec![MonitorRect {
+            x: 0,
+            y: 0,
+            width: screen.width_in_pixels,
+            height: screen.height_in_pixels,
+            primary: true,
+        }]
+    };
+
+    if connection
+        .randr_query_version(RANDR_MAJOR, RANDR_MINOR)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_none()
+    {
+        tracing::debug!("RandR did not answer QueryVersion: reporting the X screen as one monitor");
+        return fallback();
+    }
+
+    // `get_active = true` asks for the heads that currently show something;
+    // a disconnected output is not a monitor a guest can be pointed at.
+    let Some(reply) = connection
+        .randr_get_monitors(screen.root, true)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+    else {
+        tracing::debug!("RandR refused GetMonitors: reporting the X screen as one monitor");
+        return fallback();
+    };
+
+    let mut rects: Vec<MonitorRect> = reply
+        .monitors
+        .iter()
+        .filter(|info| info.width > 0 && info.height > 0)
+        .take(MAX_MONITORS_PER_HOST)
+        .map(|info| MonitorRect {
+            x: info.x,
+            y: info.y,
+            width: info.width,
+            height: info.height,
+            primary: info.primary,
+        })
+        .collect();
+
+    if rects.is_empty() {
+        // `RandR` answered with nothing usable, which a headless or
+        // mid-reconfiguration server does. The root window is still there.
+        return fallback();
+    }
+
+    // `RandR` does not promise a primary head, and servers that nobody ran
+    // `xrandr --primary` against do not mark one — Xvfb and Xwayland both
+    // report `primary: false` for their only monitor. A `MonitorsList` with
+    // no primary in it leaves the guest with no monitor to open on, so the
+    // first head takes the flag. Exactly one entry carries it either way.
+    if !rects.iter().any(|rect| rect.primary)
+        && let Some(first) = rects.first_mut()
+    {
+        first.primary = true;
+    }
+    rects
+}
+
+/// Every monitor of the current X display, for the §11 `MonitorsList`
+/// (ADR 0028).
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] when there is no X display to connect
+/// to at all — the same condition [`ScreenCapturer::start`] refuses on.
+pub fn host_monitors() -> Result<Vec<crate::capture::HostMonitor>> {
+    let (connection, screen_num) = x11rb::connect(None).map_err(|e| {
+        MediaError::CaptureUnavailable(format!("cannot connect to the X server: {e}"))
+    })?;
+    let screen = connection.setup().roots[screen_num].clone();
+    Ok(monitor_rects(&connection, &screen)
+        .iter()
+        .enumerate()
+        .map(|(index, rect)| crate::capture::HostMonitor {
+            // The enumeration index, which is what `CaptureTarget::Display`
+            // takes: `MAX_MONITORS_PER_HOST` is 8, so it always fits.
+            id: u32::try_from(index).unwrap_or(0),
+            width: u32::from(rect.width),
+            height: u32::from(rect.height),
+            primary: rect.primary,
+        })
+        .collect())
+}
+
 /// Live X11 connection and the geometry it captures.
 #[derive(Debug)]
 struct Active {
     connection: RustConnection,
     root: u32,
+    /// Left edge of the captured monitor on the root window. Non-zero on
+    /// every head but the leftmost: `GetImage` reads the root, so the
+    /// monitor a guest picked is a crop out of it (ADR 0028).
+    origin_x: i16,
+    /// Top edge of the captured monitor on the root window.
+    origin_y: i16,
     width: u16,
     height: u16,
     /// Hash of the last frame handed out, so an unchanged screen yields `None`
@@ -110,17 +255,46 @@ impl X11Capturer {
         ENCODE_DEFAULT_FPS
     }
 
-    fn screen(connection: &RustConnection, screen_num: usize, target: CaptureTarget) -> Screen {
-        let setup = connection.setup();
-        let index = match target {
-            CaptureTarget::PrimaryDisplay => screen_num,
-            CaptureTarget::Display(n) => n as usize,
-        };
-        setup
-            .roots
-            .get(index)
-            .unwrap_or(&setup.roots[screen_num])
-            .clone()
+    /// The rectangle `target` names, resolved against the same `RandR`
+    /// enumeration [`host_monitors`] reports (ADR 0028).
+    ///
+    /// An out-of-range index falls back to the primary rather than failing:
+    /// a guest can hold a stale `MonitorsList` across a monitor being
+    /// unplugged, and showing the primary screen beats dropping the session
+    /// (§18).
+    fn monitor(connection: &RustConnection, screen: &Screen, target: CaptureTarget) -> MonitorRect {
+        resolve_target(&monitor_rects(connection, screen), target).unwrap_or(MonitorRect {
+            x: 0,
+            y: 0,
+            width: screen.width_in_pixels,
+            height: screen.height_in_pixels,
+            primary: true,
+        })
+    }
+}
+
+/// Picks the rectangle `target` names out of `rects`, which is the very list
+/// [`host_monitors`] is derived from.
+///
+/// Split out from [`X11Capturer::monitor`] with no connection in it so the
+/// contract it carries — `Display(n)` is the n-th entry of the announced
+/// list, same order, same index — is testable without an X server (ADR 0028).
+///
+/// `None` only for an empty list.
+fn resolve_target(rects: &[MonitorRect], target: CaptureTarget) -> Option<MonitorRect> {
+    let primary = || {
+        rects
+            .iter()
+            .find(|rect| rect.primary)
+            .or_else(|| rects.first())
+            .copied()
+    };
+    match target {
+        CaptureTarget::PrimaryDisplay => primary(),
+        CaptureTarget::Display(n) => usize::try_from(n)
+            .ok()
+            .and_then(|index| rects.get(index).copied())
+            .or_else(primary),
     }
 }
 
@@ -131,7 +305,8 @@ impl ScreenCapturer for X11Capturer {
             // declining the system prompt (§18).
             MediaError::CaptureUnavailable(format!("cannot connect to the X server: {e}"))
         })?;
-        let screen = Self::screen(&connection, screen_num, target);
+        let screen = connection.setup().roots[screen_num].clone();
+        let monitor = Self::monitor(&connection, &screen, target);
 
         // XFIXES is what makes the pointer visible at all here. A display
         // without it is a display whose frames simply have no cursor in them:
@@ -149,8 +324,10 @@ impl ScreenCapturer for X11Capturer {
 
         self.active = Some(Active {
             root: screen.root,
-            width: screen.width_in_pixels,
-            height: screen.height_in_pixels,
+            origin_x: monitor.x,
+            origin_y: monitor.y,
+            width: monitor.width,
+            height: monitor.height,
             connection,
             last_hash: None,
             started_at: std::time::Instant::now(),
@@ -173,8 +350,8 @@ impl ScreenCapturer for X11Capturer {
             .get_image(
                 ImageFormat::Z_PIXMAP,
                 active.root,
-                0,
-                0,
+                active.origin_x,
+                active.origin_y,
                 active.width,
                 active.height,
                 ALL_PLANES,
@@ -310,12 +487,16 @@ impl Active {
             pixels.extend_from_slice(&word.to_le_bytes());
         }
         Some(Pointer {
+            // Root coordinates minus the hotspot give the shape's top-left on
+            // the root; minus the crop origin puts it on the frame.
             x: image
                 .x
-                .saturating_sub(i16::try_from(image.xhot).unwrap_or(i16::MAX)),
+                .saturating_sub(i16::try_from(image.xhot).unwrap_or(i16::MAX))
+                .saturating_sub(self.origin_x),
             y: image
                 .y
-                .saturating_sub(i16::try_from(image.yhot).unwrap_or(i16::MAX)),
+                .saturating_sub(i16::try_from(image.yhot).unwrap_or(i16::MAX))
+                .saturating_sub(self.origin_y),
             width: image.width,
             height: image.height,
             hotspot_x: image.xhot,
@@ -783,6 +964,101 @@ mod tests {
     )]
 
     use super::*;
+
+    fn rect(x: i16, width: u16, primary: bool) -> MonitorRect {
+        MonitorRect {
+            x,
+            y: 0,
+            width,
+            height: 1080,
+            primary,
+        }
+    }
+
+    /// ADR 0028's contract, and the reason `resolve_target` exists as its own
+    /// function: the id a guest sends in `MonitorSelect` is an index into the
+    /// very list `host_monitors` announced. If these two ever drift, a guest
+    /// picking "monitor 2" gets monitor 1's pixels and nothing errors.
+    #[test]
+    fn display_indexes_the_same_order_host_monitors_announces() {
+        // Three heads left to right, the middle one primary — the layout that
+        // catches an implementation that confused "primary" with "first".
+        let rects = [
+            rect(0, 1280, false),
+            rect(1280, 1920, true),
+            rect(3200, 2560, false),
+        ];
+
+        // What `host_monitors` would announce for this list.
+        let announced: Vec<(u32, u32)> = rects
+            .iter()
+            .map(|rect| (u32::from(rect.width), u32::from(rect.height)))
+            .collect();
+
+        for (index, expected) in announced.iter().enumerate() {
+            let id = u32::try_from(index).unwrap();
+            let chosen = resolve_target(&rects, CaptureTarget::Display(id)).unwrap();
+            assert_eq!(
+                (u32::from(chosen.width), u32::from(chosen.height)),
+                *expected,
+                "Display({id}) must select the monitor announced at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_display_selects_the_head_randr_marks_primary() {
+        let rects = [rect(0, 1280, false), rect(1280, 1920, true)];
+        let chosen = resolve_target(&rects, CaptureTarget::PrimaryDisplay).unwrap();
+        assert_eq!(chosen.width, 1920);
+        assert_eq!(chosen.x, 1280, "the crop origin travels with the choice");
+    }
+
+    /// A guest can hold a `MonitorsList` from before a monitor was unplugged.
+    /// Showing the primary beats dropping the session (§18).
+    #[test]
+    fn an_out_of_range_display_falls_back_to_primary_rather_than_failing() {
+        let rects = [rect(0, 1280, false), rect(1280, 1920, true)];
+        let chosen = resolve_target(&rects, CaptureTarget::Display(7)).unwrap();
+        assert_eq!(chosen.width, 1920);
+    }
+
+    #[test]
+    fn an_empty_list_resolves_to_nothing_so_the_caller_uses_the_x_screen() {
+        assert!(resolve_target(&[], CaptureTarget::PrimaryDisplay).is_none());
+        assert!(resolve_target(&[], CaptureTarget::Display(0)).is_none());
+    }
+
+    /// Needs a real display, so it shares the opt-in of the injection tests.
+    /// Under Xvfb this is one monitor; on a real multi-head machine it is
+    /// however many `RandR` reports — either way the two entry points must
+    /// agree, because `on_monitor_select` range-checks against the count and
+    /// the guest picked from the list.
+    #[test]
+    fn the_announced_list_and_the_display_count_agree() {
+        if std::env::var("LUMEPEER_TEST_XTEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set LUMEPEER_TEST_XTEST=1 with a display to run this");
+            return;
+        }
+        let monitors = host_monitors().expect("a display was promised");
+        assert!(!monitors.is_empty(), "a display must report a monitor");
+        assert!(
+            monitors.len() <= MAX_MONITORS_PER_HOST,
+            "MonitorsList would be rejected by check_limits"
+        );
+        for (index, monitor) in monitors.iter().enumerate() {
+            assert_eq!(
+                monitor.id,
+                u32::try_from(index).unwrap(),
+                "ids must be the enumeration index Display takes"
+            );
+            assert!(
+                monitor.width > 0 && monitor.height > 0,
+                "a real monitor has a real size, never zeros"
+            );
+        }
+        assert_eq!(monitors.iter().filter(|m| m.primary).count(), 1);
+    }
 
     fn pointer(width: u16, height: u16, pixels: Vec<u8>) -> Pointer {
         Pointer {

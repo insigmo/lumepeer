@@ -72,7 +72,15 @@ cargo fmt --all -- --check
 ```
 
 Linux needs `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
-`libayatana-appindicator3-dev`, `librsvg2-dev` and `libxdo-dev`.
+`libayatana-appindicator3-dev`, `librsvg2-dev` and `libxdo-dev`, plus
+`libpipewire-0.3-dev` and `libclang-dev` for the `capture-portal` and
+`audio-capture-pipewire` features that a shipped Linux client carries
+(`pipewire-sys` links libpipewire and generates its bindings with bindgen).
+The X11 capture path needs no headers of its own — `x11rb` is pure Rust.
+
+At runtime a `.deb`/`.rpm` depends on `libpipewire-0.3-0` (`pipewire-libs` on
+RPM distributions) and recommends `xdg-desktop-portal` plus a running
+`pipewire`; a Wayland desktop with no portal has no capture path at all.
 
 `apps/desktop/src-tauri/icons/icon.png` is a placeholder until there is a real
 one.
@@ -133,10 +141,18 @@ session, X11 input injection goes through XTEST, the Secret Service keystore of
 the normative order of §11, and every row of the error matrix has its own test
 in `tests/integration/tests/error_matrix.rs`.
 
-The X11 injection test drives whatever display it runs against, so it is opt-in:
+The X11 injection test drives whatever display it runs against, so it is
+opt-in. The same switch gates the monitor-enumeration test, which needs a real
+X server to have any RandR outputs to enumerate:
 
 ```sh
 LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11
+```
+
+The full set a Linux client actually ships with, which is what CI checks:
+
+```sh
+cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
 ```
 
 Still failing with an explicit error rather than pretending to work: Windows
