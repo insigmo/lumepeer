@@ -127,6 +127,21 @@ export type TranslationKey =
   | 'toolbar.file'
   | 'toolbar.collapse'
   | 'toolbar.expand'
+  | 'toolbar.fullscreen'
+  | 'toolbar.fullscreen.exit'
+  | 'toolbar.settings.displayMode'
+  | 'toolbar.settings.localCursor'
+  | 'toolbar.settings.cursorEmbedded'
+  | 'toolbar.display.fit'
+  | 'toolbar.display.actual'
+  | 'toolbar.display.scaled'
+  | 'toolbar.hotkeys'
+  | 'toolbar.hotkey.toggle-fullscreen'
+  | 'toolbar.hotkey.cycle-display-mode'
+  | 'toolbar.hotkey.reset-view'
+  | 'toolbar.hotkey.toggle-chat'
+  | 'toolbar.hotkey.send-cad'
+  | 'toolbar.hotkey.toggle-toolbar'
   | 'unattended.heading'
   | 'unattended.explain'
   | 'unattended.indicator'
@@ -179,7 +194,22 @@ export type TranslationKey =
   | 'creds.badPassword'
   | 'creds.badCode'
   | 'creds.lockedOut'
-  | 'creds.unavailable';
+  | 'creds.unavailable'
+  | 'quality.path.direct'
+  | 'quality.path.relay'
+  | 'quality.path.mixed'
+  | 'quality.path.unknown'
+  | 'quality.rttLabel'
+  | 'quality.lossLabel'
+  | 'quality.goodputLabel'
+  | 'quality.bitrateLabel'
+  | 'quality.fpsLabel'
+  | 'quality.relayLabel'
+  | 'quality.ms'
+  | 'quality.percent'
+  | 'quality.kbps'
+  | 'quality.fpsValue'
+  | 'quality.unknown';
 
 type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
@@ -313,6 +343,26 @@ const en: Dictionary = {
   'toolbar.file': 'Send a file to the host',
   'toolbar.collapse': 'Collapse',
   'toolbar.expand': 'Expand',
+  'toolbar.fullscreen': 'Full screen',
+  'toolbar.fullscreen.exit': 'Leave full screen',
+  'toolbar.settings.displayMode': 'Picture size',
+  'toolbar.settings.localCursor': 'Draw the pointer here',
+  // Said as a fact about the other machine, not as a setting that is missing:
+  // on this host the pointer is part of the picture and nothing here can
+  // change that.
+  'toolbar.settings.cursorEmbedded': 'This device sends the pointer inside the picture.',
+  // Named for what the operator sees, not for the arithmetic: "actual size"
+  // is a promise about pixels, "1:1" is a formula.
+  'toolbar.display.fit': 'Fit to window',
+  'toolbar.display.actual': 'Actual size',
+  'toolbar.display.scaled': 'Zoom',
+  'toolbar.hotkeys': 'Keyboard shortcuts',
+  'toolbar.hotkey.toggle-fullscreen': 'Full screen on or off',
+  'toolbar.hotkey.cycle-display-mode': 'Next picture size',
+  'toolbar.hotkey.reset-view': 'Fit the picture again and centre it',
+  'toolbar.hotkey.toggle-chat': 'Chat on or off',
+  'toolbar.hotkey.send-cad': 'Send Ctrl+Alt+Del',
+  'toolbar.hotkey.toggle-toolbar': 'Collapse or expand this toolbar',
   'unattended.heading': 'Unattended access',
   'unattended.explain': 'With this on, a device you have marked trusted can start a session by entering this device password — nobody has to be sitting here to approve it. This banner stays up whenever it is on.',
   'unattended.indicator': 'Unattended access is on: trusted devices can connect with the device password.',
@@ -366,6 +416,24 @@ const en: Dictionary = {
   'creds.badCode': 'That code was not accepted.',
   'creds.lockedOut': (secs) => `Too many attempts. Try again in ${secs} seconds.`,
   'creds.unavailable': 'This device cannot sign you in that way right now.',
+  // Named for what is happening, not for the transport that makes it happen:
+  // "via relay" is something a person can act on, "DERP" is not (§18).
+  'quality.path.direct': 'Direct',
+  'quality.path.relay': 'Via relay',
+  'quality.path.mixed': 'Direct and relay',
+  'quality.path.unknown': 'Path not known yet',
+  'quality.rttLabel': 'Round trip',
+  'quality.lossLabel': 'Frames lost',
+  'quality.goodputLabel': 'Received',
+  'quality.bitrateLabel': 'Sending at',
+  'quality.fpsLabel': 'Frame rate',
+  'quality.relayLabel': 'Relay region',
+  'quality.ms': (value) => `${value} ms`,
+  'quality.percent': (value) => `${value}%`,
+  'quality.kbps': (value) => `${value} kbit/s`,
+  'quality.fpsValue': (value) => `${value} fps`,
+  // Nothing has measured this yet, which is a different fact from zero.
+  'quality.unknown': 'not measured yet',
 };
 
 const ar: Dictionary = {
@@ -494,6 +562,21 @@ const ar: Dictionary = {
   'toolbar.file': 'إرسال ملف إلى المضيف',
   'toolbar.collapse': 'طي',
   'toolbar.expand': 'توسيع',
+  'toolbar.fullscreen': 'ملء الشاشة',
+  'toolbar.fullscreen.exit': 'إنهاء ملء الشاشة',
+  'toolbar.settings.displayMode': 'حجم الصورة',
+  'toolbar.settings.localCursor': 'ارسم المؤشر هنا',
+  'toolbar.settings.cursorEmbedded': 'يرسل هذا الجهاز المؤشر داخل الصورة.',
+  'toolbar.display.fit': 'ملاءمة النافذة',
+  'toolbar.display.actual': 'الحجم الحقيقي',
+  'toolbar.display.scaled': 'تكبير',
+  'toolbar.hotkeys': 'اختصارات لوحة المفاتيح',
+  'toolbar.hotkey.toggle-fullscreen': 'تشغيل ملء الشاشة أو إيقافه',
+  'toolbar.hotkey.cycle-display-mode': 'حجم الصورة التالي',
+  'toolbar.hotkey.reset-view': 'إعادة ملاءمة الصورة وتوسيطها',
+  'toolbar.hotkey.toggle-chat': 'تشغيل الدردشة أو إيقافها',
+  'toolbar.hotkey.send-cad': 'إرسال Ctrl+Alt+Del',
+  'toolbar.hotkey.toggle-toolbar': 'طي شريط الأدوات أو توسيعه',
   'unattended.heading': 'الوصول دون حضور',
   'unattended.explain': 'عند تفعيله يمكن لجهاز وثّقته أن يبدأ جلسة بإدخال كلمة مرور هذا الجهاز، دون حاجة إلى موافقة أحد هنا. يبقى هذا التنبيه ظاهرًا ما دام مفعّلًا.',
   'unattended.indicator': 'الوصول دون حضور مفعّل: يمكن للأجهزة الموثوقة الاتصال بكلمة مرور الجهاز.',
@@ -547,6 +630,21 @@ const ar: Dictionary = {
   'creds.badCode': 'لم يُقبل الرمز.',
   'creds.lockedOut': (secs) => `محاولات كثيرة. أعد المحاولة بعد ${secs} ثانية.`,
   'creds.unavailable': 'لا يستطيع هذا الجهاز تسجيل دخولك بهذه الطريقة الآن.',
+  'quality.path.direct': 'اتصال مباشر',
+  'quality.path.relay': 'عبر خادم ترحيل',
+  'quality.path.mixed': 'مباشر وعبر ترحيل',
+  'quality.path.unknown': 'المسار غير معروف بعد',
+  'quality.rttLabel': 'زمن الذهاب والإياب',
+  'quality.lossLabel': 'إطارات مفقودة',
+  'quality.goodputLabel': 'المستلَم',
+  'quality.bitrateLabel': 'معدل الإرسال',
+  'quality.fpsLabel': 'معدل الإطارات',
+  'quality.relayLabel': 'منطقة خادم الترحيل',
+  'quality.ms': (value) => `${value} م.ث`,
+  'quality.percent': (value) => `${value}٪`,
+  'quality.kbps': (value) => `${value} ك.بت/ث`,
+  'quality.fpsValue': (value) => `${value} إطار/ث`,
+  'quality.unknown': 'لم يُقَس بعد',
 };
 
 const dictionaries: Record<Locale, Dictionary> = { en, ar };

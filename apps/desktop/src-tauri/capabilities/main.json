@@ -44,6 +44,7 @@
     "allow-history-connect",
     "allow-connect-status",
     "allow-network-status",
+    "allow-connection-stats",
     "allow-license-status",
     "allow-invite-create",
     "allow-invite-connect",

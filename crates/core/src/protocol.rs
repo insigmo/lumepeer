@@ -77,7 +77,15 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `Hello` advertised [`FEATURE_FILE_TRANSFER`], for the same minor-version
 /// reason `MediaUnavailable` rides behind its feature string. See
 /// `docs/adr/0032-file-transfer-start-and-the-lazy-file-connection.md`.
-pub const PROTOCOL_MINOR: u16 = 5;
+///
+/// 6: appended [`MessageKind::ReceiverReport`] after `FileTransferStart`.
+/// `QualityAdjust` says what the encoder should do; nothing said what the
+/// receiver actually saw, so the host's adaptation had to invent a congestion
+/// signal out of its own write latency (ADR 0015). A guest sends it only to a
+/// host whose `HelloAck` minor is at least this one, and a host only reads it
+/// from a guest whose `Hello` advertised [`FEATURE_RECEIVER_REPORT`]. See
+/// `docs/adr/0037-receiver-reports-and-the-degradation-ladder.md`.
+pub const PROTOCOL_MINOR: u16 = 6;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -118,6 +126,36 @@ pub const FEATURE_UNATTENDED: &str = "unattended";
 /// made — better than a transfer that starts and then cannot be acked,
 /// aborted or resumed.
 pub const FEATURE_FILE_TRANSFER: &str = "file-transfer";
+
+/// `Hello.features` string a guest sends to say it will report what it
+/// actually received ([`MessageKind::ReceiverReport`]), and therefore that
+/// this host's adaptation can be driven by measurements rather than by a
+/// stand-in (ADR 0015, ADR 0037).
+///
+/// Same compatibility shape as [`FEATURE_MEDIA_UNAVAILABLE`], read in the
+/// other direction: it is the *guest* that sends the new message, so the host
+/// uses the string to know whether the reports it is not receiving mean "this
+/// link is quiet" or "this peer cannot speak". Without it the host keeps
+/// deriving congestion from its own writes, which is what every peer before
+/// minor 6 gets.
+pub const FEATURE_RECEIVER_REPORT: &str = "receiver-report";
+
+/// `Hello.features` string a guest sends to say it will draw the host's cursor
+/// itself, from [`MessageKind::CursorShape`], rather than expecting it in the
+/// picture (§11).
+///
+/// Unlike the other feature strings this one does not gate a *new*
+/// discriminant — `CursorShape` has existed since minor 1 — it gates a change
+/// of behaviour on the **host**: a host that sees it, and whose capture
+/// backend can separate the two, stops compositing the cursor into the frame.
+/// Without the string the host keeps drawing it in, because a guest that
+/// cannot draw the cursor and is no longer sent one has no cursor at all.
+///
+/// Both halves have to hold. A host whose platform cannot stop compositing
+/// (Wayland's `CursorMode::Embedded`, macOS's `setShowsCursor(true)`) sends no
+/// `CursorShape` at all, which is what tells the guest to keep its own overlay
+/// off: two cursors are worse than one that lags.
+pub const FEATURE_CURSOR_SHAPE: &str = "cursor-shape";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -237,14 +275,33 @@ pub enum MessageKind {
     },
     /// Guest asks the host encoder for an instant keyframe (§11): decoder
     /// joined mid-stream or packets were lost beyond what the jitter buffer
-    /// can conceal. The host must answer with a keyframe at the next
-    /// opportunity, rate-limited by the caller.
+    /// can conceal. The host produces a keyframe at the next opportunity.
+    ///
+    /// Rate-limited by *both* sides, at most one honoured request per
+    /// `KEYFRAME_MIN_INTERVAL_MS`. The caller limiting itself is politeness;
+    /// the host limiting the caller is the part that matters, because a
+    /// keyframe is the most expensive frame in the stream and a guest that
+    /// asked on every frame would otherwise decide what the host spends its
+    /// uplink on.
     KeyframeRequest,
     /// Host announces the shape of its cursor (§11). Sent when the cursor
     /// changes; the guest draws it locally over the video for minimum input
     /// latency feedback.
+    ///
+    /// Sent only to a guest whose `Hello` advertised
+    /// [`FEATURE_CURSOR_SHAPE`], and only by a host that has stopped
+    /// compositing the cursor into the picture. Receiving one is therefore
+    /// the guest's signal that the picture no longer contains a cursor and
+    /// that drawing one is now its job.
+    ///
+    /// No position accompanies it, and that is the point: a cursor drawn from
+    /// the guest's own pointer moves with the hand instead of with the video,
+    /// which is the whole reason this channel exists. A position from the host
+    /// matters only when something other than the guest moved the pointer, and
+    /// paying a message per mouse move for that case would cost more than it
+    /// buys (§11).
     CursorShape {
-        /// Shape payload: geometry plus RGBA pixels.
+        /// Shape payload: geometry plus premultiplied BGRA pixels.
         shape: CursorShapeData,
     },
     /// Host lists the monitors a guest may target (§11).
@@ -383,6 +440,30 @@ pub enum MessageKind {
         /// BLAKE3 of the whole file, as in the offer this starts.
         hash: [u8; 32],
     },
+    /// Guest to host: what this receiver actually saw over the last
+    /// `ABR_FEEDBACK_INTERVAL_MS` (§11). New in minor 6.
+    ///
+    /// The input the adaptation of §11 was always specified to have and never
+    /// had: without it the host can only watch how long its own writes take
+    /// and call that congestion (ADR 0015). Sent only towards a host that
+    /// speaks minor 6, and read only from a guest whose `Hello` advertised
+    /// [`FEATURE_RECEIVER_REPORT`].
+    ///
+    /// Every field is a claim by an untrusted peer, so none of them is
+    /// range-checked here: an absurd report is a feedback frame to drop at the
+    /// point of use, not a malformed frame that should tear the session down.
+    /// The one thing this side owes it is that no arithmetic on it can panic,
+    /// which is why loss is an integer permille rather than a float.
+    ReceiverReport {
+        /// Share of frames in the window the decoder could not turn into a
+        /// picture, in permille. Values above 1000 are nonsense and dropped.
+        loss_permille: u16,
+        /// The guest's own smoothed control-channel round trip, in
+        /// milliseconds, as it measured it.
+        rtt_ms: u32,
+        /// Media bytes that arrived in the window, as kilobits per second.
+        goodput_kbps: u32,
+    },
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -422,19 +503,30 @@ pub enum MediaUnavailableReason {
     NoEncoder,
 }
 
-/// Pixel geometry plus RGBA payload of one cursor shape (§11).
+/// Pixel geometry plus pixel payload of one cursor shape (§11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorShapeData {
     /// Width in pixels, at least 1.
     pub width: u16,
     /// Height in pixels, at least 1.
     pub height: u16,
-    /// Hotspot x within the shape.
+    /// Hotspot x within the shape, strictly less than `width`.
     pub hotspot_x: u16,
-    /// Hotspot y within the shape.
+    /// Hotspot y within the shape, strictly less than `height`.
     pub hotspot_y: u16,
-    /// Premultiplied BGRA pixels, exactly `width * height * 4` bytes and at
-    /// most `MAX_CURSOR_SHAPE_PIXELS * 4`.
+    /// Premultiplied **BGRA** pixels, exactly `width * height * 4` bytes and
+    /// at most `MAX_CURSOR_SHAPE_PIXELS * 4`.
+    ///
+    /// The field name says RGBA and the format is BGRA, which is a
+    /// contradiction that had to be resolved in one direction or the other.
+    /// It is resolved here, in the comment, because the *bytes* are settled:
+    /// every backend that can report a cursor at all produces BGRA — Windows
+    /// hands back `DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR` as a 32bpp BGRA
+    /// bitmap, and X11's XFIXES `GetCursorImage` returns premultiplied ARGB
+    /// packed into a `CARD32`, which is the same four bytes in little-endian
+    /// order. Renaming the field would change the postcard-encoded *shape* of
+    /// this message and break the golden vectors of §17.2, so the name stays
+    /// and this comment is the authority.
     pub rgba: Vec<u8>,
 }
 
@@ -760,6 +852,44 @@ mod tests {
             )),
             35,
         );
+        assert_eq!(
+            kind_byte(MessageKind::ReceiverReport {
+                loss_permille: 0,
+                rtt_ms: 0,
+                goodput_kbps: 0,
+            }),
+            37,
+            "the minor-6 kind must be appended after FileTransferStart"
+        );
+    }
+
+    /// A receiver report is a claim, not a fact, so decoding never judges it:
+    /// even a nonsense one round-trips, and dropping it is the reader's job
+    /// (ADR 0037).
+    #[test]
+    fn a_receiver_report_roundtrips_including_the_nonsense_ones() {
+        let cases = [
+            MessageKind::ReceiverReport {
+                loss_permille: 0,
+                rtt_ms: 42,
+                goodput_kbps: 3_000,
+            },
+            MessageKind::ReceiverReport {
+                loss_permille: 1_000,
+                rtt_ms: 0,
+                goodput_kbps: 0,
+            },
+            MessageKind::ReceiverReport {
+                loss_permille: u16::MAX,
+                rtt_ms: u32::MAX,
+                goodput_kbps: u32::MAX,
+            },
+        ];
+        for kind in cases {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
     }
 
     #[test]
@@ -957,6 +1087,66 @@ mod tests {
             MessageEnvelope::decode(&bad.encode().unwrap()),
             Err(CoreError::Malformed)
         ));
+    }
+
+    /// A cursor is a bitmap from an untrusted peer, and the three ways its
+    /// geometry can lie all have to end in `Malformed` rather than in an
+    /// allocation, an index past the end, or a divide by zero.
+    #[test]
+    fn every_impossible_cursor_geometry_is_refused() {
+        let shape = |width: u16, height: u16, hotspot_x: u16, hotspot_y: u16, pixels: usize| {
+            envelope(MessageKind::CursorShape {
+                shape: CursorShapeData {
+                    width,
+                    height,
+                    hotspot_x,
+                    hotspot_y,
+                    rgba: vec![0x11; pixels],
+                },
+            })
+        };
+        let refused = |kind: MessageEnvelope| {
+            matches!(
+                MessageEnvelope::decode(&kind.encode().unwrap()),
+                Err(CoreError::Malformed)
+            )
+        };
+
+        // A zero axis: `width * height` is 0, and a "shape" of no pixels is
+        // not a shape.
+        assert!(refused(shape(0, 4, 0, 0, 0)));
+        assert!(refused(shape(4, 0, 0, 0, 0)));
+        // A hotspot outside its own shape: there is no pixel to put under the
+        // pointer.
+        assert!(refused(shape(2, 2, 2, 0, 2 * 2 * 4)));
+        assert!(refused(shape(2, 2, 0, 2, 2 * 2 * 4)));
+        // More pixels than the geometry accounts for, as well as fewer.
+        assert!(refused(shape(2, 2, 0, 0, 2 * 2 * 4 + 1)));
+        assert!(refused(shape(2, 2, 0, 0, 2 * 2 * 4 - 1)));
+        // An ordinary cursor — the 32x32 and 64x64 every desktop actually
+        // uses — is untouched by any of this.
+        for side in [32u16, 64] {
+            let ok = shape(side, side, 0, 0, usize::from(side) * usize::from(side) * 4);
+            assert_eq!(MessageEnvelope::decode(&ok.encode().unwrap()).unwrap(), ok);
+        }
+
+        // An area past the bound of §14 never reaches a decoder at all: at
+        // four bytes a pixel, `MAX_CURSOR_SHAPE_PIXELS` is already the whole
+        // of `MAX_CONTROL_FRAME_BYTES`, so the frame bound of §9.1 is the
+        // stricter of the two in practice and refuses it while encoding.
+        // Both refusals are the same outcome — nothing that size is sent, and
+        // nothing that size is believed — and the test asserts the outcome
+        // rather than which check happened to get there first.
+        let side = 256u16; // 65536 pixels, four times MAX_CURSOR_SHAPE_PIXELS.
+        let oversized = shape(side, side, 0, 0, usize::from(side) * usize::from(side) * 4);
+        match oversized.encode() {
+            Err(CoreError::FrameSize { .. }) => {}
+            Err(other) => panic!("unexpected refusal while encoding: {other}"),
+            Ok(bytes) => assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            )),
+        }
     }
 
     #[test]

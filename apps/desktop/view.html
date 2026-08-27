@@ -18,8 +18,18 @@
         height: 100%;
         display: grid;
         place-items: center;
+        /* A picture at 1:1 or zoomed in is wider than the window on purpose;
+           panning is how it is reached (§11), so the overflow is clipped
+           rather than turned into scrollbars over the remote screen. */
+        overflow: hidden;
+        /* Middle-button drag pans. Without this the browser's own autoscroll
+           takes the gesture first and the pan never happens. */
+        overscroll-behavior: contain;
       }
       #screen {
+        /* Sized in CSS pixels by `applyLayout`, which is also why these two
+           are only a starting point: the canvas *buffer* stays at the frame's
+           own resolution so `putImageData` never has to scale (§11). */
         max-width: 100%;
         max-height: 100%;
         /* The remote screen is already the picture; smoothing a 1:1 blit only
@@ -132,11 +142,62 @@
         background: #1c1c22;
         box-shadow: 0 0 0 100vmax rgb(0 0 0 / 60%);
       }
+      #cursor {
+        position: absolute;
+        inset-block-start: 0;
+        inset-inline-start: 0;
+        z-index: 20;
+        /* Purely decorative: every event under it belongs to the picture. */
+        pointer-events: none;
+        image-rendering: pixelated;
+      }
+      #cursor[hidden] {
+        display: none;
+      }
       /* Floating session toolbar (§11). Sits on top of the picture, follows
          the drag handle, and collapses to a single pill. */
       #toolbar-root {
         position: absolute;
         z-index: 30;
+      }
+      /* Full screen hides the window chrome, so the toolbar is the only way
+         back out with a pointer: it fades rather than disappears, and comes
+         back on hover or on focus. Never `display: none` or `visibility:
+         hidden` — either would take it out of hit testing and out of the tab
+         order, which is exactly the trap this avoids. */
+      #toolbar-root.is-autohide {
+        opacity: 0.08;
+        transition: opacity 0.15s ease;
+      }
+      #toolbar-root.is-autohide:hover,
+      #toolbar-root.is-autohide:focus-within {
+        opacity: 1;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #toolbar-root.is-autohide {
+          transition: none;
+        }
+      }
+      .toolbar-pop-heading {
+        margin: 0.7rem 0 0.3rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+      }
+      .toolbar-hotkeys {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.15rem 0.6rem;
+        margin: 0;
+        font-size: 0.75rem;
+      }
+      .toolbar-hotkeys dt {
+        color: #9fd0ff;
+        white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .toolbar-hotkeys dd {
+        margin: 0;
+        color: #d6d6dd;
       }
       .toolbar {
         display: inline-flex;
@@ -242,6 +303,11 @@
   <body>
     <main id="view">
       <canvas id="screen" width="1" height="1"></canvas>
+      <!-- The host's cursor, drawn locally at the local pointer (§11). Its own
+           layer rather than the video canvas: drawn into that one it would
+           have to be erased by hand on every frame, and it is hidden outright
+           on a host that still draws the cursor into the picture. -->
+      <canvas id="cursor" width="1" height="1" aria-hidden="true" hidden></canvas>
       <div id="overlay"></div>
       <div id="recording-indicator"></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>

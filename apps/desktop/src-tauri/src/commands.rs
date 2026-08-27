@@ -498,6 +498,41 @@ pub struct NetworkStatusDto {
     pub can_encode: bool,
 }
 
+/// What one live connection's link actually looks like (§18; ADR 0026,
+/// ADR 0037).
+///
+/// The panel ADR 0026 was written about: the product could not say *why* a
+/// session was bad, so a user could only guess. Every field here is measured
+/// on this machine, and one that nothing has measured yet is `null` rather
+/// than a zero pretending to be a reading.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionStatsDto {
+    /// Pseudonymized peer label; never a raw `NodeId` (§15).
+    pub peer_label: String,
+    /// Smoothed control-channel round trip, in milliseconds.
+    pub rtt_ms: Option<u32>,
+    /// Share of frames the receiving side could not turn into a picture, in
+    /// permille.
+    pub loss_permille: Option<u16>,
+    /// Media throughput the receiving side observed, in kilobits per second.
+    pub goodput_kbps: Option<u32>,
+    /// `direct`, `relay`, `mixed` or `unknown`, from iroh's own open paths —
+    /// what is happening, not what the settings asked for.
+    pub path: &'static str,
+    /// Region of the relay in use, when one is.
+    ///
+    /// The leading label of its hostname and nothing more. A relay address is
+    /// a fact about the *host's* network, and §15 keeps that class of detail
+    /// off a screen the host does not control: what a person needs is "through
+    /// a relay, roughly there", never an address.
+    pub relay_region: Option<String>,
+    /// Encoder bitrate this machine is sending at; `null` when it is the one
+    /// watching rather than the one sending.
+    pub bitrate_kbps: Option<u32>,
+    /// Frame rate this machine is sending at; `null` on the watching side.
+    pub fps: Option<u8>,
+}
+
 /// License state for the UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct LicenseStatusDto {
@@ -741,6 +776,38 @@ pub fn network_status(
         can_capture: health.can_capture(),
         can_encode: health.can_encode(),
     })
+}
+
+/// Reports what every live connection's link actually looks like (§18).
+///
+/// Read-only and measured: round trip from this session's own `Ping`/`Pong`,
+/// path type from iroh's open paths, loss and goodput from whichever side is
+/// receiving pictures, and the quality target from the encode loop. Nothing
+/// here is a setting, which is the point — ADR 0026 is about a product that
+/// could only tell a user what it had intended.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn connection_stats(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ConnectionStatsDto>, IpcError> {
+    check_window(&window)?;
+    let rows = state.network.connection_stats().await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ConnectionStatsDto {
+            peer_label: row.label,
+            rtt_ms: row.rtt_ms,
+            loss_permille: row.loss_permille,
+            goodput_kbps: row.goodput_kbps,
+            path: row.path.code(),
+            relay_region: row.relay_region,
+            bitrate_kbps: row.bitrate_kbps,
+            fps: row.fps,
+        })
+        .collect())
 }
 
 /// Lists the host's saved devices (§8; ADR 0034).
@@ -1038,6 +1105,41 @@ pub async fn view_next_frame(
 ) -> Result<tauri::ipc::Response, IpcError> {
     check_view_window(&window, &args.peer)?;
     let bytes = state.network.view_frame(&args.peer, args.since_us)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Argument of [`view_cursor`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewCursorArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Sequence number of the shape this window already has, or 0 for none.
+    pub since_seq: u32,
+}
+
+/// The host's cursor for a view window, as raw bytes (§11).
+///
+/// Binary for the same reason `view_next_frame` is, and polled rather than
+/// pushed for a different one: a cursor changes when a pointer crosses a text
+/// field, not thirty times a second, so the window asks with the sequence
+/// number it already has and gets pixels back only when the host has since
+/// announced a different shape. Layout, little endian:
+/// `seq:u32 | width:u16 | height:u16 | hotspot_x:u16 | hotspot_y:u16 | BGRA8`.
+///
+/// A `seq` of 0 means this host has announced no cursor at all — it is still
+/// drawing one into the picture — and the window must not draw a second.
+///
+/// # Errors
+/// Rejects calls from anything but this peer's own view window; [`IpcError`]
+/// if no such view exists.
+#[tauri::command]
+pub async fn view_cursor(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewCursorArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    let bytes = state.network.view_cursor(&args.peer, args.since_seq)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 

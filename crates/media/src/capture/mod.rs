@@ -6,7 +6,8 @@
 use std::collections::BTreeSet;
 
 use lumepeer_core::NodeId;
-use lumepeer_core::protocol::InputEventPayload;
+use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
+use lumepeer_core::protocol::{CursorShapeData, InputEventPayload};
 
 use crate::error::{MediaError, Result};
 
@@ -157,6 +158,74 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
 
     /// What this backend allows on the input side.
     fn input_capability(&self) -> InputCapability;
+
+    /// The host's cursor, if this backend can report it *and* it changed since
+    /// the last call (§11's `CursorShape`).
+    ///
+    /// Only when it changed: a cursor bitmap is up to
+    /// `MAX_CURSOR_SHAPE_PIXELS` pixels, and sending it with every frame would
+    /// be a second video channel for a picture that changes when someone
+    /// hovers a text field.
+    ///
+    /// The default is `None`, and that is the honest answer for a platform
+    /// whose compositor burns the cursor into the frame and never hands the
+    /// bitmap over — Wayland's `CursorMode::Embedded` and macOS's
+    /// `setShowsCursor(true)` both do. A made-up shape would be worse than
+    /// none: the guest would draw a second cursor next to the real one.
+    ///
+    /// No position travels with it. Where the cursor is is something the guest
+    /// already knows — it is the one moving the pointer — and a message per
+    /// mouse move would cost more than the latency it saves (§11).
+    fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+        None
+    }
+
+    /// Asks the backend to stop drawing the cursor into the frames it
+    /// produces, because the guest is about to draw it itself.
+    ///
+    /// Ignored by default, which is again the honest answer where the
+    /// compositor owns the decision. A backend that ignores it keeps
+    /// compositing, and a guest that sees no [`Self::cursor_shape`] therefore
+    /// draws nothing — two cursors is worse than one that lags.
+    fn set_cursor_embedded(&mut self, _embedded: bool) {}
+}
+
+/// Builds a [`CursorShapeData`] after checking it against the bound of §14.
+///
+/// The check happens here, before the `Vec` is handed on, because this is the
+/// point where a platform's own numbers become a wire payload: `width *
+/// height` over `MAX_CURSOR_SHAPE_PIXELS`, a pixel buffer that contradicts the
+/// geometry, a zero axis or a hotspot outside the shape are all a cursor to
+/// drop rather than a frame to send. `MessageEnvelope::check_limits` rejects
+/// the same shapes on the way in; this is the matching refusal on the way out.
+///
+/// `pixels` is premultiplied BGRA, which is what every backend that can report
+/// a cursor at all produces (see [`CursorShapeData::rgba`]).
+#[must_use]
+pub fn cursor_shape(
+    width: u16,
+    height: u16,
+    hotspot_x: u16,
+    hotspot_y: u16,
+    pixels: Vec<u8>,
+) -> Option<CursorShapeData> {
+    let area = usize::from(width).checked_mul(usize::from(height))?;
+    if area == 0 || area > MAX_CURSOR_SHAPE_PIXELS {
+        return None;
+    }
+    if pixels.len() != area.checked_mul(4)? {
+        return None;
+    }
+    if hotspot_x >= width || hotspot_y >= height {
+        return None;
+    }
+    Some(CursorShapeData {
+        width,
+        height,
+        hotspot_x,
+        hotspot_y,
+        rgba: pixels,
+    })
 }
 
 /// Platform input adapter (§11).
@@ -543,6 +612,28 @@ impl CaptureController {
         }
         self.capturer.next_frame()
     }
+
+    /// The host's cursor, when the backend can report it and it changed
+    /// (§11's `CursorShape`).
+    ///
+    /// Gated on `capturing` exactly like [`Self::next_frame`]: "no viewer, no
+    /// capture" (§8.1) covers the pointer too, and a cursor read from an idle
+    /// controller would be the one thing this gate does not stop.
+    pub fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+        if !self.capturing {
+            return None;
+        }
+        self.capturer.cursor_shape()
+    }
+
+    /// Stops or resumes drawing the cursor into captured frames (§11).
+    ///
+    /// Whether it takes effect is the backend's answer, not this one's: a
+    /// compositor that owns the decision ignores it, and the guest then never
+    /// receives a shape and never draws one.
+    pub fn set_cursor_embedded(&mut self, embedded: bool) {
+        self.capturer.set_cursor_embedded(embedded);
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +648,9 @@ mod tests {
         starts: usize,
         stops: usize,
         running: bool,
+        /// One cursor, handed out once — the shape of a real backend, which
+        /// answers `None` for a cursor that has not changed.
+        cursor_taken: bool,
     }
 
     impl ScreenCapturer for CountingCapturer {
@@ -564,6 +658,14 @@ mod tests {
             self.starts += 1;
             self.running = true;
             Ok(())
+        }
+
+        fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+            if self.cursor_taken {
+                return None;
+            }
+            self.cursor_taken = true;
+            cursor_shape(1, 1, 0, 0, vec![0, 0, 0, 255])
         }
 
         fn next_frame(&mut self) -> Result<Option<Frame>> {
@@ -685,5 +787,30 @@ mod tests {
     #[test]
     fn session_type_is_unknown_with_no_signal_at_all() {
         assert_eq!(session_type_from(None, None, None), SessionType::Unknown);
+    }
+
+    /// §8.1 covers the pointer too: an idle controller reports no cursor, for
+    /// the same reason it refuses a frame.
+    #[test]
+    fn no_viewer_means_no_cursor_either() {
+        let mut controller = CaptureController::new(
+            Box::new(CountingCapturer::default()),
+            CaptureTarget::PrimaryDisplay,
+        );
+        assert!(controller.cursor_shape().is_none());
+
+        let watcher = peer(7);
+        controller.add_viewer(watcher).unwrap();
+        assert!(
+            controller.cursor_shape().is_some(),
+            "a live capture reports its cursor"
+        );
+        assert!(
+            controller.cursor_shape().is_none(),
+            "an unchanged cursor is reported once and not again"
+        );
+
+        controller.remove_viewer(&watcher);
+        assert!(controller.cursor_shape().is_none());
     }
 }

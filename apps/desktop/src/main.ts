@@ -35,6 +35,7 @@ import {
   type RecordingEntry,
 } from './recordings';
 import type { FileTransfers } from './file-transfers';
+import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
@@ -79,6 +80,14 @@ const recordingPaths = new Map<string, string>();
 let recordings: RecordingEntry[] = [];
 // Offers waiting for an answer and transfers in flight, from the last poll.
 let files: FileTransfers = { offers: [], transfers: [] };
+/**
+ * What each live connection's link looks like, by peer label (§18; ADR 0026).
+ *
+ * Refreshed with everything else once a second. A peer missing from here has
+ * nothing measured about it yet, which is why this is a map of what is known
+ * rather than a row per session filled with zeroes.
+ */
+let connectionStats: ReadonlyMap<string, ConnectionStats> = new Map();
 
 /**
  * Warns the operator that people they invite will see nothing.
@@ -218,6 +227,7 @@ function renderNow(): void {
                   }
                 },
                 (peer) => saveDeviceButton(peer, locale, () => void refresh()),
+                connectionStats,
               )}
               <div class="main-divider"></div>
               ${recordingsPanel(recordings, locale, tauriRecordingsCommands, () => void refresh())}
@@ -281,6 +291,14 @@ async function refresh(): Promise<void> {
         invoke<UnattendedStatus>('unattended_status'),
         invoke<AddressBookEntry[]>('address_book_list'),
       ]);
+    // Its own call, like the two below: a link nobody has measured yet must
+    // not cost the session list its refresh.
+    try {
+      const rows = await invoke<ConnectionStats[]>('connection_stats');
+      connectionStats = new Map(rows.map((row) => [row.peer_label, row]));
+    } catch (error) {
+      console.error('connection_stats failed:', error);
+    }
     // Its own call rather than part of the batch above: a transfer list is
     // only interesting once a session exists, and a failure here must not
     // cost the session list its refresh.

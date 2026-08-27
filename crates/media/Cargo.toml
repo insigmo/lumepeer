@@ -58,7 +58,10 @@ decode-openh264 = ["dep:openh264"]
 # `windows` crate itself is not optional (the AppContainer decoder sandbox
 # of `decode::windows_sandbox` needs it unconditionally on Windows - see
 # below), so this feature only gates the encoder module itself.
-encode-mf = []
+# `Win32_System_Ole` is what gates `ICodecAPI::SetValue` in the `windows`
+# bindings, and that is how `VideoEncoder::request_keyframe` asks a hardware
+# MFT for an IDR (`CODECAPI_AVEncVideoForceKeyFrame`, §11).
+encode-mf = ["windows/Win32_System_Ole"]
 # DXGI Desktop Duplication screen capture (§11, §18; ADR 0012). Same
 # convention as capture-x11/encode-mf above, so `cargo build --workspace`
 # needs no platform SDK and pulls in no extra bindings. The `windows` crate
@@ -92,7 +95,10 @@ ashpd = { version = "0.13.13", default-features = false, features = [
     "screencast",
     "remote_desktop",
 ], optional = true }
-x11rb = { workspace = true, optional = true, features = ["xtest"] }
+# `xfixes` is what makes the pointer visible: X11's `GetImage` never contains
+# it, so without the extension an X11 host shares a screen with no cursor at
+# all (§11).
+x11rb = { workspace = true, optional = true, features = ["xtest", "xfixes"] }
 pipewire = { version = "0.8", optional = true }
 
 # ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in

@@ -559,6 +559,80 @@ button {
   padding: 1px 8px;
 }
 
+/* Connection quality (§18; ADR 0026): a pill that summarizes, opening onto
+   what was actually measured. Logical properties throughout, so the RTL
+   layout falls out of `dir` rather than out of a second rule set. */
+.connections-list .quality {
+  flex-basis: 100%;
+  margin-top: 6px;
+}
+
+.connections-list .quality-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--sidebar-bg);
+  color: var(--text-secondary);
+  font-size: var(--fs-micro);
+  cursor: pointer;
+  list-style: none;
+}
+
+.connections-list .quality-pill::-webkit-details-marker {
+  display: none;
+}
+
+.connections-list .quality-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--text-secondary);
+}
+
+.connections-list .quality-dot[data-path='direct'] {
+  background: var(--green);
+}
+
+.connections-list .quality-dot[data-path='relay'],
+.connections-list .quality-dot[data-path='mixed'] {
+  background: var(--amber, #c8891f);
+}
+
+.connections-list .quality-path {
+  font-weight: 600;
+  color: var(--text-heading);
+}
+
+.connections-list .quality-details {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 7px;
+  background: var(--sidebar-bg);
+  font-size: var(--fs-micro);
+}
+
+.connections-list .quality-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-block: 2px;
+}
+
+.connections-list .quality-label {
+  color: var(--text-secondary);
+}
+
+.connections-list .quality-value {
+  color: var(--text-heading);
+  font-variant-numeric: tabular-nums;
+}
+
 /* File transfer (§9.2): names and sizes, never paths. */
 .connections-list .file-panel {
   flex-basis: 100%;

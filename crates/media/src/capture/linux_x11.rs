@@ -9,21 +9,59 @@
 //! pure safe Rust. The MIT-SHM path of §6 is a later optimization: it needs a
 //! shared segment and therefore `unsafe`, which is not worth it before the
 //! resource gates of §15 actually measure the difference.
+//!
+//! `GetImage` never contains the pointer — X11 has no such thing as a screen
+//! capture with the cursor in it — so this backend has to draw it itself, from
+//! XFIXES. That is also why it needs none of the "clean background" cache the
+//! Windows backend keeps (`capture/windows.rs`): DXGI hands the same surface
+//! back between presents, so compositing twice onto it would leave a trail,
+//! while every `GetImage` here is a fresh, cursor-free buffer.
 
-use lumepeer_core::constants::ENCODE_DEFAULT_FPS;
+use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, MAX_CURSOR_SHAPE_PIXELS};
+use lumepeer_core::protocol::CursorShapeData;
 use x11rb::connection::Connection as _;
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, Screen};
 use x11rb::rust_connection::RustConnection;
 
 use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
 
 use crate::capture::{
-    CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
+    CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer, cursor_shape,
 };
 use crate::error::{MediaError, Result};
 
 /// All planes of the image.
 const ALL_PLANES: u32 = !0;
+
+/// Bytes per pixel of the BGRA buffers on both sides of the compositing.
+const BGRA_BYTES: usize = 4;
+
+/// Opaque alpha.
+const OPAQUE: u16 = 255;
+
+/// XFIXES version this backend asks for. 1.0 is where `GetCursorImage`
+/// appeared, and nothing here needs anything later.
+const XFIXES_MAJOR: u32 = 1;
+const XFIXES_MINOR: u32 = 0;
+
+/// The host's pointer, as XFIXES reports it.
+#[derive(Debug, Clone)]
+struct Pointer {
+    /// Top-left of the shape on the root window.
+    x: i16,
+    y: i16,
+    width: u16,
+    height: u16,
+    hotspot_x: u16,
+    hotspot_y: u16,
+    /// Premultiplied BGRA, `width * height * 4` bytes.
+    pixels: Vec<u8>,
+    /// The server's own identity for this shape. It changes exactly when the
+    /// bitmap does, which is what lets [`ScreenCapturer::cursor_shape`] answer
+    /// "unchanged" without comparing pixels.
+    serial: u32,
+}
 
 /// Live X11 connection and the geometry it captures.
 #[derive(Debug)]
@@ -36,6 +74,20 @@ struct Active {
     /// instead of a duplicate frame (§11.1).
     last_hash: Option<[u8; 32]>,
     started_at: std::time::Instant,
+    /// Whether XFIXES answered `QueryVersion`. Without it there is no cursor
+    /// on this display at all — a `tracing::debug` and a frame without one,
+    /// never a refused capture (§18).
+    xfixes: bool,
+    /// The pointer as of the last frame, or `None` while it is off this
+    /// screen or unreadable.
+    pointer: Option<Pointer>,
+    /// `cursor_serial` of the shape [`ScreenCapturer::cursor_shape`] last
+    /// handed out, so the same bitmap is never sent twice.
+    reported_serial: Option<u32>,
+    /// Whether the cursor is drawn into the frames this backend produces.
+    /// Turned off when the guest has said it will draw the cursor itself
+    /// (§11; `FEATURE_CURSOR_SHAPE`).
+    embed_cursor: bool,
 }
 
 /// X11 screen capturer.
@@ -81,6 +133,20 @@ impl ScreenCapturer for X11Capturer {
         })?;
         let screen = Self::screen(&connection, screen_num, target);
 
+        // XFIXES is what makes the pointer visible at all here. A display
+        // without it is a display whose frames simply have no cursor in them:
+        // worth a log line, never worth refusing the capture (§18).
+        let xfixes = match connection.xfixes_query_version(XFIXES_MAJOR, XFIXES_MINOR) {
+            Ok(cookie) => cookie.reply().is_ok(),
+            Err(error) => {
+                tracing::debug!(%error, "XFIXES is unavailable: frames will carry no cursor");
+                false
+            }
+        };
+        if !xfixes {
+            tracing::debug!("XFIXES did not answer: frames will carry no cursor");
+        }
+
         self.active = Some(Active {
             root: screen.root,
             width: screen.width_in_pixels,
@@ -88,6 +154,10 @@ impl ScreenCapturer for X11Capturer {
             connection,
             last_hash: None,
             started_at: std::time::Instant::now(),
+            xfixes,
+            pointer: None,
+            reported_serial: None,
+            embed_cursor: true,
         });
         Ok(())
     }
@@ -113,11 +183,37 @@ impl ScreenCapturer for X11Capturer {
             .reply()
             .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?;
 
-        let hash = *blake3::hash(&reply.data).as_bytes();
+        // Read before the change check, because the pointer is part of what
+        // "changed" means: a cursor moving over an otherwise still screen is a
+        // picture the viewer sees change.
+        active.pointer = active.read_pointer();
+
+        let mut data = reply.data;
+        let mut hash = blake3::Hasher::new();
+        hash.update(&data);
+        if active.embed_cursor
+            && let Some(pointer) = &active.pointer
+        {
+            hash.update(&pointer.x.to_le_bytes());
+            hash.update(&pointer.y.to_le_bytes());
+            hash.update(&pointer.serial.to_le_bytes());
+        }
+        let hash = *hash.finalize().as_bytes();
         if active.last_hash == Some(hash) {
             return Ok(None);
         }
         active.last_hash = Some(hash);
+
+        if active.embed_cursor
+            && let Some(pointer) = &active.pointer
+        {
+            composite_pointer(
+                &mut data,
+                u32::from(active.width),
+                u32::from(active.height),
+                pointer,
+            );
+        }
 
         let timestamp_us =
             u64::try_from(active.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -127,7 +223,7 @@ impl ScreenCapturer for X11Capturer {
             // X11 TrueColor visuals hand back little-endian BGRX in Z_PIXMAP.
             format: PixelFormat::Bgra8,
             timestamp_us,
-            data: reply.data,
+            data,
         }))
     }
 
@@ -139,6 +235,145 @@ impl ScreenCapturer for X11Capturer {
         // XTEST can inject into any X11 client; this is exactly why X11 is the
         // lower-trust path and needs the visible indicator (§11).
         InputCapability::Full
+    }
+
+    fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+        let active = self.active.as_mut()?;
+        let pointer = active.pointer.as_ref()?;
+        if active.reported_serial == Some(pointer.serial) {
+            return None;
+        }
+        let shape = cursor_shape(
+            pointer.width,
+            pointer.height,
+            pointer.hotspot_x,
+            pointer.hotspot_y,
+            pointer.pixels.clone(),
+        )?;
+        // Recorded only once the shape passed the bound of §14: a cursor that
+        // was refused must be reconsidered if the server reports it again.
+        active.reported_serial = Some(pointer.serial);
+        Some(shape)
+    }
+
+    fn set_cursor_embedded(&mut self, embedded: bool) {
+        if let Some(active) = self.active.as_mut()
+            && active.embed_cursor != embedded
+        {
+            active.embed_cursor = embedded;
+            // The picture genuinely changed: the next frame either gains or
+            // loses a cursor, and the §11.1 hash must not call it a duplicate.
+            active.last_hash = None;
+        }
+    }
+}
+
+impl Active {
+    /// The pointer as XFIXES has it, or `None` when the extension is missing,
+    /// the cursor is hidden, or the reply does not describe a usable bitmap.
+    ///
+    /// Every failure is `None` and a debug line. A screen capture that refused
+    /// to produce a frame because the cursor could not be read would be a
+    /// worse outcome than a frame without one (§18).
+    fn read_pointer(&self) -> Option<Pointer> {
+        if !self.xfixes {
+            return None;
+        }
+        let image = match self.connection.xfixes_get_cursor_image() {
+            Ok(cookie) => match cookie.reply() {
+                Ok(image) => image,
+                Err(error) => {
+                    tracing::debug!(%error, "XFIXES refused the cursor image");
+                    return None;
+                }
+            },
+            Err(error) => {
+                tracing::debug!(%error, "XFIXES cursor request failed");
+                return None;
+            }
+        };
+        // Bounded before the BGRA buffer is sized, not after: §14's limit is
+        // checked on both sides of the wire, and this is the side that would
+        // otherwise allocate first and refuse second.
+        let area = usize::from(image.width).checked_mul(usize::from(image.height))?;
+        if area == 0 || area > MAX_CURSOR_SHAPE_PIXELS || image.cursor_image.len() != area {
+            return None;
+        }
+        if image.xhot >= image.width || image.yhot >= image.height {
+            return None;
+        }
+        // XFIXES packs premultiplied ARGB into a CARD32; little-endian bytes
+        // of that word are exactly B, G, R, A — the same order every other
+        // backend produces, so no channel swap is needed here.
+        let mut pixels = Vec::with_capacity(area * BGRA_BYTES);
+        for word in &image.cursor_image {
+            pixels.extend_from_slice(&word.to_le_bytes());
+        }
+        Some(Pointer {
+            x: image
+                .x
+                .saturating_sub(i16::try_from(image.xhot).unwrap_or(i16::MAX)),
+            y: image
+                .y
+                .saturating_sub(i16::try_from(image.yhot).unwrap_or(i16::MAX)),
+            width: image.width,
+            height: image.height,
+            hotspot_x: image.xhot,
+            hotspot_y: image.yhot,
+            pixels,
+            serial: image.cursor_serial,
+        })
+    }
+}
+
+/// Alpha-blends `pointer` onto a BGRA frame, clipped to it.
+///
+/// Premultiplied source, so the blend is `dst = src + dst * (1 - a)` rather
+/// than the `src * a + dst * (1 - a)` a straight-alpha bitmap would need —
+/// getting that wrong doubles the brightness of every antialiased edge.
+fn composite_pointer(data: &mut [u8], frame_width: u32, frame_height: u32, pointer: &Pointer) {
+    for row in 0..u32::from(pointer.height) {
+        let Some(dst_y) = i32::from(pointer.y)
+            .checked_add_unsigned(row)
+            .filter(|y| u32::try_from(*y).is_ok_and(|y| y < frame_height))
+        else {
+            continue;
+        };
+        for column in 0..u32::from(pointer.width) {
+            let Some(dst_x) = i32::from(pointer.x)
+                .checked_add_unsigned(column)
+                .filter(|x| u32::try_from(*x).is_ok_and(|x| x < frame_width))
+            else {
+                continue;
+            };
+            let src_offset = ((row * u32::from(pointer.width) + column) as usize) * BGRA_BYTES;
+            let Some(src) = pointer.pixels.get(src_offset..src_offset + BGRA_BYTES) else {
+                continue;
+            };
+            let alpha = u16::from(src[3]);
+            if alpha == 0 {
+                continue;
+            }
+            #[allow(
+                clippy::cast_sign_loss,
+                reason = "dst_x/dst_y were just checked non-negative and in range above"
+            )]
+            let dst_offset = ((dst_y as u32 * frame_width + dst_x as u32) as usize) * BGRA_BYTES;
+            let Some(dst) = data.get_mut(dst_offset..dst_offset + BGRA_BYTES) else {
+                continue;
+            };
+            for channel in 0..3 {
+                let source = u16::from(src[channel]);
+                let under = u16::from(dst[channel]);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "premultiplied source plus the scaled destination is bounded by 255"
+                )]
+                let blended = (source + under * (OPAQUE - alpha) / OPAQUE).min(OPAQUE) as u8;
+                dst[channel] = blended;
+            }
+            dst[3] = 0xFF;
+        }
     }
 }
 
@@ -548,6 +783,77 @@ mod tests {
     )]
 
     use super::*;
+
+    fn pointer(width: u16, height: u16, pixels: Vec<u8>) -> Pointer {
+        Pointer {
+            x: 0,
+            y: 0,
+            width,
+            height,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            pixels,
+            serial: 1,
+        }
+    }
+
+    /// X11's `GetImage` never carries the pointer, so a frame that shows one
+    /// shows it because this drew it.
+    #[test]
+    fn an_opaque_cursor_pixel_replaces_what_was_under_it() {
+        let mut frame = vec![0u8; 2 * 2 * BGRA_BYTES];
+        // One opaque red pixel, premultiplied: B=0, G=0, R=255, A=255.
+        let cursor = pointer(1, 1, vec![0, 0, 255, 255]);
+        composite_pointer(&mut frame, 2, 2, &cursor);
+        assert_eq!(&frame[0..BGRA_BYTES], &[0, 0, 255, 255]);
+        // Nothing else moved.
+        assert!(frame[BGRA_BYTES..].iter().all(|byte| *byte == 0));
+    }
+
+    /// Premultiplied alpha: half-transparent white over black is mid grey. The
+    /// straight-alpha formula would give the same answer here only by
+    /// accident, so the case that separates them is the one worth pinning —
+    /// half-transparent white over *white* must stay white, not overflow.
+    #[test]
+    fn a_translucent_cursor_pixel_blends_rather_than_doubling() {
+        let mut frame = vec![255u8; BGRA_BYTES];
+        let cursor = pointer(1, 1, vec![128, 128, 128, 128]);
+        composite_pointer(&mut frame, 1, 1, &cursor);
+        for channel in frame.iter().take(3) {
+            assert!(
+                *channel >= 250,
+                "premultiplied white over white came out at {channel}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fully_transparent_cursor_pixel_leaves_the_screen_alone() {
+        let mut frame = vec![7u8; BGRA_BYTES];
+        composite_pointer(&mut frame, 1, 1, &pointer(1, 1, vec![0, 0, 0, 0]));
+        assert_eq!(frame, vec![7u8; BGRA_BYTES]);
+    }
+
+    /// A cursor at the screen edge hangs off it; the part that is off must be
+    /// dropped rather than wrapping onto the next row.
+    #[test]
+    fn a_cursor_past_the_edge_is_clipped_rather_than_wrapped() {
+        let mut frame = vec![0u8; 2 * 2 * BGRA_BYTES];
+        let mut cursor = pointer(2, 2, [0, 0, 255, 255].repeat(4));
+        cursor.x = 1;
+        cursor.y = 1;
+        composite_pointer(&mut frame, 2, 2, &cursor);
+        // Only the bottom-right pixel of the frame is covered.
+        assert!(frame[..3 * BGRA_BYTES].iter().all(|byte| *byte == 0));
+        assert_eq!(&frame[3 * BGRA_BYTES..], &[0, 0, 255, 255]);
+
+        // And one placed entirely outside touches nothing at all.
+        let mut untouched = vec![0u8; 2 * 2 * BGRA_BYTES];
+        cursor.x = 9;
+        cursor.y = 9;
+        composite_pointer(&mut untouched, 2, 2, &cursor);
+        assert!(untouched.iter().all(|byte| *byte == 0));
+    }
 
     #[test]
     fn normalized_coordinates_map_onto_the_screen() {

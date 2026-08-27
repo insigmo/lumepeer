@@ -238,11 +238,13 @@ fn an_oversized_bitstream_is_refused_by_the_ring() {
     decoder.shutdown();
 }
 
-/// §11: receiver feedback drives the encoder's bitrate, clamped to the ABR
-/// range of §14 and applied at most once per second.
+/// §11: receiver feedback drives the encoder's quality target, clamped to the
+/// ABR range of §14 and applied at most once per second.
 #[test]
 fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
-    use lumepeer_core::constants::{ABR_MIN_BITRATE_KBPS, ENCODE_DEFAULT_BITRATE_KBPS};
+    use lumepeer_core::constants::{
+        ABR_MIN_BITRATE_KBPS, ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS,
+    };
     use lumepeer_media::abr::{AbrController, ReceiverFeedback};
 
     let mut controller = AbrController::new();
@@ -259,8 +261,11 @@ fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
     let first = controller
         .on_feedback(heavy_loss)
         .expect("the first report is never rate limited");
-    assert!(first < ENCODE_DEFAULT_BITRATE_KBPS);
-    encoder.set_bitrate(first).unwrap();
+    assert!(first.bitrate_kbps < ENCODE_DEFAULT_BITRATE_KBPS);
+    // Bits are the first rung of the ladder and the only one that may move
+    // while the bitrate still has room (ADR 0037).
+    assert_eq!(first.fps, ENCODE_DEFAULT_FPS);
+    encoder.set_bitrate(first.bitrate_kbps).unwrap();
 
     // The second report inside the same second is dropped (§11, §14).
     assert!(controller.on_feedback(heavy_loss).is_none());
@@ -269,6 +274,28 @@ fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
     let frame = capturer.next_frame().unwrap().unwrap();
     assert!(!encoder.encode(&frame).unwrap().data.is_empty());
     assert!(controller.current_kbps() >= ABR_MIN_BITRATE_KBPS);
+}
+
+/// §11's `KeyframeRequest`: whichever encoder this machine actually has must
+/// be able to answer one, and answer it with a keyframe rather than with a
+/// side effect of some other setting (ADR 0037).
+#[test]
+fn a_keyframe_request_reaches_whichever_encoder_this_machine_has() {
+    let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
+    let mut capturer = MovingCapturer::default();
+    capturer.start(CaptureTarget::PrimaryDisplay).unwrap();
+
+    // The first frame of a stream is a keyframe on its own, so the claim is
+    // only testable from a later one.
+    let first = capturer.next_frame().unwrap().unwrap();
+    assert!(encoder.encode(&first).unwrap().keyframe);
+
+    encoder.request_keyframe().unwrap();
+    let next = capturer.next_frame().unwrap().unwrap();
+    assert!(
+        encoder.encode(&next).unwrap().keyframe,
+        "the encoder ignored a keyframe request"
+    );
 }
 
 /// The worker exits on its own when the parent goes away, so no decoder
