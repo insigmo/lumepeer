@@ -23,6 +23,7 @@ import {
   defaultLayout,
   displaySize,
   effectiveScale,
+  frameResized,
   imageRenderingFor,
   installPan,
   isLocalTextTarget,
@@ -401,6 +402,27 @@ describe('view window: how the picture is resampled', () => {
     canvas.style.imageRendering = 'pixelated';
     canvas.style.imageRendering = imageRenderingFor(defaultLayout(), frame, window960, 1);
     expect(canvas.style.imageRendering).toBe('auto');
+  });
+});
+
+describe('view window: what makes the layout stale', () => {
+  it('asks for one relayout across ten frames of the same size', () => {
+    let size = { width: 0, height: 0 };
+    let layouts = 0;
+    for (let i = 0; i < 10; i += 1) {
+      const frame = { width: 1920, height: 1080 };
+      if (frameResized(frame, size)) {
+        size = frame;
+        layouts += 1;
+      }
+    }
+    expect(layouts).toBe(1);
+  });
+
+  it('asks again the moment the remote screen changes resolution', () => {
+    expect(frameResized({ width: 1280, height: 720 }, { width: 1920, height: 1080 })).toBe(true);
+    expect(frameResized({ width: 1920, height: 720 }, { width: 1920, height: 1080 })).toBe(true);
+    expect(frameResized({ width: 1920, height: 1080 }, { width: 1920, height: 1080 })).toBe(false);
   });
 });
 

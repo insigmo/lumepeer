@@ -166,6 +166,24 @@ export function imageRenderingFor(
 }
 
 /**
+ * Whether a newly painted frame makes the layout stale.
+ *
+ * The layout is a function of the frame's size, the window's size and the
+ * display mode, and of nothing that changes from one frame to the next — so
+ * laying out on every painted frame spent a `getBoundingClientRect` and a full
+ * recompute thirty times a second on an answer that was the same every time.
+ * The window's own size is covered by the `resize` listener, and a mode or
+ * zoom change lays out where it happens; this is the third and last thing that
+ * can move the picture, and it moves rarely.
+ */
+export function frameResized(
+  frame: { width: number; height: number },
+  previous: { width: number; height: number },
+): boolean {
+  return frame.width !== previous.width || frame.height !== previous.height;
+}
+
+/**
  * The CSS size the canvas *element* must be given.
  *
  * The element's size, never `canvas.width`/`canvas.height`: the backing buffer
