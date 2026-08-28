@@ -35,8 +35,15 @@ pub struct HistoryEntry {
     pub peer_label: String,
     /// Role the host last granted.
     pub role: Role,
-    /// Unix seconds the last session with this host ended.
-    pub ended_at: u64,
+    /// Unix seconds this row was last written — a connect or a disconnect,
+    /// whichever happened most recently (docs/bugs/03-connection-list.md,
+    /// task 4). Named for what it actually means now that a row is written
+    /// at connect time as well as at disconnect: a value from a session still
+    /// in progress is not an "end" and calling it one would be a lie the
+    /// sidebar tells. `#[serde(alias)]` keeps a history file written before
+    /// this rename loading correctly.
+    #[serde(alias = "ended_at")]
+    pub last_seen_at: u64,
     /// Invite code this node used to reach the host, replayed when the row is
     /// clicked. Stays in the Rust side: the webview asks to reconnect by label
     /// and never receives the code back (§13).
@@ -94,13 +101,14 @@ impl ConnectionHistory {
             .map(|entry| entry.code.as_str())
     }
 
-    /// Records one ended session and persists the list.
+    /// Records one host visit — at connect time or at disconnect, both call
+    /// this — and persists the list.
     ///
     /// One row per host, not per session: this is a list of places to go back
     /// to, so connecting to the same host ten times leaves one row that moves
     /// to the front, carrying the code and role of the most recent visit.
     pub fn record(&mut self, peer_label: String, role: Role, code: String) {
-        let ended_at = SystemTime::now()
+        let last_seen_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         self.entries.retain(|entry| entry.peer_label != peer_label);
@@ -109,7 +117,7 @@ impl ConnectionHistory {
             HistoryEntry {
                 peer_label,
                 role,
-                ended_at,
+                last_seen_at,
                 code,
             },
         );
@@ -222,6 +230,29 @@ mod tests {
 
         let history = ConnectionHistory::open(Some(path));
         assert!(history.entries().is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// docs/bugs/03-connection-list.md, task 4: `ended_at` became
+    /// `last_seen_at`, but a history file an older build already wrote still
+    /// has the old key, and must not be discarded.
+    #[test]
+    fn a_history_file_from_before_the_rename_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-old-key-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection_history.json");
+        fs::write(
+            &path,
+            br#"[{"peer_label":"host-ab12","role":"ViewOnly","ended_at":1234,"code":"code-1"}]"#,
+        )
+        .unwrap();
+
+        let history = ConnectionHistory::open(Some(path));
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].last_seen_at, 1234);
+        assert_eq!(history.code_of("host-ab12"), Some("code-1"));
 
         let _ = fs::remove_dir_all(dir);
     }

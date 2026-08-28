@@ -3467,6 +3467,17 @@ impl Actor {
                 // (§15), and opening a media connection needs to know exactly
                 // which host granted.
                 self.settle_connect(peer, ConnectPhase::Connected);
+                // Guest side: remembered the moment the session actually
+                // starts, not only when it ends (docs/bugs/03-connection-
+                // list.md, task 4) — a session that never reaches an explicit
+                // end (a crash, a lost machine) must not lose the invite it
+                // took to get here. `ConnectionHistory::record` is a
+                // retain-and-reinsert keyed on the label, so the write
+                // `stop_view` still makes when this session ends only
+                // refreshes this same row rather than duplicating it.
+                if let Some(code) = self.host_invites.get(&peer).cloned() {
+                    self.history.record(host_tag(&peer), role, code);
+                }
                 // Only set when this grant followed a credential submission
                 // with "remember" checked (§8; ADR 0033; docs/bugs/02-connect-
                 // form.md, task 6) — a grant reached through the ordinary
@@ -8366,6 +8377,33 @@ mod tests {
         host.revoke(label).await.unwrap();
         assert_eq!(viewers(&capture), 0, "a revoke must stop capture");
         assert!(!lock_capture(&capture).is_capturing());
+    }
+
+    /// docs/bugs/03-connection-list.md, task 4: the host is remembered as
+    /// soon as the session actually starts, not only once it ends — a
+    /// session that never reaches an explicit end (a crash, a lost machine)
+    /// must not lose the invite it took to get here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guest_remembers_the_host_as_soon_as_consent_is_granted() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::FullControl).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        // Not disconnected, let alone revoked — the row must already exist.
+        let remembered = guest.history().await.unwrap();
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].role, Role::FullControl);
+        assert!(
+            host.history().await.unwrap().is_empty(),
+            "a host must not build a record of the guests it let in"
+        );
     }
 
     /// §21 punch-list item 5 / ADR 0016: an ended session is remembered by the

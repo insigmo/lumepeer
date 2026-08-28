@@ -61,8 +61,12 @@ export const CLIPBOARD_NOTE_MS = 4000;
 export interface HistoryEntry {
   peer_label: string;
   role: Role;
-  /** Unix seconds the last session with this host ended. */
-  ended_at: number;
+  /**
+   * Unix seconds this row was last written — a connect or a disconnect,
+   * whichever happened most recently (docs/bugs/03-connection-list.md,
+   * task 4).
+   */
+  last_seen_at: number;
 }
 
 async function revoke(peer: string): Promise<void> {
@@ -238,19 +242,25 @@ const MINUTE_SECS = 60;
 const HOUR_SECS = 60 * MINUTE_SECS;
 const DAY_SECS = 24 * HOUR_SECS;
 
-/** Coarse "how long ago" for a history row; exact enough for a sidebar list. */
-function relativeTime(endedAtUnix: number, locale: Locale): string {
-  const elapsed = Math.max(0, Date.now() / 1000 - endedAtUnix);
+/**
+ * Coarse "how long ago" for a history row; exact enough for a sidebar list.
+ *
+ * Worded as "last seen", not "ended": a row is written at connect time now,
+ * not only at disconnect (docs/bugs/03-connection-list.md, task 4), so a
+ * value from a session still in progress must not claim the session ended.
+ */
+function relativeTime(lastSeenAtUnix: number, locale: Locale): string {
+  const elapsed = Math.max(0, Date.now() / 1000 - lastSeenAtUnix);
   if (elapsed < MINUTE_SECS) {
-    return t(locale, 'status.endedJustNow');
+    return t(locale, 'status.lastSeenJustNow');
   }
   if (elapsed < HOUR_SECS) {
-    return t(locale, 'status.endedMinutesAgo', String(Math.floor(elapsed / MINUTE_SECS)));
+    return t(locale, 'status.lastSeenMinutesAgo', String(Math.floor(elapsed / MINUTE_SECS)));
   }
   if (elapsed < DAY_SECS) {
-    return t(locale, 'status.endedHoursAgo', String(Math.floor(elapsed / HOUR_SECS)));
+    return t(locale, 'status.lastSeenHoursAgo', String(Math.floor(elapsed / HOUR_SECS)));
   }
-  return t(locale, 'status.endedDaysAgo', String(Math.floor(elapsed / DAY_SECS)));
+  return t(locale, 'status.lastSeenDaysAgo', String(Math.floor(elapsed / DAY_SECS)));
 }
 
 const roleKey: Record<Role, 'status.role.viewOnly' | 'status.role.controlLimited' | 'status.role.fullControl'> = {
@@ -405,7 +415,7 @@ export function sessionStatus(
                   >
                     <span class="peer-label">${entry.peer_label}</span>
                     <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
-                    <span class="peer-meta history-ended">${relativeTime(entry.ended_at, locale)}</span>
+                    <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
                     <span class="history-action">${t(locale, 'status.reconnect')}</span>
                   </button>
                 </li>
