@@ -990,6 +990,35 @@ button {
   background: var(--blue-solid-hover);
 }
 
+/* ---------- Credentials modal (docs/bugs/02-connect-form.md, task 5) ----------
+   Mirrors the consent modal above rather than inventing new chrome: same
+   backdrop, same dialog surface. */
+.credentials-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(11, 18, 32, 0.45);
+}
+
+.credentials-backdrop .credentials-panel {
+  background: var(--panel-bg);
+  border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  padding: 26px 28px;
+  max-width: 360px;
+  width: 100%;
+}
+
+.credentials-panel h2 {
+  font-size: var(--fs-emphasis);
+  font-weight: 700;
+  margin: 0 0 8px;
+}
+
 /* Session recording (§17). Permission is the switch in `.session-grants`;
    these are the act, and the indicator that goes with it. Neither the banner
    nor the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
@@ -1119,8 +1148,7 @@ button {
 }
 
 .unattended-panel,
-.address-book,
-.credentials-panel {
+.address-book {
   margin-top: 14px;
   padding: 12px 14px;
   border: 1px solid var(--border-subtle);
@@ -1129,8 +1157,7 @@ button {
 }
 
 .unattended-panel h3,
-.address-book h3,
-.credentials-panel h2 {
+.address-book h3 {
   margin: 0 0 4px;
   font-size: var(--fs-body);
 }

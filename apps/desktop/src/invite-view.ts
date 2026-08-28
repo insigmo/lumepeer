@@ -126,6 +126,7 @@ export function setConnectPhase(
     (code ?? undefined) === credentialCode;
   credentialCodeRequired = codeRequired;
   credentialRetrySecs = retrySecs ?? undefined;
+  const previousCredentialCode = credentialCode;
   credentialCode = next === 'awaiting_credentials' ? (code ?? undefined) : undefined;
   if (submitting && (next !== 'awaiting_credentials' || credentialCode !== undefined)) {
     // The answer landed: either the phase moved on, or it stayed on the
@@ -137,6 +138,13 @@ export function setConnectPhase(
   }
   if (unchanged) {
     return;
+  }
+  // The credentials modal focuses its password field once per fresh reason
+  // to (opening, or a new refusal) rather than on every poll tick, which
+  // would steal focus back while the user is typing a second guess
+  // (docs/bugs/02-connect-form.md, task 5).
+  if (next === 'awaiting_credentials' && (phase !== next || credentialCode !== previousCredentialCode)) {
+    credentialFocusToken += 1;
   }
   const wasWaiting = isConnecting();
   phase = next;
@@ -157,6 +165,10 @@ let credentialRetrySecs: number | undefined;
 let credentialCode: string | undefined;
 /** True from the moment credentials are submitted until an answer lands. */
 let submitting = false;
+/** Bumped by `setConnectPhase` on a fresh reason to focus the password field. */
+let credentialFocusToken = 0;
+/** The `credentialFocusToken` the password field was last focused for. */
+let credentialFocusedToken = -1;
 
 /** The message key a phase deserves, or `undefined` when it deserves none. */
 function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | undefined {
@@ -170,7 +182,10 @@ function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | 
 }
 
 /**
- * The credential form the host's challenge puts up (§8; ADR 0033).
+ * The credential form the host's challenge puts up (§8; ADR 0033), as a
+ * modal dialog over the main panel (docs/bugs/02-connect-form.md, task 5) —
+ * a password prompt is easy to scroll past as an inline block, the way a
+ * consent dialog would be.
  *
  * The password lives in the field and in the one IPC call that carries it. It
  * is cleared as soon as that call is made, and nothing in this module keeps a
@@ -184,55 +199,71 @@ export function credentialsPanel(locale: Locale): TemplateResult {
       : errorKey
         ? t(locale, errorKey)
         : undefined;
+  if (credentialFocusToken !== credentialFocusedToken) {
+    credentialFocusedToken = credentialFocusToken;
+    queueMicrotask(() => {
+      document.getElementById('device-password')?.focus();
+    });
+  }
   return html`
-    <section class="credentials-panel" aria-labelledby="credentials-heading">
-      <h2 id="credentials-heading">${t(locale, 'creds.heading')}</h2>
-      <p class="credentials-body">${t(locale, 'creds.body')}</p>
-      <form
-        class="credentials-form"
-        @submit=${(event: SubmitEvent) => {
+    <div
+      class="credentials-backdrop"
+      @keydown=${(event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
           event.preventDefault();
-          const form = event.target as HTMLFormElement;
-          const passwordField = form.elements.namedItem('device-password') as HTMLInputElement;
-          const codeField = form.elements.namedItem('device-code') as HTMLInputElement | null;
-          const password = passwordField.value;
-          const code = codeField?.value ?? '';
-          passwordField.value = '';
-          if (codeField) {
-            codeField.value = '';
-          }
-          void submitCredentials(password, code);
-        }}
-      >
-        <label for="device-password">${t(locale, 'creds.password.label')}</label>
-        <input
-          id="device-password"
-          name="device-password"
-          type="password"
-          autocomplete="current-password"
-          placeholder=${t(locale, 'creds.password.placeholder')}
-        />
-        ${credentialCodeRequired
-          ? html`
-              <label for="device-code">${t(locale, 'creds.code.label')}</label>
-              <input
-                id="device-code"
-                name="device-code"
-                type="text"
-                inputmode="numeric"
-                autocomplete="one-time-code"
-                placeholder=${t(locale, 'creds.code.placeholder')}
-              />
-            `
+          void cancel();
+        }
+      }}
+    >
+      <section class="credentials-panel" role="dialog" aria-modal="true" aria-labelledby="credentials-heading">
+        <h2 id="credentials-heading">${t(locale, 'creds.heading')}</h2>
+        <p class="credentials-body">${t(locale, 'creds.body')}</p>
+        <form
+          class="credentials-form"
+          @submit=${(event: SubmitEvent) => {
+            event.preventDefault();
+            const form = event.target as HTMLFormElement;
+            const passwordField = form.elements.namedItem('device-password') as HTMLInputElement;
+            const codeField = form.elements.namedItem('device-code') as HTMLInputElement | null;
+            const password = passwordField.value;
+            const code = codeField?.value ?? '';
+            passwordField.value = '';
+            if (codeField) {
+              codeField.value = '';
+            }
+            void submitCredentials(password, code);
+          }}
+        >
+          <label for="device-password">${t(locale, 'creds.password.label')}</label>
+          <input
+            id="device-password"
+            name="device-password"
+            type="password"
+            autocomplete="current-password"
+            placeholder=${t(locale, 'creds.password.placeholder')}
+          />
+          ${credentialCodeRequired
+            ? html`
+                <label for="device-code">${t(locale, 'creds.code.label')}</label>
+                <input
+                  id="device-code"
+                  name="device-code"
+                  type="text"
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  placeholder=${t(locale, 'creds.code.placeholder')}
+                />
+              `
+            : ''}
+          <button type="submit" class="credentials-submit" ?disabled=${submitting}>
+            ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
+          </button>
+        </form>
+        ${message
+          ? html`<p class="credentials-error" role="alert" data-testid="credentials-error">${message}</p>`
           : ''}
-        <button type="submit" class="credentials-submit" ?disabled=${submitting}>
-          ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
-        </button>
-      </form>
-      ${message
-        ? html`<p class="credentials-error" role="alert" data-testid="credentials-error">${message}</p>`
-        : ''}
-    </section>
+      </section>
+    </div>
   `;
 }
 

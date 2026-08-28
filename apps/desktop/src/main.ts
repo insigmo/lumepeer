@@ -207,7 +207,7 @@ function renderNow(): void {
             </aside>
             <main class="main-panel">
               ${unattendedIndicator(unattended, locale)} ${recordingBanner()} ${mediaWarning()}
-              ${isAwaitingCredentials() ? credentialsPanel(locale) : ''} ${connectPanel(locale)}
+              ${connectPanel(locale)}
               <div class="main-divider"></div>
               ${sessionStatus(
                 activeSessions,
@@ -244,6 +244,7 @@ function renderNow(): void {
         </div>
       `,
       consentDialog(pendingRequest, locale),
+      isAwaitingCredentials() ? credentialsPanel(locale) : '',
     ],
     root as HTMLElement,
   );
