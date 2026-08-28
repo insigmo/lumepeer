@@ -183,30 +183,29 @@ button {
   margin: 0 0 6px;
 }
 
+/* An invite code is ~200 characters (D3 in docs/bugs/DECISIONS.md: the format
+   is not being shortened), so the sidebar shows one clipped line of it. The
+   whole code stays on `title` for hovering and goes to the clipboard whole;
+   it is plain text rather than a button, and selectable, because that is the
+   fallback when the clipboard is unavailable. */
 .code-box {
-  appearance: none;
   display: block;
   width: 100%;
   background: #fff;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
   padding: 10px 12px;
-  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: var(--fs-emphasis);
   font-weight: 700;
   color: var(--blue-solid);
   letter-spacing: 0.03em;
   text-align: start;
-  margin-bottom: 8px;
+  margin: 0 0 8px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: pointer;
-  transition: background 150ms ease;
-}
-
-.code-box:hover {
-  background: #eef2fe;
+  user-select: text;
 }
 
 .copy-btn,
