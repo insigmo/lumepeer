@@ -8533,6 +8533,61 @@ mod tests {
         );
     }
 
+    use lumepeer_core::constants::CONSENT_RATE_PER_MINUTE;
+
+    /// docs/bugs/03-connection-list.md, task 1: H1, reproduced directly
+    /// rather than left as a hypothesis. Five connect/close-window cycles
+    /// inside a minute succeed; a sixth against the same host in the same
+    /// window is refused. `ConsentRateLimiter::forget` is never called
+    /// anywhere in this file (confirmed by grep before writing this test),
+    /// so nothing resets the per-peer counter `on_handshaked` checks on
+    /// every attempt — including one against a host this node already
+    /// completed five clean sessions with a moment ago.
+    ///
+    /// The guest sees exactly the user's report: `connect_phase` lands on
+    /// `Failed` with no §18 code at all — `on_closed` never sets
+    /// `connect_failure` for an ordinary transport close — which is what
+    /// `invite-view.ts::failureKey` falls back to `invite.failed` for: "The
+    /// connection ended before it was accepted."
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h1_five_reconnects_succeed_a_sixth_is_refused_by_the_rate_limiter() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        for attempt in 1..=CONSENT_RATE_PER_MINUTE {
+            let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+            guest.invite_connect(invite.code).await.unwrap();
+            let host_side_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+                .await
+                .unwrap_or_else(|_| panic!("attempt {attempt} never reached the host"));
+            host.grant(host_side_label, Role::ViewOnly).await.unwrap();
+            wait_for_phase(&guest, ConnectPhase::Connected).await;
+            wait_until("no view window was opened", || {
+                !recorder.opened().is_empty()
+            })
+            .await;
+            // The guest's own label for the host it is viewing — not the
+            // host's label for the guest, which `on_revoke` cannot resolve
+            // (each side labels the other from its own per-run salt).
+            let guest_side_label = recorder.opened().last().unwrap().1.clone();
+            // Closing the view window — the user's exact reported action.
+            guest.revoke(guest_side_label).await.unwrap();
+            wait_for_phase(&guest, ConnectPhase::Idle).await;
+        }
+
+        // The sixth attempt, same host, well inside the same minute.
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Failed).await;
+        let state = guest.connect_state().await.unwrap();
+        assert_eq!(
+            state.code, None,
+            "a rate-limited handshake carries no §18 code — it is a bare transport close"
+        );
+    }
+
     /// §21 punch-list item 6: the connect form has to know that a dial which
     /// returned is not a session yet, or it re-enables itself while the host
     /// is still looking at the consent dialog.
