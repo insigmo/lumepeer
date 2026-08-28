@@ -75,7 +75,13 @@ describe('connect form: one request at a time', () => {
 
     render(view.connectPanel('en'), container);
     expect(connectButton().disabled).toBe(true);
-    expect(connectButton().textContent?.trim()).toMatch(/^Connecting\.{1,3}$/);
+    // docs/bugs/02-connect-form.md, task 1+2: the button no longer breathes
+    // with the dots — its label is fixed, and the animated wait now lives in
+    // the status line under the form.
+    expect(connectButton().textContent?.trim()).toBe('Connect');
+    expect(container.querySelector('[data-testid="connect-status"]')?.textContent?.trim()).toMatch(
+      /^Connecting\.{1,3}$/,
+    );
 
     view.setConnectPhase('connected');
     render(view.connectPanel('en'), container);
@@ -103,6 +109,38 @@ describe('connect form: one request at a time', () => {
     view.setConnectPhase('connected', null);
     render(view.connectPanel('en'), container);
     expect(connectButton().disabled).toBe(false);
+  });
+
+  // docs/bugs/02-connect-form.md, task 2: the status line names which of the
+  // three waits is outstanding, not just that one is.
+  it('names which wait is outstanding in the status line', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+
+    view.setConnectPhase('dialing', null);
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('[data-testid="connect-status"]')?.textContent).toContain(
+      'Connecting',
+    );
+
+    view.setConnectPhase('awaiting_consent', null);
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('[data-testid="connect-status"]')?.textContent).toContain(
+      'Waiting for the other device to answer',
+    );
+
+    view.setConnectPhase('awaiting_credentials', null);
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('[data-testid="connect-status"]')?.textContent).toContain(
+      'The device is asking for a password',
+    );
+
+    view.setConnectPhase('connected', null);
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('[data-testid="connect-status"]')).toBeNull();
   });
 
   // Before ADR 0027 every transport failure reached the user as one sentence,

@@ -23,6 +23,10 @@ export type TranslationKey =
   | 'invite.connect'
   | 'invite.connectPlaceholder'
   | 'invite.connecting'
+  | 'invite.connecting.dialing'
+  | 'invite.connecting.awaitingConsent'
+  | 'invite.connecting.awaitingCredentials'
+  | 'invite.cancel'
   | 'invite.denied'
   | 'invite.failed'
   | 'invite.unreachable'
@@ -241,6 +245,7 @@ export type TranslationKey =
   | 'creds.code.placeholder'
   | 'creds.submit'
   | 'creds.checking'
+  | 'creds.remember'
   | 'creds.badPassword'
   | 'creds.badCode'
   | 'creds.lockedOut'
@@ -281,6 +286,10 @@ const en: Dictionary = {
   'invite.connect': 'Connect',
   'invite.connectPlaceholder': 'Paste invite code here',
   'invite.connecting': 'Connecting',
+  'invite.connecting.dialing': 'Connecting',
+  'invite.connecting.awaitingConsent': 'Waiting for the other device to answer',
+  'invite.connecting.awaitingCredentials': 'The device is asking for a password',
+  'invite.cancel': 'Cancel',
   'invite.denied': 'The other device declined the request.',
   'invite.failed': 'The connection ended before it was accepted.',
   'invite.unreachable':
@@ -514,6 +523,7 @@ const en: Dictionary = {
   'creds.code.placeholder': '6 digits',
   'creds.submit': 'Sign in',
   'creds.checking': 'Checking',
+  'creds.remember': "Remember this device's password",
   'creds.badPassword': 'That password was not accepted.',
   'creds.badCode': 'That code was not accepted.',
   'creds.lockedOut': (secs) => `Too many attempts. Try again in ${secs} seconds.`,
@@ -554,6 +564,10 @@ const ar: Dictionary = {
   'invite.connect': 'الاتصال',
   'invite.connectPlaceholder': 'الصق رمز الدعوة هنا',
   'invite.connecting': 'جارٍ الاتصال',
+  'invite.connecting.dialing': 'جارٍ الاتصال',
+  'invite.connecting.awaitingConsent': 'في انتظار رد الجهاز الآخر',
+  'invite.connecting.awaitingCredentials': 'يطلب الجهاز كلمة مرور',
+  'invite.cancel': 'إلغاء',
   'invite.denied': 'رفض الجهاز الآخر الطلب.',
   'invite.failed': 'انتهى الاتصال قبل قبوله.',
   'invite.unreachable':
@@ -778,6 +792,7 @@ const ar: Dictionary = {
   'creds.code.placeholder': '٦ أرقام',
   'creds.submit': 'تسجيل الدخول',
   'creds.checking': 'جارٍ التحقق',
+  'creds.remember': 'تذكّر كلمة مرور هذا الجهاز',
   'creds.badPassword': 'لم تُقبل كلمة المرور.',
   'creds.badCode': 'لم يُقبل الرمز.',
   'creds.lockedOut': (secs) => `محاولات كثيرة. أعد المحاولة بعد ${secs} ثانية.`,
