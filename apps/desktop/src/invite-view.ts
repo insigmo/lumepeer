@@ -127,8 +127,12 @@ export function setConnectPhase(
   credentialCodeRequired = codeRequired;
   credentialRetrySecs = retrySecs ?? undefined;
   credentialCode = next === 'awaiting_credentials' ? (code ?? undefined) : undefined;
-  if (submitting && next !== 'awaiting_credentials') {
-    // The answer landed, refused or not: let a later attempt submit again.
+  if (submitting && (next !== 'awaiting_credentials' || credentialCode !== undefined)) {
+    // The answer landed: either the phase moved on, or it stayed on the
+    // credential form but with a fresh refusal code — a bad password leaves
+    // the phase exactly where it was, so that case has to be recognized here
+    // too, or the submit button (and Enter with it) stays disabled forever
+    // after the first wrong guess (docs/bugs/02-connect-form.md, task 4).
     submitting = false;
   }
   if (unchanged) {

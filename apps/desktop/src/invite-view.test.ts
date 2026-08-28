@@ -264,6 +264,55 @@ describe('invite code panel', () => {
   });
 });
 
+describe('credentials form: a refused password can be corrected', () => {
+  function credentialsSubmitButton(): HTMLButtonElement {
+    const button = container.querySelector<HTMLButtonElement>('button.credentials-submit');
+    if (!button) {
+      throw new Error('the credentials form has no submit button');
+    }
+    return button;
+  }
+
+  /** Fills the password field and submits, the way typing and Enter does. */
+  function submitCredentials(password: string): void {
+    const input = container.querySelector<HTMLInputElement>('#device-password');
+    const form = container.querySelector('form.credentials-form');
+    if (!input || !form) {
+      throw new Error('the credentials form is not rendered');
+    }
+    input.value = password;
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+  }
+
+  // docs/bugs/02-connect-form.md, task 4: `submitting` used to be reset only
+  // on a phase change, and a bad password leaves the phase at
+  // `awaiting_credentials` — so the submit button, and with it implicit
+  // submission on Enter, stayed disabled forever after one wrong guess.
+  it('lets a second, corrected password reach unattended_submit', async () => {
+    const view = await load();
+    view.setConnectPhase('awaiting_credentials');
+    render(view.credentialsPanel('en'), container);
+
+    submitCredentials('wrong-password');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('unattended_submit', {
+      args: { password: 'wrong-password', code: null },
+    });
+
+    view.setConnectPhase('awaiting_credentials', 'UNATTENDED_BAD_PASSWORD');
+    render(view.credentialsPanel('en'), container);
+    expect(credentialsSubmitButton().disabled).toBe(false);
+
+    submitCredentials('right-password');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('unattended_submit', {
+      args: { password: 'right-password', code: null },
+    });
+
+    view.setConnectPhase('connected');
+  });
+});
+
 describe('remembered hosts', () => {
   it('reconnects by label, never by handing the invite code back to the webview', async () => {
     const view = await load();
