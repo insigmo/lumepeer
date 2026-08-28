@@ -47,6 +47,9 @@ arboard.workspace = true
 lumepeer-core.workspace = true
 lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
 lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] }
+# The privileged helper service and its two-byte protocol (ADR 0043). The
+# library half carries no privileges and no Win32; the service binary does.
+lumepeer-service.workspace = true
 ed25519-dalek.workspace = true
 iroh.workspace = true
 postcard.workspace = true

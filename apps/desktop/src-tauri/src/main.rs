@@ -21,6 +21,7 @@ mod connection_history;
 mod logging;
 mod network;
 mod recorder;
+mod service_control;
 mod unattended_store;
 mod view;
 
@@ -247,6 +248,8 @@ fn main() {
             commands::update_install,
             commands::autostart_status,
             commands::autostart_set,
+            commands::service_status,
+            commands::service_set,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

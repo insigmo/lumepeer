@@ -6,7 +6,10 @@ infrastructure, a short-link service and a license broker.
 
 The specification is `p2p-iroh-tauri-design-v12.md`. Section references in the
 code (`§8.2`, `§14`, …) point into it, and it wins over anything written here.
-Deviations from it live in `docs/adr/`, never in silence.
+Deviations from it live in `docs/adr/`, never in silence. The document itself
+is **not in this repository** — it is kept alongside it, so a `§` reference
+resolves only for someone who has it. The ADR log is the part that is
+self-contained.
 
 ## Installing
 
@@ -50,6 +53,7 @@ instead of installing latest.
 | `crates/net`             | Iroh endpoint, invite tickets, control framing, reconnect, keystore. |
 | `crates/media`           | Capture, encode, jitter buffer, adaptive bitrate.                    |
 | `crates/decoder-worker`  | Decoder in its own sandboxed OS process (§11.3).                     |
+| `crates/service`         | Privileged helper: Ctrl+Alt+Del delivery, nothing else (ADR 0043).  |
 | `apps/desktop`           | Tauri app: `src-tauri` Rust backend, `src` TypeScript webview.       |
 | `services/broker`        | Axum + SQLite license broker.                                        |
 | `docs/adr`               | Architecture decision records.                                       |
@@ -241,23 +245,30 @@ range; what shipped:
   is configured for and installs on a press, and it can start with the user's
   session — which grants nothing on its own and can be switched off from the
   same panel that switched it on (ADR 0042).
+- Ctrl+Alt+Del no longer needs the whole client running elevated: a helper
+  service with exactly one operation delivers it, and the client falls back to
+  its own in-process path when that service is absent (ADR 0043).
 
 ### Written but not wired
 
 Code that exists and compiles but that nothing in the product reaches yet.
 Named here rather than left to be rediscovered:
 
-- **Privacy mode.** `MessageKind::PrivacyMode`/`PrivacyModeAck` have been in
-  the protocol since minor 1. No host implements them and no UI sends them, so
-  a guest has no way to ask and a host no way to answer.
+- **Privacy mode — decided against.** `MessageKind::PrivacyMode`/
+  `PrivacyModeAck` have been in the protocol since minor 1; nothing implements
+  them and nothing will. The discriminants stay where they are rather than
+  being removed, because every message after them would renumber and the
+  golden vectors of §17.2 exist to make exactly that impossible without a
+  major version. Read them as reserved, not as pending.
 - **macOS audio and monitors.** `platform_audio_capturer` and
   `platform_player` both refuse on macOS, so a macOS host streams no sound and
   plays no guest microphone; `host_monitors()` reports a single primary
   display because nothing enumerates them there.
-- **Running before anyone signs in.** There is no Windows service, systemd
-  system unit or launchd daemon. Autostart (below) starts the client with the
-  user's session and no earlier, which is also what keeps Ctrl+Alt+Del
-  delivery limited to an elevated process (`crates/media/src/sas.rs`).
+- **Running before anyone signs in.** The helper service of ADR 0043 is a
+  privileged process, but it holds one capability — Ctrl+Alt+Del — and does
+  not serve a screen. Reaching a machine before somebody signs in needs a
+  session-0 process that hands capture and injection to whichever session
+  exists, which is a different piece of work and does not exist here.
 - **A released update.** The pipeline is wired end to end — signed artifacts,
   a `latest.json` per release, a per-channel endpoint, a client that checks
   and installs (ADR 0042) — but no release has run through it yet, so nothing

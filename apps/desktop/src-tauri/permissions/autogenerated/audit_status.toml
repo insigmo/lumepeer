@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-audit-status"
+description = "Enables the audit_status command without any pre-configured scope."
+commands.allow = ["audit_status"]
+
+[[permission]]
+identifier = "deny-audit-status"
+description = "Denies the audit_status command without any pre-configured scope."
+commands.deny = ["audit_status"]

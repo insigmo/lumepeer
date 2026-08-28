@@ -231,17 +231,22 @@ jobs:
       # so CI produces it here from the same source tree — same recipe as the
       # ci.yml build job, except it stages from a --target release build so
       # the macos-amd64 job on arm64 hardware bundles an x86_64 worker.
-      - name: Build the decoder-worker sidecar for this target
+      - name: Build the sidecars for this target
         shell: bash
         run: |
           case "$RUNNER_OS" in
             Windows) EXE=.exe ;;
             *) EXE= ;;
           esac
-          cargo build --release -p lumepeer-decoder-worker --target ${{ matrix.target }}
+          # `lumepeer-service` is the privileged helper of ADR 0043. It is
+          # staged for every target because `externalBin` is not per-platform;
+          # off Windows the binary exits with an explanation, because there is
+          # no privileged action there for a daemon to hold.
           mkdir -p apps/desktop/src-tauri/binaries
-          cp "target/${{ matrix.target }}/release/lumepeer-decoder-worker${EXE}" \
-             "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${{ matrix.target }}${EXE}"
+          for BIN in lumepeer-decoder-worker lumepeer-service; do
+            cargo build --release -p "${BIN}" --target ${{ matrix.target }}
+            cp "target/${{ matrix.target }}/release/${BIN}${EXE}"                "apps/desktop/src-tauri/binaries/${BIN}-${{ matrix.target }}${EXE}"
+          done
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

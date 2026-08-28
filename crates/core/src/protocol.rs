@@ -317,6 +317,12 @@ pub enum MessageKind {
     /// Guest asks the host to enable or disable privacy mode (§11): blank
     /// the host's physical monitors and block local input while the session
     /// is controlled. The host user must have enabled this capability.
+    ///
+    /// **Reserved, not pending.** The feature was decided against; nothing
+    /// implements this message or its ack, and nothing is going to. The
+    /// discriminant stays because removing it renumbers every variant after
+    /// it, which the golden vectors of §17.2 exist to prevent outside a major
+    /// version. A host that receives it answers nothing.
     PrivacyMode {
         /// `true` to blank and lock, `false` to restore.
         enabled: bool,

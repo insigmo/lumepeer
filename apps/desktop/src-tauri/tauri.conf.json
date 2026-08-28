@@ -34,7 +34,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/lumepeer-decoder-worker"],
+    "externalBin": [
+      "binaries/lumepeer-decoder-worker",
+      "binaries/lumepeer-service"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
