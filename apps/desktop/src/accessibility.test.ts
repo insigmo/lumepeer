@@ -17,6 +17,7 @@ import { SUPPORTED_LOCALES } from './i18n';
 import { connectPanel, credentialsPanel, inviteCodePanel, setConnectPhase } from './invite-view';
 import { recordingsPanel, type RecordingEntry } from './recordings';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
+import { openSettings, resetSettingsView, settingsView } from './settings-view';
 import { statusPill } from './status-pill';
 import { unattendedIndicator, unattendedSettings, type UnattendedStatus } from './unattended-settings';
 import { titleBar } from './title-bar';
@@ -206,6 +207,62 @@ describe('accessibility: status pill', () => {
     it(`has no axe violations when not ready (${locale})`, async () => {
       render(statusPill(false, locale), container);
       expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: settings screen', () => {
+  const off: UnattendedStatus = { enabled: false, totp_enabled: false, role: 'view_only' };
+  const commands = {
+    status: () => Promise.resolve(false),
+    kinds: () => Promise.resolve([]),
+    list: () => Promise.resolve([]),
+    export: () => Promise.resolve(null),
+    clear: () => Promise.resolve(0),
+  };
+  const systemCommands = {
+    serviceStatus: () => Promise.resolve('unsupported' as const),
+    serviceSet: () => Promise.resolve(),
+    autostartStatus: () => Promise.resolve(false),
+    autostartSet: () => Promise.resolve(),
+    updateCheck: () => Promise.resolve(null),
+    updateInstall: () => Promise.resolve(),
+  };
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations while open (${locale})`, async () => {
+      resetSettingsView();
+      resetAuditPanel();
+      resetSystemSettings();
+      openSettings();
+      render(
+        settingsView({
+          locale,
+          unattended: off,
+          savedDevices: [],
+          recordings: [],
+          recordingsCommands: {
+            list: () => Promise.resolve([]),
+            export: () =>
+              Promise.resolve({
+                dir: '',
+                video: null,
+                audio: null,
+                video_frames: 0,
+                audio_packets: 0,
+                events_skipped: 0,
+              }),
+          },
+          auditCommands: commands,
+          systemCommands,
+          onRefresh: () => {},
+        }),
+        container,
+      );
+      expect(await auditViolations(container)).toEqual([]);
+      resetSettingsView();
+      resetAuditPanel();
+      resetSystemSettings();
     });
   }
 });

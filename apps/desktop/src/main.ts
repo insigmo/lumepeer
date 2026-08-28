@@ -7,7 +7,6 @@
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 
 import {
-  addressBook,
   onAddressBookStateChange,
   saveDeviceButton,
   type AddressBookEntry,
@@ -16,6 +15,7 @@ import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { consentDialog } from './consent-dialog';
 import { detectLocale, dirOf, type Locale } from './i18n';
 import { t } from './i18n';
+import { SETTINGS_ICON } from './icons';
 import {
   connectPanel,
   credentialsPanel,
@@ -28,26 +28,17 @@ import {
   setConnectPhase,
   type ConnectPhase,
 } from './invite-view';
-import { auditPanel, onAuditStateChange, tauriAuditCommands } from './audit-log';
-import { onSystemStateChange, systemSettings, tauriSystemCommands } from './system-settings';
+import { onAuditStateChange, tauriAuditCommands } from './audit-log';
+import { onSystemStateChange, tauriSystemCommands } from './system-settings';
 import { logoMark } from './logo';
-import {
-  onRecordingsStateChange,
-  recordingsPanel,
-  tauriRecordingsCommands,
-  type RecordingEntry,
-} from './recordings';
+import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
+import { onSettingsStateChange, openSettings, settingsView } from './settings-view';
 import type { FileTransfers } from './file-transfers';
 import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
-import {
-  onUnattendedStateChange,
-  unattendedIndicator,
-  unattendedSettings,
-  type UnattendedStatus,
-} from './unattended-settings';
+import { onUnattendedStateChange, unattendedIndicator, type UnattendedStatus } from './unattended-settings';
 
 const root = document.querySelector('#app');
 const chatPanel = document.querySelector<HTMLElement>('#host-chat-panel');
@@ -195,6 +186,7 @@ function renderNow(): void {
               ${inviteCodePanel(locale)}
               <div class="sidebar-bottom">
                 ${statusPill(networkReady, locale)}
+                ${unattendedIndicator(unattended, locale)}
                 <div class="sidebar-divider"></div>
                 <div class="footer-tag">
                   <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
@@ -203,11 +195,19 @@ function renderNow(): void {
                     <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="currentColor" stroke-width="1.2" />
                   </svg>
                   <span>${t(locale, 'sidebar.serverless')}</span>
+                  <button
+                    type="button"
+                    class="settings-btn"
+                    aria-label=${t(locale, 'sidebar.settings')}
+                    @click=${() => openSettings()}
+                  >
+                    ${SETTINGS_ICON}
+                  </button>
                 </div>
               </div>
             </aside>
             <main class="main-panel">
-              ${unattendedIndicator(unattended, locale)} ${recordingBanner()} ${mediaWarning()}
+              ${recordingBanner()} ${mediaWarning()}
               ${connectPanel(locale)}
               <div class="main-divider"></div>
               ${sessionStatus(
@@ -232,20 +232,22 @@ function renderNow(): void {
                 (peer) => saveDeviceButton(peer, locale, () => void refresh()),
                 connectionStats,
               )}
-              <div class="main-divider"></div>
-              ${recordingsPanel(recordings, locale, tauriRecordingsCommands, () => void refresh())}
-              <div class="main-divider"></div>
-              ${auditPanel(locale, tauriAuditCommands)}
-              <div class="main-divider"></div>
-              ${addressBook(savedDevices, locale, () => void refresh())}
-              ${unattendedSettings(unattended, locale, () => void refresh())}
-              ${systemSettings(locale, tauriSystemCommands)}
             </main>
           </div>
         </div>
       `,
       consentDialog(pendingRequest, locale),
       isAwaitingCredentials() && !isCredentialsAuto() ? credentialsPanel(locale) : '',
+      settingsView({
+        locale,
+        unattended,
+        savedDevices,
+        recordings,
+        recordingsCommands: tauriRecordingsCommands,
+        auditCommands: tauriAuditCommands,
+        systemCommands: tauriSystemCommands,
+        onRefresh: () => void refresh(),
+      }),
     ],
     root as HTMLElement,
   );
@@ -373,6 +375,7 @@ onAddressBookStateChange(renderNow);
 onRecordingsStateChange(renderNow);
 onAuditStateChange(renderNow);
 onSystemStateChange(renderNow);
+onSettingsStateChange(renderNow);
 
 renderNow();
 void refresh();

@@ -331,6 +331,29 @@ describe('invite code panel', () => {
   });
 });
 
+describe('invite refresh (docs/bugs/05-settings-window.md, task 4)', () => {
+  // The button that used to sit under Copy in the sidebar now lives in
+  // settings, under a name that says what it does: reissuing retires every
+  // code handed out before it (ADR 0016).
+  it('revokes and reissues through invite_create when pressed', async () => {
+    invoke.mockResolvedValue({ code: 'lumepeer1:new' });
+    const view = await load();
+    render(view.inviteRefreshPanel('en'), container);
+
+    container.querySelector<HTMLButtonElement>('.invite-refresh-btn')?.click();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('invite_create', { args: { role: 'view_only' } });
+    });
+  });
+
+  it('names what the button does rather than saying "Refresh"', async () => {
+    const view = await load();
+    render(view.inviteRefreshPanel('en'), container);
+    const button = container.querySelector('.invite-refresh-btn');
+    expect(button?.textContent?.trim()).toBe('Revoke current code and issue a new one');
+  });
+});
+
 describe('credentials form: a refused password can be corrected', () => {
   function credentialsSubmitButton(): HTMLButtonElement {
     const button = container.querySelector<HTMLButtonElement>('button.credentials-submit');

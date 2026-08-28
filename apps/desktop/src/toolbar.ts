@@ -17,6 +17,7 @@ import { html, render, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { SETTINGS_ICON } from './icons';
 import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
 import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
@@ -183,7 +184,7 @@ export interface ToolbarHooks {
 
 const ICONS = {
   handle: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3h4M4 6h8M4 9h8M6 12h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
-  settings: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm5.4-2a5.4 5.4 0 0 0-.1-1l1.2-1-1.2-2-1.4.5a5.5 5.5 0 0 0-1.7-1L10 2H6l-.2 1.5a5.5 5.5 0 0 0-1.7 1L2.7 4 1.5 6l1.2 1a5.4 5.4 0 0 0 0 2l-1.2 1 1.2 2 1.4-.5a5.5 5.5 0 0 0 1.7 1L6 14h4l.2-1.5a5.5 5.5 0 0 0 1.7-1l1.4.5 1.2-2-1.2-1c.1-.3.1-.7.1-1Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
+  settings: SETTINGS_ICON,
   monitor: (n: string) => html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><text x="8" y="10" text-anchor="middle" font-size="7" fill="currentColor" stroke="none" font-family="system-ui">${n}</text></svg>`,
   chat: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="2.5" fill="#9fd0ff" stroke="none"/></svg>`,

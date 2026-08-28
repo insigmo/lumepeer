@@ -511,6 +511,30 @@ export function inviteCodePanel(locale: Locale): TemplateResult {
   `;
 }
 
+/**
+ * Settings-window control that revokes every invite code handed out so far
+ * and issues a fresh one (docs/bugs/05-settings-window.md, task 4).
+ *
+ * Reuses `createInvite`/`invite_create` rather than a new command: the actor
+ * already retires the whole `TicketRegistry` on every call
+ * (`network.rs::on_invite_create`), which is exactly "revoke and reissue".
+ */
+export function inviteRefreshPanel(locale: Locale): TemplateResult {
+  return html`
+    <div class="invite-refresh">
+      <button
+        type="button"
+        class="invite-refresh-btn"
+        ?disabled=${creatingInvite}
+        @click=${() => void createInvite()}
+      >
+        ${t(locale, 'invite.refresh')}
+      </button>
+      <p class="invite-refresh-note">${t(locale, 'invite.refresh.note')}</p>
+    </div>
+  `;
+}
+
 /** Main panel block: heading, subtext and the paste-a-code connect form. */
 export function connectPanel(locale: Locale): TemplateResult {
   const waiting = isConnecting();
