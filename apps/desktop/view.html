@@ -35,14 +35,17 @@
         /* The remote screen is already the picture; smoothing a 1:1 blit only
            costs time. */
         image-rendering: pixelated;
-        /* A crosshair, not `none` and not the usual arrow. Pointer motion is
-           sent as an absolute position normalized to this canvas, so the local
-           pointer sits exactly where the click will land on the host and
-           hiding it leaves the operator aiming blind. A crosshair rather than
-           an arrow because the host's own cursor is composited into the
-           picture on the platforms that can (Windows, macOS): two arrows would
-           be indistinguishable, an arrow under a crosshair is not. */
-        cursor: crosshair;
+        /* The ordinary arrow. Pointer motion is sent as an absolute position
+           normalized to this canvas, so the local pointer sits exactly where
+           the click will land on the host and hiding it outright would leave
+           the operator aiming blind. `view.ts` overrides this with `none` for
+           the one state that has its own pointer to show — the host's shape
+           drawn on the `#cursor` layer (ADR 0038) — and puts it back the
+           moment that stops being true. It used to be a crosshair, from before
+           that layer existed and the host's cursor was only ever composited
+           into the picture; with the layer, a crosshair is the second cursor
+           on screen. */
+        cursor: default;
       }
       .view-banner {
         position: absolute;
