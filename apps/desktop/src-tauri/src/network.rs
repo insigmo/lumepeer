@@ -2556,6 +2556,10 @@ impl Actor {
                 loss: f32::from(loss_permille) / f32::from(PERMILLE),
                 rtt_ms,
                 goodput_kbps: goodput,
+                // Left for the encode loop to fill: it is the only place that
+                // knows how much this host actually wrote over the window the
+                // guest was measuring.
+                sent_kbps: 0,
             });
     }
 

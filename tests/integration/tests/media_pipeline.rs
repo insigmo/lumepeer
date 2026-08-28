@@ -256,6 +256,7 @@ fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
         loss: 0.30,
         rtt_ms: 90,
         goodput_kbps: 900,
+        sent_kbps: ENCODE_DEFAULT_BITRATE_KBPS,
     };
 
     let first = controller

@@ -41,6 +41,15 @@ pub struct ReceiverFeedback {
     /// one — a report with nothing in it must not read as a link carrying
     /// nothing.
     pub goodput_kbps: u32,
+    /// What the host actually put on the wire over the same window, or 0 when
+    /// it did not measure that either.
+    ///
+    /// Filled in by the host from its own encoder output, never by the peer:
+    /// it is the only thing that makes [`Self::goodput_kbps`] mean anything.
+    /// Throughput below the target says nothing on its own — a still desktop
+    /// legitimately encodes to a fraction of it — and only throughput below
+    /// what was *offered* is the link saying it cannot carry the load.
+    pub sent_kbps: u32,
 }
 
 /// The three knobs, as one target the encode loop applies together.
@@ -142,19 +151,29 @@ impl AbrController {
     /// Two independent signals, because `rd/media/1` is a reliable ordered
     /// stream and only one of them is ever available at a time. Loss is real
     /// content the guest's decoder could not reconstruct. Goodput below
-    /// [`ABR_GOODPUT_SHORTFALL_PERCENT`] of the target is the link saying it
-    /// cannot carry the rate — but only when the guest actually measured one,
-    /// since a still desktop legitimately produces almost no bytes and must
-    /// not read as congestion.
+    /// [`ABR_GOODPUT_SHORTFALL_PERCENT`] of what the host *offered* is the
+    /// link saying it cannot carry the load.
+    ///
+    /// Offered, not targeted. The bitrate target is a ceiling, and a desktop
+    /// that is not moving encodes to a small fraction of it: comparing arrival
+    /// against the ceiling turned "there was nothing to send" into "the link
+    /// is congested" on a link with no loss at all, and the ladder then walked
+    /// all the way to its floor — 300 kbps, 10 fps and half of each axis — on
+    /// an idle LAN session. Measured; the numbers are in
+    /// docs/bugs/07-video-quality.md.
     fn pressure(&self, feedback: ReceiverFeedback) -> Pressure {
         if feedback.loss > LIGHT_LOSS {
             return Pressure::Down;
         }
-        let floor = self
-            .target
-            .bitrate_kbps
-            .saturating_mul(ABR_GOODPUT_SHORTFALL_PERCENT)
-            / PERCENT;
+        // The host cannot have offered more than the target, and a host that
+        // did not measure its own output leaves the target as the only basis
+        // there is.
+        let offered = if feedback.sent_kbps > 0 {
+            self.target.bitrate_kbps.min(feedback.sent_kbps)
+        } else {
+            self.target.bitrate_kbps
+        };
+        let floor = offered.saturating_mul(ABR_GOODPUT_SHORTFALL_PERCENT) / PERCENT;
         if feedback.goodput_kbps > 0 && feedback.goodput_kbps < floor {
             return Pressure::Down;
         }
@@ -234,6 +253,7 @@ mod tests {
             loss,
             rtt_ms: 30,
             goodput_kbps: 0,
+            sent_kbps: 0,
         }
     }
 
@@ -250,6 +270,66 @@ mod tests {
         assert_eq!(target.bitrate_kbps, ENCODE_DEFAULT_BITRATE_KBPS / 2);
         assert!(abr.current_kbps() >= ABR_MIN_BITRATE_KBPS);
         assert!(abr.current_kbps() <= ABR_MAX_BITRATE_KBPS);
+    }
+
+    /// The measured regression of docs/bugs/07-video-quality.md, task 2: a
+    /// desktop nobody is touching, on a link with no loss and room to spare.
+    ///
+    /// The guest reports what actually arrived, which for a still screen is a
+    /// fraction of the bitrate ceiling. Read against the ceiling that was
+    /// congestion, and the ladder walked to its floor in about half a minute:
+    /// 300 kbps, 10 fps, and half of each axis — a quarter of the pixels, on a
+    /// LAN. Read against what the host actually sent, it is what it is: a
+    /// quiet screen.
+    #[test]
+    fn a_still_screen_on_a_fast_link_is_not_congestion() {
+        let mut abr = AbrController::new();
+        for _ in 0..60 {
+            allow_another_decision(&mut abr);
+            abr.on_feedback(ReceiverFeedback {
+                loss: 0.0,
+                rtt_ms: 2,
+                // Everything the host encoded arrived, and it was not much:
+                // this is a desktop with a clock on it.
+                goodput_kbps: 200,
+                sent_kbps: 200,
+            });
+        }
+        let target = abr.target();
+        assert_eq!(
+            target.scale_percent, FULL_SCALE_PERCENT,
+            "the picture was downscaled on an idle LAN"
+        );
+        assert_eq!(
+            target.fps, ENCODE_DEFAULT_FPS,
+            "the frame rate was cut on an idle LAN"
+        );
+        assert!(
+            target.bitrate_kbps >= ENCODE_DEFAULT_BITRATE_KBPS,
+            "the ceiling fell below the default on an idle LAN: {}",
+            target.bitrate_kbps
+        );
+    }
+
+    /// And the signal still works: a link that really is dropping what the
+    /// host offered gets the ladder it is there for.
+    #[test]
+    fn arrival_far_under_what_was_sent_is_still_congestion() {
+        let mut abr = AbrController::new();
+        for _ in 0..10 {
+            allow_another_decision(&mut abr);
+            abr.on_feedback(ReceiverFeedback {
+                loss: 0.0,
+                rtt_ms: 40,
+                // A quarter of what went out came back reported.
+                goodput_kbps: 1_000,
+                sent_kbps: 4_000,
+            });
+        }
+        assert!(
+            abr.current_kbps() < ENCODE_DEFAULT_BITRATE_KBPS,
+            "a link losing three quarters of the load was read as healthy"
+        );
     }
 
     #[test]
@@ -343,15 +423,16 @@ mod tests {
         assert_eq!(target.bitrate_kbps, ABR_MAX_BITRATE_KBPS);
     }
 
-    /// Goodput well under the target is the only congestion signal a reliable
-    /// ordered stream can give, so it has to count on its own.
+    /// Goodput well under what was sent is the only congestion signal a
+    /// reliable ordered stream can give, so it has to count on its own.
     #[test]
-    fn goodput_far_under_the_target_degrades_without_any_reported_loss() {
+    fn goodput_far_under_what_was_sent_degrades_without_any_reported_loss() {
         let mut abr = AbrController::new();
         let starved = ReceiverFeedback {
             loss: 0.0,
             rtt_ms: 30,
             goodput_kbps: ENCODE_DEFAULT_BITRATE_KBPS / 10,
+            sent_kbps: ENCODE_DEFAULT_BITRATE_KBPS,
         };
         let target = abr
             .on_feedback(starved)
