@@ -91,6 +91,13 @@ jobs:
         working-directory: apps/desktop
       - run: npm test
         working-directory: apps/desktop
+      # TypeScript checks the webview's *own* description of each Rust command,
+      # never the command itself, and the unit tests inject fakes shaped like
+      # that same description — so an `invoke` with the wrong argument shape
+      # passes both and fails only at runtime, in a `.catch` nobody reads. This
+      # compares the call sites against `commands.rs` directly.
+      - run: npm run ipc-contract
+        working-directory: apps/desktop
 
   # The media backends of phase 2 are behind features so that the default build
   # needs no platform SDK. They still have to be built and tested, and the X11

@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "tauri": "tauri",
-    "glibc-floor": "node ../../ci/glibc-floor.mjs"
+    "glibc-floor": "node ../../ci/glibc-floor.mjs",
+    "ipc-contract": "node ../../ci/ipc-contract.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
