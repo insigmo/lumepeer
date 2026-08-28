@@ -5449,7 +5449,11 @@ impl Actor {
             // Records the host into the remembered list on its way out.
             self.stop_view(peer);
             self.host_addrs.remove(&peer);
-            self.close_connection(peer);
+            // The user closing the window on purpose, not a protocol fault —
+            // the malformed code close_connection sends would otherwise make
+            // an ordinary exit look like an error in the host's own log
+            // (docs/bugs/03-connection-list.md, task 3).
+            self.close_connection_normal(peer);
             return Ok(());
         }
         // Nothing is written to the remembered-hosts list here. This branch is
