@@ -23,11 +23,13 @@ import {
   defaultLayout,
   displaySize,
   effectiveScale,
+  imageRenderingFor,
   installPan,
   isLocalTextTarget,
   logicalOfButton,
   logicalOfKey,
   MAX_SCALE,
+  PIXELATED_MIN_SCALE,
   nextDisplayMode,
   paintCursor,
   paintFrame,
@@ -365,6 +367,40 @@ describe('view window: the panels can be hidden at all', () => {
 
   it('ships the panel hidden, so the window opens on the picture', () => {
     expect(/<aside id="chat-panel"[^>]*\shidden\s*>/.test(markup)).toBe(true);
+  });
+});
+
+// The picture is drawn by one `putImageData` and then scaled by CSS, so how
+// the browser resamples it is the whole of the on-screen quality. `pixelated`
+// was hard-coded, and the default `fit` mode shrinks — where nearest
+// neighbour drops the thin strokes of a glyph outright.
+describe('view window: how the picture is resampled', () => {
+  const frame = { width: 1920, height: 1080 };
+  const window960 = { width: 960, height: 640 };
+
+  it('smooths a picture that is being shrunk into the window', () => {
+    expect(effectiveScale(defaultLayout(), frame, window960, 1)).toBeLessThan(
+      PIXELATED_MIN_SCALE,
+    );
+    expect(imageRenderingFor(defaultLayout(), frame, window960, 1)).toBe('auto');
+  });
+
+  it('leaves 1:1 and anything magnified alone', () => {
+    const actual: ViewLayout = { ...defaultLayout(), mode: 'actual' };
+    expect(imageRenderingFor(actual, frame, window960, 1)).toBe('pixelated');
+    const zoomed: ViewLayout = { mode: 'scaled', scale: 2, offsetX: 0, offsetY: 0 };
+    expect(imageRenderingFor(zoomed, frame, window960, 1)).toBe('pixelated');
+    // And a window big enough that `fit` is no longer a reduction.
+    expect(imageRenderingFor(defaultLayout(), frame, { width: 3840, height: 2160 }, 1)).toBe(
+      'pixelated',
+    );
+  });
+
+  it('reaches the canvas element rather than staying an opinion', () => {
+    const canvas = document.createElement('canvas');
+    canvas.style.imageRendering = 'pixelated';
+    canvas.style.imageRendering = imageRenderingFor(defaultLayout(), frame, window960, 1);
+    expect(canvas.style.imageRendering).toBe('auto');
   });
 });
 

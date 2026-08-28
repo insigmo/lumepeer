@@ -32,8 +32,13 @@
            own resolution so `putImageData` never has to scale (§11). */
         max-width: 100%;
         max-height: 100%;
-        /* The remote screen is already the picture; smoothing a 1:1 blit only
-           costs time. */
+        /* Only the starting value, for the moment before the first frame:
+           `applyLayout` overrides it on every layout because the right answer
+           depends on the scale, which CSS cannot see. Smoothing a 1:1 blit
+           only costs time, and magnifying wants nearest neighbour — but the
+           default `fit` mode shrinks a 1080p host into the window, and
+           shrinking with nearest neighbour drops the thin strokes of a glyph
+           whole. See `PIXELATED_MIN_SCALE` in `view-window.ts`. */
         image-rendering: pixelated;
         /* The ordinary arrow. Pointer motion is sent as an absolute position
            normalized to this canvas, so the local pointer sits exactly where
