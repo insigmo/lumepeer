@@ -3914,6 +3914,14 @@ impl Actor {
             // a guest that dropped before the host decided: drop its queued
             // request instead of leaving it pending forever.
             let _ = self.sessions.revoke(peer);
+        } else {
+            // `on_disconnect` only succeeds for a peer that had reached an
+            // active, granted session — never for one still only queued —
+            // so forgetting the consent-rate counter here cannot be used to
+            // flood past it: a peer that was never granted anything gets no
+            // forget, no matter how many times it disconnects
+            // (docs/bugs/03-connection-list.md, task 2).
+            self.sessions.forget_consent_rate(&peer);
         }
         tracing::info!(peer = %label, "peer disconnected");
         self.refresh_clipboard_watch();
@@ -8535,28 +8543,28 @@ mod tests {
 
     use lumepeer_core::constants::CONSENT_RATE_PER_MINUTE;
 
-    /// docs/bugs/03-connection-list.md, task 1: H1, reproduced directly
-    /// rather than left as a hypothesis. Five connect/close-window cycles
-    /// inside a minute succeed; a sixth against the same host in the same
-    /// window is refused. `ConsentRateLimiter::forget` is never called
-    /// anywhere in this file (confirmed by grep before writing this test),
-    /// so nothing resets the per-peer counter `on_handshaked` checks on
-    /// every attempt — including one against a host this node already
-    /// completed five clean sessions with a moment ago.
-    ///
-    /// The guest sees exactly the user's report: `connect_phase` lands on
-    /// `Failed` with no §18 code at all — `on_closed` never sets
-    /// `connect_failure` for an ordinary transport close — which is what
-    /// `invite-view.ts::failureKey` falls back to `invite.failed` for: "The
-    /// connection ended before it was accepted."
+    /// docs/bugs/03-connection-list.md, tasks 1 and 2. H1 was confirmed by
+    /// this exact scenario failing before the fix: five connect/close-window
+    /// cycles inside a minute succeeded, and a sixth against the same host
+    /// in the same window was refused — `connect_phase` landed on `Failed`
+    /// with no §18 code at all, which `invite-view.ts::failureKey` renders
+    /// as "The connection ended before it was accepted", the user's exact
+    /// report. `on_closed` now forgets the consent-rate counter for a peer
+    /// whose session actually ran (`SessionManager::on_disconnect` returns
+    /// `Ok` only then — never for one only ever queued, which keeps the
+    /// limiter's protection against a peer that floods requests without
+    /// ever being granted a session), so reconnecting stays possible however
+    /// many times this cycle repeats within the minute.
     #[tokio::test(flavor = "multi_thread")]
-    async fn h1_five_reconnects_succeed_a_sixth_is_refused_by_the_rate_limiter() {
+    async fn h1_reconnecting_past_the_rate_limit_keeps_working_after_a_clean_session() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let recorder = Arc::new(RecordingWindows::default());
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        for attempt in 1..=CONSENT_RATE_PER_MINUTE {
+        // Twice CONSENT_RATE_PER_MINUTE, comfortably past where the bug used
+        // to bite on the very next cycle after the fifth.
+        for attempt in 1..=2 * CONSENT_RATE_PER_MINUTE {
             let invite = host.invite_create(Role::ViewOnly).await.unwrap();
             guest.invite_connect(invite.code).await.unwrap();
             let host_side_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -8575,17 +8583,12 @@ mod tests {
             // Closing the view window — the user's exact reported action.
             guest.revoke(guest_side_label).await.unwrap();
             wait_for_phase(&guest, ConnectPhase::Idle).await;
+            assert_eq!(
+                guest.connect_state().await.unwrap().phase,
+                ConnectPhase::Idle,
+                "attempt {attempt} did not settle cleanly"
+            );
         }
-
-        // The sixth attempt, same host, well inside the same minute.
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
-        guest.invite_connect(invite.code).await.unwrap();
-        wait_for_phase(&guest, ConnectPhase::Failed).await;
-        let state = guest.connect_state().await.unwrap();
-        assert_eq!(
-            state.code, None,
-            "a rate-limited handshake carries no §18 code — it is a bare transport close"
-        );
     }
 
     /// §21 punch-list item 6: the connect form has to know that a dial which
