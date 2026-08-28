@@ -15,6 +15,7 @@ import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './tool
 import { installHotkeys } from './view-hotkeys';
 import {
   clampPan,
+  cursorCssFor,
   cursorPlacement,
   decodeCursorShape,
   decodeViewFrame,
@@ -128,16 +129,23 @@ function cursorChannelLive(): boolean {
 }
 
 /**
- * Moves the cursor layer to the pointer, or hides it.
+ * Moves the cursor layer to the pointer, or hides it, and keeps the canvas's
+ * own `cursor` in step with it.
  *
  * Hidden whenever there is nothing honest to draw: no shape from the host, the
  * operator turned the overlay off, or the pointer is not over the picture.
  */
 function placeCursor(): void {
+  const visible = cursor !== null && localCursor && pointerAt !== null;
+  if (canvas) {
+    // The shape on the layer *is* the pointer while it is drawn, so the
+    // system one underneath has to go — and has to come back the moment it
+    // stops being drawn, or the toolbar becomes unusable.
+    canvas.style.cursor = cursorCssFor(cursor !== null, localCursor, pointerAt !== null);
+  }
   if (!cursorLayer) {
     return;
   }
-  const visible = cursor !== null && localCursor && pointerAt !== null;
   cursorLayer.hidden = !visible;
   if (!visible || !cursor || !pointerAt) {
     return;
