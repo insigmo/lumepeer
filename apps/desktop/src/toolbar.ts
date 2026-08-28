@@ -90,11 +90,18 @@ export const tauriToolbarCommands: ToolbarCommands = {
   },
   async monitorsList(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return (await invoke('monitors_list', { args: { peer } })) as MonitorDto[];
+    // A bare `peer`, not `{ args: { peer } }`: the Rust command takes the
+    // string as a command *parameter*, like `chat_transcript` and
+    // `clipboard_pull` do, and an `args` key would leave `peer` missing.
+    return (await invoke('monitors_list', { peer })) as MonitorDto[];
   },
   async monitorSelect(peer, monitorId) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('monitor_select', { args: { peer, monitorId } });
+    // `monitor_id`, not `monitorId`: Tauri converts the *parameter* names of a
+    // command, never the fields of a struct it deserializes, and
+    // `MonitorSelectArgs` is plain serde. snake_case on the IPC boundary is
+    // what the rest of this surface already uses (`since_us`, `code_required`).
+    return invoke('monitor_select', { args: { peer, monitor_id: monitorId } });
   },
 };
 
