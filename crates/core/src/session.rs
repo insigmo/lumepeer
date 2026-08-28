@@ -175,6 +175,17 @@ impl SessionManager {
         self.queue.push(peer, role)
     }
 
+    /// Forgets `peer`'s consent-request history, e.g. after a session with it
+    /// ended normally (docs/bugs/03-connection-list.md, task 2).
+    ///
+    /// The limiter stays private to this module — `crates/core` is the sole
+    /// authorization point — so a caller that needs to reset it after a
+    /// session ends goes through this wrapper rather than reaching into
+    /// `ConsentRateLimiter` directly.
+    pub fn forget_consent_rate(&mut self, peer: &NodeId) {
+        self.limiter.forget(peer);
+    }
+
     /// Grants `role` to `peer`, moving it to `Active`.
     ///
     /// # Errors
@@ -459,6 +470,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::constants::CONSENT_RATE_PER_MINUTE;
 
     fn peer(n: u8) -> NodeId {
         iroh_base::SecretKey::from_bytes(&[n; 32]).public()
@@ -487,6 +499,32 @@ mod tests {
             ));
             assert_eq!(manager.active_guest_count(), 1);
         }
+    }
+
+    /// docs/bugs/03-connection-list.md, task 2: a peer that completed a
+    /// clean session gets its consent-request counter forgotten, so a normal
+    /// reconnect right after does not inherit the count from the session
+    /// that just ended.
+    #[test]
+    fn forgetting_the_consent_rate_lets_a_sixth_request_through() {
+        let mut manager = SessionManager::new();
+        let who = peer(1);
+        // Each cycle resolves before the next request, the way a real
+        // grant-then-revoke does — `MAX_PENDING_CONSENTS` (unresolved
+        // requests) is a different, smaller limit than the rate limiter
+        // under test here, and would otherwise trip first.
+        for _ in 0..CONSENT_RATE_PER_MINUTE {
+            manager.request_consent(who).unwrap();
+            manager.grant(who, Role::ViewOnly).unwrap();
+            manager.revoke(who).unwrap();
+        }
+        assert!(matches!(
+            manager.request_consent(who),
+            Err(CoreError::ConsentRateLimited)
+        ));
+
+        manager.forget_consent_rate(&who);
+        assert!(manager.request_consent(who).is_ok());
     }
 
     #[test]
