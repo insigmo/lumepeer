@@ -74,7 +74,7 @@ describe('device credential form', () => {
 
     await vi.waitFor(() =>
       expect(invoke).toHaveBeenCalledWith('unattended_submit', {
-        args: { password: 'correct horse battery staple', code: '287082' },
+        args: { password: 'correct horse battery staple', code: '287082', remember: false },
       }),
     );
     // Nothing is left on screen to read, and nothing in the module keeps it.
@@ -93,7 +93,33 @@ describe('device credential form', () => {
 
     await vi.waitFor(() =>
       expect(invoke).toHaveBeenCalledWith('unattended_submit', {
-        args: { password: 'opensesame', code: null },
+        args: { password: 'opensesame', code: null, remember: false },
+      }),
+    );
+  });
+
+  // docs/bugs/02-connect-form.md, task 6 (D2): the box is off by default, and
+  // checking it is what turns the third argument on — the password itself
+  // never comes back from Rust, so this argument is the only thing this
+  // module's tests can pin about "remember" at all.
+  it('remember stays unchecked by default, and checking it flips the argument', async () => {
+    setConnectPhase('awaiting_credentials', null, false);
+    render(credentialsPanel('en'), container);
+    const remember = container.querySelector<HTMLInputElement>('#remember-password');
+    expect(remember?.checked).toBe(false);
+
+    const password = container.querySelector<HTMLInputElement>('#device-password');
+    if (password) {
+      password.value = 'opensesame';
+    }
+    if (remember) {
+      remember.checked = true;
+    }
+    submit();
+
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('unattended_submit', {
+        args: { password: 'opensesame', code: null, remember: true },
       }),
     );
   });

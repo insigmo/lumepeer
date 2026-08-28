@@ -370,6 +370,11 @@ pub struct ConnectStatusDto {
     /// count it down and must not pretend to know better than the host that
     /// is enforcing it.
     pub retry_secs: Option<u64>,
+    /// Whether the credential attempt in flight was started automatically
+    /// from a remembered password (docs/bugs/02-connect-form.md, task 6). The
+    /// form uses this to stay on its status line rather than popping the
+    /// credentials modal open for a host it already knows the password to.
+    pub credentials_auto: bool,
 }
 
 /// One saved device of the host's address book (§8; ADR 0034).
@@ -478,6 +483,10 @@ pub struct UnattendedSubmitArgs {
     /// The one-time code, when the host asked for one.
     #[serde(default)]
     pub code: Option<String>,
+    /// Whether to remember this password for this host in the OS keystore
+    /// (docs/bugs/02-connect-form.md, task 6; docs/bugs/DECISIONS.md D2).
+    #[serde(default)]
+    pub remember: bool,
 }
 
 /// Whether this host is ready to accept incoming connections.
@@ -711,6 +720,7 @@ pub async fn connect_status(
         code: snapshot.code,
         code_required: snapshot.code_required,
         retry_secs: snapshot.retry_secs,
+        credentials_auto: snapshot.credentials_auto,
     })
 }
 
@@ -1024,7 +1034,7 @@ pub async fn unattended_submit(
     check_window(&window)?;
     state
         .network
-        .unattended_submit(args.password, args.code)
+        .unattended_submit(args.password, args.code, args.remember)
         .await?;
     Ok(())
 }

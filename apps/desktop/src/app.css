@@ -1227,7 +1227,8 @@ button {
 }
 
 .unattended-totp,
-.book-trust {
+.book-trust,
+.credentials-remember {
   display: flex;
   align-items: center;
   gap: 8px;

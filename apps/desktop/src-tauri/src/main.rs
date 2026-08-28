@@ -21,6 +21,7 @@ mod connection_history;
 mod logging;
 mod network;
 mod recorder;
+mod remembered_password;
 mod service_control;
 mod unattended_store;
 mod view;

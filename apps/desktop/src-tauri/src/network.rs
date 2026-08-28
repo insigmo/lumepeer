@@ -52,6 +52,7 @@ use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::address_book_store::AddressBookStore;
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
+use crate::remembered_password::RememberedPasswordStore;
 use crate::unattended_store::UnattendedStore;
 use crate::view::{
     CursorFeed, EncodeControl, HostMedia, MediaFault, MediaHealth, MediaReport, MediaTarget,
@@ -373,6 +374,12 @@ pub struct ConnectSnapshot {
     pub code_required: bool,
     /// Seconds the host said to wait before trying again, after a lockout.
     pub retry_secs: Option<u64>,
+    /// Whether the credential attempt in flight was started automatically
+    /// from a remembered password, rather than by the user submitting the
+    /// form (docs/bugs/02-connect-form.md, task 6). The connect form uses
+    /// this to keep the credentials modal from flashing open for a host it
+    /// already knows the password to.
+    pub credentials_auto: bool,
 }
 
 /// One address-book device as the UI sees it (§8; ADR 0034).
@@ -781,11 +788,14 @@ enum ActorCommand {
     /// Guest side: answer the host's `UnattendedChallenge` (§8; ADR 0033).
     ///
     /// The password crosses this boundary once, from the field the user typed
-    /// it into to the wire, and is not stored on the way: no field of the
-    /// actor holds it, and the reply says only that it was sent.
+    /// it into to the wire; the reply says only that it was sent. A copy does
+    /// briefly live in `Actor::pending_remember` when `remember` is set — held
+    /// only until the grant or refusal lands, then either written to the
+    /// keystore or dropped (docs/bugs/02-connect-form.md, task 6).
     UnattendedSubmit {
         password: String,
         code: Option<String>,
+        remember: bool,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
 }
@@ -1477,12 +1487,14 @@ impl ActorHandle {
         &self,
         password: String,
         code: Option<String>,
+        remember: bool,
     ) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::UnattendedSubmit {
                 password,
                 code,
+                remember,
                 reply,
             })
             .await
@@ -2287,6 +2299,19 @@ struct Actor {
     /// told "could not connect" and nothing else, which is the report ADR 0026
     /// was written about (ADR 0027).
     connect_failure: Option<&'static str>,
+    /// Guest side: remembered device passwords, one per host (§8; ADR 0033;
+    /// docs/bugs/02-connect-form.md, task 6; docs/bugs/DECISIONS.md D2).
+    remembered_passwords: RememberedPasswordStore,
+    /// Guest side: the password of an outstanding `unattended_submit`, held
+    /// only until the host answers — saved to the keystore on a grant,
+    /// dropped on a refusal. Never read back out of this field; the one copy
+    /// that matters afterwards lives in the keystore, not here.
+    pending_remember: Option<String>,
+    /// Guest side: whether the credential attempt in flight was started
+    /// automatically from a remembered password, rather than by the user
+    /// submitting the form. The connect form uses this to keep the modal from
+    /// flashing open for a host it already knows the password to.
+    connect_credentials_auto: bool,
 }
 
 impl Actor {
@@ -3442,6 +3467,16 @@ impl Actor {
                 // (§15), and opening a media connection needs to know exactly
                 // which host granted.
                 self.settle_connect(peer, ConnectPhase::Connected);
+                // Only set when this grant followed a credential submission
+                // with "remember" checked (§8; ADR 0033; docs/bugs/02-connect-
+                // form.md, task 6) — a grant reached through the ordinary
+                // consent dialog leaves this `None` and nothing happens here.
+                if let Some(password) = self.pending_remember.take()
+                    && let Err(error) = self.remembered_passwords.save(&host_tag(&peer), &password)
+                {
+                    tracing::warn!(%error, "could not remember this device's password");
+                }
+                self.connect_credentials_auto = false;
                 self.start_view(peer, role);
             }
             MessageKind::ConsentRevoke => {
@@ -3610,7 +3645,19 @@ impl Actor {
                 self.connect_code_required = code_required;
                 self.connect_failure = None;
                 self.connect_retry_secs = None;
+                self.connect_credentials_auto = false;
                 let _ = self.notify.send(ActorNotification::UnattendedChallenge);
+                // A remembered password is tried once, automatically, without
+                // ever showing the modal — but never when a second factor is
+                // also required: that one is never saved, so there would be
+                // nothing to answer with anyway (docs/bugs/02-connect-form.md,
+                // task 6; docs/bugs/DECISIONS.md D2).
+                if !code_required
+                    && let Ok(Some(password)) = self.remembered_passwords.load(&host_tag(&peer))
+                {
+                    self.connect_credentials_auto = true;
+                    let _ = self.on_unattended_submit(&password, None, false);
+                }
             }
             // Host side: a guest answered the challenge.
             MessageKind::UnattendedAuth {
@@ -3624,6 +3671,18 @@ impl Actor {
             MessageKind::UnattendedReject(reason) => {
                 if self.connect_peer != Some(peer) {
                     return;
+                }
+                // A submitted password that turned out wrong is not worth
+                // remembering, and a remembered one that was just refused is
+                // worth forgetting — silently retrying it would only burn the
+                // consent-rate budget on a password already known to be wrong
+                // (docs/bugs/02-connect-form.md, task 6).
+                self.pending_remember = None;
+                if self.connect_credentials_auto {
+                    self.connect_credentials_auto = false;
+                    if let Err(error) = self.remembered_passwords.forget(&host_tag(&peer)) {
+                        tracing::warn!(%error, "could not forget a refused remembered password");
+                    }
                 }
                 let (code, retry_secs) = match reason {
                     UnattendedRejection::BadPassword => ("UNATTENDED_BAD_PASSWORD", None),
@@ -3865,6 +3924,7 @@ impl Actor {
                     code: self.connect_failure,
                     code_required: self.connect_code_required,
                     retry_secs: self.connect_retry_secs,
+                    credentials_auto: self.connect_credentials_auto,
                 });
             }
             ActorCommand::ConnectCancel { reply } => {
@@ -4025,9 +4085,10 @@ impl Actor {
             ActorCommand::UnattendedSubmit {
                 password,
                 code,
+                remember,
                 reply,
             } => {
-                let _ = reply.send(self.on_unattended_submit(&password, code));
+                let _ = reply.send(self.on_unattended_submit(&password, code, remember));
             }
         }
     }
@@ -5675,17 +5736,22 @@ impl Actor {
         self.connect_failure = None;
         self.connect_code_required = false;
         self.connect_retry_secs = None;
+        self.pending_remember = None;
+        self.connect_credentials_auto = false;
     }
 
     /// Guest side: answers the host's credential challenge (§8; ADR 0033).
     ///
-    /// The password reaches the wire and stops there: no field of this actor
-    /// holds it afterwards, and the reply says only that it went out. Whether
-    /// it was right comes back as a grant or a rejection.
+    /// The password reaches the wire and stops there as far as this method is
+    /// concerned; the reply says only that it went out. Whether it was right
+    /// comes back as a grant or a rejection, which is also where `remember`
+    /// takes effect — see `pending_remember` (docs/bugs/02-connect-form.md,
+    /// task 6).
     fn on_unattended_submit(
         &mut self,
         password: &str,
         code: Option<String>,
+        remember: bool,
     ) -> Result<(), ActorError> {
         if self.connect_phase != ConnectPhase::AwaitingCredentials {
             return Err(ActorError::Core(CoreError::NotPermitted));
@@ -5693,6 +5759,7 @@ impl Actor {
         let peer = self.connect_peer.ok_or(ActorError::UnknownPeer)?;
         self.connect_failure = None;
         self.connect_retry_secs = None;
+        self.pending_remember = remember.then(|| password.to_owned());
         self.send_to(
             &peer,
             MessageKind::UnattendedAuth {
@@ -5757,6 +5824,13 @@ impl Actor {
         self.connect_phase = ConnectPhase::Dialing;
         self.connect_peer = Some(addr.id);
         self.connect_failure = None;
+        // A previous attempt that never reached a grant or a refusal — the
+        // transport dropped mid-credential-exchange, say — could otherwise
+        // leave a stale password or auto-submit flag behind for this new,
+        // possibly different, host to inherit (docs/bugs/02-connect-form.md,
+        // task 6).
+        self.pending_remember = None;
+        self.connect_credentials_auto = false;
 
         let endpoint = self.endpoint.clone();
         let tx = self.events_tx.clone();
@@ -6344,6 +6418,13 @@ pub async fn spawn_actor(
         PeerEndpoint::bind_with_lan(secret_key, relay).await?
     };
     let audit = open_audit_log(&app, store.as_ref()).await;
+    // A second, independent handle on the same keystore: every native backend
+    // opens its own connection per operation rather than holding one open
+    // (see e.g. `SecretServiceKeystore`'s own doc comment), so this costs
+    // nothing beyond what `UnattendedStore` below already pays, and it is
+    // what lets the two stores own their `Box<dyn Keystore>` outright instead
+    // of sharing one behind an `Arc` (docs/bugs/02-connect-form.md, task 6).
+    let remembered_password_keystore = open_keystore()?;
     let stores = ActorStores {
         history_path: connection_history_path(&app),
         address_book_path: address_book_path(),
@@ -6351,6 +6432,7 @@ pub async fn spawn_actor(
         // hash and TOTP secret are secret material and `CLAUDE.md` keeps
         // secrets out of `config/*.toml` (§11.2; ADR 0033).
         keystore: store,
+        remembered_password_keystore,
         audit,
     };
 
@@ -6505,6 +6587,12 @@ pub struct ActorStores {
     /// in the real application, an in-memory stand-in in tests — never a
     /// config file, which `CLAUDE.md` rules out for secrets.
     pub keystore: Box<dyn Keystore>,
+    /// Where remembered device passwords live (docs/bugs/02-connect-form.md,
+    /// task 6). A second, independent keystore handle rather than a second
+    /// owner of `keystore` above: every native backend opens its own
+    /// connection per operation and holds no state between calls, so a second
+    /// `open()` is exactly as cheap and needs no shared ownership.
+    pub remembered_password_keystore: Box<dyn Keystore>,
     /// The audit log, when one could be opened (§15; ADR 0041).
     ///
     /// `None` is the ordinary degraded state: no data directory, or a database
@@ -6523,7 +6611,7 @@ impl std::fmt::Debug for ActorStores {
 
 impl ActorStores {
     /// Stores that keep nothing after the process ends: no history file, no
-    /// address book file, and an in-memory keystore.
+    /// address book file, and in-memory keystores.
     #[cfg(test)]
     #[must_use]
     pub fn in_memory() -> Self {
@@ -6531,6 +6619,7 @@ impl ActorStores {
             history_path: None,
             address_book_path: None,
             keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
+            remembered_password_keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
             audit: None,
         }
     }
@@ -6559,8 +6648,10 @@ pub fn spawn_actor_with(
         history_path,
         address_book_path,
         keystore,
+        remembered_password_keystore,
         audit,
     } = stores;
+    let remembered_passwords = RememberedPasswordStore::new(remembered_password_keystore);
     // One log, two handles: the actor writes through the `AuditSink` contract,
     // the IPC commands read through the handle below (§15; ADR 0041).
     let audit_reader = audit.clone();
@@ -6665,6 +6756,9 @@ pub fn spawn_actor_with(
         connect_phase: ConnectPhase::Idle,
         connect_peer: None,
         connect_failure: None,
+        remembered_passwords,
+        pending_remember: None,
+        connect_credentials_auto: false,
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -7710,7 +7804,7 @@ mod tests {
         );
 
         guest
-            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
             .await
             .unwrap();
         wait_for_phase(&guest, ConnectPhase::Connected).await;
@@ -7721,6 +7815,85 @@ mod tests {
             .find(|row| row.label == label && row.state == SessionStateDto::Active)
             .expect("the admitted session is active on the host");
         assert_eq!(session.role, Role::ViewOnly, "the host's configured role");
+    }
+
+    /// docs/bugs/02-connect-form.md, task 6 (D2): a password remembered with
+    /// "remember" checked is submitted automatically on the next connect to
+    /// the same host — the guest never has to answer the credential form a
+    /// second time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remembered_password_signs_in_again_without_a_second_submission() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, true)
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        // End the session so the guest is free to dial the same host again.
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        // No second `unattended_submit` call anywhere in this test: if the
+        // remembered password were not tried automatically, the guest would
+        // sit in `AwaitingCredentials` forever and this wait would time out.
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+    }
+
+    /// docs/bugs/02-connect-form.md, task 6: an auto-submitted password the
+    /// host no longer accepts must not be retried silently (that would burn
+    /// the consent-rate budget on a password already known to be wrong) — it
+    /// falls back to the ordinary credential form for a human to answer, and
+    /// the stale entry is forgotten rather than tried again next time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_remembered_password_falls_back_to_the_modal_instead_of_retrying() {
+        const NEW_PASSWORD: &str = "a completely different passphrase";
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, true)
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+
+        // The host's password changes; the guest's remembered copy is now
+        // stale.
+        host.unattended_set_password(NEW_PASSWORD.to_owned())
+            .await
+            .unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let state = wait_for_refusal(&guest, "UNATTENDED_BAD_PASSWORD").await;
+        assert_eq!(state.phase, ConnectPhase::AwaitingCredentials);
+        assert!(
+            !state.credentials_auto,
+            "a refused auto-submit must fall back to showing the modal, not retry unseen"
+        );
+
+        // A human can still sign in with the new password — the failed
+        // auto-attempt did not consume the credential form's own retry.
+        guest
+            .unattended_submit(NEW_PASSWORD.to_owned(), None, false)
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
     }
 
     /// §8.2: passing the password is admission, not a blanket permission. The
@@ -7737,7 +7910,7 @@ mod tests {
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         guest
-            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
             .await
             .unwrap();
         wait_for_phase(&guest, ConnectPhase::Connected).await;
@@ -7817,7 +7990,7 @@ mod tests {
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
 
         guest
-            .unattended_submit("not the password at all".to_owned(), None)
+            .unattended_submit("not the password at all".to_owned(), None, false)
             .await
             .unwrap();
 
@@ -7886,7 +8059,7 @@ mod tests {
 
         for _ in 0..UNATTENDED_MAX_FAILED_ATTEMPTS {
             guest
-                .unattended_submit("not the password".to_owned(), None)
+                .unattended_submit("not the password".to_owned(), None, false)
                 .await
                 .unwrap();
             // Each refusal leaves the guest on the form: a mistyped password
@@ -7895,7 +8068,7 @@ mod tests {
         }
 
         guest
-            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
             .await
             .unwrap();
         let state = wait_for_refusal(&guest, "UNATTENDED_LOCKED_OUT").await;
@@ -7988,7 +8161,7 @@ mod tests {
         );
 
         guest
-            .unattended_submit(DEVICE_PASSWORD.to_owned(), None)
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + TIMEOUT;
