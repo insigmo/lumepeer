@@ -331,8 +331,10 @@ pub struct HistoryEntryDto {
     pub peer_label: String,
     /// Role the host last granted.
     pub role: RoleDto,
-    /// Unix seconds the last session with this host ended.
-    pub ended_at: u64,
+    /// Unix seconds this row was last written — a connect or a disconnect,
+    /// whichever happened most recently (docs/bugs/03-connection-list.md,
+    /// task 4).
+    pub last_seen_at: u64,
 }
 
 /// Argument of [`history_connect`].
@@ -676,7 +678,7 @@ pub async fn connection_history(
         .map(|e| HistoryEntryDto {
             peer_label: e.peer_label,
             role: e.role.into(),
-            ended_at: e.ended_at,
+            last_seen_at: e.last_seen_at,
         })
         .collect())
 }

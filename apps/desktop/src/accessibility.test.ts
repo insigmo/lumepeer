@@ -97,7 +97,7 @@ describe('accessibility: session status', () => {
         { peer_label: 'guest-ab12', role: 'full_control', input: true, state: 'active', ...noGrants },
       ];
       const history: HistoryEntry[] = [
-        { peer_label: 'guest-cd34', role: 'view_only', ended_at: Math.floor(Date.now() / 1000) - 120 },
+        { peer_label: 'guest-cd34', role: 'view_only', last_seen_at: Math.floor(Date.now() / 1000) - 120 },
       ];
       render(sessionStatus(sessions, locale, undefined, history), container);
       expect(await auditViolations(container)).toEqual([]);

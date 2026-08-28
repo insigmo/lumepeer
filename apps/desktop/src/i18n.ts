@@ -114,10 +114,10 @@ export type TranslationKey =
   | 'system.serviceFailed'
   | 'status.clipboardSynced'
   | 'status.reconnect'
-  | 'status.endedJustNow'
-  | 'status.endedMinutesAgo'
-  | 'status.endedHoursAgo'
-  | 'status.endedDaysAgo'
+  | 'status.lastSeenJustNow'
+  | 'status.lastSeenMinutesAgo'
+  | 'status.lastSeenHoursAgo'
+  | 'status.lastSeenDaysAgo'
   | 'status.role.viewOnly'
   | 'status.role.controlLimited'
   | 'status.role.fullControl'
@@ -383,10 +383,10 @@ const en: Dictionary = {
   'system.serviceFailed': 'The helper service was not changed. Administrator permission is needed.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
-  'status.endedJustNow': 'Ended just now',
-  'status.endedMinutesAgo': (n) => `Ended ${n}m ago`,
-  'status.endedHoursAgo': (n) => `Ended ${n}h ago`,
-  'status.endedDaysAgo': (n) => `Ended ${n}d ago`,
+  'status.lastSeenJustNow': 'Last seen just now',
+  'status.lastSeenMinutesAgo': (n) => `Last seen ${n}m ago`,
+  'status.lastSeenHoursAgo': (n) => `Last seen ${n}h ago`,
+  'status.lastSeenDaysAgo': (n) => `Last seen ${n}d ago`,
   'status.role.viewOnly': 'view only',
   'status.role.controlLimited': 'limited control',
   'status.role.fullControl': 'full control',
@@ -657,10 +657,10 @@ const ar: Dictionary = {
   'system.serviceFailed': 'لم تتغيّر الخدمة المساعدة. يلزم إذن المسؤول.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
-  'status.endedJustNow': 'انتهت للتو',
-  'status.endedMinutesAgo': (n) => `انتهت قبل ${n} د`,
-  'status.endedHoursAgo': (n) => `انتهت قبل ${n} س`,
-  'status.endedDaysAgo': (n) => `انتهت قبل ${n} يوم`,
+  'status.lastSeenJustNow': 'آخر ظهور قبل قليل',
+  'status.lastSeenMinutesAgo': (n) => `آخر ظهور قبل ${n} د`,
+  'status.lastSeenHoursAgo': (n) => `آخر ظهور قبل ${n} س`,
+  'status.lastSeenDaysAgo': (n) => `آخر ظهور قبل ${n} يوم`,
   'status.role.viewOnly': 'مشاهدة فقط',
   'status.role.controlLimited': 'تحكم محدود',
   'status.role.fullControl': 'تحكم كامل',
