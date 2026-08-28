@@ -136,11 +136,16 @@ fn setup_app(
     } else {
         tracing::warn!("no usable update manifest URL configured; updates are off");
     }
+    let notifications = network.subscribe();
     app.manage(AppState {
         network,
         update_url,
         autostart: autostart::Autostart::for_this_app(),
     });
+    runtime.spawn(watch_for_consent_requests(
+        app.handle().clone(),
+        notifications,
+    ));
     // The runtime owns every actor and connection task; dropping it here would
     // abort all of them.
     app.manage(runtime);
@@ -148,6 +153,47 @@ fn setup_app(
     install_tray(app)?;
 
     Ok(())
+}
+
+/// Puts the host's window in front of them when a guest asks to connect.
+///
+/// Without this the consent dialog renders into a window that is hidden in the
+/// tray or simply behind something else, and the guest waits in
+/// `awaiting_consent` until the host happens to look. Nothing else is done
+/// with the notification: showing the window is not deciding anything, and the
+/// decision stays with the person in the dialog (§8).
+///
+/// [`ActorNotification`](network::ActorNotification) deliberately carries no
+/// peer identity (§15) and does not need to: the dialog already polls
+/// `session_status` for the label.
+async fn watch_for_consent_requests(
+    app: tauri::AppHandle,
+    mut notifications: tokio::sync::broadcast::Receiver<network::ActorNotification>,
+) {
+    use tauri::Manager as _;
+    use tokio::sync::broadcast::error::RecvError;
+
+    loop {
+        match notifications.recv().await {
+            Ok(network::ActorNotification::ConsentRequested) => {
+                focus_main_window(&app);
+                // Raising the window can lose to the foreground-lock rules of
+                // the platform when the user is busy elsewhere. The taskbar
+                // button flashing is the fallback that still gets noticed.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+                }
+            }
+            Ok(_) => {}
+            // A burst of notifications outran this listener. The ones that
+            // were dropped are gone, but the next request must still raise the
+            // window, so keep reading.
+            Err(RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "consent-request listener fell behind");
+            }
+            Err(RecvError::Closed) => return,
+        }
+    }
 }
 
 fn main() {
