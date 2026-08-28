@@ -113,4 +113,8 @@ pub mod close_code {
     pub const MALFORMED: &str = "MALFORMED";
     /// Host cannot queue another consent decision (§8.1, §9.2).
     pub const CONSENT_UNAVAILABLE: &str = "CONSENT_UNAVAILABLE";
+    /// This node is ending the connection on purpose, not reporting a fault
+    /// (docs/bugs/02-connect-form.md task 3, docs/bugs/03-connection-list.md
+    /// task 3).
+    pub const NORMAL: &str = "NORMAL";
 }

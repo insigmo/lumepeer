@@ -43,6 +43,7 @@
     "allow-connection-history",
     "allow-history-connect",
     "allow-connect-status",
+    "allow-connect-cancel",
     "allow-network-status",
     "allow-connection-stats",
     "allow-license-status",

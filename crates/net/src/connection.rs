@@ -412,6 +412,11 @@ pub const CLOSE_REPLAY_OR_ORDER: u32 = 4;
 /// QUIC application close code for a host that cannot take another consent
 /// decision right now: queue full or per-peer rate limit (§8.1, §9.2).
 pub const CLOSE_CONSENT_UNAVAILABLE: u32 = 5;
+/// QUIC application close code for a connection this node is ending on
+/// purpose — the user cancelled a connect attempt or left a session from the
+/// view window — as opposed to a protocol violation (docs/bugs/02-connect-form.md
+/// task 3, docs/bugs/03-connection-list.md task 3; §18).
+pub const CLOSE_NORMAL: u32 = 6;
 
 /// Close code and reason string that a framing error must close the stream
 /// with (§9.1, §18).
