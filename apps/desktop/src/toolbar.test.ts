@@ -1,14 +1,12 @@
 // apps/desktop/src/toolbar.test.ts
 //
 // The floating session toolbar (§11) in jsdom: collapse/expand, popover
-// toggling, the resolution placeholder, the monitor picker, and the mic/CAD
-// command paths. Every command is a spy, so the state machine is tested
+// toggling, the monitor picker, and the mic/CAD command paths. Every command is a spy, so the state machine is tested
 // without Tauri — the same shape `chat.test.ts` uses.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { t } from './i18n';
 import {
-  RESOLUTION_CHOICES,
   mountToolbar,
   renderToolbar,
   type MonitorDto,
@@ -116,10 +114,6 @@ function draw(
     },
     openPopover: (which) => {
       state.openPopover = which;
-      draw(state, commands, hooks);
-    },
-    setResolution: (value) => {
-      state.resolution = value;
       draw(state, commands, hooks);
     },
     setDisplayMode: (mode) => {
@@ -336,20 +330,6 @@ describe('the floating session toolbar', () => {
     }
     // The drag handle stays: the collapsed pill is still draggable.
     expect(container.querySelector('[data-testid="toolbar-handle"]')).not.toBeNull();
-  });
-
-  it('the settings popover offers the resolution choices and records the pick', () => {
-    const state = {
-      collapsed: false,
-      openPopover: 'settings' as const,
-      resolution: RESOLUTION_CHOICES[0],
-    } as Parameters<typeof renderToolbar>[1];
-    draw(state);
-    const select = container.querySelector<HTMLSelectElement>(
-      '[data-testid="toolbar-resolution"]',
-    );
-    expect(select).not.toBeNull();
-    expect(select!.options).toHaveLength(RESOLUTION_CHOICES.length);
   });
 
   it('marks the chat button while a message is unread, and only while the panel is closed', () => {
