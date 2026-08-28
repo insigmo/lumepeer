@@ -268,11 +268,14 @@ export function unattendedSettings(
 }
 
 /**
- * The banner that cannot be dismissed while unattended access is on.
+ * The line that cannot be dismissed while unattended access is on.
  *
  * §2 allows a host to answer with credentials instead of a click; it does not
  * allow that to be invisible. There is no close button here and no state that
  * could hide it: the only way to make it go away is to turn the feature off.
+ * Lives in the sidebar (docs/bugs/05-settings-window.md, task 5; DECISIONS.md
+ * D1) as one compact line — the full explanation is on `title` rather than in
+ * the visible text.
  */
 export function unattendedIndicator(
   status: UnattendedStatus,
@@ -282,7 +285,12 @@ export function unattendedIndicator(
     return nothing;
   }
   return html`
-    <p class="unattended-indicator" role="status" data-testid="unattended-indicator">
+    <p
+      class="unattended-indicator"
+      role="status"
+      data-testid="unattended-indicator"
+      title=${t(locale, 'unattended.indicator.title')}
+    >
       ${t(locale, 'unattended.indicator')}
     </p>
   `;

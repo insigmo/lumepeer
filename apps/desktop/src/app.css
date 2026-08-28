@@ -332,6 +332,28 @@ button {
   color: var(--text-secondary);
 }
 
+.settings-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  width: 22px;
+  height: 22px;
+  padding: 3px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings-btn:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-heading);
+}
+
+.settings-btn svg {
+  width: 100%;
+  height: 100%;
+}
+
 /* ---------- Main panel ---------- */
 .main-panel {
   flex: 1;
@@ -1045,6 +1067,100 @@ button {
   margin: 0 0 8px;
 }
 
+/* ---------- Settings screen (docs/bugs/05-settings-window.md) ----------
+   Same backdrop/surface language as the consent and credentials modals, but
+   wide and scrollable: it hosts the panels that used to run down the main
+   panel (address book, unattended access, recordings, audit log, this
+   device), not a single form. */
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(11, 18, 32, 0.45);
+}
+
+.settings-backdrop .settings-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-bg);
+  border-radius: 14px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  max-width: 560px;
+  width: 100%;
+  max-height: min(720px, 90vh);
+}
+
+.settings-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border-block-end: 1px solid var(--border-subtle);
+}
+
+.settings-head h2 {
+  font-size: var(--fs-emphasis);
+  font-weight: 700;
+  margin: 0;
+}
+
+.settings-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #6b7280;
+  font-size: 18px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.settings-close:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-heading);
+}
+
+.settings-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px 24px;
+}
+
+.invite-refresh {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--sidebar-bg);
+}
+
+.invite-refresh-btn {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: #fff;
+  color: var(--text-heading);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.invite-refresh-note {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+}
+
 /* Session recording (§17). Permission is the switch in `.session-grants`;
    these are the act, and the indicator that goes with it. Neither the banner
    nor the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
@@ -1158,19 +1274,26 @@ button {
 
 /* Unattended access (§8; ADR 0033) and the host address book (ADR 0034). */
 
-/* The banner that says an unattended login is possible. It has no dismiss
-   control on purpose: "no hidden capture" means the host machine says so on
-   its own screen for as long as the door is open, and the only way to make
-   this go away is to turn the feature off. */
+/* The compact sidebar line that says an unattended login is possible
+   (DECISIONS.md D1). It has no dismiss control on purpose: "no hidden
+   capture" means the host machine says so on its own screen for as long as
+   the door is open, and the only way to make this go away is to turn the
+   feature off. One line, `.footer-tag`-sized — not a block, not a frame. */
 .unattended-indicator {
-  margin: 0 0 10px;
-  padding: 9px 12px;
-  border: 1px solid var(--amber, #c8891f);
-  border-inline-start-width: 3px;
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--amber, #c8891f) 8%, transparent);
-  color: var(--text-heading);
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--fs-micro);
+  color: var(--amber, #c8891f);
+}
+
+.unattended-indicator::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--amber, #c8891f);
 }
 
 .unattended-panel,

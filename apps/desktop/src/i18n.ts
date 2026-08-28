@@ -19,6 +19,7 @@ export type TranslationKey =
   | 'invite.heading'
   | 'invite.create'
   | 'invite.refresh'
+  | 'invite.refresh.note'
   | 'invite.connectLabel'
   | 'invite.connect'
   | 'invite.connectPlaceholder'
@@ -134,6 +135,9 @@ export type TranslationKey =
   | 'sidebar.copyCode'
   | 'sidebar.copied'
   | 'sidebar.serverless'
+  | 'sidebar.settings'
+  | 'settings.heading'
+  | 'settings.close'
   | 'panel.heading'
   | 'panel.subtext'
   | 'connections.header'
@@ -201,6 +205,7 @@ export type TranslationKey =
   | 'unattended.heading'
   | 'unattended.explain'
   | 'unattended.indicator'
+  | 'unattended.indicator.title'
   | 'unattended.state.on'
   | 'unattended.state.off'
   | 'unattended.password.label'
@@ -283,7 +288,8 @@ const en: Dictionary = {
   'invite.create': 'Create invite',
   // Used by the settings window (docs/bugs/05); the sidebar no longer offers
   // it, because reissuing retires every code already handed out (ADR 0016).
-  'invite.refresh': 'Refresh invite',
+  'invite.refresh': 'Revoke current code and issue a new one',
+  'invite.refresh.note': 'The old code will stop working.',
   'invite.connectLabel': 'Enter invite code:',
   'invite.connect': 'Connect',
   'invite.connectPlaceholder': 'Paste invite code here',
@@ -406,7 +412,10 @@ const en: Dictionary = {
   'sidebar.inviteLabel': 'Your invite code',
   'sidebar.copyCode': 'Copy invite code',
   'sidebar.copied': 'Copied',
-  'sidebar.serverless': 'P2P · serverless',
+  'sidebar.serverless': 'Serverless',
+  'sidebar.settings': 'Settings',
+  'settings.heading': 'Settings',
+  'settings.close': 'Close settings',
   'panel.heading': 'Connect to device',
   'panel.subtext': 'Paste an invite code to connect to a remote device.',
   'connections.header': 'Connections',
@@ -480,7 +489,9 @@ const en: Dictionary = {
   'toolbar.hotkey.toggle-toolbar': 'Collapse or expand this toolbar',
   'unattended.heading': 'Unattended access',
   'unattended.explain': 'With this on, a device you have marked trusted can start a session by entering this device password — nobody has to be sitting here to approve it. This banner stays up whenever it is on.',
-  'unattended.indicator': 'Unattended access is on: trusted devices can connect with the device password.',
+  'unattended.indicator': 'Unattended access is on',
+  'unattended.indicator.title':
+    'Unattended access is on: trusted devices can connect with the device password.',
   'unattended.state.on': 'On',
   'unattended.state.off': 'Off',
   'unattended.password.label': 'Device password',
@@ -563,7 +574,8 @@ const ar: Dictionary = {
   'consent.action.allowFull': 'السماح بالتحكم الكامل',
   'invite.heading': 'الدعوة والاتصال',
   'invite.create': 'إنشاء دعوة',
-  'invite.refresh': 'تحديث الدعوة',
+  'invite.refresh': 'إبطال الرمز الحالي وإصدار رمز جديد',
+  'invite.refresh.note': 'لن يعمل الرمز القديم بعد الآن.',
   'invite.connectLabel': 'أدخل رمز الدعوة:',
   'invite.connect': 'الاتصال',
   'invite.connectPlaceholder': 'الصق رمز الدعوة هنا',
@@ -682,7 +694,10 @@ const ar: Dictionary = {
   'sidebar.inviteLabel': 'رمز الدعوة الخاص بك',
   'sidebar.copyCode': 'نسخ رمز الدعوة',
   'sidebar.copied': 'تم النسخ',
-  'sidebar.serverless': 'اتصال مباشر · بلا خوادم',
+  'sidebar.serverless': 'بلا خوادم',
+  'sidebar.settings': 'الإعدادات',
+  'settings.heading': 'الإعدادات',
+  'settings.close': 'إغلاق الإعدادات',
   'panel.heading': 'الاتصال بجهاز',
   'panel.subtext': 'الصق رمز الدعوة للاتصال بجهاز بعيد.',
   'connections.header': 'الاتصالات',
@@ -751,7 +766,9 @@ const ar: Dictionary = {
   'toolbar.hotkey.toggle-toolbar': 'طي شريط الأدوات أو توسيعه',
   'unattended.heading': 'الوصول دون حضور',
   'unattended.explain': 'عند تفعيله يمكن لجهاز وثّقته أن يبدأ جلسة بإدخال كلمة مرور هذا الجهاز، دون حاجة إلى موافقة أحد هنا. يبقى هذا التنبيه ظاهرًا ما دام مفعّلًا.',
-  'unattended.indicator': 'الوصول دون حضور مفعّل: يمكن للأجهزة الموثوقة الاتصال بكلمة مرور الجهاز.',
+  'unattended.indicator': 'الوصول دون حضور مفعّل',
+  'unattended.indicator.title':
+    'الوصول دون حضور مفعّل: يمكن للأجهزة الموثوقة الاتصال بكلمة مرور الجهاز.',
   'unattended.state.on': 'مفعّل',
   'unattended.state.off': 'متوقف',
   'unattended.password.label': 'كلمة مرور الجهاز',
