@@ -363,7 +363,7 @@ describe('credentials form: a refused password can be corrected', () => {
     submitCredentials('wrong-password');
     await settle();
     expect(invoke).toHaveBeenCalledWith('unattended_submit', {
-      args: { password: 'wrong-password', code: null },
+      args: { password: 'wrong-password', code: null, remember: false },
     });
 
     view.setConnectPhase('awaiting_credentials', 'UNATTENDED_BAD_PASSWORD');
@@ -373,7 +373,7 @@ describe('credentials form: a refused password can be corrected', () => {
     submitCredentials('right-password');
     await settle();
     expect(invoke).toHaveBeenCalledWith('unattended_submit', {
-      args: { password: 'right-password', code: null },
+      args: { password: 'right-password', code: null, remember: false },
     });
 
     view.setConnectPhase('connected');

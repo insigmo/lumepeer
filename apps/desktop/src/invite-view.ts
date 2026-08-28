@@ -104,6 +104,17 @@ export function isAwaitingCredentials(): boolean {
 }
 
 /**
+ * Whether the credential attempt in flight was started automatically from a
+ * remembered password, rather than by the user submitting the form
+ * (docs/bugs/02-connect-form.md, task 6). `main.ts` uses this to keep the
+ * credentials modal from popping open for a host it already knows the
+ * password to — the status line under the connect form is enough.
+ */
+export function isCredentialsAuto(): boolean {
+  return phase === 'awaiting_credentials' && credentialsAuto;
+}
+
+/**
  * Called by main.ts on every poll of `connect_status`.
  *
  * `code` is the §18 classification of a failure, present only with
@@ -116,6 +127,7 @@ export function setConnectPhase(
   code?: string | null,
   codeRequired = false,
   retrySecs?: number | null,
+  auto = false,
 ): void {
   const nextError = failureKey(next, code);
   const unchanged =
@@ -123,9 +135,11 @@ export function setConnectPhase(
     nextError === connectError &&
     codeRequired === credentialCodeRequired &&
     (retrySecs ?? undefined) === credentialRetrySecs &&
-    (code ?? undefined) === credentialCode;
+    (code ?? undefined) === credentialCode &&
+    auto === credentialsAuto;
   credentialCodeRequired = codeRequired;
   credentialRetrySecs = retrySecs ?? undefined;
+  credentialsAuto = auto;
   const previousCredentialCode = credentialCode;
   credentialCode = next === 'awaiting_credentials' ? (code ?? undefined) : undefined;
   if (submitting && (next !== 'awaiting_credentials' || credentialCode !== undefined)) {
@@ -157,6 +171,8 @@ export function setConnectPhase(
   notify();
 }
 
+/** Whether the outstanding credential attempt was started automatically. */
+let credentialsAuto = false;
 /** Whether the host's challenge asked for a one-time code as well. */
 let credentialCodeRequired = false;
 /** Seconds the host said to wait, after a lockout. */
@@ -189,7 +205,12 @@ function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | 
  *
  * The password lives in the field and in the one IPC call that carries it. It
  * is cleared as soon as that call is made, and nothing in this module keeps a
- * copy — a wrong password means retyping it, which is the correct trade.
+ * copy — a wrong password means retyping it, which is the correct trade. That
+ * is a statement about this module, not about the system: when "remember" is
+ * checked, a copy does reach the OS keystore, on the Rust side, on a grant
+ * (docs/bugs/02-connect-form.md, task 6; docs/bugs/DECISIONS.md D2). It is
+ * never returned to this module — reconnecting to the same host substitutes
+ * it in Rust, without the password ever crossing back into the webview.
  */
 export function credentialsPanel(locale: Locale): TemplateResult {
   const errorKey = credentialCode ? CREDENTIAL_ERROR_TEXT[credentialCode] : undefined;
@@ -225,13 +246,15 @@ export function credentialsPanel(locale: Locale): TemplateResult {
             const form = event.target as HTMLFormElement;
             const passwordField = form.elements.namedItem('device-password') as HTMLInputElement;
             const codeField = form.elements.namedItem('device-code') as HTMLInputElement | null;
+            const rememberField = form.elements.namedItem('remember-password') as HTMLInputElement | null;
             const password = passwordField.value;
             const code = codeField?.value ?? '';
+            const remember = rememberField?.checked ?? false;
             passwordField.value = '';
             if (codeField) {
               codeField.value = '';
             }
-            void submitCredentials(password, code);
+            void submitCredentials(password, code, remember);
           }}
         >
           <label for="device-password">${t(locale, 'creds.password.label')}</label>
@@ -255,6 +278,10 @@ export function credentialsPanel(locale: Locale): TemplateResult {
                 />
               `
             : ''}
+          <label class="credentials-remember" for="remember-password">
+            <input id="remember-password" name="remember-password" type="checkbox" />
+            ${t(locale, 'creds.remember')}
+          </label>
           <button type="submit" class="credentials-submit" ?disabled=${submitting}>
             ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
           </button>
@@ -267,14 +294,14 @@ export function credentialsPanel(locale: Locale): TemplateResult {
   `;
 }
 
-async function submitCredentials(password: string, code: string): Promise<void> {
+async function submitCredentials(password: string, code: string, remember = false): Promise<void> {
   submitting = true;
   credentialCode = undefined;
   notify();
   try {
     const invoke = await invoker();
     await invoke('unattended_submit', {
-      args: { password, code: credentialCodeRequired ? code : null },
+      args: { password, code: credentialCodeRequired ? code : null, remember },
     });
   } catch (error) {
     // The call itself failed — the session went away, or nothing was waiting

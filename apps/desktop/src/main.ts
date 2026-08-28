@@ -22,6 +22,7 @@ import {
   inviteCodePanel,
   isAwaitingCredentials,
   isConnecting,
+  isCredentialsAuto,
   onInviteStateChange,
   reconnect,
   setConnectPhase,
@@ -244,7 +245,7 @@ function renderNow(): void {
         </div>
       `,
       consentDialog(pendingRequest, locale),
-      isAwaitingCredentials() ? credentialsPanel(locale) : '',
+      isAwaitingCredentials() && !isCredentialsAuto() ? credentialsPanel(locale) : '',
     ],
     root as HTMLElement,
   );
@@ -293,6 +294,7 @@ async function refresh(): Promise<void> {
           code: string | null;
           code_required: boolean;
           retry_secs: number | null;
+          credentials_auto: boolean;
         }>('connect_status'),
         invoke<UnattendedStatus>('unattended_status'),
         invoke<AddressBookEntry[]>('address_book_list'),
@@ -347,6 +349,7 @@ async function refresh(): Promise<void> {
       connectResult.code,
       connectResult.code_required,
       connectResult.retry_secs,
+      connectResult.credentials_auto,
     );
     await noteClipboardArrivals(invoke);
   } catch (error) {
