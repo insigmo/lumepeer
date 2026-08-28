@@ -27,6 +27,7 @@ import {
   decodeViewFrame,
   defaultLayout,
   displaySize,
+  imageRenderingFor,
   installPan,
   nextDisplayMode,
   paintCursor,
@@ -272,6 +273,10 @@ function applyLayout(): void {
   canvas.style.maxWidth = 'none';
   canvas.style.maxHeight = 'none';
   canvas.style.transform = `translate(${layout.offsetX}px, ${layout.offsetY}px)`;
+  // Only CSS knows how the picture is resampled, and only this knows the
+  // scale it is being drawn at — the stylesheet's `pixelated` is right at 1:1
+  // and above and wrong for every fitted window below it.
+  canvas.style.imageRendering = imageRenderingFor(layout, frameSize, viewport, ratio);
   placeCursor();
 }
 

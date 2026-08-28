@@ -74,6 +74,22 @@ export const MAX_SCALE = 4;
 /** How much one wheel notch or one zoom press moves the scale. */
 export const SCALE_STEP = 0.25;
 
+/**
+ * Scale at or above which the picture is blitted without smoothing.
+ *
+ * One frame pixel to one device pixel, or bigger. At exactly one there is
+ * nothing to interpolate and smoothing only costs time; above it, nearest
+ * neighbour is what keeps a magnified screenshot crisp instead of turning
+ * text into a smear.
+ *
+ * Below it the opposite holds and it is not a close call: minifying with
+ * nearest neighbour *drops* pixels, so the thin strokes of a glyph fall out
+ * whole and the picture comes apart. The default mode is `fit`, which is
+ * almost always below one — a 1920×1080 host in a 960×640 window is 0.5 —
+ * so this threshold is the difference between readable remote text and not.
+ */
+export const PIXELATED_MIN_SCALE = 1;
+
 /** Everything about where the picture is and how big it is drawn. */
 export interface ViewLayout {
   mode: DisplayMode;
@@ -128,6 +144,25 @@ export function effectiveScale(
     (viewport.height * devicePixelRatio) / frame.height,
   );
   return scale > 0 && Number.isFinite(scale) ? scale : 1;
+}
+
+/**
+ * How the canvas should be resampled at this layout: `pixelated` at
+ * {@link PIXELATED_MIN_SCALE} and above, `auto` below it.
+ *
+ * Not a CSS rule, because CSS cannot see the scale: the picture's size comes
+ * from the frame, the window and the display mode, all of which change at
+ * runtime. The stylesheet's `pixelated` is the starting value, for the moment
+ * before the first frame arrives, and this overrides it from then on.
+ */
+export function imageRenderingFor(
+  layout: ViewLayout,
+  frame: { width: number; height: number },
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+): 'pixelated' | 'auto' {
+  const scale = effectiveScale(layout, frame, viewport, devicePixelRatio);
+  return scale >= PIXELATED_MIN_SCALE ? 'pixelated' : 'auto';
 }
 
 /**
