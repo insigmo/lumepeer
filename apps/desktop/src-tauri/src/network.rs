@@ -7842,6 +7842,24 @@ mod tests {
         assert_eq!(revoked.unwrap(), ActorNotification::ConsentRevoked);
     }
 
+    /// The host's UI has to learn about an incoming request without polling:
+    /// `main.rs` subscribes to this stream to raise the window, and the guest
+    /// otherwise waits in `awaiting_consent` until the host happens to look
+    /// (docs/bugs/01). The notification was broadcast to nobody for a while,
+    /// so this test exists to keep it read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_request_reaches_a_host_side_subscriber() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let mut events = host.subscribe();
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+
+        let requested = tokio::time::timeout(TIMEOUT, events.recv()).await.unwrap();
+        assert_eq!(requested.unwrap(), ActorNotification::ConsentRequested);
+    }
+
     /// I3: when the guest goes away before the host decides, the host's reader
     /// task must notice and the pending row must disappear.
     #[tokio::test(flavor = "multi_thread")]
