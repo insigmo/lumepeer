@@ -370,7 +370,17 @@ function errorText(locale: Locale): string | undefined {
     : connectError;
 }
 
-/** Sidebar block: "Your invite code" label, code box + copy, or a create trigger. */
+/**
+ * Sidebar block: "Your invite code" label, code box + copy, or a create
+ * trigger.
+ *
+ * One copy affordance, not two: the code itself is plain text, selectable
+ * with the mouse so it is still readable when the clipboard is unavailable,
+ * and truncated by CSS with the whole of it on `title` and in the clipboard.
+ * Reissuing the code retires every code handed out before it (ADR 0016), so
+ * that button belongs in the settings window under a name that says so, not
+ * next to Copy in the sidebar (docs/bugs/04, docs/bugs/05).
+ */
 export function inviteCodePanel(locale: Locale): TemplateResult {
   if (!lastCode) {
     return html`
@@ -388,29 +398,13 @@ export function inviteCodePanel(locale: Locale): TemplateResult {
 
   return html`
     <p class="field-label">${t(locale, 'sidebar.inviteLabel')}</p>
-    <button
-      type="button"
-      class="code-box"
-      title=${lastCode}
-      aria-label=${t(locale, 'sidebar.copyCode')}
-      @click=${() => void copyCode()}
-    >
-      ${lastCode}
-    </button>
+    <p class="code-box" title=${lastCode}>${lastCode}</p>
     <button type="button" class="copy-btn" @click=${() => void copyCode()}>
       <svg width="13" height="13" viewBox="0 0 20 20" aria-hidden="true">
         <rect x="3" y="3" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.4" fill="none" />
         <rect x="6.5" y="6.5" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.4" fill="#fff" />
       </svg>
       ${copied ? t(locale, 'sidebar.copied') : t(locale, 'sidebar.copyCode')}
-    </button>
-    <button
-      type="button"
-      class="create-btn"
-      ?disabled=${creatingInvite}
-      @click=${() => void createInvite()}
-    >
-      ${t(locale, 'invite.refresh')}
     </button>
   `;
 }

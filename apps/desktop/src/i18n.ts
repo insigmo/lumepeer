@@ -277,6 +277,8 @@ const en: Dictionary = {
   'consent.action.allowFull': 'Allow full control',
   'invite.heading': 'Invite and connect',
   'invite.create': 'Create invite',
+  // Used by the settings window (docs/bugs/05); the sidebar no longer offers
+  // it, because reissuing retires every code already handed out (ADR 0016).
   'invite.refresh': 'Refresh invite',
   'invite.connectLabel': 'Enter invite code:',
   'invite.connect': 'Connect',
@@ -392,7 +394,7 @@ const en: Dictionary = {
   'titlebar.maximize': 'Maximize',
   'titlebar.close': 'Close',
   'sidebar.inviteLabel': 'Your invite code',
-  'sidebar.copyCode': 'Copy code',
+  'sidebar.copyCode': 'Copy invite code',
   'sidebar.copied': 'Copied',
   'sidebar.serverless': 'P2P · serverless',
   'panel.heading': 'Connect to device',
@@ -664,7 +666,7 @@ const ar: Dictionary = {
   'titlebar.maximize': 'تكبير',
   'titlebar.close': 'إغلاق',
   'sidebar.inviteLabel': 'رمز الدعوة الخاص بك',
-  'sidebar.copyCode': 'نسخ الرمز',
+  'sidebar.copyCode': 'نسخ رمز الدعوة',
   'sidebar.copied': 'تم النسخ',
   'sidebar.serverless': 'اتصال مباشر · بلا خوادم',
   'panel.heading': 'الاتصال بجهاز',
