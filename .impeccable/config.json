@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "apps/desktop/src/app.css"
+        ],
+        "createdAt": "2026-08-28T22:15:54.860Z",
+        "reason": "pre-existing .unattended-indicator rule, git blame dd92e456 2026-08-27 predates this session; docs/bugs/02 and 03 tasks never touched this selector, only shifted its line number by adding unrelated CSS earlier in the file — out of scope per project's surgical-changes rule"
+      }
+    ]
+  }
+}
