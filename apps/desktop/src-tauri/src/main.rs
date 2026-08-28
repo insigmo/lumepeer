@@ -46,6 +46,11 @@ pub struct AppState {
 /// destroying it. That makes the tray the only way back to the UI, so a
 /// missing bundled icon degrades to a blank tray entry and a warning rather
 /// than taking the start down with it (§18).
+///
+/// This is the only tray icon the app has. `tauri.conf.json` deliberately
+/// declares no `app.trayIcon`: Tauri would build a second entry from it, with
+/// neither this menu nor this click handler, and an inert icon next to the
+/// working one is what the user sees as "one of them does nothing".
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::Manager as _;
     use tauri::menu::{Menu, MenuItem};
@@ -63,6 +68,10 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     }
 
     tray.menu(&tray_menu)
+        // Carried over from the removed `app.trayIcon` block: on macOS the
+        // icon is a monochrome mask tinted by the menu bar, and elsewhere this
+        // is a no-op.
+        .icon_as_template(true)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => app.exit(0),
