@@ -90,6 +90,29 @@ describe('view hotkeys: installation', () => {
     }
   });
 
+  it('takes nothing while the operator is typing into a field of this window', () => {
+    // Same document-scoped trap the forwarder has: the chat box is inside this
+    // window, so a chord typed there would otherwise fire the action and be
+    // eaten before the field ever saw it.
+    const chat = vi.fn();
+    const field = document.createElement('input');
+    container.appendChild(field);
+    const stop = installHotkeys(container, { 'toggle-chat': chat });
+    try {
+      const typed = chord('KeyC');
+      field.dispatchEvent(typed);
+      expect(chat).not.toHaveBeenCalled();
+      expect(typed.defaultPrevented).toBe(false);
+
+      const overPicture = chord('KeyC');
+      container.dispatchEvent(overPicture);
+      expect(chat).toHaveBeenCalledOnce();
+      expect(overPicture.defaultPrevented).toBe(true);
+    } finally {
+      stop();
+    }
+  });
+
   it('leaves an action it has no handler for untouched', () => {
     const stop = installHotkeys(container, {});
     try {

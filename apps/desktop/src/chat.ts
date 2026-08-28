@@ -55,9 +55,11 @@ export class ChatState {
  * Renders the chat panel into `container`.
  *
  * The input is a plain `<input>` on purpose: chat is one-line messages, and
- * Enter-to-send must not fight the remote-control keyboard forwarding —
- * typing into the panel never reaches the host, because focus sits in the
- * panel's input, not on the canvas surface.
+ * Enter-to-send must not fight the remote-control keyboard forwarding. Focus
+ * is not what keeps the two apart: the window's keyboard listeners sit on the
+ * *document*, so every keystroke reaches them wherever it was typed. What
+ * keeps them apart is `isLocalTextTarget` in `view-window.ts`, which the
+ * forwarder and the hotkeys both consult before they take a key.
  */
 export function renderChat(
   container: HTMLElement,

@@ -23,6 +23,7 @@ import {
   displaySize,
   effectiveScale,
   installPan,
+  isLocalTextTarget,
   logicalOfButton,
   logicalOfKey,
   MAX_SCALE,
@@ -312,6 +313,48 @@ describe('view window: input listeners follow the live grant', () => {
     input.setEnabled(true);
     container.dispatchEvent(new KeyboardEvent('keydown', { key: 'BrightnessUp', bubbles: true }));
     expect(calls).toEqual([]);
+  });
+
+  // The listeners sit on the document, not on the canvas, so everything typed
+  // anywhere in the window reaches them — including what is typed into the
+  // window's own chat box. Without the guard the box receives nothing at all:
+  // every character is cancelled here and sent to the other machine instead.
+  it('leaves a local text field alone: the field gets the key, the host does not', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    const field = document.createElement('input');
+    container.appendChild(field);
+
+    const typed = new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true });
+    field.dispatchEvent(typed);
+    expect(calls).toEqual([]);
+    expect(typed.defaultPrevented).toBe(false);
+
+    const onPicture = new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true });
+    container.dispatchEvent(onPicture);
+    expect(calls).toEqual(['press 97 0 0 true']);
+    expect(onPicture.defaultPrevented).toBe(true);
+  });
+});
+
+describe('view window: local text targets', () => {
+  it('names every field a keystroke belongs to', () => {
+    for (const tag of ['input', 'textarea', 'select']) {
+      expect(isLocalTextTarget(document.createElement(tag))).toBe(true);
+    }
+    const editable = document.createElement('div');
+    // jsdom implements `isContentEditable` as a stub that never turns true, so
+    // the property is the thing under test and is set directly.
+    Object.defineProperty(editable, 'isContentEditable', { value: true });
+    expect(isLocalTextTarget(editable)).toBe(true);
+  });
+
+  it('leaves everything else to the remote machine', () => {
+    expect(isLocalTextTarget(document.createElement('canvas'))).toBe(false);
+    expect(isLocalTextTarget(document.createElement('div'))).toBe(false);
+    expect(isLocalTextTarget(document.body)).toBe(false);
+    expect(isLocalTextTarget(null)).toBe(false);
+    expect(isLocalTextTarget(new EventTarget())).toBe(false);
   });
 });
 

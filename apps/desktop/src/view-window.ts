@@ -550,6 +550,32 @@ export function suppressContextMenu(target: EventTarget): void {
 }
 
 /**
+ * Whether `target` is a local text field this window must not type over.
+ *
+ * The keyboard listeners sit on the *document*, not on the canvas, because a
+ * canvas cannot hold focus and a window that only forwarded what the picture
+ * was focused on would forward nothing at all. The cost of that is this
+ * function: everything typed anywhere in the window reaches the forwarder,
+ * including what is typed into the window's own chat box, and without a guard
+ * the chat box receives no characters at all — every one of them is consumed
+ * here and sent to the other machine.
+ *
+ * `event.target` rather than `document.activeElement`: the two agree in a
+ * browser but not in every test, and the event's own target is the one that
+ * actually produced the keystroke.
+ */
+export function isLocalTextTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  if ((target as HTMLElement).isContentEditable) {
+    return true;
+  }
+  const tag = target.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
+/**
  * Owner of the view window's pointer and keyboard listeners.
  *
  * Listeners are attached on `setEnabled(true)` and fully removed on
@@ -650,6 +676,12 @@ export class ViewInput {
     // A client hotkey has already been handled and marked; forwarding it too
     // would deliver half a chord to the remote machine (§11).
     if (event.defaultPrevented) {
+      return;
+    }
+    // Typed into one of this window's own fields — the chat box. Neither
+    // forwarded nor cancelled: the field has to receive the character, and the
+    // remote machine has no business seeing it.
+    if (isLocalTextTarget(event.target)) {
       return;
     }
     const logical = logicalOfKey(event.key);
