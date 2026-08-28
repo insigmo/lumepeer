@@ -507,6 +507,11 @@ pub enum ActorNotification {
     ConsentRevoked,
     /// A consent request was queued for the host user to decide (host side).
     ConsentRequested,
+    /// This node was just asked for device credentials (guest side; §8; ADR
+    /// 0033). Deliberately carries no peer identity, like every other variant
+    /// here — the credentials modal already has what it needs from
+    /// `connect_status` (docs/bugs/02-connect-form.md, task 5).
+    UnattendedChallenge,
     /// A control connection closed, in either direction.
     Disconnected,
     /// A chat message arrived from a peer. The label is pseudonymized (§15);
@@ -3605,6 +3610,7 @@ impl Actor {
                 self.connect_code_required = code_required;
                 self.connect_failure = None;
                 self.connect_retry_secs = None;
+                let _ = self.notify.send(ActorNotification::UnattendedChallenge);
             }
             // Host side: a guest answered the challenge.
             MessageKind::UnattendedAuth {

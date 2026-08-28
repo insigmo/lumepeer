@@ -124,6 +124,39 @@ describe('device credential form', () => {
     expect(isAwaitingCredentials()).toBe(false);
   });
 
+  // docs/bugs/02-connect-form.md, task 5: the form is a modal now, and the
+  // password field should already have focus rather than making the user
+  // click into it — but a re-render that changed nothing must not steal
+  // focus back while they are typing a second guess.
+  it('focuses the password field on open and after a fresh refusal, not on every re-render', async () => {
+    setConnectPhase('awaiting_credentials', null, false);
+    render(credentialsPanel('en'), container);
+    await Promise.resolve();
+    const password = container.querySelector<HTMLInputElement>('#device-password');
+    expect(document.activeElement).toBe(password);
+
+    password?.blur();
+    render(credentialsPanel('en'), container);
+    await Promise.resolve();
+    expect(document.activeElement).not.toBe(password);
+
+    setConnectPhase('awaiting_credentials', 'UNATTENDED_BAD_PASSWORD');
+    render(credentialsPanel('en'), container);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(password);
+  });
+
+  // docs/bugs/02-connect-form.md, task 5: Escape gives up on the attempt the
+  // same way the Cancel button on the connect form does.
+  it('cancels the outstanding attempt when Escape is pressed on the backdrop', async () => {
+    setConnectPhase('awaiting_credentials', null, false);
+    render(credentialsPanel('en'), container);
+    container
+      .querySelector('.credentials-backdrop')
+      ?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('connect_cancel'));
+  });
+
   it('is labelled in both locales, and the password field is a password field', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const scoped = document.createElement('div');

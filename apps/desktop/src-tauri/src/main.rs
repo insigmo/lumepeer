@@ -142,7 +142,7 @@ fn setup_app(
         update_url,
         autostart: autostart::Autostart::for_this_app(),
     });
-    runtime.spawn(watch_for_consent_requests(
+    runtime.spawn(watch_for_window_raising_notifications(
         app.handle().clone(),
         notifications,
     ));
@@ -155,18 +155,21 @@ fn setup_app(
     Ok(())
 }
 
-/// Puts the host's window in front of them when a guest asks to connect.
+/// Puts this app's window in front of the user when something needs their
+/// attention: a guest asking the host to decide (`ConsentRequested`), or a
+/// host asking this node, as a guest, for device credentials
+/// (`UnattendedChallenge`; docs/bugs/02-connect-form.md, task 5).
 ///
-/// Without this the consent dialog renders into a window that is hidden in the
-/// tray or simply behind something else, and the guest waits in
-/// `awaiting_consent` until the host happens to look. Nothing else is done
-/// with the notification: showing the window is not deciding anything, and the
-/// decision stays with the person in the dialog (§8).
+/// Without this the relevant dialog renders into a window that is hidden in
+/// the tray or simply behind something else, and the far side waits until the
+/// user happens to look. Nothing else is done with either notification:
+/// showing the window is not deciding anything or answering anything, and
+/// both stay with the person in the dialog (§8).
 ///
 /// [`ActorNotification`](network::ActorNotification) deliberately carries no
-/// peer identity (§15) and does not need to: the dialog already polls
-/// `session_status` for the label.
-async fn watch_for_consent_requests(
+/// peer identity (§15) and does not need to: both dialogs already poll for
+/// what they need (`session_status`, `connect_status`).
+async fn watch_for_window_raising_notifications(
     app: tauri::AppHandle,
     mut notifications: tokio::sync::broadcast::Receiver<network::ActorNotification>,
 ) {
@@ -175,7 +178,10 @@ async fn watch_for_consent_requests(
 
     loop {
         match notifications.recv().await {
-            Ok(network::ActorNotification::ConsentRequested) => {
+            Ok(
+                network::ActorNotification::ConsentRequested
+                | network::ActorNotification::UnattendedChallenge,
+            ) => {
                 focus_main_window(&app);
                 // Raising the window can lose to the foreground-lock rules of
                 // the platform when the user is busy elsewhere. The taskbar
@@ -186,10 +192,10 @@ async fn watch_for_consent_requests(
             }
             Ok(_) => {}
             // A burst of notifications outran this listener. The ones that
-            // were dropped are gone, but the next request must still raise the
-            // window, so keep reading.
+            // were dropped are gone, but the next one that matters must still
+            // raise the window, so keep reading.
             Err(RecvError::Lagged(missed)) => {
-                tracing::warn!(missed, "consent-request listener fell behind");
+                tracing::warn!(missed, "window-raising listener fell behind");
             }
             Err(RecvError::Closed) => return,
         }
