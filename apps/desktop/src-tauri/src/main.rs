@@ -39,6 +39,25 @@ pub struct AppState {
     pub autostart: autostart::Autostart,
 }
 
+/// Brings the main window back to the user: out of the tray, out of a
+/// minimized state and in front of whatever they were doing.
+///
+/// All three calls are needed and none of them subsumes the others: `show`
+/// undoes the hide the close handler in [`main`] does, `unminimize` undoes a
+/// minimize, and `set_focus` is what actually raises the window. Every caller
+/// wants all three, which is why they live here rather than being copied into
+/// the tray handlers, the single-instance callback and the consent listener.
+fn focus_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 /// Installs the tray icon and its menu.
 ///
 /// Closing the window must not stop remote sessions: the app keeps running in
@@ -52,7 +71,6 @@ pub struct AppState {
 /// neither this menu nor this click handler, and an inert icon next to the
 /// working one is what the user sees as "one of them does nothing".
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
-    use tauri::Manager as _;
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
 
@@ -75,12 +93,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => app.exit(0),
-            "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
+            "show" => focus_main_window(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -90,11 +103,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                focus_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -171,6 +180,15 @@ fn main() {
     // plugin makes it available to this process, not to the untrusted
     // presentation layer (§2.3; ADR 0032).
     let mut builder = tauri::Builder::default()
+        // First in the chain on purpose: a second launch has to be turned away
+        // before any other plugin or the setup hook gets to claim a resource
+        // the running process already owns — above all the iroh endpoint,
+        // whose NodeId is what the invite code already in someone's hands
+        // points at (docs/bugs/01). The callback hands the first process's
+        // window back instead, which is what the second launch was for.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            focus_main_window(app);
+        }))
         // The plugin carries the public key from `tauri.conf.json`; the
         // endpoint is chosen per check instead, because it depends on the
         // configured channel (§21; ADR 0042) and a channel that could only be

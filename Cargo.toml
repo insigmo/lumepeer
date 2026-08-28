@@ -96,6 +96,12 @@ tauri-plugin-updater = "2"
 # says the view window has no filesystem rights, and a picker that ran in the
 # webview would be exactly that right under another name (ADR 0032).
 tauri-plugin-dialog = "2"
+# One process per machine (docs/bugs/01). A second launch must hand the first
+# one's window back to the user rather than binding a second iroh endpoint:
+# the invite code already handed out points at the first process's NodeId, so
+# two live endpoints mean the UI the user is looking at is not the one the
+# guest is dialling.
+tauri-plugin-single-instance = "2"
 
 # dev-dependencies
 proptest = "1"
