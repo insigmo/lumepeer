@@ -125,6 +125,21 @@ impl ConnectionHistory {
         self.save();
     }
 
+    /// Removes the row for `peer_label`, if there is one, and persists the
+    /// list (docs/bugs/03-connection-list.md, task 5).
+    ///
+    /// Returns whether a row was actually removed, so the caller can tell a
+    /// real deletion from a no-op on a label that was never there.
+    pub fn remove(&mut self, peer_label: &str) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.peer_label != peer_label);
+        let removed = self.entries.len() != before;
+        if removed {
+            self.save();
+        }
+        removed
+    }
+
     /// Best-effort: a write failure here must never take the session down
     /// with it, only leave the sidebar's history stale until the next
     /// successful save.
@@ -193,6 +208,46 @@ mod tests {
         assert_eq!(history.entries()[0].role, Role::FullControl);
         assert_eq!(history.code_of("host-ab12"), Some("code-3"));
         assert_eq!(history.code_of("host-zz99"), None);
+    }
+
+    /// docs/bugs/03-connection-list.md, task 5.
+    #[test]
+    fn removing_a_row_drops_it_and_leaves_the_rest_alone() {
+        let mut history = ConnectionHistory::open(None);
+        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+
+        assert!(history.remove("host-ab12"));
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(history.entries()[0].peer_label, "host-cd34");
+        assert_eq!(history.code_of("host-ab12"), None);
+    }
+
+    #[test]
+    fn removing_a_label_that_was_never_there_changes_nothing() {
+        let mut history = ConnectionHistory::open(None);
+        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+
+        assert!(!history.remove("host-never-connected"));
+        assert_eq!(history.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_removal_persists_across_a_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-remove-{}", std::process::id()));
+        let path = dir.join("connection_history.json");
+
+        let mut history = ConnectionHistory::open(Some(path.clone()));
+        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        assert!(history.remove("host-ab12"));
+
+        let reloaded = ConnectionHistory::open(Some(path));
+        assert_eq!(reloaded.entries().len(), 1);
+        assert_eq!(reloaded.entries()[0].peer_label, "host-cd34");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

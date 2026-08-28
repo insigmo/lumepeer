@@ -42,6 +42,7 @@
     "allow-unattended-submit",
     "allow-connection-history",
     "allow-history-connect",
+    "allow-history-remove",
     "allow-connect-status",
     "allow-connect-cancel",
     "allow-network-status",

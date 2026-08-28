@@ -743,8 +743,10 @@ button {
 .connections-list .history-row {
   background: var(--sidebar-bg);
   border-style: dashed;
-  /* The row is one big button, so it brings its own padding. */
-  padding: 0;
+  /* history-reconnect brings its own padding; history-remove needs a little
+     of its own on the trailing edge (docs/bugs/03-connection-list.md, task
+     5 — a button next to the reconnect control, not inside it). */
+  padding: 0 8px 0 0;
 }
 
 /* A remembered host is somewhere to go back to, so the whole row is the
@@ -790,6 +792,30 @@ button {
   font-weight: 600;
   color: var(--blue-solid);
   white-space: nowrap;
+}
+
+.connections-list .history-remove {
+  flex-shrink: 0;
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.connections-list .history-remove:hover {
+  background: var(--red-tint);
+  color: var(--red);
+  border-color: var(--red);
 }
 
 /* ---------- Host chat drawer ---------- */

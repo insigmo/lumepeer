@@ -227,6 +227,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::unattended_submit,
         commands::connection_history,
         commands::history_connect,
+        commands::history_remove,
         commands::connect_status,
         commands::connect_cancel,
         commands::network_status,

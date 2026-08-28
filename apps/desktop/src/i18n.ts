@@ -114,6 +114,8 @@ export type TranslationKey =
   | 'system.serviceFailed'
   | 'status.clipboardSynced'
   | 'status.reconnect'
+  | 'history.remove'
+  | 'history.remove.confirm'
   | 'status.lastSeenJustNow'
   | 'status.lastSeenMinutesAgo'
   | 'status.lastSeenHoursAgo'
@@ -383,6 +385,8 @@ const en: Dictionary = {
   'system.serviceFailed': 'The helper service was not changed. Administrator permission is needed.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
+  'history.remove': 'Remove',
+  'history.remove.confirm': (name) => `Remove ${name} from the connection list?`,
   'status.lastSeenJustNow': 'Last seen just now',
   'status.lastSeenMinutesAgo': (n) => `Last seen ${n}m ago`,
   'status.lastSeenHoursAgo': (n) => `Last seen ${n}h ago`,
@@ -657,6 +661,8 @@ const ar: Dictionary = {
   'system.serviceFailed': 'لم تتغيّر الخدمة المساعدة. يلزم إذن المسؤول.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
+  'history.remove': 'إزالة',
+  'history.remove.confirm': (name) => `إزالة ${name} من قائمة الاتصالات؟`,
   'status.lastSeenJustNow': 'آخر ظهور قبل قليل',
   'status.lastSeenMinutesAgo': (n) => `آخر ظهور قبل ${n} د`,
   'status.lastSeenHoursAgo': (n) => `آخر ظهور قبل ${n} س`,

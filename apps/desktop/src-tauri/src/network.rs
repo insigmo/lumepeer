@@ -586,6 +586,12 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Guest side: forget a remembered host (docs/bugs/03-connection-list.md,
+    /// task 5).
+    HistoryRemove {
+        label: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Guest side: how this node's own outgoing connect attempt is going, and
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
@@ -899,6 +905,21 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Forgets a remembered host (docs/bugs/03-connection-list.md, task 5).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone. Removing a
+    /// label that was never remembered is not an error — the post-condition
+    /// (nothing listed under that label) already holds.
+    pub async fn history_remove(&self, label: String) -> Result<bool, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryRemove { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
     /// What every live connection's link actually looks like: round trip,
@@ -3925,6 +3946,9 @@ impl Actor {
                     tracing::warn!(%error, "reconnecting to a remembered host failed");
                 }
                 let _ = reply.send(result);
+            }
+            ActorCommand::HistoryRemove { label, reply } => {
+                let _ = reply.send(self.history.remove(&label));
             }
             ActorCommand::ConnectionStats { reply } => {
                 let _ = reply.send(self.connection_stats());

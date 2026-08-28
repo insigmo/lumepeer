@@ -74,6 +74,12 @@ async function revoke(peer: string): Promise<void> {
   await invoke('session_revoke', { args: { peer } });
 }
 
+/** Forgets a remembered host (docs/bugs/03-connection-list.md, task 5). */
+async function forgetHistory(peer: string): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('history_remove', { args: { peer } });
+}
+
 async function setGrant(peer: string, grant: IndependentGrant, allowed: boolean): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('session_set_grant', { args: { peer, grant, allowed } });
@@ -417,6 +423,22 @@ export function sessionStatus(
                     <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
                     <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
                     <span class="history-action">${t(locale, 'status.reconnect')}</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="history-remove"
+                    aria-label=${`${t(locale, 'history.remove')}: ${entry.peer_label}`}
+                    @click=${() => {
+                      if (!globalThis.confirm(t(locale, 'history.remove.confirm', entry.peer_label))) {
+                        return;
+                      }
+                      void forgetHistory(entry.peer_label).then(onRefresh, (error: unknown) => {
+                        console.error('history_remove failed:', error);
+                        onRefresh();
+                      });
+                    }}
+                  >
+                    ${t(locale, 'history.remove')}
                   </button>
                 </li>
               `,
