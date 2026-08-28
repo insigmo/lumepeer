@@ -82,6 +82,7 @@ function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
     controls: null,
     toggleChat: () => true,
     chatVisible: () => true,
+    chatUnread: () => false,
     displayMode: () => hooks.mode,
     setDisplayMode: (mode) => {
       hooks.mode = mode;
@@ -349,6 +350,25 @@ describe('the floating session toolbar', () => {
     );
     expect(select).not.toBeNull();
     expect(select!.options).toHaveLength(RESOLUTION_CHOICES.length);
+  });
+
+  it('marks the chat button while a message is unread, and only while the panel is closed', () => {
+    const state = { collapsed: false, openPopover: null } as Parameters<typeof renderToolbar>[1];
+    let visible = false;
+    let unread = true;
+    const hooks = fakeHooks({ chatVisible: () => visible, chatUnread: () => unread });
+
+    draw(state, fakeCommands(), hooks);
+    const button = (): HTMLButtonElement =>
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-chat"]')!;
+    expect(button().getAttribute('aria-label')).toBe(t('en', 'toolbar.chat.unread'));
+
+    // Opening the panel is what reads the message; the mark goes with it.
+    visible = true;
+    unread = false;
+    draw(state, fakeCommands(), hooks);
+    expect(button().getAttribute('aria-label')).toBe(t('en', 'toolbar.chat'));
+    expect(button().getAttribute('aria-pressed')).toBe('true');
   });
 
   it('the monitors popover lists what the host announced with 1-based numbers', () => {

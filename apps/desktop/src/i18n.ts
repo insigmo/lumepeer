@@ -172,6 +172,7 @@ export type TranslationKey =
   | 'toolbar.monitors.empty'
   | 'toolbar.monitors.entry'
   | 'toolbar.chat'
+  | 'toolbar.chat.unread'
   | 'toolbar.mic'
   | 'toolbar.cad'
   | 'toolbar.record'
@@ -443,6 +444,7 @@ const en: Dictionary = {
   'toolbar.monitors.empty': 'The host has not announced any screens yet.',
   'toolbar.monitors.entry': (arg) => `Screen ${arg}`,
   'toolbar.chat': 'Chat',
+  'toolbar.chat.unread': 'Chat — a new message',
   'toolbar.mic': 'Microphone',
   'toolbar.cad': 'Ctrl+Alt+Del',
   'toolbar.record': 'Ask the host to record this session',
@@ -715,6 +717,7 @@ const ar: Dictionary = {
   'toolbar.monitors.empty': 'لم يعلن المضيف عن أي شاشات بعد.',
   'toolbar.monitors.entry': (arg) => `الشاشة ${arg}`,
   'toolbar.chat': 'المحادثة',
+  'toolbar.chat.unread': 'المحادثة — رسالة جديدة',
   'toolbar.mic': 'الميكروفون',
   'toolbar.cad': 'Ctrl+Alt+Del',
   'toolbar.record': 'اطلب من المضيف تسجيل هذه الجلسة',
