@@ -285,8 +285,8 @@ pub const MAX_CONCURRENT_FILE_TRANSFERS: usize = 3;
 /// timing out aborts one transfer rather than the connection.
 pub const FILE_TRANSFER_START_TIMEOUT_SECS: u64 = 15;
 
-/// Time step of the RFC 6238 TOTP second factor (§8; ADR 0021). 30 s is what
-/// every mainstream authenticator app defaults to.
+/// Time step of the RFC 6238 TOTP second factor (§8; ADR 0023 §2). 30 s is
+/// what every mainstream authenticator app defaults to.
 pub const UNATTENDED_TOTP_STEP_SECS: u64 = 30;
 /// Consecutive failed unattended verifications before the host locks out
 /// brute force (§18).
@@ -314,3 +314,19 @@ pub const UNATTENDED_PASSWORD_MAX_BYTES: usize = 1024;
 /// sending a longer code fails verification with a coarse `BadCode` instead of
 /// having its connection torn down as a malformed frame.
 pub const UNATTENDED_CODE_MAX_BYTES: usize = 8;
+
+/// How long the host keeps an audit record before deleting it (§15).
+///
+/// §15 fixes the retention, and that is the whole policy: records older than
+/// this are removed unconditionally, protocol violations included. "Keep the
+/// interesting ones longer" would be a retention decision §15 did not make,
+/// and a log that quietly outlives its stated retention is worse than no log.
+pub const AUDIT_RETENTION_DAYS: u64 = 30;
+
+/// How often the host sweeps records past [`AUDIT_RETENTION_DAYS`] (§15).
+///
+/// Once a day, plus once at startup. Sweeping per append would turn every
+/// consent decision into a table scan, and the cutoff moves by seconds — a
+/// record can outlive its retention by up to this long, which is the price of
+/// not paying for a scan the host has no reason to make.
+pub const AUDIT_RETENTION_SWEEP_SECS: u64 = 24 * 60 * 60;

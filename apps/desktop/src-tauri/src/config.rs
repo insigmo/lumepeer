@@ -32,6 +32,8 @@ pub struct Settings {
     pub network: Network,
     /// `[logging]`.
     pub logging: Logging,
+    /// `[updates]`.
+    pub updates: Updates,
 }
 
 /// `[network]` of `config/default.toml`.
@@ -64,6 +66,39 @@ pub struct Logging {
     /// client is started from is not one it may write to.
     pub directory: Option<String>,
 }
+
+/// Which stream of releases this client updates from (ADR 0042).
+///
+/// A setting rather than a compiled-in constant, because the whole point of a
+/// beta channel is that a person can move one machine onto it without a
+/// special build. Default is stable, and moving off it takes an explicit edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Released builds only. GitHub's own "latest release" skips prereleases,
+    /// so a stable client cannot be handed a beta by accident.
+    #[default]
+    Stable,
+    /// Prereleases as well, from the rolling `beta` release.
+    Beta,
+}
+
+/// `[updates]` of `config/default.toml`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Updates {
+    /// Release stream to follow.
+    pub channel: UpdateChannel,
+    /// Base URL update manifests are fetched from, without a trailing slash.
+    ///
+    /// Configurable so a self-hosting operator can serve their own builds the
+    /// way `relay_url` lets them serve their own relay. `None` is the project's
+    /// own GitHub releases.
+    pub manifest_base_url: Option<String>,
+}
+
+/// Where the project publishes its own update manifests.
+const DEFAULT_MANIFEST_BASE: &str = "https://github.com/insigmo/lumepeer/releases";
 
 impl Settings {
     /// Loads every config file that exists, later files winning key by key.
@@ -129,6 +164,46 @@ impl Settings {
         if other.logging.directory.is_some() {
             self.logging.directory = other.logging.directory;
         }
+        self.updates.channel = other.updates.channel;
+        if other.updates.manifest_base_url.is_some() {
+            self.updates.manifest_base_url = other.updates.manifest_base_url;
+        }
+    }
+
+    /// The update manifest this client checks, or `None` when updates are not
+    /// configured at all (ADR 0042).
+    ///
+    /// One URL per channel, and the channel decides which. The stable manifest
+    /// rides GitHub's `latest` redirect, which skips prereleases outright, so
+    /// a stable client is not merely *asked* not to take a beta — it is never
+    /// shown one. The beta manifest lives on a rolling `beta` release, because
+    /// GitHub has no "newest including prereleases" download URL.
+    ///
+    /// A base URL that is not `https` is refused: an update manifest names
+    /// what this machine is about to install, and while the artifact's own
+    /// signature is what actually gates the install (§21), there is no reason
+    /// to accept the manifest over a channel anyone can rewrite.
+    #[must_use]
+    pub fn update_manifest_url(&self) -> Option<String> {
+        let base = self
+            .updates
+            .manifest_base_url
+            .as_deref()
+            .unwrap_or(DEFAULT_MANIFEST_BASE)
+            .trim_end_matches('/');
+        if !base.starts_with("https://") {
+            return None;
+        }
+        Some(match self.updates.channel {
+            UpdateChannel::Stable => format!("{base}/latest/download/latest.json"),
+            UpdateChannel::Beta => format!("{base}/download/beta/beta.json"),
+        })
+    }
+
+    /// The release stream this client follows.
+    #[must_use]
+    pub const fn update_channel(&self) -> UpdateChannel {
+        self.updates.channel
     }
 
     /// Relay to hand `PeerEndpoint::bind`, if one is configured.
@@ -293,5 +368,50 @@ mod tests {
         let mut settings = Settings::default();
         settings.network.prefer_direct = false;
         assert!(settings.relay_only());
+    }
+
+    /// A fresh install follows stable, and the two channels resolve to two
+    /// different manifests (ADR 0042). The stable one goes through GitHub's
+    /// `latest` redirect on purpose: that redirect skips prereleases, which is
+    /// what keeps a stable client from ever being shown a beta.
+    #[test]
+    fn the_channel_decides_the_manifest() {
+        let stable = Settings::default();
+        assert_eq!(stable.update_channel(), UpdateChannel::Stable);
+        let stable_url = stable.update_manifest_url().unwrap();
+        assert!(stable_url.ends_with("/releases/latest/download/latest.json"));
+
+        let mut beta = Settings::default();
+        beta.updates.channel = UpdateChannel::Beta;
+        let beta_url = beta.update_manifest_url().unwrap();
+        assert!(beta_url.ends_with("/releases/download/beta/beta.json"));
+        assert_ne!(stable_url, beta_url);
+    }
+
+    /// A self-hoster's own base URL is honoured, with or without a trailing
+    /// slash, but only over https.
+    #[test]
+    fn a_custom_manifest_base_must_be_https() {
+        let mut settings = Settings::default();
+        settings.updates.manifest_base_url =
+            Some("https://updates.example.com/lumepeer/".to_owned());
+        assert_eq!(
+            settings.update_manifest_url().as_deref(),
+            Some("https://updates.example.com/lumepeer/latest/download/latest.json")
+        );
+
+        settings.updates.manifest_base_url = Some("http://updates.example.com".to_owned());
+        assert_eq!(
+            settings.update_manifest_url(),
+            None,
+            "a plaintext manifest URL is no configuration at all"
+        );
+    }
+
+    /// `channel = "beta"` is written the way a person would write it.
+    #[test]
+    fn the_channel_parses_from_the_config_file() {
+        let parsed: Settings = toml::from_str("[updates]\nchannel = \"beta\"\n").unwrap();
+        assert_eq!(parsed.update_channel(), UpdateChannel::Beta);
     }
 }

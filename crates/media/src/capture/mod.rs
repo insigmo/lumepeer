@@ -90,9 +90,13 @@ pub fn host_monitors() -> Result<Vec<HostMonitor>> {
         all(target_os = "linux", not(target_os = "android"))
     )))]
     {
-        // No other backend exposes enumeration yet: report the primary as
+        // macOS is the only platform left here, and its ScreenCaptureKit
+        // backend does not enumerate displays yet: report the primary as
         // the only monitor rather than an empty list, which would read as
         // "this host has no screens" (§18: degrade honestly, never lie).
+        //
+        // TODO(docs/tasks/12-macos-completion.md): once that backend can
+        // enumerate, this arm becomes the "no backend at all" case only.
         Ok(vec![HostMonitor {
             id: 0,
             width: 0,

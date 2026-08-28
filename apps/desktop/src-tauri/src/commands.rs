@@ -1481,6 +1481,19 @@ async fn pick_directory(app: &tauri::AppHandle) -> Option<String> {
     rx.await.ok().flatten().and_then(path_string)
 }
 
+/// Runs the OS save dialog, for a file this process is about to write.
+async fn pick_save_path(app: &tauri::AppHandle, suggested: &str) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(suggested)
+        .save_file(move |chosen| {
+            let _ = tx.send(chosen);
+        });
+    rx.await.ok().flatten().and_then(path_string)
+}
+
 /// A picked path as a plain string, or `None` when it is not a local path.
 ///
 /// The picker can hand back a content URI on mobile; this build is desktop
@@ -1914,6 +1927,308 @@ pub async fn recording_export(
 fn file_name_of(path: Option<&std::path::Path>) -> Option<String> {
     path.and_then(std::path::Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// What an update check found, when it found something.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateDto {
+    /// Version offered by the manifest.
+    pub version: String,
+    /// Version running right now.
+    pub current: String,
+    /// Release notes as the manifest carries them, or empty.
+    pub notes: String,
+}
+
+/// Turns an updater failure into an IPC error without leaking a URL.
+///
+/// The manifest URL is configuration, not a secret, but an error string that
+/// carries it ends up in the webview and in screenshots; the code is what the
+/// UI branches on and the log already has the detail.
+fn update_error(error: &tauri_plugin_updater::Error) -> IpcError {
+    tracing::warn!(%error, "update check failed");
+    IpcError {
+        code: "UPDATE",
+        message: "the update check failed".to_owned(),
+    }
+}
+
+/// Builds the updater against the configured channel's manifest (ADR 0042).
+fn updater(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<tauri_plugin_updater::Updater, IpcError> {
+    use tauri_plugin_updater::UpdaterExt as _;
+
+    let url = state.update_url.as_deref().ok_or(IpcError {
+        code: "UPDATE_OFF",
+        message: "this build has no update endpoint configured".to_owned(),
+    })?;
+    let parsed = url.parse().map_err(|_| IpcError {
+        code: "UPDATE_OFF",
+        message: "the configured update endpoint is not a URL".to_owned(),
+    })?;
+    app.updater_builder()
+        .endpoints(vec![parsed])
+        .map_err(|error| update_error(&error))?
+        .build()
+        .map_err(|error| update_error(&error))
+}
+
+/// Asks the configured channel whether a newer release exists (§21; ADR 0042).
+///
+/// Only *asks*. Nothing is downloaded and nothing is installed: this app can be
+/// in the middle of someone else's remote session, and an update that restarted
+/// the process on its own would end that session without anyone deciding to.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when updates
+/// are not configured or the manifest cannot be read.
+#[tauri::command]
+pub async fn update_check(
+    window: Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<UpdateDto>, IpcError> {
+    check_window(&window)?;
+    let updater = updater(&app, &state)?;
+    let found = updater
+        .check()
+        .await
+        .map_err(|error| update_error(&error))?;
+    Ok(found.map(|update| UpdateDto {
+        version: update.version.clone(),
+        current: update.current_version.clone(),
+        notes: update.body.clone().unwrap_or_default(),
+    }))
+}
+
+/// Downloads and installs the update the channel offers (§21; ADR 0042).
+///
+/// The signature is checked by `tauri-plugin-updater` against the public key
+/// baked into the bundle before a single byte is installed. There is no path
+/// past that check in this command and there must never be one: an artifact
+/// whose signature does not verify is not installed, whatever the manifest
+/// said, and a network error is a failed update rather than a reason to take
+/// anything unsigned.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when there is
+/// nothing to install, the download fails, or the signature does not verify.
+#[tauri::command]
+pub async fn update_install(
+    window: Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    let updater = updater(&app, &state)?;
+    let Some(update) = updater
+        .check()
+        .await
+        .map_err(|error| update_error(&error))?
+    else {
+        return Err(IpcError {
+            code: "UPDATE_NONE",
+            message: "there is no newer release on this channel".to_owned(),
+        });
+    };
+    tracing::info!(version = %update.version, "installing an update");
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| update_error(&error))?;
+    tracing::info!("update installed; restart to run it");
+    Ok(())
+}
+
+/// Whether this installation starts with the user's session (ADR 0042).
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the
+/// platform mechanism cannot be read.
+#[tauri::command]
+pub fn autostart_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, IpcError> {
+    check_window(&window)?;
+    Ok(state.autostart.is_enabled())
+}
+
+/// Argument of [`autostart_set`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutostartArgs {
+    /// `true` adds the per-user startup entry, `false` removes it outright.
+    pub enabled: bool,
+}
+
+/// Turns autostart on or off (ADR 0042).
+///
+/// Per-user only, and switching it off removes the entry rather than disabling
+/// it. Starting with the session grants nothing: the app comes up and waits for
+/// consent exactly as it does when a person launches it.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the
+/// platform refuses the change.
+#[tauri::command]
+pub fn autostart_set(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AutostartArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .autostart
+        .set(args.enabled)
+        .map_err(|message| IpcError {
+            code: "AUTOSTART",
+            message,
+        })?;
+    tracing::info!(enabled = args.enabled, "autostart changed");
+    Ok(())
+}
+
+/// Filter of one [`audit_list`] call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditListArgs {
+    /// Oldest wall-clock second to include, or `None` for "from the start".
+    pub since: Option<i64>,
+    /// Newest wall-clock second to include, or `None` for "up to now".
+    pub until: Option<i64>,
+    /// One event kind, as [`audit_kinds`] lists them, or `None` for all.
+    pub kind: Option<String>,
+}
+
+/// One audit record as the panel shows it (§15).
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditRowDto {
+    /// Wall-clock second the event was recorded at.
+    pub at_unix_secs: i64,
+    /// Pseudonymized peer label — a hash prefix, never a `NodeId`.
+    pub peer: String,
+    /// Event kind from the closed vocabulary of [`audit_kinds`].
+    pub kind: String,
+    /// Extra detail from the same closed vocabulary, or empty.
+    pub detail: String,
+}
+
+/// Host side: the audit log, filtered by time window and event kind (§15).
+///
+/// A host running without a usable log answers with an empty list rather than
+/// an error: "there is no log" is a true answer, and the panel says as much
+/// through [`audit_status`].
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the query
+/// fails.
+#[tauri::command]
+pub async fn audit_list(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: AuditListArgs,
+) -> Result<Vec<AuditRowDto>, IpcError> {
+    check_window(&window)?;
+    let Some(store) = state.network.audit() else {
+        return Ok(Vec::new());
+    };
+    let rows = store
+        .list(args.since, args.until, args.kind.as_deref())
+        .await
+        .map_err(|error| IpcError {
+            code: "AUDIT",
+            message: error.to_string(),
+        })?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AuditRowDto {
+            at_unix_secs: row.at_unix_secs,
+            peer: row.peer,
+            kind: row.kind,
+            detail: row.detail,
+        })
+        .collect())
+}
+
+/// Every event kind the log can hold, for the panel's filter (§15).
+///
+/// Served from Rust rather than hardcoded in the webview so the filter cannot
+/// drift away from what `audit_store::event_columns` actually writes.
+#[tauri::command]
+pub fn audit_kinds() -> Vec<&'static str> {
+    crate::audit_store::EVENT_KINDS.to_vec()
+}
+
+/// Whether this host is keeping an audit log at all (§15).
+///
+/// The panel needs to tell "nothing happened yet" apart from "nothing is being
+/// recorded", which are the same empty list otherwise (§18).
+#[tauri::command]
+pub fn audit_status(window: Window, state: tauri::State<'_, AppState>) -> Result<bool, IpcError> {
+    check_window(&window)?;
+    Ok(state.network.audit().is_some())
+}
+
+/// Host side: writes the whole log to a file the host user picks (§15).
+///
+/// The path comes from the OS save dialog driven here, in Rust: the webview
+/// holds no `fs` permission and never names a path, exactly as with recordings
+/// (§2.3). Returns the path written, or `None` when the dialog was dismissed.
+///
+/// CSV of the stored rows, not a copy of the database file — what leaves the
+/// machine should be the pseudonymized records themselves.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the log
+/// cannot be read or the file cannot be written.
+#[tauri::command]
+pub async fn audit_export(
+    window: Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, IpcError> {
+    check_window(&window)?;
+    let Some(store) = state.network.audit() else {
+        return Ok(None);
+    };
+    let csv = store.export_csv().await.map_err(|error| IpcError {
+        code: "AUDIT",
+        message: error.to_string(),
+    })?;
+    let Some(path) = pick_save_path(&app, "lumepeer-audit.csv").await else {
+        return Ok(None);
+    };
+    std::fs::write(&path, csv).map_err(|error| IpcError {
+        code: "AUDIT",
+        message: error.to_string(),
+    })?;
+    tracing::info!("audit log exported");
+    Ok(Some(path))
+}
+
+/// Host side: deletes every audit record (§15).
+///
+/// §15 requires the host user be able to erase the log, not only read it. The
+/// confirmation is the webview's; this end simply does it, and returns how
+/// many records went.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the
+/// delete fails.
+#[tauri::command]
+pub async fn audit_clear(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<u64, IpcError> {
+    check_window(&window)?;
+    let Some(store) = state.network.audit() else {
+        return Ok(0);
+    };
+    store.purge().await.map_err(|error| IpcError {
+        code: "AUDIT",
+        message: error.to_string(),
+    })
 }
 
 #[cfg(test)]

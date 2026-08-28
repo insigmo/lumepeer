@@ -27,6 +27,8 @@ import {
   setConnectPhase,
   type ConnectPhase,
 } from './invite-view';
+import { auditPanel, onAuditStateChange, tauriAuditCommands } from './audit-log';
+import { onSystemStateChange, systemSettings, tauriSystemCommands } from './system-settings';
 import { logoMark } from './logo';
 import {
   onRecordingsStateChange,
@@ -232,8 +234,11 @@ function renderNow(): void {
               <div class="main-divider"></div>
               ${recordingsPanel(recordings, locale, tauriRecordingsCommands, () => void refresh())}
               <div class="main-divider"></div>
+              ${auditPanel(locale, tauriAuditCommands)}
+              <div class="main-divider"></div>
               ${addressBook(savedDevices, locale, () => void refresh())}
               ${unattendedSettings(unattended, locale, () => void refresh())}
+              ${systemSettings(locale, tauriSystemCommands)}
             </main>
           </div>
         </div>
@@ -362,6 +367,8 @@ onInviteStateChange(renderNow);
 onUnattendedStateChange(renderNow);
 onAddressBookStateChange(renderNow);
 onRecordingsStateChange(renderNow);
+onAuditStateChange(renderNow);
+onSystemStateChange(renderNow);
 
 renderNow();
 void refresh();

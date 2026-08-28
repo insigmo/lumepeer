@@ -57,6 +57,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "migrate",
 ] }
 toml = "0.8"
+# Per-user autostart on Windows: the HKCU Run key (ADR 0042). Not named in
+# §5; already in the tree as a transitive build dependency of tauri-winres.
+winreg = "0.55"
 config = "0.14"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md
 scap = "=0.1.0-beta.1" # `scap = "0.1"` in §5 does not resolve: only pre-releases exist

@@ -10,6 +10,8 @@ import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { addressBook, type AddressBookEntry } from './address-book';
+import { auditPanel, resetAuditPanel, type AuditCommands, type AuditRow } from './audit-log';
+import { resetSystemSettings, systemSettings, type SystemCommands } from './system-settings';
 import { consentDialog } from './consent-dialog';
 import { SUPPORTED_LOCALES } from './i18n';
 import { connectPanel, credentialsPanel, inviteCodePanel, setConnectPhase } from './invite-view';
@@ -234,6 +236,57 @@ describe('accessibility: invite view', () => {
         expect(container.querySelector('.code-box')).not.toBeNull();
       });
       expect(await auditViolations(container)).toEqual([]);
+    });
+  }
+});
+
+describe('accessibility: audit log', () => {
+  const rows: AuditRow[] = [
+    { at_unix_secs: 1_700_000_000, peer: 'ab12cd34', kind: 'consent_granted', detail: 'full_control' },
+  ];
+  const commands: AuditCommands = {
+    status: () => Promise.resolve(true),
+    kinds: () => Promise.resolve(['consent_granted']),
+    list: () => Promise.resolve(rows),
+    export: () => Promise.resolve(null),
+    clear: () => Promise.resolve(0),
+  };
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations with records listed (${locale})`, async () => {
+      resetAuditPanel();
+      render(auditPanel(locale, commands), container);
+      await vi.waitFor(() => {
+        render(auditPanel(locale, commands), container);
+        expect(container.querySelector('[data-testid="audit-row"]')).not.toBeNull();
+      });
+      expect(await auditViolations(container)).toEqual([]);
+      resetAuditPanel();
+    });
+  }
+});
+
+describe('accessibility: this device', () => {
+  const commands: SystemCommands = {
+    autostartStatus: () => Promise.resolve(true),
+    autostartSet: () => Promise.resolve(),
+    updateCheck: () => Promise.resolve({ version: '0.0.24', current: '0.0.23', notes: '' }),
+    updateInstall: () => Promise.resolve(),
+  };
+
+  for (const locale of SUPPORTED_LOCALES) {
+    it(`has no axe violations, before and after an update is found (${locale})`, async () => {
+      resetSystemSettings();
+      render(systemSettings(locale, commands), container);
+      expect(await auditViolations(container)).toEqual([]);
+
+      container.querySelector<HTMLButtonElement>('[data-testid="update-check"]')?.click();
+      await vi.waitFor(() => {
+        render(systemSettings(locale, commands), container);
+        expect(container.querySelector('[data-testid="update-found"]')).not.toBeNull();
+      });
+      expect(await auditViolations(container)).toEqual([]);
+      resetSystemSettings();
     });
   }
 });

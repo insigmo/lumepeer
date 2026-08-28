@@ -799,6 +799,13 @@ pub struct ActorHandle {
     /// picture without queueing behind the actor's mailbox (ADR 0027).
     /// Written only by the actor.
     views: ViewFeeds,
+    /// Host side: the audit log, for the read-only IPC commands (§15;
+    /// ADR 0041).
+    ///
+    /// Shared with the actor for the same reason `views` is: listing, exporting
+    /// and clearing a local table decides nothing, and routing those through
+    /// the actor's mailbox would put disk latency in front of consent.
+    audit: Option<crate::audit_store::AuditStore>,
 }
 
 impl ActorHandle {
@@ -811,6 +818,16 @@ impl ActorHandle {
     /// Whether this host is currently ready to accept incoming connections
     /// from outside the LAN. Purely a status report for the UI — carries no
     /// authorization of its own (§2.3).
+    /// The audit log, when one was opened (§15; ADR 0041).
+    ///
+    /// `None` means this host is running without an audit trail and has
+    /// already said so in its own log; the commands turn it into an empty
+    /// list rather than an error, because "no log" is a true answer.
+    #[must_use]
+    pub const fn audit(&self) -> Option<&crate::audit_store::AuditStore> {
+        self.audit.as_ref()
+    }
+
     #[must_use]
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
@@ -1948,6 +1965,11 @@ enum ActorEvent {
     },
     /// A live connection's stream closed or errored.
     Closed { peer: NodeId, id: u64 },
+    /// A control stream ended on a §9.1 framing violation, with the close code
+    /// §18 names it by. Separate from [`ActorEvent::Closed`], which every
+    /// ordinary hang-up also produces: only a violation belongs in the audit
+    /// log (§15).
+    Violation { peer: NodeId, code: &'static str },
     /// An incoming `rd/media/1` connection finished its QUIC handshake. It has
     /// proven nothing beyond its `NodeId`; whether it may exist at all is a
     /// question only the actor can answer, since only the actor knows which
@@ -2013,6 +2035,25 @@ enum Accepted {
     },
 }
 
+/// The audit log as the actor holds it: a sink plus the persistent salt every
+/// record's peer hash is mixed with (§15; ADR 0041).
+///
+/// The salt is *not* [`Actor::install_salt`] and must not be made to be. That
+/// one is regenerated on every start precisely so a displayed label cannot be
+/// correlated across runs; an audit log needs the opposite, or two visits by
+/// the same device read as two devices. It lives in the keystore and is minted
+/// once.
+struct AuditContext {
+    sink: Box<dyn lumepeer_core::audit::AuditSink>,
+    salt: [u8; 32],
+}
+
+impl std::fmt::Debug for AuditContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditContext").finish_non_exhaustive()
+    }
+}
+
 /// Runtime state the actor owns and loops over.
 struct Actor {
     rx: mpsc::Receiver<ActorCommand>,
@@ -2020,6 +2061,11 @@ struct Actor {
     /// Per-process salt for pseudonymized labels (§15): regenerated on every
     /// start, so a label is stable within a run and meaningless across runs.
     install_salt: [u8; 32],
+    /// Where audit records go, when a log could be opened at all (§15).
+    ///
+    /// `None` is a working host with no audit trail, not a broken one: §18
+    /// says a storage failure degrades the feature, never the session.
+    audit: Option<AuditContext>,
     /// label -> `NodeId`, rebuilt on every command that changes session state.
     labels: std::collections::HashMap<String, NodeId>,
     endpoint: PeerEndpoint,
@@ -2212,6 +2258,26 @@ struct Actor {
 impl Actor {
     fn label_of(&self, peer: &NodeId) -> String {
         peer_tag(&self.install_salt, peer)
+    }
+
+    /// Records one audit event against `peer` (§15; ADR 0041).
+    ///
+    /// Never blocks and never fails: the sink queues, and a host with no
+    /// usable log simply has none. Nothing on the consent path may wait on
+    /// disk, which is what `AuditSink`'s contract says in words.
+    ///
+    /// Wall-clock time on purpose — an audit record is evidence, and §12.3's
+    /// rollback defence belongs to licensing, not to this.
+    fn audit(&mut self, peer: &NodeId, event: lumepeer_core::audit::AuditEvent) {
+        let Some(context) = self.audit.as_mut() else {
+            return;
+        };
+        let record = lumepeer_core::audit::AuditRecord {
+            peer_hash: lumepeer_core::audit::peer_hash(&context.salt, peer),
+            at_unix_secs: unix_now_secs(),
+            event,
+        };
+        context.sink.append(record);
     }
 
     fn resolve(&self, label: &str) -> Result<NodeId, ActorError> {
@@ -2627,6 +2693,14 @@ impl Actor {
                     }
                     Err(error) => {
                         tracing::debug!(peer = %read_tag, %error, "control stream ended");
+                        // A framing error is the peer breaking §9.1, not a peer
+                        // hanging up: only that earns a §15 record. Every other
+                        // read error — an ordinary close, a lost link — is the
+                        // end of a session, which `Closed` already covers.
+                        if matches!(error, NetError::Framing(_)) {
+                            let (_, code) = lumepeer_net::connection::close_for(&error);
+                            let _ = events.send(ActorEvent::Violation { peer, code }).await;
+                        }
                         let _ = events.send(ActorEvent::Closed { peer, id }).await;
                         return;
                     }
@@ -2714,6 +2788,13 @@ impl Actor {
             }
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
             ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
+            ActorEvent::Violation { peer, code } => {
+                tracing::warn!(peer = %self.label_of(&peer), code, "protocol violation");
+                self.audit(
+                    &peer,
+                    lumepeer_core::audit::AuditEvent::ProtocolViolation { code },
+                );
+            }
             ActorEvent::MediaAccepted { connection, peer } => {
                 self.on_media_accepted(*connection, peer);
             }
@@ -2888,9 +2969,9 @@ impl Actor {
                 dropped,
                 "recording flushed at session end"
             );
-            tracing::info!(
-                event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
-                "audit"
+            self.audit(
+                &peer,
+                lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
             );
         }
         // A request nobody answered dies with the session it was about, and
@@ -3143,6 +3224,22 @@ impl Actor {
             .request_consent_as(peer, ticket.allowed_request)
         {
             tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
+            // Which refusal it was is worth a record: §15 separates "the host
+            // was too busy to ask" from "the plan does not allow another
+            // guest", and the two lead to different answers for the operator.
+            match error {
+                CoreError::PendingConsentQueueFull => self.audit(
+                    &peer,
+                    lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
+                ),
+                CoreError::ConcurrentGuestLimit { limit } => self.audit(
+                    &peer,
+                    lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
+                ),
+                // Anything else is not one of the two §15 names a rejection;
+                // the warning above is the whole record it gets.
+                _ => {}
+            }
             // The ticket is already burned and nobody will ever decide on this
             // peer, so the connection must not linger: close it here, before
             // it is ever stored.
@@ -3150,6 +3247,12 @@ impl Actor {
             return;
         }
         tracing::info!(peer = %tag, "consent request queued");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::ConsentRequested {
+                role: ticket.allowed_request,
+            },
+        );
         self.adopt(
             connection,
             peer,
@@ -3235,12 +3338,8 @@ impl Actor {
                 // The audit line records the verdict and nothing else: which
                 // factor was presented, and how nearly it matched, would make
                 // the log the oracle the error type refuses to be (§15).
-                tracing::info!(
-                    peer = %tag,
-                    ?role,
-                    event = ?AuditEvent::UnattendedLogin { accepted: true },
-                    "unattended login accepted"
-                );
+                tracing::info!(peer = %tag, ?role, "unattended login accepted");
+                self.audit(&peer, AuditEvent::UnattendedLogin { accepted: true });
                 if let Err(error) = self.grant_role(peer, role) {
                     tracing::warn!(peer = %tag, ?error, "cannot start the admitted session");
                     self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
@@ -3253,11 +3352,8 @@ impl Actor {
                 // bounds retries, and a guest that mistyped a code should not
                 // have to redial to try again.
                 self.unattended_pending.insert(peer);
-                tracing::warn!(
-                    peer = %tag,
-                    event = ?AuditEvent::UnattendedLogin { accepted: false },
-                    "unattended login refused"
-                );
+                tracing::warn!(peer = %tag, "unattended login refused");
+                self.audit(&peer, AuditEvent::UnattendedLogin { accepted: false });
                 self.send_unattended_reject(peer, rejection_of(&error));
             }
         }
@@ -3908,10 +4004,10 @@ impl Actor {
             self.send_to(&peer, MessageKind::RecordAck(true));
             // §15 keeps paths out of the audit log; the event says that
             // recording started, not where it is being written.
-            tracing::info!(
-                peer = %label,
-                event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: true },
-                "recording started"
+            tracing::info!(peer = %label, "recording started");
+            self.audit(
+                &peer,
+                lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: true },
             );
             Ok(Some(path.to_string_lossy().into_owned()))
         } else {
@@ -3930,12 +4026,10 @@ impl Actor {
                 recorder.write_event(0, r#"{"event":"record-stop"}"#);
                 let clean = recorder.stop();
                 let dropped = recorder.dropped();
-                tracing::info!(
-                    peer = %label,
-                    clean,
-                    dropped,
-                    event = ?lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
-                    "recording stopped"
+                tracing::info!(peer = %label, clean, dropped, "recording stopped");
+                self.audit(
+                    &peer,
+                    lumepeer_core::audit::AuditEvent::RecordingToggled { enabled: false },
                 );
             }
             // Off is also how the host declines a pending request: either way
@@ -4360,9 +4454,12 @@ impl Actor {
     ///
     /// The tag and the pseudonymized peer, and nothing else: a file name is
     /// exactly what §15 keeps out of this log.
-    fn audit_file(&self, peer: &NodeId, action: &'static str) {
-        let event = lumepeer_core::audit::AuditEvent::FileAction { action };
-        tracing::info!(peer = %self.label_of(peer), ?event, "file transfer");
+    fn audit_file(&mut self, peer: &NodeId, action: &'static str) {
+        tracing::info!(peer = %self.label_of(peer), action, "file transfer");
+        self.audit(
+            peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action },
+        );
     }
 
     /// Either side: offer one local file to `label` (§9.2).
@@ -5120,6 +5217,18 @@ impl Actor {
             }
         }
         tracing::info!(peer = %label, ?role, "consent granted");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::ConsentGranted { role },
+        );
+        // The role is the only thing that moves `input` — it is not one of the
+        // four independent grants (ADR 0029) — so a grant is exactly when the
+        // §15 `InputToggled` event happens, and the value is the session's own.
+        let input = self.sessions.grants(&peer).is_some_and(|g| g.input);
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::InputToggled { enabled: input },
+        );
         self.refresh_clipboard_watch();
         // A role change moves the `input` grant, and that is one of the two
         // things the cursor channel is decided on (§11).
@@ -5162,6 +5271,7 @@ impl Actor {
         // file connection is closed here and now.
         self.drop_file_state(peer);
         tracing::info!(peer = %label, "consent revoked");
+        self.audit(&peer, lumepeer_core::audit::AuditEvent::ConsentRevoked);
         Ok(())
     }
 
@@ -5194,6 +5304,7 @@ impl Actor {
         // The label is already the pseudonymized tag; the raw `NodeId` never
         // reaches a log line (§15).
         tracing::info!(peer = %label, ?event, "an independent grant changed");
+        self.audit(&peer, event);
         // `clipboard_read` is what decides whether this desktop's clipboard
         // is read at all, so the watcher follows the switch immediately
         // rather than on the next session change (ADR 0030).
@@ -5299,11 +5410,8 @@ impl Actor {
         // change (§15); the label is already the pseudonymized tag, and the
         // device's name and notes stay out of the log as host-identifying
         // free text.
-        tracing::info!(
-            peer = %label,
-            event = ?AuditEvent::DeviceTrustChanged { trusted: now },
-            "device trust changed"
-        );
+        tracing::info!(peer = %label, trusted = now, "device trust changed");
+        self.audit(&peer, AuditEvent::DeviceTrustChanged { trusted: now });
         Ok(())
     }
 
@@ -6072,6 +6180,7 @@ pub async fn spawn_actor(
         tracing::info!("transport: direct IP paths preferred, relay as the fallback");
         PeerEndpoint::bind_with_lan(secret_key, relay).await?
     };
+    let audit = open_audit_log(&app, store.as_ref()).await;
     let stores = ActorStores {
         history_path: connection_history_path(&app),
         address_book_path: address_book_path(),
@@ -6079,6 +6188,7 @@ pub async fn spawn_actor(
         // hash and TOTP secret are secret material and `CLAUDE.md` keeps
         // secrets out of `config/*.toml` (§11.2; ADR 0033).
         keystore: store,
+        audit,
     };
 
     let handle = spawn_actor_with(
@@ -6118,6 +6228,55 @@ fn address_book_path() -> Option<std::path::PathBuf> {
         return None;
     };
     Some(dir.join("address_book.json"))
+}
+
+/// Opens the audit log and starts its daily retention sweep (§15; ADR 0041).
+///
+/// Every failure here is a warning and a `None`, never a refusal to start: §18
+/// says a storage fault degrades the feature that needs the storage. A host
+/// that cannot write an audit trail is still a host, and refusing to run would
+/// hand anyone who can break the database a way to take the machine offline.
+///
+/// The one failure worth its own message is a lost install salt over a
+/// non-empty log: minting a new one would silently split every peer's history
+/// in two, so the log is left untouched and unwritten instead.
+async fn open_audit_log(
+    app: &tauri::AppHandle,
+    keystore: &dyn Keystore,
+) -> Option<crate::audit_store::AuditStore> {
+    use tauri::Manager as _;
+
+    let path = match app.path().app_local_data_dir() {
+        Ok(dir) => dir.join("audit.db"),
+        Err(error) => {
+            tracing::warn!(%error, "cannot resolve the app data directory; no audit log this run");
+            return None;
+        }
+    };
+    let store = match crate::audit_store::AuditStore::open(path, keystore).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(%error, "audit log unavailable; the host runs without an audit trail");
+            return None;
+        }
+    };
+
+    // Once a day, not once per record: the sweep is a table scan and the
+    // cutoff moves by seconds. `AuditStore::open` already swept once.
+    let daily = store.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+            lumepeer_core::constants::AUDIT_RETENTION_SWEEP_SECS,
+        ));
+        ticker.tick().await; // fires immediately; the open already pruned
+        loop {
+            ticker.tick().await;
+            if let Err(error) = daily.prune().await {
+                tracing::warn!(%error, "audit log: retention sweep failed");
+            }
+        }
+    });
+    Some(store)
 }
 
 fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
@@ -6183,6 +6342,11 @@ pub struct ActorStores {
     /// in the real application, an in-memory stand-in in tests — never a
     /// config file, which `CLAUDE.md` rules out for secrets.
     pub keystore: Box<dyn Keystore>,
+    /// The audit log, when one could be opened (§15; ADR 0041).
+    ///
+    /// `None` is the ordinary degraded state: no data directory, or a database
+    /// that refused to open. The caller has already said so in the log.
+    pub audit: Option<crate::audit_store::AuditStore>,
 }
 
 impl std::fmt::Debug for ActorStores {
@@ -6204,6 +6368,7 @@ impl ActorStores {
             history_path: None,
             address_book_path: None,
             keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
+            audit: None,
         }
     }
 }
@@ -6231,7 +6396,15 @@ pub fn spawn_actor_with(
         history_path,
         address_book_path,
         keystore,
+        audit,
     } = stores;
+    // One log, two handles: the actor writes through the `AuditSink` contract,
+    // the IPC commands read through the handle below (§15; ADR 0041).
+    let audit_reader = audit.clone();
+    let audit = audit.map(|store| AuditContext {
+        salt: *store.salt(),
+        sink: Box::new(store) as Box<dyn lumepeer_core::audit::AuditSink>,
+    });
     let unattended_store = UnattendedStore::new(keystore);
     let mut unattended = UnattendedAccess::new();
     unattended_store.restore(&mut unattended);
@@ -6265,6 +6438,7 @@ pub fn spawn_actor_with(
         rx,
         sessions: SessionManager::new(),
         install_salt,
+        audit,
         labels: std::collections::HashMap::new(),
         endpoint,
         identity,
@@ -6336,6 +6510,7 @@ pub fn spawn_actor_with(
         online: Arc::new(AtomicBool::new(false)),
         health,
         views: view_feeds,
+        audit: audit_reader,
     }
 }
 

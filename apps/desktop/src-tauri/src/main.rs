@@ -12,6 +12,8 @@
 )]
 
 mod address_book_store;
+mod audit_store;
+mod autostart;
 mod clipboard_os;
 mod commands;
 mod config;
@@ -28,6 +30,105 @@ pub struct AppState {
     /// Channel handle into the `NetworkActor` (§2.3): the only way commands
     /// reach `SessionManager` or the transport.
     pub network: network::ActorHandle,
+    /// Update manifest this client checks, already resolved for the configured
+    /// channel (§21; ADR 0042). `None` when updates are not configured.
+    pub update_url: Option<String>,
+    /// Whether this build starts with the user's session (ADR 0042), as the
+    /// settings panel reads and writes it.
+    pub autostart: autostart::Autostart,
+}
+
+/// Installs the tray icon and its menu.
+///
+/// Closing the window must not stop remote sessions: the app keeps running in
+/// the tray, and the close handler in [`main`] hides the window rather than
+/// destroying it. That makes the tray the only way back to the UI, so a
+/// missing bundled icon degrades to a blank tray entry and a warning rather
+/// than taking the start down with it (§18).
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::Manager as _;
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show_item = MenuItem::with_id(app, "show", "Show Lumepeer", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let mut tray = TrayIconBuilder::new();
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    } else {
+        tracing::warn!("no bundled window icon: the tray entry will be blank");
+    }
+
+    tray.menu(&tray_menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "quit" => app.exit(0),
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
+
+/// Binds the endpoint, publishes the state every IPC command reads, and puts
+/// the tray up.
+///
+/// Runs inside Tauri's `setup` hook because the actor now owns the remote-view
+/// windows, and an `AppHandle` only exists once Tauri has set the application
+/// up.
+fn setup_app(
+    app: &tauri::App,
+    runtime: tokio::runtime::Runtime,
+    settings: &config::Settings,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::Manager as _;
+
+    let network = runtime
+        .block_on(network::spawn_actor(app.handle().clone(), settings))
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: failed to bind the network endpoint: {error}");
+            std::process::exit(1);
+        });
+    let update_url = settings.update_manifest_url();
+    if let Some(url) = update_url.as_deref() {
+        tracing::info!(channel = ?settings.update_channel(), url, "update channel");
+    } else {
+        tracing::warn!("no usable update manifest URL configured; updates are off");
+    }
+    app.manage(AppState {
+        network,
+        update_url,
+        autostart: autostart::Autostart::for_this_app(),
+    });
+    // The runtime owns every actor and connection task; dropping it here would
+    // abort all of them.
+    app.manage(runtime);
+
+    install_tray(app)?;
+
+    Ok(())
 }
 
 fn main() {
@@ -60,6 +161,10 @@ fn main() {
     // plugin makes it available to this process, not to the untrusted
     // presentation layer (§2.3; ADR 0032).
     let mut builder = tauri::Builder::default()
+        // The plugin carries the public key from `tauri.conf.json`; the
+        // endpoint is chosen per check instead, because it depends on the
+        // configured channel (§21; ADR 0042) and a channel that could only be
+        // changed by rebuilding would not be a channel.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init());
 
@@ -78,64 +183,7 @@ fn main() {
         // The actor is built here rather than before the builder because it now
         // owns the remote-view windows, and an `AppHandle` only exists once
         // Tauri has set the application up.
-        .setup(move |app| {
-            use tauri::Manager as _;
-            use tauri::menu::{Menu, MenuItem};
-            use tauri::tray::TrayIconBuilder;
-
-            let network = runtime
-                .block_on(network::spawn_actor(app.handle().clone(), &settings))
-                .unwrap_or_else(|error| {
-                    eprintln!("fatal: failed to bind the network endpoint: {error}");
-                    std::process::exit(1);
-                });
-            app.manage(AppState { network });
-            // The runtime owns every actor and connection task; dropping it
-            // here would abort all of them.
-            app.manage(runtime);
-
-            // Closing the window must not stop remote sessions: the app keeps
-            // running in the tray, and the window close handler below hides
-            // rather than destroys it.
-            let show_item = MenuItem::with_id(app, "show", "Show Lumepeer", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-            TrayIconBuilder::new()
-                .icon(
-                    app.default_window_icon()
-                        .cloned()
-                        .expect("bundled tray icon"),
-                )
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => app.exit(0),
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                })
-                .build(app)?;
-
-            Ok(())
-        })
+        .setup(move |app| setup_app(app, runtime, &settings))
         .on_window_event(|window, event| {
             // Closing the window hides it instead of quitting: lumepeer keeps
             // serving remote sessions from the tray until "Quit" is chosen.
@@ -190,6 +238,15 @@ fn main() {
             commands::monitors_list,
             commands::recordings_list,
             commands::recording_export,
+            commands::audit_list,
+            commands::audit_kinds,
+            commands::audit_status,
+            commands::audit_export,
+            commands::audit_clear,
+            commands::update_check,
+            commands::update_install,
+            commands::autostart_status,
+            commands::autostart_set,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {

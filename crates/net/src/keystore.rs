@@ -58,6 +58,19 @@ pub const UNATTENDED_ROLE_ENTRY: &str = "lumepeer.unattended.role";
 /// mint valid codes, which is exactly why it is not in a config file.
 pub const UNATTENDED_TOTP_ENTRY: &str = "lumepeer.unattended.totp";
 
+/// Keystore entry name of the audit log's install salt (§15).
+///
+/// Thirty-two random bytes, minted once on the first run that opens the audit
+/// log and never again: `audit::peer_hash` mixes them into every stored peer
+/// hash, so replacing them silently turns one peer into two and makes the
+/// existing log unreadable as a history.
+///
+/// Kept here rather than next to the log for the same reason the unattended
+/// TOTP secret is: the salt is what stops a reader of the log from confirming
+/// a guessed `NodeId` by re-hashing it, so it is secret material even though
+/// it is not a key.
+pub const AUDIT_SALT_ENTRY: &str = "lumepeer.audit.salt";
+
 /// Domain separator of the file-fallback key derivation.
 const KDF_CONTEXT: &str = "lumepeer 2026 endpoint identity file keystore";
 

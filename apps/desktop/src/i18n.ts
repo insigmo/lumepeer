@@ -55,6 +55,52 @@ export type TranslationKey =
   | 'recordings.exportFailed'
   | 'recordings.megabytes'
   | 'recordings.kilobytes'
+  | 'audit.heading'
+  | 'audit.empty'
+  | 'audit.disabled'
+  | 'audit.filterFrom'
+  | 'audit.filterTo'
+  | 'audit.filterKind'
+  | 'audit.filterAll'
+  | 'audit.apply'
+  | 'audit.time'
+  | 'audit.peer'
+  | 'audit.event'
+  | 'audit.detail'
+  | 'audit.export'
+  | 'audit.exported'
+  | 'audit.exportFailed'
+  | 'audit.clear'
+  | 'audit.clearConfirm'
+  | 'audit.clearYes'
+  | 'audit.clearNo'
+  | 'audit.cleared'
+  | 'audit.clearFailed'
+  | 'audit.loadFailed'
+  | 'audit.kind.consent_requested'
+  | 'audit.kind.consent_granted'
+  | 'audit.kind.consent_revoked'
+  | 'audit.kind.consent_rejected_queue_full'
+  | 'audit.kind.consent_rejected_guest_limit'
+  | 'audit.kind.input_toggled'
+  | 'audit.kind.recording_toggled'
+  | 'audit.kind.file_action'
+  | 'audit.kind.protocol_violation'
+  | 'audit.kind.grant_changed'
+  | 'audit.kind.unattended_login'
+  | 'audit.kind.device_trust_changed'
+  | 'system.heading'
+  | 'system.autostart'
+  | 'system.autostartNote'
+  | 'system.autostartFailed'
+  | 'system.checkUpdates'
+  | 'system.checking'
+  | 'system.upToDate'
+  | 'system.available'
+  | 'system.installUpdate'
+  | 'system.installing'
+  | 'system.installedRestart'
+  | 'system.updateFailed'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'status.endedJustNow'
@@ -267,6 +313,52 @@ const en: Dictionary = {
   'recordings.exportFailed': 'The export failed. Nothing was written.',
   'recordings.megabytes': (size) => `${size} MB`,
   'recordings.kilobytes': (size) => `${size} kB`,
+  'audit.heading': 'Audit log',
+  'audit.empty': 'Nothing was recorded in the window you asked for.',
+  'audit.disabled': 'This host is running without an audit log. Nothing is being recorded.',
+  'audit.filterFrom': 'From',
+  'audit.filterTo': 'To',
+  'audit.filterKind': 'Event',
+  'audit.filterAll': 'All events',
+  'audit.apply': 'Apply',
+  'audit.time': 'When',
+  'audit.peer': 'Device',
+  'audit.event': 'Event',
+  'audit.detail': 'Detail',
+  'audit.export': 'Export...',
+  'audit.exported': (path) => `Exported to ${path}`,
+  'audit.exportFailed': 'The export failed. Nothing was written.',
+  'audit.clear': 'Erase the log',
+  'audit.clearConfirm': 'Erase every record? This cannot be undone.',
+  'audit.clearYes': 'Erase',
+  'audit.clearNo': 'Keep',
+  'audit.cleared': (count) => `${count} records erased.`,
+  'audit.clearFailed': 'The log could not be erased.',
+  'audit.loadFailed': 'The log could not be read.',
+  'audit.kind.consent_requested': 'Consent requested',
+  'audit.kind.consent_granted': 'Consent granted',
+  'audit.kind.consent_revoked': 'Consent revoked',
+  'audit.kind.consent_rejected_queue_full': 'Refused: the request queue was full',
+  'audit.kind.consent_rejected_guest_limit': 'Refused: the guest limit was reached',
+  'audit.kind.input_toggled': 'Input changed',
+  'audit.kind.recording_toggled': 'Recording changed',
+  'audit.kind.file_action': 'File transfer',
+  'audit.kind.protocol_violation': 'Protocol violation',
+  'audit.kind.grant_changed': 'Permission changed',
+  'audit.kind.unattended_login': 'Unattended login',
+  'audit.kind.device_trust_changed': 'Device trust changed',
+  'system.heading': 'This device',
+  'system.autostart': 'Start Lumepeer when I sign in',
+  'system.autostartNote': 'Starting with your session allows nothing on its own: Lumepeer comes up and waits for you to accept each connection. Turning this off removes the startup entry.',
+  'system.autostartFailed': 'This device would not change its startup setting.',
+  'system.checkUpdates': 'Check for updates',
+  'system.checking': 'Checking...',
+  'system.upToDate': 'You are on the newest release.',
+  'system.available': (version) => `Version ${version} is available`,
+  'system.installUpdate': 'Install',
+  'system.installing': 'Installing...',
+  'system.installedRestart': 'Installed. Restart Lumepeer to run the new version.',
+  'system.updateFailed': 'The update could not be completed. Nothing was installed.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'status.endedJustNow': 'Ended just now',
@@ -486,6 +578,52 @@ const ar: Dictionary = {
   'recordings.exportFailed': 'فشل التصدير. لم يُكتب أي ملف.',
   'recordings.megabytes': (size) => `${size} م.ب`,
   'recordings.kilobytes': (size) => `${size} ك.ب`,
+  'audit.heading': 'سجل التدقيق',
+  'audit.empty': 'لا توجد سجلات ضمن النطاق المطلوب.',
+  'audit.disabled': 'يعمل هذا المضيف بدون سجل تدقيق. لا يُسجَّل شيء.',
+  'audit.filterFrom': 'من',
+  'audit.filterTo': 'إلى',
+  'audit.filterKind': 'الحدث',
+  'audit.filterAll': 'كل الأحداث',
+  'audit.apply': 'تطبيق',
+  'audit.time': 'الوقت',
+  'audit.peer': 'الجهاز',
+  'audit.event': 'الحدث',
+  'audit.detail': 'التفاصيل',
+  'audit.export': 'تصدير...',
+  'audit.exported': (path) => `تم التصدير إلى ${path}`,
+  'audit.exportFailed': 'فشل التصدير. لم يُكتب أي ملف.',
+  'audit.clear': 'محو السجل',
+  'audit.clearConfirm': 'محو كل السجلات؟ لا يمكن التراجع عن ذلك.',
+  'audit.clearYes': 'محو',
+  'audit.clearNo': 'إبقاء',
+  'audit.cleared': (count) => `تم محو ${count} سجلاً.`,
+  'audit.clearFailed': 'تعذّر محو السجل.',
+  'audit.loadFailed': 'تعذّرت قراءة السجل.',
+  'audit.kind.consent_requested': 'طُلبت الموافقة',
+  'audit.kind.consent_granted': 'مُنحت الموافقة',
+  'audit.kind.consent_revoked': 'سُحبت الموافقة',
+  'audit.kind.consent_rejected_queue_full': 'رُفض: طابور الطلبات ممتلئ',
+  'audit.kind.consent_rejected_guest_limit': 'رُفض: بلغ حد الضيوف',
+  'audit.kind.input_toggled': 'تغيّر الإدخال',
+  'audit.kind.recording_toggled': 'تغيّر التسجيل',
+  'audit.kind.file_action': 'نقل ملف',
+  'audit.kind.protocol_violation': 'مخالفة بروتوكول',
+  'audit.kind.grant_changed': 'تغيّر إذن',
+  'audit.kind.unattended_login': 'دخول غير مراقب',
+  'audit.kind.device_trust_changed': 'تغيّرت ثقة الجهاز',
+  'system.heading': 'هذا الجهاز',
+  'system.autostart': 'تشغيل Lumepeer عند تسجيل الدخول',
+  'system.autostartNote': 'التشغيل مع الجلسة لا يمنح شيئًا بحد ذاته: يبدأ Lumepeer وينتظر قبولك لكل اتصال. إيقاف هذا الخيار يزيل مُدخل بدء التشغيل.',
+  'system.autostartFailed': 'تعذّر تغيير إعداد بدء التشغيل على هذا الجهاز.',
+  'system.checkUpdates': 'التحقق من التحديثات',
+  'system.checking': 'جارٍ التحقق...',
+  'system.upToDate': 'أنت على أحدث إصدار.',
+  'system.available': (version) => `الإصدار ${version} متاح`,
+  'system.installUpdate': 'تثبيت',
+  'system.installing': 'جارٍ التثبيت...',
+  'system.installedRestart': 'تم التثبيت. أعد تشغيل Lumepeer لتشغيل الإصدار الجديد.',
+  'system.updateFailed': 'تعذّر إكمال التحديث. لم يُثبَّت شيء.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'status.endedJustNow': 'انتهت للتو',

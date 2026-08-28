@@ -34,3 +34,18 @@ broker_base_url = "https://broker.invalid"
 [ui]
 # The consent screen must render instantly even on weak hardware (§5.1).
 locale = "en"
+
+[updates]
+# Which stream of releases this client updates from (ADR 0042). "stable" takes
+# only released builds; "beta" also takes prereleases, and moving a machine
+# onto it is meant to be a deliberate edit, never a default.
+#
+# Signature checking is not affected by this setting: an artifact whose
+# signature does not verify against the public key in tauri.conf.json is
+# refused on both channels, and there is no unsigned fallback (§21).
+channel = "stable"
+# Where update manifests are fetched from, without a trailing slash. Unset
+# means this project's own GitHub releases. Point it at your own server when
+# you build and distribute lumepeer yourself; it must be https, and the
+# artifacts must be signed with the key pairing the pubkey in tauri.conf.json.
+# manifest_base_url = "https://updates.example.com/lumepeer"

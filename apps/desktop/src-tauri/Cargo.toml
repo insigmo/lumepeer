@@ -58,8 +58,13 @@ tauri-plugin-pilot = { version = "0.7.2", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The audit log's append-only store (§15; ADR 0041). Same workspace pin the
+# broker uses, so no new SQLite build enters the workspace — only this binary
+# links it.
+sqlx.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -70,6 +75,11 @@ tracing-subscriber.workspace = true
 # unlike x11rb, the `windows`/`objc2` bindings those pull in are large enough
 # that making them unconditional here would slow down every Windows/macOS
 # build, including ones that never touch capture.
+[target.'cfg(target_os = "windows")'.dependencies]
+# The per-user Run key of ADR 0042. Windows only: the macOS and Linux arms
+# of `autostart` are plain file writes and need nothing.
+winreg.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `audio-capture-pipewire` sits here rather than in the shared section above
 # for the same reason `capture-x11` does: it is the Linux half of a feature

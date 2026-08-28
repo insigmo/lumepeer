@@ -1385,3 +1385,106 @@ button {
   flex-basis: 100%;
   color: var(--red);
 }
+
+/* Audit log panel (§15; ADR 0041). Same card as .recordings: it sits next to
+   it in the main column and reads as one more thing this device keeps. */
+.audit {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--sidebar-bg);
+}
+
+.audit h3 {
+  margin: 0 0 4px;
+  font-size: var(--fs-body);
+}
+
+.audit-disabled,
+.audit-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+}
+
+.audit-filters,
+.audit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: var(--fs-micro);
+}
+
+.audit-filter {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.audit-table {
+  width: 100%;
+  margin-top: 8px;
+  border-collapse: collapse;
+  font-size: var(--fs-micro);
+}
+
+.audit-table th,
+.audit-table td {
+  padding: 4px 6px;
+  text-align: start;
+  border-top: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+
+.audit-table thead th {
+  border-top: none;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.audit-peer {
+  font-family: var(--font-mono, monospace);
+}
+
+.audit-confirm,
+.audit-notice {
+  color: var(--text-muted);
+}
+
+/* Autostart and updates (ADR 0042). Same card as .audit and .recordings. */
+.system-settings {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+  background: var(--sidebar-bg);
+}
+
+.system-settings h3 {
+  margin: 0 0 4px;
+  font-size: var(--fs-body);
+}
+
+.system-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: var(--fs-micro);
+}
+
+.system-note {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+}
+
+.system-error {
+  margin: 4px 0 0;
+  color: var(--danger, #c0392b);
+  font-size: var(--fs-micro);
+}
