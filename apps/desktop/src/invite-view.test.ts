@@ -199,6 +199,71 @@ describe('connect form: one request at a time', () => {
   });
 });
 
+describe('invite code panel', () => {
+  /** Creates an invite and renders the panel that shows it. */
+  async function withCode(view: InviteView, code: string): Promise<void> {
+    invoke.mockResolvedValue({ code });
+    render(view.inviteCodePanel('en'), container);
+    container.querySelector<HTMLButtonElement>('.create-btn')?.click();
+    await vi.waitFor(() => {
+      render(view.inviteCodePanel('en'), container);
+      expect(container.querySelector('.code-box')).not.toBeNull();
+    });
+  }
+
+  const CODE = `lumepeer1:${'x'.repeat(200)}`;
+
+  // Two controls used to copy the code: the code box was a button as well as
+  // the Copy button next to it. One affordance, on the button that says so.
+  it('offers exactly one control that copies, and it is not the code itself', async () => {
+    const view = await load();
+    await withCode(view, CODE);
+
+    const codeBox = container.querySelector('.code-box');
+    expect(codeBox).not.toBeNull();
+    expect(codeBox?.tagName).not.toBe('BUTTON');
+
+    const buttons = container.querySelectorAll('button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]?.className).toBe('copy-btn');
+    expect(buttons[0]?.textContent?.trim()).toBe('Copy invite code');
+  });
+
+  it('copies the whole code, not the truncated line on screen', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const view = await load();
+    await withCode(view, CODE);
+
+    container.querySelector<HTMLButtonElement>('.copy-btn')?.click();
+    await vi.waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(CODE);
+    });
+  });
+
+  // The line is clipped by CSS, which jsdom has no layout engine to apply, so
+  // what is pinned here is the part that survives without one: the whole code
+  // is on `title` and can be read by hovering.
+  it('keeps the whole code on title even though the line is truncated', async () => {
+    const view = await load();
+    await withCode(view, CODE);
+    expect(container.querySelector('.code-box')?.getAttribute('title')).toBe(CODE);
+  });
+
+  // Reissuing retires every code handed out before it (ADR 0016). That is a
+  // revoke, and it belongs in settings under a name that says so — not one
+  // button below Copy.
+  it('does not offer to reissue the code from the sidebar', async () => {
+    const view = await load();
+    await withCode(view, CODE);
+    expect(container.querySelector('.create-btn')).toBeNull();
+    expect(container.textContent).not.toContain('Refresh');
+  });
+});
+
 describe('remembered hosts', () => {
   it('reconnects by label, never by handing the invite code back to the webview', async () => {
     const view = await load();

@@ -145,7 +145,7 @@ describe('keyboard navigation: invite view', () => {
     expect(buttons[0]?.disabled).toBe(false);
   });
 
-  it('the create-invite, code-box, copy-code and refresh-invite buttons are reachable across the invite lifecycle', async () => {
+  it('the create-invite and copy-code buttons are reachable across the invite lifecycle', async () => {
     render(inviteCodePanel('en'), container);
     let buttons = focusables(container);
     expect(buttons).toHaveLength(1);
@@ -157,9 +157,10 @@ describe('keyboard navigation: invite view', () => {
       expect(container.querySelector('.copy-btn')).not.toBeNull();
     });
 
-    // Code box (copies on click), explicit copy button, and refresh-invite.
+    // Copy is the only control here: the code itself is plain selectable text
+    // and reissuing the invite lives in the settings window (docs/bugs/04).
     buttons = focusables(container);
-    expect(buttons).toHaveLength(3);
+    expect(buttons).toHaveLength(1);
     for (const button of buttons) {
       expect(button.disabled).toBe(false);
       expect(button.tabIndex).not.toBe(-1);
