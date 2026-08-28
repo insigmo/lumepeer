@@ -15,9 +15,16 @@
 // - Only the matched chord is consumed. `preventDefault` marks it so
 //   `ViewInput` knows not to forward it as well, and everything else is left
 //   exactly as it arrived.
+// - Nothing matches while the operator is typing into one of this window's own
+//   fields. The listener sits on the document, so a chord typed into the chat
+//   box would otherwise fire the window's action *and* be eaten before the
+//   field saw it — the same document-scoped trap `ViewInput` has, which is why
+//   both read the same {@link isLocalTextTarget}.
 //
 // A hotkey nobody can see is indistinguishable from a bug, so the same table
 // this module matches against is what the toolbar's help popover lists.
+
+import { isLocalTextTarget } from './view-window';
 
 /** One thing the operator can ask this window — not the host — to do. */
 export type HotkeyAction =
@@ -76,6 +83,9 @@ export type HotkeyHandlers = Partial<Record<HotkeyAction, () => void>>;
  */
 export function installHotkeys(target: EventTarget, handlers: HotkeyHandlers): () => void {
   const onKeyDown = (event: Event): void => {
+    if (isLocalTextTarget(event.target)) {
+      return;
+    }
     const action = matchHotkey(event as KeyboardEvent);
     if (!action) {
       return;
