@@ -362,6 +362,23 @@ export async function reconnect(peer: string): Promise<void> {
   await attempt('history_connect', { args: { peer } });
 }
 
+/**
+ * The key for the line under the form while an attempt is outstanding
+ * (docs/bugs/02-connect-form.md, task 2). Falls back to the dialing wording
+ * for `idle`/`dialing`/the synchronous `dialing` flag — the only two waits
+ * with their own text are the ones where the far side, not this node, is
+ * holding things up.
+ */
+function connectingStatusKey(): TranslationKey {
+  if (phase === 'awaiting_consent') {
+    return 'invite.connecting.awaitingConsent';
+  }
+  if (phase === 'awaiting_credentials') {
+    return 'invite.connecting.awaitingCredentials';
+  }
+  return 'invite.connecting.dialing';
+}
+
 /** The message under the connect form, if there is one to show. */
 function errorText(locale: Locale): string | undefined {
   if (connectError === undefined) {
@@ -436,11 +453,14 @@ export function connectPanel(locale: Locale): TemplateResult {
         placeholder=${t(locale, 'invite.connectPlaceholder')}
       />
       <button type="submit" class="connect-btn" ?disabled=${waiting}>
-        ${waiting
-          ? `${t(locale, 'invite.connecting')}${'.'.repeat(connectingDots)}`
-          : t(locale, 'invite.connect')}
+        ${t(locale, 'invite.connect')}
       </button>
     </form>
+    ${waiting
+      ? html`<p class="connect-status" role="status" aria-live="polite" data-testid="connect-status">
+          ${t(locale, connectingStatusKey())}${'.'.repeat(connectingDots)}
+        </p>`
+      : ''}
     ${message ? html`<p class="connect-error" role="alert">${message}</p>` : ''}
   `;
 }
