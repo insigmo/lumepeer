@@ -352,6 +352,9 @@ async function main(): Promise<void> {
     mountToolbar(toolbarRootElement, locale, peer, tauriToolbarCommands, {
       toggleChat(): boolean {
         chatPanel.hidden = !chatPanel.hidden;
+        // The button's own `is-active` and `aria-pressed` are both read off
+        // this, and neither updates itself.
+        toolbar?.redraw();
         return !chatPanel.hidden;
       },
       chatVisible(): boolean {
