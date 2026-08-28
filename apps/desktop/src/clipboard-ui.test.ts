@@ -26,6 +26,7 @@ function toolbarHooks(): ToolbarHooks {
   return {
     toggleChat: () => true,
     chatVisible: () => false,
+    chatUnread: () => false,
     displayMode: () => 'fit',
     setDisplayMode: () => {},
     fullscreen: () => false,

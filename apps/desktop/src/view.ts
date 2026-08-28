@@ -9,7 +9,13 @@
 
 import { render } from 'lit-html';
 
-import { ChatState, startChatPolling, tauriChatCommands } from './chat';
+import {
+  ChatState,
+  startChatPolling,
+  tauriChatCommands,
+  type ChatCommands,
+  type ChatRow,
+} from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
 import { installHotkeys } from './view-hotkeys';
@@ -105,10 +111,58 @@ let cursor: CursorShape | null = null;
 // arrived: without one there is nothing to turn off, and the toolbar says so
 // by disabling the switch.
 let localCursor = true;
+// The chat panel opens closed (§11), so a message from the host would arrive
+// with nothing on screen to show it. This is the whole of the indication: one
+// flag, marked on the toolbar's chat button and cleared when the panel opens.
+let chatUnread = false;
+// Incoming rows already on screen. Compared against the transcript rather than
+// counted from an event, because the actor's transcript is the only thing that
+// knows what arrived.
+let chatSeenIncoming = 0;
+const chatState = new ChatState();
 // The last pointer position inside the window, which is where the cursor is
 // drawn. Local by design: a cursor that moved with the video would lag by the
 // round trip, and removing that lag is the whole reason for the channel.
 let pointerAt: { x: number; y: number } | null = null;
+
+function incomingCount(rows: readonly ChatRow[]): number {
+  return rows.reduce((total, row) => (row.outgoing ? total : total + 1), 0);
+}
+
+/** Clears the unread mark: everything in the transcript is now on screen. */
+function markChatRead(): void {
+  chatSeenIncoming = incomingCount(chatState.transcript);
+  chatUnread = false;
+}
+
+/**
+ * The transcript poll, wrapped rather than replaced.
+ *
+ * `startChatPolling` already re-reads the authoritative transcript once a
+ * second and owns the panel's markup; the only thing missing is that nobody
+ * notices a message that arrived while the panel was closed. Wrapping the
+ * command it polls through is where that fits without the panel having to know
+ * anything about the toolbar.
+ */
+const chatCommands: ChatCommands = {
+  async chatTranscript(label) {
+    const rows = await tauriChatCommands.chatTranscript(label);
+    const incoming = incomingCount(rows);
+    if (chatPanel && !chatPanel.hidden) {
+      chatSeenIncoming = incoming;
+    } else if (incoming > chatSeenIncoming) {
+      chatSeenIncoming = incoming;
+      if (!chatUnread) {
+        chatUnread = true;
+        toolbar?.redraw();
+      }
+    }
+    return rows;
+  },
+  chatSend(label, text) {
+    return tauriChatCommands.chatSend(label, text);
+  },
+};
 
 function viewportBox(): Box {
   if (!surface) {
@@ -342,8 +396,11 @@ async function main(): Promise<void> {
   // window does, so no explicit teardown beyond the poll's own stop. The
   // toolbar's chat button toggles exactly this panel.
   if (chatPanel) {
-    chatPanel.hidden = false;
-    startChatPolling(chatPanel, new ChatState(), locale, peer, tauriChatCommands);
+    // Closed on arrival: the picture is what this window is for, and the panel
+    // sits on top of it. The poll still runs, so opening the panel shows the
+    // history that is already there rather than a blank second of waiting.
+    chatPanel.hidden = true;
+    startChatPolling(chatPanel, chatState, locale, peer, chatCommands);
   }
   // The floating session toolbar (§11): drag handle, settings, monitor
   // picker, chat toggle, microphone, Ctrl+Alt+Del, full screen, collapse. It
@@ -352,13 +409,19 @@ async function main(): Promise<void> {
     mountToolbar(toolbarRootElement, locale, peer, tauriToolbarCommands, {
       toggleChat(): boolean {
         chatPanel.hidden = !chatPanel.hidden;
-        // The button's own `is-active` and `aria-pressed` are both read off
-        // this, and neither updates itself.
+        if (!chatPanel.hidden) {
+          markChatRead();
+        }
+        // The button's own `is-active`, `aria-pressed` and unread mark are all
+        // read off this, and none of them updates itself.
         toolbar?.redraw();
         return !chatPanel.hidden;
       },
       chatVisible(): boolean {
         return !chatPanel.hidden;
+      },
+      chatUnread(): boolean {
+        return chatUnread;
       },
       displayMode: () => layout.mode,
       setDisplayMode,
@@ -437,6 +500,9 @@ async function main(): Promise<void> {
     'toggle-chat': () => {
       if (chatPanel) {
         chatPanel.hidden = !chatPanel.hidden;
+        if (!chatPanel.hidden) {
+          markChatRead();
+        }
         toolbar?.redraw();
       }
     },

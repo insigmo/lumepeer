@@ -143,6 +143,14 @@ export interface ToolbarHooks {
   /** Whether the chat panel is visible right now. */
   chatVisible(): boolean;
   /**
+   * Whether a message arrived while the panel was closed.
+   *
+   * The panel starts hidden, so without a mark on the button a message from
+   * the host is something the guest simply never sees. A flag, not a count:
+   * "there is something to read" is the whole of what the button has to say.
+   */
+  chatUnread(): boolean;
+  /**
    * How the picture is laid out right now (§11).
    *
    * Read, never held: the window owns the layout, because the same three
@@ -176,6 +184,7 @@ const ICONS = {
   settings: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm5.4-2a5.4 5.4 0 0 0-.1-1l1.2-1-1.2-2-1.4.5a5.5 5.5 0 0 0-1.7-1L10 2H6l-.2 1.5a5.5 5.5 0 0 0-1.7 1L2.7 4 1.5 6l1.2 1a5.4 5.4 0 0 0 0 2l-1.2 1 1.2 2 1.4-.5a5.5 5.5 0 0 0 1.7 1L6 14h4l.2-1.5a5.5 5.5 0 0 0 1.7-1l1.4.5 1.2-2-1.2-1c.1-.3.1-.7.1-1Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/></svg>`,
   monitor: (n: string) => html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><text x="8" y="10" text-anchor="middle" font-size="7" fill="currentColor" stroke="none" font-family="system-ui">${n}</text></svg>`,
   chat: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
+  chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="2.5" fill="#9fd0ff" stroke="none"/></svg>`,
   mic: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   micOff: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2M3 3l10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   file: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6L9 2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><path d="M9 2v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
@@ -218,6 +227,10 @@ export function renderToolbar(
   },
 ): void {
   const chatOn = hooks.chatVisible();
+  // Only worth showing while the panel is closed: with it open the message is
+  // already on screen, and a mark next to it would be a second claim about the
+  // same thing.
+  const chatUnread = !chatOn && hooks.chatUnread();
   const monitorLabel = state.activeMonitor === null ? '1' : String(state.activeMonitor + 1);
 
   const settingsPopover: TemplateResult =
@@ -359,12 +372,12 @@ export function renderToolbar(
           type="button"
           class="toolbar-btn ${chatOn ? 'is-active' : ''}"
           data-testid="toolbar-chat"
-          aria-label=${t(locale, 'toolbar.chat')}
-          title=${t(locale, 'toolbar.chat')}
+          aria-label=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
+          title=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
           aria-pressed=${chatOn ? 'true' : 'false'}
           @click=${() => hooks.toggleChat()}
         >
-          ${ICONS.chat}
+          ${chatUnread ? ICONS.chatUnread : ICONS.chat}
         </button>
         <button
           type="button"
