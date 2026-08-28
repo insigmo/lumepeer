@@ -714,6 +714,22 @@ pub async fn connect_status(
     })
 }
 
+/// Abandons this node's own outgoing connect attempt, whatever stage it is
+/// at (docs/bugs/02-connect-form.md, task 3). Always the one attempt this
+/// node has in flight, so there is nothing to name.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn connect_cancel(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.connect_cancel().await?;
+    Ok(())
+}
+
 /// Issues an invite for `args.role` and returns its code.
 ///
 /// # Errors
@@ -2351,7 +2367,7 @@ mod tests {
             "];",
         );
         let handled: Vec<String> =
-            command_list(include_str!("main.rs"), "tauri::generate_handler![", "])")
+            command_list(include_str!("main.rs"), "tauri::generate_handler![", "]")
                 .into_iter()
                 .map(|line| line.trim_start_matches("commands::").to_owned())
                 .collect();

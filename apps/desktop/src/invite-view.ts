@@ -363,6 +363,29 @@ export async function reconnect(peer: string): Promise<void> {
 }
 
 /**
+ * Abandons the outstanding connect attempt (docs/bugs/02-connect-form.md,
+ * task 3).
+ *
+ * Local state resets once the actor confirms the cancellation, not before —
+ * the form should not claim to be idle a moment before it actually is, and
+ * there is no need to wait for the next `connect_status` poll to find out.
+ */
+async function cancel(): Promise<void> {
+  try {
+    const invoke = await invoker();
+    await invoke('connect_cancel');
+  } catch (error) {
+    console.error('connect_cancel failed:', describeError(error));
+    return;
+  }
+  dialing = false;
+  phase = 'idle';
+  connectError = undefined;
+  syncConnectingAnimation();
+  notify();
+}
+
+/**
  * The key for the line under the form while an attempt is outstanding
  * (docs/bugs/02-connect-form.md, task 2). Falls back to the dialing wording
  * for `idle`/`dialing`/the synchronous `dialing` flag — the only two waits
@@ -452,9 +475,11 @@ export function connectPanel(locale: Locale): TemplateResult {
         type="text"
         placeholder=${t(locale, 'invite.connectPlaceholder')}
       />
-      <button type="submit" class="connect-btn" ?disabled=${waiting}>
-        ${t(locale, 'invite.connect')}
-      </button>
+      ${waiting
+        ? html`<button type="button" class="connect-btn" @click=${() => void cancel()}>
+            ${t(locale, 'invite.cancel')}
+          </button>`
+        : html`<button type="submit" class="connect-btn">${t(locale, 'invite.connect')}</button>`}
     </form>
     ${waiting
       ? html`<p class="connect-status" role="status" aria-live="polite" data-testid="connect-status">

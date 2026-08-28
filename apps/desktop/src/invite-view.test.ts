@@ -61,10 +61,16 @@ function settle(): Promise<void> {
 }
 
 describe('connect form: one request at a time', () => {
-  it('stays disabled after the dial resolves, because the host has not decided yet', async () => {
+  // docs/bugs/02-connect-form.md, task 3: a disabled button used to be the
+  // only sign an attempt was outstanding, with no way to give up on it. It is
+  // now a working Cancel button instead — never disabled, so the guard
+  // against a second request has to live in `attempt()`'s own
+  // `isConnecting()` check, not in the DOM `disabled` attribute.
+  it('offers Cancel once the dial resolves, because the host has not decided yet', async () => {
     const view = await load();
     render(view.connectPanel('en'), container);
     expect(connectButton().disabled).toBe(false);
+    expect(connectButton().type).toBe('submit');
 
     submit('lumepeer1:abc');
     await settle();
@@ -74,25 +80,24 @@ describe('connect form: one request at a time', () => {
     expect(view.isConnecting()).toBe(true);
 
     render(view.connectPanel('en'), container);
-    expect(connectButton().disabled).toBe(true);
-    // docs/bugs/02-connect-form.md, task 1+2: the button no longer breathes
-    // with the dots — its label is fixed, and the animated wait now lives in
-    // the status line under the form.
-    expect(connectButton().textContent?.trim()).toBe('Connect');
+    expect(connectButton().type).toBe('button');
+    expect(connectButton().disabled).toBe(false);
+    expect(connectButton().textContent?.trim()).toBe('Cancel');
     expect(container.querySelector('[data-testid="connect-status"]')?.textContent?.trim()).toMatch(
       /^Connecting\.{1,3}$/,
     );
 
     view.setConnectPhase('connected');
     render(view.connectPanel('en'), container);
-    expect(connectButton().disabled).toBe(false);
+    expect(connectButton().type).toBe('submit');
+    expect(connectButton().textContent?.trim()).toBe('Connect');
   });
 
   // ADR 0027: the dial runs off the actor loop, so `invite_connect` resolving
-  // now means "the attempt started", not "the handshake landed". The button
-  // has to stay disabled across both waits or the user fires a second attempt
-  // into the first one.
-  it('stays disabled through the dial as well as the decision', async () => {
+  // now means "the attempt started", not "the handshake landed". Cancel has
+  // to stay available across both waits, or the user has no way to give up
+  // on an attempt that is taking a while.
+  it('offers Cancel through the dial as well as the decision', async () => {
     const view = await load();
     render(view.connectPanel('en'), container);
 
@@ -101,14 +106,38 @@ describe('connect form: one request at a time', () => {
     view.setConnectPhase('dialing', null);
     expect(view.isConnecting()).toBe(true);
     render(view.connectPanel('en'), container);
-    expect(connectButton().disabled).toBe(true);
+    expect(connectButton().type).toBe('button');
+    expect(connectButton().disabled).toBe(false);
 
     view.setConnectPhase('awaiting_consent', null);
     expect(view.isConnecting()).toBe(true);
 
     view.setConnectPhase('connected', null);
     render(view.connectPanel('en'), container);
+    expect(connectButton().type).toBe('submit');
+  });
+
+  // docs/bugs/02-connect-form.md, task 3: Cancel calls connect_cancel and
+  // returns the form to idle without waiting for the next status poll, and
+  // without showing a red error — cancelling is not a failure.
+  it('cancels the outstanding attempt and returns to idle, with no error shown', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+
+    submit('lumepeer1:abc');
+    await settle();
+    view.setConnectPhase('awaiting_consent', null);
+    render(view.connectPanel('en'), container);
+
+    connectButton().click();
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('connect_cancel');
+    expect(view.isConnecting()).toBe(false);
+
+    render(view.connectPanel('en'), container);
+    expect(connectButton().type).toBe('submit');
     expect(connectButton().disabled).toBe(false);
+    expect(container.querySelector('.connect-error')).toBeNull();
   });
 
   // docs/bugs/02-connect-form.md, task 2: the status line names which of the

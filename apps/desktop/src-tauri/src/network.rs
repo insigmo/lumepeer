@@ -579,6 +579,10 @@ enum ActorCommand {
     ConnectState {
         reply: oneshot::Sender<ConnectSnapshot>,
     },
+    /// Guest side: abandon this node's own outgoing connect attempt
+    /// (docs/bugs/02-connect-form.md, task 3). Always the one attempt this
+    /// node has in flight, so no argument names it.
+    ConnectCancel { reply: oneshot::Sender<()> },
     /// What every live connection's link actually looks like (§18).
     ConnectionStats {
         reply: oneshot::Sender<Vec<ConnectionStats>>,
@@ -904,6 +908,20 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ConnectState { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Abandons this node's own outgoing connect attempt, whatever stage it
+    /// is at (docs/bugs/02-connect-form.md, task 3).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn connect_cancel(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ConnectCancel { reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -3124,16 +3142,35 @@ impl Actor {
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
     }
 
-    /// Drops this node's control connection to `peer` outright.
+    /// Drops this node's control connection to `peer` outright, citing the
+    /// malformed close code — the far end sees this as a protocol fault.
     ///
     /// Dropping the outbound sender alone only ends the writer task; the far
     /// end would sit in `recv` until it noticed by itself.
     fn close_connection(&mut self, peer: NodeId) {
+        self.close_connection_with(
+            peer,
+            lumepeer_net::connection::CLOSE_MALFORMED,
+            lumepeer_net::error::close_code::MALFORMED,
+        );
+    }
+
+    /// Drops this node's control connection to `peer` outright, citing the
+    /// normal close code: this is the user leaving on purpose — cancelling a
+    /// connect attempt or closing the view window — not a protocol fault
+    /// (docs/bugs/02-connect-form.md task 3, docs/bugs/03-connection-list.md
+    /// task 3).
+    fn close_connection_normal(&mut self, peer: NodeId) {
+        self.close_connection_with(
+            peer,
+            lumepeer_net::connection::CLOSE_NORMAL,
+            lumepeer_net::error::close_code::NORMAL,
+        );
+    }
+
+    fn close_connection_with(&mut self, peer: NodeId, code: u32, reason: &str) {
         if let Some(handle) = self.connections.remove(&peer) {
-            handle.connection.close(
-                lumepeer_net::connection::CLOSE_MALFORMED.into(),
-                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
-            );
+            handle.connection.close(code.into(), reason.as_bytes());
         }
     }
 
@@ -3823,6 +3860,10 @@ impl Actor {
                     code_required: self.connect_code_required,
                     retry_secs: self.connect_retry_secs,
                 });
+            }
+            ActorCommand::ConnectCancel { reply } => {
+                self.on_connect_cancel();
+                let _ = reply.send(());
             }
             ActorCommand::Grant { label, role, reply } => {
                 let result = self.on_grant(&label, role);
@@ -5602,6 +5643,32 @@ impl Actor {
         }
         tracing::info!(?role, "the unattended role was set");
         Ok(())
+    }
+
+    /// Guest side: abandons this node's own outgoing connect attempt, at
+    /// whatever stage it is at (docs/bugs/02-connect-form.md, task 3).
+    ///
+    /// Clearing `connect_peer` is the whole fix for a dial still in flight:
+    /// `on_dialed`'s own staleness check (`self.connect_peer != Some(peer)`)
+    /// discards the result once it lands, the same way an already-superseded
+    /// attempt is discarded today. A connection already open and waiting on
+    /// the far side is closed outright, with the normal close code — the user
+    /// walked away, which is not a protocol error and must not be reported as
+    /// one (see `03`, task 3, for the sibling case on the view-window side).
+    fn on_connect_cancel(&mut self) {
+        let Some(peer) = self.connect_peer.take() else {
+            return;
+        };
+        if matches!(
+            self.connect_phase,
+            ConnectPhase::AwaitingConsent | ConnectPhase::AwaitingCredentials
+        ) {
+            self.close_connection_normal(peer);
+        }
+        self.connect_phase = ConnectPhase::Idle;
+        self.connect_failure = None;
+        self.connect_code_required = false;
+        self.connect_retry_secs = None;
     }
 
     /// Guest side: answers the host's credential challenge (§8; ADR 0033).

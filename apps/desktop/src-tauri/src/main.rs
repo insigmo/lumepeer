@@ -196,6 +196,74 @@ async fn watch_for_consent_requests(
     }
 }
 
+/// Every IPC command this app answers, as Tauri's dispatch table.
+///
+/// Kept as a function of its own rather than inline in `main`: the list only
+/// grows, and it was already what was pushing `main` over clippy's
+/// `too_many_lines` threshold — extracting it fixes that at the source
+/// instead of suppressing the lint.
+fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
+    tauri::generate_handler![
+        commands::session_grant,
+        commands::session_revoke,
+        commands::session_status,
+        commands::session_set_grant,
+        commands::address_book_list,
+        commands::address_book_upsert,
+        commands::address_book_remove,
+        commands::address_book_set_trusted,
+        commands::unattended_status,
+        commands::unattended_set_password,
+        commands::unattended_disable,
+        commands::unattended_set_totp,
+        commands::unattended_set_role,
+        commands::unattended_submit,
+        commands::connection_history,
+        commands::history_connect,
+        commands::connect_status,
+        commands::connect_cancel,
+        commands::network_status,
+        commands::connection_stats,
+        commands::license_status,
+        commands::invite_create,
+        commands::invite_connect,
+        commands::view_next_frame,
+        commands::view_cursor,
+        commands::input_pointer_move,
+        commands::input_press,
+        commands::input_wheel,
+        commands::chat_send,
+        commands::chat_transcript,
+        commands::clipboard_push,
+        commands::clipboard_pull,
+        commands::file_offer,
+        commands::file_accept,
+        commands::file_abort,
+        commands::file_transfers,
+        commands::audio_toggle,
+        commands::recording_toggle,
+        commands::record_request,
+        commands::mic_toggle,
+        commands::sas_request,
+        commands::sas_available,
+        commands::monitor_select,
+        commands::monitors_list,
+        commands::recordings_list,
+        commands::recording_export,
+        commands::audit_list,
+        commands::audit_kinds,
+        commands::audit_status,
+        commands::audit_export,
+        commands::audit_clear,
+        commands::update_check,
+        commands::update_install,
+        commands::autostart_status,
+        commands::autostart_set,
+        commands::service_status,
+        commands::service_set,
+    ]
+}
+
 fn main() {
     // Configuration first: it decides where the log file goes, and tracing has
     // to be installed before anything worth logging happens (§5.1, §16.1).
@@ -266,64 +334,7 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            commands::session_grant,
-            commands::session_revoke,
-            commands::session_status,
-            commands::session_set_grant,
-            commands::address_book_list,
-            commands::address_book_upsert,
-            commands::address_book_remove,
-            commands::address_book_set_trusted,
-            commands::unattended_status,
-            commands::unattended_set_password,
-            commands::unattended_disable,
-            commands::unattended_set_totp,
-            commands::unattended_set_role,
-            commands::unattended_submit,
-            commands::connection_history,
-            commands::history_connect,
-            commands::connect_status,
-            commands::network_status,
-            commands::connection_stats,
-            commands::license_status,
-            commands::invite_create,
-            commands::invite_connect,
-            commands::view_next_frame,
-            commands::view_cursor,
-            commands::input_pointer_move,
-            commands::input_press,
-            commands::input_wheel,
-            commands::chat_send,
-            commands::chat_transcript,
-            commands::clipboard_push,
-            commands::clipboard_pull,
-            commands::file_offer,
-            commands::file_accept,
-            commands::file_abort,
-            commands::file_transfers,
-            commands::audio_toggle,
-            commands::recording_toggle,
-            commands::record_request,
-            commands::mic_toggle,
-            commands::sas_request,
-            commands::sas_available,
-            commands::monitor_select,
-            commands::monitors_list,
-            commands::recordings_list,
-            commands::recording_export,
-            commands::audit_list,
-            commands::audit_kinds,
-            commands::audit_status,
-            commands::audit_export,
-            commands::audit_clear,
-            commands::update_check,
-            commands::update_install,
-            commands::autostart_status,
-            commands::autostart_set,
-            commands::service_status,
-            commands::service_set,
-        ])
+        .invoke_handler(invoke_handler())
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
             eprintln!("fatal: failed to start the application: {error}");

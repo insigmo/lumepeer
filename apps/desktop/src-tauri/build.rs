@@ -25,6 +25,7 @@ const COMMANDS: &[&str] = &[
     "connection_history",
     "history_connect",
     "connect_status",
+    "connect_cancel",
     "network_status",
     "connection_stats",
     "license_status",
