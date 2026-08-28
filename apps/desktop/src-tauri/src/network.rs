@@ -697,15 +697,15 @@ enum ActorCommand {
         on: bool,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Host side: retarget capture at the monitor `label`'s guest picked
-    /// (§11 `MonitorSelect`; ADR 0028). Requires a live `view` grant.
+    /// Guest side: ask the watched host to show the monitor the operator
+    /// picked (§11 `MonitorSelect`; ADR 0028).
     MonitorSelect {
         label: String,
         monitor_id: u32,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Host side: announce this host's monitors to `label`'s guest
-    /// (§11 `MonitorsList`; ADR 0028). The reply carries what was sent.
+    /// Guest side: the monitors the watched host announced
+    /// (§11 `MonitorsList`; ADR 0028).
     MonitorsList {
         label: String,
         reply: oneshot::Sender<Result<Vec<MonitorInfo>, ActorError>>,
@@ -1256,13 +1256,13 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
-    /// Host side: retargets capture at `monitor_id` for `label`'s session
-    /// (§11 `MonitorSelect`; ADR 0028). The guest learns nothing back on this
-    /// call — the next picture it receives simply shows the new monitor.
+    /// Guest side: asks the watched host to show `monitor_id` instead
+    /// (§11 `MonitorSelect`; ADR 0028). Nothing comes back on this call — the
+    /// next picture simply shows the other screen.
     ///
     /// # Errors
-    /// [`ActorError::Core::NotPermitted`] without a granted view session;
-    /// [`ActorError::Core::Malformed`] when the id names no announced monitor;
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] when the host announced no such id;
     /// [`ActorError::ChannelClosed`] if the actor is gone.
     pub async fn monitor_select(&self, label: String, monitor_id: u32) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
@@ -1277,12 +1277,15 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
-    /// Host side: announces this host's monitors to `label`'s guest
-    /// (§11 `MonitorsList`; ADR 0028). Returns the list that was sent, so the
-    /// caller can show the same numbers the guest will see.
+    /// Guest side: the watched host's monitors, as it announced them when it
+    /// granted this session (§11 `MonitorsList`; ADR 0028).
+    ///
+    /// Empty when the host announced none — a host that cannot produce a
+    /// picture at all does not announce, and the picker says so rather than
+    /// offering screens nothing will ever be shown on.
     ///
     /// # Errors
-    /// [`ActorError::UnknownPeer`] without a live session;
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
     /// [`ActorError::ChannelClosed`] if the actor is gone.
     pub async fn monitors_list(&self, label: String) -> Result<Vec<MonitorInfo>, ActorError> {
         let (reply, rx) = oneshot::channel();
@@ -1895,6 +1898,14 @@ struct ViewState {
     /// `CursorShape` arrives, and never inferred: a host that composites its
     /// cursor into the picture sends none, and this stays `None`.
     cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
+    /// The host's monitors, as it announced them when it granted the session
+    /// (§11 `MonitorsList`; ADR 0028).
+    ///
+    /// Only ever what arrived on the wire. This node's own displays are not a
+    /// fallback and never stand in for the host's: an empty list means the
+    /// host announced nothing, and the picker says so rather than offering
+    /// screens that belong to the machine the operator is already sitting at.
+    monitors: Vec<MonitorInfo>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -3067,6 +3078,7 @@ impl Actor {
                 input,
                 recording,
                 cursor,
+                monitors: Vec::new(),
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -3663,22 +3675,39 @@ impl Actor {
                 };
                 self.send_sas_ack(peer, delivered);
             }
+            // Guest side: the host announced its screens when it granted the
+            // session (§11; ADR 0028). Kept until the view closes, because
+            // this is the only place the guest ever learns them — the picker
+            // reads this list rather than asking, so opening it costs no round
+            // trip and cannot show a stale answer from a previous session.
+            MessageKind::MonitorsList { ref monitors } => {
+                if let Some(view) = self.views.get_mut(&peer) {
+                    view.monitors.clone_from(monitors);
+                    tracing::debug!(peer = %tag, count = monitors.len(), "host announced its screens");
+                } else {
+                    tracing::debug!(peer = %tag, "screens announced without a view to show them in");
+                }
+            }
             // Host side: the guest picked a monitor to watch (§11; ADR 0028).
             // The id must name a monitor this host announced; anything else is
             // a malformed request and is dropped with a log line.
             MessageKind::MonitorSelect { monitor_id } => {
-                if self.media.contains_key(&peer) {
-                    match self.on_monitor_select(&self.label_of(&peer), monitor_id) {
-                        Ok(()) => tracing::info!(peer = %tag, monitor_id, "capture retargeted"),
-                        Err(error) => tracing::warn!(
-                            peer = %tag,
-                            monitor_id,
-                            ?error,
-                            "monitor select refused"
-                        ),
-                    }
-                } else {
-                    tracing::debug!(peer = %tag, monitor_id, "monitor select without a media session");
+                // Not gated on a live media connection. The `view` grant is
+                // what authorizes this and `on_monitor_select` checks it;
+                // capture is already running because the grant added the
+                // viewer, and a pick made while the guest's media dial is
+                // between attempts has to be honoured, or the picture that
+                // comes back is the screen the operator just moved away from
+                // — a control that looks live, does nothing, and says nothing
+                // (§18).
+                match self.on_monitor_select(&self.label_of(&peer), monitor_id) {
+                    Ok(()) => tracing::info!(peer = %tag, monitor_id, "capture retargeted"),
+                    Err(error) => tracing::warn!(
+                        peer = %tag,
+                        monitor_id,
+                        ?error,
+                        "monitor select refused"
+                    ),
                 }
             }
             // Everything else belongs to a phase this build does not run yet.
@@ -3884,10 +3913,10 @@ impl Actor {
                 monitor_id,
                 reply,
             } => {
-                let _ = reply.send(self.on_monitor_select(&label, monitor_id));
+                let _ = reply.send(self.on_pick_monitor(&label, monitor_id));
             }
             ActorCommand::MonitorsList { label, reply } => {
-                let _ = reply.send(self.on_monitors_list(&label));
+                let _ = reply.send(self.on_announced_monitors(&label));
             }
             ActorCommand::SetGrant {
                 label,
@@ -4236,40 +4265,78 @@ impl Actor {
         Ok(())
     }
 
-    /// Host side: announces this host's monitors to `label`'s guest
-    /// (§11 `MonitorsList`; ADR 0028). Returns what was sent.
-    fn on_monitors_list(&mut self, label: &str) -> Result<Vec<MonitorInfo>, ActorError> {
+    /// Guest side: which of the host's screens the operator may pick from
+    /// (§11 `MonitorsList`; ADR 0028).
+    ///
+    /// Reads what the host announced and nothing else. There is no request
+    /// message in the protocol, so this cannot ask, and it must not fall back
+    /// to enumerating *this* machine's displays: that is what the code here
+    /// used to do, and it offered the operator their own screens as if they
+    /// were the host's.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
+    fn on_announced_monitors(&self, label: &str) -> Result<Vec<MonitorInfo>, ActorError> {
         let peer = self.resolve(label)?;
-        if self.sessions.state(&peer) != SessionState::Active {
-            return Err(ActorError::UnknownPeer);
+        let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+        Ok(view.monitors.clone())
+    }
+
+    /// Guest side: asks the host to show `monitor_id` instead (§11
+    /// `MonitorSelect`; ADR 0028).
+    ///
+    /// The host re-checks the `view` grant and the id's range and is the only
+    /// side that decides; the check here only keeps an id the host never
+    /// announced off the wire. Nothing comes back — the next picture simply
+    /// shows the other screen, and `view.ts` already handles a frame that
+    /// changed size mid-session.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] when the host announced no such id.
+    fn on_pick_monitor(&mut self, label: &str, monitor_id: u32) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+        if !view.monitors.iter().any(|monitor| monitor.id == monitor_id) {
+            tracing::warn!(peer = %label, monitor_id, "no such screen was announced");
+            return Err(ActorError::Core(CoreError::Malformed));
         }
-        let monitors = crate::view::host_monitors()
-            .map_err(|error| {
-                tracing::warn!(peer = %label, %error, "cannot enumerate this host's monitors");
-                ActorError::Core(CoreError::Malformed)
-            })?
-            .into_iter()
-            .map(|monitor| MonitorInfo {
-                id: monitor.id,
-                width: monitor.width,
-                height: monitor.height,
-                primary: monitor.primary,
-            })
-            .collect::<Vec<_>>();
-        if let Some(reason) = self.health.fault() {
+        self.send_to(&peer, MessageKind::MonitorSelect { monitor_id });
+        Ok(())
+    }
+
+    /// Host side: announces this host's monitors to `peer`'s guest
+    /// (§11 `MonitorsList`; ADR 0028).
+    ///
+    /// Fire and forget, from the grant that made `peer` a viewer: the guest
+    /// has no way to ask, so this is the only thing that puts the list in
+    /// front of it.
+    fn announce_monitors(&mut self, peer: NodeId) {
+        let label = self.label_of(&peer);
+        if self.health.fault().is_some() {
             // A host that cannot produce a picture at all has no meaningful
-            // list to give; say so rather than offering monitors that will
-            // never show anything.
-            let _ = reason;
-            return Err(ActorError::Core(CoreError::NotPermitted));
+            // list to give; say nothing rather than offering screens that will
+            // never show anything. The guest already has `MediaUnavailable`.
+            tracing::debug!(peer = %label, "not announcing screens: no picture to show on them");
+            return;
         }
-        self.send_to(
-            &peer,
-            MessageKind::MonitorsList {
-                monitors: monitors.clone(),
-            },
-        );
-        Ok(monitors)
+        let monitors = match crate::view::host_monitors() {
+            Ok(found) => found
+                .into_iter()
+                .map(|monitor| MonitorInfo {
+                    id: monitor.id,
+                    width: monitor.width,
+                    height: monitor.height,
+                    primary: monitor.primary,
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(peer = %label, %error, "cannot enumerate this host's monitors");
+                return;
+            }
+        };
+        tracing::debug!(peer = %label, count = monitors.len(), "announcing this host's screens");
+        self.send_to(&peer, MessageKind::MonitorsList { monitors });
     }
 
     /// Issues an invite for `role`, refusing while the endpoint has no
@@ -5228,6 +5295,12 @@ impl Actor {
             if let Some(reason) = self.health.fault() {
                 self.announce_media_fault(peer, reason);
             }
+            // Same reasoning, and the same moment: the guest's picker has no
+            // way to ask for this list — there is no request message and
+            // adding one would be a protocol change — so the announcement is
+            // what puts it there, and it goes out with the grant that made the
+            // guest a viewer in the first place (§11; ADR 0028).
+            self.announce_monitors(peer);
         }
         tracing::info!(peer = %label, ?role, "consent granted");
         self.audit(
@@ -6897,7 +6970,16 @@ mod tests {
     /// The endpoints are not returned: the actor owns a clone of the one it
     /// was spawned with, so this side's copy has nothing left to hold.
     async fn file_pair() -> (ActorHandle, ActorHandle, String, String) {
-        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (host, guest, guest_label, host_label, _host_capture) = session_pair().await;
+        (host, guest, guest_label, host_label)
+    }
+
+    /// [`file_pair`], keeping the host's capture controller.
+    ///
+    /// What the host is pointed at is not visible from either handle, so a
+    /// test about the monitor picker has to hold the controller itself.
+    async fn session_pair() -> (ActorHandle, ActorHandle, String, String, SharedCapture) {
+        let (host, _host_endpoint, host_capture) = actor().await;
         let recorder = Arc::new(RecordingWindows::default());
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
@@ -6915,7 +6997,7 @@ mod tests {
         })
         .await;
         let (_window, host_label, _input) = recorder.opened().remove(0);
-        (host, guest, guest_label, host_label)
+        (host, guest, guest_label, host_label, host_capture)
     }
 
     /// Polls `file_transfers` the way the panel does, until `ready` holds.
@@ -6932,6 +7014,90 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// §11 and ADR 0028 through the actor: the guest sees the *host's* screens
+    /// and picking one retargets the *host's* capture.
+    ///
+    /// Both halves used to run backwards. The IPC commands are reachable only
+    /// from the guest's view window, but the actor handled them as a host
+    /// would: `monitors_list` enumerated the guest's own displays and
+    /// announced them to the host, and `monitor_select` retargeted the guest's
+    /// own capture. Nothing ever crossed the wire, and the toolbar's argument
+    /// shapes were wrong on top of that, so the popover only ever showed its
+    /// empty note and nobody found out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guest_picks_a_screen_and_the_host_is_the_one_that_moves() {
+        let (_host, guest, _guest_label, host_label, host_capture) = session_pair().await;
+
+        // The host's own enumeration. Both actors share this process, so this
+        // is the same call the host makes — which is exactly what hid the old
+        // code's mistake: it enumerated on the wrong side and got the same
+        // answer.
+        let Ok(expected) = crate::view::host_monitors() else {
+            // This build has no way to enumerate displays at all (a Windows
+            // build without `capture-windows`). There is then nothing honest
+            // to announce, and the picker's empty note is the right answer —
+            // never this machine's own screens dressed up as the host's.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(
+                guest
+                    .monitors_list(host_label.clone())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                guest.monitor_select(host_label, 0).await.is_err(),
+                "a screen that was never announced was accepted"
+            );
+            return;
+        };
+
+        // Announced with the grant, so it is already there when the picker
+        // opens: there is no request message to send.
+        let announced = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let monitors = guest.monitors_list(host_label.clone()).await.unwrap();
+                if !monitors.is_empty() {
+                    return monitors;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the host never announced its screens");
+        assert_eq!(announced.len(), expected.len());
+        for (got, want) in announced.iter().zip(expected.iter()) {
+            assert_eq!(got.id, want.id);
+            assert_eq!(got.width, want.width);
+            assert_eq!(got.height, want.height);
+            assert_eq!(got.primary, want.primary);
+        }
+
+        // An id the host never announced never reaches the wire.
+        let bogus = announced.iter().map(|m| m.id).max().unwrap_or(0) + 100;
+        assert!(
+            guest
+                .monitor_select(host_label.clone(), bogus)
+                .await
+                .is_err(),
+            "an unannounced screen id was accepted"
+        );
+
+        let pick = announced[0].id;
+        assert_eq!(
+            lock_capture(&host_capture).target(),
+            CaptureTarget::PrimaryDisplay,
+            "the host started somewhere other than where this test assumes"
+        );
+        guest.monitor_select(host_label, pick).await.unwrap();
+        // The pick travels on the control stream and the host acts on it in
+        // its own loop, so the observation is the retarget, not the send.
+        wait_until("the host never retargeted its capture", || {
+            lock_capture(&host_capture).target() == CaptureTarget::Display(pick)
+        })
+        .await;
     }
 
     /// §9.2 and §4 through the actor: a granted host offers a file, the guest
