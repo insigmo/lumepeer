@@ -101,6 +101,13 @@ export type TranslationKey =
   | 'system.installing'
   | 'system.installedRestart'
   | 'system.updateFailed'
+  | 'system.serviceRunning'
+  | 'system.serviceOff'
+  | 'system.serviceInstall'
+  | 'system.serviceRemove'
+  | 'system.serviceWorking'
+  | 'system.serviceNote'
+  | 'system.serviceFailed'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'status.endedJustNow'
@@ -359,6 +366,13 @@ const en: Dictionary = {
   'system.installing': 'Installing...',
   'system.installedRestart': 'Installed. Restart Lumepeer to run the new version.',
   'system.updateFailed': 'The update could not be completed. Nothing was installed.',
+  'system.serviceRunning': 'Ctrl+Alt+Del helper: running',
+  'system.serviceOff': 'Ctrl+Alt+Del helper: not running',
+  'system.serviceInstall': 'Install',
+  'system.serviceRemove': 'Remove',
+  'system.serviceWorking': 'Working...',
+  'system.serviceNote': 'A background service that does exactly one thing: send Ctrl+Alt+Del to this screen when a remote session asks for it. It lets nobody in and can be removed here at any time. Installing or removing it asks Windows for administrator permission.',
+  'system.serviceFailed': 'The helper service was not changed. Administrator permission is needed.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'status.endedJustNow': 'Ended just now',
@@ -624,6 +638,13 @@ const ar: Dictionary = {
   'system.installing': 'جارٍ التثبيت...',
   'system.installedRestart': 'تم التثبيت. أعد تشغيل Lumepeer لتشغيل الإصدار الجديد.',
   'system.updateFailed': 'تعذّر إكمال التحديث. لم يُثبَّت شيء.',
+  'system.serviceRunning': 'مساعد Ctrl+Alt+Del: قيد التشغيل',
+  'system.serviceOff': 'مساعد Ctrl+Alt+Del: متوقف',
+  'system.serviceInstall': 'تثبيت',
+  'system.serviceRemove': 'إزالة',
+  'system.serviceWorking': 'جارٍ التنفيذ...',
+  'system.serviceNote': 'خدمة في الخلفية تقوم بشيء واحد فقط: إرسال Ctrl+Alt+Del إلى هذه الشاشة عندما تطلبه جلسة بعيدة. لا تسمح لأحد بالدخول ويمكن إزالتها من هنا في أي وقت. التثبيت أو الإزالة يطلبان إذن المسؤول من Windows.',
+  'system.serviceFailed': 'لم تتغيّر الخدمة المساعدة. يلزم إذن المسؤول.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'status.endedJustNow': 'انتهت للتو',

@@ -5,6 +5,7 @@ members = [
     "crates/net",
     "crates/media",
     "crates/decoder-worker",
+    "crates/service",
     "apps/desktop/src-tauri",
     "services/broker",
     "tests/integration",
@@ -23,6 +24,7 @@ repository = "https://github.com/insigmo/lumepeer"
 lumepeer-core = { path = "crates/core" }
 lumepeer-net = { path = "crates/net" }
 lumepeer-media = { path = "crates/media" }
+lumepeer-service = { path = "crates/service" }
 lumepeer-decoder-worker = { path = "crates/decoder-worker" }
 
 # Design doc §5 — exact pins, updates go through a dedicated compatibility PR.

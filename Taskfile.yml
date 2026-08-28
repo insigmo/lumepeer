@@ -161,6 +161,11 @@ tasks:
       - cargo build --release -p lumepeer-decoder-worker --target {{.TARGET}}
       - mkdir -p {{.DESKTOP_DIR}}/src-tauri/binaries
       - cp target/{{.TARGET}}/release/lumepeer-decoder-worker{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-decoder-worker-{{.TARGET}}{{.EXT}}
+      # The privileged helper of ADR 0043. Staged for every target because
+      # `externalBin` is not per-platform; off Windows it exits with an
+      # explanation rather than holding privileges for nothing.
+      - cargo build --release -p lumepeer-service --target {{.TARGET}}
+      - cp target/{{.TARGET}}/release/lumepeer-service{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-service-{{.TARGET}}{{.EXT}}
 
   build:client:linux-amd64:
     desc: Build the Linux amd64 client (.deb + .rpm)

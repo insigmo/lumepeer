@@ -3853,7 +3853,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "anyhow",
  "axum",
@@ -3873,7 +3873,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "argon2",
  "blake3",
@@ -3894,7 +3894,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "anyhow",
  "libc",
@@ -3907,7 +3907,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3916,6 +3916,7 @@ dependencies = [
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
+ "lumepeer-service",
  "postcard",
  "rand 0.10.2",
  "serde",
@@ -3936,7 +3937,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3954,7 +3955,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "ashpd",
  "blake3",
@@ -3984,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.23"
+version = "0.0.24"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -4006,6 +4007,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lumepeer-service"
+version = "0.0.24"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.61.3",
 ]
 
 [[package]]

@@ -2042,6 +2042,66 @@ pub async fn update_install(
     Ok(())
 }
 
+/// What the privileged helper service is doing on this machine (ADR 0043).
+///
+/// Reads the machine every time and needs no rights of its own; the panel
+/// calls it on every render.
+///
+/// # Errors
+/// Rejects calls from any window but the main one.
+#[tauri::command]
+pub fn service_status(window: Window) -> Result<crate::service_control::ServiceState, IpcError> {
+    check_window(&window)?;
+    Ok(crate::service_control::state())
+}
+
+/// Argument of [`service_set`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceArgs {
+    /// `true` installs and starts the helper service, `false` stops and
+    /// removes it.
+    pub enabled: bool,
+}
+
+/// Installs or removes the privileged helper service (ADR 0043).
+///
+/// Both directions raise the operating system's own administrator prompt —
+/// this process has no rights to give itself, and the elevated code is the
+/// service binary with one flag, not a command line assembled here.
+///
+/// The service holds exactly one capability, Ctrl+Alt+Del delivery. It admits
+/// nobody: removing it costs the SAS button and nothing else, which is why
+/// removing it is always available from the same panel that installed it.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; [`IpcError`] when the
+/// change fails or the administrator prompt is declined.
+#[tauri::command]
+pub async fn service_set(window: Window, args: ServiceArgs) -> Result<(), IpcError> {
+    check_window(&window)?;
+    // Off the async runtime: this blocks on a consent prompt the user may take
+    // a while to answer, and the IPC executor is shared with every other
+    // command, including a revoke.
+    let changed = tauri::async_runtime::spawn_blocking(move || {
+        if args.enabled {
+            crate::service_control::install()
+        } else {
+            crate::service_control::uninstall()
+        }
+    })
+    .await
+    .map_err(|_| IpcError {
+        code: "SERVICE",
+        message: "the change did not complete".to_owned(),
+    })?;
+    changed.map_err(|message| IpcError {
+        code: "SERVICE",
+        message,
+    })?;
+    tracing::info!(enabled = args.enabled, "helper service changed");
+    Ok(())
+}
+
 /// Whether this installation starts with the user's session (ADR 0042).
 ///
 /// # Errors

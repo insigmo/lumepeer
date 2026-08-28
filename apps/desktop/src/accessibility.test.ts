@@ -268,6 +268,8 @@ describe('accessibility: audit log', () => {
 
 describe('accessibility: this device', () => {
   const commands: SystemCommands = {
+    serviceStatus: () => Promise.resolve('running' as const),
+    serviceSet: () => Promise.resolve(),
     autostartStatus: () => Promise.resolve(true),
     autostartSet: () => Promise.resolve(),
     updateCheck: () => Promise.resolve({ version: '0.0.24', current: '0.0.23', notes: '' }),

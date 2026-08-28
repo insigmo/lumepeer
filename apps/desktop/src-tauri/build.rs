@@ -62,6 +62,8 @@ const COMMANDS: &[&str] = &[
     "update_install",
     "autostart_status",
     "autostart_set",
+    "service_status",
+    "service_set",
 ];
 
 fn main() {

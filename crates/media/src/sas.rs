@@ -6,11 +6,17 @@
 //! Remote Desktop client uses, exposed by the `windows` crate under
 //! `Win32::Security::Authentication::Identity`. It works when the calling
 //! process runs in session 0 as a service (the `SoftwareSASGeneration`
-//! policy grants services the right) or — the shape this app ships in — when
-//! the user launches it elevated: `SendSAS(FALSE)` from an elevated process
-//! in the user's own session synthesizes the sequence on the secure desktop.
-//! An unelevated process gets a silent no-op from the OS itself, which is
-//! why the wire answer is an ack the guest can show, not a log line.
+//! policy grants services the right) or when the user launches it elevated:
+//! `SendSAS(FALSE)` from an elevated process in the user's own session
+//! synthesizes the sequence on the secure desktop. An unelevated process gets
+//! a silent no-op from the OS itself, which is why the wire answer is an ack
+//! the guest can show, not a log line.
+//!
+//! Both shapes ship. `crates/service` is a `LocalSystem` helper whose only
+//! operation is this one, and the desktop client asks it first (ADR 0043);
+//! this function is what runs when that service is not installed or not
+//! running, which is also the only shape that existed before it. Nothing here
+//! knows which case it is in — the caller does, and reports it.
 //!
 //! Every platform without a SAS mechanism at all reports "unavailable" —
 //! the actor turns that into a `SasAck(false)` on the wire and a disabled

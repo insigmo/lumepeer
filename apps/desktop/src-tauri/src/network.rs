@@ -3639,16 +3639,29 @@ impl Actor {
                     self.send_sas_ack(peer, false);
                     return;
                 }
-                match lumepeer_media::sas::send_sas() {
-                    Ok(()) => {
-                        tracing::info!(peer = %tag, "SAS delivered on the guest's request");
-                        self.send_sas_ack(peer, true);
+                // The helper service first, this process second (ADR 0043).
+                // Both paths end in the same `SendSAS`; the difference is
+                // whose rights it runs with, and only the service's are the
+                // ones the OS honours without the user having launched this
+                // app elevated. A machine with no service falls back to the
+                // in-process call, which is what happened before there was
+                // one — never to a silent success.
+                let delivered = if lumepeer_service::client::deliver_sas() {
+                    tracing::info!(peer = %tag, "SAS delivered by the helper service");
+                    true
+                } else {
+                    match lumepeer_media::sas::send_sas() {
+                        Ok(()) => {
+                            tracing::info!(peer = %tag, "SAS delivered in-process");
+                            true
+                        }
+                        Err(reason) => {
+                            tracing::warn!(peer = %tag, %reason, "SAS refused by the host OS");
+                            false
+                        }
                     }
-                    Err(reason) => {
-                        tracing::warn!(peer = %tag, %reason, "SAS refused by the host OS");
-                        self.send_sas_ack(peer, false);
-                    }
-                }
+                };
+                self.send_sas_ack(peer, delivered);
             }
             // Host side: the guest picked a monitor to watch (§11; ADR 0028).
             // The id must name a monitor this host announced; anything else is
