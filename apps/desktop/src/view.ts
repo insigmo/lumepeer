@@ -27,6 +27,7 @@ import {
   decodeViewFrame,
   defaultLayout,
   displaySize,
+  frameResized,
   imageRenderingFor,
   installPan,
   nextDisplayMode,
@@ -366,11 +367,15 @@ async function tick(): Promise<void> {
     if (paintFrame(canvas, frame)) {
       lastPaintedUs = frame.timestampUs;
       // The remote screen can change resolution mid-session, and every part
-      // of the layout is a function of the frame's size.
-      if (frame.width !== frameSize.width || frame.height !== frameSize.height) {
+      // of the layout is a function of the frame's size — but only of that,
+      // of the window's size and of the display mode, so this is the only
+      // per-frame reason to lay out again. It used to run on every painted
+      // frame, thirty times a second, for an answer that changed perhaps
+      // twice a session.
+      if (frameResized(frame, frameSize)) {
         frameSize = { width: frame.width, height: frame.height };
+        applyLayout();
       }
-      applyLayout();
       // Nothing to point at while the input grant is withdrawn, so nothing to
       // draw a pointer for either.
       if (!frame.input && pointerAt !== null) {
