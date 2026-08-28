@@ -11,6 +11,7 @@ import * as axe from 'axe-core';
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import viewMarkup from '../view.html?raw';
 import { SUPPORTED_LOCALES } from './i18n';
 import {
   clampPan,
@@ -334,6 +335,36 @@ describe('view window: input listeners follow the live grant', () => {
     container.dispatchEvent(onPicture);
     expect(calls).toEqual(['press 97 0 0 true']);
     expect(onPicture.defaultPrevented).toBe(true);
+  });
+});
+
+// The window's own stylesheet, which is where two of its rules actually live:
+// `#chat-panel` and `#cursor` both declare a `display`, and an id selector
+// beats the browser's own `[hidden] { display: none }`. Nothing in TypeScript
+// can compensate for that, so the sheet itself is what gets asserted.
+describe('view window: the panels can be hidden at all', () => {
+  const markup = viewMarkup;
+
+  beforeEach(() => {
+    const css = /<style>([\s\S]*?)<\/style>/.exec(markup)?.[1] ?? '';
+    expect(css).not.toBe('');
+    const style = document.createElement('style');
+    style.textContent = css;
+    container.appendChild(style);
+  });
+
+  it('hides the chat panel when the attribute is set, and shows it when it is not', () => {
+    const panel = document.createElement('aside');
+    panel.id = 'chat-panel';
+    container.appendChild(panel);
+
+    expect(getComputedStyle(panel).display).toBe('flex');
+    panel.hidden = true;
+    expect(getComputedStyle(panel).display).toBe('none');
+  });
+
+  it('ships the panel hidden, so the window opens on the picture', () => {
+    expect(/<aside id="chat-panel"[^>]*\shidden\s*>/.test(markup)).toBe(true);
   });
 });
 

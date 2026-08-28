@@ -93,6 +93,13 @@
         border-start-start-radius: 0.5rem;
         font-size: 0.85rem;
       }
+      /* Without this the panel cannot be hidden at all: the browser's own
+         `[hidden] { display: none }` is specificity (0,1,0) and loses to the
+         `#chat-panel` rule above, so `hidden = true` would leave it laid out
+         and on screen. Same reason `#cursor[hidden]` below exists. */
+      #chat-panel[hidden] {
+        display: none;
+      }
       .chat-log {
         flex: 1;
         overflow-y: auto;
