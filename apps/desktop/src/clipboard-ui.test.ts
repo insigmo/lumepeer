@@ -138,7 +138,6 @@ describe("the guest toolbar's clipboard button", () => {
       {
         toggleCollapsed: () => {},
         openPopover: () => {},
-        setResolution: () => {},
         setDisplayMode: () => {},
         toggleFullscreen: () => {},
         toggleLocalCursor: () => {},

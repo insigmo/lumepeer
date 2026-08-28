@@ -163,11 +163,7 @@ export type TranslationKey =
   | 'files.state.failed'
   | 'toolbar.dragHandle'
   | 'toolbar.settings'
-  | 'toolbar.settings.resolution'
   | 'toolbar.settings.placeholder'
-  | 'toolbar.resolution.native'
-  | 'toolbar.resolution.1080p'
-  | 'toolbar.resolution.720p'
   | 'toolbar.monitors'
   | 'toolbar.monitors.empty'
   | 'toolbar.monitors.entry'
@@ -435,11 +431,7 @@ const en: Dictionary = {
   'files.state.failed': 'Failed',
   'toolbar.dragHandle': 'Drag toolbar',
   'toolbar.settings': 'Settings',
-  'toolbar.settings.resolution': 'Screen resolution',
   'toolbar.settings.placeholder': 'More settings are on the way.',
-  'toolbar.resolution.native': 'Native',
-  'toolbar.resolution.1080p': '1080p',
-  'toolbar.resolution.720p': '720p',
   'toolbar.monitors': 'Choose screen',
   'toolbar.monitors.empty': 'The host has not announced any screens yet.',
   'toolbar.monitors.entry': (arg) => `Screen ${arg}`,
@@ -708,11 +700,7 @@ const ar: Dictionary = {
   'files.state.failed': 'أخفق',
   'toolbar.dragHandle': 'اسحب شريط الأدوات',
   'toolbar.settings': 'الإعدادات',
-  'toolbar.settings.resolution': 'دقة الشاشة',
   'toolbar.settings.placeholder': 'المزيد من الإعدادات قادم.',
-  'toolbar.resolution.native': 'الأصلية',
-  'toolbar.resolution.1080p': '1080p',
-  'toolbar.resolution.720p': '720p',
   'toolbar.monitors': 'اختيار الشاشة',
   'toolbar.monitors.empty': 'لم يعلن المضيف عن أي شاشات بعد.',
   'toolbar.monitors.entry': (arg) => `الشاشة ${arg}`,

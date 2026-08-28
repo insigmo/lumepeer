@@ -1,9 +1,9 @@
 // Floating session toolbar of the remote-view window (design doc §11).
 //
 // A small draggable pill that follows the remote picture: drag handle,
-// settings (screen-resolution placeholder for now), monitor picker, chat
-// toggle, microphone toggle, Ctrl+Alt+Del, and a collapse button that hides
-// everything but the pill until it is expanded again. Every action goes
+// settings, monitor picker, chat toggle, microphone toggle, Ctrl+Alt+Del,
+// and a collapse button that hides everything but the pill until it is
+// expanded again. Every action goes
 // through the same injectable command surface the rest of the window uses,
 // so the state machine is testable in jsdom without Tauri.
 //
@@ -105,9 +105,6 @@ export const tauriToolbarCommands: ToolbarCommands = {
   },
 };
 
-/** Resolution choices of the settings popover (placeholder, §11). */
-export const RESOLUTION_CHOICES: readonly string[] = ['native', '1080p', '720p'];
-
 /** Render-side mirror of everything the toolbar shows. */
 export class ToolbarState {
   /** Collapsed to the small pill: every button hidden but expand. */
@@ -122,8 +119,6 @@ export class ToolbarState {
   monitors: MonitorDto[] = [];
   /** Monitor currently being watched. */
   activeMonitor: number | null = null;
-  /** Placeholder resolution choice; recorded only (§11 stub). */
-  resolution: string = RESOLUTION_CHOICES[0] ?? 'native';
   /**
    * Whether a recording request has already been sent this session.
    *
@@ -219,7 +214,6 @@ export function renderToolbar(
   actions: {
     toggleCollapsed(): void;
     openPopover(which: 'settings' | 'monitors' | null): void;
-    setResolution(value: string): void;
     setDisplayMode(mode: DisplayMode): void;
     toggleFullscreen(): void;
     toggleLocalCursor(): void;
@@ -244,21 +238,6 @@ export function renderToolbar(
     state.openPopover === 'settings'
       ? html`
           <div class="toolbar-pop" role="dialog" aria-label=${t(locale, 'toolbar.settings')}>
-            <label class="toolbar-pop-row">
-              <span>${t(locale, 'toolbar.settings.resolution')}</span>
-              <select
-                data-testid="toolbar-resolution"
-                @change=${(event: Event) =>
-                  actions.setResolution((event.target as HTMLSelectElement).value)}
-              >
-                ${RESOLUTION_CHOICES.map(
-                  (choice) =>
-                    html`<option value=${choice} ?selected=${choice === state.resolution}>
-                      ${t(locale, `toolbar.resolution.${choice}` as TranslationKeyAlias)}
-                    </option>`,
-                )}
-              </select>
-            </label>
             <label class="toolbar-pop-row">
               <span>${t(locale, 'toolbar.settings.displayMode')}</span>
               <select
@@ -566,14 +545,6 @@ export function mountToolbar(
             state.monitors = [];
             draw();
           });
-      }
-      draw();
-    },
-    setResolution(value: string): void {
-      // Placeholder by design (§11): the choice is recorded so the real
-      // implementation can pick it up, but nothing is sent to the host yet.
-      if (RESOLUTION_CHOICES.includes(value)) {
-        state.resolution = value;
       }
       draw();
     },
