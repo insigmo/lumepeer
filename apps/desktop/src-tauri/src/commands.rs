@@ -344,6 +344,13 @@ pub struct HistoryConnectArgs {
     pub peer: String,
 }
 
+/// Argument of [`history_remove`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryRemoveArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+}
+
 /// Guest-side state of this node's own outgoing connect attempt (§21
 /// punch-list item 6).
 #[derive(Debug, Clone, Serialize)]
@@ -701,6 +708,22 @@ pub async fn history_connect(
 ) -> Result<(), IpcError> {
     check_window(&window)?;
     state.network.history_connect(args.peer).await?;
+    Ok(())
+}
+
+/// Forgets a remembered host (docs/bugs/03-connection-list.md, task 5).
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+/// Removing a label that was never remembered is not an error.
+#[tauri::command]
+pub async fn history_remove(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HistoryRemoveArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.history_remove(args.peer).await?;
     Ok(())
 }
 

@@ -24,6 +24,7 @@ const COMMANDS: &[&str] = &[
     "unattended_submit",
     "connection_history",
     "history_connect",
+    "history_remove",
     "connect_status",
     "connect_cancel",
     "network_status",
