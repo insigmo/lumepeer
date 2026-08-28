@@ -63,7 +63,10 @@ export const tauriFileCommands: FileCommands = {
   },
   async abort(peer, transferId) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('file_abort', { args: { peer, transferId } });
+    // `transfer_id`: `FileAbortArgs` is deserialized by plain serde, which
+    // does not rename anything, so `transferId` never reached it and the
+    // cancel button silently did nothing.
+    return invoke('file_abort', { args: { peer, transfer_id: transferId } });
   },
   async list() {
     const { invoke } = await import('@tauri-apps/api/core');
