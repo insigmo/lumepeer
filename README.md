@@ -87,8 +87,12 @@ one.
 
 ## Status
 
-Phases 0 through 4 of §19 are done; phase 5 is done except for what needs the
-reference-hardware runner of §16.2 (see below).
+Phases 0 through 6 of §19 are done, except for what needs the
+reference-hardware runner of §16.2, a paid vendor relationship or an
+independent human tester — each named below. A seventh, unnumbered round then
+closed the feature gap against the commercial products (ADR 0023 and the
+0029–0040 range); "Written but not wired" at the end lists what it did not
+reach.
 
 Phase 0: the workspace builds, the constants of §14, the wire types of §9.1 and
 the signatures of §8.3/§11.1 are in place, CI runs fmt, clippy, build, test,
@@ -155,13 +159,14 @@ The full set a Linux client actually ships with, which is what CI checks:
 cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
 ```
 
-Still failing with an explicit error rather than pretending to work: Windows
-screen capture and input injection, and everything macOS-specific (capture,
-input, decoder sandbox). Windows keystore, the Windows `AppContainer` decoder
-sandbox and a Windows Media Foundation hardware H.264 encoder (behind the
-`encode-mf` feature; ADR 0011) are done, each needing a machine that can build
-and run it, which this one now is for Windows. ADR 0007 and ADR 0011 have the
-detail.
+Windows and macOS have since caught up to that scope: DXGI Desktop Duplication
+capture and `SendInput` injection on Windows (ADR 0012), ScreenCaptureKit
+capture and `CGEvent` injection on macOS (ADR 0013), the Windows keystore, and
+a decoder sandbox on all three platforms — seccomp-BPF, `AppContainer` and
+`sandbox_init(3)` (ADR 0019). Hardware encoding is Media Foundation on Windows
+(`encode-mf`; ADR 0011) and VA-API on Linux (`encode-vaapi`; ADR 0040); macOS
+still encodes in software, as no VideoToolbox backend exists yet. ADR 0007 has
+the detail on why phase 4 was scoped to Linux first.
 
 Phase 5: `cargo audit`/`cargo deny` (already wired since phase 0/3) are joined
 by a `cargo cyclonedx` SBOM step in the same `supply-chain` CI job, uploaded as
@@ -202,3 +207,59 @@ attempted; and the third-party penetration test §19 phase 6 asks for needs
 an independent human tester no CI job or agent session can substitute for,
 so Task 7's security-review pass stands in for it instead, imperfectly.
 ADR 0009 has the detail on both.
+
+Phase 7 (unnumbered in §19, opened against the TeamViewer/AnyDesk/RustDesk gap
+list) closed the feature gap. Its decisions are ADR 0023 and the 0028–0040
+range; what shipped:
+
+- Grants are issued and withdrawn independently while a session runs, from the
+  host's own UI (ADR 0029), and the snapshot rule of §8.2 still holds.
+- Clipboard text crosses the wire and the OS in both directions, gated on
+  `clipboard_read`/`clipboard_write` (ADR 0030).
+- File transfer runs end to end over `rd/file/1`, with `FileTransferStart`
+  naming each transfer and the file connection dialed lazily (ADR 0032).
+- Unattended access admits a trusted device on an Argon2id device password and
+  an optional TOTP code, with a banner the host cannot dismiss (ADR 0033), and
+  the address book decides who may even attempt it (ADR 0034).
+- Session recording writes the `LMRC` container, and recordings are listed,
+  played and exported from the UI (ADR 0031, ADR 0035).
+- Connection quality is measured from receiver reports rather than guessed
+  from the host's own write latency, driving a degradation ladder (ADR 0037).
+- The guest view window carries a real toolbar: fullscreen and scaling with
+  hotkeys, cursor-shape updates (ADR 0038), a monitor picker, Ctrl+Alt+Del
+  delivery and a microphone back-channel (ADR 0028).
+- Audio runs both ways — desktop mix out, guest microphone in — on WASAPI and
+  PipeWire (ADR 0023 §5, ADR 0028).
+- Linux ships both session types: X11 capture/XTEST and the Wayland portal
+  with its PipeWire stream, plus PipeWire audio (ADR 0039).
+- Chat rides the control channel with a bounded, non-persisted transcript
+  (ADR 0023 §6).
+- The audit log of §15 is written: an append-only SQLite table with a 30-day
+  retention, peers stored only as a salted hash, and a panel that reads,
+  filters, exports and erases it (ADR 0041).
+- Releases publish a signed update manifest, the client checks the channel it
+  is configured for and installs on a press, and it can start with the user's
+  session — which grants nothing on its own and can be switched off from the
+  same panel that switched it on (ADR 0042).
+
+### Written but not wired
+
+Code that exists and compiles but that nothing in the product reaches yet.
+Named here rather than left to be rediscovered:
+
+- **Privacy mode.** `MessageKind::PrivacyMode`/`PrivacyModeAck` have been in
+  the protocol since minor 1. No host implements them and no UI sends them, so
+  a guest has no way to ask and a host no way to answer.
+- **macOS audio and monitors.** `platform_audio_capturer` and
+  `platform_player` both refuse on macOS, so a macOS host streams no sound and
+  plays no guest microphone; `host_monitors()` reports a single primary
+  display because nothing enumerates them there.
+- **Running before anyone signs in.** There is no Windows service, systemd
+  system unit or launchd daemon. Autostart (below) starts the client with the
+  user's session and no earlier, which is also what keeps Ctrl+Alt+Del
+  delivery limited to an elevated process (`crates/media/src/sas.rs`).
+- **A released update.** The pipeline is wired end to end — signed artifacts,
+  a `latest.json` per release, a per-channel endpoint, a client that checks
+  and installs (ADR 0042) — but no release has run through it yet, so nothing
+  in it has been proven against a real installed client. The manual steps are
+  in `docs/release-checklist.md`.

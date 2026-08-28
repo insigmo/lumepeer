@@ -59,6 +59,15 @@
     "allow-audio-toggle",
     "allow-recording-toggle",
     "allow-recordings-list",
-    "allow-recording-export"
+    "allow-recording-export",
+    "allow-audit-list",
+    "allow-audit-kinds",
+    "allow-audit-status",
+    "allow-audit-export",
+    "allow-audit-clear",
+    "allow-update-check",
+    "allow-update-install",
+    "allow-autostart-status",
+    "allow-autostart-set"
   ]
 }

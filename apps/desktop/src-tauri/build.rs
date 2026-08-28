@@ -53,6 +53,15 @@ const COMMANDS: &[&str] = &[
     "monitors_list",
     "recordings_list",
     "recording_export",
+    "audit_list",
+    "audit_kinds",
+    "audit_status",
+    "audit_export",
+    "audit_clear",
+    "update_check",
+    "update_install",
+    "autostart_status",
+    "autostart_set",
 ];
 
 fn main() {

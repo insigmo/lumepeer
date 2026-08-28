@@ -3920,15 +3920,18 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
+ "sqlx",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-pilot",
  "tauri-plugin-updater",
+ "thiserror 2.0.20",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "winreg",
 ]
 
 [[package]]

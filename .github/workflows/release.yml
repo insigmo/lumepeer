@@ -17,6 +17,16 @@ on:
         type: choice
         options: [patch, minor, major]
         default: patch
+      channel:
+        description: >-
+          Update channel this release is published to (ADR 0042). "beta" marks
+          the GitHub release as a prerelease, which GitHub's own /releases/
+          latest redirect skips, so a stable client never sees it; the manifest
+          is then also published to the rolling `beta` release that beta
+          clients poll.
+        type: choice
+        options: [stable, beta]
+        default: stable
 
 concurrency:
   group: release
@@ -65,6 +75,7 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      channel: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'stable' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -241,5 +252,40 @@ jobs:
           tagName: ${{ needs.version.outputs.tag }}
           releaseName: 'Lumepeer ${{ needs.version.outputs.tag }}'
           releaseDraft: false
-          prerelease: false
+          # A beta is a GitHub prerelease. That is not cosmetic: the
+          # /releases/latest redirect the stable manifest is fetched through
+          # skips prereleases outright, so a stable client is never *shown* a
+          # beta rather than merely asked not to take one (ADR 0042).
+          prerelease: ${{ needs.version.outputs.channel == 'beta' }}
+          # Emits `latest.json` alongside the bundles and merges each matrix
+          # row's platform entry into it. Without this the updater plugin has
+          # a public key, a signature and nothing to fetch (ADR 0042).
+          includeUpdaterJson: true
           args: --target ${{ matrix.target }} --features ${{ matrix.features }}
+
+  # The beta channel needs its own manifest at a stable URL, and GitHub has no
+  # "newest release including prereleases" download link. So the manifest this
+  # run produced is copied onto a rolling `beta` release, which is the only
+  # thing beta clients ever fetch.
+  beta-manifest:
+    needs: [guard, version, build]
+    if: needs.guard.outputs.proceed == 'true' && needs.version.outputs.channel == 'beta'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the manifest to the beta channel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" --pattern latest.json --output beta.json --clobber
+          # `beta` is a rolling pointer, not a version: it is recreated on the
+          # default branch every time so its single asset is always the newest
+          # prerelease manifest. Marked prerelease itself so it can never be
+          # mistaken for the latest stable release.
+          if ! gh release view beta >/dev/null 2>&1; then
+            gh release create beta               --title "Beta channel"               --notes "Rolling update manifest for clients configured with [updates] channel = \"beta\". Not a release; see the tagged releases for artifacts."               --prerelease               --target "${GITHUB_SHA}"
+          fi
+          gh release upload beta beta.json --clobber
+          echo "beta channel now points at ${TAG}"
