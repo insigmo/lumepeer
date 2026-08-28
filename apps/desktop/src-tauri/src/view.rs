@@ -706,6 +706,13 @@ pub fn spawn_encode_loop(
         // budget, which is what ADR 0015 settled for.
         let mut last_report: Option<Instant> = None;
         let feedback_stale = Duration::from_millis(ABR_FEEDBACK_STALE_AFTER_MS);
+        // What this side actually put on the wire, over the window the guest
+        // measures its own arrivals across. Without it the controller has only
+        // the bitrate *ceiling* to compare arrivals against, and a desktop
+        // nobody is touching encodes to a fraction of that — which read as
+        // congestion on a link with no loss at all, and walked the whole
+        // degradation ladder down on an idle LAN (docs/bugs/07-video-quality.md).
+        let mut sent = SendRate::default();
         // Session recording (§17): the actor swaps a recorder into the shared
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
@@ -792,6 +799,7 @@ pub fn spawn_encode_loop(
                 tracing::info!(peer = %tag, %error, "media stream ended");
                 return;
             }
+            sent.wrote(bitstream.data.len());
             // Recording rides the successfully written frame (§17): the
             // container stores the same bitstream the guest received.
             if let Some(recorder) = recorder_now.as_ref() {
@@ -801,8 +809,12 @@ pub fn spawn_encode_loop(
             // the host-local stand-in only speaks for a link nobody is
             // reporting on (ADR 0015, ADR 0037).
             let measured = match control.take_feedback() {
-                Some((feedback, at)) => {
+                Some((mut feedback, at)) => {
                     last_report = Some(at);
+                    // The guest reports what arrived; only this side knows
+                    // what was offered, and one without the other says
+                    // nothing about the link.
+                    feedback.sent_kbps = sent.take_kbps();
                     Some(feedback)
                 }
                 None if last_report.is_none_or(|at| at.elapsed() > feedback_stale) => {
@@ -872,9 +884,10 @@ async fn sleep_for_the_rest_of(interval: Duration, tick_started: Instant) {
 /// A write finishing inside the frame budget reports no congestion; one
 /// running twice the budget or beyond reports total loss, saturating the
 /// controller's multiplicative-decrease branch. `rtt_ms` has no local
-/// equivalent here and `goodput_kbps` is not read by
-/// `AbrController::on_feedback`'s current decision, but both are filled in
-/// honestly rather than left at a placeholder.
+/// equivalent here, and the goodput half is deliberately self-cancelling:
+/// both `goodput_kbps` and `sent_kbps` are the same local write rate, so the
+/// controller's arrival check cannot fire on a measurement that never crossed
+/// the network. Congestion on this path is `loss`, and only `loss`.
 fn write_congestion_feedback(
     write_elapsed: Duration,
     interval: Duration,
@@ -888,6 +901,42 @@ fn write_congestion_feedback(
         loss: over_budget.clamp(0.0, 1.0),
         rtt_ms: 0,
         goodput_kbps,
+        sent_kbps: goodput_kbps,
+    }
+}
+
+/// How much this host has written since the guest's previous report.
+///
+/// The counterpart of the guest's own arrival window, kept on this side
+/// because only this side knows what it offered the link. Reset every time it
+/// is read, so each report is compared against the frames it was reporting on.
+#[derive(Debug, Default)]
+struct SendRate {
+    bytes: u64,
+    since: Option<Instant>,
+}
+
+impl SendRate {
+    /// One frame went out.
+    fn wrote(&mut self, bytes: usize) {
+        self.since.get_or_insert_with(Instant::now);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    /// The rate over the window just ended, and starts the next one.
+    ///
+    /// `0` for a window with no elapsed time in it, which is what the
+    /// controller already reads as "nobody measured this".
+    fn take_kbps(&mut self) -> u32 {
+        let millis = self.since.map_or(0, |at| {
+            u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+        let bits = self.bytes.saturating_mul(8);
+        *self = Self::default();
+        if millis == 0 {
+            return 0;
+        }
+        u32::try_from(bits / millis).unwrap_or(u32::MAX)
     }
 }
 
