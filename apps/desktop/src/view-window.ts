@@ -448,6 +448,28 @@ export function cursorPlacement(
   };
 }
 
+/**
+ * The `cursor` the picture canvas should carry right now.
+ *
+ * `none` in exactly one state: the host announced a shape, the operator left
+ * the overlay on, and the pointer is over the picture — the layer is already
+ * showing where the pointer is, and the system arrow underneath it would be a
+ * second cursor. Everything else is the ordinary arrow, including the moment
+ * the pointer leaves the picture: `none` left behind there would take the
+ * pointer away over the toolbar and the chat panel too.
+ *
+ * Never `crosshair`. That was for hosts that composite their own cursor into
+ * the frame, from before the shape had a channel of its own (ADR 0038); those
+ * hosts announce no shape and get the arrow here.
+ */
+export function cursorCssFor(
+  hasShape: boolean,
+  localCursor: boolean,
+  overPicture: boolean,
+): 'none' | 'default' {
+  return hasShape && localCursor && overPicture ? 'none' : 'default';
+}
+
 /** Where forwarded input events go. The entry point wires this to Tauri IPC. */
 export interface InputSink {
   pointerMove(x: number, y: number, modifiers: number): void;

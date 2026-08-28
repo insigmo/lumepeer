@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SUPPORTED_LOCALES } from './i18n';
 import {
   clampPan,
+  cursorCssFor,
   cursorPlacement,
   CURSOR_RESPONSE_HEADER_BYTES,
   decodeCursorShape,
@@ -675,6 +676,33 @@ describe('view window: the host cursor', () => {
     expect([half.width, half.height]).toEqual([16, 16]);
     expect(half.left).toBe(500 - 8);
     expect(half.top).toBe(400 - 8);
+  });
+});
+
+describe('view window: the pointer over the picture', () => {
+  // The window used to force `cursor: crosshair` on the canvas, from before
+  // the cursor channel existed (ADR 0038). With the host's shape drawn on its
+  // own layer that is a second pointer on screen, which is exactly what
+  // docs/tasks/09-cursor-shape.md says not to have.
+  it('hides the system pointer only while the host shape is the one being drawn', () => {
+    expect(cursorCssFor(true, true, true)).toBe('none');
+  });
+
+  it('shows the ordinary arrow when the operator turned the overlay off', () => {
+    expect(cursorCssFor(true, false, true)).toBe('default');
+  });
+
+  it('shows the ordinary arrow on a host that draws its cursor into the frame', () => {
+    expect(cursorCssFor(false, true, true)).toBe('default');
+    expect(cursorCssFor(false, false, true)).toBe('default');
+  });
+
+  // The dangerous one: leaving `none` behind when the pointer moves off the
+  // picture takes the pointer away over the toolbar and the chat panel, and
+  // the window stops being operable.
+  it('brings the arrow back as soon as the pointer leaves the picture', () => {
+    expect(cursorCssFor(true, true, false)).toBe('default');
+    expect(cursorCssFor(false, true, false)).toBe('default');
   });
 });
 
