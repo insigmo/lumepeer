@@ -22,10 +22,8 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
-
+use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::phc::SaltString;
 use crate::consent::Role;
 use crate::constants::{
     UNATTENDED_LOCKOUT_DURATION_SECS, UNATTENDED_MAX_FAILED_ATTEMPTS,
@@ -112,7 +110,10 @@ impl Totp {
     /// RFC forbids; never a panic on hostile input.
     pub fn generate(&self, unix_secs: u64) -> Result<String> {
         let counter = unix_secs / UNATTENDED_TOTP_STEP_SECS;
-        let mac = <Hmac<Sha1> as hmac::Mac>::new_from_slice(&self.secret)
+        use hmac::{Hmac, Mac, KeyInit};
+        use sha1::Sha1;
+
+        let mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&self.secret)
             .map_err(|_| UnattendedError::BadCode)?
             .chain_update(counter.to_be_bytes());
         let digest = hmac::Mac::finalize(mac).into_bytes();
@@ -261,9 +262,8 @@ impl UnattendedAccess {
         // RNG straight into `SaltString::generate` would hit (ADR 0023 §1).
         let mut bytes = [0u8; 16];
         rand::rng().fill(&mut bytes);
-        let salt = SaltString::encode_b64(&bytes).map_err(|_| UnattendedError::SaltGeneration)?;
         let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .map_err(|_| UnattendedError::SaltGeneration)?;
         self.password_hash = Some(hash.to_string());
         Ok(())
