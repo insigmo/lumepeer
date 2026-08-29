@@ -45,7 +45,7 @@ postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-big-array = "0.5"
-ed25519-dalek = "2"
+ed25519-dalek = "2.0.0"
 blake3 = "1"
 thiserror = "2"
 anyhow = "1"
@@ -61,29 +61,29 @@ sqlx = { version = "0.8", default-features = false, features = [
 toml = "0.8"
 # Per-user autostart on Windows: the HKCU Run key (ADR 0042). Not named in
 # §5; already in the tree as a transitive build dependency of tauri-winres.
-winreg = "0.55"
-config = "0.14"
+winreg = "0.56.0"
+config = "0.15.25"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md
 scap = "=0.1.0-beta.1" # `scap = "0.1"` in §5 does not resolve: only pre-releases exist
 openh264 = "0.9"       # §5 says 0.6; 0.6 is long unmaintained
 # Not named in §5; see docs/adr/0004-phase-1-transport-dependencies.md.
 rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)
-chacha20poly1305 = "0.10" # encrypted-file keystore fallback (§11.2)
-opus = "0.3"             # Opus audio codec bindings over vendored libopus (§5.1, ADR 0023)
+chacha20poly1305 = "0.11.0" # encrypted-file keystore fallback (§11.2)
+opus = "0.4.0"             # Opus audio codec bindings over vendored libopus (§5.1, ADR 0023)
 # Unattended-access password hashing (phase 7 catch-up; ADR 0021). Not named
 # in §5; the spec predates the unattended feature.
-argon2 = "0.5"
+argon2 = "0.6.0"
 # HMAC-SHA1 for RFC 6238 TOTP only (ADR 0021): SHA1 stays confined to the
 # compatibility requirement towards authenticator apps; nothing else uses it.
-hmac = "0.12"
-sha1 = "0.10"
+hmac = "0.13.0"
+sha1 = "0.11.0"
 # Host clipboard access for §9.2. Deliberately on the Rust side and not a
 # webview plugin: the webview is an untrusted presentation layer (§2.3), so
 # it never gets a handle on the host's clipboard. `image-data` is off — §9.2
 # is text-only for v1, and the feature pulls in the whole `image` stack.
 arboard = { version = "3", default-features = false }
-x11rb = "0.13"          # safe X11 client for the lower-trust Linux capture (§11)
+x11rb = "0.14.0"          # safe X11 client for the lower-trust Linux capture (§11)
 memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
 libc = "0.2"            # syscall numbers for that filter
@@ -100,12 +100,12 @@ tauri-plugin-dialog = "2"
 # one's window back to the user rather than binding a second iroh endpoint:
 # the invite code already handed out points at the first process's NodeId, so
 # two live endpoints mean the UI the user is looking at is not the one the
-# guest is dialling.
+# guest is dialing.
 tauri-plugin-single-instance = "2"
 
 # dev-dependencies
 proptest = "1"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3.4.0", features = ["json"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

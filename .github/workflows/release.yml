@@ -170,7 +170,7 @@ jobs:
       matrix:
         include:
           - name: linux-amd64 (deb/rpm)
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             features: capture-x11,capture-portal,encode-openh264
           - name: linux-arm64 (deb/rpm)
