@@ -35,6 +35,7 @@ use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback};
 use lumepeer_media::capture::{CaptureController, InputInjector};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
+use lumepeer_media::error::MediaError;
 use lumepeer_media::scale::{fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerEndpoint, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
@@ -297,6 +298,12 @@ impl MediaHealth {
     }
 
     /// Records a fault a session just ran into.
+    ///
+    /// `SecureDesktopActive` is deliberately not recorded here: unlike the
+    /// other two, it is not a fact about this host's platform or build — it
+    /// is expected to clear on its own, and a future guest must not be
+    /// refused a session over a UAC prompt that has since closed
+    /// (`docs/bugs/11-uac-degradation.md`).
     pub fn record(&self, reason: MediaUnavailableReason) {
         match reason {
             MediaUnavailableReason::NoCaptureBackend => {
@@ -305,6 +312,7 @@ impl MediaHealth {
             MediaUnavailableReason::NoEncoder => {
                 self.encoder_missing.store(true, Ordering::Relaxed);
             }
+            MediaUnavailableReason::SecureDesktopActive => {}
         }
     }
 
@@ -419,6 +427,12 @@ pub enum ViewStatus {
     NoCapture,
     /// The host said it has no video encoder. Terminal, same as `NoCapture`.
     NoEncoder,
+    /// The host's Windows capture is blocked by a secure desktop (lock
+    /// screen, UAC prompt or fast user switch) and is retrying on its own.
+    /// Not terminal, and not `Reconnecting`: the media connection itself is
+    /// fine, and the picture underneath is only stale, not lost
+    /// (`docs/bugs/11-uac-degradation.md`).
+    SecureDesktop,
 }
 
 impl From<MediaUnavailableReason> for ViewStatus {
@@ -426,12 +440,17 @@ impl From<MediaUnavailableReason> for ViewStatus {
         match reason {
             MediaUnavailableReason::NoCaptureBackend => Self::NoCapture,
             MediaUnavailableReason::NoEncoder => Self::NoEncoder,
+            MediaUnavailableReason::SecureDesktopActive => Self::SecureDesktop,
         }
     }
 }
 
 impl ViewStatus {
     /// Wire value carried in the first byte of the IPC frame response.
+    ///
+    /// Only ever append: this index is `apps/desktop/src/view-window.ts`'s
+    /// `STATUS_BY_CODE` position, a byte of the protocol
+    /// (`docs/bugs/11-uac-degradation.md`).
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -441,6 +460,7 @@ impl ViewStatus {
             Self::Failed => 3,
             Self::NoCapture => 4,
             Self::NoEncoder => 5,
+            Self::SecureDesktop => 6,
         }
     }
 
@@ -717,6 +737,12 @@ pub fn spawn_encode_loop(
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
         let mut recorder_now: Option<Arc<crate::recorder::SessionRecorder>>;
+        // Whether the guest has already been told about the secure desktop
+        // this side is currently stuck behind, so a tick that is still stuck
+        // does not re-announce every frame interval
+        // (docs/bugs/11-uac-degradation.md). Reset as soon as capture is
+        // healthy again, so a later recurrence is announced afresh.
+        let mut secure_desktop_notified = false;
 
         loop {
             let tick_started = Instant::now();
@@ -733,9 +759,39 @@ pub fn spawn_encode_loop(
             let captured =
                 tokio::task::spawn_blocking(move || lock_capture(&shared).next_frame()).await;
             let frame = match captured {
-                Ok(Ok(Some(frame))) => frame,
-                // The screen has not changed (§11.1): nothing to send.
+                Ok(Ok(Some(frame))) => {
+                    secure_desktop_notified = false;
+                    frame
+                }
+                // The screen has not changed (§11.1): nothing to send. Also
+                // the "just reopened, no pixels yet" answer `WindowsCapturer`
+                // gives right after a secure-desktop recovery, so this is
+                // where that recovery is noticed too.
                 Ok(Ok(None)) => {
+                    secure_desktop_notified = false;
+                    sleep_for_the_rest_of(interval, tick_started).await;
+                    continue;
+                }
+                // The secure desktop (lock screen, UAC prompt or fast user
+                // switch) is in the foreground; `WindowsCapturer` is already
+                // retrying its own reopen on a backoff
+                // (`crates/media/src/capture/windows.rs`). This is expected
+                // to clear, so the loop keeps running instead of returning —
+                // the session stays up, and only the guest is told, once per
+                // episode rather than every tick (§18,
+                // docs/bugs/11-uac-degradation.md).
+                Ok(Err(MediaError::SecureDesktopActive(reason))) => {
+                    if !secure_desktop_notified {
+                        tracing::info!(
+                            peer = %tag,
+                            %reason,
+                            "capture blocked by the secure desktop; retrying while it clears"
+                        );
+                        let _ = faults
+                            .send((peer, MediaUnavailableReason::SecureDesktopActive))
+                            .await;
+                        secure_desktop_notified = true;
+                    }
                     sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
@@ -1946,6 +2002,19 @@ mod tests {
         assert!(!ViewStatus::Waiting.is_terminal());
         assert!(!ViewStatus::Reconnecting.is_terminal());
         assert!(!ViewStatus::Live.is_terminal());
+    }
+
+    /// docs/bugs/11-uac-degradation.md: unlike the two faults above, the
+    /// secure desktop is not terminal — the session and the encode loop
+    /// behind it are both still alive.
+    #[test]
+    fn secure_desktop_maps_to_a_non_terminal_status() {
+        assert_eq!(
+            ViewStatus::from(MediaUnavailableReason::SecureDesktopActive),
+            ViewStatus::SecureDesktop
+        );
+        assert_eq!(ViewStatus::SecureDesktop.code(), 6);
+        assert!(!ViewStatus::SecureDesktop.is_terminal());
     }
 
     /// The actor writes the host's reason into the slot and then aborts the

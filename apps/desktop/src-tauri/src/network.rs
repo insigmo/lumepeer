@@ -2967,12 +2967,25 @@ impl Actor {
         crate::view::spawn_guest_mic_pass(connection, tag);
     }
 
-    /// Host side: an encode loop found it cannot produce a picture at all.
+    /// Host side: an encode loop found it cannot produce a picture at all —
+    /// or, for [`MediaUnavailableReason::SecureDesktopActive`], that it is
+    /// stuck behind one for now (`docs/bugs/11-uac-degradation.md`).
     ///
     /// Recorded on this host first. A missing encoder is a property of the
     /// machine, not of whichever peer happened to ask for it first, so the
     /// operator's own status must keep saying so after this session ends.
+    ///
+    /// The secure-desktop case is deliberately not treated like the other
+    /// two: the encode loop that sent it is still running — it is retrying
+    /// its own reopen in `WindowsCapturer` — so there is no session to tear
+    /// down and nothing durable about this host to record. Removing the
+    /// media session here would force a full reconnect for a condition that
+    /// clears on its own.
     fn on_media_fault(&mut self, peer: NodeId, reason: MediaUnavailableReason) {
+        if matches!(reason, MediaUnavailableReason::SecureDesktopActive) {
+            self.announce_media_fault(peer, reason);
+            return;
+        }
         self.health.record(reason);
         // The loop has already returned; its media connection has nothing
         // left to carry, and dropping the entry closes it.
@@ -3009,18 +3022,37 @@ impl Actor {
         self.send_to(&peer, MessageKind::MediaUnavailable(reason));
     }
 
-    /// Guest side: the host says this session will never carry a picture.
+    /// Guest side: the host says this session will never carry a picture —
+    /// or, for [`MediaUnavailableReason::SecureDesktopActive`], that it
+    /// currently cannot but expects to again (`docs/bugs/11-uac-degradation.md`).
     ///
     /// Not a revoke and not a failure of this connection: the control session
     /// and every grant on it stay as they are, and the window stays open with
     /// the real reason on it. What ends is the waiting — the receiver's
     /// recovery pass has nothing to reconnect to, so it is stopped rather
     /// than left to time out and report a connection that was never lost.
+    ///
+    /// The secure-desktop case does not stop anything: the host's media
+    /// stream is still open and will start carrying frames again on its own,
+    /// so aborting the receive task here would tear down a connection that
+    /// is about to recover and force a needless reconnect. Only the status
+    /// shown changes, and only while nothing more urgent already has it —
+    /// a status this message reports as recovered underneath must never
+    /// clobber a status that turned terminal in the meantime.
     fn on_media_unavailable(&mut self, peer: NodeId, reason: MediaUnavailableReason) {
         let tag = self.label_of(&peer);
         let Some(state) = self.views.get(&peer) else {
             return;
         };
+        if matches!(reason, MediaUnavailableReason::SecureDesktopActive) {
+            tracing::info!(peer = %tag, "the host's capture is behind a secure desktop; waiting");
+            state.slot_tx.send_modify(|slot| {
+                if !slot.status.is_terminal() {
+                    slot.status = ViewStatus::SecureDesktop;
+                }
+            });
+            return;
+        }
         tracing::warn!(peer = %tag, ?reason, "the host cannot produce a picture for this session");
         state.task.abort();
         let status = ViewStatus::from(reason);

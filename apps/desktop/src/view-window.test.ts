@@ -145,6 +145,13 @@ describe('view window: frame decoding', () => {
     expect(decodeViewFrame(response({ status: 5, input: false, width: 0, height: 0 })).status).toBe('no-encoder');
   });
 
+  // Code 6 is `ViewStatus::SecureDesktop` in view.rs (docs/bugs/11-uac-degradation.md).
+  it('decodes the secure-desktop status', () => {
+    expect(decodeViewFrame(response({ status: 6, input: false, width: 0, height: 0 })).status).toBe(
+      'secure-desktop',
+    );
+  });
+
   it('refuses an unknown status byte', () => {
     expect(() => decodeViewFrame(response({ status: 9, input: false, width: 0, height: 0 }))).toThrow();
   });
@@ -856,14 +863,20 @@ describe('view window: status overlay', () => {
     expect(container.textContent?.trim()).toBe('');
   });
 
-  it('keeps waiting and reconnecting non-blocking', () => {
-    for (const status of ['waiting', 'reconnecting'] as ViewStatus[]) {
+  it('keeps waiting, reconnecting and secure-desktop non-blocking', () => {
+    for (const status of ['waiting', 'reconnecting', 'secure-desktop'] as ViewStatus[]) {
       render(viewOverlay(status, 'en', noop), container);
       const banner = container.querySelector('.view-banner');
       expect(banner).not.toBeNull();
       expect(banner?.getAttribute('role')).toBe('status');
       expect(container.querySelector('[aria-modal="true"]')).toBeNull();
     }
+  });
+
+  it('names the secure desktop instead of a generic reconnect message', () => {
+    render(viewOverlay('secure-desktop', 'en', noop), container);
+    expect(container.textContent).toContain('administrator request');
+    expect(container.textContent).not.toContain('reconnecting');
   });
 
   it('says the host cannot send a picture instead of blaming the connection', () => {
@@ -899,6 +912,7 @@ describe('view window: status overlay', () => {
     for (const status of [
       'waiting',
       'reconnecting',
+      'secure-desktop',
       'failed',
       'no-capture',
       'no-encoder',

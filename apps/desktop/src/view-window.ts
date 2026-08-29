@@ -28,8 +28,11 @@ export type ViewStatus =
   | 'reconnecting'
   | 'failed'
   | 'no-capture'
-  | 'no-encoder';
+  | 'no-encoder'
+  | 'secure-desktop';
 
+// Append-only: this array's index is the byte the Rust side's `ViewStatus::code`
+// writes into the IPC response (`apps/desktop/src-tauri/src/view.rs`).
 const STATUS_BY_CODE: readonly ViewStatus[] = [
   'waiting',
   'live',
@@ -37,6 +40,7 @@ const STATUS_BY_CODE: readonly ViewStatus[] = [
   'failed',
   'no-capture',
   'no-encoder',
+  'secure-desktop',
 ];
 
 /** Bytes of the fixed header every `view_next_frame` response carries. */
@@ -879,7 +883,12 @@ export function viewOverlay(status: ViewStatus, locale: Locale, onDismiss: () =>
       onDismiss,
     );
   }
-  const key = status === 'waiting' ? 'view.waiting' : 'view.reconnecting';
+  const key =
+    status === 'waiting'
+      ? 'view.waiting'
+      : status === 'secure-desktop'
+        ? 'view.secureDesktop'
+        : 'view.reconnecting';
   return html`<p class="view-banner" role="status" aria-live="polite">${t(locale, key)}</p>`;
 }
 

@@ -32,6 +32,18 @@ pub const CONSENT_RATE_PER_MINUTE: u32 = 5;
 pub const MAX_PENDING_CONSENTS: usize = 3;
 /// Window in which a dropped session may be resumed by the same peer (§10).
 pub const RECONNECT_WINDOW_SECS: u64 = 60;
+/// Pause between attempts of `WindowsCapturer` to reopen a Desktop
+/// Duplication lost to the secure desktop (lock screen, UAC prompt or fast
+/// user switch), in milliseconds (docs/bugs/11-uac-degradation.md).
+pub const SECURE_DESKTOP_RECOVERY_BACKOFF_MS: u64 = 1_000;
+/// Consecutive reopen attempts `WindowsCapturer` makes before giving up and
+/// reporting the session as interrupted for good
+/// (docs/bugs/11-uac-degradation.md). At
+/// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`] this is a two-minute window —
+/// generous enough for someone to notice and answer a UAC prompt, bounded
+/// enough that a host with a permanently unattended monitor does not spin
+/// forever.
+pub const SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS: u32 = 120;
 /// Control-channel keepalive interval (§9.1).
 pub const PING_INTERVAL_SECS: u64 = 20;
 /// Smoothing factor of the exponentially weighted moving average that turns
