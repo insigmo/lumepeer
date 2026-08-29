@@ -9,9 +9,11 @@
 //!   [`ScreenCapturer::next_frame`] needs no `WinRT` dispatcher, no callback
 //!   thread and no frame-pool bookkeeping.
 //! - `DXGI_ERROR_ACCESS_LOST` is documented as the error for a desktop
-//!   switch, a session lock or a mode change, which is §18's
-//!   [`MediaError::CaptureInterrupted`] verbatim. Nothing has to infer an
-//!   interruption from a timeout or a silent stream.
+//!   switch, a session lock or a mode change, which is §18's capture
+//!   interruption verbatim (see [`MediaError::CaptureInterrupted`] and, for
+//!   the secure-desktop case specifically,
+//!   [`MediaError::SecureDesktopActive`] — `docs/bugs/11-uac-degradation.md`).
+//!   Nothing has to infer an interruption from a timeout or a silent stream.
 //! - Adapter/output enumeration is native to DXGI, so
 //!   [`CaptureTarget::Display`] is a real monitor index rather than a
 //!   platform-specific handle, and the primary display is the output whose
@@ -58,9 +60,12 @@ pub use stub::{WindowsCapturer, WindowsInjector};
     reason = "DXGI Desktop Duplication is COM and SendInput is raw FFI; every IDXGIOutputDuplication/ID3D11Device call in the `windows` crate is `unsafe fn`. See ADR 0012."
 )]
 mod dxgi {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use lumepeer_core::constants::ENCODE_DEFAULT_FPS;
+    use lumepeer_core::constants::{
+        ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS,
+        SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS,
+    };
     use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, HMODULE};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
     use windows::Win32::Graphics::Direct3D11::{
@@ -1044,9 +1049,17 @@ mod dxgi {
     /// for something they were never asked (§18).
     fn map_start_error(error: &windows::core::Error) -> MediaError {
         let code = error.code();
-        let reason = if code == E_ACCESSDENIED {
-            "the secure desktop (lock screen, UAC prompt or fast user switch) is in the foreground"
-        } else if code == E_INVALIDARG {
+        if code == E_ACCESSDENIED {
+            // Distinct from the generic branch below: `WindowsCapturer`'s own
+            // reopen loop (see `next_frame`) matches on this variant to keep
+            // retrying instead of giving up on the first failed reopen
+            // (docs/bugs/11-uac-degradation.md).
+            return MediaError::SecureDesktopActive(
+                "the secure desktop (lock screen, UAC prompt or fast user switch) is in the foreground"
+                    .to_owned(),
+            );
+        }
+        let reason = if code == E_INVALIDARG {
             // MSDN: DuplicateOutput reports E_INVALIDARG when the calling
             // process is already duplicating this output. One duplication per
             // output per process is the hard limit, which is why `start`
@@ -1068,14 +1081,29 @@ mod dxgi {
     ///
     /// Once frames have started, a failure means capture stopped, which is
     /// [`MediaError::CaptureInterrupted`] rather than "unavailable" — the
-    /// distinction the caller needs to revoke instead of retrying (§18). The
-    /// recognized codes get a specific reason so the UI can say what happened;
-    /// the rest still stop capture rather than being swallowed.
+    /// distinction the caller needs to revoke instead of retrying (§18).
+    ///
+    /// One exception, since `docs/bugs/11-uac-degradation.md`:
+    /// `DXGI_ERROR_ACCESS_LOST`/`E_ACCESSDENIED` come back
+    /// [`MediaError::SecureDesktopActive`] instead. That is still "stop
+    /// capturing this instant", but `WindowsCapturer::next_frame` absorbs it
+    /// with its own reopen-with-backoff loop and only turns it into a real
+    /// [`MediaError::CaptureInterrupted`] — the caller's cue to revoke —
+    /// once that loop's attempt budget is exhausted. Every other code here
+    /// still means revoke immediately; the caller is not expected to retry
+    /// them.
+    ///
+    /// The recognized codes get a specific reason so the UI can say what
+    /// happened; the rest still stop capture rather than being swallowed.
     fn map_runtime_error(error: &windows::core::Error) -> MediaError {
         let code = error.code();
-        let reason = if code == DXGI_ERROR_ACCESS_LOST || code == E_ACCESSDENIED {
-            "the desktop changed: a screen lock, a UAC prompt, a user switch or a mode change"
-        } else if code == DXGI_ERROR_SESSION_DISCONNECTED {
+        if code == DXGI_ERROR_ACCESS_LOST || code == E_ACCESSDENIED {
+            return MediaError::SecureDesktopActive(
+                "the desktop changed: a screen lock, a UAC prompt, a user switch or a mode change"
+                    .to_owned(),
+            );
+        }
+        let reason = if code == DXGI_ERROR_SESSION_DISCONNECTED {
             "the session was disconnected"
         } else if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
             "the graphics device was reset or removed"
@@ -1085,10 +1113,63 @@ mod dxgi {
         MediaError::CaptureInterrupted(format!("capture stopped: {reason}"))
     }
 
+    /// Bookkeeping for `WindowsCapturer::next_frame`'s reopen-with-backoff
+    /// loop, kept apart from `Active` so it survives the duplication being
+    /// dropped and can be driven with an injected clock in tests
+    /// (`docs/bugs/11-uac-degradation.md`).
+    #[derive(Debug)]
+    struct Recovery {
+        /// Reopen attempts made so far, including the current one.
+        attempts: u32,
+        /// Earliest instant the next reopen attempt may run.
+        next_attempt_at: Instant,
+        /// Reason from the most recent failed reopen (or the failure that
+        /// started this recovery), surfaced to the caller on every poll.
+        reason: String,
+    }
+
+    impl Recovery {
+        /// Starts tracking a recovery whose first attempt is due immediately:
+        /// there is no reason to wait out a backoff before ever trying once.
+        fn started(reason: String) -> Self {
+            Self {
+                attempts: 0,
+                next_attempt_at: Instant::now(),
+                reason,
+            }
+        }
+
+        /// Whether a reopen attempt is due at `now`.
+        fn due(&self, now: Instant) -> bool {
+            now >= self.next_attempt_at
+        }
+
+        /// Counts one more attempt and reports whether
+        /// [`SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`] is now exhausted.
+        fn record_attempt(&mut self) -> bool {
+            self.attempts += 1;
+            self.attempts > SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS
+        }
+
+        /// Schedules the next attempt one backoff interval after `now`, and
+        /// updates the reason a caller polling in between should see.
+        fn schedule_next(&mut self, now: Instant, reason: String) {
+            self.reason = reason;
+            self.next_attempt_at = now + Duration::from_millis(SECURE_DESKTOP_RECOVERY_BACKOFF_MS);
+        }
+    }
+
     /// DXGI Desktop Duplication capturer (§11; ADR 0012).
     #[derive(Debug, Default)]
     pub struct WindowsCapturer {
         active: Option<Active>,
+        /// What [`ScreenCapturer::start`] was last asked to capture, kept so a
+        /// reopen after the secure desktop clears targets the same monitor.
+        target: Option<CaptureTarget>,
+        /// Set while a duplication lost to the secure desktop is being
+        /// retried; cleared as soon as a reopen succeeds or the attempt
+        /// budget in [`Recovery::record_attempt`] is exhausted.
+        recovering: Option<Recovery>,
     }
 
     impl WindowsCapturer {
@@ -1096,7 +1177,11 @@ mod dxgi {
         /// [`ScreenCapturer::start`].
         #[must_use]
         pub const fn new() -> Self {
-            Self { active: None }
+            Self {
+                active: None,
+                target: None,
+                recovering: None,
+            }
         }
 
         /// Frames per second this backend is polled at (§11, §14).
@@ -1164,16 +1249,82 @@ mod dxgi {
             // Drop any previous duplication first: Windows caps how many a
             // display may have, so a restart must not compete with itself.
             self.active = None;
+            self.recovering = None;
+            self.target = Some(target);
             self.active = Some(Active::open(target)?);
             Ok(())
         }
 
+        /// One poll, plus the secure-desktop reopen loop of
+        /// `docs/bugs/11-uac-degradation.md`.
+        ///
+        /// A duplication lost to `MediaError::SecureDesktopActive` is not
+        /// handed back to the caller as a failure on the spot: it is dropped
+        /// here and reopening is retried on later polls, at most once per
+        /// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`], for up to
+        /// [`SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`] attempts. Every poll
+        /// while that is running still returns
+        /// `Err(MediaError::SecureDesktopActive)` — never `Ok` — so the
+        /// caller (`apps/desktop/src-tauri/src/view.rs::spawn_encode_loop`)
+        /// can tell "still stuck, keep the session up and say so" apart from
+        /// "gave up, revoke", without counting attempts of its own. Only once
+        /// the budget above is exhausted does this return the ordinary
+        /// [`MediaError::CaptureInterrupted`] that means revoke.
         fn next_frame(&mut self) -> Result<Option<Frame>> {
-            let active = self
-                .active
-                .as_mut()
-                .ok_or_else(|| MediaError::CaptureUnavailable("capturer not started".to_owned()))?;
-            active.next_frame()
+            if let Some(active) = self.active.as_mut() {
+                match active.next_frame() {
+                    Err(MediaError::SecureDesktopActive(reason)) => {
+                        self.active = None;
+                        self.recovering = Some(Recovery::started(reason));
+                    }
+                    other => {
+                        // A frame (or "nothing changed") is proof the
+                        // duplication is healthy; a failure of any other kind
+                        // is the caller's to handle, unrelated to recovery.
+                        self.recovering = None;
+                        return other;
+                    }
+                }
+            }
+
+            let (Some(target), Some(recovery)) = (self.target, self.recovering.as_mut()) else {
+                // Reached only if `next_frame` is called before `start`:
+                // `self.active` being `None` above would then leave
+                // `recovering` unset too, since only the branch that just
+                // set it falls through to here.
+                return Err(MediaError::CaptureUnavailable(
+                    "capturer not started".to_owned(),
+                ));
+            };
+
+            let now = Instant::now();
+            if !recovery.due(now) {
+                return Err(MediaError::SecureDesktopActive(recovery.reason.clone()));
+            }
+            if recovery.record_attempt() {
+                let reason = recovery.reason.clone();
+                self.recovering = None;
+                return Err(MediaError::CaptureInterrupted(format!(
+                    "gave up reopening after the secure desktop, {SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS} attempts: {reason}"
+                )));
+            }
+            match Active::open(target) {
+                Ok(active) => {
+                    self.active = Some(active);
+                    self.recovering = None;
+                    // The duplication is fresh; nothing has been acquired
+                    // from it yet, so honestly there is no frame this poll.
+                    Ok(None)
+                }
+                Err(MediaError::SecureDesktopActive(reason)) => {
+                    recovery.schedule_next(now, reason.clone());
+                    Err(MediaError::SecureDesktopActive(reason))
+                }
+                Err(other) => {
+                    self.recovering = None;
+                    Err(other)
+                }
+            }
         }
 
         fn stop(&mut self) {
@@ -1181,6 +1332,8 @@ mod dxgi {
             // from handing this process desktop frames; there is nothing else
             // to tear down, and dropping twice is a no-op.
             self.active = None;
+            self.recovering = None;
+            self.target = None;
         }
 
         fn input_capability(&self) -> InputCapability {
@@ -1626,6 +1779,36 @@ mod dxgi {
             // A plain character code point is not a named key: `key` sends it
             // through `KEYEVENTF_UNICODE` instead.
             assert_eq!(named_key_vk(u32::from(b'a')), None);
+        }
+
+        /// The reopen loop's own logic, independent of DXGI: due immediately
+        /// on the first attempt, not due again until a full backoff elapses,
+        /// and exhausted only once `SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`
+        /// attempts have actually been counted (docs/bugs/11-uac-degradation.md).
+        #[test]
+        fn recovery_backoff_paces_attempts_and_has_a_bounded_budget() {
+            let mut recovery = Recovery::started("secure desktop".to_owned());
+            let start = Instant::now();
+
+            // The very first attempt needs no wait.
+            assert!(recovery.due(start));
+
+            recovery.schedule_next(start, "still blocked".to_owned());
+            assert!(!recovery.due(start));
+            assert!(
+                recovery.due(start + Duration::from_millis(SECURE_DESKTOP_RECOVERY_BACKOFF_MS))
+            );
+
+            for attempt in 1..=SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS {
+                let exhausted = recovery.record_attempt();
+                assert_eq!(
+                    exhausted,
+                    attempt > SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS,
+                    "attempt {attempt} should not exhaust the budget early"
+                );
+            }
+            // One more, past the budget, must exhaust it.
+            assert!(recovery.record_attempt());
         }
 
         /// `COLOR` arrives with straight alpha and the wire wants it

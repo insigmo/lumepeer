@@ -147,6 +147,7 @@ export type TranslationKey =
   | 'view.canvasLabel'
   | 'view.waiting'
   | 'view.reconnecting'
+  | 'view.secureDesktop'
   | 'view.failed.title'
   | 'view.failed.body'
   | 'view.failed.dismiss'
@@ -425,6 +426,8 @@ const en: Dictionary = {
   'view.canvasLabel': 'Remote screen',
   'view.waiting': 'Waiting for the remote screen…',
   'view.reconnecting': 'Connection lost, reconnecting…',
+  'view.secureDesktop':
+    'A secure prompt (an administrator request, the lock screen, or a user switch) is showing on the remote machine. Respond to it there, or wait — the picture resumes on its own.',
   'view.failed.title': 'Connection lost',
   'view.failed.body': 'The remote screen could not be reconnected, so the session has ended.',
   'view.failed.dismiss': 'Close',
@@ -707,6 +710,8 @@ const ar: Dictionary = {
   'view.canvasLabel': 'الشاشة البعيدة',
   'view.waiting': 'في انتظار الشاشة البعيدة…',
   'view.reconnecting': 'انقطع الاتصال، جارٍ إعادة الاتصال…',
+  'view.secureDesktop':
+    'تظهر على الجهاز البعيد نافذة آمنة (طلب صلاحيات المسؤول، شاشة القفل، أو تبديل المستخدم). أجب عنها هناك، أو انتظر — ستعود الصورة من تلقاء نفسها.',
   'view.failed.title': 'انقطع الاتصال',
   'view.failed.body': 'تعذّرت إعادة الاتصال بالشاشة البعيدة، لذلك انتهت الجلسة.',
   'view.failed.dismiss': 'إغلاق',

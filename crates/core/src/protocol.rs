@@ -507,6 +507,12 @@ pub enum MediaUnavailableReason {
     NoCaptureBackend,
     /// The host has no video encoder it can build.
     NoEncoder,
+    /// The host's Windows capture is currently blocked by a secure desktop
+    /// (lock screen, UAC prompt or fast user switch) and is retrying on its
+    /// own (`docs/bugs/11-uac-degradation.md`). Unlike the two reasons
+    /// above, this is not permanent: the session stays open, and the guest
+    /// should expect it to clear without a reconnect.
+    SecureDesktopActive,
 }
 
 /// Pixel geometry plus pixel payload of one cursor shape (§11).

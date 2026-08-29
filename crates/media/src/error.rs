@@ -17,6 +17,14 @@ pub enum MediaError {
     #[error("capture interrupted: {0}")]
     CaptureInterrupted(String),
 
+    /// Capture stopped because a secure desktop (UAC prompt, lock screen or
+    /// fast user switch) took the foreground on Windows
+    /// (`docs/bugs/11-uac-degradation.md`). Distinct from the general
+    /// [`Self::CaptureInterrupted`]: this is expected to resolve on its own,
+    /// so the caller keeps retrying instead of revoking the session.
+    #[error("capture interrupted by the secure desktop: {0}")]
+    SecureDesktopActive(String),
+
     /// The platform refuses input injection: no adapter, no permission, or a
     /// permission withdrawn mid-session (§18). The session degrades to
     /// view-only and the UI says so; it never silently keeps "control".
