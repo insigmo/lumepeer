@@ -23,7 +23,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
 use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
-use argon2::password_hash::phc::SaltString;
+use hmac::{Hmac, KeyInit, Mac};
+use sha1::Sha1;
+
 use crate::consent::Role;
 use crate::constants::{
     UNATTENDED_LOCKOUT_DURATION_SECS, UNATTENDED_MAX_FAILED_ATTEMPTS,
@@ -110,9 +112,6 @@ impl Totp {
     /// RFC forbids; never a panic on hostile input.
     pub fn generate(&self, unix_secs: u64) -> Result<String> {
         let counter = unix_secs / UNATTENDED_TOTP_STEP_SECS;
-        use hmac::{Hmac, Mac, KeyInit};
-        use sha1::Sha1;
-
         let mac = <Hmac<Sha1> as KeyInit>::new_from_slice(&self.secret)
             .map_err(|_| UnattendedError::BadCode)?
             .chain_update(counter.to_be_bytes());
