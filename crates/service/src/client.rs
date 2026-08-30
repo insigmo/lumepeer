@@ -10,7 +10,7 @@
 //! is what it did before the service existed, so a missing service degrades
 //! the privilege level and never the feature (§18).
 
-use crate::protocol::{OP_DELIVER_SAS};
+use crate::protocol::OP_DELIVER_SAS;
 
 /// Asks the service to deliver the Secure Attention Sequence.
 ///
