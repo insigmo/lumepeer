@@ -21,6 +21,7 @@
 //! platform that has a real store.
 
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -744,7 +745,6 @@ impl FileKeystore {
 
 /// Bytes of the XChaCha20-Poly1305 nonce prefix.
 const NONCE_BYTES: usize = 24;
-
 impl Keystore for FileKeystore {
     fn load_secret(&self, entry: &str) -> Result<Option<Vec<u8>>> {
         let raw = match fs::read(self.path_for(entry)) {
@@ -756,9 +756,11 @@ impl Keystore for FileKeystore {
             return Err(NetError::Keystore("keystore file truncated".to_owned()));
         }
         let (nonce, ciphertext) = raw.split_at(NONCE_BYTES);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| NetError::Keystore("invalid nonce length in keystore file".to_owned()))?;
         let plain = self
             .cipher()
-            .decrypt(XNonce::from_slice(nonce), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| NetError::Keystore("keystore file failed authentication".to_owned()))?;
         Ok(Some(plain))
     }
@@ -766,9 +768,10 @@ impl Keystore for FileKeystore {
     fn store_secret(&self, entry: &str, bytes: &[u8]) -> Result<()> {
         let mut nonce = [0u8; NONCE_BYTES];
         rand::rng().fill_bytes(&mut nonce);
+        let nonce_array: XNonce = nonce.into();
         let ciphertext = self
             .cipher()
-            .encrypt(XNonce::from_slice(&nonce), bytes)
+            .encrypt(&nonce_array, bytes)
             .map_err(|_| NetError::Keystore("could not encrypt the secret".to_owned()))?;
         let mut out = Vec::with_capacity(NONCE_BYTES + ciphertext.len());
         out.extend_from_slice(&nonce);

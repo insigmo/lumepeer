@@ -22,7 +22,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
-use argon2::password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
