@@ -5,7 +5,6 @@
 # Usage:   e2e/run-on-vm.sh <session-type>
 #          e2e/run-on-vm.sh x11       — one app, the declarative smoke scenario
 #          e2e/run-on-vm.sh wayland   — the same, on the Wayland VM
-#          e2e/run-on-vm.sh stand     — the two-node stand CI runs (ADR 0036)
 #
 # The script runs ON the VM (scp it there or pipe it through ssh bash).
 # It syncs nothing: `task remote:e2e:<type>` in Taskfile.yml does the sync,
@@ -53,13 +52,6 @@ else
   SESSION_ENV=( env "DISPLAY=${DISPLAY_VALUE}" )
 fi
 echo "session env: ${SESSION_ENV[*]}"
-
-if [ "$SESSION_TYPE" = "stand" ]; then
-  echo "== running the two-node stand =="
-  pkill -f 'lumepeer-desktop' 2>/dev/null || true
-  mkdir -p target/e2e
-  exec "${SESSION_ENV[@]}"     LUMEPEER_BIN="target/debug/lumepeer-desktop"     E2E_OUT="target/e2e"     bash e2e/ci-stand.sh
-fi
 
 echo "== headless identity: encrypted-file keystore =="
 # A session reached only over SSH never ran PAM's keyring unlock, so the
