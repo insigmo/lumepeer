@@ -59,8 +59,8 @@ fn open() -> Option<std::fs::File> {
 
 #[cfg(target_os = "windows")]
 fn round_trip(op: u8) -> bool {
-    use std::io::{Read as _, Write as _};
     use crate::protocol::{FRAME_LEN, request, succeeded};
+    use std::io::{Read as _, Write as _};
 
     let Some(mut pipe) = open() else {
         return false;
