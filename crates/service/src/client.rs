@@ -10,7 +10,7 @@
 //! is what it did before the service existed, so a missing service degrades
 //! the privilege level and never the feature (§18).
 
-use crate::protocol::{FRAME_LEN, OP_DELIVER_SAS, request, succeeded};
+use crate::protocol::{OP_DELIVER_SAS};
 
 /// Asks the service to deliver the Secure Attention Sequence.
 ///
@@ -60,6 +60,7 @@ fn open() -> Option<std::fs::File> {
 #[cfg(target_os = "windows")]
 fn round_trip(op: u8) -> bool {
     use std::io::{Read as _, Write as _};
+    use crate::protocol::{FRAME_LEN, request, succeeded};
 
     let Some(mut pipe) = open() else {
         return false;
