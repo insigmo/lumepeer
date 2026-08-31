@@ -237,7 +237,7 @@
         border-radius: 0.35rem;
         cursor: pointer;
       }
-      .toolbar-btn:hover:not(.is-disabled) {
+      .toolbar-btn:hover:not(.is-disabled):not(.toolbar-indicator) {
         background: rgb(255 255 255 / 12%);
       }
       .toolbar-btn:focus-visible {
@@ -250,6 +250,26 @@
       .toolbar-btn.is-disabled {
         opacity: 0.4;
         cursor: not-allowed;
+      }
+      /* A status, not a control (docs/bugs/10-clipboard-auto.md #2): the
+         clipboard icon shows that sync is on, and nothing here responds to a
+         click. */
+      .toolbar-btn.toolbar-indicator {
+        cursor: default;
+      }
+      /* The transient "a clipboard just synced" note, next to the toolbar
+         (§15: the fact only, never the content). */
+      .toolbar-clipboard-note {
+        display: inline-flex;
+        align-items: center;
+        margin-inline-start: 0.2rem;
+        padding: 1px 8px;
+        border: 1px solid rgb(255 255 255 / 18%);
+        border-radius: 999px;
+        background: rgb(16 16 20 / 88%);
+        color: #9fd0ff;
+        font-size: 0.7rem;
+        white-space: nowrap;
       }
       .toolbar-handle {
         cursor: grab;
