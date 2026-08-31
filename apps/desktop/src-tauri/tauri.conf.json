@@ -42,14 +42,24 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    },
     "linux": {
       "deb": {
         "depends": ["libpipewire-0.3-0"],
-        "recommends": ["xdg-desktop-portal", "pipewire"]
+        "recommends": ["xdg-desktop-portal", "pipewire"],
+        "postInstallScript": "packaging/deb-postinst.sh",
+        "preRemoveScript": "packaging/deb-prerm.sh"
       },
       "rpm": {
         "depends": ["pipewire-libs"],
-        "recommends": ["xdg-desktop-portal", "pipewire"]
+        "recommends": ["xdg-desktop-portal", "pipewire"],
+        "postInstallScript": "packaging/rpm-post.sh",
+        "preRemoveScript": "packaging/rpm-preun.sh"
       }
     }
   },
