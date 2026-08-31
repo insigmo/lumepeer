@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::Role;
 use crate::constants::{
-    ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES,
-    FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
-    STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
+    FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS,
+    MAX_MONITORS_PER_HOST, STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES,
+    UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -95,7 +96,17 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// [`FEATURE_RECEIVER_REPORT`] uses, since this is also a guest-to-host
 /// message and `HelloAck` carries no feature list of its own. See
 /// `docs/bugs/13-stream-resolution.md` and `docs/bugs/DECISIONS.md` D7.
-pub const PROTOCOL_MINOR: u16 = 7;
+///
+/// 8: appended [`MessageKind::ClipboardFileOffer`] and
+/// [`MessageKind::ClipboardFileAccept`] after `StreamScaleRequest`. §9.2's
+/// file transfer engine (ADR 0032) could already move a file once both sides
+/// had agreed to it; nothing let either side say "these files are on my
+/// clipboard" in the first place. Either side may hold such a clipboard, so
+/// either side may send `ClipboardFileOffer`, exactly like `FileOffer` — sent
+/// only to a peer whose `Hello` advertised [`FEATURE_CLIPBOARD_FILES`]. See
+/// `docs/bugs/14-clipboard-files.md` and `docs/adr/0047-clipboard-files-are-a-
+/// file-transfer-not-a-clipboard-extension.md`.
+pub const PROTOCOL_MINOR: u16 = 8;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -177,6 +188,19 @@ pub const FEATURE_CURSOR_SHAPE: &str = "cursor-shape";
 /// its own `Hello`, and the host reads it off that — `HelloAck` carries no
 /// feature list for the guest to read the other way.
 pub const FEATURE_STREAM_SCALE: &str = "stream-scale";
+
+/// `Hello.features` string a peer sends to say it understands
+/// [`MessageKind::ClipboardFileOffer`] and [`MessageKind::ClipboardFileAccept`]
+/// (docs/bugs/14-clipboard-files.md; ADR 0047).
+///
+/// Same compatibility shape as [`FEATURE_FILE_TRANSFER`]: either end of a
+/// session may have files on its own clipboard, so either end may be the one
+/// that has to send the offer, and both sides advertise and check the string.
+/// Without it on the far side, a clipboard file list is simply never
+/// announced — the same choice `FEATURE_FILE_TRANSFER` makes for an ordinary
+/// offer, and for the same reason (§18: a transfer that starts and cannot be
+/// acked or resumed is worse than one never offered).
+pub const FEATURE_CLIPBOARD_FILES: &str = "clipboard-files";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -510,6 +534,34 @@ pub enum MessageKind {
         /// Requested ceiling, `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT`.
         scale_percent: u32,
     },
+    /// Sender to receiver: "these files are on my clipboard" (docs/bugs/
+    /// 14-clipboard-files.md #2; ADR 0047). New in minor 8.
+    ///
+    /// Names and sizes only, **never paths**: a full path leaks information
+    /// about the sending machine that the receiver has no use for (§15). This
+    /// message announces nothing more than "there is something to paste" —
+    /// no content crosses the wire here, and no bytes move until the receiver
+    /// accepts and the existing `FileOffer`/`FileTransferStart` machinery
+    /// carries them over `rd/file/1`, exactly as it would for a file offered
+    /// through the ordinary picker. Sent only to a peer whose `Hello`
+    /// advertised [`FEATURE_CLIPBOARD_FILES`].
+    ClipboardFileOffer {
+        /// One entry per file currently on the sender's clipboard, at most
+        /// `CLIPBOARD_FILE_LIST_MAX_ENTRIES`.
+        files: Vec<ClipboardFileEntry>,
+    },
+    /// Receiver to sender: answers the oldest outstanding
+    /// [`MessageKind::ClipboardFileOffer`] entry (§9.2; ADR 0047). New in
+    /// minor 8.
+    ///
+    /// Shaped exactly like [`MessageKind::FileAccept`] — a bare bool — for
+    /// the same reason: the entries are answered one at a time, oldest first,
+    /// so nothing beyond "yes" or "no" has to travel back. `true` is the
+    /// receiving user's single decision to paste; the sender then measures,
+    /// hashes and starts the transfer through the same
+    /// `FileTransferStart` a regular offer would use — the receiver never
+    /// re-confirms the individual file that follows.
+    ClipboardFileAccept(bool),
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -580,6 +632,25 @@ pub struct CursorShapeData {
     /// this message and break the golden vectors of §17.2, so the name stays
     /// and this comment is the authority.
     pub rgba: Vec<u8>,
+}
+
+/// One file named in a [`MessageKind::ClipboardFileOffer`] (docs/bugs/
+/// 14-clipboard-files.md #2; ADR 0047).
+///
+/// Deliberately the same two fields [`MessageKind::FileOffer`] restates on
+/// the wire, minus the hash: hashing every file on a clipboard just to
+/// announce it would be a full disk pass nobody asked for yet (ADR 0027), so
+/// the hash is computed only once the specific file is actually accepted,
+/// exactly as it already is for the first offer a user makes through the
+/// picker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardFileEntry {
+    /// Basename, already normalized on the sending side the same way
+    /// `FileOffer` is — no path separators, nothing a receiver would have to
+    /// repair.
+    pub name: String,
+    /// File size, at most `FILE_OFFER_MAX_BYTES`.
+    pub size: u64,
 }
 
 /// One monitor of the host, as reported in `MonitorsList` (§11).
@@ -723,6 +794,21 @@ impl MessageEnvelope {
                     return Err(CoreError::Malformed);
                 }
             }
+            // A clipboard file list is untrusted input from a peer that has
+            // not necessarily proven anything about the files it claims to
+            // hold, so it gets the same two bounds `FileOffer` gets, checked
+            // before anything downstream allocates per entry (§9.1;
+            // docs/bugs/14-clipboard-files.md #2).
+            MessageKind::ClipboardFileOffer { files } => {
+                if files.len() > CLIPBOARD_FILE_LIST_MAX_ENTRIES {
+                    return Err(CoreError::Malformed);
+                }
+                for entry in files {
+                    if entry.size > FILE_OFFER_MAX_BYTES || entry.name.len() > FILE_NAME_MAX_BYTES {
+                        return Err(CoreError::Malformed);
+                    }
+                }
+            }
             // Credentials arrive from a peer that has not been admitted yet,
             // which makes this the least trusted payload on the channel: both
             // fields are bounded before anything downstream allocates (§9.1).
@@ -775,8 +861,8 @@ mod tests {
 
     use super::*;
     use crate::constants::{
-        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES,
-        FILE_OFFER_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
+        AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
+        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     fn envelope(kind: MessageKind) -> MessageEnvelope {
@@ -928,6 +1014,12 @@ mod tests {
             38,
             "the minor-7 kind must be appended after ReceiverReport"
         );
+        assert_eq!(
+            kind_byte(MessageKind::ClipboardFileOffer { files: Vec::new() }),
+            39,
+            "the minor-8 kinds must be appended after StreamScaleRequest"
+        );
+        assert_eq!(kind_byte(MessageKind::ClipboardFileAccept(false)), 40,);
     }
 
     /// A receiver report is a claim, not a fact, so decoding never judges it:
@@ -1321,5 +1413,90 @@ mod tests {
                 "scale_percent {scale_percent} outside the range was accepted"
             );
         }
+    }
+
+    /// docs/bugs/14-clipboard-files.md #2: names and sizes travel, an empty
+    /// list is ordinary (declining a whole clipboard is still a valid state
+    /// to be in), and the accept is a bare bool like `FileAccept`.
+    #[test]
+    fn a_clipboard_file_offer_roundtrips_including_the_accept() {
+        let cases = [
+            MessageKind::ClipboardFileOffer { files: Vec::new() },
+            MessageKind::ClipboardFileOffer {
+                files: vec![
+                    ClipboardFileEntry {
+                        name: "report.pdf".to_owned(),
+                        size: 4096,
+                    },
+                    ClipboardFileEntry {
+                        name: "photo.png".to_owned(),
+                        size: 1_048_576,
+                    },
+                ],
+            },
+            MessageKind::ClipboardFileAccept(true),
+            MessageKind::ClipboardFileAccept(false),
+        ];
+        for kind in cases {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    /// §9.1: the same two bounds `FileOffer` enforces apply per entry, and to
+    /// the whole list's length, before anything downstream believes an
+    /// untrusted peer's clipboard announcement (docs/bugs/
+    /// 14-clipboard-files.md #2).
+    #[test]
+    fn a_clipboard_file_offer_past_its_bounds_is_malformed() {
+        let too_many = envelope(MessageKind::ClipboardFileOffer {
+            files: (0..=CLIPBOARD_FILE_LIST_MAX_ENTRIES)
+                .map(|i| ClipboardFileEntry {
+                    name: format!("file-{i}.bin"),
+                    size: 1,
+                })
+                .collect(),
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&too_many.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let name_too_long = envelope(MessageKind::ClipboardFileOffer {
+            files: vec![ClipboardFileEntry {
+                name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+                size: 1,
+            }],
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&name_too_long.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let size_too_big = envelope(MessageKind::ClipboardFileOffer {
+            files: vec![ClipboardFileEntry {
+                name: "big.bin".to_owned(),
+                size: FILE_OFFER_MAX_BYTES + 1,
+            }],
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&size_too_big.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        // Exactly at every bound is still ordinary traffic.
+        let at_bounds = envelope(MessageKind::ClipboardFileOffer {
+            files: (0..CLIPBOARD_FILE_LIST_MAX_ENTRIES)
+                .map(|i| ClipboardFileEntry {
+                    name: format!(
+                        "{i}{}",
+                        "n".repeat(FILE_NAME_MAX_BYTES - i.to_string().len())
+                    ),
+                    size: FILE_OFFER_MAX_BYTES,
+                })
+                .collect(),
+        });
+        assert!(MessageEnvelope::decode(&at_bounds.encode().unwrap()).is_ok());
     }
 }

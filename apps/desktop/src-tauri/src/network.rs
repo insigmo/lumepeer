@@ -31,9 +31,10 @@ use lumepeer_core::constants::{
     STREAM_SCALE_MAX_PERCENT,
 };
 use lumepeer_core::protocol::{
-    CursorShapeData, FEATURE_CURSOR_SHAPE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
-    FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_UNATTENDED, InputEventPayload,
-    MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
+    ClipboardFileEntry, CursorShapeData, FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE,
+    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
+    FEATURE_STREAM_SCALE, FEATURE_UNATTENDED, InputEventPayload, MediaUnavailableReason,
+    MessageKind, MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -85,6 +86,17 @@ const RECEIVER_REPORT_MINOR: u16 = 6;
 /// guest's `FEATURE_STREAM_SCALE` string instead, which is the more precise
 /// signal, and `HelloAck` carries no feature list for the guest to read.
 const STREAM_SCALE_MINOR: u16 = 7;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::ClipboardFileOffer` and
+/// `MessageKind::ClipboardFileAccept`, and therefore the floor for offering
+/// clipboard files to a host (docs/bugs/14-clipboard-files.md #2; ADR 0047).
+///
+/// Guest side only, exactly like [`FILE_TRANSFER_MINOR`] — the same
+/// asymmetry, for the same reason: either side may have files on its own
+/// clipboard, so a host reads the guest's `FEATURE_CLIPBOARD_FILES` string
+/// instead of a minor, but the guest has no feature list of the host's to
+/// read.
+const CLIPBOARD_FILES_MINOR: u16 = 8;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -662,6 +674,14 @@ enum ActorCommand {
         path: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Either side: offer this node's own clipboard file list to the peer
+    /// (docs/bugs/14-clipboard-files.md #2). No path ever comes from the
+    /// webview here — the list comes off this machine's clipboard, on its
+    /// own thread.
+    FileOfferClipboard {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
     /// Either side: answer the oldest offer this peer made. `directory` is
     /// where the receiving user chose to put it, and is ignored on a refusal.
     FileAccept {
@@ -1158,6 +1178,26 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::FileOffer { label, path, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Offers this node's own clipboard file list to `label` (docs/bugs/
+    /// 14-clipboard-files.md #2).
+    ///
+    /// Returns as soon as the read and the announcement are queued: reading
+    /// the clipboard and measuring what it holds both run off the actor
+    /// loop (ADR 0027).
+    ///
+    /// # Errors
+    /// [`ActorError::Core`] as `NotPermitted` without the `file_transfer`
+    /// grant, [`ActorError::Unsupported`] towards a peer too old to
+    /// understand a clipboard file offer.
+    pub async fn file_offer_clipboard(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::FileOfferClipboard { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -1705,13 +1745,56 @@ struct OutgoingOffer {
 struct AcceptedOffer {
     name: String,
     size: u64,
-    hash: [u8; 32],
-    /// Where the verified file goes. Chosen by the *receiving* user: the
-    /// sender picks a name, never a location.
+    /// `None` for an offer accepted through `ClipboardFileAccept`: the
+    /// sender had not hashed the file yet at accept time (docs/bugs/
+    /// 14-clipboard-files.md #2), so there is nothing here to check the
+    /// start against beyond name and size. `FileTransferStart`'s own hash is
+    /// still what `ReceiveTracker::finish` verifies the bytes against either
+    /// way — this only gates the *bait-and-switch* check a hash-carrying
+    /// offer gets.
+    hash: Option<[u8; 32]>,
+    /// Where the verified file goes. Chosen by the *receiving* user for an
+    /// ordinary offer; fixed to this node's own clipboard-receive directory
+    /// for one accepted through `ClipboardFileAccept` (docs/bugs/
+    /// 14-clipboard-files.md #3) — the sender picks a name, never a
+    /// location, either way.
     destination: std::path::PathBuf,
+    /// Whether this offer came from the peer's clipboard rather than its
+    /// file picker (docs/bugs/14-clipboard-files.md #3), so the transfer it
+    /// starts can be tagged for the UI and for the clipboard write-back on
+    /// completion.
+    from_clipboard: bool,
 }
 
 /// One offer that arrived and is waiting for this user to answer.
+#[derive(Clone)]
+enum IncomingOffer {
+    /// Offered through the sender's file picker, with a hash already known
+    /// (§9.2).
+    Direct(PendingOffer),
+    /// Offered through the sender's clipboard: name and size only, no hash
+    /// yet (docs/bugs/14-clipboard-files.md #2).
+    Clipboard(ClipboardFileEntry),
+}
+
+impl IncomingOffer {
+    fn name(&self) -> &str {
+        match self {
+            Self::Direct(offer) => &offer.name,
+            Self::Clipboard(entry) => &entry.name,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::Direct(offer) => offer.size,
+            Self::Clipboard(entry) => entry.size,
+        }
+    }
+}
+
+/// One offer that arrived through the sender's file picker and is waiting
+/// for this user to answer (§9.2).
 #[derive(Clone)]
 struct PendingOffer {
     /// Basename, already through `safe_file_name`.
@@ -1804,6 +1887,9 @@ pub struct TransferRow {
     pub incoming: bool,
     /// Where it is up to.
     pub state: TransferState,
+    /// Whether this transfer started from the peer's clipboard rather than
+    /// its file picker (docs/bugs/14-clipboard-files.md #3).
+    pub from_clipboard: bool,
 }
 
 /// One offer waiting for this user's answer, as the UI lists it.
@@ -1815,6 +1901,9 @@ pub struct OfferRow {
     pub name: String,
     /// Size the offer announced.
     pub size: u64,
+    /// Whether this offer came from the peer's clipboard rather than its
+    /// file picker (docs/bugs/14-clipboard-files.md #1, #3).
+    pub from_clipboard: bool,
 }
 
 /// Everything the transfer panel draws in one poll.
@@ -1859,6 +1948,22 @@ enum FileEvent {
         id: TransferId,
         state: TransferState,
     },
+    /// A file accepted through `ClipboardFileAccept` finished measuring and
+    /// hashing and can now start (docs/bugs/14-clipboard-files.md #2): the
+    /// human decision already happened when the peer answered the clipboard
+    /// offer, so this goes straight to `FileTransferStart` rather than
+    /// through another `FileOffer`/`FileAccept` round trip.
+    ClipboardTransferReady {
+        peer: NodeId,
+        path: std::path::PathBuf,
+        name: String,
+        size: u64,
+        hash: [u8; 32],
+    },
+    /// The file behind an accepted clipboard entry could not be measured,
+    /// hashed or named after all — moved or deleted since it was announced,
+    /// say. Nothing starts.
+    ClipboardPrepareFailed { peer: NodeId },
 }
 
 /// The actor's end of one live control connection.
@@ -2085,6 +2190,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
         /// docs/bugs/13-stream-resolution.md).
         speaks_stream_scale: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
+        /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
+        speaks_clipboard_files: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -2124,6 +2232,16 @@ enum ActorEvent {
     },
     /// Something happened to a file transfer, on one of its own tasks.
     File(FileEvent),
+    /// This node's own clipboard file list was read and measured, off the
+    /// actor loop (docs/bugs/14-clipboard-files.md #2; ADR 0027).
+    ClipboardFilesRead {
+        peer: NodeId,
+        files: Vec<ClipboardFileEntry>,
+        /// The real local paths behind `files`, in the same order — never
+        /// sent on the wire (§15), kept so an accept can be traced back to
+        /// the file it named.
+        paths: Vec<std::path::PathBuf>,
+    },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -2153,6 +2271,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
         /// docs/bugs/13-stream-resolution.md).
         speaks_stream_scale: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
+        /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
+        speaks_clipboard_files: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -2311,6 +2432,16 @@ struct Actor {
     /// Whether this peer's `Hello` (host side) or `HelloAck` minor (guest
     /// side) says it understands `FileTransferStart` (§9.1; ADR 0032).
     speaks_file_transfer: std::collections::HashSet<NodeId>,
+    /// Whether this peer's `Hello` (host side) or `HelloAck` minor (guest
+    /// side) says it understands `ClipboardFileOffer`/`ClipboardFileAccept`
+    /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
+    speaks_clipboard_files: std::collections::HashSet<NodeId>,
+    /// Local paths behind the entries of this node's last `ClipboardFileOffer`
+    /// to a peer, popped one at a time as each `ClipboardFileAccept` answers
+    /// (docs/bugs/14-clipboard-files.md #2). Never sent on the wire — only
+    /// the name and size in the entry are (§15).
+    clipboard_offers_out:
+        std::collections::HashMap<NodeId, std::collections::VecDeque<std::path::PathBuf>>,
     /// The `rd/file/1` connection per peer, opened lazily and only after an
     /// accepted offer (§4).
     file_conns: std::collections::HashMap<NodeId, iroh::endpoint::Connection>,
@@ -2319,8 +2450,10 @@ struct Actor {
     file_dialing: std::collections::HashSet<NodeId>,
     /// Offers this node has made and not yet heard back on.
     file_offers_out: std::collections::HashMap<NodeId, std::collections::VecDeque<OutgoingOffer>>,
-    /// Offers that arrived and are waiting for this user to answer.
-    file_offers_in: std::collections::HashMap<NodeId, std::collections::VecDeque<PendingOffer>>,
+    /// Offers that arrived and are waiting for this user to answer, either
+    /// through the sender's file picker or its clipboard (docs/bugs/
+    /// 14-clipboard-files.md #2).
+    file_offers_in: std::collections::HashMap<NodeId, std::collections::VecDeque<IncomingOffer>>,
     /// Offers this user accepted, waiting for the sender to name them.
     file_accepted: std::collections::HashMap<NodeId, std::collections::VecDeque<AcceptedOffer>>,
     /// Receiver-side state per peer, shared with its stream readers.
@@ -2329,6 +2462,14 @@ struct Actor {
     file_pending_sends: std::collections::HashMap<NodeId, Vec<SendJob>>,
     /// Every transfer this node knows about, keyed by peer and id.
     file_transfers: std::collections::HashMap<(NodeId, TransferId), TransferRow>,
+    /// Where an *incoming* transfer's bytes actually land, and whether it
+    /// came from a clipboard offer — kept out of `TransferRow` deliberately,
+    /// since that DTO reaches the webview and a destination is a path on
+    /// this machine (§15). Consulted once, when the transfer finishes, to
+    /// decide whether to put the path on this machine's own clipboard
+    /// (docs/bugs/14-clipboard-files.md #3).
+    file_receive_destinations:
+        std::collections::HashMap<(NodeId, TransferId), (std::path::PathBuf, bool)>,
     /// Tasks pushing bytes, so an abort can stop one without waiting for the
     /// stream to notice.
     file_send_tasks: std::collections::HashMap<(NodeId, TransferId), tokio::task::JoinHandle<()>>,
@@ -2829,6 +2970,7 @@ impl Actor {
                     speaks_receiver_report,
                     speaks_cursor_shape,
                     speaks_stream_scale,
+                    speaks_clipboard_files,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
@@ -2839,6 +2981,7 @@ impl Actor {
                     speaks_receiver_report,
                     speaks_cursor_shape,
                     speaks_stream_scale,
+                    speaks_clipboard_files,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -2962,6 +3105,7 @@ impl Actor {
                 speaks_receiver_report,
                 speaks_cursor_shape,
                 speaks_stream_scale,
+                speaks_clipboard_files,
             } => {
                 // Host side of the exchange: whether this guest's own reports
                 // may be read at all (ADR 0037). The guest side is recorded in
@@ -2990,6 +3134,11 @@ impl Actor {
                 } else {
                     self.speaks_file_transfer.remove(&peer);
                 }
+                if speaks_clipboard_files {
+                    self.speaks_clipboard_files.insert(peer);
+                } else {
+                    self.speaks_clipboard_files.remove(&peer);
+                }
                 self.on_handshaked(*connection, peer, &ticket, announces_media_faults);
             }
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
@@ -3011,6 +3160,9 @@ impl Actor {
                 result,
             } => self.on_dialed(peer, code, *addr, result),
             ActorEvent::File(event) => self.on_file_event(event),
+            ActorEvent::ClipboardFilesRead { peer, files, paths } => {
+                self.on_clipboard_files_read(peer, files, paths);
+            }
         }
     }
 
@@ -3778,6 +3930,16 @@ impl Actor {
                 tracing::info!(peer = %tag, "the peer aborted a transfer");
                 self.cancel_transfer(peer, transfer_id);
             }
+            // "These files are on my clipboard" (docs/bugs/
+            // 14-clipboard-files.md #2; ADR 0047). Names and sizes only; the
+            // grant re-check and the queue capacity are identical to an
+            // ordinary `FileOffer`, because this is one.
+            MessageKind::ClipboardFileOffer { ref files } => {
+                self.on_clipboard_file_offer_inbound(peer, files);
+            }
+            MessageKind::ClipboardFileAccept(accepted) => {
+                self.on_clipboard_file_accept_inbound(peer, accepted);
+            }
             // Keepalive of §9.1, both directions. Answered immediately and
             // with the same value: the sender is the only side that can turn
             // it into a round trip, because it is the only side that knows
@@ -4192,6 +4354,10 @@ impl Actor {
             }
             ActorCommand::FileOffer { label, path, reply } => {
                 let result = self.on_file_offer(&label, path);
+                let _ = reply.send(result);
+            }
+            ActorCommand::FileOfferClipboard { label, reply } => {
+                let result = self.on_file_offer_clipboard(&label);
                 let _ = reply.send(result);
             }
             ActorCommand::FileAccept {
@@ -4953,6 +5119,79 @@ impl Actor {
         Ok(())
     }
 
+    /// Either side: offers this node's own clipboard file list to `label`
+    /// (docs/bugs/14-clipboard-files.md #2).
+    ///
+    /// Nothing is read here. The clipboard read happens on its own dedicated
+    /// thread and the per-file stat pass on its own task, exactly like
+    /// [`Self::on_file_offer`]'s hash pass — this call only checks
+    /// permission and starts that task (ADR 0027).
+    fn on_file_offer_clipboard(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.may_transfer_files(&peer) {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        if !self.speaks_clipboard_files.contains(&peer) {
+            return Err(ActorError::Unsupported);
+        }
+        let clipboard = self.clipboard_worker.clone();
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        tokio::spawn(async move {
+            let Some(paths) = clipboard.read_files().await else {
+                tracing::debug!(peer = %tag, "no files on the local clipboard to offer");
+                return;
+            };
+            let mut files = Vec::new();
+            let mut kept_paths = Vec::new();
+            for path in paths {
+                match stat_offer(&path).await {
+                    Ok((name, size)) => {
+                        files.push(ClipboardFileEntry { name, size });
+                        kept_paths.push(path);
+                    }
+                    Err(error) => {
+                        // The path is this machine's own and stays out of
+                        // the log, like every other file name (§15).
+                        tracing::debug!(peer = %tag, %error, "a clipboard entry could not be offered");
+                    }
+                }
+            }
+            if files.is_empty() {
+                return;
+            }
+            let _ = events
+                .send(ActorEvent::ClipboardFilesRead {
+                    peer,
+                    files,
+                    paths: kept_paths,
+                })
+                .await;
+        });
+        Ok(())
+    }
+
+    /// This node's own clipboard file list finished being read and measured,
+    /// and can now be announced (docs/bugs/14-clipboard-files.md #2).
+    fn on_clipboard_files_read(
+        &mut self,
+        peer: NodeId,
+        files: Vec<ClipboardFileEntry>,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        // Re-checked rather than assumed: the clipboard read and the stat
+        // pass both take real time, long enough for a revoke to land.
+        if !self.may_transfer_files(&peer) || !self.speaks_clipboard_files.contains(&peer) {
+            tracing::warn!(peer = %self.label_of(&peer), "dropping a read clipboard file list");
+            return;
+        }
+        let queue = self.clipboard_offers_out.entry(peer).or_default();
+        queue.extend(paths);
+        self.send_to(&peer, MessageKind::ClipboardFileOffer { files });
+        self.audit_file(&peer, "clipboard-offer-sent");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
     /// Offers to `peer` that are either being hashed or already announced.
     fn outstanding_offers(&self, peer: &NodeId) -> usize {
         self.file_offers_out.get(peer).map_or(0, VecDeque::len)
@@ -4971,6 +5210,22 @@ impl Actor {
             .get_mut(&peer)
             .and_then(VecDeque::pop_front)
             .ok_or(ActorError::UnknownPeer)?;
+        match offer {
+            IncomingOffer::Direct(offer) => {
+                self.on_direct_offer_accept(peer, offer, accept, directory)
+            }
+            IncomingOffer::Clipboard(entry) => self.on_clipboard_offer_accept(peer, entry, accept),
+        }
+    }
+
+    /// Answers one offer that arrived through the peer's file picker (§9.2).
+    fn on_direct_offer_accept(
+        &mut self,
+        peer: NodeId,
+        offer: PendingOffer,
+        accept: bool,
+        directory: Option<String>,
+    ) -> Result<(), ActorError> {
         if !accept {
             // §4: a refused offer opens nothing at all. There is no
             // connection to tear down afterwards because there never was one.
@@ -4993,14 +5248,64 @@ impl Actor {
             .push_back(AcceptedOffer {
                 name: offer.name,
                 size: offer.size,
-                hash: offer.hash,
+                hash: Some(offer.hash),
                 destination,
+                from_clipboard: false,
             });
         self.send_to(&peer, MessageKind::FileAccept(true));
         self.audit_file(&peer, "offer-accepted");
         // The receiving side opens the connection when it is the guest; a
         // host has no address to dial and waits for the guest's (§4, ADR
         // 0026). Either way this is the first moment `rd/file/1` may exist.
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+        Ok(())
+    }
+
+    /// Answers one entry of the peer's last `ClipboardFileOffer` (docs/bugs/
+    /// 14-clipboard-files.md #3).
+    ///
+    /// The receiving user's directory picker never runs for this path: a
+    /// clipboard receive always lands in this node's own clipboard-receive
+    /// directory, so a paste actually has something to point at
+    /// (`crate::config::clipboard_files_dir`). Accepting is this session's
+    /// one human decision; everything after — measuring, hashing, chunking —
+    /// is the existing engine, unchanged.
+    fn on_clipboard_offer_accept(
+        &mut self,
+        peer: NodeId,
+        entry: ClipboardFileEntry,
+        accept: bool,
+    ) -> Result<(), ActorError> {
+        if !accept {
+            self.send_to(&peer, MessageKind::ClipboardFileAccept(false));
+            self.audit_file(&peer, "clipboard-offer-declined");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return Ok(());
+        }
+        if !self.may_transfer_files(&peer) {
+            self.send_to(&peer, MessageKind::ClipboardFileAccept(false));
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        let tag = self.label_of(&peer);
+        let base = crate::config::clipboard_files_dir()
+            .ok_or_else(|| ActorError::Net(NetError::Io("no data directory".to_owned())))?;
+        let directory = base.join(&tag);
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| ActorError::Net(NetError::Io(error.to_string())))?;
+        let destination = unique_destination(&directory, &entry.name);
+        self.file_accepted
+            .entry(peer)
+            .or_default()
+            .push_back(AcceptedOffer {
+                name: entry.name,
+                size: entry.size,
+                hash: None,
+                destination,
+                from_clipboard: true,
+            });
+        self.send_to(&peer, MessageKind::ClipboardFileAccept(true));
+        self.audit_file(&peer, "clipboard-offer-accepted");
         self.ensure_file_connection(peer);
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
         Ok(())
@@ -5050,8 +5355,9 @@ impl Actor {
             for offer in queue {
                 offers.push(OfferRow {
                     peer_label: peer_label.clone(),
-                    name: offer.name.clone(),
-                    size: offer.size,
+                    name: offer.name().to_owned(),
+                    size: offer.size(),
+                    from_clipboard: matches!(offer, IncomingOffer::Clipboard(_)),
                 });
             }
         }
@@ -5224,6 +5530,20 @@ impl Actor {
             FileEvent::Connected { peer, connection } => self.on_file_connected(peer, *connection),
             FileEvent::Progress { peer, id, moved } => self.on_file_progress(peer, id, moved),
             FileEvent::Finished { peer, id, state } => self.on_file_finished(peer, id, state),
+            FileEvent::ClipboardTransferReady {
+                peer,
+                path,
+                name,
+                size,
+                hash,
+            } => self.on_clipboard_transfer_ready(peer, path, name, size, hash),
+            FileEvent::ClipboardPrepareFailed { peer } => {
+                tracing::warn!(
+                    peer = %self.label_of(&peer),
+                    "a clipboard file could not be prepared after acceptance"
+                );
+                let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            }
         }
     }
 
@@ -5327,6 +5647,16 @@ impl Actor {
             row.moved = size;
         }
         self.file_send_tasks.remove(&(peer, id));
+        // A verified, on-disk clipboard receive is put back on this
+        // machine's own clipboard, so the paste it exists to serve actually
+        // works (docs/bugs/14-clipboard-files.md #3).
+        if let Some((destination, from_clipboard)) =
+            self.file_receive_destinations.remove(&(peer, id))
+            && from_clipboard
+            && state == TransferState::Completed
+        {
+            self.clipboard_worker.write_files(vec![destination]);
+        }
         if incoming {
             match state {
                 // Sent only now: this ack means "verified and on disk", which
@@ -5383,7 +5713,7 @@ impl Actor {
             self.send_to(&peer, MessageKind::FileAccept(false));
             return;
         }
-        queue.push_back(PendingOffer { name, size, hash });
+        queue.push_back(IncomingOffer::Direct(PendingOffer { name, size, hash }));
         self.audit_file(&peer, "offer-received");
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
@@ -5428,6 +5758,7 @@ impl Actor {
                 moved: 0,
                 incoming: false,
                 state: TransferState::Running,
+                from_clipboard: false,
             },
         );
         self.file_pending_sends
@@ -5470,8 +5801,15 @@ impl Actor {
         // This is why the start restates the offer: without it the id would
         // mean "whichever offer we both believe was accepted last", and a
         // sender could start a different file under an answer given for this
-        // one.
-        if accepted.name != name || accepted.size != size || accepted.hash != hash {
+        // one. A clipboard-sourced accept carries no hash to check here — it
+        // had not been computed yet when the human agreed to it (docs/bugs/
+        // 14-clipboard-files.md #2) — so that half of the check is skipped
+        // for exactly that case; `ReceiveTracker::finish` still verifies the
+        // real bytes against the hash this message carries, regardless.
+        if accepted.name != name
+            || accepted.size != size
+            || accepted.hash.is_some_and(|expected| expected != hash)
+        {
             tracing::warn!(peer = %tag, "a transfer start that does not describe the accepted offer");
             self.send_to(&peer, MessageKind::FileAbort { transfer_id });
             return;
@@ -5486,11 +5824,16 @@ impl Actor {
                 moved: 0,
                 incoming: true,
                 state: TransferState::Running,
+                from_clipboard: accepted.from_clipboard,
             },
         );
         let channel = self.file_channel(peer);
         let events = self.events_tx.clone();
         let destination = accepted.destination;
+        self.file_receive_destinations.insert(
+            (peer, transfer_id),
+            (destination.clone(), accepted.from_clipboard),
+        );
         tokio::spawn(async move {
             let mut inbox = channel.inbox.lock().await;
             if let Err(error) = inbox.tracker.begin_with(transfer_id, size) {
@@ -5538,6 +5881,145 @@ impl Actor {
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
 
+    /// Inbound `ClipboardFileOffer`: the peer's clipboard holds these files
+    /// (docs/bugs/14-clipboard-files.md #2). Each entry is queued exactly
+    /// like an ordinary `FileOffer`, tagged so the panel can say where it
+    /// came from — the same grant, the same queue, the same FIFO answer
+    /// order.
+    fn on_clipboard_file_offer_inbound(&mut self, peer: NodeId, files: &[ClipboardFileEntry]) {
+        let tag = self.label_of(&peer);
+        if !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %tag, "a clipboard file offer without a grant; declined");
+            self.send_to(&peer, MessageKind::ClipboardFileAccept(false));
+            return;
+        }
+        let queue = self.file_offers_in.entry(peer).or_default();
+        let mut accepted_any = false;
+        for entry in files {
+            if queue.len() >= MAX_PENDING_FILE_OFFERS {
+                tracing::warn!(peer = %tag, "declining a clipboard entry past the pending limit");
+                break;
+            }
+            let Some(name) = safe_file_name(&entry.name) else {
+                tracing::warn!(
+                    peer = %tag,
+                    "a clipboard file entry whose name is not a plain basename; skipped"
+                );
+                continue;
+            };
+            queue.push_back(IncomingOffer::Clipboard(ClipboardFileEntry {
+                name,
+                size: entry.size,
+            }));
+            accepted_any = true;
+        }
+        if accepted_any {
+            self.audit_file(&peer, "clipboard-offer-received");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+        }
+    }
+
+    /// Inbound `ClipboardFileAccept`: the peer answered the oldest entry of
+    /// this node's last `ClipboardFileOffer` (docs/bugs/
+    /// 14-clipboard-files.md #2).
+    ///
+    /// A decline ends here. An accept is the receiver's one human decision;
+    /// everything after runs on its own task exactly like an ordinary offer
+    /// does (ADR 0027) and lands as [`FileEvent::ClipboardTransferReady`],
+    /// which starts the transfer without asking again.
+    fn on_clipboard_file_accept_inbound(&mut self, peer: NodeId, accepted: bool) {
+        let tag = self.label_of(&peer);
+        let Some(path) = self
+            .clipboard_offers_out
+            .get_mut(&peer)
+            .and_then(VecDeque::pop_front)
+        else {
+            tracing::warn!(peer = %tag, "a clipboard file answer with no offer outstanding");
+            return;
+        };
+        if !accepted {
+            self.audit_file(&peer, "clipboard-offer-refused");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return;
+        }
+        if !self.may_transfer_files(&peer) {
+            return;
+        }
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let event = match prepare_offer(&path).await {
+                Ok((name, size, hash)) => FileEvent::ClipboardTransferReady {
+                    peer,
+                    path,
+                    name,
+                    size,
+                    hash,
+                },
+                Err(error) => {
+                    // The path is this machine's own and stays out of the
+                    // log, like every other file name (§15).
+                    tracing::warn!(peer = %tag, %error, "an accepted clipboard file could not be prepared");
+                    FileEvent::ClipboardPrepareFailed { peer }
+                }
+            };
+            let _ = events.send(ActorEvent::File(event)).await;
+        });
+    }
+
+    /// A file accepted through `ClipboardFileAccept` finished measuring and
+    /// hashing and can start (docs/bugs/14-clipboard-files.md #2).
+    ///
+    /// The tail of this mirrors [`Self::on_file_accept_inbound`] exactly,
+    /// from the point an ordinary offer's acceptance is known: allocate the
+    /// id, announce `FileTransferStart`, queue the send. What is missing on
+    /// purpose is the `FileOffer`/`FileAccept` round trip in front of it —
+    /// the human already answered, when they accepted the clipboard entry.
+    fn on_clipboard_transfer_ready(
+        &mut self,
+        peer: NodeId,
+        path: std::path::PathBuf,
+        name: String,
+        size: u64,
+        hash: [u8; 32],
+    ) {
+        if !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %self.label_of(&peer), "dropping a prepared clipboard transfer");
+            return;
+        }
+        let tag = self.label_of(&peer);
+        let id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        self.send_to(
+            &peer,
+            MessageKind::FileTransferStart {
+                transfer_id: id,
+                name: name.clone(),
+                size,
+                hash,
+            },
+        );
+        self.file_transfers.insert(
+            (peer, id),
+            TransferRow {
+                peer_label: tag,
+                transfer_id: id,
+                name,
+                size,
+                moved: 0,
+                incoming: false,
+                state: TransferState::Running,
+                from_clipboard: true,
+            },
+        );
+        self.file_pending_sends
+            .entry(peer)
+            .or_default()
+            .push(SendJob { id, path, from: 0 });
+        self.ensure_file_connection(peer);
+        self.audit_file(&peer, "clipboard-transfer-started");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
     /// Inbound `FileChunkAck`: the receiver reports its resume point, and at
     /// the full size, its verified completion (§9.2, §10).
     fn on_file_chunk_ack(&mut self, peer: NodeId, transfer_id: TransferId, offset: u64) {
@@ -5569,6 +6051,7 @@ impl Actor {
     fn drop_file_state(&mut self, peer: NodeId) {
         self.abandon_file_transfers(peer);
         self.speaks_file_transfer.remove(&peer);
+        self.speaks_clipboard_files.remove(&peer);
     }
 
     /// The same teardown, minus the peer's feature advertisement (§8.1).
@@ -5587,6 +6070,9 @@ impl Actor {
         self.file_offers_out.remove(&peer);
         self.file_accepted.remove(&peer);
         self.file_pending_sends.remove(&peer);
+        self.clipboard_offers_out.remove(&peer);
+        self.file_receive_destinations
+            .retain(|(p, _), _| *p != peer);
         self.file_send_tasks.retain(|(p, _), task| {
             if *p == peer {
                 task.abort();
@@ -5607,6 +6093,15 @@ impl Actor {
                     }
                 }
                 inbox.expected.clear();
+            });
+        }
+        // The temp directory this peer's clipboard-file receives landed in,
+        // gone with the session — leftovers from a past session are a leak
+        // (docs/bugs/14-clipboard-files.md #3).
+        if let Some(base) = crate::config::clipboard_files_dir() {
+            let dir = base.join(self.label_of(&peer));
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
             });
         }
     }
@@ -6180,6 +6675,15 @@ impl Actor {
         } else {
             self.speaks_file_transfer.remove(&peer);
         }
+        // Same reasoning for clipboard files: either side may have some, so
+        // the guest needs the same floor `FILE_TRANSFER_MINOR` reads off the
+        // minor rather than a feature string (docs/bugs/
+        // 14-clipboard-files.md #2; ADR 0047).
+        if control.peer_minor() >= CLIPBOARD_FILES_MINOR {
+            self.speaks_clipboard_files.insert(peer);
+        } else {
+            self.speaks_clipboard_files.remove(&peer);
+        }
         // Same reasoning for the receiver reports this node is about to start
         // producing: only the host's minor says whether it can decode one, and
         // sending one it cannot would close the connection over a diagnostic
@@ -6219,6 +6723,33 @@ async fn prepare_offer(path: &std::path::Path) -> Result<(String, u64, [u8; 32])
         .ok_or_else(|| NetError::Io("the file has no name that can be offered".to_owned()))?;
     let hash = hash_file(path).await?;
     Ok((name, size, hash))
+}
+
+/// Measures and names one local file for a `ClipboardFileOffer` entry
+/// (docs/bugs/14-clipboard-files.md #2), without hashing it.
+///
+/// A clipboard file list is announced before anyone has agreed to receive
+/// any of it, so hashing every entry up front — a full disk pass each,
+/// exactly what `prepare_offer` does for a file the user already chose to
+/// send — would be a disk pass nobody asked for yet. The hash is computed
+/// once, in `prepare_offer`, only for the specific file the peer accepts.
+async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| NetError::Io(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(NetError::Io("not a regular file".to_owned()));
+    }
+    let size = meta.len();
+    if size > FILE_OFFER_MAX_BYTES {
+        return Err(NetError::Io("over the offer size limit".to_owned()));
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(safe_file_name)
+        .ok_or_else(|| NetError::Io("the file has no name that can be offered".to_owned()))?;
+    Ok((name, size))
 }
 
 /// Picks a path in `directory` for `name` that is not already taken.
@@ -6526,6 +7057,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_STREAM_SCALE),
+        speaks_clipboard_files: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_CLIPBOARD_FILES),
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -6619,6 +7154,7 @@ async fn connect_once(
     let features = vec![
         FEATURE_MEDIA_UNAVAILABLE.to_owned(),
         FEATURE_FILE_TRANSFER.to_owned(),
+        FEATURE_CLIPBOARD_FILES.to_owned(),
         FEATURE_UNATTENDED.to_owned(),
         FEATURE_RECEIVER_REPORT.to_owned(),
         FEATURE_CURSOR_SHAPE.to_owned(),
@@ -6971,6 +7507,13 @@ pub fn spawn_actor_with(
     // user copied while it was busy.
     let (clipboard_tx, clipboard_changes) = mpsc::channel(4);
     let clipboard_worker = crate::clipboard_os::spawn(clipboard, clipboard_tx);
+    // Files a past run received through the clipboard path and never got to
+    // clean up (a crash, a kill) are a leak, not something to keep serving
+    // (docs/bugs/14-clipboard-files.md #3). Swept once, here, rather than on
+    // every session end, which already removes its own peer's subdirectory.
+    if let Some(dir) = crate::config::clipboard_files_dir() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
@@ -7017,6 +7560,8 @@ pub fn spawn_actor_with(
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
         speaks_file_transfer: std::collections::HashSet::new(),
+        speaks_clipboard_files: std::collections::HashSet::new(),
+        clipboard_offers_out: std::collections::HashMap::new(),
         file_conns: std::collections::HashMap::new(),
         file_dialing: std::collections::HashSet::new(),
         file_offers_out: std::collections::HashMap::new(),
@@ -7025,6 +7570,7 @@ pub fn spawn_actor_with(
         file_channels: std::collections::HashMap::new(),
         file_pending_sends: std::collections::HashMap::new(),
         file_transfers: std::collections::HashMap::new(),
+        file_receive_destinations: std::collections::HashMap::new(),
         file_send_tasks: std::collections::HashMap::new(),
         next_transfer_id: 0,
         clipboard: std::collections::HashMap::new(),
@@ -7349,6 +7895,15 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .text = Some(text.to_owned());
+    }
+
+    /// docs/bugs/14-clipboard-files.md #1: puts a file list on a test
+    /// clipboard, the same seam a real platform read goes through.
+    fn set_clipboard_files(state: &SharedTestClipboard, paths: &[std::path::PathBuf]) {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files = Some(paths.to_vec());
     }
 
     /// Brings up a host and a guest with a live `ViewOnly` session, and
@@ -7812,6 +8367,74 @@ mod tests {
             0,
             "a declined offer wrote something"
         );
+    }
+
+    /// docs/bugs/14-clipboard-files.md #4 (ADR 0047): files through the
+    /// clipboard run under `file_transfer` alone, never under
+    /// `clipboard_read`/`clipboard_write`. A host that turns both clipboard
+    /// grants on but leaves `file_transfer` off must still refuse a
+    /// clipboard file offer — proved over two real actors and a real
+    /// connection, not by reasoning about the grant check in isolation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_files_need_file_transfer_not_the_clipboard_grants() {
+        let scratch = Scratch::new("clipboard-grant");
+        let source = scratch.join("photo.png");
+        std::fs::write(&source, b"not a real image, just bytes").unwrap();
+
+        let pair = clipboard_pair().await;
+        // Both clipboard grants on, `file_transfer` conspicuously left off.
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardRead,
+                true,
+            )
+            .await
+            .unwrap();
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+
+        set_clipboard_files(&pair.guest_clipboard, std::slice::from_ref(&source));
+        pair.guest
+            .file_offer_clipboard(pair.host_label.clone())
+            .await
+            .unwrap();
+
+        a_few_poll_rounds().await;
+        assert!(
+            pair.host.file_transfers().await.unwrap().offers.is_empty(),
+            "clipboard grants alone let a clipboard file offer through"
+        );
+
+        // The positive control: the same offer succeeds once `file_transfer`
+        // is the grant that is actually on, which is what proves the
+        // refusal above was the grant check and not, say, a feature
+        // negotiation that silently never happened.
+        pair.host
+            .set_grant(pair.guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        pair.guest
+            .file_offer_clipboard(pair.host_label)
+            .await
+            .unwrap();
+        wait_for_files(
+            &pair.host,
+            "the clipboard offer never arrived once file_transfer was on",
+            |files| {
+                files
+                    .offers
+                    .iter()
+                    .any(|row| row.name == "photo.png" && row.from_clipboard)
+            },
+        )
+        .await;
     }
 
     /// §8.1 applied to §9.2: a granted session is not a licence to read the

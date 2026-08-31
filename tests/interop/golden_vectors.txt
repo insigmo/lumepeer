@@ -116,3 +116,13 @@ valid minor6_receiver_report_congested abababababababababababababababab010125e80
 valid minor7_stream_scale_request_min abababababababababababababababab0100263200
 valid minor7_stream_scale_request_max abababababababababababababababab0100266400
 invalid minor7_stream_scale_request_below_floor abababababababababababababababab0100263100
+
+# --- Frozen for PROTOCOL_MINOR 8: "these files are on my clipboard"
+# (docs/bugs/14-clipboard-files.md; ADR 0047). Either side may send the
+# offer — the entries carry a name and a size, never a path — and only a
+# peer whose Hello advertised the "clipboard-files" feature string ever
+# receives one. The accept is a bare bool, like FileAccept: it answers the
+# oldest outstanding entry, and the file itself still moves only through
+# the existing FileOffer/FileTransferStart path on rd/file/1.
+valid minor8_clipboard_file_offer_two_entries abababababababababababababababab010027020a7265706f72742e70646680200970686f746f2e706e67a0cb980100
+valid minor8_clipboard_file_accept_true abababababababababababababababab0001280100

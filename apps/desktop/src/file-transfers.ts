@@ -24,6 +24,9 @@ export interface OfferRow {
   peer_label: string;
   name: string;
   size: number;
+  /** Whether this offer came from the peer's clipboard rather than its file
+   *  picker (docs/bugs/14-clipboard-files.md #1, #3). */
+  from_clipboard: boolean;
 }
 
 /** One transfer running or recently ended. */
@@ -35,6 +38,9 @@ export interface TransferRow {
   moved: number;
   incoming: boolean;
   state: TransferState;
+  /** Whether this transfer started from the peer's clipboard (docs/bugs/
+   *  14-clipboard-files.md #3). */
+  from_clipboard: boolean;
 }
 
 /** What `file_transfers` returns in one poll. */
@@ -46,7 +52,8 @@ export interface FileTransfers {
 /** How this panel talks to Tauri; injectable so the logic is testable. */
 export interface FileCommands {
   offer(peer: string): Promise<void>;
-  accept(peer: string, accept: boolean): Promise<void>;
+  offerClipboard(peer: string): Promise<void>;
+  accept(peer: string, accept: boolean, fromClipboard: boolean): Promise<void>;
   abort(peer: string, transferId: number): Promise<void>;
   list(): Promise<FileTransfers>;
 }
@@ -57,9 +64,15 @@ export const tauriFileCommands: FileCommands = {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('file_offer', { peer });
   },
-  async accept(peer, accept) {
+  async offerClipboard(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('file_accept', { args: { peer, accept } });
+    return invoke('file_offer_clipboard', { peer });
+  },
+  async accept(peer, accept, fromClipboard) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('file_accept', {
+      args: { peer, accept, from_clipboard: fromClipboard },
+    });
   },
   async abort(peer, transferId) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -124,8 +137,8 @@ export function fileTransferPanel(
   const offers = data.offers.filter((offer) => offer.peer_label === peer);
   const transfers = data.transfers.filter((row) => row.peer_label === peer);
 
-  const answer = (accept: boolean): void => {
-    void commands.accept(peer, accept).then(onChange, (error: unknown) => {
+  const answer = (accept: boolean, fromClipboard: boolean): void => {
+    void commands.accept(peer, accept, fromClipboard).then(onChange, (error: unknown) => {
       console.error('file_accept failed:', error);
       onChange();
     });
@@ -149,6 +162,20 @@ export function fileTransferPanel(
         >
           ${t(locale, 'files.send')}
         </button>
+        <button
+          type="button"
+          class="file-send-clipboard-btn"
+          data-testid="file-send-clipboard"
+          aria-label=${`${t(locale, 'files.sendClipboard')}: ${peer}`}
+          @click=${() => {
+            void commands.offerClipboard(peer).then(onChange, (error: unknown) => {
+              console.error('file_offer_clipboard failed:', error);
+              onChange();
+            });
+          }}
+        >
+          ${t(locale, 'files.sendClipboard')}
+        </button>
       </div>
       ${offers.length === 0
         ? ''
@@ -159,11 +186,16 @@ export function fileTransferPanel(
                   <li data-testid="file-offer">
                     <span class="file-name">${offer.name}</span>
                     <span class="file-size">${formatSize(offer.size)}</span>
+                    ${offer.from_clipboard
+                      ? html`<span class="file-clipboard-tag" data-testid="file-clipboard-tag"
+                          >${t(locale, 'files.fromClipboard')}</span
+                        >`
+                      : ''}
                     <button
                       type="button"
                       data-testid="file-accept"
                       aria-label=${`${t(locale, 'files.accept')}: ${offer.name}`}
-                      @click=${() => answer(true)}
+                      @click=${() => answer(true, offer.from_clipboard)}
                     >
                       ${t(locale, 'files.accept')}
                     </button>
@@ -171,7 +203,7 @@ export function fileTransferPanel(
                       type="button"
                       data-testid="file-decline"
                       aria-label=${`${t(locale, 'files.decline')}: ${offer.name}`}
-                      @click=${() => answer(false)}
+                      @click=${() => answer(false, offer.from_clipboard)}
                     >
                       ${t(locale, 'files.decline')}
                     </button>
@@ -192,6 +224,11 @@ export function fileTransferPanel(
                     >
                     <span class="file-name">${row.name}</span>
                     <span class="file-size">${formatSize(row.size)}</span>
+                    ${row.from_clipboard
+                      ? html`<span class="file-clipboard-tag" data-testid="file-clipboard-tag"
+                          >${t(locale, 'files.fromClipboard')}</span
+                        >`
+                      : ''}
                     ${row.state === 'running'
                       ? html`
                           <progress
