@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::Role;
 use crate::constants::{
-    CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES,
-    MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
-    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES,
+    FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+    STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -85,7 +85,17 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// host whose `HelloAck` minor is at least this one, and a host only reads it
 /// from a guest whose `Hello` advertised [`FEATURE_RECEIVER_REPORT`]. See
 /// `docs/adr/0037-receiver-reports-and-the-degradation-ladder.md`.
-pub const PROTOCOL_MINOR: u16 = 6;
+///
+/// 7: appended [`MessageKind::StreamScaleRequest`] after `ReceiverReport`.
+/// The host-side downscale mechanism of ADR 0018 and the adaptive ladder of
+/// ADR 0037 already existed in full; nothing let a guest ask for a picture
+/// smaller than its own screen wants. A guest sends it only to a host whose
+/// `HelloAck` minor is at least this one, and a host only reads it from a
+/// guest whose `Hello` advertised [`FEATURE_STREAM_SCALE`] — the same shape
+/// [`FEATURE_RECEIVER_REPORT`] uses, since this is also a guest-to-host
+/// message and `HelloAck` carries no feature list of its own. See
+/// `docs/bugs/13-stream-resolution.md` and `docs/bugs/DECISIONS.md` D7.
+pub const PROTOCOL_MINOR: u16 = 7;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -156,6 +166,17 @@ pub const FEATURE_RECEIVER_REPORT: &str = "receiver-report";
 /// `CursorShape` at all, which is what tells the guest to keep its own overlay
 /// off: two cursors are worse than one that lags.
 pub const FEATURE_CURSOR_SHAPE: &str = "cursor-shape";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::StreamScaleRequest`], and therefore that this host may read
+/// one from it as an authorized ceiling rather than an unknown discriminant
+/// (D7, docs/bugs/13-stream-resolution.md).
+///
+/// Same compatibility shape as [`FEATURE_RECEIVER_REPORT`]: this is a
+/// guest-to-host message, so it is the *guest* that advertises the string in
+/// its own `Hello`, and the host reads it off that — `HelloAck` carries no
+/// feature list for the guest to read the other way.
+pub const FEATURE_STREAM_SCALE: &str = "stream-scale";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -470,6 +491,25 @@ pub enum MessageKind {
         /// Media bytes that arrived in the window, as kilobits per second.
         goodput_kbps: u32,
     },
+    /// Guest to host: cap the picture at `scale_percent` of the host's own
+    /// captured size (§11; D7, docs/bugs/13-stream-resolution.md). New in
+    /// minor 7.
+    ///
+    /// A ceiling, not a target: the host's adaptive controller (ADR 0037)
+    /// stays free to sit below it when the link cannot carry it, and stays
+    /// free to recover only up to it, never past it. Sent only towards a host
+    /// that speaks minor 7, and read only from a guest whose `Hello`
+    /// advertised [`FEATURE_STREAM_SCALE`].
+    ///
+    /// Bounded here, on decode, because a static range is exactly what §9.1
+    /// exists to check before anything downstream believes an untrusted
+    /// peer's number: `ABR_MIN_SCALE_PERCENT` is the floor below which text
+    /// stops being readable, and `STREAM_SCALE_MAX_PERCENT` is simply the
+    /// whole picture.
+    StreamScaleRequest {
+        /// Requested ceiling, `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT`.
+        scale_percent: u32,
+    },
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -697,6 +737,16 @@ impl MessageEnvelope {
                     return Err(CoreError::Malformed);
                 }
             }
+            // A guest's manual ceiling is a claim from an untrusted peer
+            // (§9.1), and the range is static — unlike `MonitorSelect`,
+            // which can only be checked against a host's own runtime monitor
+            // count — so it is checked here rather than at the point of use.
+            MessageKind::StreamScaleRequest { scale_percent }
+                if *scale_percent < ABR_MIN_SCALE_PERCENT
+                    || *scale_percent > STREAM_SCALE_MAX_PERCENT =>
+            {
+                return Err(CoreError::Malformed);
+            }
             _ => {}
         }
         Ok(())
@@ -872,6 +922,11 @@ mod tests {
             }),
             37,
             "the minor-6 kind must be appended after FileTransferStart"
+        );
+        assert_eq!(
+            kind_byte(MessageKind::StreamScaleRequest { scale_percent: 100 }),
+            38,
+            "the minor-7 kind must be appended after ReceiverReport"
         );
     }
 
@@ -1238,5 +1293,33 @@ mod tests {
             MessageEnvelope::decode(&oversized.encode().unwrap()),
             Err(CoreError::Malformed)
         ));
+    }
+
+    /// D7, docs/bugs/13-stream-resolution.md task 1: the range is
+    /// `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT`, inclusive on both
+    /// ends, and a guest's claim outside it is malformed rather than an index
+    /// or an allocation trusted from an unauthenticated field.
+    #[test]
+    fn a_stream_scale_request_roundtrips_within_its_range_and_is_malformed_outside_it() {
+        for scale_percent in [ABR_MIN_SCALE_PERCENT, 75, STREAM_SCALE_MAX_PERCENT] {
+            let original = envelope(MessageKind::StreamScaleRequest { scale_percent });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for scale_percent in [
+            0,
+            ABR_MIN_SCALE_PERCENT - 1,
+            STREAM_SCALE_MAX_PERCENT + 1,
+            u32::MAX,
+        ] {
+            let bytes = envelope(MessageKind::StreamScaleRequest { scale_percent })
+                .encode()
+                .unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "scale_percent {scale_percent} outside the range was accepted"
+            );
+        }
     }
 }

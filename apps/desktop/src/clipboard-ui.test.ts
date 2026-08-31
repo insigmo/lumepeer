@@ -127,6 +127,7 @@ describe("the guest toolbar's clipboard indicator", () => {
       sasAvailable: vi.fn().mockResolvedValue(true),
       monitorsList: vi.fn().mockResolvedValue([]),
       monitorSelect: vi.fn().mockResolvedValue(undefined),
+      viewSetScale: vi.fn().mockResolvedValue(undefined),
     };
   }
 
@@ -142,6 +143,7 @@ describe("the guest toolbar's clipboard indicator", () => {
       askToRecord: () => {},
       sendFile: () => {},
       pickMonitor: () => {},
+      pickResolution: () => {},
       beginDrag: () => {},
       nudge: () => {},
     });

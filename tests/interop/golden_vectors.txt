@@ -104,3 +104,15 @@ invalid minor4_unattended_auth_overlong_code abababababababababababababababab010
 # --- malformed frame that tears the session down (§9.1).
 valid minor6_receiver_report_clean abababababababababababababababab010025002ab81700
 valid minor6_receiver_report_congested abababababababababababababababab010125e807fa01ac0200
+
+# --- Frozen for PROTOCOL_MINOR 7: the guest asking the host to cap the
+# --- picture at a ceiling percentage of its own captured size (D7,
+# --- docs/bugs/13-stream-resolution.md). Guest to host only, and only
+# --- towards a host that speaks minor 7; a host reads it only from a guest
+# --- whose Hello advertised the "stream-scale" feature string. The range is
+# --- checked while decoding: ABR_MIN_SCALE_PERCENT is the floor below which
+# --- text stops being readable, and STREAM_SCALE_MAX_PERCENT is simply the
+# --- whole picture.
+valid minor7_stream_scale_request_min abababababababababababababababab0100263200
+valid minor7_stream_scale_request_max abababababababababababababababab0100266400
+invalid minor7_stream_scale_request_below_floor abababababababababababababababab0100263100
