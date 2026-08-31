@@ -42,12 +42,12 @@ function fakeCommands(): ToolbarCommands & {
   sasAvailable: ReturnType<typeof vi.fn>;
   monitorsList: ReturnType<typeof vi.fn>;
   monitorSelect: ReturnType<typeof vi.fn>;
-  clipboardPush: ReturnType<typeof vi.fn>;
+  clipboardPull: ReturnType<typeof vi.fn>;
   fileOffer: ReturnType<typeof vi.fn>;
 } {
   const commands = {
     micToggle: vi.fn().mockResolvedValue(undefined),
-    clipboardPush: vi.fn().mockResolvedValue(undefined),
+    clipboardPull: vi.fn().mockResolvedValue(null),
     fileOffer: vi.fn().mockResolvedValue(undefined),
     sasRequest: vi.fn().mockResolvedValue(undefined),
     recordRequest: vi.fn().mockResolvedValue(undefined),
@@ -131,7 +131,6 @@ function draw(
     toggleMic: () => {},
     sendCad: () => {},
     askToRecord: () => {},
-    sendClipboard: () => {},
     sendFile: () => {},
     pickMonitor: () => {},
     beginDrag: () => {},
