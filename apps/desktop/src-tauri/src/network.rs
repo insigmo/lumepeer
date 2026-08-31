@@ -8144,7 +8144,7 @@ mod tests {
             .await
             .unwrap();
 
-        set_clipboard_files(&pair.guest_clipboard, &[source.clone()]);
+        set_clipboard_files(&pair.guest_clipboard, std::slice::from_ref(&source));
         pair.guest
             .file_offer_clipboard(pair.host_label.clone())
             .await
