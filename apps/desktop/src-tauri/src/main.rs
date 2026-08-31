@@ -256,6 +256,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::sas_available,
         commands::monitor_select,
         commands::monitors_list,
+        commands::view_set_scale,
         commands::recordings_list,
         commands::recording_export,
         commands::audit_list,
