@@ -83,6 +83,14 @@ sha1 = "0.11.0"
 # it never gets a handle on the host's clipboard. `image-data` is off — §9.2
 # is text-only for v1, and the feature pulls in the whole `image` stack.
 arboard = { version = "3", default-features = false }
+# Clipboard file lists (docs/bugs/14-clipboard-files.md #1, #3), which
+# `arboard` does not cover on any platform. Each is the crate `arboard`'s own
+# per-platform text backend already depends on, at the version already
+# resolved for it, so none of these three add a new dependency *version* to
+# `Cargo.lock` (see ADR 0046 and `apps/desktop/src-tauri/src/clipboard_os.rs`).
+clipboard-win = { version = "5", features = ["std"] } # Windows CF_HDROP
+x11-clipboard = "0.9"     # Linux/XWayland text/uri-list, over x11rb 0.13.x
+percent-encoding = "2"    # file:// URI <-> path, shared by the macOS and Linux arms
 x11rb = "0.14.0"          # safe X11 client for the lower-trust Linux capture (§11)
 memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
