@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-view-set-scale"
+description = "Enables the view_set_scale command without any pre-configured scope."
+commands.allow = ["view_set_scale"]
+
+[[permission]]
+identifier = "deny-view-set-scale"
+description = "Denies the view_set_scale command without any pre-configured scope."
+commands.deny = ["view_set_scale"]

@@ -53,6 +53,7 @@ const COMMANDS: &[&str] = &[
     "sas_available",
     "monitor_select",
     "monitors_list",
+    "view_set_scale",
     "recordings_list",
     "recording_export",
     "audit_list",
