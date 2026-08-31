@@ -188,3 +188,51 @@ from the app that installed it is the thing this project must not ship.»
 агента — служба на ней стояла и была `Running` уже на момент начала работы)
 он больше не красит `cargo test --workspace` без причины.
 
+### Ureq 2.x/3.x в `tests/integration/tests/broker.rs`
+
+Найдено при прогоне проверки перед коммитом задачи 1: `cargo clippy
+--workspace --all-targets` и `cargo test --workspace` не собираются вовсе —
+`tests/integration/tests/broker.rs` использует API `ureq` 2.x
+(`ureq::AgentBuilder`, `ureq::Error::Status`, `.into_json()`,
+`RequestBuilder::set`), а `Cargo.lock`/`Cargo.toml` уже закрепляют `ureq
+3.4.0`, чья API несовместима (typestate-билдер, другие варианты `Error`,
+`hyper::Response` вместо старого ответа). Это никак не связано с сервисом:
+проверено, что файл не менялся с коммита `b29fd36`, а `ureq` подняли позже,
+в одном из `fix pipelines`/`chore: release` коммитов, без правки теста.
+
+Из-за этого весь `--workspace` прогон в этой пачке шёл с флагом `--exclude
+lumepeer-integration-tests` — иначе задачу 12 в принципе нельзя закрыть ни на
+одной машине с чистым `master`. Сам файл не тронут; чинить `ureq` — отдельная
+задача, не по этому документу.
+
+### `ci.yml` стейджит только один из двух `externalBin`
+
+`tauri.conf.json`, `bundle.externalBin`, перечисляет два сайдкара:
+`binaries/lumepeer-decoder-worker` и `binaries/lumepeer-service`.
+`tauri-build` (`build.rs`) на этапе компиляции `lumepeer-desktop` требует,
+чтобы **оба** существовали на диске как `binaries/<имя>-<target-triple>.exe`
+— иначе паника `resource path ... doesn't exist`, ещё до clippy/test.
+`.github/workflows/release.yml` копирует туда оба (`for BIN in
+lumepeer-decoder-worker lumepeer-service`), а `.github/workflows/ci.yml`,
+job `build`, — только `lumepeer-decoder-worker`. Похоже, что обычный `cargo
+build --workspace`/`clippy --workspace`/`test --workspace` в этом CI job'е
+должен падать на `lumepeer-service` тем же образом, каким он падал здесь до
+ручного `cargo build -p lumepeer-service` и копирования бинаря в
+`binaries/`. Не проверено на самом GitHub Actions (агент туда не пушил), но
+воспроизведено локально: тот же `build.rs`, та же паника, стейджинг только
+первого сайдкара из списка её не убирает. Не по этому документу —
+`12-service-lifecycle.md` про инсталлятор/деинсталлятор, а не про CI.
+
+### Разовая нестабильность `network::tests::a_remembered_host_can_be_dialed_again_and_still_needs_consent`
+
+Один прогон `cargo test --workspace --exclude lumepeer-integration-tests` (на
+машине, уже нагруженной несколькими параллельными `cargo`/`rustc` от
+верификации этой же пачки) уронил этот тест
+`apps/desktop/src-tauri/src/network.rs` с `Result::unwrap() on an Err value:
+Net(AlreadyConnected)`. Файл `network.rs` в этой пачке не трогался.
+Повторный прогон именно этого теста в изоляции (`--test-threads=1`, без
+конкурентной нагрузки) прошёл зелёным с первого раза. Похоже на состояние
+гонки под нагрузкой между обновлением `connection_history` и очисткой
+`connections` после `revoke` — тест ждёт первое, не дожидаясь второго — а не
+на дефект, специфичный для этой пачки. Не по этому документу; не чинилось.
+
