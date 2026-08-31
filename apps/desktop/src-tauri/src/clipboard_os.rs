@@ -98,11 +98,6 @@ pub trait OsClipboard {
     /// user's own typed text — exactly the allocation-DoS shape §9.1 already
     /// guards against on the wire, applied here to what a foreign process on
     /// this same machine can hand the clipboard.
-    #[allow(
-        dead_code,
-        reason = "consumed by ClipboardWorker::read_files, wired to the actor in \
-                  docs/bugs/14-clipboard-files.md task 3"
-    )]
     fn read_file_paths(&mut self) -> Option<Vec<PathBuf>>;
 
     /// Places `paths` on the clipboard as a file list, so a paste in the
@@ -112,11 +107,6 @@ pub trait OsClipboard {
     /// # Errors
     /// [`ClipboardError`] when the platform has no clipboard or refused the
     /// write.
-    #[allow(
-        dead_code,
-        reason = "consumed by ClipboardWorker::write_files, wired to the actor in \
-                  docs/bugs/14-clipboard-files.md task 3"
-    )]
     fn write_file_paths(&mut self, paths: &[PathBuf]) -> Result<(), ClipboardError>;
 }
 
@@ -212,11 +202,6 @@ impl OsClipboard for ArboardClipboard {
 /// full comparison against a general-purpose alternative.
 #[cfg(target_os = "windows")]
 mod platform {
-    #![allow(
-        dead_code,
-        reason = "wired to ClipboardWorker in docs/bugs/14-clipboard-files.md task 3"
-    )]
-
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
@@ -295,11 +280,6 @@ mod platform {
 /// `arboard`'s own macOS text backend already depends on.
 #[cfg(target_os = "macos")]
 mod platform {
-    #![allow(
-        dead_code,
-        reason = "wired to ClipboardWorker in docs/bugs/14-clipboard-files.md task 3"
-    )]
-
     use std::path::PathBuf;
 
     use lumepeer_core::constants::{
@@ -407,11 +387,6 @@ mod platform {
 /// task does not widen.
 #[cfg(target_os = "linux")]
 mod platform {
-    #![allow(
-        dead_code,
-        reason = "wired to ClipboardWorker in docs/bugs/14-clipboard-files.md task 3"
-    )]
-
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -534,11 +509,6 @@ mod platform {
 /// itself has no backend.
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 mod platform {
-    #![allow(
-        dead_code,
-        reason = "wired to ClipboardWorker in docs/bugs/14-clipboard-files.md task 3"
-    )]
-
     use std::path::PathBuf;
 
     use super::ClipboardError;
@@ -598,12 +568,25 @@ enum ClipboardJob {
     /// Put this text on the local clipboard (a peer's payload, already
     /// validated and authorized).
     Write(String),
+    /// Put this file list on the local clipboard — a completed receive's
+    /// paths, so pasting them actually works (docs/bugs/
+    /// 14-clipboard-files.md #3).
+    WriteFiles(Vec<PathBuf>),
+    /// Read the local clipboard's current file list, if it has one
+    /// (docs/bugs/14-clipboard-files.md #1). Answered on a oneshot rather
+    /// than through `on_change`: this is an on-demand request tied to one
+    /// IPC call, not a continuous watch like text's.
+    ReadFiles(tokio::sync::oneshot::Sender<Option<Vec<PathBuf>>>),
 }
 
 /// The actor's handle on the clipboard thread.
 ///
-/// Dropping it ends the thread: the job channel closes and the loop returns.
-#[derive(Debug)]
+/// Dropping every clone of it ends the thread: the job channel closes and
+/// the loop returns. `Clone` exists so a task spawned off the actor loop —
+/// reading the local clipboard's file list, which is a round trip like any
+/// other clipboard read (docs/bugs/14-clipboard-files.md #1) — can hold its
+/// own handle without borrowing the actor.
+#[derive(Debug, Clone)]
 pub struct ClipboardWorker {
     jobs: std::sync::mpsc::Sender<ClipboardJob>,
     /// Whether any live session currently permits reading this machine's
@@ -623,6 +606,34 @@ impl ClipboardWorker {
         if self.jobs.send(ClipboardJob::Write(text)).is_err() {
             tracing::debug!("the clipboard thread is gone; dropping an inbound payload");
         }
+    }
+
+    /// Asks the clipboard thread to place `paths` on the local clipboard as
+    /// a file list (docs/bugs/14-clipboard-files.md #3).
+    ///
+    /// Fire and forget, for the same reason [`Self::write`] is: a failed
+    /// write is logged by the thread that attempted it, and there is no
+    /// caller waiting on the outcome.
+    pub fn write_files(&self, paths: Vec<PathBuf>) {
+        if self.jobs.send(ClipboardJob::WriteFiles(paths)).is_err() {
+            tracing::debug!("the clipboard thread is gone; dropping a file-list payload");
+        }
+    }
+
+    /// Reads this machine's own clipboard file list, on the dedicated
+    /// thread, exactly once (docs/bugs/14-clipboard-files.md #1).
+    ///
+    /// Unlike text, file lists are not polled continuously: this answers one
+    /// on-demand request (a user action offering the local clipboard's
+    /// files to a peer), so `None` covers both "not files" and "the
+    /// clipboard thread is gone" alike — the caller's response to either is
+    /// the same, offering nothing.
+    pub async fn read_files(&self) -> Option<Vec<PathBuf>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.jobs.send(ClipboardJob::ReadFiles(reply)).is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     /// Turns polling on or off.
@@ -700,6 +711,16 @@ fn run(
                     Ok(()) => seen = Some(text),
                     Err(error) => tracing::debug!(%error, "could not apply a peer's clipboard"),
                 }
+                continue;
+            }
+            Ok(ClipboardJob::WriteFiles(paths)) => {
+                if let Err(error) = clipboard.write_file_paths(&paths) {
+                    tracing::debug!(%error, "could not apply a clipboard file-list payload");
+                }
+                continue;
+            }
+            Ok(ClipboardJob::ReadFiles(reply)) => {
+                let _ = reply.send(clipboard.read_file_paths());
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}

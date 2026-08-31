@@ -27,6 +27,7 @@
     "allow-chat-transcript",
     "allow-clipboard-push",
     "allow-file-offer",
+    "allow-file-offer-clipboard",
     "allow-file-accept",
     "allow-file-abort",
     "allow-file-transfers",

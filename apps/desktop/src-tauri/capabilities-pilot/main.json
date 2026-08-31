@@ -52,6 +52,7 @@
     "allow-clipboard-push",
     "allow-clipboard-pull",
     "allow-file-offer",
+    "allow-file-offer-clipboard",
     "allow-file-accept",
     "allow-file-abort",
     "allow-file-transfers",
