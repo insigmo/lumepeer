@@ -19,8 +19,8 @@ use std::time::Duration;
 use lumepeer_core::CoreError;
 use lumepeer_core::consent::Role;
 use lumepeer_core::constants::{
-    FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, UNATTENDED_CODE_MAX_BYTES,
-    UNATTENDED_PASSWORD_MAX_BYTES,
+    ABR_MIN_SCALE_PERCENT, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
+    STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use lumepeer_core::protocol::{
     CursorShapeData, Direction, MessageEnvelope, MessageKind, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -323,6 +323,88 @@ async fn credentials_exactly_at_their_bounds_are_ordinary_traffic() {
     control.connection().close(0u32.into(), b"done");
     guest.close().await;
     host.close().await;
+}
+
+/// D7, docs/bugs/13-stream-resolution.md task 1: a guest's manual scale
+/// ceiling outside `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT` is
+/// refused on a live connection, exactly like an over-limit file message —
+/// the only thing wrong with the frame is a claim from an untrusted peer
+/// that a static range already rules out (§9.1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_scale_request_outside_its_range_is_refused_on_a_live_connection() {
+    for scale_percent in [0, ABR_MIN_SCALE_PERCENT - 1, STREAM_SCALE_MAX_PERCENT + 1] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        control
+            .send(MessageKind::StreamScaleRequest { scale_percent })
+            .await
+            .unwrap();
+
+        let refused = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, NetError::Framing(CoreError::Malformed)),
+            "scale_percent {scale_percent} outside the range was accepted: {refused:?}"
+        );
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
+}
+
+/// The mirror: both ends of the range are ordinary traffic, not a limit that
+/// also refuses the values it is supposed to allow.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_scale_request_at_its_range_bounds_is_ordinary_traffic() {
+    for scale_percent in [ABR_MIN_SCALE_PERCENT, STREAM_SCALE_MAX_PERCENT] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        let at_bound = MessageKind::StreamScaleRequest { scale_percent };
+        control.send(at_bound.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.kind, at_bound);
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
 }
 
 /// §11: a cursor whose geometry contradicts its own pixel buffer is refused
