@@ -42,6 +42,12 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    },
     "linux": {
       "deb": {
         "depends": ["libpipewire-0.3-0"],
