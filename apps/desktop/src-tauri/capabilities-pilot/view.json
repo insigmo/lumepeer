@@ -42,6 +42,7 @@
     "allow-sas-available",
     "allow-monitor-select",
     "allow-monitors-list",
+    "allow-view-set-scale",
     "allow-session-revoke"
   ]
 }

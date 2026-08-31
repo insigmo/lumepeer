@@ -24,15 +24,17 @@ use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
 use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
-    CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
-    DIAL_RETRY_BACKOFF_MS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
+    ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
+    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_MS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
     INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
     MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
+    STREAM_SCALE_MAX_PERCENT,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE,
-    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_UNATTENDED,
-    InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
+    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
+    FEATURE_STREAM_SCALE, FEATURE_UNATTENDED, InputEventPayload, MediaUnavailableReason,
+    MessageKind, MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -76,16 +78,25 @@ const FILE_TRANSFER_MINOR: u16 = 5;
 /// signal, and `HelloAck` carries no feature list for the guest to read.
 const RECEIVER_REPORT_MINOR: u16 = 6;
 
+/// First `PROTOCOL_MINOR` that carries `MessageKind::StreamScaleRequest`, and
+/// therefore the floor for asking a host to cap the picture (D7,
+/// docs/bugs/13-stream-resolution.md).
+///
+/// Guest side only, exactly like [`RECEIVER_REPORT_MINOR`]: a host reads the
+/// guest's `FEATURE_STREAM_SCALE` string instead, which is the more precise
+/// signal, and `HelloAck` carries no feature list for the guest to read.
+const STREAM_SCALE_MINOR: u16 = 7;
+
 /// First `PROTOCOL_MINOR` that carries `MessageKind::ClipboardFileOffer` and
 /// `MessageKind::ClipboardFileAccept`, and therefore the floor for offering
-/// clipboard files to a host (docs/bugs/14-clipboard-files.md #2; ADR 0046).
+/// clipboard files to a host (docs/bugs/14-clipboard-files.md #2; ADR 0047).
 ///
 /// Guest side only, exactly like [`FILE_TRANSFER_MINOR`] — the same
 /// asymmetry, for the same reason: either side may have files on its own
 /// clipboard, so a host reads the guest's `FEATURE_CLIPBOARD_FILES` string
 /// instead of a minor, but the guest has no feature list of the host's to
 /// read.
-const CLIPBOARD_FILES_MINOR: u16 = 7;
+const CLIPBOARD_FILES_MINOR: u16 = 8;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -751,6 +762,13 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<Vec<MonitorInfo>, ActorError>>,
     },
+    /// Guest side: ask the watched host to cap the picture at a percentage of
+    /// its own captured size (§11; D7, docs/bugs/13-stream-resolution.md).
+    StreamScaleRequest {
+        label: String,
+        scale_percent: u32,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
     /// Host side: turn one independent grant of `label`'s session on or off
     /// (§8.2; ADR 0029). Only the host's own main window reaches this.
     SetGrant {
@@ -1370,6 +1388,35 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Guest side: asks the watched host to cap the picture at
+    /// `scale_percent` of its own captured size (§11; D7,
+    /// docs/bugs/13-stream-resolution.md). Nothing comes back on this call
+    /// other than whether the request could be sent — the picture itself
+    /// simply gets smaller once the host applies it.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] for a value outside the
+    /// guest-selectable range; [`ActorError::Unsupported`] towards a host
+    /// that never confirmed it understands the message;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn set_stream_scale(
+        &self,
+        label: String,
+        scale_percent: u32,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::StreamScaleRequest {
+                label,
+                scale_percent,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
     /// Guest side: the watched host's monitors, as it announced them when it
     /// granted this session (§11 `MonitorsList`; ADR 0028).
     ///
@@ -1962,6 +2009,19 @@ struct ReceiverReports {
     to_peer: bool,
 }
 
+/// Whether this build may send `StreamScaleRequest` towards a peer, and
+/// whether it may act on one received from it — the same shape
+/// [`ReceiverReports`] uses, for the same reason (D7,
+/// docs/bugs/13-stream-resolution.md).
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamScaleFeature {
+    /// Host side: the guest advertised [`FEATURE_STREAM_SCALE`].
+    from_peer: bool,
+    /// Guest side: the host answered with a minor of at least
+    /// [`STREAM_SCALE_MINOR`].
+    to_peer: bool,
+}
+
 /// Host side: one running capture/encode loop, plus the connection it writes
 /// on, so a revoke can stop both without waiting for the loop to notice.
 /// `recorder` is the §17 slot the actor swaps a session recorder into; it
@@ -2127,8 +2187,11 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_CURSOR_SHAPE`
         /// (§11), so this host may stop compositing the cursor for it.
         speaks_cursor_shape: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
+        /// docs/bugs/13-stream-resolution.md).
+        speaks_stream_scale: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
-        /// (docs/bugs/14-clipboard-files.md #2; ADR 0046).
+        /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
     },
     /// A live connection delivered a control message.
@@ -2205,8 +2268,11 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_CURSOR_SHAPE`
         /// (§11).
         speaks_cursor_shape: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
+        /// docs/bugs/13-stream-resolution.md).
+        speaks_stream_scale: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
-        /// (docs/bugs/14-clipboard-files.md #2; ADR 0046).
+        /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
@@ -2294,6 +2360,9 @@ struct Actor {
     /// Which side of the `ReceiverReport` exchange each peer can speak
     /// (§9.1; ADR 0037).
     receiver_reports: std::collections::HashMap<NodeId, ReceiverReports>,
+    /// Which side of the `StreamScaleRequest` exchange each peer can speak
+    /// (§9.1; D7, docs/bugs/13-stream-resolution.md).
+    stream_scale: std::collections::HashMap<NodeId, StreamScaleFeature>,
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
@@ -2365,7 +2434,7 @@ struct Actor {
     speaks_file_transfer: std::collections::HashSet<NodeId>,
     /// Whether this peer's `Hello` (host side) or `HelloAck` minor (guest
     /// side) says it understands `ClipboardFileOffer`/`ClipboardFileAccept`
-    /// (docs/bugs/14-clipboard-files.md #2; ADR 0046).
+    /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
     speaks_clipboard_files: std::collections::HashSet<NodeId>,
     /// Local paths behind the entries of this node's last `ClipboardFileOffer`
     /// to a peer, popped one at a time as each `ClipboardFileAccept` answers
@@ -2710,6 +2779,14 @@ impl Actor {
             .is_some_and(|speaks| speaks.to_peer)
     }
 
+    /// Guest side: whether `peer` speaks minor 7 and can decode a
+    /// `StreamScaleRequest` at all (§9.1; D7, docs/bugs/13-stream-resolution.md).
+    fn may_request_scale_to(&self, peer: &NodeId) -> bool {
+        self.stream_scale
+            .get(peer)
+            .is_some_and(|speaks| speaks.to_peer)
+    }
+
     /// Host side: honours a guest's `KeyframeRequest`, at most once per
     /// [`KEYFRAME_MIN_INTERVAL_MS`].
     ///
@@ -2770,6 +2847,46 @@ impl Actor {
                 // guest was measuring.
                 sent_kbps: 0,
             });
+    }
+
+    /// Host side: applies a guest's manual scale ceiling to the picture this
+    /// session's encode loop produces (§11; D7,
+    /// docs/bugs/13-stream-resolution.md task 2).
+    ///
+    /// The range was already checked while decoding (§9.1: a static bound is
+    /// exactly what that check exists for). What is left here is
+    /// authorization, and it is re-checked from scratch rather than trusted
+    /// from the fact that the message arrived at all: a `view` grant revoked
+    /// a moment ago must not be reopened by a message already in flight
+    /// (§2.3), the same rule [`Self::on_monitor_select`] enforces for the
+    /// same reason.
+    fn on_stream_scale_request(&mut self, peer: NodeId, scale_percent: u32) {
+        let tag = self.label_of(&peer);
+        if !self
+            .stream_scale
+            .get(&peer)
+            .is_some_and(|speaks| speaks.from_peer)
+        {
+            tracing::debug!(peer = %tag, "stream scale request from a peer that never advertised one");
+            return;
+        }
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            tracing::warn!(peer = %tag, "stream scale request without a live view grant; ignored");
+            return;
+        }
+        let Some(session) = self.media.get(&peer) else {
+            tracing::debug!(peer = %tag, "stream scale request without a media session; ignored");
+            return;
+        };
+        // A repeated value has nothing new to draw, so it does not spend a
+        // keyframe: task 2.4 asks for one on a *change*, not on every message
+        // a guest happens to send (§11).
+        if session.control.set_manual_cap(Some(scale_percent)) {
+            session.control.request_keyframe();
+        }
     }
 
     /// What every live connection's link actually looks like (§18).
@@ -2852,6 +2969,7 @@ impl Actor {
                     speaks_unattended,
                     speaks_receiver_report,
                     speaks_cursor_shape,
+                    speaks_stream_scale,
                     speaks_clipboard_files,
                 }) => ActorEvent::Handshaked {
                     connection,
@@ -2862,6 +2980,7 @@ impl Actor {
                     speaks_unattended,
                     speaks_receiver_report,
                     speaks_cursor_shape,
+                    speaks_stream_scale,
                     speaks_clipboard_files,
                     ticket: *ticket,
                 },
@@ -2985,12 +3104,16 @@ impl Actor {
                 speaks_unattended,
                 speaks_receiver_report,
                 speaks_cursor_shape,
+                speaks_stream_scale,
                 speaks_clipboard_files,
             } => {
                 // Host side of the exchange: whether this guest's own reports
                 // may be read at all (ADR 0037). The guest side is recorded in
                 // `on_dialed`, from the `HelloAck` minor.
                 self.receiver_reports.entry(peer).or_default().from_peer = speaks_receiver_report;
+                // Same shape, for the manual scale ceiling (D7,
+                // docs/bugs/13-stream-resolution.md).
+                self.stream_scale.entry(peer).or_default().from_peer = speaks_stream_scale;
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
                 } else {
@@ -3343,6 +3466,11 @@ impl Actor {
         );
         self.windows.open(&label, &tag, grants.input);
         self.rebuild_labels_and_snapshot();
+        // A fresh entry in `self.views` is one of the two reasons the
+        // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
+        // now has something worth offering the host it just started
+        // watching.
+        self.refresh_clipboard_watch();
     }
 
     /// Guest side: closes the view window, tears the pipeline down, and
@@ -3374,6 +3502,10 @@ impl Actor {
             self.history.record(host_tag(&peer), state.role, code);
         }
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
+        // The last view closing may be the only reason the watcher was on
+        // (docs/bugs/10-clipboard-auto.md #1): with `self.views` empty and no
+        // host-side `clipboard_read` live, nothing is left to justify it.
+        self.refresh_clipboard_watch();
     }
 
     /// Drops this node's control connection to `peer` outright, citing the
@@ -3799,7 +3931,7 @@ impl Actor {
                 self.cancel_transfer(peer, transfer_id);
             }
             // "These files are on my clipboard" (docs/bugs/
-            // 14-clipboard-files.md #2; ADR 0046). Names and sizes only; the
+            // 14-clipboard-files.md #2; ADR 0047). Names and sizes only; the
             // grant re-check and the queue capacity are identical to an
             // ordinary `FileOffer`, because this is one.
             MessageKind::ClipboardFileOffer { ref files } => {
@@ -3854,6 +3986,12 @@ impl Actor {
                 rtt_ms,
                 goodput_kbps,
             } => self.on_receiver_report(peer, loss_permille, rtt_ms, goodput_kbps),
+            // Host side: the guest asked to cap the picture at a percentage
+            // of this host's own captured size (§11; D7,
+            // docs/bugs/13-stream-resolution.md task 2).
+            MessageKind::StreamScaleRequest { scale_percent } => {
+                self.on_stream_scale_request(peer, scale_percent);
+            }
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
             // Guest side: this host wants credentials rather than a dialog
@@ -4087,6 +4225,7 @@ impl Actor {
         self.reception.remove(&peer);
         self.last_keyframe.remove(&peer);
         self.receiver_reports.remove(&peer);
+        self.stream_scale.remove(&peer);
         // Chat and clipboard state are per-session by design (§15): nothing
         // about a past peer survives its connection here.
         self.chat.drop_transcript(&peer);
@@ -4268,6 +4407,13 @@ impl Actor {
             }
             ActorCommand::MonitorsList { label, reply } => {
                 let _ = reply.send(self.on_announced_monitors(&label));
+            }
+            ActorCommand::StreamScaleRequest {
+                label,
+                scale_percent,
+                reply,
+            } => {
+                let _ = reply.send(self.on_request_stream_scale(&label, scale_percent));
             }
             ActorCommand::SetGrant {
                 label,
@@ -4657,6 +4803,36 @@ impl Actor {
         Ok(())
     }
 
+    /// Guest side: asks the watched host to cap the picture at
+    /// `scale_percent` of its own captured size (§11; D7,
+    /// docs/bugs/13-stream-resolution.md task 3).
+    ///
+    /// The host is the only side that decides what it actually encodes; this
+    /// only keeps a value nothing could ever satisfy, or a message a host
+    /// that never confirmed it understands, off the wire.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] for a value outside
+    /// `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT`;
+    /// [`ActorError::Unsupported`] when the host never answered with a minor
+    /// that carries `MessageKind::StreamScaleRequest`.
+    fn on_request_stream_scale(
+        &mut self,
+        label: &str,
+        scale_percent: u32,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !(ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT).contains(&scale_percent) {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        if !self.may_request_scale_to(&peer) {
+            return Err(ActorError::Unsupported);
+        }
+        self.send_to(&peer, MessageKind::StreamScaleRequest { scale_percent });
+        Ok(())
+    }
+
     /// Host side: announces this host's monitors to `peer`'s guest
     /// (§11 `MonitorsList`; ADR 0028).
     ///
@@ -4788,10 +4964,11 @@ impl Actor {
     /// to a guest is exactly what `clipboard_read` means, and the session has
     /// to hold it. On the guest there is no grant to consult, because a guest
     /// is given none (ADR 0029). What stands in for one is that this path
-    /// runs only from a deliberate press in the guest's own view window: the
-    /// guest's clipboard is the guest's to offer, and whether the host
-    /// *accepts* it is decided on arrival, against `clipboard_write`, by the
-    /// only core entitled to decide it.
+    /// runs only for a host this node currently has an open view onto
+    /// (docs/bugs/10-clipboard-auto.md #1; ADR 0046): the guest's clipboard
+    /// is the guest's to offer, automatically the moment it changes, and
+    /// whether the host *accepts* it is decided on arrival, against
+    /// `clipboard_write`, by the only core entitled to decide it.
     fn on_clipboard_push(&mut self, label: &str, text: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
         let permitted = if self.views.contains_key(&peer) {
@@ -4823,15 +5000,21 @@ impl Actor {
         Ok(())
     }
 
-    /// This desktop's clipboard changed and at least one session is allowed
-    /// to see it (§8.2, §9.2).
+    /// This desktop's clipboard changed and at least one session or view is
+    /// allowed to be offered it (§8.2, §9.2).
     ///
-    /// Only the host side runs a watcher, so every recipient here is a guest
-    /// whose session carries `clipboard_read`. A session that does not carry
-    /// it is skipped without a word: the change is not an error, it simply is
-    /// not that session's to receive.
+    /// Two kinds of recipient, and both run through `on_clipboard_push`,
+    /// which already knows how to authorize each:
+    ///
+    /// - **Host side.** A guest whose session carries `clipboard_read`: a
+    ///   session that does not carry it is skipped without a word, the
+    ///   change is not an error, it simply is not that session's to receive.
+    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). Every host this
+    ///   node currently has an open view onto. There is no grant to check
+    ///   here — this side may always *offer* — so every one of them is a
+    ///   recipient; the host's own core is what decides on arrival.
     fn on_local_clipboard(&mut self, text: &str) {
-        let recipients: Vec<NodeId> = self
+        let mut recipients: Vec<NodeId> = self
             .sessions
             .active()
             .into_iter()
@@ -4841,6 +5024,7 @@ impl Actor {
             })
             .map(|(peer, _, _)| peer)
             .collect();
+        recipients.extend(self.views.keys().copied());
         for peer in recipients {
             let label = self.label_of(&peer);
             if let Err(error) = self.on_clipboard_push(&label, text) {
@@ -5926,15 +6110,30 @@ impl Actor {
     /// currently allow (§8.1 applied to §9.2).
     ///
     /// The rule is the one that keeps capture off when nobody is watching:
-    /// with no session holding `clipboard_read`, this desktop's clipboard is
-    /// not read at all — not read and discarded. Called from every place a
-    /// grant, a session or a connection can change.
+    /// with no session holding `clipboard_read` and no open view of this
+    /// node's own, this desktop's clipboard is not read at all — not read
+    /// and discarded. Called from every place a grant, a session, a view or
+    /// a connection can change.
+    ///
+    /// Two independent reasons can justify the read, and either is enough:
+    ///
+    /// - **Host side.** A session this node granted holds `clipboard_read`,
+    ///   so this desktop's own copies are due to that guest.
+    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). `self.views` is
+    ///   non-empty: this node is watching at least one host, and its own
+    ///   clipboard changes are worth *offering* there the moment they
+    ///   happen — the same offer a manual toolbar press used to make, now
+    ///   made automatically. The host decides on arrival whether to accept
+    ///   it, against its own `clipboard_write`; this side holds no grant to
+    ///   consult (ADR 0029, ADR 0030), so an open view is the only local
+    ///   fact that can gate the read at all.
     fn refresh_clipboard_watch(&self) {
-        let needed = self.sessions.active().into_iter().any(|(peer, _, grants)| {
+        let host_side = self.sessions.active().into_iter().any(|(peer, _, grants)| {
             self.sessions.state(&peer) == SessionState::Active
                 && clip::permits(grants, ClipboardFlow::HostToGuest)
         });
-        self.clipboard_worker.set_watching(needed);
+        let guest_side = !self.views.is_empty();
+        self.clipboard_worker.set_watching(host_side || guest_side);
     }
 
     /// Host side: grants `role` and, if it carries `view`, registers the peer
@@ -6479,7 +6678,7 @@ impl Actor {
         // Same reasoning for clipboard files: either side may have some, so
         // the guest needs the same floor `FILE_TRANSFER_MINOR` reads off the
         // minor rather than a feature string (docs/bugs/
-        // 14-clipboard-files.md #2; ADR 0046).
+        // 14-clipboard-files.md #2; ADR 0047).
         if control.peer_minor() >= CLIPBOARD_FILES_MINOR {
             self.speaks_clipboard_files.insert(peer);
         } else {
@@ -6491,6 +6690,10 @@ impl Actor {
         // (§9.1; ADR 0037).
         self.receiver_reports.entry(peer).or_default().to_peer =
             control.peer_minor() >= RECEIVER_REPORT_MINOR;
+        // Same reasoning for a manual scale ceiling this node might ask for
+        // (D7, docs/bugs/13-stream-resolution.md).
+        self.stream_scale.entry(peer).or_default().to_peer =
+            control.peer_minor() >= STREAM_SCALE_MINOR;
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -6850,6 +7053,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_UNATTENDED),
+        speaks_stream_scale: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_STREAM_SCALE),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -6951,6 +7158,7 @@ async fn connect_once(
         FEATURE_UNATTENDED.to_owned(),
         FEATURE_RECEIVER_REPORT.to_owned(),
         FEATURE_CURSOR_SHAPE.to_owned(),
+        FEATURE_STREAM_SCALE.to_owned(),
     ];
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
@@ -7331,6 +7539,7 @@ pub fn spawn_actor_with(
         reception: std::collections::HashMap::new(),
         last_keyframe: std::collections::HashMap::new(),
         receiver_reports: std::collections::HashMap::new(),
+        stream_scale: std::collections::HashMap::new(),
         speaks_cursor_shape: std::collections::HashSet::new(),
         cursors_tx,
         cursors_rx,
@@ -7904,6 +8113,53 @@ mod tests {
         .await;
     }
 
+    /// D7, docs/bugs/13-stream-resolution.md task 3: a value outside
+    /// `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT` never reaches the
+    /// wire at all — it is refused by this node's own actor, the same shape
+    /// [`the_guest_picks_a_screen_and_the_host_is_the_one_that_moves`] checks
+    /// for an unannounced monitor id.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_scale_request_outside_the_range_never_leaves_this_node() {
+        let (_host, guest, _guest_label, host_label, _host_capture) = session_pair().await;
+
+        for scale_percent in [0, ABR_MIN_SCALE_PERCENT - 1, STREAM_SCALE_MAX_PERCENT + 1] {
+            assert!(
+                matches!(
+                    guest
+                        .set_stream_scale(host_label.clone(), scale_percent)
+                        .await,
+                    Err(ActorError::Core(CoreError::Malformed))
+                ),
+                "scale_percent {scale_percent} outside the range was accepted"
+            );
+        }
+
+        // The bounds themselves are ordinary requests: two builds of the same
+        // software always speak `FEATURE_STREAM_SCALE` to each other, so the
+        // only thing left to refuse is the range.
+        for scale_percent in [ABR_MIN_SCALE_PERCENT, STREAM_SCALE_MAX_PERCENT] {
+            assert!(
+                guest
+                    .set_stream_scale(host_label.clone(), scale_percent)
+                    .await
+                    .is_ok(),
+                "scale_percent {scale_percent} at the bound was refused"
+            );
+        }
+    }
+
+    /// D7, docs/bugs/13-stream-resolution.md task 2: the host is the one that
+    /// decides, and a peer this actor is not watching at all is refused the
+    /// same way an unknown label is refused everywhere else in this file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_scale_request_to_an_unwatched_peer_is_refused() {
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        assert!(matches!(
+            guest.set_stream_scale("nobody".to_owned(), 100).await,
+            Err(ActorError::UnknownPeer)
+        ));
+    }
+
     /// §9.2 and §4 through the actor: a granted host offers a file, the guest
     /// accepts it into a directory of its own choosing, `rd/file/1` opens for
     /// the first time, and the file lands verified under the offered basename.
@@ -8113,7 +8369,7 @@ mod tests {
         );
     }
 
-    /// docs/bugs/14-clipboard-files.md #4 (ADR 0046): files through the
+    /// docs/bugs/14-clipboard-files.md #4 (ADR 0047): files through the
     /// clipboard run under `file_transfer` alone, never under
     /// `clipboard_read`/`clipboard_write`. A host that turns both clipboard
     /// grants on but leaves `file_transfer` off must still refuse a
@@ -8359,6 +8615,73 @@ mod tests {
         assert_eq!(
             before, after,
             "the clipboard was still being read after a revoke"
+        );
+    }
+
+    /// docs/bugs/10-clipboard-auto.md #1: the guest-to-host direction no
+    /// longer needs a toolbar press. Opening a view starts this node's own
+    /// clipboard watcher, a local change is *offered* to the host it is
+    /// watching automatically, and the host's `clipboard_write` grant is
+    /// still what decides whether it lands — exactly the same authorization
+    /// `the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard`
+    /// covers for a manual push.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_clipboard_change_reaches_the_host_only_with_the_write_grant() {
+        let pair = clipboard_pair().await;
+        // The view is already open by the time `clipboard_pair` returns, so
+        // the guest's watcher is already on (docs/bugs/10-clipboard-auto.md
+        // #1). Let its baseline round land on the empty starting clipboard
+        // before this test's own change exists to be mistaken for one.
+        a_few_poll_rounds().await;
+
+        set_clipboard(&pair.guest_clipboard, "typed on the guest");
+        a_few_poll_rounds().await;
+        assert!(
+            clipboard_writes(&pair.host_clipboard).is_empty(),
+            "the guest's clipboard reached the host with no grant"
+        );
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+        set_clipboard(&pair.guest_clipboard, "typed after the grant");
+        wait_until("the host never received the guest's clipboard", || {
+            clipboard_writes(&pair.host_clipboard) == vec!["typed after the grant".to_owned()]
+        })
+        .await;
+    }
+
+    /// §8.1 applied to the new guest-side watcher (docs/bugs/10-clipboard-
+    /// auto.md #1): closing the view is what stops it, the same as a
+    /// host-side revoke stops the host's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_view_stops_the_guests_own_clipboard_watch() {
+        let pair = clipboard_pair().await;
+        a_few_poll_rounds().await;
+        let before = pair
+            .guest_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+
+        // Guest side: leaving the session from the view window, exactly what
+        // closing it does (`on_revoke`'s `self.views.contains_key` branch).
+        pair.guest.revoke(pair.host_label.clone()).await.unwrap();
+        set_clipboard(&pair.guest_clipboard, "after closing the view");
+        a_few_poll_rounds().await;
+        let after = pair
+            .guest_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        assert_eq!(
+            before, after,
+            "the guest's own clipboard was still being read after the view closed"
         );
     }
 

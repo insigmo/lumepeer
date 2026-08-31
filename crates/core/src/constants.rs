@@ -218,6 +218,14 @@ pub const ABR_MIN_FPS: u8 = 10;
 pub const ABR_MIN_SCALE_PERCENT: u32 = 50;
 /// Step, in percent, by which the adaptive picture scale moves (§11; ADR 0037).
 pub const ABR_SCALE_STEP_PERCENT: u32 = 25;
+/// Upper bound of a guest's manual stream-scale ceiling request (§11; D7,
+/// docs/bugs/13-stream-resolution.md).
+///
+/// The same value as `lumepeer_media::abr::FULL_SCALE_PERCENT` — restated
+/// here, not imported, because `crates/core` cannot depend on
+/// `crates/media`, and this is the crate that decodes the wire message and
+/// has to bound it.
+pub const STREAM_SCALE_MAX_PERCENT: u32 = 100;
 /// Step, in frames per second, by which the adaptive frame rate moves
 /// (§11; ADR 0037).
 pub const ABR_FPS_STEP: u8 = 5;

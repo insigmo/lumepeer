@@ -1,4 +1,4 @@
-# ADR 0046 — Clipboard files are a file transfer, not a clipboard extension
+# ADR 0047 — Clipboard files are a file transfer, not a clipboard extension
 
 Status: accepted
 Date: 2026-09-01
@@ -71,7 +71,7 @@ this feature would otherwise have had to invent and keep in step by hand.
 ### The announcement carries names and sizes, never paths
 
 `MessageKind::ClipboardFileOffer { files: Vec<ClipboardFileEntry> }` is new
-(`PROTOCOL_MINOR` 7, appended after `ReceiverReport`, behind
+(`PROTOCOL_MINOR` 8, appended after `StreamScaleRequest`, behind
 `FEATURE_CLIPBOARD_FILES` exactly as `docs/tasks/03-file-transfer.md` task 1
 requires for a new file-transfer message: a new `FEATURE_*` string, sent only
 to a peer that advertised it, golden vectors appended, a negative test in
@@ -224,10 +224,10 @@ exactly the boundary §9.1 was written to bound precisely.
   unconditionally; none of them introduce a new resolved version anywhere in
   `Cargo.lock` that was not already there via `arboard`, `tauri`/`tao`, or
   `lumepeer-media`.
-- `PROTOCOL_MINOR` is 7. `ClipboardFileOffer` and `ClipboardFileAccept` sit
-  at discriminants 38 and 39, after `ReceiverReport`; every earlier
+- `PROTOCOL_MINOR` is 8. `ClipboardFileOffer` and `ClipboardFileAccept` sit
+  at discriminants 39 and 40, after `StreamScaleRequest`; every earlier
   discriminant is unmoved and the frozen golden vectors still pass, with two
-  new ones appended for minor 7.
+  new ones appended for minor 8.
 - `IncomingOffer::Clipboard`/`AcceptedOffer.from_clipboard` are the only
   places the receiving side's code needs to know an offer came from a
   clipboard rather than a picker; `file-transfers.ts` reads that flag to
@@ -254,10 +254,10 @@ exactly the boundary §9.1 was written to bound precisely.
   roundtrip; a list past `CLIPBOARD_FILE_LIST_MAX_ENTRIES`, a name past
   `FILE_NAME_MAX_BYTES` and a size past `FILE_OFFER_MAX_BYTES` are each
   malformed; the exact bound on every axis is still ordinary traffic; the
-  new discriminants sit at 38 and 39.
+  new discriminants sit at 39 and 40.
 - `tests/integration/tests/protocol_negative.rs`: the same three bounds
   refused on a live connection, not merely on a hand-built envelope.
-- `tests/interop/golden_vectors.txt`: two vectors frozen for minor 7.
+- `tests/interop/golden_vectors.txt`: two vectors frozen for minor 8.
 - `crates/core::clipboard`: `permits_files` requires `file_transfer` and
   ignores both clipboard grants in either direction.
 - `apps/desktop/src-tauri/src/network.rs`:

@@ -52,7 +52,7 @@ allow = [
     # `arboard`'s Windows clipboard backend (`clipboard-win`, `error-code`),
     # and `apps/desktop/src-tauri` now also depends on `clipboard-win`
     # directly, at the same version, for clipboard file lists (docs/bugs/
-    # 14-clipboard-files.md; ADR 0046).
+    # 14-clipboard-files.md; ADR 0047).
     "BSL-1.0",
 ]
 confidence-threshold = 0.9

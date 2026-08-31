@@ -18,6 +18,7 @@ import { html, render, type TemplateResult } from 'lit-html';
 import type { Locale } from './i18n';
 import { t } from './i18n';
 import { SETTINGS_ICON } from './icons';
+import { CLIPBOARD_NOTE_MS } from './session-status';
 import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
 import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
@@ -33,15 +34,18 @@ export interface MonitorDto {
 export interface ToolbarCommands {
   micToggle(peer: string, on: boolean): Promise<void>;
   /**
-   * Offers this machine's clipboard to the host.
+   * The host's clipboard, if it changed since the last check.
    *
-   * Only ever called from the press below. A guest holds no clipboard grant
-   * of its own (ADR 0029), so nothing here decides that the host may have the
-   * text — the host's core does, against `clipboard_write`, when it arrives.
-   * What the press decides is the half that is the guest's to decide: whether
-   * to offer their own clipboard at all.
+   * Sending this window's own clipboard to the host no longer runs through
+   * this interface at all: a guest holds no clipboard grant of its own (ADR
+   * 0029), so it is never this window's to decide, and the Rust actor now
+   * reads and offers this machine's own clipboard by itself the moment it
+   * changes (docs/bugs/10-clipboard-auto.md #1; ADR 0046) — the same way the
+   * host side always has. What is left for this window is the *arrival*
+   * half: polled so the toolbar can say a sync happened, and the text is
+   * discarded the moment it is read (§15) — never rendered, logged or held.
    */
-  clipboardPush(peer: string, text: string): Promise<void>;
+  clipboardPull(peer: string): Promise<string | null>;
   /**
    * Opens the OS file picker on the Rust side and offers what was chosen.
    *
@@ -61,6 +65,14 @@ export interface ToolbarCommands {
   sasAvailable(): Promise<boolean>;
   monitorsList(peer: string): Promise<MonitorDto[]>;
   monitorSelect(peer: string, monitorId: number): Promise<void>;
+  /**
+   * Caps the picture at `scalePercent` of the host's own captured size
+   * (§11; D7, docs/bugs/13-stream-resolution.md).
+   *
+   * A ceiling, not a target: the host's own adaptive controller stays free
+   * to sit below it, and stays free to recover only up to it.
+   */
+  viewSetScale(peer: string, scalePercent: number): Promise<void>;
 }
 
 /** Default binding to the real IPC surface. */
@@ -69,9 +81,11 @@ export const tauriToolbarCommands: ToolbarCommands = {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('mic_toggle', { args: { peer, on } });
   },
-  async clipboardPush(peer, text) {
+  async clipboardPull(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('clipboard_push', { args: { peer, text } });
+    // A bare `peer`, like `monitorsList`: the Rust command takes it as a
+    // command parameter, not a field of an `args` struct.
+    return (await invoke('clipboard_pull', { peer })) as string | null;
   },
   async fileOffer(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -104,7 +118,65 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // what the rest of this surface already uses (`since_us`, `code_required`).
     return invoke('monitor_select', { args: { peer, monitor_id: monitorId } });
   },
+  async viewSetScale(peer, scalePercent) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // `scale_percent`, not `scalePercent`: same snake_case boundary as
+    // `monitor_id` above.
+    return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent } });
+  },
 };
+
+/**
+ * Fixed, hardware-independent resolution choices the guest may cap the
+ * stream at (§11; D7, docs/bugs/13-stream-resolution.md task 4). Nothing is
+ * collected at install time: what each one maps to is worked out from the
+ * monitor size the host already announces via `monitors_list`.
+ *
+ * `25%` is not offered. §14's `ABR_MIN_SCALE_PERCENT` (50) is the floor below
+ * which text stops being readable, and the host's decoder enforces it on the
+ * wire — a raw 25% request would either be silently clamped to 50%, which
+ * makes the two options indistinguishable, or, worse, be refused as a
+ * malformed frame and end the session. Offering a choice this project's own
+ * floor cannot honour is worse than not offering it.
+ */
+export const RESOLUTION_OPTIONS = ['native', '1080p', '720p', 'half'] as const;
+export type ResolutionOption = (typeof RESOLUTION_OPTIONS)[number];
+
+/**
+ * Mirrors `crates/core/src/constants.rs::ABR_MIN_SCALE_PERCENT` (§11; ADR
+ * 0037). Not importable across the IPC boundary, so restated here with the
+ * same reasoning: below this, text on the remote screen is not readable.
+ */
+const MIN_SCALE_PERCENT = 50;
+
+/**
+ * The percentage `option` maps to for a host screen of `monitor`'s size, or
+ * `null` when it makes no sense for it: bigger than the monitor's own size
+ * (task 4.2 — a 1080p request against a 1280×1024 screen is meaningless), or
+ * a target so far below the monitor's own height that reaching it would
+ * need a ceiling under `MIN_SCALE_PERCENT` (a 4K screen cannot reach 720p
+ * this way without crossing that floor).
+ */
+export function scalePercentFor(
+  option: ResolutionOption,
+  monitor: MonitorDto | undefined,
+): number | null {
+  if (option === 'native') {
+    return 100;
+  }
+  if (option === 'half') {
+    return MIN_SCALE_PERCENT;
+  }
+  if (!monitor || monitor.height <= 0) {
+    return null;
+  }
+  const targetHeight = option === '1080p' ? 1080 : 720;
+  if (monitor.height <= targetHeight) {
+    return null;
+  }
+  const percent = Math.round((targetHeight / monitor.height) * 100);
+  return percent >= MIN_SCALE_PERCENT ? percent : null;
+}
 
 /** Render-side mirror of everything the toolbar shows. */
 export class ToolbarState {
@@ -121,6 +193,12 @@ export class ToolbarState {
   /** Monitor currently being watched. */
   activeMonitor: number | null = null;
   /**
+   * The stream-resolution ceiling picked for this session (§11; D7,
+   * docs/bugs/13-stream-resolution.md task 4). Persists across a monitor
+   * switch; the percentage it maps to is recalculated for the new screen.
+   */
+  resolution: ResolutionOption = 'native';
+  /**
    * Whether a recording request has already been sent this session.
    *
    * Only so the button can stop inviting a second press while the first is
@@ -129,6 +207,14 @@ export class ToolbarState {
    * whether a recording is running.
    */
   recordAsked = false;
+  /**
+   * When the host's clipboard last arrived, in `Date.now()` milliseconds, or
+   * `0` for never (docs/bugs/10-clipboard-auto.md #2; ADR 0046).
+   *
+   * The fact only — the text itself is never kept here or anywhere else in
+   * this module (§15). Mirrors `clipboardSyncedAt` in `main.ts`'s host panel.
+   */
+  clipboardSyncedAt = 0;
 }
 
 /** What the toolbar hands back to whoever mounted it, once, at mount. */
@@ -221,9 +307,9 @@ export function renderToolbar(
     toggleMic(): void;
     sendCad(): void;
     askToRecord(): void;
-    sendClipboard(): void;
     sendFile(): void;
     pickMonitor(id: number): void;
+    pickResolution(option: ResolutionOption): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
   },
@@ -234,6 +320,17 @@ export function renderToolbar(
   // same thing.
   const chatUnread = !chatOn && hooks.chatUnread();
   const monitorLabel = state.activeMonitor === null ? '1' : String(state.activeMonitor + 1);
+  // The watched monitor's own size, for filtering resolution options by it
+  // (task 4.2) — `null` until it is known, which keeps only `native` on
+  // offer rather than guessing. `state.monitors` defaults to `[]` on a real
+  // `ToolbarState`; the `?? []` only guards a test harness that built one by
+  // hand without it.
+  const activeMonitorInfo = (state.monitors ?? []).find(
+    (monitor) => monitor.id === (state.activeMonitor ?? 0),
+  );
+  const resolutionChoices = RESOLUTION_OPTIONS.filter(
+    (option) => scalePercentFor(option, activeMonitorInfo) !== null,
+  );
 
   const settingsPopover: TemplateResult =
     state.openPopover === 'settings'
@@ -250,6 +347,23 @@ export function renderToolbar(
                   (mode) =>
                     html`<option value=${mode} ?selected=${mode === hooks.displayMode()}>
                       ${t(locale, `toolbar.display.${mode}` as TranslationKeyAlias)}
+                    </option>`,
+                )}
+              </select>
+            </label>
+            <label class="toolbar-pop-row">
+              <span>${t(locale, 'toolbar.settings.resolution')}</span>
+              <select
+                data-testid="toolbar-resolution"
+                @change=${(event: Event) =>
+                  actions.pickResolution(
+                    (event.target as HTMLSelectElement).value as ResolutionOption,
+                  )}
+              >
+                ${resolutionChoices.map(
+                  (option) =>
+                    html`<option value=${option} ?selected=${option === state.resolution}>
+                      ${t(locale, `toolbar.resolution.${option}` as TranslationKeyAlias)}
                     </option>`,
                 )}
               </select>
@@ -387,16 +501,20 @@ export function renderToolbar(
         >
           ${ICONS.file}
         </button>
-        <button
-          type="button"
-          class="toolbar-btn"
+        <span
+          class="toolbar-btn toolbar-indicator"
           data-testid="toolbar-clipboard"
+          role="img"
           aria-label=${t(locale, 'toolbar.clipboard')}
           title=${t(locale, 'toolbar.clipboard')}
-          @click=${actions.sendClipboard}
         >
           ${ICONS.clipboard}
-        </button>
+        </span>
+        ${Date.now() - state.clipboardSyncedAt < CLIPBOARD_NOTE_MS
+          ? html`<span class="toolbar-clipboard-note" data-testid="toolbar-clipboard-note">
+              ${t(locale, 'status.clipboardSynced')}
+            </span>`
+          : html``}
         <button
           type="button"
           class="toolbar-btn ${state.recordAsked ? 'is-active' : ''}"
@@ -484,6 +602,17 @@ type TranslationKeyAlias = Parameters<typeof t>[1];
 const TOOLBAR_INSET = 8;
 
 /**
+ * How often this window asks whether the host's clipboard arrived
+ * (docs/bugs/10-clipboard-auto.md #2).
+ *
+ * Not the OS-facing poll — that one is `CLIPBOARD_POLL_INTERVAL_MS` in
+ * `crates/core/src/constants.rs`, on its own dedicated thread (ADR 0027).
+ * This is only how often this window's own IPC check runs, on the same
+ * cadence `startChatPolling`'s own default uses.
+ */
+const CLIPBOARD_SYNC_POLL_INTERVAL_MS = 1000;
+
+/**
  * Wires the toolbar to the DOM: render loop, drag, popovers, and IPC.
  *
  * Returns a stop function that removes the global listeners; the container
@@ -495,6 +624,7 @@ export function mountToolbar(
   peer: string,
   commands: ToolbarCommands,
   hooks: ToolbarHooks,
+  clipboardPollIntervalMs = CLIPBOARD_SYNC_POLL_INTERVAL_MS,
 ): () => void {
   const state = new ToolbarState();
   const root = container.closest('#view') ?? document.body;
@@ -533,7 +663,9 @@ export function mountToolbar(
     },
     openPopover(which: 'settings' | 'monitors' | null): void {
       state.openPopover = which;
-      if (which === 'monitors' && state.monitors.length === 0) {
+      // Settings needs the list too, to filter resolution options by the
+      // watched monitor's size (task 4.2) — not only the monitors popover.
+      if ((which === 'monitors' || which === 'settings') && state.monitors.length === 0) {
         void commands
           .monitorsList(peer)
           .then((monitors) => {
@@ -601,30 +733,43 @@ export function mountToolbar(
         // nothing here claims otherwise.
       });
     },
-    sendClipboard(): void {
-      // The guest's own clipboard, read from the guest's own window on the
-      // guest's own press. The *host* clipboard is never reachable from a
-      // webview — that one is read and written by the Rust actor alone
-      // (§2.3; ADR 0030).
-      void navigator.clipboard
-        ?.readText()
-        .then((text) => (text ? commands.clipboardPush(peer, text) : undefined))
-        .catch(() => {
-          // No clipboard permission, an empty clipboard, or a host that
-          // refused: nothing was sent, and nothing is claimed to have been.
-        });
-    },
     pickMonitor(id: number): void {
       void commands
         .monitorSelect(peer, id)
         .then(() => {
           state.activeMonitor = id;
           state.openPopover = null;
+          // The resolution choice persists across the switch, but the
+          // percentage it maps to does not: it was worked out from the old
+          // monitor's size (task 4.4). Recomputing for a screen that cannot
+          // reach it falls back to native rather than sending a ceiling the
+          // guest never actually asked for.
+          const monitor = state.monitors.find((entry) => entry.id === id);
+          const percent = scalePercentFor(state.resolution, monitor);
+          if (percent === null) {
+            state.resolution = 'native';
+            void commands.viewSetScale(peer, 100).catch(() => {});
+          } else {
+            void commands.viewSetScale(peer, percent).catch(() => {});
+          }
           draw();
         })
         .catch(() => {
           draw();
         });
+    },
+    pickResolution(option: ResolutionOption): void {
+      state.resolution = option;
+      const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
+      const percent = scalePercentFor(option, monitor);
+      if (percent !== null) {
+        void commands.viewSetScale(peer, percent).catch(() => {
+          // The host refused (grant gone, an old peer) or the session ended:
+          // the selector keeps showing what was asked for, and the picture
+          // simply does not change.
+        });
+      }
+      draw();
     },
     beginDrag(event: PointerEvent): void {
       if (event.button !== 0) {
@@ -695,10 +840,31 @@ export function mountToolbar(
   };
   window.addEventListener('resize', onResize);
 
+  // docs/bugs/10-clipboard-auto.md #2: the mandatory indicator this window
+  // owes the guest now that the host's clipboard can arrive without a press
+  // on either side. `clipboard_pull` hands back the text; this callback is
+  // the only place that ever sees it, and it only ever checks it is not
+  // `null` — the text itself is never assigned to anything (§15).
+  const clipboardPollTimer = window.setInterval(() => {
+    void commands
+      .clipboardPull(peer)
+      .then((text) => {
+        if (text !== null) {
+          state.clipboardSyncedAt = Date.now();
+          draw();
+        }
+      })
+      .catch(() => {
+        // The session ended between polls; the next tick, or the window
+        // closing, is what stops this rather than an error here.
+      });
+  }, clipboardPollIntervalMs);
+
   draw();
 
   return () => {
     document.removeEventListener('pointerdown', onPointerDownAnywhere, true);
     window.removeEventListener('resize', onResize);
+    window.clearInterval(clipboardPollTimer);
   };
 }

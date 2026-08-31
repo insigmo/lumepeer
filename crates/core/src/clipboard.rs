@@ -8,7 +8,7 @@
 //!   clipboard now reach the peer too, but through a different door
 //!   entirely: `MessageKind::ClipboardFileOffer` and the `file_transfer`
 //!   grant [`permits_files`] checks below, never `clipboard_read`/
-//!   `clipboard_write` (docs/bugs/14-clipboard-files.md; ADR 0046). A
+//!   `clipboard_write` (docs/bugs/14-clipboard-files.md; ADR 0047). A
 //!   clipboard holding a file list is not text this module's `ClipboardSync`
 //!   state machine ever sees.
 //! - The payload limit is enforced on both sides before anything is stored
@@ -69,7 +69,7 @@ pub const fn permits(grants: Grants, flow: ClipboardFlow) -> bool {
 }
 
 /// Whether `grants` allow files to be offered through a clipboard file list
-/// at all (docs/bugs/14-clipboard-files.md #4; ADR 0046).
+/// at all (docs/bugs/14-clipboard-files.md #4; ADR 0047).
 ///
 /// Deliberately not part of [`ClipboardFlow`]: a file list on the clipboard
 /// is a file transfer with a different entry point, not an extension of

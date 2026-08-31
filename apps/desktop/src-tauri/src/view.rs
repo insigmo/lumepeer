@@ -31,7 +31,7 @@ use lumepeer_core::constants::{
     RECONNECT_WINDOW_SECS,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
-use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback};
+use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, effective_scale};
 use lumepeer_media::capture::{CaptureController, InputInjector};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
@@ -81,6 +81,12 @@ pub struct EncodeControl {
     /// What the loop is encoding at right now, for the connection-quality
     /// panel of §18. Written by the loop, read by the actor.
     target: Arc<Mutex<QualityTarget>>,
+    /// The guest's manual scale ceiling, if it asked for one (§11; D7,
+    /// docs/bugs/13-stream-resolution.md task 2). Combined with the ABR
+    /// target by `lumepeer_media::abr::effective_scale`, never applied on
+    /// its own — a ceiling this loop reads is not a target ABR stops
+    /// adapting around.
+    manual_cap: Arc<Mutex<Option<u32>>>,
 }
 
 impl EncodeControl {
@@ -94,6 +100,7 @@ impl EncodeControl {
             keyframe: Arc::new(AtomicBool::new(false)),
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
+            manual_cap: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -154,6 +161,30 @@ impl EncodeControl {
             .target
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = target;
+    }
+
+    /// The guest's manual scale ceiling right now, if any (§11; D7).
+    #[must_use]
+    pub fn manual_cap(&self) -> Option<u32> {
+        *self
+            .manual_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the guest's manual scale ceiling, replacing whatever was there.
+    ///
+    /// Returns whether this actually changed the ceiling, which is what the
+    /// actor uses to decide whether a keyframe is owed: a request that
+    /// repeats the value already in effect has nothing new to draw.
+    pub fn set_manual_cap(&self, cap: Option<u32>) -> bool {
+        let mut current = self
+            .manual_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = *current != cap;
+        *current = cap;
+        changed
     }
 }
 
@@ -805,12 +836,16 @@ pub fn spawn_encode_loop(
                 }
             };
 
-            // Two reductions, in this order and for different reasons. The
-            // adaptive one is the last rung of the ladder the controller may
-            // have reached (ADR 0037) and is a choice about quality; the
-            // budget one is the hard ceiling of §15 that no choice may exceed,
-            // so it goes last and has the final say (ADR 0018).
-            let frame = fit_within_budget(scale_to_percent(frame, target.scale_percent));
+            // Three reductions, in this order and for different reasons. The
+            // manual ceiling and the adaptive target are combined first,
+            // because they are not allowed to fight over the same variable
+            // (D7, docs/bugs/13-stream-resolution.md): a ceiling below the
+            // ABR target wins, and ABR stays free to sit below a higher one
+            // when the link cannot carry it. The budget reduction is the hard
+            // ceiling of §15 that no choice may exceed, so it goes last and
+            // has the final say (ADR 0018).
+            let scale_percent = effective_scale(control.manual_cap(), target.scale_percent);
+            let frame = fit_within_budget(scale_to_percent(frame, scale_percent));
 
             // The cursor rides its own channel when the guest asked for one,
             // and is read only then: a shape the loop would never send is a
@@ -1771,6 +1806,41 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
+
+    /// D7, docs/bugs/13-stream-resolution.md task 2: the ceiling starts
+    /// unset, a new value replaces it, and the loop sees exactly what was
+    /// set.
+    #[test]
+    fn manual_cap_starts_unset_and_is_read_back_after_being_set() {
+        let control = EncodeControl::new(iroh::SecretKey::generate().public(), None);
+        assert_eq!(control.manual_cap(), None);
+        control.set_manual_cap(Some(75));
+        assert_eq!(control.manual_cap(), Some(75));
+        control.set_manual_cap(None);
+        assert_eq!(control.manual_cap(), None);
+    }
+
+    /// The actor uses the return value of `set_manual_cap` to decide whether
+    /// a keyframe is owed (task 2.4): repeating the value already in effect
+    /// must not look like a change.
+    #[test]
+    fn set_manual_cap_reports_whether_it_actually_changed() {
+        let control = EncodeControl::new(iroh::SecretKey::generate().public(), None);
+        assert!(control.set_manual_cap(Some(50)), "unset to a value changed");
+        assert!(
+            !control.set_manual_cap(Some(50)),
+            "repeating the same value must not read as a change"
+        );
+        assert!(
+            control.set_manual_cap(Some(75)),
+            "a different value changed"
+        );
+        assert!(control.set_manual_cap(None), "clearing the cap changed");
+        assert!(
+            !control.set_manual_cap(None),
+            "clearing an already-clear cap did not"
+        );
+    }
 
     /// Audio must ride the media connection the picture already dialed
     /// (§4.1, §11), and this is what goes wrong when it does not: a second

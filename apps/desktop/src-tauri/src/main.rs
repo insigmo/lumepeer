@@ -138,10 +138,20 @@ fn setup_app(
         tracing::warn!("no usable update manifest URL configured; updates are off");
     }
     let notifications = network.subscribe();
+    let autostart = autostart::Autostart::for_this_app();
+    // macOS only (docs/bugs/12-service-lifecycle.md task 4; D6): `.dmg` is a
+    // drag-install with no post-install hook at all, unlike deb/rpm, so
+    // there is nothing to call `--enable-autostart` at install time. Turning
+    // it on happens here instead, once, the first time an installed copy
+    // ever runs; the same call also removes a stale login item a previous,
+    // since-deleted copy left behind, since a drag-install has no uninstall
+    // hook to have done that either. A no-op on Windows and Linux, which get
+    // autostart from a hook that runs exactly once already.
+    autostart.reconcile_first_launch();
     app.manage(AppState {
         network,
         update_url,
-        autostart: autostart::Autostart::for_this_app(),
+        autostart,
     });
     runtime.spawn(watch_for_window_raising_notifications(
         app.handle().clone(),
@@ -257,6 +267,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::sas_available,
         commands::monitor_select,
         commands::monitors_list,
+        commands::view_set_scale,
         commands::recordings_list,
         commands::recording_export,
         commands::audit_list,
@@ -273,7 +284,47 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
     ]
 }
 
+/// Reads `--enable-autostart` / `--disable-autostart` off the command line.
+///
+/// The deb/rpm packaging scripts under `apps/desktop/src-tauri/packaging`
+/// call these two flags from `postinst`/`postInstallScript`'s and
+/// `prerm`/`preRemoveScript`'s hooks (docs/bugs/12-service-lifecycle.md task
+/// 4; D6) — a real install/removal hook exists on Linux, unlike macOS's
+/// `.dmg`, so the same per-user mechanism the settings panel's toggle uses
+/// (`autostart.rs`, ADR 0042) can be invoked headlessly instead of teaching
+/// the packaging scripts a second way to write the same file. A plain
+/// function rather than inline matching in `main` so a typo in either flag
+/// silently doing nothing is a test failure rather than a packaging script
+/// that quietly never enables anything.
+fn autostart_cli_flag(args: &[String]) -> Option<bool> {
+    if args.iter().any(|arg| arg == "--enable-autostart") {
+        Some(true)
+    } else if args.iter().any(|arg| arg == "--disable-autostart") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn main() {
+    // `--enable-autostart` / `--disable-autostart`: a headless call into the
+    // same autostart mechanism the settings panel's toggle uses, for
+    // packaging scripts that have an install/remove hook but no window to
+    // click through (see `autostart_cli_flag`). Checked before anything else
+    // starts — no config loaded, no log file opened, no webview built —
+    // mirroring the equivalent `--install`/`--uninstall` short-circuit at the
+    // top of `crates/service`'s own `main.rs`.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(enabled) = autostart_cli_flag(&args) {
+        match autostart::Autostart::for_this_app().set(enabled) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Configuration first: it decides where the log file goes, and tracing has
     // to be installed before anything worth logging happens (§5.1, §16.1).
     let (settings, notes) = config::Settings::load();
@@ -349,4 +400,34 @@ fn main() {
             eprintln!("fatal: failed to start the application: {error}");
             std::process::exit(1);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(rest: &[&str]) -> Vec<String> {
+        std::iter::once("lumepeer-desktop".to_owned())
+            .chain(rest.iter().map(|arg| (*arg).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn recognizes_enable_and_disable() {
+        assert_eq!(
+            autostart_cli_flag(&args(&["--enable-autostart"])),
+            Some(true)
+        );
+        assert_eq!(
+            autostart_cli_flag(&args(&["--disable-autostart"])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn ignores_everything_else() {
+        assert_eq!(autostart_cli_flag(&args(&[])), None);
+        assert_eq!(autostart_cli_flag(&args(&["--enable-autostar"])), None);
+        assert_eq!(autostart_cli_flag(&args(&["enable-autostart"])), None);
+    }
 }
