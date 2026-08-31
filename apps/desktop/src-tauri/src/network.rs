@@ -7688,6 +7688,15 @@ mod tests {
             .text = Some(text.to_owned());
     }
 
+    /// docs/bugs/14-clipboard-files.md #1: puts a file list on a test
+    /// clipboard, the same seam a real platform read goes through.
+    fn set_clipboard_files(state: &SharedTestClipboard, paths: &[std::path::PathBuf]) {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .files = Some(paths.to_vec());
+    }
+
     /// Brings up a host and a guest with a live `ViewOnly` session, and
     /// returns both handles, both clipboards and the labels each side knows
     /// the other by.
@@ -8102,6 +8111,74 @@ mod tests {
             0,
             "a declined offer wrote something"
         );
+    }
+
+    /// docs/bugs/14-clipboard-files.md #4 (ADR 0046): files through the
+    /// clipboard run under `file_transfer` alone, never under
+    /// `clipboard_read`/`clipboard_write`. A host that turns both clipboard
+    /// grants on but leaves `file_transfer` off must still refuse a
+    /// clipboard file offer — proved over two real actors and a real
+    /// connection, not by reasoning about the grant check in isolation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_files_need_file_transfer_not_the_clipboard_grants() {
+        let scratch = Scratch::new("clipboard-grant");
+        let source = scratch.join("photo.png");
+        std::fs::write(&source, b"not a real image, just bytes").unwrap();
+
+        let pair = clipboard_pair().await;
+        // Both clipboard grants on, `file_transfer` conspicuously left off.
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardRead,
+                true,
+            )
+            .await
+            .unwrap();
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+
+        set_clipboard_files(&pair.guest_clipboard, &[source.clone()]);
+        pair.guest
+            .file_offer_clipboard(pair.host_label.clone())
+            .await
+            .unwrap();
+
+        a_few_poll_rounds().await;
+        assert!(
+            pair.host.file_transfers().await.unwrap().offers.is_empty(),
+            "clipboard grants alone let a clipboard file offer through"
+        );
+
+        // The positive control: the same offer succeeds once `file_transfer`
+        // is the grant that is actually on, which is what proves the
+        // refusal above was the grant check and not, say, a feature
+        // negotiation that silently never happened.
+        pair.host
+            .set_grant(pair.guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        pair.guest
+            .file_offer_clipboard(pair.host_label)
+            .await
+            .unwrap();
+        wait_for_files(
+            &pair.host,
+            "the clipboard offer never arrived once file_transfer was on",
+            |files| {
+                files
+                    .offers
+                    .iter()
+                    .any(|row| row.name == "photo.png" && row.from_clipboard)
+            },
+        )
+        .await;
     }
 
     /// §8.1 applied to §9.2: a granted session is not a licence to read the
