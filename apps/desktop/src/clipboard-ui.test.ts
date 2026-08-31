@@ -1,12 +1,13 @@
-// Clipboard sync as the two windows show it (design doc §9.2, §15; ADR 0030).
+// Clipboard sync as the two windows show it (design doc §9.2, §15; ADR 0030,
+// ADR 0046).
 //
-// Two rules are under test and they are both about what the UI must *not* do.
-// The host panel says a clipboard arrived and never says what was in it — a
-// panel that sits on screen all session is read by whoever walks past the
+// Both windows now sync automatically, and both are under the same rule:
+// they may say a clipboard arrived, never what was in it — a panel or a
+// toolbar that sits on screen all session is read by whoever walks past the
 // machine, and clipboard content is the one payload §15 keeps off every
-// surface. And the guest's toolbar reads only the guest's own clipboard, on
-// the guest's own press: the host's clipboard is never reachable from a
-// webview at all.
+// surface. The guest's toolbar no longer pushes anything on a press
+// (docs/bugs/10-clipboard-auto.md #1, #3): the clipboard icon is a status,
+// and the only thing it does is notice the host's clipboard arriving.
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -115,91 +116,86 @@ describe('the host panel', () => {
   });
 });
 
-describe("the guest toolbar's clipboard button", () => {
-  function commands(): ToolbarCommands & { clipboardPush: ReturnType<typeof vi.fn> } {
+describe("the guest toolbar's clipboard indicator", () => {
+  function commands(): ToolbarCommands & { clipboardPull: ReturnType<typeof vi.fn> } {
     return {
       micToggle: vi.fn().mockResolvedValue(undefined),
-      clipboardPush: vi.fn().mockResolvedValue(undefined),
+      clipboardPull: vi.fn().mockResolvedValue(null),
       fileOffer: vi.fn().mockResolvedValue(undefined),
       sasRequest: vi.fn().mockResolvedValue(undefined),
       recordRequest: vi.fn().mockResolvedValue(undefined),
       sasAvailable: vi.fn().mockResolvedValue(true),
       monitorsList: vi.fn().mockResolvedValue([]),
       monitorSelect: vi.fn().mockResolvedValue(undefined),
+      viewSetScale: vi.fn().mockResolvedValue(undefined),
     };
   }
 
-  function draw(sendClipboard: () => void): void {
-    renderToolbar(
-      container,
-      new ToolbarState(),
-      'en',
-      toolbarHooks(),
-      {
-        toggleCollapsed: () => {},
-        openPopover: () => {},
-        setDisplayMode: () => {},
-        toggleFullscreen: () => {},
-        toggleLocalCursor: () => {},
-        toggleMic: () => {},
-        sendCad: () => {},
-        askToRecord: () => {},
-        sendClipboard,
-        sendFile: () => {},
-        pickMonitor: () => {},
-        beginDrag: () => {},
-        nudge: () => {},
-      },
-    );
+  function draw(state: ToolbarState): void {
+    renderToolbar(container, state, 'en', toolbarHooks(), {
+      toggleCollapsed: () => {},
+      openPopover: () => {},
+      setDisplayMode: () => {},
+      toggleFullscreen: () => {},
+      toggleLocalCursor: () => {},
+      toggleMic: () => {},
+      sendCad: () => {},
+      askToRecord: () => {},
+      sendFile: () => {},
+      pickMonitor: () => {},
+      pickResolution: () => {},
+      beginDrag: () => {},
+      nudge: () => {},
+    });
   }
 
-  it('is reachable from the keyboard and named in both locales', () => {
-    draw(() => {});
-    const button = container.querySelector<HTMLButtonElement>(
-      '[data-testid="toolbar-clipboard"]',
+  it('is a status, not a control, and named in both locales', () => {
+    draw(new ToolbarState());
+    const indicator = container.querySelector('[data-testid="toolbar-clipboard"]');
+    expect(indicator).not.toBeNull();
+    // Not a button: nothing responds to a click any more (docs/bugs/10-
+    // clipboard-auto.md #3).
+    expect(indicator?.tagName).not.toBe('BUTTON');
+    expect(indicator?.getAttribute('aria-label')).toBe(
+      'Clipboard sync is automatic in both directions',
     );
-    expect(button).not.toBeNull();
-    expect(button?.tagName).toBe('BUTTON');
-    expect(button?.getAttribute('aria-label')).toBe('Send my clipboard to the host');
-    expect(button?.hasAttribute('disabled')).toBe(false);
   });
 
-  it('offers the guest clipboard only when the guest presses it', () => {
-    let pressed = 0;
-    draw(() => {
-      pressed += 1;
-    });
-    const button = container.querySelector<HTMLButtonElement>(
-      '[data-testid="toolbar-clipboard"]',
-    );
-    expect(pressed).toBe(0);
-    button?.click();
-    expect(pressed).toBe(1);
+  it('shows a note right after a sync and hides it once the note ages out', () => {
+    const state = new ToolbarState();
+    state.clipboardSyncedAt = Date.now();
+    draw(state);
+    const note = container.querySelector('[data-testid="toolbar-clipboard-note"]');
+    expect(note).not.toBeNull();
+    expect(note?.textContent?.trim()).toBe('Clipboard synced');
+
+    state.clipboardSyncedAt = Date.now() - CLIPBOARD_NOTE_MS - 1;
+    draw(state);
+    expect(container.querySelector('[data-testid="toolbar-clipboard-note"]')).toBeNull();
   });
 
-  it('sends what the guest clipboard holds, and sends nothing when it is empty', async () => {
-    const readText = vi.fn().mockResolvedValue('from the guest');
-    Object.defineProperty(navigator, 'clipboard', {
-      value: { readText },
-      configurable: true,
-    });
+  it('shows nothing before the first sync', () => {
+    draw(new ToolbarState());
+    expect(container.querySelector('[data-testid="toolbar-clipboard-note"]')).toBeNull();
+  });
+
+  it('notices the host clipboard arriving without ever putting its text in the DOM', async () => {
+    const secret = 'correct horse battery staple';
     const fake = commands();
+    fake.clipboardPull.mockResolvedValue(secret);
     const { mountToolbar } = await import('./toolbar');
-    const stop = mountToolbar(container, 'en', 'host-99', fake, toolbarHooks());
-    container
-      .querySelector<HTMLButtonElement>('[data-testid="toolbar-clipboard"]')
-      ?.click();
-    await vi.waitFor(() => {
-      expect(fake.clipboardPush).toHaveBeenCalledWith('host-99', 'from the guest');
-    });
-
-    readText.mockResolvedValue('');
-    container
-      .querySelector<HTMLButtonElement>('[data-testid="toolbar-clipboard"]')
-      ?.click();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(fake.clipboardPush).toHaveBeenCalledTimes(1);
-    stop();
+    // A fast poll so the test does not wait a full second for the real
+    // default (docs/bugs/10-clipboard-auto.md #2).
+    const stop = mountToolbar(container, 'en', 'host-99', fake, toolbarHooks(), 5);
+    try {
+      await vi.waitFor(() => {
+        expect(
+          container.querySelector('[data-testid="toolbar-clipboard-note"]'),
+        ).not.toBeNull();
+      });
+      expect(container.textContent).not.toContain(secret);
+    } finally {
+      stop();
+    }
   });
 });

@@ -195,6 +195,11 @@ export type TranslationKey =
   | 'toolbar.settings.displayMode'
   | 'toolbar.settings.localCursor'
   | 'toolbar.settings.cursorEmbedded'
+  | 'toolbar.settings.resolution'
+  | 'toolbar.resolution.native'
+  | 'toolbar.resolution.1080p'
+  | 'toolbar.resolution.720p'
+  | 'toolbar.resolution.half'
   | 'toolbar.display.fit'
   | 'toolbar.display.actual'
   | 'toolbar.display.scaled'
@@ -470,7 +475,7 @@ const en: Dictionary = {
   'toolbar.cad': 'Ctrl+Alt+Del',
   'toolbar.record': 'Ask the host to record this session',
   'toolbar.record.asked': 'Asked the host to record; waiting for an answer',
-  'toolbar.clipboard': 'Send my clipboard to the host',
+  'toolbar.clipboard': 'Clipboard sync is automatic in both directions',
   'toolbar.file': 'Send a file to the host',
   'toolbar.collapse': 'Collapse',
   'toolbar.expand': 'Expand',
@@ -482,6 +487,13 @@ const en: Dictionary = {
   // on this host the pointer is part of the picture and nothing here can
   // change that.
   'toolbar.settings.cursorEmbedded': 'This device sends the pointer inside the picture.',
+  // D7, docs/bugs/13-stream-resolution.md: a ceiling on what the host sends,
+  // not the host's own screen resolution — that stays untouched.
+  'toolbar.settings.resolution': 'Stream resolution',
+  'toolbar.resolution.native': 'Native',
+  'toolbar.resolution.1080p': '1080p',
+  'toolbar.resolution.720p': '720p',
+  'toolbar.resolution.half': '50%',
   // Named for what the operator sees, not for the arithmetic: "actual size"
   // is a promise about pixels, "1:1" is a formula.
   'toolbar.display.fit': 'Fit to window',
@@ -756,7 +768,7 @@ const ar: Dictionary = {
   'toolbar.cad': 'Ctrl+Alt+Del',
   'toolbar.record': 'اطلب من المضيف تسجيل هذه الجلسة',
   'toolbar.record.asked': 'تم إرسال طلب التسجيل؛ في انتظار الرد',
-  'toolbar.clipboard': 'إرسال الحافظة الخاصة بي إلى المضيف',
+  'toolbar.clipboard': 'مزامنة الحافظة تلقائية في الاتجاهين',
   'toolbar.file': 'إرسال ملف إلى المضيف',
   'toolbar.collapse': 'طي',
   'toolbar.expand': 'توسيع',
@@ -765,6 +777,11 @@ const ar: Dictionary = {
   'toolbar.settings.displayMode': 'حجم الصورة',
   'toolbar.settings.localCursor': 'ارسم المؤشر هنا',
   'toolbar.settings.cursorEmbedded': 'يرسل هذا الجهاز المؤشر داخل الصورة.',
+  'toolbar.settings.resolution': 'دقة البث',
+  'toolbar.resolution.native': 'الدقة الأصلية',
+  'toolbar.resolution.1080p': '1080p',
+  'toolbar.resolution.720p': '720p',
+  'toolbar.resolution.half': '50%',
   'toolbar.display.fit': 'ملاءمة النافذة',
   'toolbar.display.actual': 'الحجم الحقيقي',
   'toolbar.display.scaled': 'تكبير',

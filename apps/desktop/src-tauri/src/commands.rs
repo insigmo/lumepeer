@@ -1769,6 +1769,38 @@ pub async fn monitor_select(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ViewSetScaleArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Requested ceiling, as a percentage of the host's own captured size
+    /// (§11; D7, docs/bugs/13-stream-resolution.md).
+    pub scale_percent: u32,
+}
+
+/// Guest side: caps the picture at `scale_percent` of the host's own
+/// captured size (§11; D7, docs/bugs/13-stream-resolution.md task 3).
+///
+/// The host re-checks the `view` grant and the range before applying
+/// anything; this call only says whether the request could be sent at all.
+///
+/// # Errors
+/// [`IpcError`] when unallowed, the value is outside the guest-selectable
+/// range, or the host never confirmed it understands the message.
+#[tauri::command]
+pub async fn view_set_scale(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewSetScaleArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .set_stream_scale(args.peer, args.scale_percent)
+        .await?;
+    Ok(())
+}
+
 /// DTO of one monitor of the watched host (§11 `MonitorsList`).
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorDto {

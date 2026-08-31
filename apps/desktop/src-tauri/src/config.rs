@@ -291,7 +291,7 @@ pub fn recordings_dir() -> Option<PathBuf> {
 
 /// Directory a completed clipboard file receive lands in, so the paste it
 /// exists to serve actually has something on disk to point at (docs/bugs/
-/// 14-clipboard-files.md #3; ADR 0046).
+/// 14-clipboard-files.md #3; ADR 0047).
 ///
 /// Under the per-user data directory like `recordings_dir`, for the same
 /// reason: this is application working storage, not a place the untrusted

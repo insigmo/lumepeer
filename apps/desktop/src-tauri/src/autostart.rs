@@ -87,6 +87,34 @@ impl Autostart {
             platform::disable()
         }
     }
+
+    /// Runs the macOS-only startup reconciliation `.dmg`'s lack of any
+    /// install or removal hook makes necessary (docs/bugs/
+    /// 12-service-lifecycle.md task 4; D6):
+    ///
+    /// - **Turns autostart on once**, the first time this installed copy
+    ///   ever runs — `.dmg` is a drag-install with no `postinst` to flip the
+    ///   switch the way deb/rpm can (`--enable-autostart` in `main.rs`).
+    /// - **Removes a stale entry.** The same lack of an uninstall hook means
+    ///   deleting the app from `/Applications` cannot clean up after itself;
+    ///   the next time *any* copy of this app starts, it checks whether the
+    ///   login item it finds still points at a file that exists, and removes
+    ///   it if not, rather than leaving a permanently broken one behind.
+    ///
+    /// A no-op everywhere else: Windows and Linux both get autostart from a
+    /// hook that runs exactly once (the NSIS installer/uninstaller and
+    /// deb/rpm's postinst/prerm respectively), so neither needs a check on
+    /// every ordinary startup. Failures are logged and swallowed — this runs
+    /// on every launch and must never be the reason the app fails to open.
+    #[allow(
+        clippy::unused_self,
+        reason = "self is read on macOS only (platform::reconcile_first_launch); a no-op stub \
+                  on every other target so `main.rs` can call this unconditionally"
+    )]
+    pub fn reconcile_first_launch(&self) {
+        #[cfg(target_os = "macos")]
+        platform::reconcile_first_launch(self);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -228,6 +256,101 @@ mod platform {
              X-GNOME-Autostart-enabled=true\n",
             exe = exe.display()
         )
+    }
+
+    /// Where the "first launch already ran" marker lives, next to the plist
+    /// itself. Only meaningful on macOS — Linux enables and disables
+    /// autostart from packaging hooks instead (task 4), so it never needs
+    /// this file, and never writes one.
+    #[cfg(target_os = "macos")]
+    fn first_launch_marker() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{ENTRY_NAME}.first-launch")),
+        )
+    }
+
+    /// Pulls the path back out of the `<string>` inside `plist`'s
+    /// `ProgramArguments` array.
+    ///
+    /// Just enough of an XML "parser" for a file this module wrote itself in
+    /// the first place: `body` is never anything but the exact template
+    /// `plist` produces, never input from outside the app.
+    #[cfg(target_os = "macos")]
+    fn recorded_target(body: &str) -> Option<&str> {
+        let after_array = &body[body.find("<array>")? + "<array>".len()..];
+        let start = after_array.find("<string>")? + "<string>".len();
+        let end = after_array[start..].find("</string>")?;
+        Some(after_array[start..start + end].trim())
+    }
+
+    /// See [`super::Autostart::reconcile_first_launch`].
+    #[cfg(target_os = "macos")]
+    pub fn reconcile_first_launch(autostart: &super::Autostart) {
+        let Some(exe) = autostart.exe.as_deref() else {
+            return;
+        };
+
+        // A login item whose target no longer exists — most plausibly this
+        // exact app, deleted from `/Applications` by dragging it to the
+        // Trash, with nothing left behind to have disabled it first — is
+        // removed rather than left to fail silently at every future login.
+        if let Some(path) = entry_path() {
+            let stale = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|body| recorded_target(&body).map(str::to_owned))
+                .is_some_and(|target| !Path::new(&target).exists());
+            if stale {
+                tracing::warn!(
+                    "the login item points at a file that no longer exists; removing it"
+                );
+                if let Err(error) = disable() {
+                    tracing::warn!(%error, "could not remove the stale login item");
+                }
+            }
+        }
+
+        let Some(marker) = first_launch_marker() else {
+            return;
+        };
+        if marker.exists() {
+            return;
+        }
+        if !is_enabled() {
+            if let Err(error) = enable(exe) {
+                tracing::warn!(%error, "could not turn on autostart at first launch");
+            }
+        }
+        if let Err(error) = std::fs::write(&marker, b"") {
+            tracing::warn!(%error, "could not record that first launch ran");
+        }
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::recorded_target;
+
+        /// Pulls the path back out of a plist this same module wrote,
+        /// exactly the shape `reconcile_first_launch` reads back at every
+        /// startup.
+        #[test]
+        fn reads_the_path_written_into_the_program_arguments_array() {
+            let body = super::plist(std::path::Path::new("/Applications/Lumepeer.app/lumepeer"));
+            assert_eq!(
+                recorded_target(&body),
+                Some("/Applications/Lumepeer.app/lumepeer")
+            );
+        }
+
+        /// A file that is not a plist this module wrote — empty, or missing
+        /// the array entirely — is "no target", not a panic.
+        #[test]
+        fn is_none_without_a_program_arguments_array() {
+            assert_eq!(recorded_target(""), None);
+            assert_eq!(recorded_target("<plist><dict/></plist>"), None);
+        }
     }
 }
 
