@@ -164,6 +164,8 @@ export type TranslationKey =
   | 'chat.close'
   | 'files.heading'
   | 'files.send'
+  | 'files.sendClipboard'
+  | 'files.fromClipboard'
   | 'files.accept'
   | 'files.decline'
   | 'files.cancel'
@@ -446,6 +448,8 @@ const en: Dictionary = {
   'chat.close': 'Close chat',
   'files.heading': 'Files',
   'files.send': 'Send a file',
+  'files.sendClipboard': 'Send clipboard files',
+  'files.fromClipboard': 'From clipboard',
   'files.accept': 'Accept',
   'files.decline': 'Decline',
   'files.cancel': 'Cancel',
@@ -730,6 +734,8 @@ const ar: Dictionary = {
   'chat.close': 'إغلاق المحادثة',
   'files.heading': 'الملفات',
   'files.send': 'إرسال ملف',
+  'files.sendClipboard': 'إرسال ملفات الحافظة',
+  'files.fromClipboard': 'من الحافظة',
   'files.accept': 'قبول',
   'files.decline': 'رفض',
   'files.cancel': 'إلغاء',

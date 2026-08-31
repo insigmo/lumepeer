@@ -245,6 +245,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::clipboard_push,
         commands::clipboard_pull,
         commands::file_offer,
+        commands::file_offer_clipboard,
         commands::file_accept,
         commands::file_abort,
         commands::file_transfers,
