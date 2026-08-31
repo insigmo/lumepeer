@@ -1420,20 +1420,57 @@ pub async fn file_offer(
     Ok(())
 }
 
+/// Offers this node's own clipboard file list to `peer` (docs/bugs/
+/// 14-clipboard-files.md #2).
+///
+/// No dialog runs here: the list comes from the OS clipboard itself, on its
+/// own dedicated thread, never through anything the webview names. What
+/// crosses the IPC boundary in the other direction is names and sizes, same
+/// as an ordinary offer — never a path on this machine (§15).
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed, the session holds no
+/// `file_transfer` grant, or the peer is too old to understand a clipboard
+/// file offer.
+#[tauri::command]
+pub async fn file_offer_clipboard(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
+    state.network.file_offer_clipboard(peer).await?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FileAcceptArgs {
     /// Pseudonymized label of the session partner.
     pub peer: String,
     /// Whether to take the file.
     pub accept: bool,
+    /// Whether the offer being answered came from the peer's clipboard
+    /// (docs/bugs/14-clipboard-files.md #3), as the panel showed it.
+    ///
+    /// Only ever changes which picker this command runs, never what the
+    /// actor authorizes: a clipboard-sourced offer always lands in this
+    /// node's own clipboard-receive directory regardless of what this field
+    /// says, and a lie here in either direction costs at most an
+    /// unnecessary dialog or a clean refusal, never a widened grant.
+    #[serde(default)]
+    pub from_clipboard: bool,
 }
 
-/// Answers the oldest offer `peer` made (§9.2).
+/// Answers the oldest offer `peer` made (§9.2; docs/bugs/
+/// 14-clipboard-files.md #3).
 ///
-/// On an acceptance the OS directory picker runs here, for the same reason
-/// the file picker does. The *receiving* user chooses where the file lands;
-/// the sender only ever chose a name, and that name is normalized to a
-/// basename before it is ever joined to the chosen directory.
+/// On an acceptance of an ordinary offer, the OS directory picker runs here,
+/// for the same reason the file picker does: the *receiving* user chooses
+/// where the file lands, and the sender only ever chose a name, normalized
+/// to a basename before it is ever joined to the chosen directory. A
+/// clipboard-sourced offer skips the picker entirely — it always lands in
+/// this node's own clipboard-receive directory, so a paste has something to
+/// point at.
 ///
 /// # Errors
 /// [`IpcError`] when the window is not allowed, there is no offer to answer,
@@ -1446,7 +1483,7 @@ pub async fn file_accept(
     args: FileAcceptArgs,
 ) -> Result<(), IpcError> {
     check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
-    let directory = if args.accept {
+    let directory = if args.accept && !args.from_clipboard {
         let Some(directory) = pick_directory(&app).await else {
             // The picker was dismissed: nothing has been answered yet, so the
             // offer is still there to accept or decline. Saying "declined"

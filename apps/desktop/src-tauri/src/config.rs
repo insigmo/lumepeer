@@ -289,6 +289,21 @@ pub fn recordings_dir() -> Option<PathBuf> {
     data_dir().map(|base| base.join("recordings"))
 }
 
+/// Directory a completed clipboard file receive lands in, so the paste it
+/// exists to serve actually has something on disk to point at (docs/bugs/
+/// 14-clipboard-files.md #3; ADR 0047).
+///
+/// Under the per-user data directory like `recordings_dir`, for the same
+/// reason: this is application working storage, not a place the untrusted
+/// view layer names. Ephemeral rather than a user-facing library — every
+/// per-peer subdirectory under it is removed when that peer's session ends,
+/// and the whole thing is swept once at startup in case a previous run never
+/// got to.
+#[must_use]
+pub fn clipboard_files_dir() -> Option<PathBuf> {
+    data_dir().map(|base| base.join("clipboard-files"))
+}
+
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

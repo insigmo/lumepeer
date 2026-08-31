@@ -4025,7 +4025,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "axum",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "argon2",
  "blake3",
@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "libc",
@@ -4080,16 +4080,21 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "arboard",
+ "clipboard-win",
  "ed25519-dalek 2.2.0",
  "iroh",
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
  "lumepeer-service",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "percent-encoding",
  "postcard",
  "rand 0.10.2",
  "serde",
@@ -4107,11 +4112,12 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "winreg 0.56.0",
+ "x11-clipboard",
 ]
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -4129,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "ashpd",
  "blake3",
@@ -4159,7 +4165,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -4185,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-service"
-version = "0.0.34"
+version = "0.0.36"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -9908,6 +9914,16 @@ checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
 dependencies = [
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "x11-clipboard"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "662d74b3d77e396b8e5beb00b9cad6a9eccf40b2ef68cc858784b14c41d535a3"
+dependencies = [
+ "libc",
+ "x11rb 0.13.2",
 ]
 
 [[package]]

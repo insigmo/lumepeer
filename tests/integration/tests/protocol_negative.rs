@@ -195,6 +195,70 @@ async fn a_transfer_start_past_its_bounds_is_refused_on_a_live_connection() {
     }
 }
 
+/// §9.2, §18: a clipboard file list is untrusted input exactly like a
+/// `FileOffer`, and the same two bounds are enforced on a live connection
+/// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clipboard_file_offer_past_its_bounds_is_refused_on_a_live_connection() {
+    use lumepeer_core::constants::CLIPBOARD_FILE_LIST_MAX_ENTRIES;
+    use lumepeer_core::protocol::ClipboardFileEntry;
+
+    for kind in [
+        MessageKind::ClipboardFileOffer {
+            files: (0..=CLIPBOARD_FILE_LIST_MAX_ENTRIES)
+                .map(|i| ClipboardFileEntry {
+                    name: format!("file-{i}.bin"),
+                    size: 1,
+                })
+                .collect(),
+        },
+        MessageKind::ClipboardFileOffer {
+            files: vec![ClipboardFileEntry {
+                name: "n".repeat(FILE_NAME_MAX_BYTES + 1),
+                size: 1,
+            }],
+        },
+        MessageKind::ClipboardFileOffer {
+            files: vec![ClipboardFileEntry {
+                name: "big.bin".to_owned(),
+                size: FILE_OFFER_MAX_BYTES + 1,
+            }],
+        },
+    ] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        control.send(kind).await.unwrap();
+
+        let refused = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, NetError::Framing(CoreError::Malformed)),
+            "an over-limit clipboard file offer was accepted: {refused:?}"
+        );
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
+}
+
 /// The mirror of the test above: at the bound, both messages are ordinary
 /// traffic. A limit that also refused the largest legal value would be a
 /// different limit.

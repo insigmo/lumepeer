@@ -29,11 +29,13 @@ const PEER = 'guest-ab12';
 
 function commands(): FileCommands & {
   offer: ReturnType<typeof vi.fn>;
+  offerClipboard: ReturnType<typeof vi.fn>;
   accept: ReturnType<typeof vi.fn>;
   abort: ReturnType<typeof vi.fn>;
 } {
   return {
     offer: vi.fn().mockResolvedValue(undefined),
+    offerClipboard: vi.fn().mockResolvedValue(undefined),
     accept: vi.fn().mockResolvedValue(undefined),
     abort: vi.fn().mockResolvedValue(undefined),
     list: vi.fn().mockResolvedValue({ offers: [], transfers: [] }),
@@ -48,6 +50,7 @@ const running: TransferRow = {
   moved: 512,
   incoming: true,
   state: 'running',
+  from_clipboard: false,
 };
 
 const session: SessionStatus = {
@@ -82,20 +85,32 @@ function draw(data: FileTransfers, cmds: FileCommands): void {
 describe('an incoming offer', () => {
   it('is not taken until someone presses accept', () => {
     const cmds = commands();
-    draw({ offers: [{ peer_label: PEER, name: 'report.pdf', size: 4096 }], transfers: [] }, cmds);
+    draw(
+      {
+        offers: [{ peer_label: PEER, name: 'report.pdf', size: 4096, from_clipboard: false }],
+        transfers: [],
+      },
+      cmds,
+    );
 
     expect(container.querySelector('[data-testid="file-offer"]')).not.toBeNull();
     expect(cmds.accept).not.toHaveBeenCalled();
 
     container.querySelector<HTMLButtonElement>('[data-testid="file-accept"]')?.click();
-    expect(cmds.accept).toHaveBeenCalledWith(PEER, true);
+    expect(cmds.accept).toHaveBeenCalledWith(PEER, true, false);
   });
 
   it('carries the direction the button says when it is declined', () => {
     const cmds = commands();
-    draw({ offers: [{ peer_label: PEER, name: 'report.pdf', size: 4096 }], transfers: [] }, cmds);
+    draw(
+      {
+        offers: [{ peer_label: PEER, name: 'report.pdf', size: 4096, from_clipboard: false }],
+        transfers: [],
+      },
+      cmds,
+    );
     container.querySelector<HTMLButtonElement>('[data-testid="file-decline"]')?.click();
-    expect(cmds.accept).toHaveBeenCalledWith(PEER, false);
+    expect(cmds.accept).toHaveBeenCalledWith(PEER, false, false);
   });
 
   it('shows only the offers of this session', () => {
@@ -103,8 +118,8 @@ describe('an incoming offer', () => {
     draw(
       {
         offers: [
-          { peer_label: PEER, name: 'mine.pdf', size: 1 },
-          { peer_label: 'guest-9999', name: 'someone-elses.pdf', size: 1 },
+          { peer_label: PEER, name: 'mine.pdf', size: 1, from_clipboard: false },
+          { peer_label: 'guest-9999', name: 'someone-elses.pdf', size: 1, from_clipboard: false },
         ],
         transfers: [],
       },
@@ -113,6 +128,32 @@ describe('an incoming offer', () => {
     expect(container.querySelectorAll('[data-testid="file-offer"]')).toHaveLength(1);
     expect(container.textContent).toContain('mine.pdf');
     expect(container.textContent).not.toContain('someone-elses.pdf');
+  });
+
+  it('is tagged and answered with from_clipboard when it came from the clipboard', () => {
+    const cmds = commands();
+    draw(
+      {
+        offers: [{ peer_label: PEER, name: 'photo.png', size: 4096, from_clipboard: true }],
+        transfers: [],
+      },
+      cmds,
+    );
+    expect(container.querySelector('[data-testid="file-clipboard-tag"]')).not.toBeNull();
+    container.querySelector<HTMLButtonElement>('[data-testid="file-accept"]')?.click();
+    expect(cmds.accept).toHaveBeenCalledWith(PEER, true, true);
+  });
+
+  it('shows no clipboard tag for an ordinary offer', () => {
+    const cmds = commands();
+    draw(
+      {
+        offers: [{ peer_label: PEER, name: 'report.pdf', size: 4096, from_clipboard: false }],
+        transfers: [],
+      },
+      cmds,
+    );
+    expect(container.querySelector('[data-testid="file-clipboard-tag"]')).toBeNull();
   });
 });
 
@@ -148,6 +189,17 @@ describe('the send button', () => {
     expect(cmds.offer).toHaveBeenCalledTimes(1);
     // One argument only: the peer. A path would mean the webview had one.
     expect(cmds.offer.mock.calls[0]).toHaveLength(1);
+  });
+});
+
+describe('the send-from-clipboard button', () => {
+  it('asks the Rust side to read the clipboard, and supplies no path itself', () => {
+    const cmds = commands();
+    draw({ offers: [], transfers: [] }, cmds);
+    container.querySelector<HTMLButtonElement>('[data-testid="file-send-clipboard"]')?.click();
+    expect(cmds.offerClipboard).toHaveBeenCalledWith(PEER);
+    expect(cmds.offerClipboard).toHaveBeenCalledTimes(1);
+    expect(cmds.offerClipboard.mock.calls[0]).toHaveLength(1);
   });
 });
 
@@ -209,13 +261,22 @@ describe('presentation', () => {
       render(
         fileTransferPanel(
           PEER,
-          { offers: [{ peer_label: PEER, name: 'report.pdf', size: 10 }], transfers: [running] },
+          {
+            offers: [{ peer_label: PEER, name: 'report.pdf', size: 10, from_clipboard: false }],
+            transfers: [running],
+          },
           locale,
           commands(),
         ),
         container,
       );
-      for (const testid of ['file-send', 'file-accept', 'file-decline', 'file-cancel']) {
+      for (const testid of [
+        'file-send',
+        'file-send-clipboard',
+        'file-accept',
+        'file-decline',
+        'file-cancel',
+      ]) {
         const button = container.querySelector<HTMLButtonElement>(`[data-testid="${testid}"]`);
         expect(button, `${testid} missing in ${locale}`).not.toBeNull();
         expect(button?.tagName).toBe('BUTTON');

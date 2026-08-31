@@ -1,4 +1,4 @@
-//! This machine's own clipboard (design doc §9.2; ADR 0030, ADR 0046).
+//! This machine's own clipboard (design doc §9.2; ADR 0030, ADR 0047).
 //!
 //! One worker, used the same way whichever role a session gives this node:
 //! a host reads its own clipboard for a guest holding `clipboard_read`, and
@@ -27,7 +27,19 @@
 //! The [`OsClipboard`] seam exists for the same reason [`crate::view::
 //! HostMedia`] does: CI has no display, `arboard` needs one, and a test that
 //! cannot run headless is a test that stops running.
+//!
+//! **File lists are a separate capability from text, read on this same
+//! thread** (docs/bugs/14-clipboard-files.md #1; ADR 0047). `arboard` has no
+//! notion of a file list at all, so [`OsClipboard::read_file_paths`] and
+//! [`OsClipboard::write_file_paths`] go straight to a platform-specific
+//! implementation per target, each chosen to add no new dependency *version*
+//! to the tree — only a direct edge onto one `arboard` itself already pulls
+//! in transitively on that platform (see the `platform` module below and the
+//! ADR for the full comparison). Reading a file list is exactly the same kind
+//! of round trip reading text is, so it is never done from the actor loop
+//! either.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -81,6 +93,27 @@ pub trait OsClipboard {
     /// [`ClipboardError`] when the platform has no clipboard or refused the
     /// write; the caller logs and moves on.
     fn write_text(&mut self, text: &str) -> Result<(), ClipboardError>;
+
+    /// The clipboard's current list of file paths (docs/bugs/
+    /// 14-clipboard-files.md #1), or `None` when it holds something else,
+    /// nothing, or could not be read.
+    ///
+    /// Bounded by `CLIPBOARD_FILE_LIST_MAX_ENTRIES` and
+    /// `CLIPBOARD_FILE_PATH_MAX_BYTES` before this returns: a clipboard's file
+    /// list is untrusted input — another local application's, not this
+    /// user's own typed text — exactly the allocation-DoS shape §9.1 already
+    /// guards against on the wire, applied here to what a foreign process on
+    /// this same machine can hand the clipboard.
+    fn read_file_paths(&mut self) -> Option<Vec<PathBuf>>;
+
+    /// Places `paths` on the clipboard as a file list, so a paste in the
+    /// user's own file manager actually produces them (docs/bugs/
+    /// 14-clipboard-files.md #3).
+    ///
+    /// # Errors
+    /// [`ClipboardError`] when the platform has no clipboard or refused the
+    /// write.
+    fn write_file_paths(&mut self, paths: &[PathBuf]) -> Result<(), ClipboardError>;
 }
 
 /// Builds an [`OsClipboard`] on the thread that will own it.
@@ -153,6 +186,346 @@ impl OsClipboard for ArboardClipboard {
         }
         result
     }
+
+    fn read_file_paths(&mut self) -> Option<Vec<PathBuf>> {
+        platform::read_file_paths()
+    }
+
+    fn write_file_paths(&mut self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        platform::write_file_paths(paths)
+    }
+}
+
+/// Platform-specific file-list access (docs/bugs/14-clipboard-files.md #1).
+///
+/// `arboard` covers none of these three formats at all — it is text (and,
+/// behind a feature this workspace does not enable, images) only. Rather than
+/// add a general-purpose clipboard crate on top of the one already in the
+/// tree, each arm below calls the lowest-level crate that already exists at
+/// the version `arboard`'s own backend pulls in on that platform, so nothing
+/// here adds a *new* dependency version to `Cargo.lock` — only a direct edge
+/// onto one this process already links transitively. See ADR 0047 for the
+/// full comparison against a general-purpose alternative.
+#[cfg(target_os = "windows")]
+mod platform {
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
+
+    use clipboard_win::formats::{CF_HDROP, FileList};
+    use lumepeer_core::constants::{
+        CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_FILE_PATH_MAX_BYTES,
+    };
+
+    use super::ClipboardError;
+
+    /// A generous ceiling on the whole `CF_HDROP` block, checked before
+    /// `clipboard-win` walks it: `DROPFILES`'s own header plus
+    /// `CLIPBOARD_FILE_LIST_MAX_ENTRIES` UTF-16 paths of
+    /// `CLIPBOARD_FILE_PATH_MAX_BYTES` bytes each, doubled for UTF-16 and
+    /// given headroom for the header and the terminating nulls.
+    fn max_hdrop_bytes() -> usize {
+        CLIPBOARD_FILE_LIST_MAX_ENTRIES * CLIPBOARD_FILE_PATH_MAX_BYTES * 2 + 4096
+    }
+
+    /// `CF_HDROP` via `clipboard-win`, the exact crate (and pinned version)
+    /// `arboard`'s own Windows text backend already depends on.
+    ///
+    /// The byte-length check runs before `clipboard-win` allocates a single
+    /// `PathBuf`: an absurd `CF_HDROP` block is untrusted input from whichever
+    /// other local process currently owns the clipboard, so it is bounded the
+    /// same way an oversized wire frame is (§9.1). The per-path length check
+    /// afterwards cannot happen any earlier — `clipboard-win`'s `FileList`
+    /// getter has no lower-level entry point that yields one path at a time —
+    /// so it is the second, narrower gate rather than the only one.
+    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+        let byte_len = clipboard_win::raw::size(CF_HDROP).map_or(0, NonZeroUsize::get);
+        if byte_len == 0 {
+            // No `CF_HDROP` format on the clipboard at all: not files, and
+            // not an error either.
+            return None;
+        }
+        if byte_len > max_hdrop_bytes() {
+            tracing::warn!(byte_len, "refusing an oversized clipboard file list");
+            return None;
+        }
+        let mut paths = match clipboard_win::get_clipboard::<Vec<PathBuf>, _>(FileList) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::debug!(%error, "clipboard file list read skipped this round");
+                return None;
+            }
+        };
+        if paths.len() > CLIPBOARD_FILE_LIST_MAX_ENTRIES {
+            tracing::warn!(
+                count = paths.len(),
+                "refusing a clipboard file list past the entry limit"
+            );
+            return None;
+        }
+        paths.retain(|path| path.as_os_str().len() <= CLIPBOARD_FILE_PATH_MAX_BYTES);
+        if paths.is_empty() { None } else { Some(paths) }
+    }
+
+    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        let strings: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        // `set_clipboard`'s generic `Setter` bound needs a `Sized` value type,
+        // which a slice is not; `raw::set_file_list` is the same operation
+        // one level down, over an explicitly held clipboard guard instead.
+        let _clip = clipboard_win::Clipboard::new_attempts(10)
+            .map_err(|error| ClipboardError::Refused(error.to_string()))?;
+        clipboard_win::raw::set_file_list(&strings)
+            .map_err(|error| ClipboardError::Refused(error.to_string()))
+    }
+}
+
+/// macOS: `NSPasteboardTypeFileURL` via `NSPasteboard`, through `objc2-app-
+/// kit` and `objc2-foundation` — the same crates (and pinned versions)
+/// `arboard`'s own macOS text backend already depends on.
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::path::PathBuf;
+
+    use lumepeer_core::constants::{
+        CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_FILE_PATH_MAX_BYTES,
+    };
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+
+    use super::ClipboardError;
+
+    fn file_url_type() -> &'static objc2_app_kit::NSPasteboardType {
+        // SAFETY: a documented Apple Foundation/AppKit `extern` global,
+        // initialized by the framework before any Objective-C runtime call
+        // can observe it; objc2's generated binding has no safe accessor for
+        // a foreign static (same shape as `SendSAS` in `crates/media/src/
+        // sas.rs`, justified there against ADR 0012's standard).
+        #[allow(
+            unsafe_code,
+            reason = "reading an extern \"C\" static from objc2's generated AppKit \
+                      binding has no safe wrapper; same justification standard as \
+                      SendInput/SendSAS (ADR 0012)"
+        )]
+        unsafe {
+            NSPasteboardTypeFileURL
+        }
+    }
+
+    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        let items = pasteboard.pasteboardItems()?;
+        // Checked before this side allocates a single `PathBuf`: the
+        // pasteboard is untrusted input from whichever other local
+        // application last owned it (§9.1's allocation bound, applied here).
+        if items.count() > CLIPBOARD_FILE_LIST_MAX_ENTRIES {
+            tracing::warn!(
+                count = items.count(),
+                "refusing a clipboard file list past the entry limit"
+            );
+            return None;
+        }
+        let file_url_type = file_url_type();
+        let mut paths = Vec::new();
+        for item in items.iter() {
+            let Some(value) = item.stringForType(file_url_type) else {
+                continue;
+            };
+            let url_string = value.to_string();
+            if url_string.len() > CLIPBOARD_FILE_PATH_MAX_BYTES {
+                continue;
+            }
+            if let Some(path) = file_url_to_path(&url_string) {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() { None } else { Some(paths) }
+    }
+
+    /// `file:///a/b%20c` -> `/a/b c`. Percent-decodes the path component of a
+    /// `file://` URL; anything that is not that scheme is refused rather than
+    /// guessed at.
+    fn file_url_to_path(url: &str) -> Option<PathBuf> {
+        let path = url.strip_prefix("file://")?;
+        let decoded = percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .ok()?;
+        Some(PathBuf::from(decoded.into_owned()))
+    }
+
+    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let urls: Vec<objc2::rc::Retained<NSURL>> = paths
+            .iter()
+            .map(|path| NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy())))
+            .collect();
+        let objects: Vec<
+            objc2::rc::Retained<
+                objc2::runtime::ProtocolObject<dyn objc2_app_kit::NSPasteboardWriting>,
+            >,
+        > = urls
+            .iter()
+            .map(|url| objc2::runtime::ProtocolObject::from_ref(url.as_ref()).into())
+            .collect();
+        let array = NSArray::from_retained_slice(&objects);
+        if pasteboard.writeObjects(&array) {
+            Ok(())
+        } else {
+            Err(ClipboardError::Refused(
+                "NSPasteboard refused the file list".to_owned(),
+            ))
+        }
+    }
+}
+
+/// Linux (X11, and Wayland through XWayland): `text/uri-list` on the
+/// `CLIPBOARD` selection, through `x11-clipboard` — a small, purpose-built
+/// crate over `x11rb` at the same major version `arboard`'s own Linux text
+/// backend already depends on, so this adds no new *version* of `x11rb` to
+/// the tree.
+///
+/// The same limitation `arboard`'s own text backend already has on Linux:
+/// there is no native Wayland clipboard protocol implementation here, only
+/// the X11 selection mechanism, which a pure-Wayland compositor with no
+/// XWayland compatibility layer does not serve. That is an existing gap this
+/// task does not widen.
+#[cfg(target_os = "linux")]
+mod platform {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use lumepeer_core::constants::{
+        CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_FILE_PATH_MAX_BYTES,
+    };
+    use percent_encoding::AsciiSet;
+
+    use super::ClipboardError;
+
+    /// How long a read waits for the current selection owner to answer.
+    ///
+    /// A clipboard read is a round trip to another process (this module's own
+    /// header, and ADR 0027): a selection owner that is slow or wedged must
+    /// cost this poll one round, not hang the dedicated clipboard thread.
+    const SELECTION_TIMEOUT: Duration = Duration::from_millis(200);
+
+    /// Characters a `file://` URI's path component must not carry literally
+    /// (RFC 3986 `pchar`, minus the separators this code needs to keep
+    /// readable: `/ - . _ ~`).
+    const PATH_ENCODE_SET: &AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'/')
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+
+    fn context() -> Option<x11_clipboard::Clipboard> {
+        match x11_clipboard::Clipboard::new() {
+            Ok(clipboard) => Some(clipboard),
+            Err(error) => {
+                tracing::debug!(%error, "no X11 display for the clipboard file-list seam");
+                None
+            }
+        }
+    }
+
+    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+        let clipboard = context()?;
+        let uri_list = clipboard.get_atom("text/uri-list").ok()?;
+        let property = clipboard.getter.atoms.property;
+        let raw = clipboard
+            .load(
+                clipboard.getter.atoms.clipboard,
+                uri_list,
+                property,
+                SELECTION_TIMEOUT,
+            )
+            .ok()?;
+        // Checked before this side allocates a single `PathBuf`: the
+        // selection owner is untrusted input from whichever other local
+        // application currently holds it (§9.1's allocation bound, applied
+        // here). A generous ceiling on the whole payload, mirroring the
+        // Windows `CF_HDROP` byte-length pre-check.
+        let max_bytes = CLIPBOARD_FILE_LIST_MAX_ENTRIES * (CLIPBOARD_FILE_PATH_MAX_BYTES + 16);
+        if raw.len() > max_bytes {
+            tracing::warn!(
+                byte_len = raw.len(),
+                "refusing an oversized clipboard file list"
+            );
+            return None;
+        }
+        let text = String::from_utf8_lossy(&raw);
+        let mut paths = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            // RFC 2483 `text/uri-list`: blank lines and `#`-comments are not
+            // entries.
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.len() > CLIPBOARD_FILE_PATH_MAX_BYTES {
+                continue;
+            }
+            if let Some(path) = uri_to_path(line) {
+                paths.push(path);
+            }
+            if paths.len() >= CLIPBOARD_FILE_LIST_MAX_ENTRIES {
+                break;
+            }
+        }
+        if paths.is_empty() { None } else { Some(paths) }
+    }
+
+    fn uri_to_path(uri: &str) -> Option<PathBuf> {
+        let path = uri.strip_prefix("file://")?;
+        let decoded = percent_encoding::percent_decode_str(path)
+            .decode_utf8()
+            .ok()?;
+        Some(PathBuf::from(decoded.into_owned()))
+    }
+
+    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        let clipboard = context().ok_or(ClipboardError::Unavailable)?;
+        let uri_list = clipboard
+            .get_atom("text/uri-list")
+            .map_err(|error| ClipboardError::Refused(error.to_string()))?;
+        let mut body = String::new();
+        for path in paths {
+            let encoded =
+                percent_encoding::utf8_percent_encode(&path.to_string_lossy(), PATH_ENCODE_SET);
+            body.push_str("file://");
+            for chunk in encoded {
+                body.push_str(chunk);
+            }
+            body.push_str("\r\n");
+        }
+        clipboard
+            .store(
+                clipboard.getter.atoms.clipboard,
+                uri_list,
+                body.into_bytes(),
+            )
+            .map_err(|error| ClipboardError::Refused(error.to_string()))
+    }
+}
+
+/// Any other target this workspace does not ship a desktop client for: no
+/// file-list support, exactly like the text path degrades when `arboard`
+/// itself has no backend.
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+mod platform {
+    use std::path::PathBuf;
+
+    use super::ClipboardError;
+
+    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+        None
+    }
+
+    pub fn write_file_paths(_paths: &[PathBuf]) -> Result<(), ClipboardError> {
+        Err(ClipboardError::Unavailable)
+    }
 }
 
 /// A machine with no clipboard: every read is empty and every write fails.
@@ -171,6 +544,14 @@ impl OsClipboard for NoClipboard {
     }
 
     fn write_text(&mut self, _text: &str) -> Result<(), ClipboardError> {
+        Err(ClipboardError::Unavailable)
+    }
+
+    fn read_file_paths(&mut self) -> Option<Vec<PathBuf>> {
+        None
+    }
+
+    fn write_file_paths(&mut self, _paths: &[PathBuf]) -> Result<(), ClipboardError> {
         Err(ClipboardError::Unavailable)
     }
 }
@@ -193,12 +574,25 @@ enum ClipboardJob {
     /// Put this text on the local clipboard (a peer's payload, already
     /// validated and authorized).
     Write(String),
+    /// Put this file list on the local clipboard — a completed receive's
+    /// paths, so pasting them actually works (docs/bugs/
+    /// 14-clipboard-files.md #3).
+    WriteFiles(Vec<PathBuf>),
+    /// Read the local clipboard's current file list, if it has one
+    /// (docs/bugs/14-clipboard-files.md #1). Answered on a oneshot rather
+    /// than through `on_change`: this is an on-demand request tied to one
+    /// IPC call, not a continuous watch like text's.
+    ReadFiles(tokio::sync::oneshot::Sender<Option<Vec<PathBuf>>>),
 }
 
 /// The actor's handle on the clipboard thread.
 ///
-/// Dropping it ends the thread: the job channel closes and the loop returns.
-#[derive(Debug)]
+/// Dropping every clone of it ends the thread: the job channel closes and
+/// the loop returns. `Clone` exists so a task spawned off the actor loop —
+/// reading the local clipboard's file list, which is a round trip like any
+/// other clipboard read (docs/bugs/14-clipboard-files.md #1) — can hold its
+/// own handle without borrowing the actor.
+#[derive(Debug, Clone)]
 pub struct ClipboardWorker {
     jobs: std::sync::mpsc::Sender<ClipboardJob>,
     /// Whether any live session currently permits reading this machine's
@@ -218,6 +612,34 @@ impl ClipboardWorker {
         if self.jobs.send(ClipboardJob::Write(text)).is_err() {
             tracing::debug!("the clipboard thread is gone; dropping an inbound payload");
         }
+    }
+
+    /// Asks the clipboard thread to place `paths` on the local clipboard as
+    /// a file list (docs/bugs/14-clipboard-files.md #3).
+    ///
+    /// Fire and forget, for the same reason [`Self::write`] is: a failed
+    /// write is logged by the thread that attempted it, and there is no
+    /// caller waiting on the outcome.
+    pub fn write_files(&self, paths: Vec<PathBuf>) {
+        if self.jobs.send(ClipboardJob::WriteFiles(paths)).is_err() {
+            tracing::debug!("the clipboard thread is gone; dropping a file-list payload");
+        }
+    }
+
+    /// Reads this machine's own clipboard file list, on the dedicated
+    /// thread, exactly once (docs/bugs/14-clipboard-files.md #1).
+    ///
+    /// Unlike text, file lists are not polled continuously: this answers one
+    /// on-demand request (a user action offering the local clipboard's
+    /// files to a peer), so `None` covers both "not files" and "the
+    /// clipboard thread is gone" alike — the caller's response to either is
+    /// the same, offering nothing.
+    pub async fn read_files(&self) -> Option<Vec<PathBuf>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.jobs.send(ClipboardJob::ReadFiles(reply)).is_err() {
+            return None;
+        }
+        rx.await.ok().flatten()
     }
 
     /// Turns polling on or off.
@@ -297,6 +719,16 @@ fn run(
                 }
                 continue;
             }
+            Ok(ClipboardJob::WriteFiles(paths)) => {
+                if let Err(error) = clipboard.write_file_paths(&paths) {
+                    tracing::debug!(%error, "could not apply a clipboard file-list payload");
+                }
+                continue;
+            }
+            Ok(ClipboardJob::ReadFiles(reply)) => {
+                let _ = reply.send(clipboard.read_file_paths());
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             // The actor dropped its handle: nothing left to serve.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
@@ -344,6 +776,8 @@ pub mod testing {
 
     use super::{ClipboardError, ClipboardFactory, OsClipboard};
 
+    use std::path::PathBuf;
+
     /// What a test clipboard holds and what has been done to it.
     #[derive(Debug, Default)]
     pub struct TestClipboardState {
@@ -355,6 +789,12 @@ pub mod testing {
         /// says an ungranted session must not read the user's clipboard at
         /// all, not read it and discard the result.
         pub reads: usize,
+        /// Current file list, as a test set it (docs/bugs/
+        /// 14-clipboard-files.md #1).
+        pub files: Option<Vec<PathBuf>>,
+        /// Every file list written to it, in order (docs/bugs/
+        /// 14-clipboard-files.md #3).
+        pub file_writes: Vec<Vec<PathBuf>>,
     }
 
     /// A test clipboard's shared state.
@@ -374,6 +814,17 @@ pub mod testing {
             let mut state = self.0.lock().unwrap();
             state.text = Some(text.to_owned());
             state.writes.push(text.to_owned());
+            Ok(())
+        }
+
+        fn read_file_paths(&mut self) -> Option<Vec<PathBuf>> {
+            self.0.lock().unwrap().files.clone()
+        }
+
+        fn write_file_paths(&mut self, paths: &[PathBuf]) -> Result<(), ClipboardError> {
+            let mut state = self.0.lock().unwrap();
+            state.files = Some(paths.to_vec());
+            state.file_writes.push(paths.to_vec());
             Ok(())
         }
     }
@@ -491,5 +942,35 @@ mod tests {
             clipboard.write_text("x"),
             Err(ClipboardError::Unavailable)
         ));
+        assert!(clipboard.read_file_paths().is_none());
+        assert!(matches!(
+            clipboard.write_file_paths(&[std::path::PathBuf::from("x")]),
+            Err(ClipboardError::Unavailable)
+        ));
+    }
+
+    /// docs/bugs/14-clipboard-files.md #1: a clipboard holding files reports
+    /// them, distinctly from a clipboard holding text or nothing.
+    #[test]
+    fn a_file_list_is_read_through_the_same_seam_as_text() {
+        let (factory, state) = fake();
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/report.pdf"),
+            std::path::PathBuf::from("/tmp/photo.png"),
+        ];
+        state.lock().unwrap().files = Some(paths.clone());
+        let mut clipboard = factory();
+        assert_eq!(clipboard.read_file_paths(), Some(paths));
+    }
+
+    /// docs/bugs/14-clipboard-files.md #3: a completed receive's paths are
+    /// put on this machine's own clipboard so pasting them actually works.
+    #[test]
+    fn received_file_paths_are_written_back_to_the_clipboard() {
+        let (factory, state) = fake();
+        let mut clipboard = factory();
+        let paths = vec![std::path::PathBuf::from("/tmp/inbox/report.pdf")];
+        assert!(clipboard.write_file_paths(&paths).is_ok());
+        assert_eq!(state.lock().unwrap().file_writes, vec![paths]);
     }
 }

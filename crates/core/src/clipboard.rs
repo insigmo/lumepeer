@@ -3,8 +3,14 @@
 //! The `ClipboardSync` message and its `CLIPBOARD_MAX_BYTES` limit already
 //! exist in the protocol; this module owns the *policy* around them:
 //!
-//! - Only plain UTF-8 text is ever exchanged — no images, no file lists
-//!   (§9.2 scope for v1).
+//! - Only plain UTF-8 text is ever exchanged through this module — no
+//!   images, no file lists (§9.2 scope for v1). Files copied onto a
+//!   clipboard now reach the peer too, but through a different door
+//!   entirely: `MessageKind::ClipboardFileOffer` and the `file_transfer`
+//!   grant [`permits_files`] checks below, never `clipboard_read`/
+//!   `clipboard_write` (docs/bugs/14-clipboard-files.md; ADR 0047). A
+//!   clipboard holding a file list is not text this module's `ClipboardSync`
+//!   state machine ever sees.
 //! - The payload limit is enforced on both sides before anything is stored
 //!   or forwarded, so a peer cannot smuggle an oversized paste through a
 //!   hand-built frame.
@@ -60,6 +66,21 @@ impl ClipboardFlow {
 #[must_use]
 pub const fn permits(grants: Grants, flow: ClipboardFlow) -> bool {
     grants.get(flow.grant())
+}
+
+/// Whether `grants` allow files to be offered through a clipboard file list
+/// at all (docs/bugs/14-clipboard-files.md #4; ADR 0047).
+///
+/// Deliberately not part of [`ClipboardFlow`]: a file list on the clipboard
+/// is a file transfer with a different entry point, not an extension of
+/// text sync, so it is gated on `file_transfer` and never on
+/// `clipboard_read`/`clipboard_write` — a host that turns clipboard sync off
+/// but leaves `file_transfer` on must still be able to paste a file, and a
+/// host that turns `file_transfer` off must not leak files through the
+/// clipboard just because a text grant happens to be live.
+#[must_use]
+pub const fn permits_files(grants: Grants) -> bool {
+    grants.get(IndependentGrant::FileTransfer)
 }
 
 /// Validates an outbound/inbound clipboard payload against §9.2.
@@ -218,6 +239,32 @@ mod tests {
         let full = Grants::from_role(crate::consent::Role::FullControl);
         assert!(!permits(full, ClipboardFlow::HostToGuest));
         assert!(!permits(full, ClipboardFlow::GuestToHost));
+    }
+
+    /// docs/bugs/14-clipboard-files.md #4: files through the clipboard run
+    /// under `file_transfer` alone. Neither clipboard grant, on its own or
+    /// together, substitutes for it, and `file_transfer` alone is
+    /// sufficient without either clipboard grant.
+    #[test]
+    fn clipboard_files_are_gated_on_file_transfer_alone() {
+        let mut clipboard_only = Grants::from_role(crate::consent::Role::ViewOnly);
+        clipboard_only.set(IndependentGrant::ClipboardRead, true);
+        clipboard_only.set(IndependentGrant::ClipboardWrite, true);
+        assert!(
+            !permits_files(clipboard_only),
+            "both clipboard grants without file_transfer must not permit files"
+        );
+
+        let mut file_transfer_only = Grants::from_role(crate::consent::Role::ViewOnly);
+        file_transfer_only.set(IndependentGrant::FileTransfer, true);
+        assert!(
+            permits_files(file_transfer_only),
+            "file_transfer alone must permit files, with no clipboard grant at all"
+        );
+
+        // A role implies nothing here either (§2.2).
+        let full = Grants::from_role(crate::consent::Role::FullControl);
+        assert!(!permits_files(full));
     }
 
     #[test]

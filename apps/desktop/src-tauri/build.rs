@@ -42,6 +42,7 @@ const COMMANDS: &[&str] = &[
     "clipboard_push",
     "clipboard_pull",
     "file_offer",
+    "file_offer_clipboard",
     "file_accept",
     "file_abort",
     "file_transfers",
