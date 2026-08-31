@@ -9,6 +9,7 @@ import { t } from './i18n';
 import {
   mountToolbar,
   renderToolbar,
+  scalePercentFor,
   type MonitorDto,
   type ToolbarCommands,
   type ToolbarControls,
@@ -44,6 +45,7 @@ function fakeCommands(): ToolbarCommands & {
   monitorSelect: ReturnType<typeof vi.fn>;
   clipboardPush: ReturnType<typeof vi.fn>;
   fileOffer: ReturnType<typeof vi.fn>;
+  viewSetScale: ReturnType<typeof vi.fn>;
 } {
   const commands = {
     micToggle: vi.fn().mockResolvedValue(undefined),
@@ -54,6 +56,7 @@ function fakeCommands(): ToolbarCommands & {
     sasAvailable: vi.fn().mockResolvedValue(true),
     monitorsList: vi.fn().mockResolvedValue(MONITORS),
     monitorSelect: vi.fn().mockResolvedValue(undefined),
+    viewSetScale: vi.fn().mockResolvedValue(undefined),
   };
   return commands;
 }
@@ -134,6 +137,10 @@ function draw(
     sendClipboard: () => {},
     sendFile: () => {},
     pickMonitor: () => {},
+    pickResolution: (option) => {
+      state.resolution = option;
+      draw(state, commands, hooks);
+    },
     beginDrag: () => {},
     nudge: () => {},
   });
@@ -376,6 +383,173 @@ describe('the floating session toolbar', () => {
     draw(state);
     const button = container.querySelector('[data-testid="toolbar-monitors"]');
     expect(button?.textContent).toContain('2');
+  });
+
+  describe('scalePercentFor', () => {
+    const monitor = (width: number, height: number): MonitorDto => ({
+      id: 0,
+      width,
+      height,
+      primary: true,
+    });
+
+    it('native is always 100%, regardless of the monitor', () => {
+      expect(scalePercentFor('native', undefined)).toBe(100);
+      expect(scalePercentFor('native', monitor(1920, 1080))).toBe(100);
+    });
+
+    it('half is always the ABR floor, regardless of the monitor', () => {
+      expect(scalePercentFor('half', undefined)).toBe(50);
+      expect(scalePercentFor('half', monitor(3840, 2160))).toBe(50);
+    });
+
+    it('1080p and 720p are worked out from the monitor height', () => {
+      expect(scalePercentFor('1080p', monitor(2560, 1440))).toBe(75);
+      expect(scalePercentFor('720p', monitor(1920, 1080))).toBe(67);
+    });
+
+    it('a target at or above the monitor height makes no sense and is refused', () => {
+      // 1080p against a 1080p (or shorter) screen: there is nothing to cap.
+      expect(scalePercentFor('1080p', monitor(1920, 1080))).toBeNull();
+      expect(scalePercentFor('1080p', monitor(1280, 800))).toBeNull();
+      expect(scalePercentFor('720p', monitor(1280, 720))).toBeNull();
+    });
+
+    it('a target that would fall under the ABR floor is refused rather than clamped', () => {
+      // A 4K screen cannot reach 720p without a ceiling under 50%.
+      expect(scalePercentFor('720p', monitor(3840, 2160))).toBeNull();
+    });
+
+    it('an unknown monitor size offers nothing size-dependent', () => {
+      expect(scalePercentFor('1080p', undefined)).toBeNull();
+      expect(scalePercentFor('720p', undefined)).toBeNull();
+    });
+  });
+
+  it('offers only the resolutions the watched monitor can actually reach', () => {
+    const state = {
+      collapsed: false,
+      openPopover: 'settings' as const,
+      monitors: [{ id: 0, width: 1920, height: 1080, primary: true }],
+      activeMonitor: 0,
+    } as unknown as Parameters<typeof renderToolbar>[1];
+    draw(state);
+    const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-resolution"]');
+    expect(select).not.toBeNull();
+    // 1080p is not offered against a 1080p screen (task 4.2): there is
+    // nothing for it to cap.
+    expect(Array.from(select?.options ?? []).map((option) => option.value)).toEqual([
+      'native',
+      '720p',
+      'half',
+    ]);
+  });
+
+  it('offers 1080p once the watched monitor is tall enough for it to mean something', () => {
+    const state = {
+      collapsed: false,
+      openPopover: 'settings' as const,
+      monitors: [{ id: 0, width: 2560, height: 1440, primary: true }],
+      activeMonitor: 0,
+    } as unknown as Parameters<typeof renderToolbar>[1];
+    draw(state);
+    const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-resolution"]');
+    expect(Array.from(select?.options ?? []).map((option) => option.value)).toEqual([
+      'native',
+      '1080p',
+      '720p',
+      'half',
+    ]);
+  });
+
+  it('offers only the size-independent choices before the monitor size is known', () => {
+    const state = {
+      collapsed: false,
+      openPopover: 'settings' as const,
+    } as Parameters<typeof renderToolbar>[1];
+    draw(state);
+    const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-resolution"]');
+    expect(Array.from(select?.options ?? []).map((option) => option.value)).toEqual([
+      'native',
+      'half',
+    ]);
+  });
+
+  it('picking a resolution asks the host for the percentage worked out from the watched monitor', async () => {
+    const commands = fakeCommands();
+    commands.monitorsList.mockResolvedValue([{ id: 0, width: 2560, height: 1440, primary: true }]);
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() =>
+        expect(
+          container.querySelectorAll('[data-testid="toolbar-resolution"] option').length,
+        ).toBeGreaterThan(2),
+      );
+      const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-resolution"]');
+      expect(select).not.toBeNull();
+      if (select) {
+        select.value = '1080p';
+        select.dispatchEvent(new Event('change'));
+      }
+      await vi.waitFor(() =>
+        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 75),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it('a monitor switch recalculates the resolution ceiling for the new screen', async () => {
+    const commands = fakeCommands();
+    commands.monitorsList.mockResolvedValue([
+      { id: 0, width: 2560, height: 1440, primary: true },
+      { id: 1, width: 1280, height: 800, primary: false },
+    ]);
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() =>
+        expect(
+          container.querySelectorAll('[data-testid="toolbar-resolution"] option').length,
+        ).toBeGreaterThan(2),
+      );
+      const select = () =>
+        container.querySelector<HTMLSelectElement>('[data-testid="toolbar-resolution"]');
+      if (select()) {
+        select()!.value = '1080p';
+        select()!.dispatchEvent(new Event('change'));
+      }
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 75));
+      commands.viewSetScale.mockClear();
+
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-monitors"]')?.click();
+      await vi.waitFor(() => {
+        const option = container.querySelectorAll('[data-testid="toolbar-monitor-option"]')[1];
+        expect(option).not.toBeUndefined();
+      });
+      container
+        .querySelectorAll<HTMLButtonElement>('[data-testid="toolbar-monitor-option"]')[1]
+        ?.click();
+      await vi.waitFor(() => expect(commands.monitorSelect).toHaveBeenCalledWith('host-ab12', 1));
+      // 1280x800 cannot reach 1080p at all: the ceiling falls back to native
+      // rather than silently keeping a value the new screen cannot honour.
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100));
+    } finally {
+      stop();
+    }
   });
 
   it('the CAD button is disabled when the host platform cannot deliver the SAS', () => {

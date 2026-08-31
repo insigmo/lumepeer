@@ -61,6 +61,14 @@ export interface ToolbarCommands {
   sasAvailable(): Promise<boolean>;
   monitorsList(peer: string): Promise<MonitorDto[]>;
   monitorSelect(peer: string, monitorId: number): Promise<void>;
+  /**
+   * Caps the picture at `scalePercent` of the host's own captured size
+   * (§11; D7, docs/bugs/13-stream-resolution.md).
+   *
+   * A ceiling, not a target: the host's own adaptive controller stays free
+   * to sit below it, and stays free to recover only up to it.
+   */
+  viewSetScale(peer: string, scalePercent: number): Promise<void>;
 }
 
 /** Default binding to the real IPC surface. */
@@ -104,7 +112,65 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // what the rest of this surface already uses (`since_us`, `code_required`).
     return invoke('monitor_select', { args: { peer, monitor_id: monitorId } });
   },
+  async viewSetScale(peer, scalePercent) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // `scale_percent`, not `scalePercent`: same snake_case boundary as
+    // `monitor_id` above.
+    return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent } });
+  },
 };
+
+/**
+ * Fixed, hardware-independent resolution choices the guest may cap the
+ * stream at (§11; D7, docs/bugs/13-stream-resolution.md task 4). Nothing is
+ * collected at install time: what each one maps to is worked out from the
+ * monitor size the host already announces via `monitors_list`.
+ *
+ * `25%` is not offered. §14's `ABR_MIN_SCALE_PERCENT` (50) is the floor below
+ * which text stops being readable, and the host's decoder enforces it on the
+ * wire — a raw 25% request would either be silently clamped to 50%, which
+ * makes the two options indistinguishable, or, worse, be refused as a
+ * malformed frame and end the session. Offering a choice this project's own
+ * floor cannot honour is worse than not offering it.
+ */
+export const RESOLUTION_OPTIONS = ['native', '1080p', '720p', 'half'] as const;
+export type ResolutionOption = (typeof RESOLUTION_OPTIONS)[number];
+
+/**
+ * Mirrors `crates/core/src/constants.rs::ABR_MIN_SCALE_PERCENT` (§11; ADR
+ * 0037). Not importable across the IPC boundary, so restated here with the
+ * same reasoning: below this, text on the remote screen is not readable.
+ */
+const MIN_SCALE_PERCENT = 50;
+
+/**
+ * The percentage `option` maps to for a host screen of `monitor`'s size, or
+ * `null` when it makes no sense for it: bigger than the monitor's own size
+ * (task 4.2 — a 1080p request against a 1280×1024 screen is meaningless), or
+ * a target so far below the monitor's own height that reaching it would
+ * need a ceiling under `MIN_SCALE_PERCENT` (a 4K screen cannot reach 720p
+ * this way without crossing that floor).
+ */
+export function scalePercentFor(
+  option: ResolutionOption,
+  monitor: MonitorDto | undefined,
+): number | null {
+  if (option === 'native') {
+    return 100;
+  }
+  if (option === 'half') {
+    return MIN_SCALE_PERCENT;
+  }
+  if (!monitor || monitor.height <= 0) {
+    return null;
+  }
+  const targetHeight = option === '1080p' ? 1080 : 720;
+  if (monitor.height <= targetHeight) {
+    return null;
+  }
+  const percent = Math.round((targetHeight / monitor.height) * 100);
+  return percent >= MIN_SCALE_PERCENT ? percent : null;
+}
 
 /** Render-side mirror of everything the toolbar shows. */
 export class ToolbarState {
@@ -120,6 +186,12 @@ export class ToolbarState {
   monitors: MonitorDto[] = [];
   /** Monitor currently being watched. */
   activeMonitor: number | null = null;
+  /**
+   * The stream-resolution ceiling picked for this session (§11; D7,
+   * docs/bugs/13-stream-resolution.md task 4). Persists across a monitor
+   * switch; the percentage it maps to is recalculated for the new screen.
+   */
+  resolution: ResolutionOption = 'native';
   /**
    * Whether a recording request has already been sent this session.
    *
@@ -224,6 +296,7 @@ export function renderToolbar(
     sendClipboard(): void;
     sendFile(): void;
     pickMonitor(id: number): void;
+    pickResolution(option: ResolutionOption): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
   },
@@ -234,6 +307,17 @@ export function renderToolbar(
   // same thing.
   const chatUnread = !chatOn && hooks.chatUnread();
   const monitorLabel = state.activeMonitor === null ? '1' : String(state.activeMonitor + 1);
+  // The watched monitor's own size, for filtering resolution options by it
+  // (task 4.2) — `null` until it is known, which keeps only `native` on
+  // offer rather than guessing. `state.monitors` defaults to `[]` on a real
+  // `ToolbarState`; the `?? []` only guards a test harness that built one by
+  // hand without it.
+  const activeMonitorInfo = (state.monitors ?? []).find(
+    (monitor) => monitor.id === (state.activeMonitor ?? 0),
+  );
+  const resolutionChoices = RESOLUTION_OPTIONS.filter(
+    (option) => scalePercentFor(option, activeMonitorInfo) !== null,
+  );
 
   const settingsPopover: TemplateResult =
     state.openPopover === 'settings'
@@ -250,6 +334,23 @@ export function renderToolbar(
                   (mode) =>
                     html`<option value=${mode} ?selected=${mode === hooks.displayMode()}>
                       ${t(locale, `toolbar.display.${mode}` as TranslationKeyAlias)}
+                    </option>`,
+                )}
+              </select>
+            </label>
+            <label class="toolbar-pop-row">
+              <span>${t(locale, 'toolbar.settings.resolution')}</span>
+              <select
+                data-testid="toolbar-resolution"
+                @change=${(event: Event) =>
+                  actions.pickResolution(
+                    (event.target as HTMLSelectElement).value as ResolutionOption,
+                  )}
+              >
+                ${resolutionChoices.map(
+                  (option) =>
+                    html`<option value=${option} ?selected=${option === state.resolution}>
+                      ${t(locale, `toolbar.resolution.${option}` as TranslationKeyAlias)}
                     </option>`,
                 )}
               </select>
@@ -533,7 +634,9 @@ export function mountToolbar(
     },
     openPopover(which: 'settings' | 'monitors' | null): void {
       state.openPopover = which;
-      if (which === 'monitors' && state.monitors.length === 0) {
+      // Settings needs the list too, to filter resolution options by the
+      // watched monitor's size (task 4.2) — not only the monitors popover.
+      if ((which === 'monitors' || which === 'settings') && state.monitors.length === 0) {
         void commands
           .monitorsList(peer)
           .then((monitors) => {
@@ -620,11 +723,37 @@ export function mountToolbar(
         .then(() => {
           state.activeMonitor = id;
           state.openPopover = null;
+          // The resolution choice persists across the switch, but the
+          // percentage it maps to does not: it was worked out from the old
+          // monitor's size (task 4.4). Recomputing for a screen that cannot
+          // reach it falls back to native rather than sending a ceiling the
+          // guest never actually asked for.
+          const monitor = state.monitors.find((entry) => entry.id === id);
+          const percent = scalePercentFor(state.resolution, monitor);
+          if (percent === null) {
+            state.resolution = 'native';
+            void commands.viewSetScale(peer, 100).catch(() => {});
+          } else {
+            void commands.viewSetScale(peer, percent).catch(() => {});
+          }
           draw();
         })
         .catch(() => {
           draw();
         });
+    },
+    pickResolution(option: ResolutionOption): void {
+      state.resolution = option;
+      const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
+      const percent = scalePercentFor(option, monitor);
+      if (percent !== null) {
+        void commands.viewSetScale(peer, percent).catch(() => {
+          // The host refused (grant gone, an old peer) or the session ended:
+          // the selector keeps showing what was asked for, and the picture
+          // simply does not change.
+        });
+      }
+      draw();
     },
     beginDrag(event: PointerEvent): void {
       if (event.button !== 0) {
