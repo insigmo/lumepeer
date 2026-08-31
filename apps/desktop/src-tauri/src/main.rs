@@ -138,10 +138,18 @@ fn setup_app(
         tracing::warn!("no usable update manifest URL configured; updates are off");
     }
     let notifications = network.subscribe();
+    let autostart = autostart::Autostart::for_this_app();
+    // A `.dmg` has no install script to turn autostart on from, so the app's
+    // own first launch is the only place left (`docs/bugs/
+    // 12-service-lifecycle.md` #4). Windows and Linux do this from their own
+    // installer instead — see `--enable-autostart` in `main` and
+    // `installer/hooks.nsh`.
+    #[cfg(target_os = "macos")]
+    autostart.enable_once_on_first_launch();
     app.manage(AppState {
         network,
         update_url,
-        autostart: autostart::Autostart::for_this_app(),
+        autostart,
     });
     runtime.spawn(watch_for_window_raising_notifications(
         app.handle().clone(),
@@ -272,7 +280,35 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
     ]
 }
 
+/// Toggles the per-user autostart entry and exits, without starting the app.
+///
+/// Backs `--enable-autostart`/`--disable-autostart`: a headless call into the
+/// same mechanism the settings panel drives (`autostart.rs`, ADR 0042), meant
+/// for a Linux package's `postinst`/`prerm` to invoke as the installing user
+/// (`docs/bugs/12-service-lifecycle.md` #4). No log file, no network, no
+/// window — this runs once from a packaging script and exits, it is not a
+/// second way to start the app.
+fn exit_after_autostart_toggle(enabled: bool) -> ! {
+    match autostart::Autostart::for_this_app().set(enabled) {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    // Checked before anything else in `main` sets up, because this path has
+    // to work with no config file, no log directory and no display.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--enable-autostart") {
+        exit_after_autostart_toggle(true);
+    }
+    if args.iter().any(|arg| arg == "--disable-autostart") {
+        exit_after_autostart_toggle(false);
+    }
+
     // Configuration first: it decides where the log file goes, and tracing has
     // to be installed before anything worth logging happens (§5.1, §16.1).
     let (settings, notes) = config::Settings::load();

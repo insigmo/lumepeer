@@ -32,6 +32,12 @@ const ENTRY_NAME: &str = "io.insigmo.lumepeer";
 /// Human-facing name of the registry value and the `.desktop` entry.
 const DISPLAY_NAME: &str = "Lumepeer";
 
+/// Marker file under the per-user data directory recording that this
+/// installation has already run its one-time macOS first-launch autostart
+/// enable (see [`Autostart::enable_once_on_first_launch`]).
+#[cfg(target_os = "macos")]
+const FIRST_LAUNCH_MARKER: &str = "autostart-first-launch-done";
+
 /// The autostart entry of this installation.
 #[derive(Debug, Clone)]
 pub struct Autostart {
@@ -86,6 +92,33 @@ impl Autostart {
         } else {
             platform::disable()
         }
+    }
+
+    /// Enables autostart exactly once, the first time this installation is
+    /// ever run, and never again — a later "off" is the user's own decision,
+    /// and ADR 0042's "off removes the entry" has to stick against this too.
+    ///
+    /// Only macOS calls this. A `.dmg` install is a drag to `/Applications`
+    /// with no install script to turn autostart on from
+    /// (`docs/bugs/12-service-lifecycle.md` #4), so the app's own first
+    /// launch is the only place left; Windows and Linux turn it on from their
+    /// own installer instead. Every failure here is silent on purpose: this
+    /// is a convenience default, not something worth surfacing an error for
+    /// on first run.
+    #[cfg(target_os = "macos")]
+    pub fn enable_once_on_first_launch(&self) {
+        let Some(marker) = crate::config::data_dir().map(|dir| dir.join(FIRST_LAUNCH_MARKER))
+        else {
+            return;
+        };
+        if marker.exists() {
+            return;
+        }
+        let _ = self.set(true);
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker, b"");
     }
 }
 
@@ -172,7 +205,7 @@ mod platform {
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
         let body = if cfg!(target_os = "macos") {
-            plist(exe)
+            plist(exe, &path)
         } else {
             desktop_entry(exe)
         };
@@ -194,7 +227,18 @@ mod platform {
     /// A `launchd` *agent*: it runs as the logged-in user, in that user's
     /// session. A daemon in `/Library/LaunchDaemons` would run before login
     /// and as root, which is the separate feature this module refuses.
-    fn plist(exe: &Path) -> String {
+    ///
+    /// `ProgramArguments` is a conditional shell line rather than the
+    /// executable directly. A `.dmg` install has no uninstall hook
+    /// (`docs/bugs/12-service-lifecycle.md` #4): dragging the `.app` to the
+    /// Trash leaves this plist behind, pointed at a path that no longer
+    /// exists. The only thing that ever runs again to notice that is
+    /// whatever launchd itself invokes at the next login, so the check has to
+    /// live here rather than in the app. The script text is a fixed literal
+    /// with no path spliced into it — `exe` and this plist's own path are
+    /// `sh`'s positional parameters instead, the same way
+    /// `std::process::Command::arg` keeps a path out of a shell's grammar.
+    pub(super) fn plist(exe: &Path, plist_path: &Path) -> String {
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -204,14 +248,20 @@ mod platform {
     <string>{ENTRY_NAME}</string>
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>if [ -e "$1" ]; then exec "$1"; else rm -f "$2"; fi</string>
+        <string>sh</string>
         <string>{exe}</string>
+        <string>{plist_path}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
 </dict>
 </plist>
 "#,
-            exe = exe.display()
+            exe = exe.display(),
+            plist_path = plist_path.display(),
         )
     }
 
@@ -236,6 +286,8 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
+    #[cfg(not(target_os = "windows"))]
+    use std::path::Path;
 
     /// A process that cannot find its own executable reports autostart as
     /// unavailable rather than writing an entry pointing at a guess.
@@ -245,6 +297,28 @@ mod tests {
         assert!(!autostart.available());
         assert!(!autostart.is_enabled());
         assert!(autostart.set(true).is_err());
+    }
+
+    /// The macOS LaunchAgent's `ProgramArguments` checks the app is still
+    /// there before running it, and removes its own plist otherwise, rather
+    /// than unconditionally pointing at a path a `.dmg` uninstall (a plain
+    /// drag to the Trash) may have made stale
+    /// (`docs/bugs/12-service-lifecycle.md` #4). Both paths are passed as
+    /// `sh`'s positional parameters, never spliced into the script text
+    /// itself.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn the_macos_agent_checks_the_app_exists_before_running_it() {
+        let exe = Path::new("/Applications/Lumepeer.app/Contents/MacOS/lumepeer-desktop");
+        let plist_path = Path::new("/Users/example/Library/LaunchAgents/io.insigmo.lumepeer.plist");
+        let body = platform::plist(exe, plist_path);
+
+        assert!(
+            body.contains(r#"if [ -e "$1" ]; then exec "$1"; else rm -f "$2"; fi"#),
+            "the script text itself must be a fixed literal with no interpolated path"
+        );
+        assert!(body.contains(&exe.display().to_string()));
+        assert!(body.contains(&plist_path.display().to_string()));
     }
 
     /// Turning it off when it is already off succeeds: the post-condition is

@@ -51,11 +51,15 @@
     "linux": {
       "deb": {
         "depends": ["libpipewire-0.3-0"],
-        "recommends": ["xdg-desktop-portal", "pipewire"]
+        "recommends": ["xdg-desktop-portal", "pipewire"],
+        "postInstallScript": "installer/linux/postinst.sh",
+        "preRemoveScript": "installer/linux/prerm.sh"
       },
       "rpm": {
         "depends": ["pipewire-libs"],
-        "recommends": ["xdg-desktop-portal", "pipewire"]
+        "recommends": ["xdg-desktop-portal", "pipewire"],
+        "postInstallScript": "installer/linux/postinst.sh",
+        "preRemoveScript": "installer/linux/prerm.sh"
       }
     }
   },
