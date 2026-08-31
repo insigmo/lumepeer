@@ -18,6 +18,7 @@ import { html, render, type TemplateResult } from 'lit-html';
 import type { Locale } from './i18n';
 import { t } from './i18n';
 import { SETTINGS_ICON } from './icons';
+import { CLIPBOARD_NOTE_MS } from './session-status';
 import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
 import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
@@ -33,15 +34,18 @@ export interface MonitorDto {
 export interface ToolbarCommands {
   micToggle(peer: string, on: boolean): Promise<void>;
   /**
-   * Offers this machine's clipboard to the host.
+   * The host's clipboard, if it changed since the last check.
    *
-   * Only ever called from the press below. A guest holds no clipboard grant
-   * of its own (ADR 0029), so nothing here decides that the host may have the
-   * text — the host's core does, against `clipboard_write`, when it arrives.
-   * What the press decides is the half that is the guest's to decide: whether
-   * to offer their own clipboard at all.
+   * Sending this window's own clipboard to the host no longer runs through
+   * this interface at all: a guest holds no clipboard grant of its own (ADR
+   * 0029), so it is never this window's to decide, and the Rust actor now
+   * reads and offers this machine's own clipboard by itself the moment it
+   * changes (docs/bugs/10-clipboard-auto.md #1; ADR 0046) — the same way the
+   * host side always has. What is left for this window is the *arrival*
+   * half: polled so the toolbar can say a sync happened, and the text is
+   * discarded the moment it is read (§15) — never rendered, logged or held.
    */
-  clipboardPush(peer: string, text: string): Promise<void>;
+  clipboardPull(peer: string): Promise<string | null>;
   /**
    * Opens the OS file picker on the Rust side and offers what was chosen.
    *
@@ -69,9 +73,11 @@ export const tauriToolbarCommands: ToolbarCommands = {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('mic_toggle', { args: { peer, on } });
   },
-  async clipboardPush(peer, text) {
+  async clipboardPull(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('clipboard_push', { args: { peer, text } });
+    // A bare `peer`, like `monitorsList`: the Rust command takes it as a
+    // command parameter, not a field of an `args` struct.
+    return (await invoke('clipboard_pull', { peer })) as string | null;
   },
   async fileOffer(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -129,6 +135,14 @@ export class ToolbarState {
    * whether a recording is running.
    */
   recordAsked = false;
+  /**
+   * When the host's clipboard last arrived, in `Date.now()` milliseconds, or
+   * `0` for never (docs/bugs/10-clipboard-auto.md #2; ADR 0046).
+   *
+   * The fact only — the text itself is never kept here or anywhere else in
+   * this module (§15). Mirrors `clipboardSyncedAt` in `main.ts`'s host panel.
+   */
+  clipboardSyncedAt = 0;
 }
 
 /** What the toolbar hands back to whoever mounted it, once, at mount. */
@@ -221,7 +235,6 @@ export function renderToolbar(
     toggleMic(): void;
     sendCad(): void;
     askToRecord(): void;
-    sendClipboard(): void;
     sendFile(): void;
     pickMonitor(id: number): void;
     beginDrag(event: PointerEvent): void;
@@ -387,16 +400,20 @@ export function renderToolbar(
         >
           ${ICONS.file}
         </button>
-        <button
-          type="button"
-          class="toolbar-btn"
+        <span
+          class="toolbar-btn toolbar-indicator"
           data-testid="toolbar-clipboard"
+          role="img"
           aria-label=${t(locale, 'toolbar.clipboard')}
           title=${t(locale, 'toolbar.clipboard')}
-          @click=${actions.sendClipboard}
         >
           ${ICONS.clipboard}
-        </button>
+        </span>
+        ${Date.now() - state.clipboardSyncedAt < CLIPBOARD_NOTE_MS
+          ? html`<span class="toolbar-clipboard-note" data-testid="toolbar-clipboard-note">
+              ${t(locale, 'status.clipboardSynced')}
+            </span>`
+          : html``}
         <button
           type="button"
           class="toolbar-btn ${state.recordAsked ? 'is-active' : ''}"
@@ -484,6 +501,17 @@ type TranslationKeyAlias = Parameters<typeof t>[1];
 const TOOLBAR_INSET = 8;
 
 /**
+ * How often this window asks whether the host's clipboard arrived
+ * (docs/bugs/10-clipboard-auto.md #2).
+ *
+ * Not the OS-facing poll — that one is `CLIPBOARD_POLL_INTERVAL_MS` in
+ * `crates/core/src/constants.rs`, on its own dedicated thread (ADR 0027).
+ * This is only how often this window's own IPC check runs, on the same
+ * cadence `startChatPolling`'s own default uses.
+ */
+const CLIPBOARD_SYNC_POLL_INTERVAL_MS = 1000;
+
+/**
  * Wires the toolbar to the DOM: render loop, drag, popovers, and IPC.
  *
  * Returns a stop function that removes the global listeners; the container
@@ -495,6 +523,7 @@ export function mountToolbar(
   peer: string,
   commands: ToolbarCommands,
   hooks: ToolbarHooks,
+  clipboardPollIntervalMs = CLIPBOARD_SYNC_POLL_INTERVAL_MS,
 ): () => void {
   const state = new ToolbarState();
   const root = container.closest('#view') ?? document.body;
@@ -601,19 +630,6 @@ export function mountToolbar(
         // nothing here claims otherwise.
       });
     },
-    sendClipboard(): void {
-      // The guest's own clipboard, read from the guest's own window on the
-      // guest's own press. The *host* clipboard is never reachable from a
-      // webview — that one is read and written by the Rust actor alone
-      // (§2.3; ADR 0030).
-      void navigator.clipboard
-        ?.readText()
-        .then((text) => (text ? commands.clipboardPush(peer, text) : undefined))
-        .catch(() => {
-          // No clipboard permission, an empty clipboard, or a host that
-          // refused: nothing was sent, and nothing is claimed to have been.
-        });
-    },
     pickMonitor(id: number): void {
       void commands
         .monitorSelect(peer, id)
@@ -695,10 +711,31 @@ export function mountToolbar(
   };
   window.addEventListener('resize', onResize);
 
+  // docs/bugs/10-clipboard-auto.md #2: the mandatory indicator this window
+  // owes the guest now that the host's clipboard can arrive without a press
+  // on either side. `clipboard_pull` hands back the text; this callback is
+  // the only place that ever sees it, and it only ever checks it is not
+  // `null` — the text itself is never assigned to anything (§15).
+  const clipboardPollTimer = window.setInterval(() => {
+    void commands
+      .clipboardPull(peer)
+      .then((text) => {
+        if (text !== null) {
+          state.clipboardSyncedAt = Date.now();
+          draw();
+        }
+      })
+      .catch(() => {
+        // The session ended between polls; the next tick, or the window
+        // closing, is what stops this rather than an error here.
+      });
+  }, clipboardPollIntervalMs);
+
   draw();
 
   return () => {
     document.removeEventListener('pointerdown', onPointerDownAnywhere, true);
     window.removeEventListener('resize', onResize);
+    window.clearInterval(clipboardPollTimer);
   };
 }

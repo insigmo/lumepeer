@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "view-window",
-  "description": "Per-window capability of a remote-view window (design doc §13). Deliberately NOT `core:default`: a window that renders a remote screen and forwards input needs a short, enumerated list of application commands, its own close (`allow-close` for the close-requested event, `allow-destroy` for the unconditional close the JS API issues once that event is not prevented), and the close-request event that turns closing the window into ending the session. `allow-set-fullscreen` is scoped to this window's own label like the other two: full screen is the window's own presentation and nothing else, and the toolbar stays reachable inside it so there is always a way back out. Clipboard and file transfer are named here for §9.2, and named narrowly: `allow-clipboard-push` offers this machine's own clipboard on a deliberate press and cannot read the host's, and the file commands open the OS pickers on the Rust side only. Everything else — filesystem, shell, network, other windows' commands — is absent rather than denied, and there are no wildcard entries.",
+  "description": "Per-window capability of a remote-view window (design doc §13). Deliberately NOT `core:default`: a window that renders a remote screen and forwards input needs a short, enumerated list of application commands, its own close (`allow-close` for the close-requested event, `allow-destroy` for the unconditional close the JS API issues once that event is not prevented), and the close-request event that turns closing the window into ending the session. `allow-set-fullscreen` is scoped to this window's own label like the other two: full screen is the window's own presentation and nothing else, and the toolbar stays reachable inside it so there is always a way back out. Clipboard and file transfer are named here for §9.2, and named narrowly: `allow-clipboard-pull` only ever returns this session's own already-applied inbound payload, for the mandatory sync indicator (docs/bugs/10-clipboard-auto.md #2; ADR 0046) — this window has no way to read the host's clipboard directly, and no `allow-clipboard-push`: the guest's own clipboard is read and offered by the Rust actor now, not by this window (docs/bugs/10-clipboard-auto.md #1; ADR 0046). The file commands open the OS pickers on the Rust side only. Everything else — filesystem, shell, network, other windows' commands — is absent rather than denied, and there are no wildcard entries.",
   "windows": ["view-*"],
   "local": true,
   "permissions": [
@@ -25,7 +25,7 @@
     "allow-input-wheel",
     "allow-chat-send",
     "allow-chat-transcript",
-    "allow-clipboard-push",
+    "allow-clipboard-pull",
     "allow-file-offer",
     "allow-file-accept",
     "allow-file-abort",
