@@ -1,4 +1,10 @@
-//! The host machine's own clipboard (design doc §9.2; ADR 0030).
+//! This machine's own clipboard (design doc §9.2; ADR 0030, ADR 0046).
+//!
+//! One worker, used the same way whichever role a session gives this node:
+//! a host reads its own clipboard for a guest holding `clipboard_read`, and
+//! a guest reads its own clipboard to offer a host it has an open view onto
+//! (docs/bugs/10-clipboard-auto.md #1) — `network.rs::refresh_clipboard_watch`
+//! is what decides, each time, whether either reason currently applies.
 //!
 //! Two decisions are baked into this module's shape.
 //!
@@ -6,9 +12,9 @@
 //! Tauri has a clipboard plugin, and using it would have been one capability
 //! line — but a capability line is exactly what it would have been: a
 //! standing grant handing the untrusted presentation layer (§2.3) a live
-//! handle on the host user's clipboard, valid whether or not any session
+//! handle on this machine's own clipboard, valid whether or not any session
 //! exists. The webview asks the actor to sync; only the actor touches the
-//! real clipboard, and only for a peer whose session holds the grant.
+//! real clipboard, and only while a session or a view justifies it.
 //!
 //! **Everything OS-facing happens on one dedicated thread.** Reading a
 //! clipboard is not a cheap in-process lookup: on X11 it is a round trip to

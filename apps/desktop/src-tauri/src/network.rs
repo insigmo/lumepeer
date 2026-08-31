@@ -3192,6 +3192,11 @@ impl Actor {
         );
         self.windows.open(&label, &tag, grants.input);
         self.rebuild_labels_and_snapshot();
+        // A fresh entry in `self.views` is one of the two reasons the
+        // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
+        // now has something worth offering the host it just started
+        // watching.
+        self.refresh_clipboard_watch();
     }
 
     /// Guest side: closes the view window, tears the pipeline down, and
@@ -3223,6 +3228,10 @@ impl Actor {
             self.history.record(host_tag(&peer), state.role, code);
         }
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
+        // The last view closing may be the only reason the watcher was on
+        // (docs/bugs/10-clipboard-auto.md #1): with `self.views` empty and no
+        // host-side `clipboard_read` live, nothing is left to justify it.
+        self.refresh_clipboard_watch();
     }
 
     /// Drops this node's control connection to `peer` outright, citing the
@@ -4623,10 +4632,11 @@ impl Actor {
     /// to a guest is exactly what `clipboard_read` means, and the session has
     /// to hold it. On the guest there is no grant to consult, because a guest
     /// is given none (ADR 0029). What stands in for one is that this path
-    /// runs only from a deliberate press in the guest's own view window: the
-    /// guest's clipboard is the guest's to offer, and whether the host
-    /// *accepts* it is decided on arrival, against `clipboard_write`, by the
-    /// only core entitled to decide it.
+    /// runs only for a host this node currently has an open view onto
+    /// (docs/bugs/10-clipboard-auto.md #1; ADR 0046): the guest's clipboard
+    /// is the guest's to offer, automatically the moment it changes, and
+    /// whether the host *accepts* it is decided on arrival, against
+    /// `clipboard_write`, by the only core entitled to decide it.
     fn on_clipboard_push(&mut self, label: &str, text: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
         let permitted = if self.views.contains_key(&peer) {
@@ -4658,15 +4668,21 @@ impl Actor {
         Ok(())
     }
 
-    /// This desktop's clipboard changed and at least one session is allowed
-    /// to see it (§8.2, §9.2).
+    /// This desktop's clipboard changed and at least one session or view is
+    /// allowed to be offered it (§8.2, §9.2).
     ///
-    /// Only the host side runs a watcher, so every recipient here is a guest
-    /// whose session carries `clipboard_read`. A session that does not carry
-    /// it is skipped without a word: the change is not an error, it simply is
-    /// not that session's to receive.
+    /// Two kinds of recipient, and both run through `on_clipboard_push`,
+    /// which already knows how to authorize each:
+    ///
+    /// - **Host side.** A guest whose session carries `clipboard_read`: a
+    ///   session that does not carry it is skipped without a word, the
+    ///   change is not an error, it simply is not that session's to receive.
+    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). Every host this
+    ///   node currently has an open view onto. There is no grant to check
+    ///   here — this side may always *offer* — so every one of them is a
+    ///   recipient; the host's own core is what decides on arrival.
     fn on_local_clipboard(&mut self, text: &str) {
-        let recipients: Vec<NodeId> = self
+        let mut recipients: Vec<NodeId> = self
             .sessions
             .active()
             .into_iter()
@@ -4676,6 +4692,7 @@ impl Actor {
             })
             .map(|(peer, _, _)| peer)
             .collect();
+        recipients.extend(self.views.keys().copied());
         for peer in recipients {
             let label = self.label_of(&peer);
             if let Err(error) = self.on_clipboard_push(&label, text) {
@@ -5432,15 +5449,30 @@ impl Actor {
     /// currently allow (§8.1 applied to §9.2).
     ///
     /// The rule is the one that keeps capture off when nobody is watching:
-    /// with no session holding `clipboard_read`, this desktop's clipboard is
-    /// not read at all — not read and discarded. Called from every place a
-    /// grant, a session or a connection can change.
+    /// with no session holding `clipboard_read` and no open view of this
+    /// node's own, this desktop's clipboard is not read at all — not read
+    /// and discarded. Called from every place a grant, a session, a view or
+    /// a connection can change.
+    ///
+    /// Two independent reasons can justify the read, and either is enough:
+    ///
+    /// - **Host side.** A session this node granted holds `clipboard_read`,
+    ///   so this desktop's own copies are due to that guest.
+    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). `self.views` is
+    ///   non-empty: this node is watching at least one host, and its own
+    ///   clipboard changes are worth *offering* there the moment they
+    ///   happen — the same offer a manual toolbar press used to make, now
+    ///   made automatically. The host decides on arrival whether to accept
+    ///   it, against its own `clipboard_write`; this side holds no grant to
+    ///   consult (ADR 0029, ADR 0030), so an open view is the only local
+    ///   fact that can gate the read at all.
     fn refresh_clipboard_watch(&self) {
-        let needed = self.sessions.active().into_iter().any(|(peer, _, grants)| {
+        let host_side = self.sessions.active().into_iter().any(|(peer, _, grants)| {
             self.sessions.state(&peer) == SessionState::Active
                 && clip::permits(grants, ClipboardFlow::HostToGuest)
         });
-        self.clipboard_worker.set_watching(needed);
+        let guest_side = !self.views.is_empty();
+        self.clipboard_worker.set_watching(host_side || guest_side);
     }
 
     /// Host side: grants `role` and, if it carries `view`, registers the peer
@@ -7737,6 +7769,73 @@ mod tests {
         assert_eq!(
             before, after,
             "the clipboard was still being read after a revoke"
+        );
+    }
+
+    /// docs/bugs/10-clipboard-auto.md #1: the guest-to-host direction no
+    /// longer needs a toolbar press. Opening a view starts this node's own
+    /// clipboard watcher, a local change is *offered* to the host it is
+    /// watching automatically, and the host's `clipboard_write` grant is
+    /// still what decides whether it lands — exactly the same authorization
+    /// `the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard`
+    /// covers for a manual push.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_clipboard_change_reaches_the_host_only_with_the_write_grant() {
+        let pair = clipboard_pair().await;
+        // The view is already open by the time `clipboard_pair` returns, so
+        // the guest's watcher is already on (docs/bugs/10-clipboard-auto.md
+        // #1). Let its baseline round land on the empty starting clipboard
+        // before this test's own change exists to be mistaken for one.
+        a_few_poll_rounds().await;
+
+        set_clipboard(&pair.guest_clipboard, "typed on the guest");
+        a_few_poll_rounds().await;
+        assert!(
+            clipboard_writes(&pair.host_clipboard).is_empty(),
+            "the guest's clipboard reached the host with no grant"
+        );
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+        set_clipboard(&pair.guest_clipboard, "typed after the grant");
+        wait_until("the host never received the guest's clipboard", || {
+            clipboard_writes(&pair.host_clipboard) == vec!["typed after the grant".to_owned()]
+        })
+        .await;
+    }
+
+    /// §8.1 applied to the new guest-side watcher (docs/bugs/10-clipboard-
+    /// auto.md #1): closing the view is what stops it, the same as a
+    /// host-side revoke stops the host's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_view_stops_the_guests_own_clipboard_watch() {
+        let pair = clipboard_pair().await;
+        a_few_poll_rounds().await;
+        let before = pair
+            .guest_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+
+        // Guest side: leaving the session from the view window, exactly what
+        // closing it does (`on_revoke`'s `self.views.contains_key` branch).
+        pair.guest.revoke(pair.host_label.clone()).await.unwrap();
+        set_clipboard(&pair.guest_clipboard, "after closing the view");
+        a_few_poll_rounds().await;
+        let after = pair
+            .guest_clipboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reads;
+        assert_eq!(
+            before, after,
+            "the guest's own clipboard was still being read after the view closed"
         );
     }
 
