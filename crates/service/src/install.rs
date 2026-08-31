@@ -17,13 +17,14 @@
               justification standard as SendInput (ADR 0012)"
 )]
 
+use windows::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_EXISTS};
 use windows::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_STATUS,
+    OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS,
+    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_START, SERVICE_STATUS,
     SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
-use windows::core::PCWSTR;
+use windows::core::{Error, HRESULT, PCWSTR};
 
 use lumepeer_service::SERVICE_NAME;
 
@@ -35,6 +36,12 @@ const DESCRIPTION: &str = "Delivers Ctrl+Alt+Del to this computer's screen when 
      Stopping this service only disables that one button.";
 
 /// Registers the service and starts it. Requires administrator rights.
+///
+/// Registering a service that is already registered succeeds: the
+/// post-condition is "this machine has a running lumepeer helper service",
+/// not "this call created it". An app update runs the installer hook again
+/// over a machine the previous version already set up, and that must not
+/// fail (`docs/bugs/12-service-lifecycle.md` #2).
 ///
 /// # Errors
 /// A description of what the service control manager refused.
@@ -91,6 +98,10 @@ pub fn install() -> Result<(), String> {
             }
             started.map_err(|error| format!("the service was created but would not start: {error}"))
         }
+        // Already registered, most likely by an earlier run of this same
+        // installer hook. The post-condition is "running", so start it rather
+        // than treating "it already exists" as a reason to fail.
+        Err(error) if is_already_exists(&error) => start_existing(manager),
         Err(error) => Err(format!("cannot create the service: {error}")),
     };
     // SAFETY: closing a handle this function opened, once.
@@ -98,6 +109,46 @@ pub fn install() -> Result<(), String> {
         let _ = CloseServiceHandle(manager);
     }
     result
+}
+
+/// Starts a service that `CreateServiceW` refused to (re-)create because it
+/// is already registered.
+///
+/// # Errors
+/// A description of what the service control manager refused.
+fn start_existing(manager: SC_HANDLE) -> Result<(), String> {
+    let name = wide(SERVICE_NAME);
+    // SAFETY: `name` is a live null-terminated wide string; `manager` is the
+    // live handle this function was called with.
+    let service = unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_START) }.map_err(
+        |error| format!("the service is already registered but cannot be reopened: {error}"),
+    )?;
+    // SAFETY: `service` is live and owned here.
+    let started = unsafe { StartServiceW(service, None) };
+    // SAFETY: closing a handle this function opened, once.
+    unsafe {
+        let _ = CloseServiceHandle(service);
+    }
+    match started {
+        Ok(()) => Ok(()),
+        // Already running is what "installed and running" looks like; it is
+        // not a failure to report.
+        Err(error) if is_already_running(&error) => Ok(()),
+        Err(error) => Err(format!(
+            "the service is registered but would not start: {error}"
+        )),
+    }
+}
+
+/// Whether `error` is `CreateServiceW` saying a service under this name is
+/// already registered, as opposed to any other reason it refused.
+fn is_already_exists(error: &Error) -> bool {
+    error.code() == HRESULT::from_win32(ERROR_SERVICE_EXISTS.0)
+}
+
+/// Whether `error` is `StartServiceW` saying the service is already running.
+fn is_already_running(error: &Error) -> bool {
+    error.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0)
 }
 
 /// Stops and removes the service. Requires administrator rights.
@@ -169,4 +220,72 @@ fn set_description(service: windows::Win32::System::Services::SC_HANDLE) {
 /// A null-terminated UTF-16 copy of `text`, for the `W` entry points.
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classification `install` relies on to treat "already registered"
+    /// as success rather than failure. Built from a synthetic `HRESULT`, not
+    /// a real service control manager call: this must hold with no
+    /// administrator rights and without touching this machine's real
+    /// service, whatever that is.
+    #[test]
+    fn recognises_already_exists_and_nothing_else() {
+        let already_exists = Error::from(HRESULT::from_win32(ERROR_SERVICE_EXISTS.0));
+        assert!(is_already_exists(&already_exists));
+
+        // Access denied (5) is a different refusal and must not be treated
+        // as "it's fine, it's already there" — that would hide a real
+        // permission problem behind a false success.
+        let access_denied = Error::from(HRESULT::from_win32(5));
+        assert!(!is_already_exists(&access_denied));
+    }
+
+    /// Same shape, for the "already running" refusal `start_existing` treats
+    /// as success rather than failure.
+    #[test]
+    fn recognises_already_running_and_nothing_else() {
+        let already_running = Error::from(HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0));
+        assert!(is_already_running(&already_running));
+
+        let access_denied = Error::from(HRESULT::from_win32(5));
+        assert!(!is_already_running(&access_denied));
+    }
+
+    /// `install`/`uninstall`, end to end, against the real service control
+    /// manager: called twice each, which is what
+    /// `docs/bugs/12-service-lifecycle.md` #2 requires ("install on an
+    /// already-installed service and uninstall on an absent one must both
+    /// succeed").
+    ///
+    /// Deliberately **not** run by default. This registers and removes a
+    /// real `LocalSystem` service under administrator rights, which
+    /// `cargo test --workspace` must never do to a machine that already
+    /// depends on the real `LumepeerHelper` for Ctrl+Alt+Del — including a
+    /// contributor's own dev machine. Opt in with
+    /// `LUMEPEER_TEST_SERVICE_INSTALL=1`, run elevated, on a disposable VM;
+    /// the same convention `LUMEPEER_TEST_XTEST` uses for the X11 tests that
+    /// need a real display.
+    #[test]
+    #[ignore = "registers/removes the real Windows service; opt in explicitly, never on a dev machine"]
+    fn install_and_uninstall_are_each_idempotent() {
+        if std::env::var_os("LUMEPEER_TEST_SERVICE_INSTALL").is_none() {
+            return;
+        }
+        assert!(install().is_ok(), "installing a fresh service must succeed");
+        assert!(
+            install().is_ok(),
+            "installing an already-installed service must succeed"
+        );
+        assert!(
+            uninstall().is_ok(),
+            "removing an installed service must succeed"
+        );
+        assert!(
+            uninstall().is_ok(),
+            "removing an already-absent service must succeed"
+        );
+    }
 }
