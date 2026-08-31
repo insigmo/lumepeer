@@ -83,6 +83,10 @@ tracing-subscriber.workspace = true
 # The per-user Run key of ADR 0042. Windows only: the macOS and Linux arms
 # of `autostart` are plain file writes and need nothing.
 winreg.workspace = true
+# CF_HDROP clipboard file lists (docs/bugs/14-clipboard-files.md #1, #3;
+# ADR 0046) — the exact crate `arboard`'s own Windows text backend already
+# depends on, so this is a new direct edge, not a new dependency version.
+clipboard-win.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `audio-capture-pipewire` sits here rather than in the shared section above
@@ -96,3 +100,30 @@ lumepeer-media = { workspace = true, features = [
     "capture-x11",
     "audio-capture-pipewire",
 ] }
+# `text/uri-list` clipboard file lists over the `CLIPBOARD` selection
+# (docs/bugs/14-clipboard-files.md #1, #3; ADR 0046) — a small crate over
+# `x11rb` at the same major version `arboard`'s own Linux text backend
+# already depends on.
+x11-clipboard.workspace = true
+percent-encoding.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `NSPasteboardTypeFileURL` clipboard file lists (docs/bugs/
+# 14-clipboard-files.md #1, #3; ADR 0046). Same `objc2` framework bindings
+# `arboard`'s own macOS text backend and `lumepeer-media`'s
+# `capture-screencapturekit` already pull in, at the same pinned versions, so
+# this adds no new dependency version to `Cargo.lock`.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+    "NSURL",
+    "NSObject",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+    "NSPasteboardItem",
+] }
+percent-encoding.workspace = true

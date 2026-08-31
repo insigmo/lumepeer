@@ -342,3 +342,29 @@ pub const AUDIT_RETENTION_DAYS: u64 = 30;
 /// record can outlive its retention by up to this long, which is the price of
 /// not paying for a scan the host has no reason to make.
 pub const AUDIT_RETENTION_SWEEP_SECS: u64 = 24 * 60 * 60;
+
+/// Maximum number of files in one clipboard file list, whether read off this
+/// machine's own OS clipboard or announced in a `ClipboardFileOffer`
+/// (docs/bugs/14-clipboard-files.md #1, #2).
+///
+/// Not in the design doc: §9.2 v1 was text-only. A clipboard file list is
+/// untrusted input on both ends this crate has to protect — another local
+/// application's clipboard on the reading side, an unauthenticated-until-
+/// granted peer's message on the wire side — and both are checked against
+/// this bound before anything is allocated per entry. Equal to
+/// `MAX_PENDING_FILE_OFFERS`, the actual ceiling on how many of them the
+/// transfer engine can ever queue at once: announcing more than that would
+/// only ever be declined further down the same pipeline.
+pub const CLIPBOARD_FILE_LIST_MAX_ENTRIES: usize = MAX_PENDING_FILE_OFFERS;
+
+/// Maximum byte length of one path (or `file://` URI) read off this
+/// machine's own OS clipboard, checked before it is decoded into a `PathBuf`
+/// (docs/bugs/14-clipboard-files.md #1).
+///
+/// Not in the design doc, and not the same bound as `FILE_NAME_MAX_BYTES`:
+/// that one bounds a basename that crosses the wire, this one bounds a raw
+/// clipboard entry before it is even split into a basename on this machine.
+/// 4096 covers `PATH_MAX` on Linux and macOS and is generous for Windows'
+/// legacy `MAX_PATH`, while still refusing the pathological case a hostile
+/// local clipboard owner could otherwise hand this process.
+pub const CLIPBOARD_FILE_PATH_MAX_BYTES: usize = 4096;
