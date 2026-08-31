@@ -8,9 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_MAX_BYTES, FILE_NAME_MAX_BYTES,
-    FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS,
-    MAX_MONITORS_PER_HOST, STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES,
-    UNATTENDED_PASSWORD_MAX_BYTES,
+    FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_MONITORS_PER_HOST,
+    STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -742,12 +741,11 @@ impl MessageEnvelope {
             // (§9.1), and the range is static — unlike `MonitorSelect`,
             // which can only be checked against a host's own runtime monitor
             // count — so it is checked here rather than at the point of use.
-            MessageKind::StreamScaleRequest { scale_percent } => {
+            MessageKind::StreamScaleRequest { scale_percent }
                 if *scale_percent < ABR_MIN_SCALE_PERCENT
-                    || *scale_percent > STREAM_SCALE_MAX_PERCENT
-                {
-                    return Err(CoreError::Malformed);
-                }
+                    || *scale_percent > STREAM_SCALE_MAX_PERCENT =>
+            {
+                return Err(CoreError::Malformed);
             }
             _ => {}
         }
@@ -1309,8 +1307,12 @@ mod tests {
             assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
         }
 
-        for scale_percent in [0, ABR_MIN_SCALE_PERCENT - 1, STREAM_SCALE_MAX_PERCENT + 1, u32::MAX]
-        {
+        for scale_percent in [
+            0,
+            ABR_MIN_SCALE_PERCENT - 1,
+            STREAM_SCALE_MAX_PERCENT + 1,
+            u32::MAX,
+        ] {
             let bytes = envelope(MessageKind::StreamScaleRequest { scale_percent })
                 .encode()
                 .unwrap();
