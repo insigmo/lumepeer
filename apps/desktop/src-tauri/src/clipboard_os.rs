@@ -389,7 +389,7 @@ mod platform {
 /// The same limitation `arboard`'s own text backend already has on Linux:
 /// there is no native Wayland clipboard protocol implementation here, only
 /// the X11 selection mechanism, which a pure-Wayland compositor with no
-/// XWayland compatibility layer does not serve. That is an existing gap this
+/// `XWayland` compatibility layer does not serve. That is an existing gap this
 /// task does not widen.
 #[cfg(target_os = "linux")]
 mod platform {
