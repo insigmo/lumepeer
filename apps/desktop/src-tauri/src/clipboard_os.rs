@@ -320,7 +320,7 @@ mod platform {
         }
         let file_url_type = file_url_type();
         let mut paths = Vec::new();
-        for item in items.iter() {
+        for item in &items {
             let Some(value) = item.stringForType(&file_url_type) else {
                 continue;
             };
