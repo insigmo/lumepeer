@@ -96,3 +96,4 @@ cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D war
 | `14-release-infrastructure.md` | Автообновление и автозапуск | — |
 | `15-docs-and-adr-debt.md` | Восстановить пропущенные ADR, выправить README | — |
 | `16-audit-log.md` | Подключить хранилище журнала аудита | 01 |
+| `17-serverless-obfuscated-quic.md` | Бессерверный обфусцированный QUIC-транспорт | — |

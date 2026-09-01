@@ -30,6 +30,16 @@ pub enum NetError {
     #[error("invalid invite ticket")]
     InvalidTicket,
 
+    /// An obfuscated datagram could not be opened: too short, corrupt, padded
+    /// wrong, or sealed under a different key (task 17 Fase 2, ADR 0051). The
+    /// variant is deliberately opaque and carries no detail — the input is
+    /// untrusted, so distinguishing the reasons would hand an observer a
+    /// decryption oracle. The caller drops the datagram silently and keeps the
+    /// connection, exactly as a QUIC stack drops a packet that fails its own
+    /// authentication.
+    #[error("obfuscated datagram rejected")]
+    Obfuscation,
+
     /// This node already holds a control connection to the host it was asked
     /// to dial. Guest-side only: a second dial would replace the live
     /// connection and its teardown would end the session that was working.

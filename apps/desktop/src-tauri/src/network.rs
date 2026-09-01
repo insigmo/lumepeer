@@ -25,10 +25,11 @@ use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
 use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
-    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_MS, DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES,
-    FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
-    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
+    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
+    DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
+    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
+    MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
+    STREAM_SCALE_MAX_PERCENT,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
@@ -50,6 +51,7 @@ use lumepeer_net::keystore::{Keystore, load_or_create};
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use rand::Rng as _;
+use rand::RngExt as _;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
 
 use crate::address_book_store::AddressBookStore;
@@ -7694,7 +7696,14 @@ async fn dial_with_retries(
         }
         last = error;
         if attempt < DIAL_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(DIAL_RETRY_BACKOFF_MS)).await;
+            // Jittered so a run of attempts sweeps across a periodically
+            // flapping relay link instead of staying locked in step with it
+            // (ADR 0050).
+            let jitter = rand::rng().random_range(0..=DIAL_RETRY_BACKOFF_JITTER_MS);
+            tokio::time::sleep(std::time::Duration::from_millis(
+                DIAL_RETRY_BACKOFF_MS + jitter,
+            ))
+            .await;
         }
     }
     Err(last)
