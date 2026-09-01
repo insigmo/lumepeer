@@ -17,11 +17,19 @@ import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 export type SessionState = 'pending' | 'active';
 
 /**
- * The four permissions of §8.2 the host can move on a session that is already
+ * The permissions of §8.2 the host can move on a session that is already
  * running. `view` and `input` are absent on purpose: they follow the role, and
- * this window has no way to reach them.
+ * this window has no way to reach them. `display_mode` is the newest one
+ * (docs/bugs/16-host-display-mode.md; ADR 0048): switching this host's own
+ * monitor is materially riskier than anything else on this list, so it stays
+ * its own independent grant rather than riding along with any role.
  */
-export type IndependentGrant = 'clipboard_read' | 'clipboard_write' | 'file_transfer' | 'recording';
+export type IndependentGrant =
+  | 'clipboard_read'
+  | 'clipboard_write'
+  | 'file_transfer'
+  | 'recording'
+  | 'display_mode';
 
 export interface SessionStatus {
   peer_label: string;
@@ -32,6 +40,7 @@ export interface SessionStatus {
   clipboard_write: boolean;
   file_transfer: boolean;
   recording: boolean;
+  display_mode: boolean;
   /**
    * Whether a recording is being written right now (§17).
    *
@@ -108,17 +117,19 @@ const GRANT_ROWS: readonly {
     | 'status.grants.clipboardRead'
     | 'status.grants.clipboardWrite'
     | 'status.grants.fileTransfer'
-    | 'status.grants.recording';
+    | 'status.grants.recording'
+    | 'status.grants.displayMode';
   held: (session: SessionStatus) => boolean;
 }[] = [
   { grant: 'clipboard_read', key: 'status.grants.clipboardRead', held: (s) => s.clipboard_read },
   { grant: 'clipboard_write', key: 'status.grants.clipboardWrite', held: (s) => s.clipboard_write },
   { grant: 'file_transfer', key: 'status.grants.fileTransfer', held: (s) => s.file_transfer },
   { grant: 'recording', key: 'status.grants.recording', held: (s) => s.recording },
+  { grant: 'display_mode', key: 'status.grants.displayMode', held: (s) => s.display_mode },
 ];
 
 /**
- * The four independent grants of one active session.
+ * The independent grants of one active session.
  *
  * Nothing is toggled locally: the checkbox shows what the last `session_status`
  * said the core holds, the click asks the core to change it, and `onChange`

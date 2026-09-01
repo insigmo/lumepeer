@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-display-set-mode"
+description = "Enables the host_display_set_mode command without any pre-configured scope."
+commands.allow = ["host_display_set_mode"]
+
+[[permission]]
+identifier = "deny-host-display-set-mode"
+description = "Denies the host_display_set_mode command without any pre-configured scope."
+commands.deny = ["host_display_set_mode"]

@@ -7,7 +7,7 @@
 //! the answer survive the wire, that a refusal says exactly as much as
 //! `UnattendedError` allows and no more, and that an admitted session is the
 //! same shape a consent dialog would have produced — a role, and none of the
-//! four independent grants.
+//! independent grants.
 //!
 //! The actor-level tests that decide *which* path a connection takes live with
 //! the actor, in `apps/desktop/src-tauri/src/network.rs`: only that crate owns
@@ -178,7 +178,7 @@ async fn a_correct_password_admits_the_guest_with_the_hosts_configured_role() {
 /// §8.2: passing the gate is admission, not a blanket permission. The four
 /// independent grants stay off however the session was admitted (ADR 0029).
 #[test]
-fn an_admitted_session_holds_none_of_the_four_independent_grants() {
+fn an_admitted_session_holds_none_of_the_independent_grants() {
     let peer = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
 
     for role in [Role::ViewOnly, Role::ControlLimited, Role::FullControl] {
@@ -196,6 +196,7 @@ fn an_admitted_session_holds_none_of_the_four_independent_grants() {
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
+        assert!(!grants.display_mode);
     }
 }
 

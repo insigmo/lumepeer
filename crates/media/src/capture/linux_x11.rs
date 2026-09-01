@@ -313,6 +313,134 @@ fn mode_info_to_display_mode(
     })
 }
 
+/// Switches the CRTC driving `target`'s monitor to `mode` (§11.1;
+/// docs/bugs/16-host-display-mode.md #2; ADR 0048).
+///
+/// Refuses with [`MediaError::CaptureUnavailable`] on anything short of a
+/// successful `RandR` `SetCrtcConfig` — there is no dry-run flag on X11
+/// (unlike Windows' `CDS_TEST`), so this is the real, final apply.
+///
+/// # Errors
+/// [`MediaError::CaptureUnavailable`] for any step `RandR` refuses: no
+/// server to connect to, no such monitor or mode, or the server itself
+/// rejecting the configuration.
+pub fn set_display_mode_for(
+    target: CaptureTarget,
+    mode: crate::capture::DisplayMode,
+) -> Result<()> {
+    use x11rb::protocol::randr::SetConfig;
+
+    let (connection, screen_num) = x11rb::connect(None).map_err(|e| {
+        MediaError::CaptureUnavailable(format!("cannot connect to the X server: {e}"))
+    })?;
+    let screen = connection.setup().roots[screen_num].clone();
+    connection
+        .randr_query_version(RANDR_MAJOR, RANDR_MINOR)
+        .map_err(|e| MediaError::CaptureUnavailable(format!("RandR unavailable: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("RandR unavailable: {e}")))?;
+
+    let monitors_reply = connection
+        .randr_get_monitors(screen.root, true)
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetMonitors failed: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetMonitors failed: {e}")))?;
+    let mut monitors: Vec<_> = monitors_reply
+        .monitors
+        .into_iter()
+        .filter(|info| info.width > 0 && info.height > 0)
+        .take(MAX_MONITORS_PER_HOST)
+        .collect();
+    if !monitors.iter().any(|info| info.primary)
+        && let Some(first) = monitors.first_mut()
+    {
+        first.primary = true;
+    }
+    let index = match target {
+        CaptureTarget::PrimaryDisplay => monitors
+            .iter()
+            .position(|info| info.primary)
+            .ok_or_else(|| MediaError::CaptureUnavailable("no monitor to target".to_owned()))?,
+        CaptureTarget::Display(n) => usize::try_from(n)
+            .map_err(|_| MediaError::CaptureUnavailable(format!("display index {n} overflows")))?,
+    };
+    let monitor = monitors
+        .get(index)
+        .ok_or_else(|| MediaError::CaptureUnavailable(format!("no display {index}")))?;
+    let output = *monitor
+        .outputs
+        .first()
+        .ok_or_else(|| MediaError::CaptureUnavailable("monitor has no output".to_owned()))?;
+
+    let resources = connection
+        .randr_get_screen_resources(screen.root)
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetScreenResources failed: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetScreenResources failed: {e}")))?;
+    let output_info = connection
+        .randr_get_output_info(output, resources.config_timestamp)
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetOutputInfo failed: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetOutputInfo failed: {e}")))?;
+    let crtc = output_info.crtc;
+    if crtc == 0 {
+        return Err(MediaError::CaptureUnavailable(
+            "this output has no CRTC to reconfigure".to_owned(),
+        ));
+    }
+
+    // The mode id matching the request: found by re-deriving the same
+    // human-facing (width, height, refresh_hz) this output already
+    // advertised through `display_modes_for`, since the caller only ever
+    // knows a mode by that triple, not by X11's own opaque id.
+    let mode_id = output_info
+        .modes
+        .iter()
+        .find_map(|candidate| {
+            let info = resources.modes.iter().find(|info| info.id == *candidate)?;
+            let converted = mode_info_to_display_mode(info)?;
+            (converted == mode).then_some(info.id)
+        })
+        .ok_or_else(|| {
+            MediaError::CaptureUnavailable(format!(
+                "{}x{}@{}Hz is not a mode this output supports",
+                mode.width, mode.height, mode.refresh_hz
+            ))
+        })?;
+
+    let crtc_info = connection
+        .randr_get_crtc_info(crtc, resources.config_timestamp)
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetCrtcInfo failed: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("GetCrtcInfo failed: {e}")))?;
+
+    let reply = connection
+        .randr_set_crtc_config(
+            crtc,
+            // `CurrentTime` (0): this call is not racing an interactive
+            // config-time-stamped client, and the config timestamp above
+            // already ties it to the resources just read.
+            x11rb::CURRENT_TIME,
+            resources.config_timestamp,
+            crtc_info.x,
+            crtc_info.y,
+            mode_id,
+            crtc_info.rotation,
+            &crtc_info.outputs,
+        )
+        .map_err(|e| MediaError::CaptureUnavailable(format!("SetCrtcConfig failed: {e}")))?
+        .reply()
+        .map_err(|e| MediaError::CaptureUnavailable(format!("SetCrtcConfig failed: {e}")))?;
+    if reply.status == SetConfig::SUCCESS {
+        Ok(())
+    } else {
+        Err(MediaError::CaptureUnavailable(format!(
+            "SetCrtcConfig refused {}x{}@{}Hz: {:?}",
+            mode.width, mode.height, mode.refresh_hz, reply.status
+        )))
+    }
+}
+
 /// Live X11 connection and the geometry it captures.
 #[derive(Debug)]
 struct Active {
@@ -557,6 +685,14 @@ impl ScreenCapturer for X11Capturer {
 
     fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
         display_modes_for(target)
+    }
+
+    fn set_display_mode(
+        &mut self,
+        target: CaptureTarget,
+        mode: crate::capture::DisplayMode,
+    ) -> Result<()> {
+        set_display_mode_for(target, mode)
     }
 }
 
@@ -1466,5 +1602,32 @@ mod tests {
 
         capturer.stop();
         assert!(capturer.next_frame().is_err());
+    }
+
+    /// Read-only: enumerates the primary monitor's real modes over `RandR`
+    /// and checks the shape of the answer, without ever calling
+    /// `set_display_mode_for` — actually switching this machine's own
+    /// display is not something an automated test suite should do
+    /// (docs/bugs/16-host-display-mode.md #1). Skipped, not failed, when
+    /// there is no `RandR`-capable X server to ask (a headless CI runner, or
+    /// one whose only output reports no modes at all).
+    #[test]
+    fn the_primary_displays_modes_include_something_sane() {
+        let modes = display_modes_for(CaptureTarget::PrimaryDisplay);
+        if modes.is_empty() {
+            eprintln!("skipping: no RandR modes reported on this machine");
+            return;
+        }
+        for mode in &modes {
+            assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 0);
+        }
+        let mut sorted = modes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, modes, "the list was not deduplicated and sorted");
+        assert!(
+            modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
+            "the list was not capped"
+        );
     }
 }

@@ -126,3 +126,17 @@ invalid minor7_stream_scale_request_below_floor abababababababababababababababab
 # the existing FileOffer/FileTransferStart path on rd/file/1.
 valid minor8_clipboard_file_offer_two_entries abababababababababababababababab010027020a7265706f72742e70646680200970686f746f2e706e67a0cb980100
 valid minor8_clipboard_file_accept_true abababababababababababababababab0001280100
+
+# --- Frozen for PROTOCOL_MINOR 9: the host's own physical display modes
+# (docs/bugs/16-host-display-mode.md; ADR 0048). Distinct from
+# StreamScaleRequest (minor 7), which only caps the picture the guest
+# receives and never touches the host's actual monitor. The list is host to
+# guest, sent only to a guest whose Hello advertised the "display-mode"
+# feature string; the set-mode request is guest to host, sent only towards a
+# host that answered with at least this minor. modes and reason must never
+# both be populated — that state is malformed, checked on decode before
+# anything downstream believes an untrusted peer's claim.
+valid minor9_display_modes_list_two_entries abababababababababababababababab0000290200800fb8083c018014a00b90010000
+valid minor9_display_modes_list_not_granted abababababababababababababababab00002900010000
+valid minor9_display_set_mode abababababababababababababababab01002a0300
+invalid minor9_display_modes_list_contradiction abababababababababababababababab0000290100800fb8083c010000

@@ -31,10 +31,10 @@ use lumepeer_core::constants::{
     STREAM_SCALE_MAX_PERCENT,
 };
 use lumepeer_core::protocol::{
-    ClipboardFileEntry, CursorShapeData, FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE,
-    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
-    FEATURE_STREAM_SCALE, FEATURE_UNATTENDED, InputEventPayload, MediaUnavailableReason,
-    MessageKind, MonitorInfo, UnattendedRejection,
+    ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
+    FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER,
+    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_UNATTENDED,
+    InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -97,6 +97,15 @@ const STREAM_SCALE_MINOR: u16 = 7;
 /// instead of a minor, but the guest has no feature list of the host's to
 /// read.
 const CLIPBOARD_FILES_MINOR: u16 = 8;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::DisplayModesList` and
+/// `MessageKind::DisplaySetMode` (docs/bugs/16-host-display-mode.md #2;
+/// ADR 0048).
+///
+/// Guest side only, exactly like [`STREAM_SCALE_MINOR`]: a host reads the
+/// guest's `FEATURE_DISPLAY_MODE` string instead, and `HelloAck` carries no
+/// feature list for the guest to read the other way.
+const DISPLAY_MODE_MINOR: u16 = 9;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -593,6 +602,12 @@ pub enum ActorError {
     Unsupported,
 }
 
+/// Reply type of [`ActorCommand::DisplayModesList`] (docs/bugs/
+/// 16-host-display-mode.md #2; ADR 0048): the modes, empty exactly when the
+/// reason is `Some`, mirroring the wire message's own shape.
+type DisplayModesReply =
+    Result<(Vec<DisplayModeInfo>, Option<DisplayModeUnavailableReason>), ActorError>;
+
 /// One request the actor understands.
 enum ActorCommand {
     Status {
@@ -767,6 +782,19 @@ enum ActorCommand {
     StreamScaleRequest {
         label: String,
         scale_percent: u32,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: the modes the watched host announced for its own physical
+    /// monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    DisplayModesList {
+        label: String,
+        reply: oneshot::Sender<DisplayModesReply>,
+    },
+    /// Guest side: ask the watched host to switch its own physical monitor
+    /// to `mode_id` (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    DisplaySetMode {
+        label: String,
+        mode_id: u32,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Host side: turn one independent grant of `label`'s session on or off
@@ -1435,6 +1463,48 @@ impl ActorHandle {
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
+
+    /// Guest side: the watched host's own physical display modes, as it last
+    /// announced them, plus an honest reason when there are none
+    /// (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn host_display_modes(&self, label: String) -> DisplayModesReply {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::DisplayModesList { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: asks the watched host to switch its own physical monitor
+    /// to `mode_id` (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] when the host announced no such id;
+    /// [`ActorError::Unsupported`] towards a host that never confirmed it
+    /// understands the message; [`ActorError::ChannelClosed`] if the actor is
+    /// gone.
+    pub async fn host_display_set_mode(
+        &self,
+        label: String,
+        mode_id: u32,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::DisplaySetMode {
+                label,
+                mode_id,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
     /// Host side: every saved device of the address book (§8; ADR 0034).
     ///
     /// # Errors
@@ -2022,6 +2092,22 @@ struct StreamScaleFeature {
     to_peer: bool,
 }
 
+/// Whether this build may announce `DisplayModesList` towards a peer and act
+/// on a `DisplaySetMode` from it, and whether it may send `DisplaySetMode`
+/// towards it and trust an incoming `DisplayModesList` — the same shape
+/// [`StreamScaleFeature`] uses, for the same reason (docs/bugs/
+/// 16-host-display-mode.md; ADR 0048). Both messages are gated by the one
+/// feature string: which one this node actually sends towards a given peer
+/// depends only on whether it is that peer's host or its guest.
+#[derive(Debug, Clone, Copy, Default)]
+struct DisplayModeFeature {
+    /// Host side: the guest advertised [`FEATURE_DISPLAY_MODE`].
+    from_peer: bool,
+    /// Guest side: the host answered with a minor of at least
+    /// [`DISPLAY_MODE_MINOR`].
+    to_peer: bool,
+}
+
 /// Host side: one running capture/encode loop, plus the connection it writes
 /// on, so a revoke can stop both without waiting for the loop to notice.
 /// `recorder` is the §17 slot the actor swaps a session recorder into; it
@@ -2126,6 +2212,13 @@ struct ViewState {
     /// host announced nothing, and the picker says so rather than offering
     /// screens that belong to the machine the operator is already sitting at.
     monitors: Vec<MonitorInfo>,
+    /// The host's own display modes, as it last announced them (docs/bugs/
+    /// 16-host-display-mode.md #2; ADR 0048). Empty exactly when
+    /// `display_modes_reason` is `Some`, mirroring the wire message's own
+    /// invariant.
+    display_modes: Vec<DisplayModeInfo>,
+    /// Why `display_modes` is empty, when it is.
+    display_modes_reason: Option<DisplayModeUnavailableReason>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -2193,6 +2286,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
+        /// (docs/bugs/16-host-display-mode.md; ADR 0048).
+        speaks_display_mode: bool,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -2274,6 +2370,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
+        /// (docs/bugs/16-host-display-mode.md; ADR 0048).
+        speaks_display_mode: bool,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -2363,6 +2462,9 @@ struct Actor {
     /// Which side of the `StreamScaleRequest` exchange each peer can speak
     /// (§9.1; D7, docs/bugs/13-stream-resolution.md).
     stream_scale: std::collections::HashMap<NodeId, StreamScaleFeature>,
+    /// Which side of the `DisplayModesList`/`DisplaySetMode` exchange each
+    /// peer can speak (§9.1; docs/bugs/16-host-display-mode.md; ADR 0048).
+    display_mode: std::collections::HashMap<NodeId, DisplayModeFeature>,
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
@@ -2787,6 +2889,15 @@ impl Actor {
             .is_some_and(|speaks| speaks.to_peer)
     }
 
+    /// Guest side: whether `peer` speaks minor 9 and can decode a
+    /// `DisplaySetMode` at all (§9.1; docs/bugs/16-host-display-mode.md;
+    /// ADR 0048).
+    fn may_set_display_mode_to(&self, peer: &NodeId) -> bool {
+        self.display_mode
+            .get(peer)
+            .is_some_and(|speaks| speaks.to_peer)
+    }
+
     /// Host side: honours a guest's `KeyframeRequest`, at most once per
     /// [`KEYFRAME_MIN_INTERVAL_MS`].
     ///
@@ -2889,6 +3000,62 @@ impl Actor {
         }
     }
 
+    /// Host side: switches this host's own physical monitor to `mode_id`
+    /// (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// `view` is not the grant this checks. Changing the operator's own
+    /// screen is materially riskier than anything a `view` grant covers —
+    /// it moves every window on the host's desktop, not only the picture a
+    /// guest receives — so it needs its own independent `display_mode`
+    /// grant, re-checked here from scratch exactly as
+    /// [`Self::on_stream_scale_request`] re-checks `view` for the same
+    /// reason (§2.3): a grant revoked a moment ago must not be honored by a
+    /// message already in flight.
+    fn on_display_set_mode(&mut self, peer: NodeId, mode_id: u32) {
+        let tag = self.label_of(&peer);
+        if !self
+            .display_mode
+            .get(&peer)
+            .is_some_and(|feature| feature.from_peer)
+        {
+            tracing::debug!(
+                peer = %tag,
+                "display set-mode request from a peer that never advertised the feature"
+            );
+            return;
+        }
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.display_mode);
+        if !granted {
+            tracing::warn!(
+                peer = %tag,
+                "display set-mode request without a live display_mode grant; ignored"
+            );
+            return;
+        }
+        // Recomputed fresh rather than trusted from whatever list was last
+        // announced: a monitor can change between the announcement and this
+        // request, the same reasoning `on_monitor_select` applies to its own
+        // id.
+        let modes = lock_capture(&self.capture).display_modes();
+        let Some(mode) = usize::try_from(mode_id)
+            .ok()
+            .and_then(|index| modes.get(index).copied())
+        else {
+            tracing::warn!(peer = %tag, mode_id, "no such display mode was announced");
+            return;
+        };
+        match lock_capture(&self.capture).set_display_mode(mode) {
+            Ok(()) => {
+                tracing::info!(peer = %tag, ?mode, "display mode switched by the guest");
+            }
+            Err(error) => {
+                tracing::warn!(peer = %tag, ?mode, %error, "the platform refused the display mode");
+            }
+        }
+    }
+
     /// What every live connection's link actually looks like (§18).
     fn connection_stats(&self) -> Vec<ConnectionStats> {
         self.connections
@@ -2971,6 +3138,7 @@ impl Actor {
                     speaks_cursor_shape,
                     speaks_stream_scale,
                     speaks_clipboard_files,
+                    speaks_display_mode,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
@@ -2982,6 +3150,7 @@ impl Actor {
                     speaks_cursor_shape,
                     speaks_stream_scale,
                     speaks_clipboard_files,
+                    speaks_display_mode,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -3106,6 +3275,7 @@ impl Actor {
                 speaks_cursor_shape,
                 speaks_stream_scale,
                 speaks_clipboard_files,
+                speaks_display_mode,
             } => {
                 // Host side of the exchange: whether this guest's own reports
                 // may be read at all (ADR 0037). The guest side is recorded in
@@ -3114,6 +3284,9 @@ impl Actor {
                 // Same shape, for the manual scale ceiling (D7,
                 // docs/bugs/13-stream-resolution.md).
                 self.stream_scale.entry(peer).or_default().from_peer = speaks_stream_scale;
+                // Same shape again, for the host's own display modes
+                // (docs/bugs/16-host-display-mode.md; ADR 0048).
+                self.display_mode.entry(peer).or_default().from_peer = speaks_display_mode;
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
                 } else {
@@ -3458,6 +3631,8 @@ impl Actor {
                 recording,
                 cursor,
                 monitors: Vec::new(),
+                display_modes: Vec::new(),
+                display_modes_reason: None,
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -3992,6 +4167,23 @@ impl Actor {
             MessageKind::StreamScaleRequest { scale_percent } => {
                 self.on_stream_scale_request(peer, scale_percent);
             }
+            // Host side: the guest asked to switch this host's own physical
+            // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+            MessageKind::DisplaySetMode { mode_id } => {
+                self.on_display_set_mode(peer, mode_id);
+            }
+            // Guest side: the watched host announced its own physical
+            // display modes, or an honest reason there are none
+            // (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+            MessageKind::DisplayModesList {
+                ref modes,
+                ref reason,
+            } => {
+                if let Some(view) = self.views.get_mut(&peer) {
+                    view.display_modes.clone_from(modes);
+                    view.display_modes_reason = *reason;
+                }
+            }
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
             // Guest side: this host wants credentials rather than a dialog
@@ -4226,6 +4418,7 @@ impl Actor {
         self.last_keyframe.remove(&peer);
         self.receiver_reports.remove(&peer);
         self.stream_scale.remove(&peer);
+        self.display_mode.remove(&peer);
         // Chat and clipboard state are per-session by design (§15): nothing
         // about a past peer survives its connection here.
         self.chat.drop_transcript(&peer);
@@ -4414,6 +4607,16 @@ impl Actor {
                 reply,
             } => {
                 let _ = reply.send(self.on_request_stream_scale(&label, scale_percent));
+            }
+            ActorCommand::DisplayModesList { label, reply } => {
+                let _ = reply.send(self.on_announced_display_modes(&label));
+            }
+            ActorCommand::DisplaySetMode {
+                label,
+                mode_id,
+                reply,
+            } => {
+                let _ = reply.send(self.on_request_display_set_mode(&label, mode_id));
             }
             ActorCommand::SetGrant {
                 label,
@@ -4833,6 +5036,50 @@ impl Actor {
         Ok(())
     }
 
+    /// Guest side: the watched host's own physical display modes, as it last
+    /// announced them, or the reason there are none (docs/bugs/
+    /// 16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// Reads what the host announced and nothing else, the same contract
+    /// [`Self::on_announced_monitors`] holds: there is no request message, so
+    /// this cannot ask, and it must not fall back to enumerating *this*
+    /// machine's own modes.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
+    fn on_announced_display_modes(&self, label: &str) -> DisplayModesReply {
+        let peer = self.resolve(label)?;
+        let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+        Ok((view.display_modes.clone(), view.display_modes_reason))
+    }
+
+    /// Guest side: asks the watched host to switch its own physical monitor
+    /// to `mode_id` (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// The host is the only side that decides whether its own `display_mode`
+    /// grant and its own hardware actually allow it; this only keeps an id
+    /// the host never announced, or a message a host that never confirmed it
+    /// understands, off the wire.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] when the host announced no such id;
+    /// [`ActorError::Unsupported`] when the host never answered with a minor
+    /// that carries `MessageKind::DisplaySetMode`.
+    fn on_request_display_set_mode(&mut self, label: &str, mode_id: u32) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+        if !view.display_modes.iter().any(|mode| mode.id == mode_id) {
+            tracing::warn!(peer = %label, mode_id, "no such display mode was announced");
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        if !self.may_set_display_mode_to(&peer) {
+            return Err(ActorError::Unsupported);
+        }
+        self.send_to(&peer, MessageKind::DisplaySetMode { mode_id });
+        Ok(())
+    }
+
     /// Host side: announces this host's monitors to `peer`'s guest
     /// (§11 `MonitorsList`; ADR 0028).
     ///
@@ -4865,6 +5112,68 @@ impl Actor {
         };
         tracing::debug!(peer = %label, count = monitors.len(), "announcing this host's screens");
         self.send_to(&peer, MessageKind::MonitorsList { monitors });
+    }
+
+    /// Host side: announces this host's own physical display modes to
+    /// `peer`'s guest (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// Sent at the same two moments `announce_monitors` is — the grant that
+    /// makes `peer` a viewer, and again whenever `on_set_grant` moves the
+    /// independent `display_mode` grant — because there is no request
+    /// message and this is the only thing that puts the list, or an honest
+    /// reason for its absence, in front of the guest at all.
+    fn announce_display_modes(&mut self, peer: NodeId) {
+        let label = self.label_of(&peer);
+        if !self
+            .display_mode
+            .get(&peer)
+            .is_some_and(|feature| feature.from_peer)
+        {
+            // An older peer would decode the unknown discriminant as
+            // malformed and close the connection (§9.1); say nothing rather
+            // than break it.
+            tracing::debug!(peer = %label, "not announcing display modes: peer does not speak the feature");
+            return;
+        }
+        let granted = self.sessions.grants(&peer).is_some_and(|g| g.display_mode);
+        let (modes, reason) = if !granted {
+            // The one place a lack of permission has to be visible on the
+            // wire: nothing else tells this guest's UI why the selector it
+            // renders has nothing in it (§18).
+            (Vec::new(), Some(DisplayModeUnavailableReason::NotGranted))
+        } else if !lumepeer_media::capture::display_modes_supported() {
+            (
+                Vec::new(),
+                Some(DisplayModeUnavailableReason::PlatformUnsupported),
+            )
+        } else {
+            let found: Vec<DisplayModeInfo> = lock_capture(&self.capture)
+                .display_modes()
+                .into_iter()
+                .enumerate()
+                .map(|(index, mode)| DisplayModeInfo {
+                    id: u32::try_from(index).unwrap_or(0),
+                    width: mode.width,
+                    height: mode.height,
+                    refresh_hz: mode.refresh_hz,
+                })
+                .collect();
+            if found.is_empty() {
+                (
+                    Vec::new(),
+                    Some(DisplayModeUnavailableReason::NoModesReported),
+                )
+            } else {
+                (found, None)
+            }
+        };
+        tracing::debug!(
+            peer = %label,
+            count = modes.len(),
+            granted,
+            "announcing this host's display modes"
+        );
+        self.send_to(&peer, MessageKind::DisplayModesList { modes, reason });
     }
 
     /// Issues an invite for `role`, refusing while the endpoint has no
@@ -6181,6 +6490,13 @@ impl Actor {
             // what puts it there, and it goes out with the grant that made the
             // guest a viewer in the first place (§11; ADR 0028).
             self.announce_monitors(peer);
+            // Same trigger again, for the host's own display modes
+            // (docs/bugs/16-host-display-mode.md #2; ADR 0048). A brand new
+            // session never holds `display_mode` (`Grants::from_role` never
+            // implies it), so this always announces the "not granted" reason
+            // at first — `on_set_grant` re-announces the real list once the
+            // host turns the permission on.
+            self.announce_display_modes(peer);
         }
         tracing::info!(peer = %label, ?role, "consent granted");
         self.audit(
@@ -6279,9 +6595,16 @@ impl Actor {
         // is read at all, so the watcher follows the switch immediately
         // rather than on the next session change (ADR 0030).
         self.refresh_clipboard_watch();
+        // The guest has no way to ask for this list, so a transition either
+        // way has to be re-announced here — the same `display_mode` grant
+        // moving is what turns an empty list with `NotGranted` into a real
+        // one, or back (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+        if grant == IndependentGrant::DisplayMode {
+            self.announce_display_modes(peer);
+        }
         if !allowed {
             // Exhaustive on purpose, with no `_` arm, for the reason
-            // `Grants::get` gives: a fifth independent grant must not be able
+            // `Grants::get` gives: a sixth independent grant must not be able
             // to appear and quietly keep running after it is switched off.
             match grant {
                 IndependentGrant::FileTransfer => self.abandon_file_transfers(peer),
@@ -6294,8 +6617,15 @@ impl Actor {
                 // what "spending" that grant looks like, and it has stopped.
                 // `clipboard_write` is spent by the peer, not here, and every
                 // inbound payload is checked against the live grant as it
-                // arrives.
-                IndependentGrant::ClipboardRead | IndependentGrant::ClipboardWrite => {}
+                // arrives. `display_mode` restoring what this session may
+                // have changed is task 3's job (docs/bugs/
+                // 16-host-display-mode.md #3): it needs the "remember the
+                // original" bookkeeping this commit does not yet have.
+                // `announce_display_modes` above has already told the guest
+                // the permission is gone.
+                IndependentGrant::ClipboardRead
+                | IndependentGrant::ClipboardWrite
+                | IndependentGrant::DisplayMode => {}
             }
         }
         Ok(())
@@ -6694,6 +7024,10 @@ impl Actor {
         // (D7, docs/bugs/13-stream-resolution.md).
         self.stream_scale.entry(peer).or_default().to_peer =
             control.peer_minor() >= STREAM_SCALE_MINOR;
+        // Same reasoning for the host's own display modes this node might ask
+        // to change (docs/bugs/16-host-display-mode.md; ADR 0048).
+        self.display_mode.entry(peer).or_default().to_peer =
+            control.peer_minor() >= DISPLAY_MODE_MINOR;
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -7061,6 +7395,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_CLIPBOARD_FILES),
+        speaks_display_mode: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_DISPLAY_MODE),
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -7159,6 +7497,7 @@ async fn connect_once(
         FEATURE_RECEIVER_REPORT.to_owned(),
         FEATURE_CURSOR_SHAPE.to_owned(),
         FEATURE_STREAM_SCALE.to_owned(),
+        FEATURE_DISPLAY_MODE.to_owned(),
     ];
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
@@ -7540,6 +7879,7 @@ pub fn spawn_actor_with(
         last_keyframe: std::collections::HashMap::new(),
         receiver_reports: std::collections::HashMap::new(),
         stream_scale: std::collections::HashMap::new(),
+        display_mode: std::collections::HashMap::new(),
         speaks_cursor_shape: std::collections::HashSet::new(),
         cursors_tx,
         cursors_rx,
@@ -7775,6 +8115,135 @@ mod tests {
             capture: Arc::clone(capture),
             health: Arc::new(MediaHealth::healthy()),
             injector: None,
+        }
+    }
+
+    /// Every mode a [`ScriptedModesCapturer`] has actually been asked to
+    /// switch to, oldest first (docs/bugs/16-host-display-mode.md #2).
+    type SharedAppliedModes = Arc<std::sync::Mutex<Vec<lumepeer_media::capture::DisplayMode>>>;
+
+    /// Capturer whose display modes and set-mode outcome are entirely
+    /// scripted, so the grant-gating and wiring of docs/bugs/
+    /// 16-host-display-mode.md can be exercised deterministically — without
+    /// depending on real hardware, and without depending on which platform
+    /// happens to run the test (`display_modes_supported` genuinely differs
+    /// across them).
+    #[derive(Debug)]
+    struct ScriptedModesCapturer {
+        running: bool,
+        modes: Vec<lumepeer_media::capture::DisplayMode>,
+        applied: SharedAppliedModes,
+    }
+
+    impl ScreenCapturer for ScriptedModesCapturer {
+        fn start(&mut self, _target: CaptureTarget) -> MediaResult<()> {
+            self.running = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> MediaResult<Option<Frame>> {
+            if self.running {
+                Ok(None)
+            } else {
+                Err(MediaError::CaptureUnavailable("stopped".to_owned()))
+            }
+        }
+
+        fn stop(&mut self) {
+            self.running = false;
+        }
+
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::None
+        }
+
+        fn display_modes(
+            &self,
+            _target: CaptureTarget,
+        ) -> Vec<lumepeer_media::capture::DisplayMode> {
+            self.modes.clone()
+        }
+
+        fn set_display_mode(
+            &mut self,
+            _target: CaptureTarget,
+            mode: lumepeer_media::capture::DisplayMode,
+        ) -> MediaResult<()> {
+            self.applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(mode);
+            Ok(())
+        }
+    }
+
+    /// A host whose "monitor" reports exactly `modes`, for docs/bugs/
+    /// 16-host-display-mode.md.
+    fn scripted_display_mode_media(
+        modes: Vec<lumepeer_media::capture::DisplayMode>,
+    ) -> (HostMedia, SharedAppliedModes) {
+        let applied: SharedAppliedModes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capturer = ScriptedModesCapturer {
+            running: false,
+            modes,
+            applied: Arc::clone(&applied),
+        };
+        let capture = Arc::new(std::sync::Mutex::new(CaptureController::new(
+            Box::new(capturer),
+            CaptureTarget::PrimaryDisplay,
+        )));
+        (test_media(&capture), applied)
+    }
+
+    /// A host granting `ViewOnly` to a guest that opened a view window,
+    /// where the host's own "monitor" reports exactly `modes` (docs/bugs/
+    /// 16-host-display-mode.md #2).
+    async fn display_mode_pair(
+        modes: Vec<lumepeer_media::capture::DisplayMode>,
+    ) -> (ActorHandle, ActorHandle, String, String, SharedAppliedModes) {
+        let (media, applied) = scripted_display_mode_media(modes);
+        let (host, _host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input) = recorder.opened().remove(0);
+        (host, guest, guest_label, host_label, applied)
+    }
+
+    /// Polls `host_display_modes` the way the toolbar does, until `ready`
+    /// holds (docs/bugs/16-host-display-mode.md #2).
+    async fn wait_for_display_modes(
+        guest: &ActorHandle,
+        host_label: &str,
+        mut ready: impl FnMut(&(Vec<DisplayModeInfo>, Option<DisplayModeUnavailableReason>)) -> bool,
+    ) -> (Vec<DisplayModeInfo>, Option<DisplayModeUnavailableReason>) {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let current = guest
+                .host_display_modes(host_label.to_owned())
+                .await
+                .unwrap();
+            if ready(&current) {
+                return current;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the announced display modes"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -8156,6 +8625,151 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         assert!(matches!(
             guest.set_stream_scale("nobody".to_owned(), 100).await,
+            Err(ActorError::UnknownPeer)
+        ));
+    }
+
+    /// docs/bugs/16-host-display-mode.md #2; ADR 0048: `view` is not enough,
+    /// and neither is `input` — a `FullControl` session still sees
+    /// `NotGranted` until the host explicitly hands out the independent
+    /// `display_mode` grant, and only then does the real list, and a
+    /// requested switch, actually reach the capturer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn display_mode_needs_its_own_grant_and_the_real_list_arrives_once_granted() {
+        use lumepeer_media::capture::DisplayMode;
+
+        let modes = vec![
+            DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            },
+            DisplayMode {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 144,
+            },
+        ];
+        let (host, guest, guest_label, host_label, applied) =
+            display_mode_pair(modes.clone()).await;
+
+        // ViewOnly alone, from the pairing above: not granted.
+        let (found, reason) =
+            wait_for_display_modes(&guest, &host_label, |(_, reason)| reason.is_some()).await;
+        assert!(found.is_empty());
+        assert_eq!(reason, Some(DisplayModeUnavailableReason::NotGranted));
+
+        // FullControl widens input too, but `display_mode` stays its own
+        // independent grant (§2.2; ADR 0048): view and input together are
+        // still not enough.
+        host.grant(guest_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        let (found, reason) =
+            wait_for_display_modes(&guest, &host_label, |(_, reason)| reason.is_some()).await;
+        assert!(found.is_empty());
+        assert_eq!(reason, Some(DisplayModeUnavailableReason::NotGranted));
+
+        // The independent grant, explicitly: the real list arrives.
+        host.set_grant(guest_label.clone(), IndependentGrant::DisplayMode, true)
+            .await
+            .unwrap();
+        let (found, reason) =
+            wait_for_display_modes(&guest, &host_label, |(modes, _)| !modes.is_empty()).await;
+        assert_eq!(reason, None);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            (found[0].width, found[0].height, found[0].refresh_hz),
+            (1920, 1080, 60)
+        );
+        assert_eq!(
+            (found[1].width, found[1].height, found[1].refresh_hz),
+            (2560, 1440, 144)
+        );
+
+        // The guest asks for the second mode; the host's own capturer sees
+        // exactly that mode, not merely "some" call.
+        guest
+            .host_display_set_mode(host_label.clone(), found[1].id)
+            .await
+            .unwrap();
+        wait_until("the host never applied the requested mode", || {
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                == Some(&modes[1])
+        })
+        .await;
+
+        // Turning the grant back off tells the guest so over the wire; a
+        // stale id from before that point is refused by the guest's own
+        // cache before anything reaches the host again.
+        host.set_grant(guest_label.clone(), IndependentGrant::DisplayMode, false)
+            .await
+            .unwrap();
+        let (found_after, reason_after) =
+            wait_for_display_modes(&guest, &host_label, |(_, reason)| {
+                *reason == Some(DisplayModeUnavailableReason::NotGranted)
+            })
+            .await;
+        assert!(found_after.is_empty());
+        assert_eq!(reason_after, Some(DisplayModeUnavailableReason::NotGranted));
+        assert!(matches!(
+            guest.host_display_set_mode(host_label, found[1].id).await,
+            Err(ActorError::Core(CoreError::Malformed))
+        ));
+        // Nothing beyond the one earlier switch ever reached the capturer.
+        assert_eq!(
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    /// §9.1: an id the host never announced is refused before it reaches the
+    /// capturer at all — the guest-side check `on_pick_monitor` already
+    /// applies to `MonitorSelect`, mirrored here for `DisplaySetMode`
+    /// (docs/bugs/16-host-display-mode.md #2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_display_set_mode_request_for_an_unannounced_id_never_reaches_the_capturer() {
+        use lumepeer_media::capture::DisplayMode;
+
+        let modes = vec![DisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        }];
+        let (host, guest, guest_label, host_label, applied) = display_mode_pair(modes).await;
+        host.set_grant(guest_label, IndependentGrant::DisplayMode, true)
+            .await
+            .unwrap();
+        wait_for_display_modes(&guest, &host_label, |(modes, _)| !modes.is_empty()).await;
+
+        assert!(matches!(
+            guest.host_display_set_mode(host_label, 99).await,
+            Err(ActorError::Core(CoreError::Malformed))
+        ));
+        assert!(
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "an unannounced id reached the capturer"
+        );
+    }
+
+    /// D7 point 2, docs/bugs/16-host-display-mode.md #2: the host is the one
+    /// that decides, and a peer this actor is not watching at all is refused
+    /// the same way an unknown label is refused everywhere else in this
+    /// file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_display_set_mode_request_to_an_unwatched_peer_is_refused() {
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        assert!(matches!(
+            guest.host_display_set_mode("nobody".to_owned(), 0).await,
             Err(ActorError::UnknownPeer)
         ));
     }

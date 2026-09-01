@@ -1,4 +1,4 @@
-// Host-side switches for the four independent grants of §8.2 (ADR 0029).
+// Host-side switches for the independent grants of §8.2 (ADR 0029; ADR 0048).
 //
 // The point of these tests is the direction of authority: this panel asks the
 // core to change a grant and then shows whatever the core says it holds. It
@@ -22,6 +22,7 @@ const noGrants = {
   clipboard_write: false,
   file_transfer: false,
   recording: false,
+  display_mode: false,
   recording_active: false,
   record_request: false,
 } as const;
@@ -51,11 +52,11 @@ function switches(root: HTMLElement): HTMLInputElement[] {
 }
 
 describe('independent grant switches', () => {
-  it('offers exactly the four independent grants, all off on a fresh session', () => {
+  it('offers exactly the five independent grants, all off on a fresh session', () => {
     render(sessionStatus([activeSession], 'en'), container);
 
     const boxes = switches(container);
-    expect(boxes).toHaveLength(4);
+    expect(boxes).toHaveLength(5);
     expect(boxes.every((box) => box.type === 'checkbox')).toBe(true);
     expect(boxes.some((box) => box.checked)).toBe(false);
   });
@@ -103,6 +104,26 @@ describe('independent grant switches', () => {
     );
   });
 
+  it('the display_mode grant is its own switch, independent of every other one (ADR 0048)', async () => {
+    render(sessionStatus([{ ...activeSession, display_mode: true }], 'en'), container);
+
+    const boxes = switches(container);
+    const checked = boxes.filter((box) => box.checked);
+    expect(checked).toHaveLength(1);
+    expect(checked[0]?.getAttribute('aria-label')).toContain('screen resolution');
+
+    const box = boxes.find((candidate) =>
+      candidate.getAttribute('aria-label')?.includes('screen resolution'),
+    );
+    box?.click();
+
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('session_set_grant', {
+        args: { peer: 'guest-ab12', grant: 'display_mode', allowed: false },
+      }),
+    );
+  });
+
   it('re-polls after a refused change, so a switch cannot stay on against the core', async () => {
     invoke.mockRejectedValueOnce(new Error('denied'));
     const onRefresh = vi.fn();
@@ -131,7 +152,7 @@ describe('independent grant switches', () => {
       try {
         render(sessionStatus([activeSession], locale), scoped);
         const boxes = switches(scoped);
-        expect(boxes).toHaveLength(4);
+        expect(boxes).toHaveLength(5);
         for (const box of boxes) {
           // Native checkboxes are in the tab order unless something takes
           // them out of it; nothing here may.

@@ -55,6 +55,8 @@ const COMMANDS: &[&str] = &[
     "monitor_select",
     "monitors_list",
     "view_set_scale",
+    "host_display_modes",
+    "host_display_set_mode",
     "recordings_list",
     "recording_export",
     "audit_list",

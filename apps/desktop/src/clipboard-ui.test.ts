@@ -54,6 +54,7 @@ const activeSession: SessionStatus = {
   clipboard_write: true,
   file_transfer: false,
   recording: false,
+  display_mode: false,
   recording_active: false,
   record_request: false,
 };
