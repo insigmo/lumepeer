@@ -37,7 +37,7 @@ impl Role {
 /// All fields default to `false`: a fresh session grants nothing.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "§2.2 requires these six permissions to stay independent flags"
+    reason = "§2.2 requires these seven permissions to stay independent flags"
 )]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Grants {
@@ -53,9 +53,18 @@ pub struct Grants {
     pub file_transfer: bool,
     /// Record the session.
     pub recording: bool,
+    /// See the host's secure desktop (UAC prompt, lock screen, fast user
+    /// switch) instead of the honest "can't see this" message
+    /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0046).
+    ///
+    /// Independent of `view` and of every role, `FullControl` included: the
+    /// same "`FullControl` does not imply recording or files" ground rule
+    /// applies here, because a guest that can move the mouse is not thereby
+    /// a guest who should watch an administrator authenticate.
+    pub secure_desktop: bool,
 }
 
-/// One of the four grants a host may toggle on a session that is already
+/// One of the five grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -72,12 +81,15 @@ pub enum IndependentGrant {
     FileTransfer,
     /// Record the session.
     Recording,
+    /// See the host's secure desktop (ADR 0046).
+    SecureDesktop,
 }
 
 impl Grants {
     /// Grants implied by a role at the moment of `ConsentGrant` (§8.2).
     ///
-    /// Clipboard, file transfer and recording are never implied.
+    /// Clipboard, file transfer, recording and the secure desktop are never
+    /// implied.
     #[must_use]
     pub const fn from_role(role: Role) -> Self {
         Self {
@@ -87,19 +99,21 @@ impl Grants {
             clipboard_write: false,
             file_transfer: false,
             recording: false,
+            secure_desktop: false,
         }
     }
 
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: a seventh permission must
+        // Exhaustive on purpose, with no `_` arm: an eighth permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
             IndependentGrant::ClipboardWrite => self.clipboard_write,
             IndependentGrant::FileTransfer => self.file_transfer,
             IndependentGrant::Recording => self.recording,
+            IndependentGrant::SecureDesktop => self.secure_desktop,
         }
     }
 
@@ -110,6 +124,7 @@ impl Grants {
             IndependentGrant::ClipboardWrite => self.clipboard_write = allowed,
             IndependentGrant::FileTransfer => self.file_transfer = allowed,
             IndependentGrant::Recording => self.recording = allowed,
+            IndependentGrant::SecureDesktop => self.secure_desktop = allowed,
         }
     }
 }
@@ -400,13 +415,14 @@ mod tests {
     }
 
     #[test]
-    fn full_control_implies_input_but_never_clipboard_files_or_recording() {
+    fn full_control_implies_input_but_never_clipboard_files_recording_or_secure_desktop() {
         let grants = Grants::from_role(Role::FullControl);
         assert!(grants.view && grants.input);
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
+        assert!(!grants.secure_desktop);
     }
 
     #[test]
