@@ -55,7 +55,7 @@ pub struct Grants {
     pub recording: bool,
     /// See the host's secure desktop (UAC prompt, lock screen, fast user
     /// switch) instead of the honest "can't see this" message
-    /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0046).
+    /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049).
     ///
     /// Independent of `view` and of every role, `FullControl` included: the
     /// same "`FullControl` does not imply recording or files" ground rule
@@ -81,7 +81,7 @@ pub enum IndependentGrant {
     FileTransfer,
     /// Record the session.
     Recording,
-    /// See the host's secure desktop (ADR 0046).
+    /// See the host's secure desktop (ADR 0049).
     SecureDesktop,
 }
 

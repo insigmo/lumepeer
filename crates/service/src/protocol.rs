@@ -1,5 +1,5 @@
 //! The whole protocol between the client and the privileged service
-//! (ADR 0043, ADR 0046).
+//! (ADR 0043, ADR 0049).
 //!
 //! Two bytes in, two bytes out, one operation *per pipe round trip*. That is
 //! not minimalism for its own sake: this is an unprivileged process talking
@@ -12,14 +12,14 @@
 //! A frame is fixed-size on both directions, so there is no length field to
 //! lie about and no partial read to reassemble.
 //!
-//! ADR 0046 adds a second operation, [`OP_CAPTURE_SECURE_DESKTOP`], whose
+//! ADR 0049 adds a second operation, [`OP_CAPTURE_SECURE_DESKTOP`], whose
 //! answer cannot fit two bytes: a screen's worth of pixels. Rather than teach
 //! the pipe a length field, the pixels travel over a second, fixed-capacity
 //! channel this file also names — a single named shared-memory mapping,
 //! sized once at compile time and never resized at runtime, so a caller
 //! still cannot make the service allocate, expose or listen on anything it
 //! did not already have before the request arrived. See `crates/service/src/
-//! frame.rs` for the mechanics and ADR 0046 for why a mapping was chosen
+//! frame.rs` for the mechanics and ADR 0049 for why a mapping was chosen
 //! over extending `crates/media`'s decoder ring buffer (§11.3).
 
 /// First byte of every frame, in both directions.
@@ -69,7 +69,7 @@ pub const STATUS_REFUSED: u8 = 0x01;
 pub const ENDPOINT: &str = r"\\.\pipe\lumepeer-service";
 
 /// Name of the shared-memory mapping [`OP_CAPTURE_SECURE_DESKTOP`] publishes
-/// frames into (ADR 0046).
+/// frames into (ADR 0049).
 ///
 /// `Global\` is required, not stylistic: the service runs in session 0 and
 /// the client runs in an interactive session, and a name without that prefix
@@ -91,13 +91,13 @@ pub const SECURE_DESKTOP_MAPPING_NAME: &str = r"Global\lumepeer-secure-desktop-f
 pub const SECURE_DESKTOP_FRAME_HEADER_BYTES: usize = 12;
 
 /// Capacity of the payload region after the header: one BGRA8 frame at this
-/// pipeline's existing size ceiling (ADR 0046).
+/// pipeline's existing size ceiling (ADR 0049).
 ///
 /// This is the same `1920 * 1080` bound `lumepeer_core::constants::
 /// MAX_PICTURE_PIXELS` already puts on every other frame this codebase
 /// moves, kept as a literal here rather than imported: `crates/service` does
 /// not depend on `lumepeer-core` (ADR 0043's dependency-minimalism
-/// argument, restated for this crate in ADR 0046), so raising one bound
+/// argument, restated for this crate in ADR 0049), so raising one bound
 /// without the other is caught by review rather than by the compiler. A
 /// frame captured larger than this is refused by [`crate::frame`] rather
 /// than published truncated — a partial BGRA8 image is a corrupt one, not a

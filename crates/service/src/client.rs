@@ -1,4 +1,4 @@
-//! Talking to the privileged helper service (ADR 0043, ADR 0046).
+//! Talking to the privileged helper service (ADR 0043, ADR 0049).
 //!
 //! Opening the pipe and sending two bytes needs no `unsafe` and no Win32
 //! bindings — an ordinary `CreateFileW`, which the standard library already
@@ -41,7 +41,7 @@ pub fn deliver_sas() -> bool {
 }
 
 /// One frame of the secure desktop, as [`capture_secure_desktop_frame`] hands
-/// it back (ADR 0046).
+/// it back (ADR 0049).
 #[derive(Debug, Clone)]
 pub struct SecureDesktopFrame {
     /// Width in pixels.
@@ -56,7 +56,7 @@ pub struct SecureDesktopFrame {
 ///
 /// `None` covers every reason at once, same as [`deliver_sas`]: not
 /// installed, not reachable, the caller's session is not the one attached to
-/// the active console (ADR 0046's session-binding check), the secure desktop
+/// the active console (ADR 0049's session-binding check), the secure desktop
 /// is not actually showing anything capturable right now, or the mapping
 /// could not be read. The caller's answer to all of them is the same —
 /// `docs/bugs/11-uac-degradation.md`'s honest message — so there is nothing
@@ -151,7 +151,7 @@ mod tests {
     /// real side effect this suite must never trigger — a *reachable* one is
     /// safe to actually call here too. Whether it is an older service that
     /// refuses the unknown opcode, or a real one with no secure desktop
-    /// currently showing, or one whose caller fails ADR 0046's session
+    /// currently showing, or one whose caller fails ADR 0049's session
     /// check, every outcome is `None` and none of them has a visible effect
     /// on the machine — capturing is read-only, unlike `SendSAS`.
     #[test]

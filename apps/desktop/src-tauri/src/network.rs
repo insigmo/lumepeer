@@ -352,7 +352,7 @@ pub struct SessionSnapshot {
     /// answer (§17). Never auto-answered: a person at the host decides.
     pub record_request: bool,
     /// Whether this guest is, right now, actually seeing the secure desktop
-    /// (ADR 0046).
+    /// (ADR 0049).
     ///
     /// Separate from `grants.secure_desktop` the same way `recording_active`
     /// is separate from `recording`: the grant says the host *may* show it,
@@ -5608,7 +5608,7 @@ impl Actor {
         // value in one place" it checks before every attempt
         // (`apps/desktop/src-tauri/src/view.rs`), so a grant switched on
         // mid-stall must reach it just as promptly as a revoke does
-        // (ADR 0046). Nothing to update if no media session exists yet — the
+        // (ADR 0049). Nothing to update if no media session exists yet — the
         // next one starts with the flag at `false`, matching
         // `Grants::from_role`.
         if grant == IndependentGrant::SecureDesktop

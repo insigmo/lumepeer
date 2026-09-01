@@ -1,5 +1,5 @@
 // Host-side switches for the five independent grants of §8.2 (ADR 0029,
-// ADR 0046).
+// ADR 0049).
 //
 // The point of these tests is the direction of authority: this panel asks the
 // core to change a grant and then shows whatever the core says it holds. It
@@ -106,7 +106,7 @@ describe('independent grant switches', () => {
     );
   });
 
-  it('the secure-desktop switch is labeled honestly and independent of the rest (ADR 0046)', async () => {
+  it('the secure-desktop switch is labeled honestly and independent of the rest (ADR 0049)', async () => {
     render(sessionStatus([activeSession], 'en'), container);
 
     const box = switches(container).find((candidate) =>
@@ -114,11 +114,11 @@ describe('independent grant switches', () => {
     );
     expect(box).toBeDefined();
     // Not "secure desktop" — the label says the consequence, not the
-    // mechanism (ADR 0046).
+    // mechanism (ADR 0049).
     expect(box?.getAttribute('aria-label')).not.toContain('secure desktop');
     // `activeSession` holds `full_control` and nothing else: the row is
     // unchecked because the grant is independent of the role, never derived
-    // from it (ADR 0046's central requirement).
+    // from it (ADR 0049's central requirement).
     expect(box?.checked).toBe(false);
 
     box?.click();

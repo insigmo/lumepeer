@@ -320,9 +320,9 @@ const en: Dictionary = {
   'status.grants.fileTransfer': 'Send and receive files',
   'status.grants.recording': 'Let this session be recorded',
   // Not "secure desktop": the person deciding needs to know what they are
-  // granting, not the Windows term for the mechanism (ADR 0046).
+  // granting, not the Windows term for the mechanism (ADR 0049).
   'status.grants.secureDesktop': 'See the administrator prompt and lock screen',
-  // The non-removable indicator while it is actually happening (ADR 0046,
+  // The non-removable indicator while it is actually happening (ADR 0049,
   // §17-equivalent) — distinct from the grant above the same way the
   // recording indicator is distinct from the recording grant.
   'status.secureDesktop.active': 'Viewing the administrator prompt or lock screen',

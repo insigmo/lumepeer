@@ -1,4 +1,4 @@
-# ADR 0046 — The helper service gets a second capability: secure-desktop frames
+# ADR 0049 — The helper service gets a second capability: secure-desktop frames
 
 Status: accepted
 Date: 2026-09-01

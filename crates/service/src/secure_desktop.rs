@@ -1,4 +1,4 @@
-//! One GDI snapshot of `Winsta0\Winlogon`, the secure desktop (ADR 0046).
+//! One GDI snapshot of `Winsta0\Winlogon`, the secure desktop (ADR 0049).
 //!
 //! A service's thread does not start out able to see this: by default a
 //! Windows service runs on a *non-interactive* window station
@@ -16,7 +16,7 @@
 //!    `CreateDIBSection`) — the same technique `crates/media`'s Windows
 //!    backend already uses for its own first-frame snapshot, reimplemented
 //!    here rather than shared, because `crates/service` does not depend on
-//!    `crates/media` (ADR 0043's dependency-minimalism argument, ADR 0046).
+//!    `crates/media` (ADR 0043's dependency-minimalism argument, ADR 0049).
 //!
 //! `SetProcessWindowStation` changes the *whole process*, not just this
 //! thread. That is safe here because the service serves one pipe connection
@@ -26,7 +26,7 @@
 //! function returns, rather than left switched for the rest of the
 //! process's life: minimizing how long a `LocalSystem` process holds a live
 //! handle onto the secure desktop is part of limiting what its compromise
-//! would be worth (ADR 0046).
+//! would be worth (ADR 0049).
 //!
 //! [`OpenWindowStationW`]: windows::Win32::System::StationsAndDesktops::OpenWindowStationW
 //! [`SetProcessWindowStation`]: windows::Win32::System::StationsAndDesktops::SetProcessWindowStation
@@ -94,7 +94,7 @@ pub fn capture() -> Option<(u32, u32, Vec<u8>)> {
     // Restore both, regardless of whether the capture above succeeded: a
     // `LocalSystem` process should hold a live handle onto the interactive
     // window station and the secure desktop for no longer than the one
-    // capture actually needs (ADR 0046).
+    // capture actually needs (ADR 0049).
     if let Some(winsta) = original_winsta
         && !winsta.is_invalid()
     {
