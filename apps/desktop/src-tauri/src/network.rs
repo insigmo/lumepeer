@@ -25,10 +25,10 @@ use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
 use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
-    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_MS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
-    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
-    MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
-    STREAM_SCALE_MAX_PERCENT,
+    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_MS, DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES,
+    FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
+    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
+    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
@@ -130,6 +130,25 @@ const REPORT_CAPACITY: usize = 16;
 fn keyframe_budget_allows(last_honoured: Option<std::time::Instant>) -> bool {
     let budget = Duration::from_millis(KEYFRAME_MIN_INTERVAL_MS);
     last_honoured.is_none_or(|at| at.elapsed() >= budget)
+}
+
+/// Whether a display-mode auto-revert timeout should actually revert
+/// (docs/bugs/16-host-display-mode.md #3; ADR 0048).
+///
+/// Pure, and separate from the actor so the generation-staleness and
+/// confirmation rules can be checked without a runtime, a capture backend or
+/// a real wait: `current_generation` is `None` once the state has already
+/// been resolved (restored, or the peer that owned it left) by the time the
+/// timeout fires, and any generation other than the one this timeout was
+/// armed for means a later switch has already superseded it. Only a timeout
+/// that still names the live generation, with capture never having
+/// confirmed health since it was armed, reverts.
+fn should_auto_revert_display_mode(
+    current_generation: Option<u64>,
+    timed_out_generation: u64,
+    healthy_since_armed: bool,
+) -> bool {
+    current_generation == Some(timed_out_generation) && !healthy_since_armed
 }
 
 /// Blends one round-trip sample into the running average of [`RTT_EWMA_ALPHA`].
@@ -2108,6 +2127,34 @@ struct DisplayModeFeature {
     to_peer: bool,
 }
 
+/// Host side: this host's own physical monitor has been switched at least
+/// once this "reversibility window", and has not been restored yet
+/// (docs/bugs/16-host-display-mode.md #3; ADR 0048).
+///
+/// Exactly one of these exists at a time, host-wide — the monitor is a
+/// single physical resource, so there is one original to remember and one
+/// current owner, never one per guest.
+#[derive(Debug, Clone, Copy)]
+struct DisplayModeState {
+    /// The mode this monitor was set up with before the *first* switch of
+    /// this window. Every later switch inside the same window is still
+    /// undone back to this one, never to whatever the immediately preceding
+    /// switch was.
+    original: lumepeer_media::capture::DisplayMode,
+    /// The peer whose request most recently moved the mode — restoring on
+    /// disconnect or on that peer losing the `display_mode` grant only makes
+    /// sense against whoever is actually responsible right now.
+    owner: NodeId,
+    /// When the most recent switch was applied, for the auto-revert
+    /// timeout's health window.
+    armed_at: std::time::Instant,
+    /// Bumped on every switch; a confirm-timeout event carries the
+    /// generation it was armed for, so a timer from an already-superseded or
+    /// already-restored switch is a no-op instead of reverting a mode
+    /// nothing here still owns.
+    generation: u64,
+}
+
 /// Host side: one running capture/encode loop, plus the connection it writes
 /// on, so a revoke can stop both without waiting for the loop to notice.
 /// `recorder` is the §17 slot the actor swaps a session recorder into; it
@@ -2338,6 +2385,13 @@ enum ActorEvent {
         /// the file it named.
         paths: Vec<std::path::PathBuf>,
     },
+    /// A display-mode switch's confirmation window elapsed off the actor
+    /// loop (docs/bugs/16-host-display-mode.md #3; ADR 0048). `generation`
+    /// ties this to the switch that armed it; the actor checks both that its
+    /// own `display_mode_state` still matches this generation and that
+    /// capture has answered successfully since the switch, before deciding
+    /// whether there is anything left to revert.
+    DisplayModeConfirmTimeout { generation: u64 },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -2465,6 +2519,16 @@ struct Actor {
     /// Which side of the `DisplayModesList`/`DisplaySetMode` exchange each
     /// peer can speak (§9.1; docs/bugs/16-host-display-mode.md; ADR 0048).
     display_mode: std::collections::HashMap<NodeId, DisplayModeFeature>,
+    /// Host side: the host's own monitor's original mode, and who is
+    /// responsible for restoring it, while a switch this session made has
+    /// not been undone yet (docs/bugs/16-host-display-mode.md #3; ADR 0048).
+    /// `None` when the monitor is in whatever mode it started this process
+    /// in.
+    display_mode_state: Option<DisplayModeState>,
+    /// Monotonic counter identifying the most recent display-mode switch,
+    /// so a late confirm-timeout event can tell whether it is still about
+    /// the switch that armed it (docs/bugs/16-host-display-mode.md #3).
+    display_mode_generation: u64,
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
@@ -3001,7 +3065,7 @@ impl Actor {
     }
 
     /// Host side: switches this host's own physical monitor to `mode_id`
-    /// (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    /// (docs/bugs/16-host-display-mode.md #2, #3; ADR 0048).
     ///
     /// `view` is not the grant this checks. Changing the operator's own
     /// screen is materially riskier than anything a `view` grant covers —
@@ -3011,6 +3075,13 @@ impl Actor {
     /// [`Self::on_stream_scale_request`] re-checks `view` for the same
     /// reason (§2.3): a grant revoked a moment ago must not be honored by a
     /// message already in flight.
+    ///
+    /// Reversibility, task 3's whole point: the mode this monitor was in
+    /// before the *first* switch of the current window is read and
+    /// remembered before anything is applied, and refused outright if it
+    /// cannot be read — a switch with no way back must not happen at all.
+    /// A successful switch arms the auto-revert timeout of
+    /// [`Self::arm_display_mode_confirm_timeout`].
     fn on_display_set_mode(&mut self, peer: NodeId, mode_id: u32) {
         let tag = self.label_of(&peer);
         if !self
@@ -3046,12 +3117,108 @@ impl Actor {
             tracing::warn!(peer = %tag, mode_id, "no such display mode was announced");
             return;
         };
+
+        let original = if let Some(state) = self.display_mode_state {
+            state.original
+        } else {
+            let Some(current) = lock_capture(&self.capture).current_display_mode() else {
+                tracing::warn!(
+                    peer = %tag,
+                    "refusing a display mode switch: the current mode could not be read back, so there would be no way to undo it"
+                );
+                return;
+            };
+            current
+        };
+
         match lock_capture(&self.capture).set_display_mode(mode) {
             Ok(()) => {
                 tracing::info!(peer = %tag, ?mode, "display mode switched by the guest");
+                self.display_mode_generation += 1;
+                let generation = self.display_mode_generation;
+                self.display_mode_state = Some(DisplayModeState {
+                    original,
+                    owner: peer,
+                    armed_at: std::time::Instant::now(),
+                    generation,
+                });
+                self.arm_display_mode_confirm_timeout(generation);
             }
             Err(error) => {
                 tracing::warn!(peer = %tag, ?mode, %error, "the platform refused the display mode");
+            }
+        }
+    }
+
+    /// Spawns the auto-revert timeout for the switch identified by
+    /// `generation` (docs/bugs/16-host-display-mode.md #3).
+    ///
+    /// Only the waiting happens off the actor loop, per ADR 0027: the
+    /// spawned task reports back through `events_tx` once the deadline
+    /// passes, and [`Self::on_display_mode_confirm_timeout`] — back on the
+    /// actor's own thread — is what actually decides whether to revert,
+    /// against whatever state is authoritative by then.
+    fn arm_display_mode_confirm_timeout(&self, generation: u64) {
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(DISPLAY_MODE_CONFIRM_TIMEOUT_SECS)).await;
+            let _ = events
+                .send(ActorEvent::DisplayModeConfirmTimeout { generation })
+                .await;
+        });
+    }
+
+    /// Host side: a display-mode confirmation window elapsed (docs/bugs/
+    /// 16-host-display-mode.md #3; ADR 0048).
+    ///
+    /// A no-op unless `generation` still names the switch currently armed —
+    /// a later switch, an explicit restore, or the owning peer leaving may
+    /// already have resolved it by the time this fires. Otherwise, capture
+    /// having answered successfully at all since the switch is what counts
+    /// as confirmed (§18: nothing here waits on a human, attended or not);
+    /// anything else reverts.
+    fn on_display_mode_confirm_timeout(&mut self, generation: u64) {
+        let current_generation = self.display_mode_state.map(|state| state.generation);
+        let healthy = self
+            .display_mode_state
+            .is_some_and(|state| lock_capture(&self.capture).healthy_since(state.armed_at));
+        if !should_auto_revert_display_mode(current_generation, generation, healthy) {
+            if current_generation == Some(generation) {
+                tracing::debug!(
+                    generation,
+                    "display mode confirmed: capture answered within the timeout"
+                );
+            }
+            return;
+        }
+        tracing::warn!(
+            generation,
+            "display mode auto-reverted: capture never confirmed it within the timeout"
+        );
+        self.restore_display_mode();
+    }
+
+    /// Restores this host's monitor to the mode it was in before the first
+    /// switch of the current window, if any switch is still outstanding
+    /// (docs/bugs/16-host-display-mode.md #3; ADR 0048).
+    ///
+    /// Always clears `display_mode_state` even if the restore itself fails:
+    /// a failed restore is not a switch to keep retrying blindly, and the
+    /// error is loud in the log either way.
+    fn restore_display_mode(&mut self) {
+        let Some(state) = self.display_mode_state.take() else {
+            return;
+        };
+        match lock_capture(&self.capture).set_display_mode(state.original) {
+            Ok(()) => {
+                tracing::info!(original = ?state.original, "display mode restored");
+            }
+            Err(error) => {
+                tracing::error!(
+                    original = ?state.original,
+                    %error,
+                    "failed to restore the original display mode"
+                );
             }
         }
     }
@@ -3335,6 +3502,9 @@ impl Actor {
             ActorEvent::File(event) => self.on_file_event(event),
             ActorEvent::ClipboardFilesRead { peer, files, paths } => {
                 self.on_clipboard_files_read(peer, files, paths);
+            }
+            ActorEvent::DisplayModeConfirmTimeout { generation } => {
+                self.on_display_mode_confirm_timeout(generation);
             }
         }
     }
@@ -4419,6 +4589,17 @@ impl Actor {
         self.receiver_reports.remove(&peer);
         self.stream_scale.remove(&peer);
         self.display_mode.remove(&peer);
+        // Reversibility, always, including an ungraceful disconnect: this is
+        // the same per-peer teardown funnel every other kind of session
+        // state already goes through here, and a display-mode switch this
+        // peer owns must not outlive the connection that asked for it
+        // (docs/bugs/16-host-display-mode.md #3; ADR 0048).
+        if self
+            .display_mode_state
+            .is_some_and(|state| state.owner == peer)
+        {
+            self.restore_display_mode();
+        }
         // Chat and clipboard state are per-session by design (§15): nothing
         // about a past peer survives its connection here.
         self.chat.drop_transcript(&peer);
@@ -6617,15 +6798,23 @@ impl Actor {
                 // what "spending" that grant looks like, and it has stopped.
                 // `clipboard_write` is spent by the peer, not here, and every
                 // inbound payload is checked against the live grant as it
-                // arrives. `display_mode` restoring what this session may
-                // have changed is task 3's job (docs/bugs/
-                // 16-host-display-mode.md #3): it needs the "remember the
-                // original" bookkeeping this commit does not yet have.
+                // arrives.
+                IndependentGrant::ClipboardRead | IndependentGrant::ClipboardWrite => {}
+                // Withdrawing the grant from whoever is actually holding the
+                // monitor in a switched mode restores it on the spot, the
+                // same way turning `recording` off stops the file rather
+                // than waiting for the session to end (docs/bugs/
+                // 16-host-display-mode.md #3; ADR 0048).
                 // `announce_display_modes` above has already told the guest
                 // the permission is gone.
-                IndependentGrant::ClipboardRead
-                | IndependentGrant::ClipboardWrite
-                | IndependentGrant::DisplayMode => {}
+                IndependentGrant::DisplayMode => {
+                    if self
+                        .display_mode_state
+                        .is_some_and(|state| state.owner == peer)
+                    {
+                        self.restore_display_mode();
+                    }
+                }
             }
         }
         Ok(())
@@ -7880,6 +8069,8 @@ pub fn spawn_actor_with(
         receiver_reports: std::collections::HashMap::new(),
         stream_scale: std::collections::HashMap::new(),
         display_mode: std::collections::HashMap::new(),
+        display_mode_state: None,
+        display_mode_generation: 0,
         speaks_cursor_shape: std::collections::HashSet::new(),
         cursors_tx,
         cursors_rx,
@@ -8031,6 +8222,24 @@ mod tests {
         );
     }
 
+    /// docs/bugs/16-host-display-mode.md #3: the auto-revert decision, pure
+    /// and checked without a runtime, a capture backend or a real 10-second
+    /// wait — only a timeout that still names the live generation, with
+    /// capture never confirmed healthy since it was armed, reverts.
+    #[test]
+    fn auto_revert_only_fires_for_the_live_generation_and_only_when_unconfirmed() {
+        // The common case: this is still the switch that armed the timer,
+        // and nothing confirmed it — revert.
+        assert!(should_auto_revert_display_mode(Some(1), 1, false));
+        // Confirmed within the window: keep it.
+        assert!(!should_auto_revert_display_mode(Some(1), 1, true));
+        // A later switch already moved the generation past this timeout.
+        assert!(!should_auto_revert_display_mode(Some(2), 1, false));
+        // Already resolved entirely (restored, or the owner disconnected)
+        // by the time this timeout fired.
+        assert!(!should_auto_revert_display_mode(None, 1, false));
+    }
+
     /// A `Pong` for a ping that was never sent is the same non-event.
     #[test]
     fn a_pong_nobody_asked_for_measures_nothing() {
@@ -8132,6 +8341,11 @@ mod tests {
     struct ScriptedModesCapturer {
         running: bool,
         modes: Vec<lumepeer_media::capture::DisplayMode>,
+        /// What this "monitor" is set up with right now, changed by every
+        /// successful `set_display_mode` — the same way real hardware
+        /// behaves, and what lets a test assert a restore actually happened
+        /// (docs/bugs/16-host-display-mode.md #3).
+        current: lumepeer_media::capture::DisplayMode,
         applied: SharedAppliedModes,
     }
 
@@ -8169,23 +8383,33 @@ mod tests {
             _target: CaptureTarget,
             mode: lumepeer_media::capture::DisplayMode,
         ) -> MediaResult<()> {
+            self.current = mode;
             self.applied
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(mode);
             Ok(())
         }
+
+        fn current_display_mode(
+            &self,
+            _target: CaptureTarget,
+        ) -> Option<lumepeer_media::capture::DisplayMode> {
+            Some(self.current)
+        }
     }
 
-    /// A host whose "monitor" reports exactly `modes`, for docs/bugs/
-    /// 16-host-display-mode.md.
+    /// A host whose "monitor" is set up with `current` and reports `modes`
+    /// as switchable, for docs/bugs/16-host-display-mode.md.
     fn scripted_display_mode_media(
+        current: lumepeer_media::capture::DisplayMode,
         modes: Vec<lumepeer_media::capture::DisplayMode>,
     ) -> (HostMedia, SharedAppliedModes) {
         let applied: SharedAppliedModes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let capturer = ScriptedModesCapturer {
             running: false,
             modes,
+            current,
             applied: Arc::clone(&applied),
         };
         let capture = Arc::new(std::sync::Mutex::new(CaptureController::new(
@@ -8196,12 +8420,13 @@ mod tests {
     }
 
     /// A host granting `ViewOnly` to a guest that opened a view window,
-    /// where the host's own "monitor" reports exactly `modes` (docs/bugs/
-    /// 16-host-display-mode.md #2).
+    /// where the host's own "monitor" starts at `current` and reports
+    /// `modes` as switchable (docs/bugs/16-host-display-mode.md #2, #3).
     async fn display_mode_pair(
+        current: lumepeer_media::capture::DisplayMode,
         modes: Vec<lumepeer_media::capture::DisplayMode>,
     ) -> (ActorHandle, ActorHandle, String, String, SharedAppliedModes) {
-        let (media, applied) = scripted_display_mode_media(modes);
+        let (media, applied) = scripted_display_mode_media(current, modes);
         let (host, _host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
         let recorder = Arc::new(RecordingWindows::default());
         let (guest, _guest_endpoint, _guest_capture, _windows) =
@@ -8638,6 +8863,11 @@ mod tests {
     async fn display_mode_needs_its_own_grant_and_the_real_list_arrives_once_granted() {
         use lumepeer_media::capture::DisplayMode;
 
+        let original = DisplayMode {
+            width: 1024,
+            height: 768,
+            refresh_hz: 60,
+        };
         let modes = vec![
             DisplayMode {
                 width: 1920,
@@ -8651,7 +8881,7 @@ mod tests {
             },
         ];
         let (host, guest, guest_label, host_label, applied) =
-            display_mode_pair(modes.clone()).await;
+            display_mode_pair(original, modes.clone()).await;
 
         // ViewOnly alone, from the pairing above: not granted.
         let (found, reason) =
@@ -8702,9 +8932,10 @@ mod tests {
         })
         .await;
 
-        // Turning the grant back off tells the guest so over the wire; a
-        // stale id from before that point is refused by the guest's own
-        // cache before anything reaches the host again.
+        // Turning the grant back off tells the guest so over the wire, and
+        // — task 3's reversibility — restores the monitor to what it was
+        // before the first switch, not to whatever the most recent switch
+        // happened to be.
         host.set_grant(guest_label.clone(), IndependentGrant::DisplayMode, false)
             .await
             .unwrap();
@@ -8715,17 +8946,28 @@ mod tests {
             .await;
         assert!(found_after.is_empty());
         assert_eq!(reason_after, Some(DisplayModeUnavailableReason::NotGranted));
+        wait_until("the original mode was never restored", || {
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                == Some(&original)
+        })
+        .await;
+        // A stale id from before the grant went away is refused by the
+        // guest's own cache before anything reaches the host again.
         assert!(matches!(
             guest.host_display_set_mode(host_label, found[1].id).await,
             Err(ActorError::Core(CoreError::Malformed))
         ));
-        // Nothing beyond the one earlier switch ever reached the capturer.
+        // Exactly the one switch and the one restore ever reached the
+        // capturer.
         assert_eq!(
             applied
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
-            1
+            2
         );
     }
 
@@ -8737,12 +8979,18 @@ mod tests {
     async fn a_display_set_mode_request_for_an_unannounced_id_never_reaches_the_capturer() {
         use lumepeer_media::capture::DisplayMode;
 
+        let original = DisplayMode {
+            width: 1024,
+            height: 768,
+            refresh_hz: 60,
+        };
         let modes = vec![DisplayMode {
             width: 1920,
             height: 1080,
             refresh_hz: 60,
         }];
-        let (host, guest, guest_label, host_label, applied) = display_mode_pair(modes).await;
+        let (host, guest, guest_label, host_label, applied) =
+            display_mode_pair(original, modes).await;
         host.set_grant(guest_label, IndependentGrant::DisplayMode, true)
             .await
             .unwrap();
@@ -8772,6 +9020,66 @@ mod tests {
             guest.host_display_set_mode("nobody".to_owned(), 0).await,
             Err(ActorError::UnknownPeer)
         ));
+    }
+
+    /// docs/bugs/16-host-display-mode.md #3, the most important property in
+    /// the file: the host's own monitor is restored when the session that
+    /// changed it ends. The guest leaving is simulated here as its own
+    /// `revoke` — the view window closing — which `on_revoke`'s own doc
+    /// comment says the host sees exactly like an ungraceful disconnect
+    /// would: both funnel into the same `on_closed` teardown every other
+    /// kind of per-peer state (media, file transfers, clipboard) already
+    /// goes through, so what this proves holds for a crash or a dropped
+    /// connection too, not only a clean exit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_display_mode_switch_is_restored_when_the_owning_session_ends() {
+        use lumepeer_media::capture::DisplayMode;
+
+        let original = DisplayMode {
+            width: 1024,
+            height: 768,
+            refresh_hz: 60,
+        };
+        let modes = vec![DisplayMode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        }];
+        let (host, guest, guest_label, host_label, applied) =
+            display_mode_pair(original, modes.clone()).await;
+        host.set_grant(guest_label.clone(), IndependentGrant::DisplayMode, true)
+            .await
+            .unwrap();
+        let (found, _) =
+            wait_for_display_modes(&guest, &host_label, |(modes, _)| !modes.is_empty()).await;
+
+        guest
+            .host_display_set_mode(host_label.clone(), found[0].id)
+            .await
+            .unwrap();
+        wait_until("the host never applied the requested mode", || {
+            applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                == Some(&modes[0])
+        })
+        .await;
+
+        // The owning guest leaves without ever touching the grant.
+        guest.revoke(host_label).await.unwrap();
+
+        wait_until(
+            "the original mode was never restored once the owning session ended",
+            || {
+                applied
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .last()
+                    == Some(&original)
+            },
+        )
+        .await;
     }
 
     /// §9.2 and §4 through the actor: a granted host offers a file, the guest

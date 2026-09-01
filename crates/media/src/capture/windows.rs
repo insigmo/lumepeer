@@ -84,10 +84,11 @@ mod dxgi {
         IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CDS_TYPE, ChangeDisplaySettingsExW,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CDS_TEST, CDS_TYPE, ChangeDisplaySettingsExW,
         CreateCompatibleDC, CreateDCW, CreateDIBSection, DEVMODEW, DIB_RGB_COLORS,
         DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DeleteDC,
-        DeleteObject, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW, SRCCOPY, SelectObject,
+        DeleteObject, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
+        SRCCOPY, SelectObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -1302,14 +1303,16 @@ mod dxgi {
         }
 
         /// Switches `target`'s monitor to `mode` via `ChangeDisplaySettingsExW`
-        /// (docs/bugs/16-host-display-mode.md #2).
+        /// (docs/bugs/16-host-display-mode.md #2, #3).
         ///
-        /// Deliberately **not** `CDS_UPDATEREGISTRY`: this is a change for the
-        /// current session only, so a crash or a hard power loss between this
-        /// call and the caller's own restore leaves nothing behind for the
-        /// registry to remember — a reboot alone recovers the monitor's
-        /// configured mode (ADR 0048). The two-step `CDS_TEST` dry run task 3
-        /// adds wraps this same call rather than replacing it.
+        /// Two-step, as task 3 asks: `CDS_TEST` first, so a driver that would
+        /// refuse the mode is caught before anything on screen actually
+        /// moves, and only then the real, permanent-for-this-session apply.
+        /// Deliberately **not** `CDS_UPDATEREGISTRY`: this is a change for
+        /// the current session only, so a crash or a hard power loss between
+        /// this call and the caller's own restore leaves nothing behind for
+        /// the registry to remember — a reboot alone recovers the monitor's
+        /// configured mode (ADR 0048).
         fn apply_display_mode(
             target: CaptureTarget,
             mode: crate::capture::DisplayMode,
@@ -1329,6 +1332,23 @@ mod dxgi {
             // `dmSize`/`dmFields` set as the API requires; `DeviceName` comes
             // from a DXGI output description this process already owns, and
             // `ChangeDisplaySettingsExW` only reads both.
+            let test = unsafe {
+                ChangeDisplaySettingsExW(
+                    PCWSTR(monitor.desc.DeviceName.as_ptr()),
+                    Some(&raw const devmode),
+                    None,
+                    CDS_TEST,
+                    None,
+                )
+            };
+            if test != DISP_CHANGE_SUCCESSFUL {
+                return Err(MediaError::CaptureUnavailable(format!(
+                    "the driver refused a test apply of {}x{}@{}Hz: {test:?}",
+                    mode.width, mode.height, mode.refresh_hz
+                )));
+            }
+            // SAFETY: same as above; this is the real apply of a mode the
+            // test just confirmed the driver accepts.
             let result = unsafe {
                 ChangeDisplaySettingsExW(
                     PCWSTR(monitor.desc.DeviceName.as_ptr()),
@@ -1346,6 +1366,39 @@ mod dxgi {
                     mode.width, mode.height, mode.refresh_hz
                 )))
             }
+        }
+
+        /// The mode `target`'s monitor is set up with right now, via
+        /// `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` (docs/bugs/
+        /// 16-host-display-mode.md #3).
+        fn current_display_mode_for(target: CaptureTarget) -> Option<crate::capture::DisplayMode> {
+            let monitors = attached_monitors().ok()?;
+            let monitor = select(monitors, target).ok()?;
+            let mut devmode = DEVMODEW {
+                dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+                ..Default::default()
+            };
+            // SAFETY: as `display_modes_for` above, with the `ENUM_CURRENT_
+            // SETTINGS` sentinel in place of an enumeration index.
+            let found = unsafe {
+                EnumDisplaySettingsW(
+                    PCWSTR(monitor.desc.DeviceName.as_ptr()),
+                    ENUM_CURRENT_SETTINGS,
+                    &raw mut devmode,
+                )
+            };
+            if !found.as_bool()
+                || devmode.dmPelsWidth == 0
+                || devmode.dmPelsHeight == 0
+                || devmode.dmDisplayFrequency <= 1
+            {
+                return None;
+            }
+            Some(crate::capture::DisplayMode {
+                width: devmode.dmPelsWidth,
+                height: devmode.dmPelsHeight,
+                refresh_hz: devmode.dmDisplayFrequency,
+            })
         }
     }
 
@@ -1482,6 +1535,13 @@ mod dxgi {
             mode: crate::capture::DisplayMode,
         ) -> Result<()> {
             Self::apply_display_mode(target, mode)
+        }
+
+        fn current_display_mode(
+            &self,
+            target: CaptureTarget,
+        ) -> Option<crate::capture::DisplayMode> {
+            Self::current_display_mode_for(target)
         }
     }
 
@@ -2116,15 +2176,41 @@ mod dxgi {
             for mode in &modes {
                 assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 1);
             }
-            // Deduplicated and sorted, per docs/bugs/16-host-display-mode.md
-            // #1 task 3: no duplicate triples, and ascending order.
+            // Deduplicated and sorted largest-first, per docs/bugs/
+            // 16-host-display-mode.md #1, #3: no duplicate triples, and the
+            // native/current resolution kept ahead of legacy VESA modes
+            // rather than truncated away by the cap.
             let mut sorted = modes.clone();
             sorted.sort_unstable();
             sorted.dedup();
+            sorted.reverse();
             assert_eq!(sorted, modes);
             assert!(
                 modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
                 "the list was not capped"
+            );
+        }
+
+        /// Read-only: whatever `current_display_mode_for` reports must be one
+        /// of the modes `display_modes_for` itself announced — the "remember
+        /// the original mode" bookkeeping of docs/bugs/16-host-display-
+        /// mode.md #3 depends on the two agreeing.
+        #[test]
+        fn the_current_mode_is_one_of_the_announced_modes() {
+            let modes = WindowsCapturer::display_modes_for(CaptureTarget::PrimaryDisplay);
+            if modes.is_empty() {
+                eprintln!("skipping: DXGI is unreachable or reported no modes on this machine");
+                return;
+            }
+            let Some(current) =
+                WindowsCapturer::current_display_mode_for(CaptureTarget::PrimaryDisplay)
+            else {
+                eprintln!("skipping: the current mode could not be read back");
+                return;
+            };
+            assert!(
+                modes.contains(&current),
+                "current mode {current:?} is not among the announced modes {modes:?}"
             );
         }
 
