@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use lumepeer_core::NodeId;
-use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
+use lumepeer_core::constants::{MAX_CURSOR_SHAPE_PIXELS, MAX_DISPLAY_MODES_PER_HOST};
 use lumepeer_core::protocol::{CursorShapeData, InputEventPayload};
 
 use crate::error::{MediaError, Result};
@@ -225,6 +225,37 @@ pub fn host_display_count() -> Result<usize> {
     }
 }
 
+/// One display mode a monitor can be physically switched to: resolution plus
+/// refresh rate (docs/bugs/16-host-display-mode.md #1; D7 point 2,
+/// docs/bugs/DECISIONS.md).
+///
+/// Distinct from [`HostMonitor`] and from the guest's `StreamScaleRequest`
+/// (D7 point 1, docs/bugs/13-stream-resolution.md): this describes what the
+/// host's own physical monitor can be set to, never what the guest receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DisplayMode {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Refresh rate in Hz, rounded to the nearest whole number.
+    pub refresh_hz: u32,
+}
+
+/// Deduplicates identical modes, sorts by resolution then refresh rate, and
+/// caps the result at [`MAX_DISPLAY_MODES_PER_HOST`]
+/// (docs/bugs/16-host-display-mode.md #1).
+///
+/// Shared by every real backend below so "what counts as a duplicate" and
+/// "what order a human sees" are decided once, not per platform.
+#[must_use]
+pub fn dedupe_and_sort_display_modes(mut modes: Vec<DisplayMode>) -> Vec<DisplayMode> {
+    modes.sort_unstable();
+    modes.dedup();
+    modes.truncate(MAX_DISPLAY_MODES_PER_HOST);
+    modes
+}
+
 /// Pixel format of a captured frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -301,6 +332,21 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// compositing, and a guest that sees no [`Self::cursor_shape`] therefore
     /// draws nothing — two cursors is worse than one that lags.
     fn set_cursor_embedded(&mut self, _embedded: bool) {}
+
+    /// Every mode the monitor `target` names actually supports, for the
+    /// host's own physical screen (docs/bugs/16-host-display-mode.md #1; D7
+    /// point 2).
+    ///
+    /// The default is an honest empty list, never a fabricated one: a
+    /// platform that cannot enumerate its own display modes must say so by
+    /// reporting nothing, not by inventing values (§18). Wayland has no such
+    /// right without compositor privilege it does not have (ADR 0010), and
+    /// macOS is out of scope this iteration — both keep this default.
+    /// Windows and X11 override it with a real enumeration, deduplicated and
+    /// sorted by [`dedupe_and_sort_display_modes`].
+    fn display_modes(&self, _target: CaptureTarget) -> Vec<DisplayMode> {
+        Vec::new()
+    }
 }
 
 /// Builds a [`CursorShapeData`] after checking it against the bound of §14.
@@ -746,6 +792,18 @@ impl CaptureController {
     /// receives a shape and never draws one.
     pub fn set_cursor_embedded(&mut self, embedded: bool) {
         self.capturer.set_cursor_embedded(embedded);
+    }
+
+    /// Every mode the monitor this controller currently targets actually
+    /// supports (docs/bugs/16-host-display-mode.md #1).
+    ///
+    /// Not gated on [`Self::is_capturing`]: unlike a frame or a cursor
+    /// bitmap, a mode list touches nobody's screen contents, and a guest that
+    /// has not yet been added as a viewer still needs to see it to decide
+    /// whether to ask for a switch at all.
+    #[must_use]
+    pub fn display_modes(&self) -> Vec<DisplayMode> {
+        self.capturer.display_modes(self.target)
     }
 }
 

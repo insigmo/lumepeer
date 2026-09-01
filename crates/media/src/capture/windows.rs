@@ -85,7 +85,8 @@ mod dxgi {
     };
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW,
-        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, SRCCOPY, SelectObject,
+        CreateDIBSection, DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+        ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW, SRCCOPY, SelectObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -1242,6 +1243,62 @@ mod dxgi {
                 })
                 .collect())
         }
+
+        /// Every mode `target`'s monitor supports, via `EnumDisplaySettingsW`
+        /// against the DXGI `DeviceName` of that same output
+        /// (docs/bugs/16-host-display-mode.md #1).
+        ///
+        /// Never fails outward: any step this cannot complete (no such
+        /// monitor, DXGI unreachable) collapses to an empty list, the same
+        /// honest-empty contract [`crate::capture::ScreenCapturer::
+        /// display_modes`]'s default documents.
+        fn display_modes_for(target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
+            let Ok(monitors) = attached_monitors() else {
+                return Vec::new();
+            };
+            let Ok(monitor) = select(monitors, target) else {
+                return Vec::new();
+            };
+
+            let mut modes = Vec::new();
+            for index in 0u32.. {
+                let mut devmode = DEVMODEW {
+                    dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+                    ..Default::default()
+                };
+                // SAFETY: `devmode` is a zero-initialized DEVMODEW with
+                // `dmSize` set as the API requires, and `DeviceName` is a
+                // fixed-size buffer this DXGI output description already
+                // owns — `EnumDisplaySettingsW` only ever reads it and
+                // writes into `devmode`.
+                let found = unsafe {
+                    EnumDisplaySettingsW(
+                        PCWSTR(monitor.desc.DeviceName.as_ptr()),
+                        ENUM_DISPLAY_SETTINGS_MODE(index),
+                        &raw mut devmode,
+                    )
+                };
+                if !found.as_bool() {
+                    // Past the last mode this device reports.
+                    break;
+                }
+                if devmode.dmPelsWidth == 0 || devmode.dmPelsHeight == 0 {
+                    continue;
+                }
+                modes.push(crate::capture::DisplayMode {
+                    width: devmode.dmPelsWidth,
+                    height: devmode.dmPelsHeight,
+                    // 0 and 1 are MSDN's "use the display's default" sentinel
+                    // values rather than a real rate; every mode this driver
+                    // actually offers for switching reports a real one, so
+                    // there is nothing honest to show for these and they are
+                    // dropped rather than displayed as "@0Hz".
+                    refresh_hz: devmode.dmDisplayFrequency,
+                });
+            }
+            modes.retain(|mode| mode.refresh_hz > 1);
+            crate::capture::dedupe_and_sort_display_modes(modes)
+        }
     }
 
     impl ScreenCapturer for WindowsCapturer {
@@ -1365,6 +1422,10 @@ mod dxgi {
                 // duplicate.
                 active.last_hash = None;
             }
+        }
+
+        fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
+            Self::display_modes_for(target)
         }
     }
 

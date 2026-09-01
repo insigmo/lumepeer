@@ -202,6 +202,117 @@ pub fn host_monitors() -> Result<Vec<crate::capture::HostMonitor>> {
         .collect())
 }
 
+/// Every mode the output driving `target`'s monitor supports (§11.1;
+/// docs/bugs/16-host-display-mode.md #1; D7 point 2).
+///
+/// A fresh `RandR` query rather than a reuse of [`monitor_rects`]: that
+/// helper discards the `outputs` field a mode lookup needs, and copying its
+/// filter/fallback rules here would either duplicate them or force
+/// `MonitorRect` to give up `Copy` for a field only this path wants.
+///
+/// Never fails outward: any step this cannot complete (no `RandR`, no such
+/// monitor, an output with no modes) collapses to an empty list, the same
+/// honest-empty contract [`ScreenCapturer::display_modes`]'s default
+/// documents.
+#[must_use]
+pub fn display_modes_for(target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
+    display_modes_for_inner(target).unwrap_or_default()
+}
+
+fn display_modes_for_inner(target: CaptureTarget) -> Option<Vec<crate::capture::DisplayMode>> {
+    let (connection, screen_num) = x11rb::connect(None).ok()?;
+    let screen = connection.setup().roots[screen_num].clone();
+    connection
+        .randr_query_version(RANDR_MAJOR, RANDR_MINOR)
+        .ok()?
+        .reply()
+        .ok()?;
+
+    let monitors_reply = connection
+        .randr_get_monitors(screen.root, true)
+        .ok()?
+        .reply()
+        .ok()?;
+    let mut monitors: Vec<_> = monitors_reply
+        .monitors
+        .into_iter()
+        .filter(|info| info.width > 0 && info.height > 0)
+        .take(MAX_MONITORS_PER_HOST)
+        .collect();
+    if monitors.is_empty() {
+        return None;
+    }
+    // Same primary fix-up `monitor_rects` applies, so `PrimaryDisplay` and
+    // `Display(0)` name the same head this enumeration and that one agree on.
+    if !monitors.iter().any(|info| info.primary)
+        && let Some(first) = monitors.first_mut()
+    {
+        first.primary = true;
+    }
+
+    let index = match target {
+        CaptureTarget::PrimaryDisplay => monitors.iter().position(|info| info.primary)?,
+        CaptureTarget::Display(n) => usize::try_from(n).ok()?,
+    };
+    let output = *monitors.get(index)?.outputs.first()?;
+
+    let resources = connection
+        .randr_get_screen_resources(screen.root)
+        .ok()?
+        .reply()
+        .ok()?;
+    let output_info = connection
+        .randr_get_output_info(output, resources.config_timestamp)
+        .ok()?
+        .reply()
+        .ok()?;
+
+    let modes = output_info
+        .modes
+        .iter()
+        .filter_map(|mode_id| resources.modes.iter().find(|info| info.id == *mode_id))
+        .filter_map(mode_info_to_display_mode)
+        .collect();
+    Some(crate::capture::dedupe_and_sort_display_modes(modes))
+}
+
+/// Converts one `RandR` `ModeInfo` into a [`crate::capture::DisplayMode`],
+/// applying the same interlace/doublescan correction `xrandr(1)` itself uses
+/// to turn raw pixel-clock timings into the refresh rate a human recognizes.
+///
+/// `None` for a degenerate mode (zero geometry or zero total lines) rather
+/// than a division that would panic or a rate of zero.
+fn mode_info_to_display_mode(
+    info: &x11rb::protocol::randr::ModeInfo,
+) -> Option<crate::capture::DisplayMode> {
+    use x11rb::protocol::randr::ModeFlag;
+
+    if info.width == 0 || info.height == 0 || info.htotal == 0 || info.vtotal == 0 {
+        return None;
+    }
+    let flags = u32::from(info.mode_flags);
+    let mut vtotal = u64::from(info.vtotal);
+    if flags & u32::from(ModeFlag::DOUBLE_SCAN) != 0 {
+        vtotal *= 2;
+    }
+    if flags & u32::from(ModeFlag::INTERLACE) != 0 {
+        vtotal /= 2;
+    }
+    let denom = u64::from(info.htotal) * vtotal.max(1);
+    if denom == 0 {
+        return None;
+    }
+    let refresh_hz = u32::try_from((u64::from(info.dot_clock) + denom / 2) / denom).ok()?;
+    if refresh_hz == 0 {
+        return None;
+    }
+    Some(crate::capture::DisplayMode {
+        width: u32::from(info.width),
+        height: u32::from(info.height),
+        refresh_hz,
+    })
+}
+
 /// Live X11 connection and the geometry it captures.
 #[derive(Debug)]
 struct Active {
@@ -442,6 +553,10 @@ impl ScreenCapturer for X11Capturer {
             // loses a cursor, and the §11.1 hash must not call it a duplicate.
             active.last_hash = None;
         }
+    }
+
+    fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
+        display_modes_for(target)
     }
 }
 
