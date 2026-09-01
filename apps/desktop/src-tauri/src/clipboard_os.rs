@@ -493,8 +493,8 @@ mod platform {
             .map_err(|error| ClipboardError::Refused(error.to_string()))?;
         let mut body = String::new();
         for path in paths {
-            let encoded =
-                percent_encoding::utf8_percent_encode(&path.to_string_lossy(), PATH_ENCODE_SET);
+            let path_text = path.to_string_lossy();
+            let encoded = percent_encoding::utf8_percent_encode(&path_text, PATH_ENCODE_SET);
             body.push_str("file://");
             for chunk in encoded {
                 body.push_str(chunk);
