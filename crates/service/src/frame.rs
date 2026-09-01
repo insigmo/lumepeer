@@ -1,5 +1,5 @@
 //! The shared-memory side channel a secure-desktop frame travels over
-//! (ADR 0046).
+//! (ADR 0049).
 //!
 //! `crates/service/src/protocol.rs` fixes the mapping's name and size; this
 //! file is the mechanics on both ends of it. [`Writer`] is the service's end
@@ -17,7 +17,7 @@
 //! kernel calls the pipe round trip already needs are a stronger ordering
 //! guarantee than an application-level lock would add on top of them, so
 //! this file does not invent one for a mapping the two sides never touch at
-//! the same time (ADR 0046).
+//! the same time (ADR 0049).
 
 #![allow(
     unsafe_code,

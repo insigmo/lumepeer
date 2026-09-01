@@ -82,7 +82,7 @@ pub struct EncodeControl {
     /// panel of §18. Written by the loop, read by the actor.
     target: Arc<Mutex<QualityTarget>>,
     /// Whether this session currently holds the `secure_desktop` grant
-    /// (ADR 0046). Written by the actor whenever the host flips the grant
+    /// (ADR 0049). Written by the actor whenever the host flips the grant
     /// (`Network::on_set_grant`), read by the loop before every attempt to
     /// serve a secure-desktop frame instead of the honest "can't see this"
     /// message — so a revoke reaches the very next frame without the loop
@@ -92,7 +92,7 @@ pub struct EncodeControl {
     /// pixels for this session — distinct from the grant above the same way
     /// `recording_active` is distinct from the `recording` grant (§17).
     /// Written by the loop, read by the actor for the host's own
-    /// non-removable indicator (ADR 0046).
+    /// non-removable indicator (ADR 0049).
     secure_desktop_active: Arc<AtomicBool>,
 }
 
@@ -107,7 +107,7 @@ impl EncodeControl {
             keyframe: Arc::new(AtomicBool::new(false)),
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
-            // `Grants::from_role` never sets `secure_desktop` (ADR 0046), so
+            // `Grants::from_role` never sets `secure_desktop` (ADR 0049), so
             // every session starts here without needing to ask the core what
             // it already knows the answer is.
             secure_desktop_allowed: Arc::new(AtomicBool::new(false)),
@@ -175,7 +175,7 @@ impl EncodeControl {
     }
 
     /// The actor calls this whenever `secure_desktop` moves on this session
-    /// (ADR 0046). Revoking it must reach the loop before its next attempt,
+    /// (ADR 0049). Revoking it must reach the loop before its next attempt,
     /// which is exactly what a plain atomic store gives for free.
     pub fn set_secure_desktop_allowed(&self, allowed: bool) {
         self.secure_desktop_allowed
@@ -195,13 +195,13 @@ impl EncodeControl {
     }
 
     /// Records whether the loop is, right now, actually serving
-    /// secure-desktop pixels for this session (ADR 0046).
+    /// secure-desktop pixels for this session (ADR 0049).
     fn set_secure_desktop_active(&self, active: bool) {
         self.secure_desktop_active.store(active, Ordering::Relaxed);
     }
 
     /// Host side: whether this session's guest is currently seeing the
-    /// secure desktop, for the non-removable indicator (ADR 0046, §17).
+    /// secure desktop, for the non-removable indicator (ADR 0049, §17).
     #[must_use]
     pub fn secure_desktop_active(&self) -> bool {
         self.secure_desktop_active.load(Ordering::Relaxed)
@@ -795,7 +795,7 @@ pub fn spawn_encode_loop(
         // healthy again, so a later recurrence is announced afresh.
         let mut secure_desktop_notified = false;
         // Earliest instant the next secure-desktop capture attempt may run
-        // (ADR 0046); due immediately the first time capture gets stuck.
+        // (ADR 0049); due immediately the first time capture gets stuck.
         let mut secure_desktop_next_attempt_at = Instant::now();
         // Reference clock for the timestamp on a secure-desktop frame — this
         // loop's own start, the same role `Active::started_at` plays inside
@@ -821,7 +821,7 @@ pub fn spawn_encode_loop(
                     secure_desktop_notified = false;
                     // Ordinary capture just produced a real frame, so
                     // whatever the secure-desktop path was doing a moment
-                    // ago is not happening on this tick (ADR 0046).
+                    // ago is not happening on this tick (ADR 0049).
                     control.set_secure_desktop_active(false);
                     frame
                 }
@@ -844,7 +844,7 @@ pub fn spawn_encode_loop(
                 // episode rather than every tick (§18,
                 // docs/bugs/11-uac-degradation.md).
                 //
-                // ADR 0046 extends this arm rather than replacing it: if this
+                // ADR 0049 extends this arm rather than replacing it: if this
                 // session holds the `secure_desktop` grant, try to serve the
                 // real thing first. Every failure of that attempt — no
                 // grant, service unreachable, the far side's session check
@@ -1019,7 +1019,7 @@ async fn sleep_for_the_rest_of(interval: Duration, tick_started: Instant) {
 }
 
 /// The branch `docs/bugs/11-uac-degradation.md`'s task 3 prepared, extended
-/// rather than replaced (ADR 0046): while capture is stuck behind the secure
+/// rather than replaced (ADR 0049): while capture is stuck behind the secure
 /// desktop, try to serve the real thing instead of the honest "can't see
 /// this" message, but only when this session actually holds the grant.
 ///

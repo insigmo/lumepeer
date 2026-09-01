@@ -47,7 +47,7 @@ pub const SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS: u32 = 120;
 /// How often the encode loop asks the privileged helper for a fresh frame of
 /// the secure desktop while it holds the `secure_desktop` grant and capture
 /// is stuck behind one, in milliseconds
-/// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0046).
+/// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049).
 ///
 /// Deliberately much slower than the ordinary encode cadence: a UAC prompt
 /// or a lock screen is largely static, and a fresh pipe round trip plus a GDI

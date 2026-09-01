@@ -1272,7 +1272,7 @@ button {
   color: var(--red);
 }
 
-/* The secure-desktop indicator (ADR 0046, §17-equivalent): no settings
+/* The secure-desktop indicator (ADR 0049, §17-equivalent): no settings
    switch hides this while a guest is actually seeing the host's secure
    desktop, mirroring the recording indicator's own non-removable dot. */
 .connections-list .secure-desktop-indicator {

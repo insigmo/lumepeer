@@ -1,4 +1,4 @@
-//! Lumepeer's privileged helper service, as a library (ADR 0043, ADR 0046).
+//! Lumepeer's privileged helper service, as a library (ADR 0043, ADR 0049).
 //!
 //! The binary in `main.rs` is the service itself; this library is what the
 //! desktop client links so both ends of the endpoint agree on the two bytes
@@ -6,7 +6,7 @@
 //!
 //! Nothing privileged lives here. [`client`] opens a pipe and writes two
 //! bytes; every capability is on the far side, in the service. [`frame`] is
-//! the one exception to "no unsafe on this side" (ADR 0046): reading a
+//! the one exception to "no unsafe on this side" (ADR 0049): reading a
 //! shared-memory mapping has no safe standard-library wrapper, the same way
 //! becoming a Windows service or creating a DACL'd pipe does not on the
 //! service's own side.

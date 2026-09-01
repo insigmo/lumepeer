@@ -316,7 +316,7 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
 /// ask for a screenshot of whichever secure desktop the physical console is
 /// showing. So this operation additionally requires the caller's session to
 /// be the one attached to the console (`caller_is_in_active_console_session`,
-/// ADR 0046) before anything is captured. This is a mechanical property of
+/// ADR 0049) before anything is captured. This is a mechanical property of
 /// which desktop object a caller may even ask about, not a policy decision
 /// about who is allowed to run a session — `lumepeer-core`, in the main
 /// process, already decided this call was worth making before the pipe was
@@ -369,7 +369,7 @@ fn serve_secure_desktop_capture(pipe: HANDLE) -> u8 {
 /// Whether the process at the far end of `pipe` is running in the session
 /// attached to the physical console — the session a real secure desktop
 /// relevant to "the local administrator is authenticating" would appear in
-/// (ADR 0046).
+/// (ADR 0049).
 ///
 /// Fails closed: any step that cannot be determined (the client's process id,
 /// its session, or the active console session) refuses rather than guesses,

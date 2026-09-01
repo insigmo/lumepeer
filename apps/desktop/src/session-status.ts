@@ -49,7 +49,7 @@ export interface SessionStatus {
   /**
    * Whether this guest may see the host's secure desktop (UAC prompt, lock
    * screen, fast user switch) instead of the honest "can't see this" message
-   * (ADR 0046). Independent of every other grant and off by default.
+   * (ADR 0049). Independent of every other grant and off by default.
    */
   secure_desktop: boolean;
   /**
@@ -265,7 +265,7 @@ function recordingRow(
 }
 
 /**
- * The secure-desktop indicator (ADR 0046, §17-equivalent).
+ * The secure-desktop indicator (ADR 0049, §17-equivalent).
  *
  * No settings switch hides this: while a guest is actually seeing the
  * secure desktop, the host sees that it is happening, exactly as the
