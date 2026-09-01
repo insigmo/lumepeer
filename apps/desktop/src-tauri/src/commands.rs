@@ -321,6 +321,16 @@ pub struct SessionStatusDto {
     /// Whether this guest asked to be recorded and is still waiting for the
     /// host user's answer (§17).
     pub record_request: bool,
+    /// Whether this guest may see the host's secure desktop (UAC prompt,
+    /// lock screen, fast user switch) instead of the honest "can't see this"
+    /// message (ADR 0049). Independent of every other grant, `input`
+    /// included, and off by default.
+    pub secure_desktop: bool,
+    /// Whether this guest is, right now, actually seeing it. Distinct from
+    /// `secure_desktop` above the same way `recording_active` is distinct
+    /// from `recording`: the host's non-removable indicator hangs off this
+    /// one (ADR 0049).
+    pub secure_desktop_active: bool,
 }
 
 /// One remembered host this node has connected to (§21 punch-list item 5).
@@ -631,6 +641,8 @@ pub async fn session_status(
             display_mode: s.grants.display_mode,
             recording_active: s.recording_active,
             record_request: s.record_request,
+            secure_desktop: s.grants.secure_desktop,
+            secure_desktop_active: s.secure_desktop_active,
         })
         .collect())
 }

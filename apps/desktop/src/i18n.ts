@@ -43,6 +43,8 @@ export type TranslationKey =
   | 'status.grants.fileTransfer'
   | 'status.grants.recording'
   | 'status.grants.displayMode'
+  | 'status.grants.secureDesktop'
+  | 'status.secureDesktop.active'
   | 'status.recording.start'
   | 'status.recording.stop'
   | 'status.recording.on'
@@ -331,6 +333,13 @@ const en: Dictionary = {
   'status.grants.fileTransfer': 'Send and receive files',
   'status.grants.recording': 'Let this session be recorded',
   'status.grants.displayMode': "Change this computer's screen resolution",
+  // Not "secure desktop": the person deciding needs to know what they are
+  // granting, not the Windows term for the mechanism (ADR 0049).
+  'status.grants.secureDesktop': 'See the administrator prompt and lock screen',
+  // The non-removable indicator while it is actually happening (ADR 0049,
+  // §17-equivalent) — distinct from the grant above the same way the
+  // recording indicator is distinct from the recording grant.
+  'status.secureDesktop.active': 'Viewing the administrator prompt or lock screen',
   // The switch above is permission; these are the act. Both sides see an
   // indicator for as long as a recording runs — §2.2 has no quiet capture.
   'status.recording.start': 'Record session',
@@ -638,6 +647,8 @@ const ar: Dictionary = {
   'status.grants.fileTransfer': 'إرسال الملفات واستقبالها',
   'status.grants.recording': 'السماح بتسجيل هذه الجلسة',
   'status.grants.displayMode': 'تغيير دقة شاشة هذا الجهاز',
+  'status.grants.secureDesktop': 'رؤية طلب المسؤول وشاشة القفل',
+  'status.secureDesktop.active': 'تجري الآن مشاهدة طلب المسؤول أو شاشة القفل',
   'status.recording.start': 'تسجيل الجلسة',
   'status.recording.stop': 'إيقاف التسجيل',
   'status.recording.on': 'جارٍ التسجيل',
