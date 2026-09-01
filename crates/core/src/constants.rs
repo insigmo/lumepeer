@@ -44,6 +44,16 @@ pub const SECURE_DESKTOP_RECOVERY_BACKOFF_MS: u64 = 1_000;
 /// enough that a host with a permanently unattended monitor does not spin
 /// forever.
 pub const SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS: u32 = 120;
+/// How often the encode loop asks the privileged helper for a fresh frame of
+/// the secure desktop while it holds the `secure_desktop` grant and capture
+/// is stuck behind one, in milliseconds
+/// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049).
+///
+/// Deliberately much slower than the ordinary encode cadence: a UAC prompt
+/// or a lock screen is largely static, and a fresh pipe round trip plus a GDI
+/// capture on a `LocalSystem` process is a real cost to spend on every frame
+/// interval for a picture that mostly is not changing.
+pub const SECURE_DESKTOP_CAPTURE_INTERVAL_MS: u64 = 500;
 /// Control-channel keepalive interval (§9.1).
 pub const PING_INTERVAL_SECS: u64 = 20;
 /// Smoothing factor of the exponentially weighted moving average that turns

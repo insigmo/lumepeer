@@ -783,12 +783,13 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 5] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 6] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
         IndependentGrant::Recording,
         IndependentGrant::DisplayMode,
+        IndependentGrant::SecureDesktop,
     ];
 
     #[test]
@@ -807,7 +808,7 @@ mod tests {
                 }
             );
             assert!(manager.grants(&peer(1)).unwrap().get(which));
-            // One grant moving leaves the other four where they were.
+            // One grant moving leaves the other five where they were.
             for other in ALL_INDEPENDENT.into_iter().filter(|o| *o != which) {
                 assert!(!manager.grants(&peer(1)).unwrap().get(other));
             }
