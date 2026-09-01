@@ -1272,6 +1272,28 @@ button {
   color: var(--red);
 }
 
+/* The secure-desktop indicator (ADR 0046, §17-equivalent): no settings
+   switch hides this while a guest is actually seeing the host's secure
+   desktop, mirroring the recording indicator's own non-removable dot. */
+.connections-list .secure-desktop-indicator {
+  flex-basis: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--red);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.secure-desktop-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--red);
+}
+
 /* Unattended access (§8; ADR 0033) and the host address book (ADR 0034). */
 
 /* The compact sidebar line that says an unattended login is possible
