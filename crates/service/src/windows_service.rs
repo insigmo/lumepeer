@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authentication::Identity::SendSAS;
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -266,7 +266,7 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
         // started, which is a connection, not a failure. Every other error
         // ends the loop.
         let error = windows::core::Error::from_win32();
-        if error.code().0 != -0x7FF8_FEDB {
+        if error.code() != windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
             tracing::warn!(?error, "the service endpoint stopped accepting");
             return false;
         }

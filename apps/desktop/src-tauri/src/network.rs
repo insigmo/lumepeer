@@ -8766,7 +8766,7 @@ mod tests {
     /// own capture. Nothing ever crossed the wire, and the toolbar's argument
     /// shapes were wrong on top of that, so the popover only ever showed its
     /// empty note and nobody found out.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_guest_picks_a_screen_and_the_host_is_the_one_that_moves() {
         let (_host, guest, _guest_label, host_label, host_capture) = session_pair().await;
 
@@ -8845,7 +8845,7 @@ mod tests {
     /// wire at all — it is refused by this node's own actor, the same shape
     /// [`the_guest_picks_a_screen_and_the_host_is_the_one_that_moves`] checks
     /// for an unannounced monitor id.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stream_scale_request_outside_the_range_never_leaves_this_node() {
         let (_host, guest, _guest_label, host_label, _host_capture) = session_pair().await;
 
@@ -8878,7 +8878,7 @@ mod tests {
     /// D7, docs/bugs/13-stream-resolution.md task 2: the host is the one that
     /// decides, and a peer this actor is not watching at all is refused the
     /// same way an unknown label is refused everywhere else in this file.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stream_scale_request_to_an_unwatched_peer_is_refused() {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         assert!(matches!(
@@ -8892,7 +8892,7 @@ mod tests {
     /// `NotGranted` until the host explicitly hands out the independent
     /// `display_mode` grant, and only then does the real list, and a
     /// requested switch, actually reach the capturer.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn display_mode_needs_its_own_grant_and_the_real_list_arrives_once_granted() {
         use lumepeer_media::capture::DisplayMode;
 
@@ -9008,7 +9008,7 @@ mod tests {
     /// capturer at all — the guest-side check `on_pick_monitor` already
     /// applies to `MonitorSelect`, mirrored here for `DisplaySetMode`
     /// (docs/bugs/16-host-display-mode.md #2).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_display_set_mode_request_for_an_unannounced_id_never_reaches_the_capturer() {
         use lumepeer_media::capture::DisplayMode;
 
@@ -9046,7 +9046,7 @@ mod tests {
     /// that decides, and a peer this actor is not watching at all is refused
     /// the same way an unknown label is refused everywhere else in this
     /// file.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_display_set_mode_request_to_an_unwatched_peer_is_refused() {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         assert!(matches!(
@@ -9064,7 +9064,7 @@ mod tests {
     /// kind of per-peer state (media, file transfers, clipboard) already
     /// goes through, so what this proves holds for a crash or a dropped
     /// connection too, not only a clean exit.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_display_mode_switch_is_restored_when_the_owning_session_ends() {
         use lumepeer_media::capture::DisplayMode;
 
@@ -9118,7 +9118,7 @@ mod tests {
     /// §9.2 and §4 through the actor: a granted host offers a file, the guest
     /// accepts it into a directory of its own choosing, `rd/file/1` opens for
     /// the first time, and the file lands verified under the offered basename.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_granted_session_moves_a_file_end_to_end() {
         let scratch = Scratch::new("e2e");
         let source = scratch.join("report.pdf");
@@ -9177,7 +9177,7 @@ mod tests {
     /// next file still moves. Only the grant went — not the peer's
     /// `FEATURE_FILE_TRANSFER` advertisement, which is a fact about a
     /// connection that is still up.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn withdrawing_the_grant_ends_the_transfers_and_can_be_given_back() {
         let scratch = Scratch::new("withdrawn");
         let first = scratch.join("first.pdf");
@@ -9261,7 +9261,7 @@ mod tests {
     /// §8.2: without the `file_transfer` grant nothing is offered at all. The
     /// refusal comes from the host's own core, before any byte or connection
     /// exists — and the same file goes through once the host decides.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offer_without_the_grant_is_refused_by_the_core() {
         let scratch = Scratch::new("nogrant");
         let source = scratch.join("report.pdf");
@@ -9289,7 +9289,7 @@ mod tests {
     /// §9.2: a declined offer leaves nothing behind on either side, and the
     /// receiving directory stays exactly as empty as it was (§4: no file
     /// connection is opened for an offer nobody took).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_declined_offer_moves_no_bytes() {
         let scratch = Scratch::new("declined");
         let source = scratch.join("report.pdf");
@@ -9330,7 +9330,7 @@ mod tests {
     /// grants on but leaves `file_transfer` off must still refuse a
     /// clipboard file offer — proved over two real actors and a real
     /// connection, not by reasoning about the grant check in isolation.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clipboard_files_need_file_transfer_not_the_clipboard_grants() {
         let scratch = Scratch::new("clipboard-grant");
         let source = scratch.join("photo.png");
@@ -9396,7 +9396,7 @@ mod tests {
     /// host user's clipboard. Until `clipboard_read` is on, the clipboard is
     /// not read at all — the assertion is on the read count, not on what was
     /// sent, because "read it and threw it away" is not the rule.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_granted_session_alone_never_reads_the_hosts_clipboard() {
         let pair = clipboard_pair().await;
         set_clipboard(&pair.host_clipboard, "a password, probably");
@@ -9414,7 +9414,7 @@ mod tests {
     /// The host-to-guest direction end to end: `clipboard_read` turns the
     /// watcher on, a copy on the host lands on the guest's own clipboard, and
     /// turning the grant back off stops it again mid-session.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_read_grant_carries_the_hosts_clipboard_to_the_guest() {
         let pair = clipboard_pair().await;
         set_clipboard(&pair.host_clipboard, "before the grant");
@@ -9462,7 +9462,7 @@ mod tests {
     /// This is the check that used to be reversed: the host was reading
     /// `clipboard_read` for a payload written *to* it, so a host that had
     /// turned exactly the right switch on saw nothing happen.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard() {
         let pair = clipboard_pair().await;
 
@@ -9509,7 +9509,7 @@ mod tests {
     /// Each direction needs its own grant, and holding one is not holding the
     /// other (§2.2). `clipboard_write` alone must not start the host's
     /// watcher, and must not carry the host's clipboard anywhere.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_write_grant_does_not_let_the_guest_read_the_host() {
         let pair = clipboard_pair().await;
         pair.host
@@ -9534,7 +9534,7 @@ mod tests {
 
     /// A revoke takes the watcher with it, without waiting for the session's
     /// transport to notice (§8.1).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_revoke_stops_the_clipboard_watcher() {
         let pair = clipboard_pair().await;
         set_clipboard(&pair.host_clipboard, "before the grant");
@@ -9580,7 +9580,7 @@ mod tests {
     /// still what decides whether it lands — exactly the same authorization
     /// `the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard`
     /// covers for a manual push.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_guest_clipboard_change_reaches_the_host_only_with_the_write_grant() {
         let pair = clipboard_pair().await;
         // The view is already open by the time `clipboard_pair` returns, so
@@ -9614,7 +9614,7 @@ mod tests {
     /// §8.1 applied to the new guest-side watcher (docs/bugs/10-clipboard-
     /// auto.md #1): closing the view is what stops it, the same as a
     /// host-side revoke stops the host's own.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_the_view_stops_the_guests_own_clipboard_watch() {
         let pair = clipboard_pair().await;
         a_few_poll_rounds().await;
@@ -9760,7 +9760,7 @@ mod tests {
     /// §8: a trusted device reaching a host with nobody at it is asked for the
     /// device password, and a correct one starts the session without any human
     /// ever seeing a dialog (ADR 0033).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trusted_device_signs_in_with_the_device_password() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -9800,7 +9800,7 @@ mod tests {
     /// "remember" checked is submitted automatically on the next connect to
     /// the same host — the guest never has to answer the credential form a
     /// second time.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_remembered_password_signs_in_again_without_a_second_submission() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -9832,7 +9832,7 @@ mod tests {
     /// the consent-rate budget on a password already known to be wrong) — it
     /// falls back to the ordinary credential form for a human to answer, and
     /// the stale entry is forgotten rather than tried again next time.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_remembered_password_falls_back_to_the_modal_instead_of_retrying() {
         const NEW_PASSWORD: &str = "a completely different passphrase";
         let (host, _host_endpoint, _host_capture) = actor().await;
@@ -9878,7 +9878,7 @@ mod tests {
     /// §8.2: passing the password is admission, not a blanket permission. The
     /// four independent grants of ADR 0029 stay off, exactly as they would
     /// after a consent dialog.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unattended_login_grants_none_of_the_four_independent_grants() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -9912,7 +9912,7 @@ mod tests {
     /// The gate of ADR 0034: trust decides who may *try* the password. A saved
     /// but untrusted device gets the ordinary consent dialog, exactly as if
     /// unattended access were off.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_untrusted_device_gets_the_consent_dialog_not_the_password_prompt() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -9939,7 +9939,7 @@ mod tests {
 
     /// A device that was never saved at all is never trusted, whatever else is
     /// configured: `is_trusted` answers `false` for everything absent.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_device_that_is_not_in_the_book_gets_the_consent_dialog() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -9958,7 +9958,7 @@ mod tests {
 
     /// §18: a wrong password is refused with the coarse code and nothing else,
     /// the form stays up, and the session never starts.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_wrong_password_is_refused_and_starts_no_session() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10026,7 +10026,7 @@ mod tests {
     /// right to be *heard*, never a budget. So hanging up and dialing again
     /// buys an attacker nothing, and there is no second counter anywhere to
     /// disagree with this one.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_lockout_refuses_even_the_right_password() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10069,7 +10069,7 @@ mod tests {
 
     /// Turning unattended access off puts the host back on the consent path
     /// even for a device that is still marked trusted.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn turning_unattended_access_off_returns_the_host_to_the_consent_path() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10091,7 +10091,7 @@ mod tests {
     /// The second factor cannot be armed without a first, and the settings a
     /// host does make are what `unattended_status` reports back — never the
     /// password itself, which the type cannot carry.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_settings_surface_reports_state_and_never_credentials() {
         let (host, _host_endpoint, _host_capture) = actor().await;
 
@@ -10124,7 +10124,7 @@ mod tests {
 
     /// A trusted device with the second factor on is told to bring a code, and
     /// a password alone is not enough.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_second_factor_is_announced_and_enforced() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10160,7 +10160,7 @@ mod tests {
 
     /// Saving a device is not trusting it (§2.1): the entry lands untrusted
     /// and only `address_book_set_trusted` moves the flag.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn saving_a_device_never_trusts_it() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10207,7 +10207,7 @@ mod tests {
     /// handshake and keep reading it, or the host's `ConsentGrant` is never
     /// observed. Both sides run as real actors, driven only through the same
     /// handle the Tauri commands use.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_guest_actor_observes_the_hosts_grant_and_revoke() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10242,7 +10242,7 @@ mod tests {
     /// otherwise waits in `awaiting_consent` until the host happens to look
     /// (docs/bugs/01). The notification was broadcast to nobody for a while,
     /// so this test exists to keep it read.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pending_request_reaches_a_host_side_subscriber() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10257,7 +10257,7 @@ mod tests {
 
     /// I3: when the guest goes away before the host decides, the host's reader
     /// task must notice and the pending row must disappear.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_guest_that_leaves_before_the_grant_stops_being_pending() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, guest_endpoint, _guest_capture) = actor().await;
@@ -10289,7 +10289,7 @@ mod tests {
     /// Media is now an accepted ALPN, so this also pins the rule that makes
     /// accepting it safe: without a granted control session behind the same
     /// `NodeId` the connection is still closed, and no capture starts.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_media_alpn_connection_is_refused_without_a_handshake() {
         let (host, host_endpoint, capture) = actor().await;
         let stranger = PeerEndpoint::bind_local(iroh::SecretKey::generate())
@@ -10320,7 +10320,7 @@ mod tests {
     /// The whole point of this phase: granting `view` registers the guest as a
     /// viewer, which is what starts capture, and revoking takes it away again
     /// (§8.1, §11).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_grant_adds_a_viewer_and_a_revoke_removes_it() {
         let (host, _host_endpoint, capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10347,7 +10347,7 @@ mod tests {
     /// soon as the session actually starts, not only once it ends — a
     /// session that never reaches an explicit end (a crash, a lost machine)
     /// must not lose the invite it took to get here.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_guest_remembers_the_host_as_soon_as_consent_is_granted() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10373,7 +10373,7 @@ mod tests {
     /// §21 punch-list item 5 / ADR 0016: an ended session is remembered by the
     /// side that dialed, so it can go back, and by nobody on the side that was
     /// dialed. The host decided once; it keeps no roster of who visited.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_guest_remembers_the_host_and_the_host_remembers_nobody() {
         let (host, host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10402,7 +10402,7 @@ mod tests {
     /// The same has to hold when nobody revokes anything: a host that simply
     /// disappears is still a host worth remembering on the guest side, since
     /// its view window closing is the only signal either side gets.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_disconnect_records_the_host_without_an_explicit_revoke() {
         let (host, host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10431,7 +10431,7 @@ mod tests {
     /// The reason the guest keeps the list at all (ADR 0016): a remembered row
     /// dials the host again on its own, without the operator hunting down a
     /// code, and the host is asked for consent again exactly as the first time.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_remembered_host_can_be_dialed_again_and_still_needs_consent() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10487,7 +10487,7 @@ mod tests {
     /// limiter's protection against a peer that floods requests without
     /// ever being granted a session), so reconnecting stays possible however
     /// many times this cycle repeats within the minute.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn h1_reconnecting_past_the_rate_limit_keeps_working_after_a_clean_session() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let recorder = Arc::new(RecordingWindows::default());
@@ -10526,7 +10526,7 @@ mod tests {
     /// §21 punch-list item 6: the connect form has to know that a dial which
     /// returned is not a session yet, or it re-enables itself while the host
     /// is still looking at the consent dialog.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_connect_phase_waits_for_the_host_to_decide() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10570,7 +10570,7 @@ mod tests {
     /// connection was accepted, no `ConsentGrant` was delivered, and the four
     /// commands the UI polls once a second all queued behind it. The app
     /// looked frozen and then said it could not connect.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dial_in_flight_does_not_stall_the_actor() {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         // A host that exists on paper and answers nothing: the ticket verifies,
@@ -10603,7 +10603,7 @@ mod tests {
 
     /// A host that says no has to say it in a way the guest's form can show:
     /// a denial is not the same as a dial that never landed.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_denied_request_leaves_the_connect_phase_denied() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10622,7 +10622,7 @@ mod tests {
     /// The bug behind §21 punch-list item 6: a second Connect against a host
     /// this node is already talking to used to replace the live connection,
     /// and the replacement's own teardown then killed the working session.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_second_connect_to_the_same_host_is_refused_and_leaves_the_session_alone() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10660,7 +10660,7 @@ mod tests {
     /// ADR 0016 end to end: the same code the host read out once has to work
     /// again after the session ends, or "remembered host" is a list of dead
     /// links and the operator is back to asking for a new code every time.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_same_invite_code_still_works_after_a_session_has_ended() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10687,7 +10687,7 @@ mod tests {
 
     /// The other half of ADR 0016: "refresh invite" is the host's withdrawal
     /// switch, so the code it replaced has to stop working immediately.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refreshing_the_invite_retires_the_code_it_replaced() {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
@@ -10712,7 +10712,7 @@ mod tests {
 
     /// A guest that disappears without a revoke must not leave the host
     /// capturing its own screen for nobody.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_disconnect_removes_the_viewer_too() {
         let (host, _host_endpoint, capture) = actor().await;
         let (guest, guest_endpoint, _guest_capture) = actor().await;
@@ -10736,7 +10736,7 @@ mod tests {
     /// The guest side of a grant: a view window opens by itself, is pollable
     /// through the same pseudonymized-label IPC as everything else, and closing
     /// it ends the session.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_granted_guest_gets_a_view_window_and_closing_it_ends_the_session() {
         let (host, _host_endpoint, host_capture) = actor().await;
         let recorder = Arc::new(RecordingWindows::default());
@@ -10791,7 +10791,7 @@ mod tests {
     /// reconnect window and then be told the connection failed.
     ///
     /// The session itself is untouched: this is not a revoke.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_host_with_no_capture_backend_tells_the_guest_why() {
         let capture = test_capture();
         let (host, _host_endpoint) = actor_with_media(
@@ -10856,7 +10856,7 @@ mod tests {
 
     /// A `ViewOnly` session must not be able to forward input, and the guest
     /// drops it before it ever reaches the wire (the host checks again).
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_view_only_guest_cannot_forward_input() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let recorder = Arc::new(RecordingWindows::default());
@@ -10907,7 +10907,7 @@ mod tests {
     /// §8.2 applied to §17: a granted session is not a licence to record it.
     /// The `recording` grant is a separate decision, and without it the toggle
     /// is refused before any file is opened.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recording_without_the_grant_is_refused_before_a_file_is_opened() {
         let pair = clipboard_pair().await;
 
@@ -10931,7 +10931,7 @@ mod tests {
 
     /// The whole §17 host path: the grant, the toggle, the file Rust chose,
     /// the indicator on both sides, and a second press that changes nothing.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_granted_recording_lands_where_rust_chose_and_toggling_twice_is_idempotent() {
         let pair = clipboard_pair().await;
         pair.host
@@ -11023,7 +11023,7 @@ mod tests {
     /// against: a host user who moves the switch off has to be able to read
     /// "nothing is being recorded" off the same panel, not "nothing new will
     /// be allowed to start".
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn withdrawing_the_grant_stops_a_running_recording() {
         let pair = clipboard_pair().await;
         pair.host
@@ -11080,7 +11080,7 @@ mod tests {
     /// §17's request half: a guest may *ask*, and asking decides nothing. The
     /// host user answers, and a refusal is an ordinary answer the guest is
     /// told about rather than an error or a silence.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_guests_request_waits_for_the_host_and_never_records_by_itself() {
         let pair = clipboard_pair().await;
 
@@ -11138,7 +11138,7 @@ mod tests {
     }
 
     /// Unknown labels are refused cleanly, with no panic and no peer parsing.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unknown_label_is_refused() {
         let (host, _endpoint, _capture) = actor().await;
         assert!(matches!(
