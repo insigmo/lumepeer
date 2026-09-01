@@ -99,8 +99,10 @@ pub const SECURE_DESKTOP_FRAME_HEADER_BYTES: usize = 12;
 /// not depend on `lumepeer-core` (ADR 0043's dependency-minimalism
 /// argument, restated for this crate in ADR 0046), so raising one bound
 /// without the other is caught by review rather than by the compiler. A
-/// frame captured larger than this is truncated by [`crate::frame`] rather
-/// than grown into — the mapping never resizes at runtime.
+/// frame captured larger than this is refused by [`crate::frame`] rather
+/// than published truncated — a partial BGRA8 image is a corrupt one, not a
+/// smaller one — so the mapping never resizes at runtime and never carries
+/// a picture nobody asked for at that size.
 pub const SECURE_DESKTOP_FRAME_CAPACITY_BYTES: usize = 1920 * 1080 * 4;
 
 /// Total size of the mapping: the fixed header plus the fixed payload
