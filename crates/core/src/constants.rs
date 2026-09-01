@@ -376,3 +376,30 @@ pub const CLIPBOARD_FILE_LIST_MAX_ENTRIES: usize = MAX_PENDING_FILE_OFFERS;
 /// legacy `MAX_PATH`, while still refusing the pathological case a hostile
 /// local clipboard owner could otherwise hand this process.
 pub const CLIPBOARD_FILE_PATH_MAX_BYTES: usize = 4096;
+
+/// Maximum number of display modes one host may report for its currently
+/// captured monitor, whether enumerated locally or announced in
+/// `DisplayModesList` (docs/bugs/16-host-display-mode.md #1; D7 point 2).
+///
+/// A monitor's EDID can list dozens of near-duplicate entries — the same
+/// resolution at 59.94/60/60.00 Hz, or every refresh rate a GPU driver is
+/// willing to try — and a list that long is not a choice a human can make
+/// from a dropdown (§18: an honest but useless answer is still the wrong
+/// one). The real backends dedupe and sort before this bound is applied, so
+/// truncating here costs only the rarest, least-distinguishable entries.
+pub const MAX_DISPLAY_MODES_PER_HOST: usize = 24;
+
+/// How long the host waits, after switching its own physical display mode,
+/// for something to confirm the new mode actually produces a picture before
+/// reverting on its own (docs/bugs/16-host-display-mode.md #3).
+///
+/// Changing display mode is the riskiest control this project hands a guest:
+/// unlike every other grant, it can strand the operator in front of a black
+/// or garbled screen with no session left to fix it from. Confirmation is
+/// the host's own capture backend successfully restarting on the new mode
+/// and handing back a frame — nothing here waits on a human, attended or not,
+/// because a mechanism that only saves someone who clicks in time is not a
+/// safety net. 10 seconds is comfortably past how long a monitor takes to
+/// resync to a new signal (typically 1-3 s) and short enough that a genuinely
+/// broken mode does not strand the desktop for long.
+pub const DISPLAY_MODE_CONFIRM_TIMEOUT_SECS: u64 = 10;
