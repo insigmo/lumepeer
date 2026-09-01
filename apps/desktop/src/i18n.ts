@@ -201,6 +201,11 @@ export type TranslationKey =
   | 'toolbar.resolution.1080p'
   | 'toolbar.resolution.720p'
   | 'toolbar.resolution.half'
+  | 'toolbar.settings.hostResolution'
+  | 'toolbar.settings.hostResolutionWarning'
+  | 'toolbar.hostResolution.empty.notGranted'
+  | 'toolbar.hostResolution.empty.platformUnsupported'
+  | 'toolbar.hostResolution.empty.noModesReported'
   | 'toolbar.display.fit'
   | 'toolbar.display.actual'
   | 'toolbar.display.scaled'
@@ -489,13 +494,24 @@ const en: Dictionary = {
   // on this host the pointer is part of the picture and nothing here can
   // change that.
   'toolbar.settings.cursorEmbedded': 'This device sends the pointer inside the picture.',
-  // D7, docs/bugs/13-stream-resolution.md: a ceiling on what the host sends,
-  // not the host's own screen resolution — that stays untouched.
-  'toolbar.settings.resolution': 'Stream resolution',
+  // D7, docs/bugs/13-stream-resolution.md: a ceiling on what the host sends
+  // to this window — see 'toolbar.settings.hostResolution' below for the
+  // separate control that switches the host's own physical screen.
+  'toolbar.settings.resolution': 'Picture resolution',
   'toolbar.resolution.native': 'Native',
   'toolbar.resolution.1080p': '1080p',
   'toolbar.resolution.720p': '720p',
   'toolbar.resolution.half': '50%',
+  // D7, docs/bugs/16-host-display-mode.md: switches the host's actual
+  // monitor, never merely what this window receives — see
+  // 'toolbar.settings.resolution' above for that one.
+  'toolbar.settings.hostResolution': "Host's screen resolution",
+  'toolbar.settings.hostResolutionWarning':
+    'This changes the resolution of the host computer itself, not just what you see here.',
+  'toolbar.hostResolution.empty.notGranted': 'The host has not allowed changing its screen.',
+  'toolbar.hostResolution.empty.platformUnsupported':
+    "The host's system cannot change its screen resolution.",
+  'toolbar.hostResolution.empty.noModesReported': 'The host reported no available resolutions.',
   // Named for what the operator sees, not for the arithmetic: "actual size"
   // is a promise about pixels, "1:1" is a formula.
   'toolbar.display.fit': 'Fit to window',
@@ -780,11 +796,17 @@ const ar: Dictionary = {
   'toolbar.settings.displayMode': 'حجم الصورة',
   'toolbar.settings.localCursor': 'ارسم المؤشر هنا',
   'toolbar.settings.cursorEmbedded': 'يرسل هذا الجهاز المؤشر داخل الصورة.',
-  'toolbar.settings.resolution': 'دقة البث',
+  'toolbar.settings.resolution': 'دقة الصورة',
   'toolbar.resolution.native': 'الدقة الأصلية',
   'toolbar.resolution.1080p': '1080p',
   'toolbar.resolution.720p': '720p',
   'toolbar.resolution.half': '50%',
+  'toolbar.settings.hostResolution': 'دقة شاشة المضيف',
+  'toolbar.settings.hostResolutionWarning':
+    'هذا يغيّر دقة شاشة جهاز المضيف نفسه، وليس فقط ما تراه هنا.',
+  'toolbar.hostResolution.empty.notGranted': 'لم يسمح المضيف بتغيير شاشته.',
+  'toolbar.hostResolution.empty.platformUnsupported': 'لا يمكن لنظام المضيف تغيير دقة شاشته.',
+  'toolbar.hostResolution.empty.noModesReported': 'لم يبلغ المضيف عن أي دقة شاشة متاحة.',
   'toolbar.display.fit': 'ملاءمة النافذة',
   'toolbar.display.actual': 'الحجم الحقيقي',
   'toolbar.display.scaled': 'تكبير',
