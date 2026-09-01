@@ -95,6 +95,15 @@ Remaining increments (staged; not done):
 4. Real-path validation on the rig (LAN and the provider path), and Fase 3's
    active countermeasures if the plain obfuscated path proves insufficient.
 
+Increment 1 dependency note: `noq = "=1.2.0"` is now a direct dependency of
+`lumepeer-net`, pinned to the exact version `iroh` 1.0.2 already resolves it
+to (`Cargo.lock` already carried it there), so this adds a direct edge to a
+crate already in the tree rather than a new dependency version.
+`ObfuscatedSocket`/`ObfuscatedSender` (`crates/net/src/obfuscate.rs`)
+implement `noq::AsyncUdpSocket`/`noq::UdpSender` directly, since iroh 1.0.2
+exposes no hook to wrap its own socket (Fase 0) and `new_with_abstract_socket`
+is the embedding point `noq` provides for exactly this.
+
 ## Consequences
 
 - The pieces that gate serverless connection for a double-NAT host — learning a

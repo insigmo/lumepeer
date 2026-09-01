@@ -12,6 +12,12 @@ workspace = true
 [dependencies]
 lumepeer-core.workspace = true
 iroh.workspace = true
+# The QUIC engine iroh is built on. Already in the dependency tree
+# transitively via `iroh`; pinned here to the exact version it resolves to
+# (task 17 increment 1, ADR 0052) so the two never diverge — `noq`'s own
+# `AsyncUdpSocket` is the embedding point `obfuscate.rs` implements, since
+# iroh 1.0.2 exposes no hook to wrap its own socket (Fase 0).
+noq = "=1.2.0"
 tokio.workspace = true
 serde.workspace = true
 serde-big-array.workspace = true
@@ -31,6 +37,10 @@ lumepeer-media.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Self-signed certs for the obfuscated-QUIC endpoint test (task 17 increment 1,
+# ADR 0052), same version `noq`'s own tests pin so the `rustls-pki-types` types
+# each side produces resolve to one crate.
+rcgen = "0.14"
 # Only for the `wan_probe` example, which needs iroh's own logs to explain a
 # failed relay connection.
 tracing-subscriber.workspace = true
