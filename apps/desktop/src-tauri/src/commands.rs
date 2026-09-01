@@ -2013,8 +2013,8 @@ fn recording_file_name(name: &str) -> Result<&str, IpcError> {
     // `\` is only a separator to `Path` on Windows; checked here regardless of
     // target so a name a Windows peer would treat as a subdirectory is
     // refused the same way on every platform this runs on.
-    let plain = !name.contains('\\')
-        && path.file_name().and_then(std::ffi::OsStr::to_str) == Some(name);
+    let plain =
+        !name.contains('\\') && path.file_name().and_then(std::ffi::OsStr::to_str) == Some(name);
     let is_recording = path
         .extension()
         .and_then(std::ffi::OsStr::to_str)
