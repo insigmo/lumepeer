@@ -204,6 +204,16 @@ pub const OBFUSCATE_PADDING_MAX_BYTES: usize = 128;
 /// to move past, not to wait on; the caller walks a list of servers and the
 /// mapping it wants is the same for all of them.
 pub const STUN_QUERY_TIMEOUT_MS: u64 = 3_000;
+/// Keep-alive interval on the obfuscated QUIC transport (task 17, ADR 0052).
+/// Mandatory: without a keep-alive the QUIC idle timeout closes an otherwise
+/// healthy path at ~30 s, which was once mistaken for a DPI drop
+/// (project-lumepeer-quic-vs-relay-transport). Must stay below
+/// [`QUIC_MAX_IDLE_TIMEOUT_SECS`].
+pub const QUIC_KEEPALIVE_SECS: u64 = 15;
+/// Idle timeout on the obfuscated QUIC transport (task 17, ADR 0052). Larger
+/// than twice [`QUIC_KEEPALIVE_SECS`] so a single lost keep-alive never trips
+/// it, but bounded so a truly dead path is eventually released.
+pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).
