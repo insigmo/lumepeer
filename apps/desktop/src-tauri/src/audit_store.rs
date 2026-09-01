@@ -453,6 +453,7 @@ const fn grant_tag(grant: IndependentGrant) -> &'static str {
         IndependentGrant::FileTransfer => "file_transfer",
         IndependentGrant::Recording => "recording",
         IndependentGrant::DisplayMode => "display_mode",
+        IndependentGrant::SecureDesktop => "secure_desktop",
     }
 }
 

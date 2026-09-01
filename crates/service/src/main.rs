@@ -33,6 +33,8 @@
 #[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
+mod secure_desktop;
+#[cfg(target_os = "windows")]
 mod windows_service;
 
 fn main() {

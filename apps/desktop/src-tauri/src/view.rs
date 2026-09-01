@@ -28,11 +28,11 @@ use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
     KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
-    RECONNECT_WINDOW_SECS,
+    RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
 use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, effective_scale};
-use lumepeer_media::capture::{CaptureController, InputInjector};
+use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
 use lumepeer_media::error::MediaError;
@@ -87,6 +87,19 @@ pub struct EncodeControl {
     /// its own — a ceiling this loop reads is not a target ABR stops
     /// adapting around.
     manual_cap: Arc<Mutex<Option<u32>>>,
+    /// Whether this session currently holds the `secure_desktop` grant
+    /// (ADR 0049). Written by the actor whenever the host flips the grant
+    /// (`Network::on_set_grant`), read by the loop before every attempt to
+    /// serve a secure-desktop frame instead of the honest "can't see this"
+    /// message — so a revoke reaches the very next frame without the loop
+    /// ever touching `lumepeer-core` itself (§2.3).
+    secure_desktop_allowed: Arc<AtomicBool>,
+    /// Whether the loop is, right now, actually serving secure-desktop
+    /// pixels for this session — distinct from the grant above the same way
+    /// `recording_active` is distinct from the `recording` grant (§17).
+    /// Written by the loop, read by the actor for the host's own
+    /// non-removable indicator (ADR 0049).
+    secure_desktop_active: Arc<AtomicBool>,
 }
 
 impl EncodeControl {
@@ -101,6 +114,11 @@ impl EncodeControl {
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
             manual_cap: Arc::new(Mutex::new(None)),
+            // `Grants::from_role` never sets `secure_desktop` (ADR 0049), so
+            // every session starts here without needing to ask the core what
+            // it already knows the answer is.
+            secure_desktop_allowed: Arc::new(AtomicBool::new(false)),
+            secure_desktop_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -185,6 +203,39 @@ impl EncodeControl {
         let changed = *current != cap;
         *current = cap;
         changed
+    }
+
+    /// The actor calls this whenever `secure_desktop` moves on this session
+    /// (ADR 0049). Revoking it must reach the loop before its next attempt,
+    /// which is exactly what a plain atomic store gives for free.
+    pub fn set_secure_desktop_allowed(&self, allowed: bool) {
+        self.secure_desktop_allowed
+            .store(allowed, Ordering::Relaxed);
+        if !allowed {
+            // A revoke stops the *attempt*; the loop's own next iteration
+            // clears `secure_desktop_active` once it notices, but the host's
+            // indicator must not keep claiming this is happening in the
+            // meantime.
+            self.secure_desktop_active.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the loop may currently try the secure-desktop path.
+    fn secure_desktop_allowed(&self) -> bool {
+        self.secure_desktop_allowed.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the loop is, right now, actually serving
+    /// secure-desktop pixels for this session (ADR 0049).
+    fn set_secure_desktop_active(&self, active: bool) {
+        self.secure_desktop_active.store(active, Ordering::Relaxed);
+    }
+
+    /// Host side: whether this session's guest is currently seeing the
+    /// secure desktop, for the non-removable indicator (ADR 0049, §17).
+    #[must_use]
+    pub fn secure_desktop_active(&self) -> bool {
+        self.secure_desktop_active.load(Ordering::Relaxed)
     }
 }
 
@@ -774,6 +825,13 @@ pub fn spawn_encode_loop(
         // (docs/bugs/11-uac-degradation.md). Reset as soon as capture is
         // healthy again, so a later recurrence is announced afresh.
         let mut secure_desktop_notified = false;
+        // Earliest instant the next secure-desktop capture attempt may run
+        // (ADR 0049); due immediately the first time capture gets stuck.
+        let mut secure_desktop_next_attempt_at = Instant::now();
+        // Reference clock for the timestamp on a secure-desktop frame — this
+        // loop's own start, the same role `Active::started_at` plays inside
+        // `WindowsCapturer` for its ordinary frames.
+        let media_started = Instant::now();
 
         loop {
             let tick_started = Instant::now();
@@ -792,6 +850,10 @@ pub fn spawn_encode_loop(
             let frame = match captured {
                 Ok(Ok(Some(frame))) => {
                     secure_desktop_notified = false;
+                    // Ordinary capture just produced a real frame, so
+                    // whatever the secure-desktop path was doing a moment
+                    // ago is not happening on this tick (ADR 0049).
+                    control.set_secure_desktop_active(false);
                     frame
                 }
                 // The screen has not changed (§11.1): nothing to send. Also
@@ -800,6 +862,7 @@ pub fn spawn_encode_loop(
                 // where that recovery is noticed too.
                 Ok(Ok(None)) => {
                     secure_desktop_notified = false;
+                    control.set_secure_desktop_active(false);
                     sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
@@ -811,20 +874,42 @@ pub fn spawn_encode_loop(
                 // the session stays up, and only the guest is told, once per
                 // episode rather than every tick (§18,
                 // docs/bugs/11-uac-degradation.md).
+                //
+                // ADR 0049 extends this arm rather than replacing it: if this
+                // session holds the `secure_desktop` grant, try to serve the
+                // real thing first. Every failure of that attempt — no
+                // grant, service unreachable, the far side's session check
+                // refusing this caller, or simply "the secure desktop is not
+                // showing anything right now" — falls straight through to
+                // `docs/bugs/11-uac-degradation.md`'s unmodified fallback
+                // below, exactly as it behaved before this ADR existed.
                 Ok(Err(MediaError::SecureDesktopActive(reason))) => {
-                    if !secure_desktop_notified {
-                        tracing::info!(
-                            peer = %tag,
-                            %reason,
-                            "capture blocked by the secure desktop; retrying while it clears"
-                        );
-                        let _ = faults
-                            .send((peer, MediaUnavailableReason::SecureDesktopActive))
-                            .await;
-                        secure_desktop_notified = true;
+                    if let Some(frame) = secure_desktop_frame(
+                        &control,
+                        &mut secure_desktop_next_attempt_at,
+                        media_started,
+                    )
+                    .await
+                    {
+                        control.set_secure_desktop_active(true);
+                        secure_desktop_notified = false;
+                        frame
+                    } else {
+                        control.set_secure_desktop_active(false);
+                        if !secure_desktop_notified {
+                            tracing::info!(
+                                peer = %tag,
+                                %reason,
+                                "capture blocked by the secure desktop; retrying while it clears"
+                            );
+                            let _ = faults
+                                .send((peer, MediaUnavailableReason::SecureDesktopActive))
+                                .await;
+                            secure_desktop_notified = true;
+                        }
+                        sleep_for_the_rest_of(interval, tick_started).await;
+                        continue;
                     }
-                    sleep_for_the_rest_of(interval, tick_started).await;
-                    continue;
                 }
                 Ok(Err(error)) => {
                     tracing::info!(peer = %tag, %error, "capture ended: stopping the encode loop");
@@ -966,6 +1051,68 @@ async fn sleep_for_the_rest_of(interval: Duration, tick_started: Instant) {
     if let Some(remaining) = interval.checked_sub(tick_started.elapsed()) {
         tokio::time::sleep(remaining).await;
     }
+}
+
+/// The branch `docs/bugs/11-uac-degradation.md`'s task 3 prepared, extended
+/// rather than replaced (ADR 0049): while capture is stuck behind the secure
+/// desktop, try to serve the real thing instead of the honest "can't see
+/// this" message, but only when this session actually holds the grant.
+///
+/// `None` for every reason at once — no grant, not yet due for another try,
+/// the service unreachable, the session-binding check on the far side
+/// refusing this caller, or a malformed answer — which is exactly what tells
+/// the caller to fall through to `docs/bugs/11-uac-degradation.md`'s
+/// existing behaviour unchanged.
+///
+/// Throttled to [`SECURE_DESKTOP_CAPTURE_INTERVAL_MS`] rather than tried
+/// every tick: a fresh pipe round trip and a GDI capture on a `LocalSystem`
+/// process is a real cost, and the secure desktop is largely static.
+/// `next_attempt_at` is advanced whether or not this call actually finds a
+/// frame, so a run of refusals cannot turn into a busy loop against the
+/// service.
+///
+/// The pipe round trip and the capture it triggers are blocking calls, so
+/// they run on `spawn_blocking` rather than on this task's own worker
+/// thread — the same treatment `next_frame` already gets a few lines below
+/// wherever this is called from.
+async fn secure_desktop_frame(
+    control: &EncodeControl,
+    next_attempt_at: &mut Instant,
+    started: Instant,
+) -> Option<Frame> {
+    if !control.secure_desktop_allowed() {
+        return None;
+    }
+    let now = Instant::now();
+    if now < *next_attempt_at {
+        return None;
+    }
+    *next_attempt_at = now + Duration::from_millis(SECURE_DESKTOP_CAPTURE_INTERVAL_MS);
+
+    let captured =
+        tokio::task::spawn_blocking(lumepeer_service::client::capture_secure_desktop_frame)
+            .await
+            .ok()??;
+    let expected_len = usize::try_from(captured.width)
+        .ok()?
+        .checked_mul(usize::try_from(captured.height).ok()?)?
+        .checked_mul(4)?;
+    if expected_len == 0 || captured.data.len() != expected_len {
+        tracing::warn!(
+            width = captured.width,
+            height = captured.height,
+            len = captured.data.len(),
+            "the secure-desktop frame mapping did not agree with its own header; discarding it"
+        );
+        return None;
+    }
+    Some(Frame {
+        width: captured.width,
+        height: captured.height,
+        format: PixelFormat::Bgra8,
+        timestamp_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        data: captured.data,
+    })
 }
 
 /// Turns how long one write actually took into the [`ReceiverFeedback`]
@@ -2085,6 +2232,45 @@ mod tests {
         );
         assert_eq!(ViewStatus::SecureDesktop.code(), 6);
         assert!(!ViewStatus::SecureDesktop.is_terminal());
+    }
+
+    /// ADR 0049's central requirement, exercised at the one point in this
+    /// file that actually checks it: without the grant, `secure_desktop_
+    /// frame` never even reaches the service — proven here by the throttle
+    /// clock never moving, since only a real attempt advances it — and with
+    /// the grant revoked again, the very next call is refused just as
+    /// promptly, with no separate teardown step needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secure_desktop_frame_is_gated_by_the_grant_before_anything_else() {
+        let peer = iroh::SecretKey::generate().public();
+        let control = EncodeControl::new(peer, None);
+        let started = Instant::now();
+
+        let mut next_attempt_at = Instant::now();
+        assert!(
+            secure_desktop_frame(&control, &mut next_attempt_at, started)
+                .await
+                .is_none()
+        );
+        let untouched = next_attempt_at;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        control.set_secure_desktop_allowed(true);
+        let _ = secure_desktop_frame(&control, &mut next_attempt_at, started).await;
+        assert!(
+            next_attempt_at > untouched,
+            "holding the grant must actually attempt a capture, which is what advances the throttle"
+        );
+
+        // Revoked again: even though the throttle above is not yet due, the
+        // grant check runs first and refuses on its own — a revoke must not
+        // have to wait out whatever throttle window happened to be open.
+        control.set_secure_desktop_allowed(false);
+        assert!(
+            secure_desktop_frame(&control, &mut next_attempt_at, started)
+                .await
+                .is_none()
+        );
     }
 
     /// The actor writes the host's reason into the slot and then aborts the

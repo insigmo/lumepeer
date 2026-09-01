@@ -27,9 +27,10 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerW, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_SHUTDOWN,
     SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
@@ -40,7 +41,8 @@ use windows::core::{PCWSTR, PWSTR};
 
 use lumepeer_service::SERVICE_NAME;
 use lumepeer_service::protocol::{
-    ENDPOINT, FRAME_LEN, OP_DELIVER_SAS, STATUS_OK, STATUS_REFUSED, parse_request, response,
+    ENDPOINT, FRAME_LEN, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS, STATUS_OK, STATUS_REFUSED,
+    parse_request, response,
 };
 
 /// Who may open the pipe, in SDDL.
@@ -284,7 +286,7 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
     // `read` outlives the call.
     let ok = unsafe { ReadFile(pipe, Some(&mut frame), Some(&raw mut read), None) };
     let status = if ok.is_ok() && read as usize == FRAME_LEN {
-        serve(frame)
+        serve(pipe, frame)
     } else {
         // A short or failed read is not an operation. Answering `refused`
         // rather than staying silent keeps the client from waiting out its
@@ -302,22 +304,92 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
     true
 }
 
-/// Carries out one request. The whole authorization story is the pipe's DACL:
-/// anything that got this far is an interactive user or an administrator.
-fn serve(frame: [u8; FRAME_LEN]) -> u8 {
-    if parse_request(&frame) == Some(OP_DELIVER_SAS) {
-        tracing::info!("delivering the secure attention sequence");
-        // SAFETY: documented Win32 entry point of `sas.dll` with no
-        // invariants beyond its argument. `FALSE` names the caller's own
-        // session, which for a service is session 0 — the case the
-        // `SoftwareSASGeneration` policy grants services.
-        unsafe {
-            SendSAS(false);
+/// Carries out one request. The whole authorization story for
+/// [`OP_DELIVER_SAS`] is the pipe's DACL: anything that got this far is an
+/// interactive user or an administrator, and delivering a Ctrl+Alt+Del to
+/// whichever session receives it discloses nothing to a caller who cannot
+/// see that session.
+///
+/// [`OP_CAPTURE_SECURE_DESKTOP`] hands back a picture instead, which is a
+/// disclosure the DACL alone does not bound the way it bounds
+/// `OP_DELIVER_SAS` — a caller in *any* interactive session could otherwise
+/// ask for a screenshot of whichever secure desktop the physical console is
+/// showing. So this operation additionally requires the caller's session to
+/// be the one attached to the console (`caller_is_in_active_console_session`,
+/// ADR 0049) before anything is captured. This is a mechanical property of
+/// which desktop object a caller may even ask about, not a policy decision
+/// about who is allowed to run a session — `lumepeer-core`, in the main
+/// process, already decided this call was worth making before the pipe was
+/// ever touched.
+fn serve(pipe: HANDLE, frame: [u8; FRAME_LEN]) -> u8 {
+    match parse_request(&frame) {
+        Some(OP_DELIVER_SAS) => {
+            tracing::info!("delivering the secure attention sequence");
+            // SAFETY: documented Win32 entry point of `sas.dll` with no
+            // invariants beyond its argument. `FALSE` names the caller's own
+            // session, which for a service is session 0 — the case the
+            // `SoftwareSASGeneration` policy grants services.
+            unsafe {
+                SendSAS(false);
+            }
+            STATUS_OK
         }
-        return STATUS_OK;
+        Some(OP_CAPTURE_SECURE_DESKTOP) => serve_secure_desktop_capture(pipe),
+        _ => {
+            tracing::warn!("refusing an unknown request");
+            STATUS_REFUSED
+        }
     }
-    tracing::warn!("refusing an unknown request");
-    STATUS_REFUSED
+}
+
+/// [`OP_CAPTURE_SECURE_DESKTOP`]'s half of [`serve`], split out so the
+/// session check and the capture-plus-publish sequence read as one thing
+/// rather than another branch of an already-branching match.
+fn serve_secure_desktop_capture(pipe: HANDLE) -> u8 {
+    if !caller_is_in_active_console_session(pipe) {
+        tracing::warn!("refusing a secure-desktop capture from outside the active console session");
+        return STATUS_REFUSED;
+    }
+    let Some((width, height, data)) = crate::secure_desktop::capture() else {
+        tracing::warn!("could not capture the secure desktop");
+        return STATUS_REFUSED;
+    };
+    let Some(writer) = lumepeer_service::frame::Writer::create() else {
+        tracing::error!("could not open the secure-desktop frame mapping");
+        return STATUS_REFUSED;
+    };
+    if writer.write(width, height, &data) {
+        tracing::info!(width, height, "published a secure-desktop frame");
+        STATUS_OK
+    } else {
+        STATUS_REFUSED
+    }
+}
+
+/// Whether the process at the far end of `pipe` is running in the session
+/// attached to the physical console — the session a real secure desktop
+/// relevant to "the local administrator is authenticating" would appear in
+/// (ADR 0049).
+///
+/// Fails closed: any step that cannot be determined (the client's process id,
+/// its session, or the active console session) refuses rather than guesses,
+/// matching this crate's rule that an unintelligible answer reads as "no".
+fn caller_is_in_active_console_session(pipe: HANDLE) -> bool {
+    let mut client_pid = 0u32;
+    // SAFETY: `pipe` is a live, connected named-pipe server handle; `client_pid`
+    // is a local that outlives the call and is only written to.
+    if unsafe { GetNamedPipeClientProcessId(pipe, &raw mut client_pid) }.is_err() {
+        return false;
+    }
+    let mut client_session = 0u32;
+    // SAFETY: `client_pid` was just filled in above; `client_session` is a
+    // local that outlives the call and is only written to.
+    if unsafe { ProcessIdToSessionId(client_pid, &raw mut client_session) }.is_err() {
+        return false;
+    }
+    // SAFETY: a plain kernel32 export with no arguments and no invariants.
+    let active_console_session = unsafe { WTSGetActiveConsoleSessionId() };
+    client_session == active_console_session
 }
 
 /// A null-terminated UTF-16 copy of `text`, for the `W` entry points.

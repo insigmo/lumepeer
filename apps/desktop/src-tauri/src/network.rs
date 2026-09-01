@@ -369,6 +369,10 @@ pub struct ConnectionStats {
 }
 
 /// One row of the status list the webview polls.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mirrors Grants plus two independent activity flags (recording_active, secure_desktop_active); §2.2 requires the grants to stay independent fields rather than folded together"
+)]
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     /// Pseudonymized label; the only peer-identifying string that ever
@@ -397,6 +401,14 @@ pub struct SessionSnapshot {
     /// Whether this guest has asked to be recorded and is still waiting for an
     /// answer (§17). Never auto-answered: a person at the host decides.
     pub record_request: bool,
+    /// Whether this guest is, right now, actually seeing the secure desktop
+    /// (ADR 0049).
+    ///
+    /// Separate from `grants.secure_desktop` the same way `recording_active`
+    /// is separate from `recording`: the grant says the host *may* show it,
+    /// this says it *is* happening. The host's non-removable indicator hangs
+    /// off this one.
+    pub secure_desktop_active: bool,
 }
 
 /// What `invite_create` hands back to the UI.
@@ -2764,6 +2776,7 @@ impl Actor {
                 grants: Grants::default(),
                 recording_active: false,
                 record_request: false,
+                secure_desktop_active: false,
             });
         }
         for (peer, role, grants) in self.sessions.active() {
@@ -2780,6 +2793,10 @@ impl Actor {
                 grants,
                 recording_active: self.recorders.contains_key(&peer),
                 record_request: self.record_requests.contains(&peer),
+                secure_desktop_active: self
+                    .media
+                    .get(&peer)
+                    .is_some_and(|s| s.control.secure_desktop_active()),
             });
         }
         // Host side: every saved device gets a label too, whether or not it is
@@ -6783,10 +6800,24 @@ impl Actor {
         if grant == IndependentGrant::DisplayMode {
             self.announce_display_modes(peer);
         }
+        // `secure_desktop` moves both on and off here, unlike the others
+        // below: the encode loop's own `EncodeControl` copy is the "one
+        // value in one place" it checks before every attempt
+        // (`apps/desktop/src-tauri/src/view.rs`), so a grant switched on
+        // mid-stall must reach it just as promptly as a revoke does
+        // (ADR 0049). Nothing to update if no media session exists yet — the
+        // next one starts with the flag at `false`, matching
+        // `Grants::from_role`.
+        if grant == IndependentGrant::SecureDesktop
+            && let Some(session) = self.media.get(&peer)
+        {
+            session.control.set_secure_desktop_allowed(allowed);
+        }
         if !allowed {
             // Exhaustive on purpose, with no `_` arm, for the reason
-            // `Grants::get` gives: a sixth independent grant must not be able
-            // to appear and quietly keep running after it is switched off.
+            // `Grants::get` gives: a seventh independent grant must not be
+            // able to appear and quietly keep running after it is switched
+            // off.
             match grant {
                 IndependentGrant::FileTransfer => self.abandon_file_transfers(peer),
                 // Idempotent, and the guest is told the recording stopped by
@@ -6798,8 +6829,10 @@ impl Actor {
                 // what "spending" that grant looks like, and it has stopped.
                 // `clipboard_write` is spent by the peer, not here, and every
                 // inbound payload is checked against the live grant as it
-                // arrives.
-                IndependentGrant::ClipboardRead | IndependentGrant::ClipboardWrite => {}
+                // arrives. `secure_desktop` is already handled above too.
+                IndependentGrant::ClipboardRead
+                | IndependentGrant::ClipboardWrite
+                | IndependentGrant::SecureDesktop => {}
                 // Withdrawing the grant from whoever is actually holding the
                 // monitor in a switched mode restores it on the spot, the
                 // same way turning `recording` off stops the file rather
