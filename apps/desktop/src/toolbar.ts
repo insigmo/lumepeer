@@ -30,6 +30,36 @@ export interface MonitorDto {
   primary: boolean;
 }
 
+/**
+ * One mode the host's own physical monitor can be switched to, as the IPC
+ * `host_display_modes` returns it (docs/bugs/16-host-display-mode.md #4).
+ *
+ * Not the same thing `MonitorDto` or the picture-resolution selector below
+ * name: this is the host's actual screen, never what this window receives.
+ */
+export interface HostDisplayModeDto {
+  id: number;
+  width: number;
+  height: number;
+  refresh_hz: number;
+}
+
+/**
+ * Why the host announced no display modes at all (docs/bugs/
+ * 16-host-display-mode.md #4): the selector shows this reason rather than
+ * an empty, silently-useless dropdown.
+ */
+export type HostDisplayModeUnavailableReason =
+  | 'not_granted'
+  | 'platform_unsupported'
+  | 'no_modes_reported';
+
+/** What `host_display_modes` hands back: the list, or why it is empty. */
+export interface HostDisplayModesDto {
+  modes: HostDisplayModeDto[];
+  reason: HostDisplayModeUnavailableReason | null;
+}
+
 /** How the toolbar talks to Tauri; injectable for tests. */
 export interface ToolbarCommands {
   micToggle(peer: string, on: boolean): Promise<void>;
@@ -73,6 +103,22 @@ export interface ToolbarCommands {
    * to sit below it, and stays free to recover only up to it.
    */
   viewSetScale(peer: string, scalePercent: number): Promise<void>;
+  /**
+   * The host's own physical display modes, or an honest reason there are
+   * none (docs/bugs/16-host-display-mode.md #4; ADR 0048).
+   *
+   * Distinct from {@link ToolbarCommands.viewSetScale}: that caps what this
+   * window receives, this switches the actual monitor on the other side.
+   */
+  hostDisplayModes(peer: string): Promise<HostDisplayModesDto>;
+  /**
+   * Asks the host to switch its own physical monitor to `modeId` (docs/bugs/
+   * 16-host-display-mode.md #4; ADR 0048).
+   *
+   * The host re-checks its own independent `display_mode` grant before
+   * acting; this call only says whether the request could be sent at all.
+   */
+  hostDisplaySetMode(peer: string, modeId: number): Promise<void>;
 }
 
 /** Default binding to the real IPC surface. */
@@ -123,6 +169,17 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // `scale_percent`, not `scalePercent`: same snake_case boundary as
     // `monitor_id` above.
     return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent } });
+  },
+  async hostDisplayModes(peer) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // A bare `peer`, like `monitorsList`: the Rust command takes it as a
+    // command parameter, not a field of an `args` struct.
+    return (await invoke('host_display_modes', { peer })) as HostDisplayModesDto;
+  },
+  async hostDisplaySetMode(peer, modeId) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // `mode_id`, not `modeId`: same snake_case boundary as `monitor_id`.
+    return invoke('host_display_set_mode', { args: { peer, mode_id: modeId } });
   },
 };
 
@@ -178,6 +235,26 @@ export function scalePercentFor(
   return percent >= MIN_SCALE_PERCENT ? percent : null;
 }
 
+/**
+ * The i18n key explaining an empty host-display-modes list (docs/bugs/
+ * 16-host-display-mode.md #4): a `null` reason means "not fetched yet",
+ * shown the same as a genuinely empty list rather than a third state,
+ * since nothing here has failed — the popover just has not been opened.
+ */
+function hostResolutionEmptyKey(
+  reason: HostDisplayModeUnavailableReason | null,
+): 'toolbar.hostResolution.empty.notGranted' | 'toolbar.hostResolution.empty.platformUnsupported' | 'toolbar.hostResolution.empty.noModesReported' {
+  switch (reason) {
+    case 'not_granted':
+      return 'toolbar.hostResolution.empty.notGranted';
+    case 'platform_unsupported':
+      return 'toolbar.hostResolution.empty.platformUnsupported';
+    case 'no_modes_reported':
+    case null:
+      return 'toolbar.hostResolution.empty.noModesReported';
+  }
+}
+
 /** Render-side mirror of everything the toolbar shows. */
 export class ToolbarState {
   /** Collapsed to the small pill: every button hidden but expand. */
@@ -198,6 +275,19 @@ export class ToolbarState {
    * switch; the percentage it maps to is recalculated for the new screen.
    */
   resolution: ResolutionOption = 'native';
+  /**
+   * The host's own physical display modes, as last fetched, and the reason
+   * when there are none (docs/bugs/16-host-display-mode.md #4; ADR 0048).
+   * `null` reason with an empty list means "not fetched yet", the same
+   * "empty until first fetched" convention `monitors` uses.
+   */
+  hostDisplayModes: HostDisplayModesDto = { modes: [], reason: null };
+  /**
+   * The host display mode id most recently picked, so the select can show
+   * it selected across a re-render. `null` until the guest picks one; the
+   * host's own current mode is not otherwise known to this window.
+   */
+  hostDisplayModeId: number | null = null;
   /**
    * Whether a recording request has already been sent this session.
    *
@@ -310,6 +400,7 @@ export function renderToolbar(
     sendFile(): void;
     pickMonitor(id: number): void;
     pickResolution(option: ResolutionOption): void;
+    pickHostDisplayMode(modeId: number): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
   },
@@ -331,6 +422,11 @@ export function renderToolbar(
   const resolutionChoices = RESOLUTION_OPTIONS.filter(
     (option) => scalePercentFor(option, activeMonitorInfo) !== null,
   );
+  // Same guard as `activeMonitorInfo` above, for the same reason: a real
+  // `ToolbarState` always has this field, but a test harness building one by
+  // hand as a bare object literal may not (docs/bugs/16-host-display-mode.md
+  // #4).
+  const hostDisplayModes = state.hostDisplayModes ?? { modes: [], reason: null };
 
   const settingsPopover: TemplateResult =
     state.openPopover === 'settings'
@@ -368,6 +464,30 @@ export function renderToolbar(
                 )}
               </select>
             </label>
+            <label class="toolbar-pop-row">
+              <span>${t(locale, 'toolbar.settings.hostResolution')}</span>
+              ${hostDisplayModes.modes.length === 0
+                ? html`<span data-testid="toolbar-host-resolution-empty">
+                    ${t(locale, hostResolutionEmptyKey(hostDisplayModes.reason))}
+                  </span>`
+                : html`<select
+                    data-testid="toolbar-host-resolution"
+                    @change=${(event: Event) =>
+                      actions.pickHostDisplayMode(
+                        Number((event.target as HTMLSelectElement).value),
+                      )}
+                  >
+                    ${hostDisplayModes.modes.map(
+                      (mode) =>
+                        html`<option value=${mode.id} ?selected=${mode.id === state.hostDisplayModeId}>
+                          ${mode.width}×${mode.height} @${mode.refresh_hz}Hz
+                        </option>`,
+                    )}
+                  </select>`}
+            </label>
+            <p class="toolbar-pop-note" data-testid="toolbar-host-resolution-warning">
+              ${t(locale, 'toolbar.settings.hostResolutionWarning')}
+            </p>
             ${hooks.cursorChannel()
               ? html`
                   <label class="toolbar-pop-row">
@@ -679,6 +799,29 @@ export function mountToolbar(
             draw();
           });
       }
+      // The host's own display modes live only in the settings popover
+      // (docs/bugs/16-host-display-mode.md #4); "not fetched yet" and
+      // "genuinely empty" both start as an empty list with no reason, so
+      // this only re-fetches while neither has arrived.
+      if (
+        which === 'settings' &&
+        state.hostDisplayModes.modes.length === 0 &&
+        state.hostDisplayModes.reason === null
+      ) {
+        void commands
+          .hostDisplayModes(peer)
+          .then((modes) => {
+            state.hostDisplayModes = modes;
+            draw();
+          })
+          .catch(() => {
+            // The host refused, speaks an older protocol, or the session is
+            // gone: the same honest-empty note a genuine `NoModesReported`
+            // shows, never a select that silently does nothing.
+            state.hostDisplayModes = { modes: [], reason: 'no_modes_reported' };
+            draw();
+          });
+      }
       draw();
     },
     setDisplayMode(mode: DisplayMode): void {
@@ -769,6 +912,16 @@ export function mountToolbar(
           // simply does not change.
         });
       }
+      draw();
+    },
+    pickHostDisplayMode(modeId: number): void {
+      state.hostDisplayModeId = modeId;
+      void commands.hostDisplaySetMode(peer, modeId).catch(() => {
+        // The host's `display_mode` grant is gone, the id is stale, or the
+        // session ended: the select keeps showing what was asked for, and
+        // the host's own monitor simply does not change — the same "refused
+        // is not shown as an error" contract `pickResolution` follows.
+      });
       draw();
     },
     beginDrag(event: PointerEvent): void {

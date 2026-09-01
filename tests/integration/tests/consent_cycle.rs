@@ -157,7 +157,7 @@ async fn each_session_gets_its_own_random_id() {
     host.close().await;
 }
 
-/// §8.2: the four independent grants belong to the session, not to the peer.
+/// §8.2: the independent grants belong to the session, not to the peer.
 /// A revoke takes them with it, and the next `ConsentGrant` starts from a
 /// role's implied grants — never from what the previous session had reached.
 #[tokio::test(flavor = "multi_thread")]

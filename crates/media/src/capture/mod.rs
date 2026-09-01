@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use lumepeer_core::NodeId;
-use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
+use lumepeer_core::constants::{MAX_CURSOR_SHAPE_PIXELS, MAX_DISPLAY_MODES_PER_HOST};
 use lumepeer_core::protocol::{CursorShapeData, InputEventPayload};
 
 use crate::error::{MediaError, Result};
@@ -225,6 +225,45 @@ pub fn host_display_count() -> Result<usize> {
     }
 }
 
+/// One display mode a monitor can be physically switched to: resolution plus
+/// refresh rate (docs/bugs/16-host-display-mode.md #1; D7 point 2,
+/// docs/bugs/DECISIONS.md).
+///
+/// Distinct from [`HostMonitor`] and from the guest's `StreamScaleRequest`
+/// (D7 point 1, docs/bugs/13-stream-resolution.md): this describes what the
+/// host's own physical monitor can be set to, never what the guest receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DisplayMode {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Refresh rate in Hz, rounded to the nearest whole number.
+    pub refresh_hz: u32,
+}
+
+/// Deduplicates identical modes, sorts by resolution then refresh rate, and
+/// caps the result at [`MAX_DISPLAY_MODES_PER_HOST`]
+/// (docs/bugs/16-host-display-mode.md #1).
+///
+/// Shared by every real backend below so "what counts as a duplicate" and
+/// "what order a human sees" are decided once, not per platform.
+#[must_use]
+pub fn dedupe_and_sort_display_modes(mut modes: Vec<DisplayMode>) -> Vec<DisplayMode> {
+    modes.sort_unstable();
+    modes.dedup();
+    // Largest first, then truncate: a monitor whose full mode list exceeds
+    // the cap loses its smallest, least useful legacy VESA entries (640x480
+    // and friends) rather than the native or currently-set resolution a
+    // human is most likely to want back. Found on real 4K hardware, whose
+    // driver lists dozens of legacy modes below the cap and would otherwise
+    // make the monitor's own current mode disappear from its own list
+    // (docs/bugs/16-host-display-mode.md #1, #3).
+    modes.reverse();
+    modes.truncate(MAX_DISPLAY_MODES_PER_HOST);
+    modes
+}
+
 /// Pixel format of a captured frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -301,6 +340,52 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// compositing, and a guest that sees no [`Self::cursor_shape`] therefore
     /// draws nothing — two cursors is worse than one that lags.
     fn set_cursor_embedded(&mut self, _embedded: bool) {}
+
+    /// Every mode the monitor `target` names actually supports, for the
+    /// host's own physical screen (docs/bugs/16-host-display-mode.md #1; D7
+    /// point 2).
+    ///
+    /// The default is an honest empty list, never a fabricated one: a
+    /// platform that cannot enumerate its own display modes must say so by
+    /// reporting nothing, not by inventing values (§18). Wayland has no such
+    /// right without compositor privilege it does not have (ADR 0010), and
+    /// macOS is out of scope this iteration — both keep this default.
+    /// Windows and X11 override it with a real enumeration, deduplicated and
+    /// sorted by [`dedupe_and_sort_display_modes`].
+    fn display_modes(&self, _target: CaptureTarget) -> Vec<DisplayMode> {
+        Vec::new()
+    }
+
+    /// Switches the monitor `target` names to `mode` (docs/bugs/
+    /// 16-host-display-mode.md #2; ADR 0048).
+    ///
+    /// The default refuses: a platform that cannot enumerate modes at all
+    /// (Wayland, macOS) has nothing here to switch to either. Windows and
+    /// X11 override it. Reversibility — remembering the original mode,
+    /// restoring it when the session ends, and the auto-revert timeout — is
+    /// the caller's responsibility (`apps/desktop/src-tauri/src/network.rs`),
+    /// not this trait's: a capture backend only knows how to apply one mode,
+    /// never which one came before it.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureUnavailable`] when the platform cannot change
+    /// modes, or when the OS refuses the requested one.
+    fn set_display_mode(&mut self, _target: CaptureTarget, _mode: DisplayMode) -> Result<()> {
+        Err(MediaError::CaptureUnavailable(
+            "this platform cannot change display modes".to_owned(),
+        ))
+    }
+
+    /// The mode `target`'s monitor is set up with right now (docs/bugs/
+    /// 16-host-display-mode.md #3; ADR 0048).
+    ///
+    /// Read before the first switch a caller makes, so there is something to
+    /// restore later. The default is `None`, the same honest-empty contract
+    /// [`Self::display_modes`]'s default keeps: a platform that cannot
+    /// change modes has nothing meaningful to report as "current" either.
+    fn current_display_mode(&self, _target: CaptureTarget) -> Option<DisplayMode> {
+        None
+    }
 }
 
 /// Builds a [`CursorShapeData`] after checking it against the bound of §14.
@@ -544,6 +629,55 @@ pub fn platform_backend() -> Result<PlatformBackend> {
     Ok((platform_capturer()?, None))
 }
 
+/// Whether the capture backend [`platform_backend`] would actually select
+/// can enumerate or change display modes at all (docs/bugs/
+/// 16-host-display-mode.md; ADR 0048).
+///
+/// Mirrors [`platform_backend`]'s own branching exactly, so this can never
+/// drift from which backend a session actually runs on: Windows can in
+/// principle, a Linux session that would resolve to the portal (Wayland, or
+/// `Unknown` treated as Wayland, ADR 0010) cannot, and an X11 session can.
+/// `false` here is what tells [`crate::error::MediaError`] aside — a caller
+/// uses it to distinguish `DisplayModeUnavailableReason::PlatformUnsupported`
+/// from a genuine `NoModesReported` on a platform that enumerates but finds
+/// nothing for this monitor.
+#[must_use]
+pub fn display_modes_supported() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-portal"
+    ))]
+    {
+        !matches!(
+            detect_session_type(),
+            SessionType::Wayland | SessionType::Unknown
+        )
+    }
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        not(feature = "capture-portal")
+    ))]
+    {
+        // No portal compiled in at all: `platform_capturer` always returns
+        // `X11Capturer` regardless of session type (ADR 0003), so this build
+        // can attempt enumeration even on a Wayland desktop via Xwayland.
+        cfg!(feature = "capture-x11")
+    }
+    #[cfg(not(any(
+        target_os = "windows",
+        all(target_os = "linux", not(target_os = "android"))
+    )))]
+    {
+        false
+    }
+}
+
 /// Opens the capture backend of the current platform.
 ///
 /// # Errors
@@ -614,6 +748,12 @@ pub struct CaptureController {
     target: CaptureTarget,
     viewers: BTreeSet<NodeId>,
     capturing: bool,
+    /// When [`Self::next_frame`] last returned `Ok` — whether or not that
+    /// poll produced a new frame (docs/bugs/16-host-display-mode.md #3): the
+    /// health signal the display-mode auto-revert timeout reads. A capture
+    /// that has stopped answering at all, new frame or not, is the failure a
+    /// bad mode switch can cause.
+    last_poll_ok_at: Option<std::time::Instant>,
 }
 
 impl CaptureController {
@@ -625,6 +765,7 @@ impl CaptureController {
             target,
             viewers: BTreeSet::new(),
             capturing: false,
+            last_poll_ok_at: None,
         }
     }
 
@@ -723,7 +864,11 @@ impl CaptureController {
                 "no viewer holds a view grant: capture must not run".to_owned(),
             ));
         }
-        self.capturer.next_frame()
+        let result = self.capturer.next_frame();
+        if result.is_ok() {
+            self.last_poll_ok_at = Some(std::time::Instant::now());
+        }
+        result
     }
 
     /// The host's cursor, when the backend can report it and it changed
@@ -746,6 +891,50 @@ impl CaptureController {
     /// receives a shape and never draws one.
     pub fn set_cursor_embedded(&mut self, embedded: bool) {
         self.capturer.set_cursor_embedded(embedded);
+    }
+
+    /// Every mode the monitor this controller currently targets actually
+    /// supports (docs/bugs/16-host-display-mode.md #1).
+    ///
+    /// Not gated on [`Self::is_capturing`]: unlike a frame or a cursor
+    /// bitmap, a mode list touches nobody's screen contents, and a guest that
+    /// has not yet been added as a viewer still needs to see it to decide
+    /// whether to ask for a switch at all.
+    #[must_use]
+    pub fn display_modes(&self) -> Vec<DisplayMode> {
+        self.capturer.display_modes(self.target)
+    }
+
+    /// Switches the monitor this controller currently targets to `mode`
+    /// (docs/bugs/16-host-display-mode.md #2).
+    ///
+    /// # Errors
+    /// Whatever [`ScreenCapturer::set_display_mode`] reports.
+    pub fn set_display_mode(&mut self, mode: DisplayMode) -> Result<()> {
+        self.capturer.set_display_mode(self.target, mode)
+    }
+
+    /// The monitor this controller currently targets, as it is set up right
+    /// now (docs/bugs/16-host-display-mode.md #3): what a caller remembers
+    /// before its first switch, so there is something to restore.
+    ///
+    /// `None` when the platform cannot report a current mode at all — the
+    /// same honest-empty contract [`Self::display_modes`] follows.
+    #[must_use]
+    pub fn current_display_mode(&self) -> Option<DisplayMode> {
+        self.capturer.current_display_mode(self.target)
+    }
+
+    /// Whether [`Self::next_frame`] has answered successfully at least once
+    /// since `since` (docs/bugs/16-host-display-mode.md #3).
+    ///
+    /// The confirmation signal for the display-mode auto-revert timeout: a
+    /// physical mode switch that leaves capture unable to produce anything
+    /// — new frame or not — is exactly the failure the timeout exists to
+    /// catch.
+    #[must_use]
+    pub fn healthy_since(&self, since: std::time::Instant) -> bool {
+        self.last_poll_ok_at.is_some_and(|at| at >= since)
     }
 }
 

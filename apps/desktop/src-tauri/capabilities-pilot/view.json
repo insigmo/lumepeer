@@ -43,6 +43,8 @@
     "allow-monitor-select",
     "allow-monitors-list",
     "allow-view-set-scale",
+    "allow-host-display-modes",
+    "allow-host-display-set-mode",
     "allow-session-revoke"
   ]
 }

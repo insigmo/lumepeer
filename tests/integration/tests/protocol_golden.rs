@@ -8,8 +8,10 @@
 //! `ReceiverReport` (docs/adr/0037), minor 7 appended `StreamScaleRequest`
 //! (D7, docs/bugs/13-stream-resolution.md), minor 8 appended
 //! `ClipboardFileOffer` and `ClipboardFileAccept` (docs/bugs/
-//! 14-clipboard-files.md; ADR 0047) — and every earlier vector is still in
-//! the file unchanged, which is the compatibility claim this test checks.
+//! 14-clipboard-files.md; ADR 0047), minor 9 appended `DisplayModesList` and
+//! `DisplaySetMode` (docs/bugs/16-host-display-mode.md; ADR 0048) — and every
+//! earlier vector is still in the file unchanged, which is the compatibility
+//! claim this test checks.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,
 //! so a stable toolchain still exercises them on every CI run; the nightly
@@ -76,7 +78,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 8,
+        PROTOCOL_MINOR, 9,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 
