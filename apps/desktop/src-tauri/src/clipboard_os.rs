@@ -432,7 +432,7 @@ mod platform {
 
     pub fn read_file_paths() -> Option<Vec<PathBuf>> {
         let clipboard = context()?;
-        let uri_list = clipboard.get_atom("text/uri-list").ok()?;
+        let uri_list = clipboard.getter.get_atom("text/uri-list").ok()?;
         let property = clipboard.getter.atoms.property;
         let raw = clipboard
             .load(
@@ -488,7 +488,7 @@ mod platform {
     pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
         let clipboard = context().ok_or(ClipboardError::Unavailable)?;
         let uri_list = clipboard
-            .get_atom("text/uri-list")
+            .getter.get_atom("text/uri-list")
             .map_err(|error| ClipboardError::Refused(error.to_string()))?;
         let mut body = String::new();
         for path in paths {
