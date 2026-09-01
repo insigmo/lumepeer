@@ -291,26 +291,18 @@ mod platform {
     use lumepeer_core::constants::{
         CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_FILE_PATH_MAX_BYTES,
     };
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    use objc2_app_kit::NSPasteboard;
     use objc2_foundation::{NSArray, NSString, NSURL};
 
     use super::ClipboardError;
 
-    fn file_url_type() -> &'static objc2_app_kit::NSPasteboardType {
-        // SAFETY: a documented Apple Foundation/AppKit `extern` global,
-        // initialized by the framework before any Objective-C runtime call
-        // can observe it; objc2's generated binding has no safe accessor for
-        // a foreign static (same shape as `SendSAS` in `crates/media/src/
-        // sas.rs`, justified there against ADR 0012's standard).
-        #[allow(
-            unsafe_code,
-            reason = "reading an extern \"C\" static from objc2's generated AppKit \
-                      binding has no safe wrapper; same justification standard as \
-                      SendInput/SendSAS (ADR 0012)"
-        )]
-        unsafe {
-            NSPasteboardTypeFileURL
-        }
+    /// `NSPasteboardTypeFileURL`'s value, built directly rather than read from
+    /// objc2's generated `extern "C"` static: `apps/desktop` forbids (not
+    /// merely denies) `unsafe_code` crate-wide, and unlike `crates/media`'s
+    /// `deny`, `forbid` cannot be locally overridden. `NSPasteboardType` is
+    /// itself just an `NSString` (the UTI), so building this one is safe.
+    fn file_url_type() -> objc2::rc::Retained<objc2_app_kit::NSPasteboardType> {
+        NSString::from_str("public.file-url")
     }
 
     pub fn read_file_paths() -> Option<Vec<PathBuf>> {
@@ -329,7 +321,7 @@ mod platform {
         let file_url_type = file_url_type();
         let mut paths = Vec::new();
         for item in items.iter() {
-            let Some(value) = item.stringForType(file_url_type) else {
+            let Some(value) = item.stringForType(&file_url_type) else {
                 continue;
             };
             let url_string = value.to_string();
@@ -367,7 +359,7 @@ mod platform {
             >,
         > = urls
             .iter()
-            .map(|url| objc2::runtime::ProtocolObject::from_ref(url.as_ref()).into())
+            .map(|url| objc2::runtime::ProtocolObject::from_ref(&**url).into())
             .collect();
         let array = NSArray::from_retained_slice(&objects);
         if pasteboard.writeObjects(&array) {
