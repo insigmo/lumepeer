@@ -31,8 +31,15 @@ async fn full_pairing_round_trip_grants_and_the_guest_sees_it() {
         .expect("guest bind");
 
     let now = unix_now();
-    let ticket = InviteTicket::issue(&host_identity, &host.addr(), Role::ViewOnly, now)
-        .expect("issue ticket");
+    let ticket = InviteTicket::issue(
+        &host_identity,
+        &host.addr(),
+        Role::ViewOnly,
+        now,
+        None,
+        None,
+    )
+    .expect("issue ticket");
     let mut registry = TicketRegistry::new();
     registry.register(&ticket);
 
@@ -103,8 +110,15 @@ async fn an_expired_ticket_is_refused_by_the_registry_after_a_real_handshake() {
         .expect("host bind");
 
     let past = 1_000u64;
-    let ticket = InviteTicket::issue(&host_identity, &host.addr(), Role::ViewOnly, past)
-        .expect("issue ticket");
+    let ticket = InviteTicket::issue(
+        &host_identity,
+        &host.addr(),
+        Role::ViewOnly,
+        past,
+        None,
+        None,
+    )
+    .expect("issue ticket");
     let mut registry = TicketRegistry::new();
     registry.register(&ticket);
 

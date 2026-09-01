@@ -9,6 +9,7 @@
 //! TTL and the registry state, and the guest still has to pass consent (§2.3).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _, VerifyingKey};
@@ -43,6 +44,16 @@ pub struct InviteTicket {
     pub expires_at: u64,
     /// Capability the guest is allowed to ask for; the host still decides (§2.3).
     pub allowed_request: Role,
+    /// Host's public reflexive address on the obfuscated transport, if STUN
+    /// discovery found one (task 17 increment 2, ADR 0053). `None` when no
+    /// reflector answered or the mapping is unusable (double NAT), in which
+    /// case a guest falls back to `node_addr` over the existing iroh path.
+    pub obfuscated_addr: Option<SocketAddr>,
+    /// Blake3 fingerprint of the host's self-signed cert for the obfuscated
+    /// transport, if `obfuscated_addr` is set (task 17 increment 2, ADR 0053).
+    /// A guest pins its TLS verification to exactly this cert rather than
+    /// validating against a CA, since there is no CA for an ad-hoc peer cert.
+    pub host_cert_fingerprint: Option<[u8; 32]>,
     /// Ed25519 signature of the host over the preceding fields.
     #[serde(with = "serde_big_array::BigArray")]
     pub signature: [u8; 64],
@@ -56,6 +67,8 @@ struct SignedFields<'a> {
     invite_id: &'a [u8; INVITE_ID_BYTES],
     expires_at: u64,
     allowed_request: Role,
+    obfuscated_addr: Option<SocketAddr>,
+    host_cert_fingerprint: Option<[u8; 32]>,
 }
 
 /// Lifecycle of a ticket on the host side (§7, as amended by ADR 0016).
@@ -80,6 +93,12 @@ impl InviteTicket {
     /// Issues a ticket for `addr`, valid for `INVITE_TICKET_TTL_SECS` from
     /// `now` (Unix seconds), signed with the host's invite key.
     ///
+    /// `obfuscated_addr`/`host_cert_fingerprint` carry the STUN-discovered
+    /// address and pinned cert fingerprint for the obfuscated transport
+    /// (task 17 increment 2, ADR 0053); pass `None` for both when that
+    /// transport is not bound or STUN found no usable address — the ticket
+    /// still works over `addr` via the existing iroh path.
+    ///
     /// # Errors
     /// [`NetError::MalformedTicket`] if the address or the signed prefix cannot
     /// be serialized.
@@ -88,6 +107,8 @@ impl InviteTicket {
         addr: &iroh::EndpointAddr,
         allowed_request: Role,
         now: u64,
+        obfuscated_addr: Option<SocketAddr>,
+        host_cert_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self> {
         let node_addr = postcard::to_allocvec(addr).map_err(|_| NetError::MalformedTicket)?;
         let mut invite_id = [0u8; INVITE_ID_BYTES];
@@ -100,6 +121,8 @@ impl InviteTicket {
             invite_id: &invite_id,
             expires_at,
             allowed_request,
+            obfuscated_addr,
+            host_cert_fingerprint,
         })
         .map_err(|_| NetError::MalformedTicket)?;
 
@@ -109,6 +132,8 @@ impl InviteTicket {
             invite_id,
             expires_at,
             allowed_request,
+            obfuscated_addr,
+            host_cert_fingerprint,
             signature: signing_key.sign(&signed).to_bytes(),
         })
     }
@@ -128,6 +153,8 @@ impl InviteTicket {
             invite_id: &self.invite_id,
             expires_at: self.expires_at,
             allowed_request: self.allowed_request,
+            obfuscated_addr: self.obfuscated_addr,
+            host_cert_fingerprint: self.host_cert_fingerprint,
         })
         .map_err(|_| NetError::InvalidTicket)?;
         let signature = ed25519_dalek::Signature::from_bytes(&self.signature);
@@ -273,7 +300,13 @@ mod tests {
     }
 
     fn ticket(now: u64) -> InviteTicket {
-        InviteTicket::issue(&keypair(), &addr(), Role::ViewOnly, now).unwrap()
+        InviteTicket::issue(&keypair(), &addr(), Role::ViewOnly, now, None, None).unwrap()
+    }
+
+    /// A fixed obfuscated address/fingerprint pair for the tests that need
+    /// the `Some` case (task 17 increment 2, ADR 0053).
+    fn obfuscated() -> (SocketAddr, [u8; 32]) {
+        ("203.0.113.7:41230".parse().unwrap(), [0x42; 32])
     }
 
     #[test]
@@ -282,6 +315,63 @@ mod tests {
         let decoded = InviteTicket::from_code(&issued.to_code().unwrap()).unwrap();
         assert_eq!(issued, decoded);
         assert_eq!(decoded.endpoint_addr().unwrap(), addr());
+        // The common no-STUN-address case round-trips as `None`, not a
+        // decode error.
+        assert_eq!(decoded.obfuscated_addr, None);
+        assert_eq!(decoded.host_cert_fingerprint, None);
+    }
+
+    /// task 17 increment 2 (ADR 0053): when STUN found a usable address, both
+    /// new fields round-trip through the code exactly, alongside everything
+    /// the previous test already covers for the `None` case.
+    #[test]
+    fn code_roundtrip_preserves_the_obfuscated_address_and_fingerprint() {
+        let (obfuscated_addr, fingerprint) = obfuscated();
+        let issued = InviteTicket::issue(
+            &keypair(),
+            &addr(),
+            Role::ViewOnly,
+            1_000,
+            Some(obfuscated_addr),
+            Some(fingerprint),
+        )
+        .unwrap();
+        let decoded = InviteTicket::from_code(&issued.to_code().unwrap()).unwrap();
+        assert_eq!(decoded.obfuscated_addr, Some(obfuscated_addr));
+        assert_eq!(decoded.host_cert_fingerprint, Some(fingerprint));
+        decoded.verify(&keypair().verifying_key(), 1_000).unwrap();
+    }
+
+    /// task 17 increment 2 (ADR 0053): the two new fields are signed like
+    /// every other field — tampering with either is caught the same way
+    /// `signature_and_ttl_are_both_enforced` already covers `allowed_request`.
+    #[test]
+    fn tampering_with_the_obfuscated_address_or_fingerprint_is_caught() {
+        let (obfuscated_addr, fingerprint) = obfuscated();
+        let issued = InviteTicket::issue(
+            &keypair(),
+            &addr(),
+            Role::ViewOnly,
+            1_000,
+            Some(obfuscated_addr),
+            Some(fingerprint),
+        )
+        .unwrap();
+        let key = keypair().verifying_key();
+
+        let mut tampered_addr = issued.clone();
+        tampered_addr.obfuscated_addr = Some("198.51.100.9:1".parse().unwrap());
+        assert!(matches!(
+            tampered_addr.verify(&key, 1_000),
+            Err(NetError::InvalidTicket)
+        ));
+
+        let mut tampered_fingerprint = issued;
+        tampered_fingerprint.host_cert_fingerprint = Some([0x99; 32]);
+        assert!(matches!(
+            tampered_fingerprint.verify(&key, 1_000),
+            Err(NetError::InvalidTicket)
+        ));
     }
 
     #[test]
