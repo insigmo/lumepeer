@@ -69,6 +69,20 @@ jobs:
           mkdir -p apps/desktop/src-tauri/binaries
           cp "target/debug/lumepeer-decoder-worker${EXE}" \
              "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${TRIPLE}${EXE}"
+      # Same as above, for the ADR 0043 privileged helper service sidecar
+      # (`externalBin` also lists binaries/lumepeer-service).
+      - name: Build the service sidecar for this target
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          cargo build -p lumepeer-service
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp "target/debug/lumepeer-service${EXE}" \
+             "apps/desktop/src-tauri/binaries/lumepeer-service-${TRIPLE}${EXE}"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
