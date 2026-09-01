@@ -313,6 +313,69 @@ fn mode_info_to_display_mode(
     })
 }
 
+/// The mode the CRTC driving `target`'s monitor is set up with right now
+/// (§11.1; docs/bugs/16-host-display-mode.md #3; ADR 0048).
+///
+/// `None` on anything `RandR` refuses, exactly the honest-empty contract
+/// [`display_modes_for`] follows — there is no "current mode" worth
+/// reporting from a monitor this cannot even ask about.
+#[must_use]
+pub fn current_display_mode_for(target: CaptureTarget) -> Option<crate::capture::DisplayMode> {
+    let (connection, screen_num) = x11rb::connect(None).ok()?;
+    let screen = connection.setup().roots[screen_num].clone();
+    connection
+        .randr_query_version(RANDR_MAJOR, RANDR_MINOR)
+        .ok()?
+        .reply()
+        .ok()?;
+
+    let monitors_reply = connection
+        .randr_get_monitors(screen.root, true)
+        .ok()?
+        .reply()
+        .ok()?;
+    let mut monitors: Vec<_> = monitors_reply
+        .monitors
+        .into_iter()
+        .filter(|info| info.width > 0 && info.height > 0)
+        .take(MAX_MONITORS_PER_HOST)
+        .collect();
+    if !monitors.iter().any(|info| info.primary)
+        && let Some(first) = monitors.first_mut()
+    {
+        first.primary = true;
+    }
+    let index = match target {
+        CaptureTarget::PrimaryDisplay => monitors.iter().position(|info| info.primary)?,
+        CaptureTarget::Display(n) => usize::try_from(n).ok()?,
+    };
+    let output = *monitors.get(index)?.outputs.first()?;
+
+    let resources = connection
+        .randr_get_screen_resources(screen.root)
+        .ok()?
+        .reply()
+        .ok()?;
+    let output_info = connection
+        .randr_get_output_info(output, resources.config_timestamp)
+        .ok()?
+        .reply()
+        .ok()?;
+    if output_info.crtc == 0 {
+        return None;
+    }
+    let crtc_info = connection
+        .randr_get_crtc_info(output_info.crtc, resources.config_timestamp)
+        .ok()?
+        .reply()
+        .ok()?;
+    let info = resources
+        .modes
+        .iter()
+        .find(|info| info.id == crtc_info.mode)?;
+    mode_info_to_display_mode(info)
+}
+
 /// Switches the CRTC driving `target`'s monitor to `mode` (§11.1;
 /// docs/bugs/16-host-display-mode.md #2; ADR 0048).
 ///
@@ -693,6 +756,10 @@ impl ScreenCapturer for X11Capturer {
         mode: crate::capture::DisplayMode,
     ) -> Result<()> {
         set_display_mode_for(target, mode)
+    }
+
+    fn current_display_mode(&self, target: CaptureTarget) -> Option<crate::capture::DisplayMode> {
+        current_display_mode_for(target)
     }
 }
 
@@ -1621,13 +1688,42 @@ mod tests {
         for mode in &modes {
             assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 0);
         }
+        // Deduplicated and sorted largest-first (docs/bugs/
+        // 16-host-display-mode.md #1, #3): the native/current resolution
+        // stays ahead of legacy VESA modes rather than being truncated away
+        // by the cap.
         let mut sorted = modes.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted, modes, "the list was not deduplicated and sorted");
+        sorted.reverse();
+        assert_eq!(
+            sorted, modes,
+            "the list was not deduplicated and sorted largest-first"
+        );
         assert!(
             modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
             "the list was not capped"
+        );
+    }
+
+    /// Read-only: whatever `current_display_mode_for` reports must be one of
+    /// the modes `display_modes_for` itself announced — the "remember the
+    /// original mode" bookkeeping of docs/bugs/16-host-display-mode.md #3
+    /// depends on the two agreeing.
+    #[test]
+    fn the_current_mode_is_one_of_the_announced_modes() {
+        let modes = display_modes_for(CaptureTarget::PrimaryDisplay);
+        if modes.is_empty() {
+            eprintln!("skipping: no RandR modes reported on this machine");
+            return;
+        }
+        let Some(current) = current_display_mode_for(CaptureTarget::PrimaryDisplay) else {
+            eprintln!("skipping: the current mode could not be read back");
+            return;
+        };
+        assert!(
+            modes.contains(&current),
+            "current mode {current:?} is not among the announced modes {modes:?}"
         );
     }
 }

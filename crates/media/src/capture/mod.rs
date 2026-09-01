@@ -252,6 +252,14 @@ pub struct DisplayMode {
 pub fn dedupe_and_sort_display_modes(mut modes: Vec<DisplayMode>) -> Vec<DisplayMode> {
     modes.sort_unstable();
     modes.dedup();
+    // Largest first, then truncate: a monitor whose full mode list exceeds
+    // the cap loses its smallest, least useful legacy VESA entries (640x480
+    // and friends) rather than the native or currently-set resolution a
+    // human is most likely to want back. Found on real 4K hardware, whose
+    // driver lists dozens of legacy modes below the cap and would otherwise
+    // make the monitor's own current mode disappear from its own list
+    // (docs/bugs/16-host-display-mode.md #1, #3).
+    modes.reverse();
     modes.truncate(MAX_DISPLAY_MODES_PER_HOST);
     modes
 }
@@ -366,6 +374,17 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
         Err(MediaError::CaptureUnavailable(
             "this platform cannot change display modes".to_owned(),
         ))
+    }
+
+    /// The mode `target`'s monitor is set up with right now (docs/bugs/
+    /// 16-host-display-mode.md #3; ADR 0048).
+    ///
+    /// Read before the first switch a caller makes, so there is something to
+    /// restore later. The default is `None`, the same honest-empty contract
+    /// [`Self::display_modes`]'s default keeps: a platform that cannot
+    /// change modes has nothing meaningful to report as "current" either.
+    fn current_display_mode(&self, _target: CaptureTarget) -> Option<DisplayMode> {
+        None
     }
 }
 
@@ -729,6 +748,12 @@ pub struct CaptureController {
     target: CaptureTarget,
     viewers: BTreeSet<NodeId>,
     capturing: bool,
+    /// When [`Self::next_frame`] last returned `Ok` — whether or not that
+    /// poll produced a new frame (docs/bugs/16-host-display-mode.md #3): the
+    /// health signal the display-mode auto-revert timeout reads. A capture
+    /// that has stopped answering at all, new frame or not, is the failure a
+    /// bad mode switch can cause.
+    last_poll_ok_at: Option<std::time::Instant>,
 }
 
 impl CaptureController {
@@ -740,6 +765,7 @@ impl CaptureController {
             target,
             viewers: BTreeSet::new(),
             capturing: false,
+            last_poll_ok_at: None,
         }
     }
 
@@ -838,7 +864,11 @@ impl CaptureController {
                 "no viewer holds a view grant: capture must not run".to_owned(),
             ));
         }
-        self.capturer.next_frame()
+        let result = self.capturer.next_frame();
+        if result.is_ok() {
+            self.last_poll_ok_at = Some(std::time::Instant::now());
+        }
+        result
     }
 
     /// The host's cursor, when the backend can report it and it changed
@@ -882,6 +912,29 @@ impl CaptureController {
     /// Whatever [`ScreenCapturer::set_display_mode`] reports.
     pub fn set_display_mode(&mut self, mode: DisplayMode) -> Result<()> {
         self.capturer.set_display_mode(self.target, mode)
+    }
+
+    /// The monitor this controller currently targets, as it is set up right
+    /// now (docs/bugs/16-host-display-mode.md #3): what a caller remembers
+    /// before its first switch, so there is something to restore.
+    ///
+    /// `None` when the platform cannot report a current mode at all — the
+    /// same honest-empty contract [`Self::display_modes`] follows.
+    #[must_use]
+    pub fn current_display_mode(&self) -> Option<DisplayMode> {
+        self.capturer.current_display_mode(self.target)
+    }
+
+    /// Whether [`Self::next_frame`] has answered successfully at least once
+    /// since `since` (docs/bugs/16-host-display-mode.md #3).
+    ///
+    /// The confirmation signal for the display-mode auto-revert timeout: a
+    /// physical mode switch that leaves capture unable to produce anything
+    /// — new frame or not — is exactly the failure the timeout exists to
+    /// catch.
+    #[must_use]
+    pub fn healthy_since(&self, since: std::time::Instant) -> bool {
+        self.last_poll_ok_at.is_some_and(|at| at >= since)
     }
 }
 
