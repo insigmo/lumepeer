@@ -92,17 +92,33 @@ pub const CONTROL_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 /// still trying (ADR 0027).
 pub const INCOMING_ACCEPT_TIMEOUT_SECS: u64 = 20;
 /// Attempts one outgoing connect makes before it is reported as failed
-/// (§7, ADR 0027).
+/// (§7, ADR 0027, ADR 0050).
 ///
 /// A first attempt races whatever the host's address set said when the invite
 /// was issued: a relay the host has since moved off, a hole punch that has not
 /// landed, a discovery record that is a few seconds stale. Each of those is
 /// gone by the next attempt, and a user who has to re-paste the code cannot
 /// tell any of them from a dead host.
-pub const DIAL_ATTEMPTS: u32 = 3;
+///
+/// Was 3 under ADR 0027. Measured against a host whose relay link flaps on a
+/// roughly 20-second cycle, 3 attempts at [`CONNECT_ATTEMPT_TIMEOUT_SECS`]
+/// apart landed in a down window all three times, with a manual retry minutes
+/// later succeeding on the first try — the automatic budget was simply too
+/// short to reliably straddle one good window (ADR 0050).
+pub const DIAL_ATTEMPTS: u32 = 5;
 /// Pause between the attempts of [`DIAL_ATTEMPTS`], long enough for iroh's own
 /// discovery to have republished, short enough not to read as a hang.
 pub const DIAL_RETRY_BACKOFF_MS: u64 = 750;
+/// Random extra pause, on top of [`DIAL_RETRY_BACKOFF_MS`], added to each
+/// retry (ADR 0050).
+///
+/// A fixed backoff keeps every retry the same distance from the one before
+/// it; against a host whose relay outages recur on their own roughly fixed
+/// period, that lets every attempt land in the same phase of the cycle — all
+/// unlucky, or all lucky, with no way to tell which in advance. Jitter breaks
+/// the lockstep so a run of attempts sweeps across the cycle instead of
+/// riding one point on it.
+pub const DIAL_RETRY_BACKOFF_JITTER_MS: u64 = 1_500;
 /// Bound on one attempt of [`DIAL_ATTEMPTS`] — dial *and* handshake together.
 ///
 /// Without it a single attempt can hold the whole budget: a connection that
@@ -167,6 +183,27 @@ pub const ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB: u32 = 150;
 pub const INVITE_ID_BITS: usize = 128;
 /// TTL of a one-shot invite ticket (§7).
 pub const INVITE_TICKET_TTL_SECS: u64 = 10 * 60;
+/// Upper bound on the random padding added inside each obfuscated datagram
+/// (task 17 Fase 2, ADR 0051).
+///
+/// The obfuscation codec seals `len || payload || padding` under AEAD, so the
+/// padding is invisible on the wire (uniform ciphertext) and its only job is
+/// to blur the datagram-length distribution — otherwise the stream would carry
+/// a new fixed-length signature in place of the QUIC one it removes. Each
+/// datagram draws a fresh padding length in `0..=OBFUSCATE_PADDING_MAX_BYTES`.
+/// Kept small so the fixed envelope overhead plus this bound stays well inside
+/// a path MTU; the endpoint-integration step (ADR 0051, §5) subtracts the
+/// envelope overhead and this bound from the QUIC max datagram size.
+pub const OBFUSCATE_PADDING_MAX_BYTES: usize = 128;
+/// How long to wait for one STUN server's Binding response before giving up on
+/// it and trying the next (task 17, ADR 0052).
+///
+/// A single stateless request/response over UDP, used only to learn this
+/// device's public reflexive address for a serverless invite — never to carry
+/// session data. Short, because a server that does not answer promptly is one
+/// to move past, not to wait on; the caller walks a list of servers and the
+/// mapping it wants is the same for all of them.
+pub const STUN_QUERY_TIMEOUT_MS: u64 = 3_000;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).
