@@ -92,9 +92,14 @@ impl Broker {
             child,
             base: format!("http://127.0.0.1:{port}"),
             database,
-            client: ureq::AgentBuilder::new()
-                .timeout(Duration::from_secs(5))
-                .build(),
+            client: ureq::Agent::new_with_config(
+                ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    // Status errors are read for their body below, same as a
+                    // success response, rather than matched out of `Err`.
+                    .http_status_as_error(false)
+                    .build(),
+            ),
         };
         broker.wait_until_up()?;
         Some(broker)
@@ -111,7 +116,7 @@ impl Broker {
             {
                 // Any answer means the listener is up, including an error
                 // status: the probe device does not exist.
-                Ok(_) | Err(ureq::Error::Status(_, _)) => return Some(()),
+                Ok(_) => return Some(()),
                 Err(_) => std::thread::sleep(Duration::from_millis(50)),
             }
         }
@@ -124,16 +129,11 @@ impl Broker {
             .post(&format!("{}{path}", self.base))
             .send_json(body)
         {
-            Ok(response) => {
-                let status = response.status();
+            Ok(mut response) => {
+                let status = response.status().as_u16();
                 let value = response
-                    .into_json::<serde_json::Value>()
-                    .unwrap_or(serde_json::Value::Null);
-                (status, value)
-            }
-            Err(ureq::Error::Status(status, response)) => {
-                let value = response
-                    .into_json::<serde_json::Value>()
+                    .body_mut()
+                    .read_json::<serde_json::Value>()
                     .unwrap_or(serde_json::Value::Null);
                 (status, value)
             }
@@ -158,20 +158,15 @@ impl Broker {
         let request = self
             .client
             .post(&format!("{}{path}", self.base))
-            .set("content-type", "application/json")
-            .set("x-lumepeer-timestamp", &timestamp.to_string())
-            .set("x-lumepeer-signature", signature);
-        match request.send_bytes(body) {
-            Ok(response) => {
-                let status = response.status();
+            .header("content-type", "application/json")
+            .header("x-lumepeer-timestamp", timestamp.to_string())
+            .header("x-lumepeer-signature", signature);
+        match request.send(body) {
+            Ok(mut response) => {
+                let status = response.status().as_u16();
                 let value = response
-                    .into_json::<serde_json::Value>()
-                    .unwrap_or(serde_json::Value::Null);
-                (status, value)
-            }
-            Err(ureq::Error::Status(status, response)) => {
-                let value = response
-                    .into_json::<serde_json::Value>()
+                    .body_mut()
+                    .read_json::<serde_json::Value>()
                     .unwrap_or(serde_json::Value::Null);
                 (status, value)
             }
