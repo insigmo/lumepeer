@@ -9,8 +9,8 @@ use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
     FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS,
-    MAX_MONITORS_PER_HOST, STREAM_SCALE_MAX_PERCENT, UNATTENDED_CODE_MAX_BYTES,
-    UNATTENDED_PASSWORD_MAX_BYTES,
+    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, STREAM_SCALE_MAX_PERCENT,
+    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -106,7 +106,19 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// only to a peer whose `Hello` advertised [`FEATURE_CLIPBOARD_FILES`]. See
 /// `docs/bugs/14-clipboard-files.md` and `docs/adr/0047-clipboard-files-are-a-
 /// file-transfer-not-a-clipboard-extension.md`.
-pub const PROTOCOL_MINOR: u16 = 8;
+///
+/// 9: appended [`MessageKind::DisplayModesList`] and
+/// [`MessageKind::DisplaySetMode`] after `ClipboardFileAccept`. Neither
+/// message existed, so a guest had no way to learn what physical modes the
+/// host's own monitor supports or to ask for one — distinct from
+/// `StreamScaleRequest` (minor 7), which only caps the picture the guest
+/// receives and never touches the host's actual display (D7 point 2,
+/// `docs/bugs/DECISIONS.md`). A host only sends the list to a guest whose
+/// `Hello` advertised [`FEATURE_DISPLAY_MODE`], and only acts on a set-mode
+/// request from one, for the same minor-version reason every feature-gated
+/// message since minor 2 uses. See `docs/bugs/16-host-display-mode.md` and
+/// `docs/adr/0048-a-fifth-independent-grant-for-the-hosts-own-screen.md`.
+pub const PROTOCOL_MINOR: u16 = 9;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -201,6 +213,16 @@ pub const FEATURE_STREAM_SCALE: &str = "stream-scale";
 /// offer, and for the same reason (§18: a transfer that starts and cannot be
 /// acked or resumed is worse than one never offered).
 pub const FEATURE_CLIPBOARD_FILES: &str = "clipboard-files";
+
+/// `Hello.features` string a peer sends to say it understands
+/// [`MessageKind::DisplayModesList`] and [`MessageKind::DisplaySetMode`]
+/// (docs/bugs/16-host-display-mode.md; ADR 0048).
+///
+/// Same compatibility shape as [`FEATURE_STREAM_SCALE`]: a host must never
+/// announce a mode list, and must never act on a set-mode request, from a
+/// peer that did not advertise this string — an older peer decodes either
+/// discriminant as unknown and closes the connection (§9.1).
+pub const FEATURE_DISPLAY_MODE: &str = "display-mode";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -562,6 +584,42 @@ pub enum MessageKind {
     /// `FileTransferStart` a regular offer would use — the receiver never
     /// re-confirms the individual file that follows.
     ClipboardFileAccept(bool),
+    /// Host to guest: the modes the monitor its capture currently targets
+    /// actually supports (§11; D7 point 2, docs/bugs/DECISIONS.md;
+    /// docs/bugs/16-host-display-mode.md #2; ADR 0048). New in minor 9.
+    ///
+    /// Distinct from [`MessageKind::MonitorsList`] (which screens exist) and
+    /// from [`MessageKind::StreamScaleRequest`] (what the guest receives):
+    /// this is what the host's own physical monitor can be switched to.
+    /// Announced the same way `MonitorsList` is — once at grant time, and
+    /// again whenever the `display_mode` grant changes — never in answer to
+    /// a request the wire has no message for. Sent only to a guest whose
+    /// `Hello` advertised [`FEATURE_DISPLAY_MODE`].
+    ///
+    /// `modes` is empty exactly when `reason` is `Some`: a platform that
+    /// cannot enumerate (Wayland, ADR 0010; macOS, out of scope this
+    /// iteration) or a guest without the `display_mode` grant gets an honest
+    /// explanation, never a list that silently does nothing (§18).
+    DisplayModesList {
+        /// One entry per mode, at most `MAX_DISPLAY_MODES_PER_HOST`.
+        modes: Vec<DisplayModeInfo>,
+        /// Why `modes` is empty, when it is.
+        reason: Option<DisplayModeUnavailableReason>,
+    },
+    /// Guest to host: switch the host's own physical monitor to `mode_id`
+    /// (§11; D7 point 2; docs/bugs/16-host-display-mode.md #2; ADR 0048).
+    /// New in minor 9.
+    ///
+    /// The host re-checks the independent `display_mode` grant before
+    /// acting — `view` is not enough, because this changes the operator's
+    /// own desktop rather than only the picture a guest receives. Sent only
+    /// to a host whose `Hello` advertised [`FEATURE_DISPLAY_MODE`]; a host
+    /// that cannot or will not honor it simply does nothing, the same
+    /// silence `MonitorSelect` answers with on refusal.
+    DisplaySetMode {
+        /// Mode id as announced in the most recent `DisplayModesList`.
+        mode_id: u32,
+    },
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -664,6 +722,38 @@ pub struct MonitorInfo {
     pub height: u32,
     /// Whether this is the host's primary display.
     pub primary: bool,
+}
+
+/// One display mode of the host's currently targeted monitor, as reported in
+/// `DisplayModesList` (§11; docs/bugs/16-host-display-mode.md #2; ADR 0048).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayModeInfo {
+    /// Host-assigned id a guest passes back in `DisplaySetMode`.
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Refresh rate in Hz.
+    pub refresh_hz: u32,
+}
+
+/// Why a host announced no display modes (§18; docs/bugs/
+/// 16-host-display-mode.md #2; ADR 0048).
+///
+/// A closed set, not a free-text reason, matching
+/// [`MediaUnavailableReason`]'s shape: §15 keeps host-identifying detail off
+/// the wire, and the guest turns this into localized text of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayModeUnavailableReason {
+    /// This guest does not hold the `display_mode` grant.
+    NotGranted,
+    /// This platform cannot enumerate or change display modes at all
+    /// (Wayland, ADR 0010; macOS, out of scope this iteration).
+    PlatformUnsupported,
+    /// The platform can enumerate in principle but reported nothing for the
+    /// monitor currently targeted.
+    NoModesReported,
 }
 
 /// Input event payload: logical key plus physical scancode, never raw OS
@@ -833,6 +923,27 @@ impl MessageEnvelope {
             {
                 return Err(CoreError::Malformed);
             }
+            // `modes` and `reason` must never disagree about which state the
+            // list is in (docs/bugs/16-host-display-mode.md #2): a populated
+            // list next to an explanation for why it is empty, or an empty
+            // list with no explanation at all, is not a state a well-behaved
+            // host can produce, so a peer claiming one is malformed rather
+            // than merely unusual. The count is bounded the same way
+            // `MonitorsList` bounds its own entries, before anything
+            // downstream allocates per mode.
+            MessageKind::DisplayModesList { modes, reason } => {
+                if modes.is_empty() == reason.is_none() {
+                    return Err(CoreError::Malformed);
+                }
+                if modes.len() > MAX_DISPLAY_MODES_PER_HOST {
+                    return Err(CoreError::Malformed);
+                }
+                for mode in modes {
+                    if mode.width == 0 || mode.height == 0 || mode.refresh_hz == 0 {
+                        return Err(CoreError::Malformed);
+                    }
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -862,7 +973,8 @@ mod tests {
     use super::*;
     use crate::constants::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
+        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_DISPLAY_MODES_PER_HOST,
+        UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     fn envelope(kind: MessageKind) -> MessageEnvelope {
@@ -1020,6 +1132,15 @@ mod tests {
             "the minor-8 kinds must be appended after StreamScaleRequest"
         );
         assert_eq!(kind_byte(MessageKind::ClipboardFileAccept(false)), 40,);
+        assert_eq!(
+            kind_byte(MessageKind::DisplayModesList {
+                modes: Vec::new(),
+                reason: Some(DisplayModeUnavailableReason::NotGranted),
+            }),
+            41,
+            "the minor-9 kinds must be appended after ClipboardFileAccept"
+        );
+        assert_eq!(kind_byte(MessageKind::DisplaySetMode { mode_id: 0 }), 42,);
     }
 
     /// A receiver report is a claim, not a fact, so decoding never judges it:
@@ -1498,5 +1619,103 @@ mod tests {
                 .collect(),
         });
         assert!(MessageEnvelope::decode(&at_bounds.encode().unwrap()).is_ok());
+    }
+
+    /// docs/bugs/16-host-display-mode.md #2: a populated list and a set-mode
+    /// request round-trip like any other message.
+    #[test]
+    fn a_display_modes_list_and_a_set_mode_request_roundtrip() {
+        let cases = [
+            MessageKind::DisplayModesList {
+                modes: vec![
+                    DisplayModeInfo {
+                        id: 0,
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                    },
+                    DisplayModeInfo {
+                        id: 1,
+                        width: 2560,
+                        height: 1440,
+                        refresh_hz: 144,
+                    },
+                ],
+                reason: None,
+            },
+            MessageKind::DisplayModesList {
+                modes: Vec::new(),
+                reason: Some(DisplayModeUnavailableReason::PlatformUnsupported),
+            },
+            MessageKind::DisplayModesList {
+                modes: Vec::new(),
+                reason: Some(DisplayModeUnavailableReason::NoModesReported),
+            },
+            MessageKind::DisplaySetMode { mode_id: 3 },
+        ];
+        for kind in cases {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    /// §9.1: `modes` and `reason` must never disagree about which state the
+    /// list is in, checked on decode before anything downstream trusts an
+    /// untrusted peer's claim (docs/bugs/16-host-display-mode.md #2).
+    #[test]
+    fn a_display_modes_list_is_malformed_when_modes_and_reason_disagree() {
+        let populated_with_a_reason = envelope(MessageKind::DisplayModesList {
+            modes: vec![DisplayModeInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            }],
+            reason: Some(DisplayModeUnavailableReason::NotGranted),
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&populated_with_a_reason.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let empty_with_no_reason = envelope(MessageKind::DisplayModesList {
+            modes: Vec::new(),
+            reason: None,
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&empty_with_no_reason.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let degenerate_mode = envelope(MessageKind::DisplayModesList {
+            modes: vec![DisplayModeInfo {
+                id: 0,
+                width: 0,
+                height: 1080,
+                refresh_hz: 60,
+            }],
+            reason: None,
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&degenerate_mode.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+
+        let too_many = envelope(MessageKind::DisplayModesList {
+            modes: (0..=MAX_DISPLAY_MODES_PER_HOST)
+                .map(|i| DisplayModeInfo {
+                    id: u32::try_from(i).unwrap(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60,
+                })
+                .collect(),
+            reason: None,
+        });
+        assert!(matches!(
+            MessageEnvelope::decode(&too_many.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
     }
 }

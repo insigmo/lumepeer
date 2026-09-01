@@ -37,7 +37,7 @@ impl Role {
 /// All fields default to `false`: a fresh session grants nothing.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "§2.2 requires these six permissions to stay independent flags"
+    reason = "§2.2 requires these permissions to stay independent flags"
 )]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Grants {
@@ -53,9 +53,18 @@ pub struct Grants {
     pub file_transfer: bool,
     /// Record the session.
     pub recording: bool,
+    /// Switch the host's own physical display mode (docs/bugs/
+    /// 16-host-display-mode.md; ADR 0048).
+    ///
+    /// Independent of `view`: watching the host's screen implies nothing
+    /// about being allowed to move it. Materially riskier than the other
+    /// four — a bad mode can strand the host operator in front of a broken
+    /// screen — so it stays its own grant rather than riding along with
+    /// `FullControl` or any other role.
+    pub display_mode: bool,
 }
 
-/// One of the four grants a host may toggle on a session that is already
+/// One of the five grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -72,12 +81,16 @@ pub enum IndependentGrant {
     FileTransfer,
     /// Record the session.
     Recording,
+    /// Switch the host's own physical display mode (docs/bugs/
+    /// 16-host-display-mode.md; ADR 0048).
+    DisplayMode,
 }
 
 impl Grants {
     /// Grants implied by a role at the moment of `ConsentGrant` (§8.2).
     ///
-    /// Clipboard, file transfer and recording are never implied.
+    /// Clipboard, file transfer, recording and display mode are never
+    /// implied.
     #[must_use]
     pub const fn from_role(role: Role) -> Self {
         Self {
@@ -87,19 +100,21 @@ impl Grants {
             clipboard_write: false,
             file_transfer: false,
             recording: false,
+            display_mode: false,
         }
     }
 
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: a seventh permission must
+        // Exhaustive on purpose, with no `_` arm: a sixth permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
             IndependentGrant::ClipboardWrite => self.clipboard_write,
             IndependentGrant::FileTransfer => self.file_transfer,
             IndependentGrant::Recording => self.recording,
+            IndependentGrant::DisplayMode => self.display_mode,
         }
     }
 
@@ -110,6 +125,7 @@ impl Grants {
             IndependentGrant::ClipboardWrite => self.clipboard_write = allowed,
             IndependentGrant::FileTransfer => self.file_transfer = allowed,
             IndependentGrant::Recording => self.recording = allowed,
+            IndependentGrant::DisplayMode => self.display_mode = allowed,
         }
     }
 }
@@ -400,13 +416,30 @@ mod tests {
     }
 
     #[test]
-    fn full_control_implies_input_but_never_clipboard_files_or_recording() {
+    fn full_control_implies_input_but_never_clipboard_files_recording_or_display_mode() {
         let grants = Grants::from_role(Role::FullControl);
         assert!(grants.view && grants.input);
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
+        assert!(!grants.display_mode);
+    }
+
+    #[test]
+    fn display_mode_is_independent_of_every_other_grant() {
+        let mut grants = Grants::from_role(Role::FullControl);
+        assert!(!grants.get(IndependentGrant::DisplayMode));
+        grants.set(IndependentGrant::DisplayMode, true);
+        assert!(grants.get(IndependentGrant::DisplayMode));
+        // Nothing else moved.
+        assert!(grants.view && grants.input);
+        assert!(!grants.clipboard_read);
+        assert!(!grants.clipboard_write);
+        assert!(!grants.file_transfer);
+        assert!(!grants.recording);
+        grants.set(IndependentGrant::DisplayMode, false);
+        assert!(!grants.get(IndependentGrant::DisplayMode));
     }
 
     #[test]

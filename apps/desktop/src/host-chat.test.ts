@@ -16,6 +16,7 @@ const noGrants = {
   clipboard_write: false,
   file_transfer: false,
   recording: false,
+  display_mode: false,
   recording_active: false,
   record_request: false,
 } as const;
