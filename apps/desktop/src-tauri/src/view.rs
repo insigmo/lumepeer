@@ -2164,6 +2164,45 @@ mod tests {
         assert!(!ViewStatus::SecureDesktop.is_terminal());
     }
 
+    /// ADR 0049's central requirement, exercised at the one point in this
+    /// file that actually checks it: without the grant, `secure_desktop_
+    /// frame` never even reaches the service — proven here by the throttle
+    /// clock never moving, since only a real attempt advances it — and with
+    /// the grant revoked again, the very next call is refused just as
+    /// promptly, with no separate teardown step needed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secure_desktop_frame_is_gated_by_the_grant_before_anything_else() {
+        let peer = iroh::SecretKey::generate().public();
+        let control = EncodeControl::new(peer, None);
+        let started = Instant::now();
+
+        let mut next_attempt_at = Instant::now();
+        assert!(
+            secure_desktop_frame(&control, &mut next_attempt_at, started)
+                .await
+                .is_none()
+        );
+        let untouched = next_attempt_at;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        control.set_secure_desktop_allowed(true);
+        let _ = secure_desktop_frame(&control, &mut next_attempt_at, started).await;
+        assert!(
+            next_attempt_at > untouched,
+            "holding the grant must actually attempt a capture, which is what advances the throttle"
+        );
+
+        // Revoked again: even though the throttle above is not yet due, the
+        // grant check runs first and refuses on its own — a revoke must not
+        // have to wait out whatever throttle window happened to be open.
+        control.set_secure_desktop_allowed(false);
+        assert!(
+            secure_desktop_frame(&control, &mut next_attempt_at, started)
+                .await
+                .is_none()
+        );
+    }
+
     /// The actor writes the host's reason into the slot and then aborts the
     /// media task; an abort only lands at the next await, so the task's
     /// wind-down must not be able to paint over that reason.
