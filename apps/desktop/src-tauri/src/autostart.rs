@@ -317,10 +317,10 @@ mod platform {
         if marker.exists() {
             return;
         }
-        if !is_enabled() {
-            if let Err(error) = enable(exe) {
-                tracing::warn!(%error, "could not turn on autostart at first launch");
-            }
+        if !is_enabled()
+            && let Err(error) = enable(exe)
+        {
+            tracing::warn!(%error, "could not turn on autostart at first launch");
         }
         if let Err(error) = std::fs::write(&marker, b"") {
             tracing::warn!(%error, "could not record that first launch ran");
