@@ -14,6 +14,7 @@ pub mod framing;
 pub mod keystore;
 pub mod media;
 pub mod obfuscate;
+pub mod obfuscated_endpoint;
 pub mod reconnect;
 pub mod stun;
 pub mod ticket;

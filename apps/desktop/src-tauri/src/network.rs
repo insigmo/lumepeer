@@ -5405,7 +5405,11 @@ impl Actor {
             );
         }
         tracing::info!(addrs = ?addr.addrs, "issuing an invite");
-        let issued = InviteTicket::issue(&self.identity, &addr, role, now);
+        // The obfuscated-transport address/fingerprint are not produced by
+        // anything in this actor yet (task 17 increment 3, ADR 0053) — every
+        // ticket issued here still carries only the existing iroh address
+        // until that wiring lands.
+        let issued = InviteTicket::issue(&self.identity, &addr, role, now, None, None);
         match issued {
             Ok(ticket) => match ticket.to_code() {
                 Ok(code) => {

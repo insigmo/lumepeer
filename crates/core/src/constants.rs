@@ -214,6 +214,28 @@ pub const QUIC_KEEPALIVE_SECS: u64 = 15;
 /// than twice [`QUIC_KEEPALIVE_SECS`] so a single lost keep-alive never trips
 /// it, but bounded so a truly dead path is eventually released.
 pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Interval on which a host holding an obfuscated-transport invite open
+/// resends a STUN request, to keep its NAT mapping from expiring before a
+/// guest dials in (task 17 increment 2, ADR 0053).
+///
+/// This is what stands in for a synchronized "simultaneous punch": an
+/// endpoint-independent NAT mapping, once opened by the host's own STUN
+/// query, accepts inbound from any source for as long as it stays alive, so
+/// holding it open with a resend on this interval is enough — no channel to
+/// coordinate timing with the guest exists or is needed. Comfortably under a
+/// typical NAT UDP-binding timeout (commonly 30-120 s) so the mapping never
+/// lapses between two resends.
+pub const NAT_MAPPING_KEEPALIVE_SECS: u64 = 25;
+/// Dial attempts a guest makes over the obfuscated transport before giving up
+/// (task 17 increment 2, ADR 0053).
+///
+/// Kept separate from [`DIAL_ATTEMPTS`] (ADR 0050): that budget was tuned for
+/// iroh relay-flap resonance, a different failure mode than a punch to a
+/// freshly learned reflexive address on this transport.
+pub const OBFUSCATED_CONNECT_ATTEMPTS: u32 = 5;
+/// Backoff between obfuscated-transport dial attempts, milliseconds (task 17
+/// increment 2, ADR 0053). See [`OBFUSCATED_CONNECT_ATTEMPTS`].
+pub const OBFUSCATED_CONNECT_RETRY_BACKOFF_MS: u64 = 500;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).

@@ -29,6 +29,12 @@ data-encoding.workspace = true
 chacha20poly1305.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Self-signed cert generation for the obfuscated transport's host endpoint
+# (task 17 increment 2, ADR 0053) — promoted from dev-only (where increment 1
+# used it only inside its own test) since `obfuscated_endpoint::bind_host` now
+# generates one for real. Same version noq's own tests pin, so the
+# `rustls-pki-types` types each side produces resolve to one crate.
+rcgen = "0.14"
 # Audio stream payload types (§11). The net crate never links a codec: this is
 # the plain `AudioChunk` struct and the constants, which build without any
 # feature.
@@ -37,12 +43,9 @@ lumepeer-media.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
-# Self-signed certs for the obfuscated-QUIC endpoint test (task 17 increment 1,
-# ADR 0052), same version `noq`'s own tests pin so the `rustls-pki-types` types
-# each side produces resolve to one crate.
-rcgen = "0.14"
-# Only for the `wan_probe` example, which needs iroh's own logs to explain a
-# failed relay connection.
+# Only for the `wan_probe`/`obfuscated_wan_probe` examples, which need iroh's
+# own logs (and, for the latter, this crate's own tracing) to explain a
+# failed connection.
 tracing-subscriber.workspace = true
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]

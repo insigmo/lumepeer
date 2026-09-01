@@ -133,7 +133,7 @@ async fn host() -> Result<(), String> {
             "the endpoint has no address at all; any invite would be undialable".to_owned(),
         );
     }
-    let ticket = InviteTicket::issue(&identity, &addr, Role::ViewOnly, unix_now())
+    let ticket = InviteTicket::issue(&identity, &addr, Role::ViewOnly, unix_now(), None, None)
         .map_err(|e| e.to_string())?;
     println!("TICKET addrs={:?}", addr.addrs);
     println!("INVITE {}", ticket.to_code().map_err(|e| e.to_string())?);
