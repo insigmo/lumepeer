@@ -17,11 +17,16 @@ import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 export type SessionState = 'pending' | 'active';
 
 /**
- * The four permissions of §8.2 the host can move on a session that is already
+ * The five permissions of §8.2 the host can move on a session that is already
  * running. `view` and `input` are absent on purpose: they follow the role, and
  * this window has no way to reach them.
  */
-export type IndependentGrant = 'clipboard_read' | 'clipboard_write' | 'file_transfer' | 'recording';
+export type IndependentGrant =
+  | 'clipboard_read'
+  | 'clipboard_write'
+  | 'file_transfer'
+  | 'recording'
+  | 'secure_desktop';
 
 export interface SessionStatus {
   peer_label: string;
@@ -41,6 +46,19 @@ export interface SessionStatus {
   recording_active: boolean;
   /** Whether this guest asked to be recorded and is still waiting (§17). */
   record_request: boolean;
+  /**
+   * Whether this guest may see the host's secure desktop (UAC prompt, lock
+   * screen, fast user switch) instead of the honest "can't see this" message
+   * (ADR 0046). Independent of every other grant and off by default.
+   */
+  secure_desktop: boolean;
+  /**
+   * Whether this guest is, right now, actually seeing it. Not the same as
+   * `secure_desktop`, which is only permission — the host's non-removable
+   * indicator hangs off this one, the same way the recording dot hangs off
+   * `recording_active` rather than `recording`.
+   */
+  secure_desktop_active: boolean;
 }
 
 /**
@@ -108,13 +126,15 @@ const GRANT_ROWS: readonly {
     | 'status.grants.clipboardRead'
     | 'status.grants.clipboardWrite'
     | 'status.grants.fileTransfer'
-    | 'status.grants.recording';
+    | 'status.grants.recording'
+    | 'status.grants.secureDesktop';
   held: (session: SessionStatus) => boolean;
 }[] = [
   { grant: 'clipboard_read', key: 'status.grants.clipboardRead', held: (s) => s.clipboard_read },
   { grant: 'clipboard_write', key: 'status.grants.clipboardWrite', held: (s) => s.clipboard_write },
   { grant: 'file_transfer', key: 'status.grants.fileTransfer', held: (s) => s.file_transfer },
   { grant: 'recording', key: 'status.grants.recording', held: (s) => s.recording },
+  { grant: 'secure_desktop', key: 'status.grants.secureDesktop', held: (s) => s.secure_desktop },
 ];
 
 /**
@@ -242,6 +262,25 @@ function recordingRow(
         `
       : ''}
   `;
+}
+
+/**
+ * The secure-desktop indicator (ADR 0046, §17-equivalent).
+ *
+ * No settings switch hides this: while a guest is actually seeing the
+ * secure desktop, the host sees that it is happening, exactly as the
+ * recording indicator above cannot be turned off while a recording runs.
+ * There is no start/stop button here — unlike recording, showing the
+ * secure desktop is not something the host presses a button for; it
+ * happens on its own, on a session that already holds the grant, whenever
+ * capture on that host gets stuck behind one.
+ */
+function secureDesktopIndicator(session: SessionStatus, locale: Locale): TemplateResult | '' {
+  return session.secure_desktop_active
+    ? html`<span class="secure-desktop-indicator" role="status" data-testid="secure-desktop-indicator">
+        <span class="secure-desktop-dot" aria-hidden="true"></span>${t(locale, 'status.secureDesktop.active')}
+      </span>`
+    : '';
 }
 
 const MINUTE_SECS = 60;
@@ -403,6 +442,7 @@ export function sessionStatus(
                         onRecordingPath,
                       )
                     : ''}
+                  ${session.state === 'active' ? secureDesktopIndicator(session, locale) : ''}
                   ${session.state === 'active' && session.file_transfer
                     ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
                     : ''}

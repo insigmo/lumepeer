@@ -22,7 +22,7 @@ import { statusPill } from './status-pill';
 import { unattendedIndicator, unattendedSettings, type UnattendedStatus } from './unattended-settings';
 import { titleBar } from './title-bar';
 
-// A session the host has granted nothing beyond its role: the four
+// A session the host has granted nothing beyond its role: the five
 // independent grants of §8.2 all start off.
 const noGrants = {
   clipboard_read: false,
@@ -31,6 +31,8 @@ const noGrants = {
   recording: false,
   recording_active: false,
   record_request: false,
+  secure_desktop: false,
+  secure_desktop_active: false,
 } as const;
 
 vi.mock('@tauri-apps/api/core', () => ({
