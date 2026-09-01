@@ -294,3 +294,43 @@ jobs:
           fi
           gh release upload beta beta.json --clobber
           echo "beta channel now points at ${TAG}"
+
+  # tauri-action leaves the release body as GitHub's default auto-generated
+  # notes. This appends a downloads table (mirrors sarca's release.yml) once
+  # every matrix row has uploaded its assets, so the release page links
+  # straight to the installer for each platform instead of making people
+  # scroll the raw asset list.
+  release-notes:
+    needs: [guard, version, build]
+    if: needs.guard.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Append downloads table to release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          NOTES_FILE="$(mktemp)"
+          gh release view "${TAG}" --json body -q '.body' > "${NOTES_FILE}"
+
+          {
+            echo ""
+            echo "Multi-platform binaries for \`${TAG}\`."
+            echo ""
+            echo "## Downloads"
+            echo ""
+            echo "| File | Description |"
+            echo "| --- | --- |"
+            echo "| [Lumepeer_${VERSION}_amd64.deb](${BASE_URL}/Lumepeer_${VERSION}_amd64.deb) | Linux x86_64 (.deb) |"
+            echo "| [Lumepeer_${VERSION}_arm64.deb](${BASE_URL}/Lumepeer_${VERSION}_arm64.deb) | Linux aarch64 (.deb) |"
+            echo "| [Lumepeer_${VERSION}_x64.dmg](${BASE_URL}/Lumepeer_${VERSION}_x64.dmg) | macOS Intel (.dmg) |"
+            echo "| [Lumepeer_${VERSION}_aarch64.dmg](${BASE_URL}/Lumepeer_${VERSION}_aarch64.dmg) | macOS Apple Silicon (.dmg) |"
+            echo "| [Lumepeer_${VERSION}_x64-setup.exe](${BASE_URL}/Lumepeer_${VERSION}_x64-setup.exe) | Windows x86_64 (installer) |"
+            echo "| [Lumepeer_${VERSION}_arm64-setup.exe](${BASE_URL}/Lumepeer_${VERSION}_arm64-setup.exe) | Windows ARM64 (installer) |"
+          } >> "${NOTES_FILE}"
+
+          gh release edit "${TAG}" --notes-file "${NOTES_FILE}"
