@@ -359,7 +359,12 @@ mod platform {
             >,
         > = urls
             .iter()
-            .map(|url| objc2::runtime::ProtocolObject::from_ref(&**url).into())
+            .map(|url| {
+                objc2::runtime::ProtocolObject::<dyn objc2_app_kit::NSPasteboardWriting>::from_ref(
+                    &**url,
+                )
+                .into()
+            })
             .collect();
         let array = NSArray::from_retained_slice(&objects);
         if pasteboard.writeObjects(&array) {
