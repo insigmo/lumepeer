@@ -46,6 +46,8 @@ function fakeCommands(): ToolbarCommands & {
   clipboardPull: ReturnType<typeof vi.fn>;
   fileOffer: ReturnType<typeof vi.fn>;
   viewSetScale: ReturnType<typeof vi.fn>;
+  hostDisplayModes: ReturnType<typeof vi.fn>;
+  hostDisplaySetMode: ReturnType<typeof vi.fn>;
 } {
   const commands = {
     micToggle: vi.fn().mockResolvedValue(undefined),
@@ -57,6 +59,8 @@ function fakeCommands(): ToolbarCommands & {
     monitorsList: vi.fn().mockResolvedValue(MONITORS),
     monitorSelect: vi.fn().mockResolvedValue(undefined),
     viewSetScale: vi.fn().mockResolvedValue(undefined),
+    hostDisplayModes: vi.fn().mockResolvedValue({ modes: [], reason: null }),
+    hostDisplaySetMode: vi.fn().mockResolvedValue(undefined),
   };
   return commands;
 }
@@ -140,6 +144,7 @@ function draw(
       state.resolution = option;
       draw(state, commands, hooks);
     },
+    pickHostDisplayMode: () => {},
     beginDrag: () => {},
     nudge: () => {},
   });
@@ -499,6 +504,94 @@ describe('the floating session toolbar', () => {
       }
       await vi.waitFor(() =>
         expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 75),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it('the host-resolution warning note is always shown next to the picture-resolution select (docs/bugs/16-host-display-mode.md #4)', () => {
+    const state = {
+      collapsed: false,
+      openPopover: 'settings' as const,
+    } as Parameters<typeof renderToolbar>[1];
+    draw(state);
+    const warning = container.querySelector('[data-testid="toolbar-host-resolution-warning"]');
+    expect(warning?.textContent).toContain('host computer itself');
+  });
+
+  it('an empty host-display-modes list shows the reason rather than a blank select (docs/bugs/16-host-display-mode.md #4)', () => {
+    for (const [reason, expected] of [
+      ['not_granted', 'has not allowed'],
+      ['platform_unsupported', 'cannot change'],
+      ['no_modes_reported', 'no available resolutions'],
+    ] as const) {
+      const scoped = document.createElement('div');
+      document.body.appendChild(scoped);
+      try {
+        const state = {
+          collapsed: false,
+          openPopover: 'settings' as const,
+          hostDisplayModes: { modes: [], reason },
+        } as unknown as Parameters<typeof renderToolbar>[1];
+        renderToolbar(scoped, state, 'en', fakeHooks(), {
+          toggleCollapsed: () => {},
+          openPopover: () => {},
+          setDisplayMode: () => {},
+          toggleFullscreen: () => {},
+          toggleLocalCursor: () => {},
+          toggleMic: () => {},
+          sendCad: () => {},
+          askToRecord: () => {},
+          sendFile: () => {},
+          pickMonitor: () => {},
+          pickResolution: () => {},
+          pickHostDisplayMode: () => {},
+          beginDrag: () => {},
+          nudge: () => {},
+        });
+        expect(scoped.querySelector('[data-testid="toolbar-host-resolution"]')).toBeNull();
+        const empty = scoped.querySelector('[data-testid="toolbar-host-resolution-empty"]');
+        expect(empty?.textContent).toContain(expected);
+      } finally {
+        scoped.remove();
+      }
+    }
+  });
+
+  it('picking a host display mode asks the host to switch its own physical monitor (docs/bugs/16-host-display-mode.md #4)', async () => {
+    const commands = fakeCommands();
+    commands.hostDisplayModes.mockResolvedValue({
+      modes: [
+        { id: 0, width: 1920, height: 1080, refresh_hz: 60 },
+        { id: 1, width: 2560, height: 1440, refresh_hz: 144 },
+      ],
+      reason: null,
+    });
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() =>
+        expect(
+          container.querySelectorAll('[data-testid="toolbar-host-resolution"] option').length,
+        ).toBe(2),
+      );
+      const select = container.querySelector<HTMLSelectElement>(
+        '[data-testid="toolbar-host-resolution"]',
+      );
+      expect(select).not.toBeNull();
+      if (select) {
+        select.value = '1';
+        select.dispatchEvent(new Event('change'));
+      }
+      await vi.waitFor(() =>
+        expect(commands.hostDisplaySetMode).toHaveBeenCalledWith('host-ab12', 1),
       );
     } finally {
       stop();
