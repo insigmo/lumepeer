@@ -27,11 +27,14 @@ pub enum ServiceState {
     /// panel offers nothing rather than a button that cannot work.
     Unsupported,
     /// Not registered with the service control manager.
+    #[cfg(target_os = "windows")]
     NotInstalled,
     /// Registered, but not answering. Ctrl+Alt+Del falls back to needing an
     /// elevated client.
+    #[cfg(target_os = "windows")]
     Stopped,
     /// Registered and answering on its endpoint.
+    #[cfg(target_os = "windows")]
     Running,
 }
 
