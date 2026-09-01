@@ -783,11 +783,12 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 4] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 5] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
         IndependentGrant::Recording,
+        IndependentGrant::DisplayMode,
     ];
 
     #[test]
@@ -806,7 +807,7 @@ mod tests {
                 }
             );
             assert!(manager.grants(&peer(1)).unwrap().get(which));
-            // One grant moving leaves the other three where they were.
+            // One grant moving leaves the other four where they were.
             for other in ALL_INDEPENDENT.into_iter().filter(|o| *o != which) {
                 assert!(!manager.grants(&peer(1)).unwrap().get(other));
             }
@@ -889,7 +890,7 @@ mod tests {
     proptest! {
         /// No sequence of `set_grant` can reach `view` or `input`: those two
         /// follow the role, and this is the property the split of §8.2 into a
-        /// role plus four independent grants exists to hold.
+        /// role plus independent grants exists to hold.
         #[test]
         fn set_grant_never_moves_view_or_input(
             role_index in 0usize..3,

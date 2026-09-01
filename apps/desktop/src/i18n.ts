@@ -42,6 +42,7 @@ export type TranslationKey =
   | 'status.grants.clipboardWrite'
   | 'status.grants.fileTransfer'
   | 'status.grants.recording'
+  | 'status.grants.displayMode'
   | 'status.recording.start'
   | 'status.recording.stop'
   | 'status.recording.on'
@@ -324,6 +325,7 @@ const en: Dictionary = {
   'status.grants.clipboardWrite': 'Change my clipboard',
   'status.grants.fileTransfer': 'Send and receive files',
   'status.grants.recording': 'Let this session be recorded',
+  'status.grants.displayMode': "Change this computer's screen resolution",
   // The switch above is permission; these are the act. Both sides see an
   // indicator for as long as a recording runs — §2.2 has no quiet capture.
   'status.recording.start': 'Record session',
@@ -619,6 +621,7 @@ const ar: Dictionary = {
   'status.grants.clipboardWrite': 'تغيير الحافظة الخاصة بي',
   'status.grants.fileTransfer': 'إرسال الملفات واستقبالها',
   'status.grants.recording': 'السماح بتسجيل هذه الجلسة',
+  'status.grants.displayMode': 'تغيير دقة شاشة هذا الجهاز',
   'status.recording.start': 'تسجيل الجلسة',
   'status.recording.stop': 'إيقاف التسجيل',
   'status.recording.on': 'جارٍ التسجيل',

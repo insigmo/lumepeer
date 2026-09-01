@@ -309,6 +309,9 @@ pub struct SessionStatusDto {
     pub file_transfer: bool,
     /// Whether this session may be recorded (§8.2).
     pub recording: bool,
+    /// Whether the guest may switch this host's own physical display mode
+    /// (§8.2; docs/bugs/16-host-display-mode.md; ADR 0048).
+    pub display_mode: bool,
     /// Whether a recording of this session is being written right now (§17).
     ///
     /// Distinct from `recording` above, which is only permission: the
@@ -625,6 +628,7 @@ pub async fn session_status(
             clipboard_write: s.grants.clipboard_write,
             file_transfer: s.grants.file_transfer,
             recording: s.grants.recording,
+            display_mode: s.grants.display_mode,
             recording_active: s.recording_active,
             record_request: s.record_request,
         })
@@ -636,7 +640,7 @@ pub async fn session_status(
 pub struct SessionSetGrantArgs {
     /// Pseudonymized label of the guest whose session is changing.
     pub peer: String,
-    /// Which of the four independent grants moves (§8.2).
+    /// Which independent grant moves (§8.2).
     pub grant: IndependentGrant,
     /// Its new state.
     pub allowed: bool,
@@ -1836,6 +1840,118 @@ pub async fn monitors_list(
             primary: monitor.primary,
         })
         .collect())
+}
+
+/// DTO of one display mode the watched host's own physical monitor supports
+/// (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDisplayModeDto {
+    /// Host-assigned id a `host_display_set_mode` call passes back.
+    pub id: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Refresh rate in Hz.
+    pub refresh_hz: u32,
+}
+
+/// Why the watched host announced no display modes (docs/bugs/
+/// 16-host-display-mode.md #2; ADR 0048), for the toolbar to explain rather
+/// than showing an empty select.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostDisplayModeUnavailableReasonDto {
+    /// This session does not hold the `display_mode` grant.
+    NotGranted,
+    /// The host's platform cannot enumerate or change display modes at all.
+    PlatformUnsupported,
+    /// The host's platform can enumerate but reported nothing for its
+    /// currently targeted monitor.
+    NoModesReported,
+}
+
+impl From<lumepeer_core::protocol::DisplayModeUnavailableReason>
+    for HostDisplayModeUnavailableReasonDto
+{
+    fn from(reason: lumepeer_core::protocol::DisplayModeUnavailableReason) -> Self {
+        match reason {
+            lumepeer_core::protocol::DisplayModeUnavailableReason::NotGranted => Self::NotGranted,
+            lumepeer_core::protocol::DisplayModeUnavailableReason::PlatformUnsupported => {
+                Self::PlatformUnsupported
+            }
+            lumepeer_core::protocol::DisplayModeUnavailableReason::NoModesReported => {
+                Self::NoModesReported
+            }
+        }
+    }
+}
+
+/// What `host_display_modes` hands back: the list, empty exactly when
+/// `reason` explains why (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostDisplayModesDto {
+    pub modes: Vec<HostDisplayModeDto>,
+    pub reason: Option<HostDisplayModeUnavailableReasonDto>,
+}
+
+/// Guest side: the watched host's own physical display modes, as it last
+/// announced them (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+///
+/// # Errors
+/// [`IpcError`] when unallowed or the actor refuses.
+#[tauri::command]
+pub async fn host_display_modes(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<HostDisplayModesDto, IpcError> {
+    check_view_window(&window, &peer)?;
+    let (modes, reason) = state.network.host_display_modes(peer).await?;
+    Ok(HostDisplayModesDto {
+        modes: modes
+            .into_iter()
+            .map(|mode| HostDisplayModeDto {
+                id: mode.id,
+                width: mode.width,
+                height: mode.height,
+                refresh_hz: mode.refresh_hz,
+            })
+            .collect(),
+        reason: reason.map(HostDisplayModeUnavailableReasonDto::from),
+    })
+}
+
+/// Argument of [`host_display_set_mode`].
+#[derive(Debug, Deserialize)]
+pub struct HostDisplaySetModeArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Mode id as announced by `host_display_modes`.
+    pub mode_id: u32,
+}
+
+/// Guest side: asks the watched host to switch its own physical monitor to
+/// `mode_id` (docs/bugs/16-host-display-mode.md #2; ADR 0048).
+///
+/// The host re-checks the independent `display_mode` grant and the id's
+/// validity; this call only says whether the request could be sent at all.
+///
+/// # Errors
+/// [`IpcError`] when unallowed, the host announced no such id, or the host
+/// never confirmed it understands the message.
+#[tauri::command]
+pub async fn host_display_set_mode(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HostDisplaySetModeArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .host_display_set_mode(args.peer, args.mode_id)
+        .await?;
+    Ok(())
 }
 
 /// One recording this device has written, as the host's own screen sees it

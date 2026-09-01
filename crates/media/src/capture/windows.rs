@@ -84,9 +84,10 @@ mod dxgi {
         IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     };
     use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW,
-        CreateDIBSection, DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-        ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW, SRCCOPY, SelectObject,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CDS_TYPE, ChangeDisplaySettingsExW,
+        CreateCompatibleDC, CreateDCW, CreateDIBSection, DEVMODEW, DIB_RGB_COLORS,
+        DISP_CHANGE_SUCCESSFUL, DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH, DeleteDC,
+        DeleteObject, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW, SRCCOPY, SelectObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
@@ -1299,6 +1300,53 @@ mod dxgi {
             modes.retain(|mode| mode.refresh_hz > 1);
             crate::capture::dedupe_and_sort_display_modes(modes)
         }
+
+        /// Switches `target`'s monitor to `mode` via `ChangeDisplaySettingsExW`
+        /// (docs/bugs/16-host-display-mode.md #2).
+        ///
+        /// Deliberately **not** `CDS_UPDATEREGISTRY`: this is a change for the
+        /// current session only, so a crash or a hard power loss between this
+        /// call and the caller's own restore leaves nothing behind for the
+        /// registry to remember — a reboot alone recovers the monitor's
+        /// configured mode (ADR 0048). The two-step `CDS_TEST` dry run task 3
+        /// adds wraps this same call rather than replacing it.
+        fn apply_display_mode(
+            target: CaptureTarget,
+            mode: crate::capture::DisplayMode,
+        ) -> Result<()> {
+            let monitors = attached_monitors()?;
+            let monitor = select(monitors, target)?;
+
+            let devmode = DEVMODEW {
+                dmSize: u16::try_from(std::mem::size_of::<DEVMODEW>()).unwrap_or(0),
+                dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+                dmPelsWidth: mode.width,
+                dmPelsHeight: mode.height,
+                dmDisplayFrequency: mode.refresh_hz,
+                ..Default::default()
+            };
+            // SAFETY: `devmode` is a plain, fully initialized DEVMODEW with
+            // `dmSize`/`dmFields` set as the API requires; `DeviceName` comes
+            // from a DXGI output description this process already owns, and
+            // `ChangeDisplaySettingsExW` only reads both.
+            let result = unsafe {
+                ChangeDisplaySettingsExW(
+                    PCWSTR(monitor.desc.DeviceName.as_ptr()),
+                    Some(&raw const devmode),
+                    None,
+                    CDS_TYPE(0),
+                    None,
+                )
+            };
+            if result == DISP_CHANGE_SUCCESSFUL {
+                Ok(())
+            } else {
+                Err(MediaError::CaptureUnavailable(format!(
+                    "ChangeDisplaySettingsExW refused {}x{}@{}Hz: {result:?}",
+                    mode.width, mode.height, mode.refresh_hz
+                )))
+            }
+        }
     }
 
     impl ScreenCapturer for WindowsCapturer {
@@ -1426,6 +1474,14 @@ mod dxgi {
 
         fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
             Self::display_modes_for(target)
+        }
+
+        fn set_display_mode(
+            &mut self,
+            target: CaptureTarget,
+            mode: crate::capture::DisplayMode,
+        ) -> Result<()> {
+            Self::apply_display_mode(target, mode)
         }
     }
 
@@ -2043,6 +2099,33 @@ mod dxgi {
             }
             let primary = select(monitors, CaptureTarget::PrimaryDisplay).unwrap();
             assert!(primary.is_primary());
+        }
+
+        /// Read-only: enumerates the primary monitor's real modes and checks
+        /// the shape of the answer, without ever calling
+        /// `apply_display_mode` — actually switching this machine's own
+        /// display is not something an automated test suite should do
+        /// (docs/bugs/16-host-display-mode.md #1).
+        #[test]
+        fn the_primary_displays_modes_include_its_current_resolution() {
+            let modes = WindowsCapturer::display_modes_for(CaptureTarget::PrimaryDisplay);
+            if modes.is_empty() {
+                eprintln!("skipping: DXGI is unreachable or reported no modes on this machine");
+                return;
+            }
+            for mode in &modes {
+                assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 1);
+            }
+            // Deduplicated and sorted, per docs/bugs/16-host-display-mode.md
+            // #1 task 3: no duplicate triples, and ascending order.
+            let mut sorted = modes.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted, modes);
+            assert!(
+                modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
+                "the list was not capped"
+            );
         }
 
         /// The real thing: a live desktop must produce a real, tightly packed

@@ -471,6 +471,69 @@ async fn a_stream_scale_request_at_its_range_bounds_is_ordinary_traffic() {
     }
 }
 
+/// §9.1, docs/bugs/16-host-display-mode.md #2: `modes` and `reason` must
+/// never disagree about which state the list is in — a populated list next
+/// to an explanation for why it is empty is not a state a well-behaved host
+/// can produce, so a peer claiming one is refused on a live connection, the
+/// same shape the file-transfer and clipboard-file bound checks use.
+///
+/// The message is host to guest in real use, but the check lives in
+/// `MessageEnvelope::decode` and runs identically regardless of which side
+/// calls `send`; the harness below reuses the same handshake helpers every
+/// other test in this file does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_display_modes_list_with_contradictory_fields_is_refused_on_a_live_connection() {
+    use lumepeer_core::protocol::{DisplayModeInfo, DisplayModeUnavailableReason};
+
+    for kind in [
+        MessageKind::DisplayModesList {
+            modes: vec![DisplayModeInfo {
+                id: 0,
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            }],
+            reason: Some(DisplayModeUnavailableReason::NotGranted),
+        },
+        MessageKind::DisplayModesList {
+            modes: Vec::new(),
+            reason: None,
+        },
+    ] {
+        let (host, guest) = host_and_guest().await;
+        let addr = host.addr();
+
+        let host_side = tokio::spawn({
+            let host = host.clone();
+            async move {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (mut control, _) = host_handshake(connection).await.unwrap();
+                control.recv().await
+            }
+        });
+
+        let connection = guest.connect_control(addr).await.unwrap();
+        let mut control = guest_handshake(connection, Role::ViewOnly, Vec::new(), Vec::new())
+            .await
+            .unwrap();
+        control.send(kind).await.unwrap();
+
+        let refused = tokio::time::timeout(TIMEOUT, host_side)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(refused, NetError::Framing(CoreError::Malformed)),
+            "a contradictory display modes list was accepted: {refused:?}"
+        );
+
+        control.connection().close(0u32.into(), b"done");
+        guest.close().await;
+        host.close().await;
+    }
+}
+
 /// §11: a cursor whose geometry contradicts its own pixel buffer is refused
 /// while decoding, and no truncation of a valid one gets through either.
 ///
