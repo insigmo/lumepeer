@@ -283,6 +283,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::autostart_set,
         commands::service_status,
         commands::service_set,
+        commands::host_bar_expand,
+        commands::host_bar_focus_main,
     ]
 }
 
@@ -393,7 +395,15 @@ fn main() {
             // serving remote sessions from the tray until "Quit" is chosen.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                // The session bar is the exception: it is the host's "somebody
+                // is connected, and here is the stop button" surface, and it
+                // goes away when the last session ends and not before
+                // (ADR 0055). Hiding it on an Alt+F4 would leave a live but
+                // invisible window and no indicator at all, which is the gap
+                // it exists to close.
+                if window.label() != crate::view::HOST_BAR_LABEL {
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(invoke_handler())

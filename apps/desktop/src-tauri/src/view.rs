@@ -114,9 +114,11 @@ impl EncodeControl {
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
             manual_cap: Arc::new(Mutex::new(None)),
-            // `Grants::from_role` never sets `secure_desktop` (ADR 0049), so
-            // every session starts here without needing to ask the core what
-            // it already knows the answer is.
+            // Deny until told otherwise: the actor seeds this from the
+            // session's live `secure_desktop` grant the moment it accepts the
+            // media connection, and moves it again on every `on_set_grant`
+            // (ADR 0049). A control that were to start permissive would be a
+            // window in which the core has not been consulted at all.
             secure_desktop_allowed: Arc::new(AtomicBool::new(false)),
             secure_desktop_active: Arc::new(AtomicBool::new(false)),
         }
@@ -656,6 +658,15 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     fn open(&self, label: &str, peer_label: &str, input: bool);
     /// Closes the view window `label`, if it is open.
     fn close(&self, label: &str);
+    /// Host side: puts the always-on-top session bar up, or takes it down.
+    ///
+    /// Idempotent, and called on every actor turn whose active-session count
+    /// changed. The bar is the host's own controls — who is connected, and
+    /// the revoke — kept reachable while the main window is minimized or
+    /// away in the tray; §2.2's "the person at this machine can see what is
+    /// happening" stops being true the moment the only surface that says so
+    /// is behind a taskbar button.
+    fn set_host_bar(&self, visible: bool);
 }
 
 /// [`ViewWindows`] that does nothing, for driving the actor without a webview.
@@ -674,12 +685,29 @@ impl ViewWindows for DetachedViewWindows {
     }
 
     fn close(&self, _label: &str) {}
+
+    fn set_host_bar(&self, visible: bool) {
+        tracing::debug!(visible, "no webview attached: not moving the host bar");
+    }
 }
 
 /// Default width of a freshly opened view window.
 const VIEW_WINDOW_WIDTH: f64 = 1280.0;
 /// Default height of a freshly opened view window.
 const VIEW_WINDOW_HEIGHT: f64 = 720.0;
+
+/// Label of the host's always-on-top session bar.
+pub const HOST_BAR_LABEL: &str = "hostbar";
+
+/// Logical width of the session bar while it is open.
+pub const HOST_BAR_WIDTH: f64 = 262.0;
+/// Logical height of the session bar while it is open.
+pub const HOST_BAR_HEIGHT: f64 = 188.0;
+/// Logical width of the collapsed edge tab — just the chevron that brings the
+/// bar back.
+pub const HOST_BAR_TAB_WIDTH: f64 = 20.0;
+/// Logical height of the collapsed edge tab.
+pub const HOST_BAR_TAB_HEIGHT: f64 = 58.0;
 
 /// [`ViewWindows`] backed by the real Tauri application.
 #[derive(Debug)]
@@ -740,6 +768,85 @@ impl ViewWindows for TauriViewWindows {
         if let Err(error) = queued {
             tracing::warn!(%error, "cannot reach the main thread to close a view window");
         }
+    }
+
+    fn set_host_bar(&self, visible: bool) {
+        let app = self.app.clone();
+        // Same reason the view windows queue: a window is created and
+        // destroyed on the platform's main thread, and the actor is on a
+        // tokio worker.
+        let queued = self.app.run_on_main_thread(move || {
+            use tauri::Manager as _;
+
+            let existing = app.get_webview_window(HOST_BAR_LABEL);
+            match (visible, existing) {
+                (false, None) => {}
+                // A bar that is already up stays as it is, except for one
+                // case: anything that hid it rather than closing it leaves a
+                // live window nobody can see, and the next session would find
+                // it here and do nothing. `show` on a visible window is a
+                // no-op, so this costs nothing in the ordinary case.
+                (true, Some(bar)) => {
+                    let _ = bar.show();
+                }
+                // `destroy`, not `close`: the application-wide close handler
+                // in `main.rs` turns a close request into a hide, which is
+                // right for the main window and would leave this one alive
+                // and invisible.
+                (false, Some(bar)) => {
+                    if let Err(error) = bar.destroy() {
+                        tracing::warn!(%error, "cannot take the host bar down");
+                    }
+                }
+                (true, None) => open_host_bar(&app),
+            }
+        });
+        if let Err(error) = queued {
+            tracing::warn!(%error, "cannot reach the main thread to move the host bar");
+        }
+    }
+}
+
+/// Builds the session bar, docked to the right edge of the primary screen.
+///
+/// Undecorated, out of the taskbar and above everything else, because the
+/// whole point is to survive the main window being minimized. It deliberately
+/// does not take focus: it appears while the host is working in another
+/// application, and stealing the keyboard at that moment would be worse than
+/// the problem it solves.
+fn open_host_bar(app: &tauri::AppHandle) {
+    // Docked to the right edge of the primary screen, halfway down, which is
+    // where its collapsed tab lives. A monitor that cannot be read is not a
+    // reason to skip the bar: Tauri centres what it cannot place, and a bar
+    // in the middle of the screen is still a bar the host can drag.
+    let placement = app.primary_monitor().ok().flatten().map(|monitor| {
+        let scale = monitor.scale_factor();
+        let size = monitor.size().to_logical::<f64>(scale);
+        let origin = monitor.position().to_logical::<f64>(scale);
+        (
+            origin.x + size.width - HOST_BAR_WIDTH,
+            origin.y + (size.height - HOST_BAR_HEIGHT) / 2.0,
+        )
+    });
+
+    let mut builder = tauri::WebviewWindowBuilder::new(
+        app,
+        HOST_BAR_LABEL,
+        tauri::WebviewUrl::App("hostbar.html".into()),
+    )
+    .title("Lumepeer")
+    .inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT)
+    .decorations(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false);
+    if let Some((x, y)) = placement {
+        builder = builder.position(x, y);
+    }
+    match builder.build() {
+        Ok(_) => tracing::info!("host session bar opened"),
+        Err(error) => tracing::warn!(%error, "cannot open the host session bar"),
     }
 }
 

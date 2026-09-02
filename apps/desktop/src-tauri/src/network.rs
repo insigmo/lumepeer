@@ -2665,8 +2665,13 @@ struct Actor {
     /// another application, and one wedged application must not be able to
     /// delay a revoke (ADR 0027).
     clipboard_changes: mpsc::Receiver<String>,
-    /// How view windows are created and closed.
+    /// How view windows are created and closed, and how the host's
+    /// always-on-top session bar goes up and down.
     windows: Arc<dyn ViewWindows>,
+    /// Whether the session bar is up right now, so `reconcile_host_bar` can
+    /// tell a change from the steady state and stay silent on every turn that
+    /// did not move a session.
+    host_bar_up: bool,
     /// Guest side: hosts this node has connected to before (§21 punch-list
     /// item 5). Nothing is recorded on the host side — see
     /// `connection_history`'s module docs.
@@ -2866,6 +2871,34 @@ impl Actor {
                 }
                 _ = ping.tick() => self.send_pings(),
             }
+            // One place, after every turn, rather than at each of the half
+            // dozen paths that start or end a session: a consent, a revoke, a
+            // disconnect and a session that simply timed out all have to move
+            // the bar, and a path that forgot to would leave the host looking
+            // at a bar for a guest who left.
+            self.reconcile_host_bar();
+        }
+        // Nothing is being served any more, so nothing is left to show.
+        self.windows.set_host_bar(false);
+    }
+
+    /// Puts the host's session bar up while at least one guest is connected,
+    /// and takes it down when the last one leaves.
+    ///
+    /// Counted the same way `session_status` counts, so the bar is up exactly
+    /// when the connections list would have a row in it. A session inside its
+    /// reconnect window is deliberately not `Active` and does not hold the
+    /// bar up: a bar that stayed after the guest's link dropped would be
+    /// claiming someone is watching when nobody is.
+    fn reconcile_host_bar(&mut self) {
+        let connected = self
+            .sessions
+            .active()
+            .into_iter()
+            .any(|(peer, _, _)| self.sessions.state(&peer) == SessionState::Active);
+        if connected != self.host_bar_up {
+            self.host_bar_up = connected;
+            self.windows.set_host_bar(connected);
         }
     }
 
@@ -3576,6 +3609,16 @@ impl Actor {
             .contains(&peer)
             .then(|| self.cursors_tx.clone());
         let control = EncodeControl::new(peer, cursors);
+        // The loop's own copy of the `secure_desktop` grant, seeded from what
+        // the session actually holds rather than assumed off: a full-control
+        // guest carries the grant from the moment consent is given
+        // (`Grants::from_role`), and the loop checks this flag — not the
+        // core — before every secure-desktop frame (ADR 0049).
+        control.set_secure_desktop_allowed(
+            self.sessions
+                .grants(&peer)
+                .is_some_and(|grants| grants.secure_desktop),
+        );
         let task = spawn_encode_loop(
             connection.clone(),
             Arc::clone(&self.capture),
@@ -6695,11 +6738,11 @@ impl Actor {
             // guest a viewer in the first place (§11; ADR 0028).
             self.announce_monitors(peer);
             // Same trigger again, for the host's own display modes
-            // (docs/bugs/16-host-display-mode.md #2; ADR 0048). A brand new
-            // session never holds `display_mode` (`Grants::from_role` never
-            // implies it), so this always announces the "not granted" reason
-            // at first — `on_set_grant` re-announces the real list once the
-            // host turns the permission on.
+            // (docs/bugs/16-host-display-mode.md #2; ADR 0048). What goes out
+            // is whatever the session's own `display_mode` grant says right
+            // now — the real list for a full-control guest, the "not granted"
+            // reason for a lesser one — and `on_set_grant` re-announces
+            // whenever the host moves the switch afterwards.
             self.announce_display_modes(peer);
         }
         tracing::info!(peer = %label, ?role, "consent granted");
@@ -6811,9 +6854,9 @@ impl Actor {
         // value in one place" it checks before every attempt
         // (`apps/desktop/src-tauri/src/view.rs`), so a grant switched on
         // mid-stall must reach it just as promptly as a revoke does
-        // (ADR 0049). Nothing to update if no media session exists yet — the
-        // next one starts with the flag at `false`, matching
-        // `Grants::from_role`.
+        // (ADR 0049). Nothing to update if no media session exists yet —
+        // `on_media_accepted` seeds the flag from the live grant when the
+        // stream opens.
         if grant == IndependentGrant::SecureDesktop
             && let Some(session) = self.media.get(&peer)
         {
@@ -8155,6 +8198,7 @@ pub fn spawn_actor_with(
         clipboard_worker,
         clipboard_changes,
         windows,
+        host_bar_up: false,
         history: ConnectionHistory::open(history_path),
         unattended,
         unattended_store,
@@ -8524,6 +8568,7 @@ mod tests {
     struct RecordingWindows {
         opened: std::sync::Mutex<Vec<(String, String, bool)>>,
         closed: std::sync::Mutex<Vec<String>>,
+        host_bar: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingWindows {
@@ -8533,6 +8578,10 @@ mod tests {
 
         fn closed(&self) -> Vec<String> {
             self.closed.lock().unwrap().clone()
+        }
+
+        fn host_bar(&self) -> bool {
+            self.host_bar.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -8546,6 +8595,11 @@ mod tests {
 
         fn close(&self, label: &str) {
             self.closed.lock().unwrap().push(label.to_owned());
+        }
+
+        fn set_host_bar(&self, visible: bool) {
+            self.host_bar
+                .store(visible, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -9405,6 +9459,40 @@ mod tests {
         .await;
     }
 
+    /// ADR 0055: the host's always-on-top session bar is up exactly while a
+    /// guest is connected, and is put there by the actor rather than by any
+    /// window asking for it — there is no setting and no IPC command that
+    /// opens it, because "somebody is connected to this machine" is not a
+    /// thing the untrusted presentation layer gets to decide (§2.2, §2.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_bar_goes_up_with_the_first_guest_and_down_with_the_last() {
+        let windows = Arc::new(RecordingWindows::default());
+        let (host, _host_endpoint, _host_capture, _windows) =
+            actor_with_windows(Arc::clone(&windows) as Arc<dyn ViewWindows>).await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        assert!(!windows.host_bar(), "the bar was up with nobody connected");
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        // A guest waiting to be let in is not a guest who is watching.
+        assert!(!windows.host_bar(), "a pending consent put the bar up");
+
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_until("the bar never went up for a live session", || {
+            windows.host_bar()
+        })
+        .await;
+
+        host.revoke(label).await.unwrap();
+        wait_until("the bar never came down after the revoke", || {
+            !windows.host_bar()
+        })
+        .await;
+    }
+
     /// §8.1 applied to §9.2: a granted session is not a licence to read the
     /// host user's clipboard. Until `clipboard_read` is on, the clipboard is
     /// not read at all — the assertion is on the read count, not on what was
@@ -9888,11 +9976,12 @@ mod tests {
         wait_for_phase(&guest, ConnectPhase::Connected).await;
     }
 
-    /// §8.2: passing the password is admission, not a blanket permission. The
-    /// four independent grants of ADR 0029 stay off, exactly as they would
-    /// after a consent dialog.
+    /// §8.2: passing the password is admission at the role the host
+    /// configured, and nothing more — an unattended login lands on exactly
+    /// the grants a consent dialog at that same role would have produced,
+    /// never on a wider set for having skipped the dialog.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unattended_login_grants_none_of_the_four_independent_grants() {
+    async fn an_unattended_login_lands_on_the_configured_roles_grants() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
@@ -9912,14 +10001,11 @@ mod tests {
             .iter()
             .find(|row| row.label == label && row.state == SessionStateDto::Active)
             .expect("the admitted session is active");
-        // The role the host chose is honored...
+        // The role the host chose is honored, not the one the invite asked
+        // for, and it brings exactly what that role brings.
         assert_eq!(session.role, Role::FullControl);
+        assert_eq!(session.grants, Grants::from_role(Role::FullControl));
         assert!(session.input, "FullControl implies input");
-        // ...and implies nothing else (§2.2).
-        assert!(!session.grants.clipboard_read);
-        assert!(!session.grants.clipboard_write);
-        assert!(!session.grants.file_transfer);
-        assert!(!session.grants.recording);
     }
 
     /// The gate of ADR 0034: trust decides who may *try* the password. A saved

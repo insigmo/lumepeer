@@ -19,11 +19,12 @@ export type SessionState = 'pending' | 'active';
 /**
  * The permissions of §8.2 the host can move on a session that is already
  * running. `view` and `input` are absent on purpose: they follow the role, and
- * this window has no way to reach them. `display_mode` (docs/bugs/
- * 16-host-display-mode.md; ADR 0048) and `secure_desktop` (docs/bugs/
- * 15-secure-desktop-capture.md; ADR 0049) are both materially riskier than
- * anything else on this list, so each stays its own independent grant rather
- * than riding along with any role.
+ * this window has no way to reach them.
+ *
+ * A session starts holding whatever its role brings — everything for full
+ * control, nothing but `view` for a guest that is only watching — so there
+ * are no per-grant switches on this panel any more (ADR 0054). The names stay
+ * because the core still moves each one on its own.
  */
 export type IndependentGrant =
   | 'clipboard_read'
@@ -55,7 +56,7 @@ export interface SessionStatus {
   /**
    * Whether this guest may see the host's secure desktop (UAC prompt, lock
    * screen, fast user switch) instead of the honest "can't see this" message
-   * (ADR 0049). Independent of every other grant and off by default.
+   * (ADR 0049). Carried by full control, absent from every lesser role.
    */
   secure_desktop: boolean;
   /**
@@ -104,6 +105,16 @@ async function forgetHistory(peer: string): Promise<void> {
   await invoke('history_remove', { args: { peer } });
 }
 
+/**
+ * Moves one independent grant on a running session (§8.2).
+ *
+ * The host no longer has a switch per grant: a session starts with exactly
+ * what its role brings (`Grants::from_role`), so the only place left that
+ * changes one is the record request below, where saying "allow" to a guest
+ * that asked to be recorded is the host granting `recording` in the same
+ * press. Nothing is toggled locally either way — the core decides, and
+ * `onChange` re-polls for what it decided.
+ */
 async function setGrant(peer: string, grant: IndependentGrant, allowed: boolean): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('session_set_grant', { args: { peer, grant, allowed } });
@@ -119,69 +130,6 @@ async function setGrant(peer: string, grant: IndependentGrant, allowed: boolean)
 async function toggleRecording(peer: string, on: boolean): Promise<string | null> {
   const { invoke } = await import('@tauri-apps/api/core');
   return (await invoke('recording_toggle', { args: { peer, on } })) as string | null;
-}
-
-/**
- * The switches, in the order they are shown. The label says what the guest
- * gets, so that turning one on is a decision about a consequence rather than
- * about a flag name (§2.2, §19 phase 6).
- */
-const GRANT_ROWS: readonly {
-  grant: IndependentGrant;
-  key:
-    | 'status.grants.clipboardRead'
-    | 'status.grants.clipboardWrite'
-    | 'status.grants.fileTransfer'
-    | 'status.grants.recording'
-    | 'status.grants.displayMode'
-    | 'status.grants.secureDesktop';
-  held: (session: SessionStatus) => boolean;
-}[] = [
-  { grant: 'clipboard_read', key: 'status.grants.clipboardRead', held: (s) => s.clipboard_read },
-  { grant: 'clipboard_write', key: 'status.grants.clipboardWrite', held: (s) => s.clipboard_write },
-  { grant: 'file_transfer', key: 'status.grants.fileTransfer', held: (s) => s.file_transfer },
-  { grant: 'recording', key: 'status.grants.recording', held: (s) => s.recording },
-  { grant: 'display_mode', key: 'status.grants.displayMode', held: (s) => s.display_mode },
-  { grant: 'secure_desktop', key: 'status.grants.secureDesktop', held: (s) => s.secure_desktop },
-];
-
-/**
- * The independent grants of one active session.
- *
- * Nothing is toggled locally: the checkbox shows what the last `session_status`
- * said the core holds, the click asks the core to change it, and `onChange`
- * re-polls. A switch that looks on while the host refused would be the one
- * lie this panel must never tell.
- */
-function grantSwitches(
-  session: SessionStatus,
-  locale: Locale,
-  onChange: () => void,
-): TemplateResult {
-  return html`
-    <fieldset class="session-grants">
-      <legend>${t(locale, 'status.grants.heading')}</legend>
-      ${GRANT_ROWS.map(
-        (row) => html`
-          <label class="grant-row">
-            <input
-              type="checkbox"
-              .checked=${row.held(session)}
-              aria-label=${`${t(locale, row.key)}: ${session.peer_label}`}
-              @change=${(event: Event) => {
-                const allowed = (event.target as HTMLInputElement).checked;
-                void setGrant(session.peer_label, row.grant, allowed).then(onChange, (error: unknown) => {
-                  console.error('session_set_grant failed:', error);
-                  onChange();
-                });
-              }}
-            />
-            <span>${t(locale, row.key)}</span>
-          </label>
-        `,
-      )}
-    </fieldset>
-  `;
 }
 
 /**
@@ -440,7 +388,6 @@ export function sessionStatus(
                   ${session.state === 'active'
                     ? connectionQuality(connectionStats.get(session.peer_label), locale)
                     : ''}
-                  ${session.state === 'active' ? grantSwitches(session, locale, onRefresh) : ''}
                   ${session.state === 'active'
                     ? recordingRow(
                         session,

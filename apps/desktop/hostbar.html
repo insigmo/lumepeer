@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumepeer</title>
+    <style>
+      /* The bar has no window chrome and no scrollbars of its own: it is a
+         small always-on-top card over somebody's desktop, and every pixel it
+         takes is one it took from the application underneath. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        color: #f2f2f5;
+        font-family: system-ui, sans-serif;
+        font-size: 12px;
+        /* Nothing here is a document to select from, and a stray drag that
+           highlights the peer label instead of moving the window is the one
+           thing a drag handle must not do. */
+        user-select: none;
+      }
+      #hostbar {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        box-sizing: border-box;
+        padding: 6px 8px 8px;
+        background: #23303a;
+        border: 1px solid rgb(255 255 255 / 14%);
+        border-radius: 8px;
+      }
+      /* Collapsed: the tab is the whole window, so the padding and the
+         rounding on the docked edge both go away. */
+      #hostbar.is-collapsed {
+        padding: 0;
+        border-radius: 6px;
+        justify-content: center;
+        align-items: center;
+      }
+      .bar-head {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        /* The drag handle. Everything on this row carries
+           data-tauri-drag-region, so the bar moves from its whole header
+           rather than from one invisible strip of it. */
+        cursor: grab;
+      }
+      .bar-head:active {
+        cursor: grabbing;
+      }
+      .bar-mark svg {
+        display: block;
+        width: 18px;
+        height: 18px;
+      }
+      .bar-name {
+        flex: 1;
+        font-weight: 600;
+        font-size: 13px;
+      }
+      .tab-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      #hostbar.is-collapsed .tab-btn {
+        width: 100%;
+        height: 100%;
+        border-radius: 0;
+      }
+      .tab-btn:hover {
+        background: rgb(255 255 255 / 14%);
+      }
+      .tab-btn:focus-visible {
+        outline: 2px solid #9fd0ff;
+        outline-offset: -2px;
+      }
+      .tab-btn svg {
+        width: 13px;
+        height: 13px;
+      }
+      .bar-heading {
+        margin: 8px 0 4px;
+        color: #a9b7c2;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .bar-list {
+        flex: 1;
+        min-height: 0;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        overflow-y: auto;
+      }
+      .bar-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 0;
+      }
+      .bar-dot {
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #4ade80;
+      }
+      .bar-peer {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .bar-role {
+        flex: none;
+        color: #a9b7c2;
+        font-size: 10px;
+      }
+      .bar-revoke {
+        flex: none;
+        padding: 1px 6px;
+        background: transparent;
+        color: #ff9d9d;
+        border: 1px solid rgb(255 157 157 / 55%);
+        border-radius: 999px;
+        font-size: 10px;
+        cursor: pointer;
+      }
+      .bar-revoke:hover {
+        background: rgb(255 157 157 / 14%);
+      }
+      .bar-revoke:focus-visible,
+      .bar-open:focus-visible {
+        outline: 2px solid #9fd0ff;
+        outline-offset: 1px;
+      }
+      .bar-open {
+        margin-block-start: 6px;
+        padding: 4px 8px;
+        background: rgb(255 255 255 / 8%);
+        color: inherit;
+        border: 1px solid rgb(255 255 255 / 18%);
+        border-radius: 5px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .bar-open:hover {
+        background: rgb(255 255 255 / 16%);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="hostbar"></div>
+    <script type="module" src="/src/hostbar.ts"></script>
+  </body>
+</html>

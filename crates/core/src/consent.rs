@@ -12,8 +12,10 @@ use crate::NodeId;
 use crate::constants::{CONSENT_RATE_PER_MINUTE, MAX_PENDING_CONSENTS};
 use crate::error::{CoreError, Result};
 
-/// Role a guest may hold. `FullControl` does not imply clipboard, file
-/// transfer or recording — those are independent grants (§2.2, §8.2).
+/// Role a guest may hold. The role is the one decision the host takes in the
+/// consent dialog; [`Grants::from_role`] turns it into the permissions the
+/// session starts with, and each of those stays independently revocable
+/// afterwards (§2.2, §8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Role {
     /// Only `view`.
@@ -57,23 +59,22 @@ pub struct Grants {
     /// 16-host-display-mode.md; ADR 0048).
     ///
     /// Independent of `view`: watching the host's screen implies nothing
-    /// about being allowed to move it. Materially riskier than the other
-    /// four — a bad mode can strand the host operator in front of a broken
-    /// screen — so it stays its own grant rather than riding along with
-    /// `FullControl` or any other role.
+    /// about being allowed to move it, and only `FullControl` brings it
+    /// (see [`Self::from_role`]). Materially riskier than the other four — a
+    /// bad mode can strand the host operator in front of a broken screen —
+    /// so it stays separately revocable once the session is running.
     pub display_mode: bool,
     /// See the host's secure desktop (UAC prompt, lock screen, fast user
     /// switch) instead of the honest "can't see this" message
     /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049).
     ///
-    /// Independent of `view` and of every role, `FullControl` included: the
-    /// same "`FullControl` does not imply recording or files" ground rule
-    /// applies here, because a guest that can move the mouse is not thereby
-    /// a guest who should watch an administrator authenticate.
+    /// Independent of `view`, and never implied by a role below
+    /// `FullControl`: a guest that is only watching is not thereby a guest
+    /// who should watch an administrator authenticate.
     pub secure_desktop: bool,
 }
 
-/// One of the five grants a host may toggle on a session that is already
+/// One of the six grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -100,19 +101,31 @@ pub enum IndependentGrant {
 impl Grants {
     /// Grants implied by a role at the moment of `ConsentGrant` (§8.2).
     ///
-    /// Clipboard, file transfer, recording, display mode and the secure
-    /// desktop are never implied.
+    /// [`Role::FullControl`] is the host saying "this guest may do everything
+    /// on this machine", so it carries every independent grant with it: a
+    /// host that has already handed over the keyboard and mouse would be
+    /// asked to re-approve, one switch at a time, permissions the guest can
+    /// already exercise by typing. The lesser roles imply nothing beyond
+    /// `view` — a guest that is only watching gets no clipboard, no files, no
+    /// recording, no display mode and no secure desktop, and there is no path
+    /// from watching to any of them but a new consent at a higher role.
+    ///
+    /// The grants stay independent flags either way: [`Self::set`] still
+    /// moves each one on its own, which is what lets the host withdraw a
+    /// single permission from a full-control session without ending it.
+    /// See ADR 0054, which amends ADR 0029/0048/0049 on this point only.
     #[must_use]
     pub const fn from_role(role: Role) -> Self {
+        let full = matches!(role, Role::FullControl);
         Self {
             view: true,
-            input: matches!(role, Role::FullControl),
-            clipboard_read: false,
-            clipboard_write: false,
-            file_transfer: false,
-            recording: false,
-            display_mode: false,
-            secure_desktop: false,
+            input: full,
+            clipboard_read: full,
+            clipboard_write: full,
+            file_transfer: full,
+            recording: full,
+            display_mode: full,
+            secure_desktop: full,
         }
     }
 
@@ -430,50 +443,67 @@ mod tests {
     }
 
     #[test]
-    fn full_control_implies_input_but_never_clipboard_files_recording_display_mode_or_secure_desktop()
-     {
+    fn full_control_brings_every_grant_and_the_lesser_roles_bring_none() {
         let grants = Grants::from_role(Role::FullControl);
         assert!(grants.view && grants.input);
-        assert!(!grants.clipboard_read);
-        assert!(!grants.clipboard_write);
-        assert!(!grants.file_transfer);
-        assert!(!grants.recording);
-        assert!(!grants.display_mode);
-        assert!(!grants.secure_desktop);
+        assert!(grants.clipboard_read);
+        assert!(grants.clipboard_write);
+        assert!(grants.file_transfer);
+        assert!(grants.recording);
+        assert!(grants.display_mode);
+        assert!(grants.secure_desktop);
+
+        // Watching is watching: nothing else rides along with it.
+        for role in [Role::ViewOnly, Role::ControlLimited] {
+            let lesser = Grants::from_role(role);
+            assert!(lesser.view);
+            assert!(!lesser.clipboard_read);
+            assert!(!lesser.clipboard_write);
+            assert!(!lesser.file_transfer);
+            assert!(!lesser.recording);
+            assert!(!lesser.display_mode);
+            assert!(!lesser.secure_desktop);
+        }
     }
 
     #[test]
     fn display_mode_is_independent_of_every_other_grant() {
-        let mut grants = Grants::from_role(Role::FullControl);
+        let mut grants = Grants::from_role(Role::ViewOnly);
         assert!(!grants.get(IndependentGrant::DisplayMode));
         grants.set(IndependentGrant::DisplayMode, true);
         assert!(grants.get(IndependentGrant::DisplayMode));
         // Nothing else moved.
-        assert!(grants.view && grants.input);
+        assert!(grants.view && !grants.input);
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
         assert!(!grants.secure_desktop);
-        grants.set(IndependentGrant::DisplayMode, false);
-        assert!(!grants.get(IndependentGrant::DisplayMode));
+        // And it is still withdrawable on its own from a session that got it
+        // from the role rather than from a switch.
+        let mut full = Grants::from_role(Role::FullControl);
+        full.set(IndependentGrant::DisplayMode, false);
+        assert!(!full.get(IndependentGrant::DisplayMode));
+        assert!(full.get(IndependentGrant::SecureDesktop));
     }
 
     #[test]
     fn secure_desktop_is_independent_of_every_other_grant() {
-        let mut grants = Grants::from_role(Role::FullControl);
+        let mut grants = Grants::from_role(Role::ViewOnly);
         assert!(!grants.get(IndependentGrant::SecureDesktop));
         grants.set(IndependentGrant::SecureDesktop, true);
         assert!(grants.get(IndependentGrant::SecureDesktop));
         // Nothing else moved.
-        assert!(grants.view && grants.input);
+        assert!(grants.view && !grants.input);
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
         assert!(!grants.display_mode);
-        grants.set(IndependentGrant::SecureDesktop, false);
-        assert!(!grants.get(IndependentGrant::SecureDesktop));
+        let mut full = Grants::from_role(Role::FullControl);
+        full.set(IndependentGrant::SecureDesktop, false);
+        assert!(!full.get(IndependentGrant::SecureDesktop));
+        assert!(full.get(IndependentGrant::DisplayMode));
     }
 
     #[test]

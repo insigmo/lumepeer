@@ -179,6 +179,34 @@ fn check_window(window: &Window) -> Result<(), IpcError> {
     }
 }
 
+/// Rejects calls that come from neither the main window nor the host's
+/// always-on-top session bar.
+///
+/// The bar is the same person at the same machine as the main window — it
+/// exists so the host keeps its own controls while that window is minimized
+/// — so the two surfaces share exactly the commands the bar needs and no
+/// others. Which ones those are is enumerated in `capabilities/hostbar.json`;
+/// this is the Rust half of the same rule (§2.3, §13).
+fn check_host_surface(window: &Window) -> Result<(), IpcError> {
+    if matches!(
+        window.label(),
+        MAIN_WINDOW_LABEL | crate::view::HOST_BAR_LABEL
+    ) {
+        Ok(())
+    } else {
+        Err(IpcError::denied())
+    }
+}
+
+/// Rejects calls that do not come from the host's session bar.
+fn check_host_bar(window: &Window) -> Result<(), IpcError> {
+    if window.label() == crate::view::HOST_BAR_LABEL {
+        Ok(())
+    } else {
+        Err(IpcError::denied())
+    }
+}
+
 /// Rejects calls that do not come from the view window of `peer`.
 ///
 /// The Tauri capability in `capabilities/view.json` already limits these four
@@ -595,7 +623,8 @@ pub async fn session_grant(
 
 /// Revokes every grant of a peer immediately (§8.1).
 ///
-/// Callable from the main window for any peer, and from a `view-{peer}` window
+/// Callable from the host's own two surfaces — the main window and the
+/// always-on-top session bar — for any peer, and from a `view-{peer}` window
 /// for its own peer only: closing a view window ends that session, which is the
 /// same one on/off switch as the status list's revoke button rather than a
 /// second state to keep in sync.
@@ -609,14 +638,15 @@ pub async fn session_revoke(
     state: tauri::State<'_, AppState>,
     args: SessionRevokeArgs,
 ) -> Result<(), IpcError> {
-    if check_window(&window).is_err() {
+    if check_host_surface(&window).is_err() {
         check_view_window(&window, &args.peer)?;
     }
     state.network.revoke(args.peer).await?;
     Ok(())
 }
 
-/// Lists pending and active sessions for the status/consent UI.
+/// Lists pending and active sessions for the status/consent UI, and for the
+/// session bar that shows the same list while the main window is away.
 ///
 /// # Errors
 /// Rejects calls from other windows; [`IpcError`] if the actor is gone.
@@ -625,7 +655,7 @@ pub async fn session_status(
     window: Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SessionStatusDto>, IpcError> {
-    check_window(&window)?;
+    check_host_surface(&window)?;
     let snapshot = state.network.status().await?;
     Ok(snapshot
         .into_iter()
@@ -2541,6 +2571,134 @@ pub async fn audit_clear(
         code: "AUDIT",
         message: error.to_string(),
     })
+}
+
+/// Argument of [`host_bar_expand`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostBarExpandArgs {
+    /// Whether the bar shows its full card, or collapses to the edge tab.
+    pub expanded: bool,
+}
+
+/// Opens or collapses the host's session bar (the two states of ADR 0055).
+///
+/// Geometry only. The bar carries no authority of its own — everything it can
+/// actually do goes through the same commands the main window uses — and this
+/// exists because the window is undecorated: there is no chrome for the user
+/// to resize it by, so the page asks for the size its own state needs.
+///
+/// The right edge stays where it is across the change, so a bar the host
+/// dragged somewhere stays there and one docked to the screen edge does not
+/// walk inwards every time it is opened. The result is clamped to the monitor
+/// the bar is on, so a collapse near the left edge cannot push the open card
+/// off the screen.
+///
+/// # Errors
+/// Rejects calls from any window but the bar itself. A bar that is not up is
+/// not an error: it means the last session ended between the click and this
+/// call, and there is nothing left to resize.
+#[tauri::command]
+pub async fn host_bar_expand(
+    window: Window,
+    app: tauri::AppHandle,
+    args: HostBarExpandArgs,
+) -> Result<(), IpcError> {
+    use tauri::{LogicalSize, Manager as _, PhysicalPosition};
+
+    check_host_bar(&window)?;
+    let Some(bar) = app.get_webview_window(crate::view::HOST_BAR_LABEL) else {
+        return Ok(());
+    };
+    let (width, height) = if args.expanded {
+        (crate::view::HOST_BAR_WIDTH, crate::view::HOST_BAR_HEIGHT)
+    } else {
+        (
+            crate::view::HOST_BAR_TAB_WIDTH,
+            crate::view::HOST_BAR_TAB_HEIGHT,
+        )
+    };
+
+    // Read the old geometry before resizing: the anchors are the right edge
+    // and the vertical middle the bar has right now, and after `set_size`
+    // both have already moved.
+    let anchor = bar.outer_position().ok().and_then(|position| {
+        let size = bar.outer_size().ok()?;
+        let scale = bar.scale_factor().ok()?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a window's size in physical pixels is far inside i32"
+        )]
+        let (new_width, new_height) = (
+            (width * scale).round() as i32,
+            (height * scale).round() as i32,
+        );
+        let old_width = i32::try_from(size.width).unwrap_or(i32::MAX);
+        let old_height = i32::try_from(size.height).unwrap_or(i32::MAX);
+        Some((
+            position.x + old_width - new_width,
+            position.y + (old_height - new_height) / 2,
+        ))
+    });
+
+    bar.set_size(LogicalSize::new(width, height))
+        .map_err(|_ignored| IpcError {
+            code: "HOST_BAR",
+            message: "the session bar could not be resized".to_owned(),
+        })?;
+    if let Some((x, y)) = anchor {
+        let (x, y) = clamp_to_monitor(&bar, (x, y), (width, height));
+        let _ = bar.set_position(PhysicalPosition::new(x, y));
+    }
+    Ok(())
+}
+
+/// Keeps the whole bar on the monitor it is already on.
+///
+/// Without this, opening the card while the bar sits near an edge would place
+/// it partly off-screen — the anchors are the right edge and the vertical
+/// middle, so the extra width and height have to come from somewhere. A
+/// monitor Tauri cannot name leaves the position alone rather than guessing
+/// at one.
+fn clamp_to_monitor(
+    bar: &tauri::WebviewWindow,
+    (x, y): (i32, i32),
+    (logical_width, logical_height): (f64, f64),
+) -> (i32, i32) {
+    let Ok(Some(monitor)) = bar.current_monitor() else {
+        return (x, y);
+    };
+    let scale = monitor.scale_factor();
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a window's size in physical pixels is far inside i32"
+    )]
+    let (width, height) = (
+        (logical_width * scale).round() as i32,
+        (logical_height * scale).round() as i32,
+    );
+    let size = monitor.size();
+    let (left, top) = (monitor.position().x, monitor.position().y);
+    let right = left + i32::try_from(size.width).unwrap_or(i32::MAX);
+    let bottom = top + i32::try_from(size.height).unwrap_or(i32::MAX);
+    (
+        x.clamp(left, (right - width).max(left)),
+        y.clamp(top, (bottom - height).max(top)),
+    )
+}
+
+/// Brings the main window back from the tray or the taskbar (§18).
+///
+/// The bar's way out to the full UI: it deliberately carries only the two
+/// things a host needs mid-session, and everything else — settings, the audit
+/// log, files, chat — lives in the window this raises.
+///
+/// # Errors
+/// Rejects calls from any window but the bar itself.
+#[tauri::command]
+pub async fn host_bar_focus_main(window: Window, app: tauri::AppHandle) -> Result<(), IpcError> {
+    check_host_bar(&window)?;
+    crate::focus_main_window(&app);
+    Ok(())
 }
 
 #[cfg(test)]

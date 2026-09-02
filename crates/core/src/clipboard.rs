@@ -235,10 +235,14 @@ mod tests {
         assert!(permits(write_only, ClipboardFlow::GuestToHost));
         assert!(!permits(write_only, ClipboardFlow::HostToGuest));
 
-        // A role implies neither, however much control it carries (§2.2).
-        let full = Grants::from_role(crate::consent::Role::FullControl);
+        // Full control brings both, and withdrawing one leaves the other
+        // (§2.2: still two flags, not one).
+        let mut full = Grants::from_role(crate::consent::Role::FullControl);
+        assert!(permits(full, ClipboardFlow::HostToGuest));
+        assert!(permits(full, ClipboardFlow::GuestToHost));
+        full.set(IndependentGrant::ClipboardRead, false);
         assert!(!permits(full, ClipboardFlow::HostToGuest));
-        assert!(!permits(full, ClipboardFlow::GuestToHost));
+        assert!(permits(full, ClipboardFlow::GuestToHost));
     }
 
     /// docs/bugs/14-clipboard-files.md #4: files through the clipboard run
@@ -262,9 +266,13 @@ mod tests {
             "file_transfer alone must permit files, with no clipboard grant at all"
         );
 
-        // A role implies nothing here either (§2.2).
-        let full = Grants::from_role(crate::consent::Role::FullControl);
+        // Full control brings `file_transfer`, and withdrawing it stops
+        // clipboard files even though both clipboard grants stay (§2.2).
+        let mut full = Grants::from_role(crate::consent::Role::FullControl);
+        assert!(permits_files(full));
+        full.set(IndependentGrant::FileTransfer, false);
         assert!(!permits_files(full));
+        assert!(full.clipboard_read && full.clipboard_write);
     }
 
     #[test]
