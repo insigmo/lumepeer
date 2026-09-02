@@ -716,20 +716,6 @@ enum ActorCommand {
         text: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Either side: offer one local file to the peer (§9.2).
-    FileOffer {
-        label: String,
-        path: String,
-        reply: oneshot::Sender<Result<(), ActorError>>,
-    },
-    /// Either side: offer this node's own clipboard file list to the peer
-    /// (docs/bugs/14-clipboard-files.md #2). No path ever comes from the
-    /// webview here — the list comes off this machine's clipboard, on its
-    /// own thread.
-    FileOfferClipboard {
-        label: String,
-        reply: oneshot::Sender<Result<(), ActorError>>,
-    },
     /// Either side: answer the oldest offer this peer made. `directory` is
     /// where the receiving user chose to put it, and is ignored on a refusal.
     FileAccept {
@@ -1219,46 +1205,6 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ClipboardPush { label, text, reply })
-            .await
-            .map_err(|_| ActorError::ChannelClosed)?;
-        rx.await.map_err(|_| ActorError::ChannelClosed)?
-    }
-
-    /// Offers `path` to `label` (§9.2).
-    ///
-    /// Returns as soon as the offer is queued: the file is hashed off the
-    /// actor loop, and a 500 MiB file would otherwise stall everything else
-    /// the actor does (ADR 0027).
-    ///
-    /// # Errors
-    /// [`ActorError::Core`] as `NotPermitted` without the `file_transfer`
-    /// grant, [`ActorError::Unsupported`] towards a peer too old to name a
-    /// transfer, [`ActorError::Net`] as `TooManyTransfers` past
-    /// `MAX_PENDING_FILE_OFFERS`.
-    pub async fn file_offer(&self, label: String, path: String) -> Result<(), ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(ActorCommand::FileOffer { label, path, reply })
-            .await
-            .map_err(|_| ActorError::ChannelClosed)?;
-        rx.await.map_err(|_| ActorError::ChannelClosed)?
-    }
-
-    /// Offers this node's own clipboard file list to `label` (docs/bugs/
-    /// 14-clipboard-files.md #2).
-    ///
-    /// Returns as soon as the read and the announcement are queued: reading
-    /// the clipboard and measuring what it holds both run off the actor
-    /// loop (ADR 0027).
-    ///
-    /// # Errors
-    /// [`ActorError::Core`] as `NotPermitted` without the `file_transfer`
-    /// grant, [`ActorError::Unsupported`] towards a peer too old to
-    /// understand a clipboard file offer.
-    pub async fn file_offer_clipboard(&self, label: String) -> Result<(), ActorError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(ActorCommand::FileOfferClipboard { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -2020,16 +1966,6 @@ pub struct FileTransfersDto {
 
 /// One thing that happened to a transfer, off the actor loop.
 enum FileEvent {
-    /// A local file was measured and hashed and can now be offered.
-    Prepared {
-        peer: NodeId,
-        path: std::path::PathBuf,
-        name: String,
-        size: u64,
-        hash: [u8; 32],
-    },
-    /// The file could not be measured, hashed or named. Nothing was offered.
-    PrepareFailed { peer: NodeId },
     /// `rd/file/1` towards this peer is up — either this node dialed it, or
     /// the peer's dial was accepted and authorized.
     Connected {
@@ -2664,7 +2600,7 @@ struct Actor {
     /// read on the actor loop: an X11 clipboard read is a round trip to
     /// another application, and one wedged application must not be able to
     /// delay a revoke (ADR 0027).
-    clipboard_changes: mpsc::Receiver<String>,
+    clipboard_changes: mpsc::Receiver<crate::clipboard_os::ClipboardChange>,
     /// How view windows are created and closed, and how the host's
     /// always-on-top session bar goes up and down.
     windows: Arc<dyn ViewWindows>,
@@ -2855,8 +2791,14 @@ impl Actor {
                     }
                 }
                 change = self.clipboard_changes.recv() => {
-                    if let Some(text) = change {
-                        self.on_local_clipboard(&text);
+                    match change {
+                        Some(crate::clipboard_os::ClipboardChange::Text(text)) => {
+                            self.on_local_clipboard(&text);
+                        }
+                        Some(crate::clipboard_os::ClipboardChange::Files(paths)) => {
+                            self.on_local_clipboard_files(&paths);
+                        }
+                        None => {}
                     }
                 }
                 report = self.reports_rx.recv() => {
@@ -4788,14 +4730,6 @@ impl Actor {
             ActorCommand::ClipboardPull { label, reply } => {
                 let _ = reply.send(self.on_clipboard_pull(&label));
             }
-            ActorCommand::FileOffer { label, path, reply } => {
-                let result = self.on_file_offer(&label, path);
-                let _ = reply.send(result);
-            }
-            ActorCommand::FileOfferClipboard { label, reply } => {
-                let result = self.on_file_offer_clipboard(&label);
-                let _ = reply.send(result);
-            }
             ActorCommand::FileAccept {
                 label,
                 accept,
@@ -5144,23 +5078,28 @@ impl Actor {
     /// Guest side: forwards the toolbar's Ctrl+Alt+Del request to the host
     /// being watched (§11; ADR 0028).
     ///
-    /// Gated exactly like [`Self::on_input`]: the host re-checks the `input`
-    /// grant per event, but this side refuses to even send without a live
-    /// session that believes it holds the grant. Whether the host actually
-    /// synthesized the sequence arrives as `SasAck` on the wire; this reply
-    /// only covers the send itself.
+    /// Gated exactly like [`Self::on_input`], and for the same reason: this
+    /// is one more injected key, so it needs the `input` grant the host
+    /// announced for the view — which is what `views` holds on this side.
+    ///
+    /// It used to ask `self.sessions` instead, and that map is the *host*
+    /// role's register of sessions this node has granted to *its* guests. A
+    /// guest has no entry in it for the host it is watching, so the lookup
+    /// missed every time and the request was refused before it could be sent:
+    /// the button and the Ctrl+Alt+Shift+D chord both did nothing at all, on
+    /// a perfectly good session with a live `input` grant.
+    ///
+    /// Whether the host actually synthesized the sequence arrives as `SasAck`
+    /// on the wire; this reply only covers the send itself.
     fn on_sas_request(&mut self, label: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
-        let permitted = self.sessions.authorize_input(
-            &peer,
-            &InputEventPayload {
-                logical: 0,
-                scancode: 0,
-                modifiers: 0,
-                detail: lumepeer_core::protocol::InputDetail::Press,
-            },
-        );
-        if permitted.is_err() {
+        let permitted = self
+            .views
+            .get(&peer)
+            .ok_or(ActorError::UnknownPeer)?
+            .grants
+            .input;
+        if !permitted {
             return Err(ActorError::Core(CoreError::NotPermitted));
         }
         self.send_to(&peer, MessageKind::SasRequest);
@@ -5591,6 +5530,40 @@ impl Actor {
         }
     }
 
+    /// This desktop's clipboard now holds files, and they are offered to
+    /// every peer allowed to receive them (docs/bugs/14-clipboard-files.md;
+    /// ADR 0047).
+    ///
+    /// The same shape as [`Self::on_local_clipboard`] one function up, and
+    /// deliberately so: copying files is copying, and it reaches the peer
+    /// without a second gesture, exactly as copying text has since ADR 0046.
+    /// What differs is only which grant decides — files are gated on
+    /// `file_transfer` and never on the clipboard grants, because a file
+    /// transfer is what this is (`lumepeer_core::clipboard::permits_files`).
+    ///
+    /// An offer is not a transfer: what crosses is a name and a size, and
+    /// the receiving side still answers it in its own file panel before a
+    /// single byte moves.
+    fn on_local_clipboard_files(&mut self, paths: &[std::path::PathBuf]) {
+        let mut recipients: Vec<NodeId> = self
+            .sessions
+            .active()
+            .into_iter()
+            .map(|(peer, _, _)| peer)
+            .collect();
+        recipients.extend(self.views.keys().copied());
+        recipients.sort_unstable();
+        recipients.dedup();
+        for peer in recipients {
+            // A peer too old to understand a clipboard file offer is skipped
+            // rather than sent one it would decode as malformed (§9.1).
+            if !self.may_transfer_files(&peer) || !self.speaks_clipboard_files.contains(&peer) {
+                continue;
+            }
+            self.spawn_clipboard_offer(peer, paths.to_vec());
+        }
+    }
+
     // ---------------------------------------------------------------------
     // File transfer (§9.2, §4; ADR 0032)
     // ---------------------------------------------------------------------
@@ -5634,70 +5607,18 @@ impl Actor {
         );
     }
 
-    /// Either side: offer one local file to `label` (§9.2).
+    /// Measures `paths` off the actor loop and, if any survive, announces
+    /// them to `peer` (docs/bugs/14-clipboard-files.md #2).
     ///
-    /// Nothing is read here. Measuring and hashing up to
-    /// `FILE_OFFER_MAX_BYTES` runs on its own task and comes back as
-    /// [`FileEvent::Prepared`]; doing it inline would stop the actor
-    /// answering anything else for the length of a disk pass (ADR 0027).
-    fn on_file_offer(&mut self, label: &str, path: String) -> Result<(), ActorError> {
-        let peer = self.resolve(label)?;
-        if !self.may_transfer_files(&peer) {
-            return Err(ActorError::Core(CoreError::NotPermitted));
-        }
-        if !self.speaks_file_transfer.contains(&peer) {
-            return Err(ActorError::Unsupported);
-        }
-        if self.outstanding_offers(&peer) >= MAX_PENDING_FILE_OFFERS {
-            return Err(ActorError::Net(NetError::TooManyTransfers));
-        }
-        let events = self.events_tx.clone();
-        let tag = label.to_owned();
-        tokio::spawn(async move {
-            let path = std::path::PathBuf::from(path);
-            let event = match prepare_offer(&path).await {
-                Ok((name, size, hash)) => FileEvent::Prepared {
-                    peer,
-                    path,
-                    name,
-                    size,
-                    hash,
-                },
-                Err(error) => {
-                    // The path is this user's own and stays out of the log,
-                    // like every other file name (§15).
-                    tracing::warn!(peer = %tag, %error, "a file could not be offered");
-                    FileEvent::PrepareFailed { peer }
-                }
-            };
-            let _ = events.send(ActorEvent::File(event)).await;
-        });
-        Ok(())
-    }
-
-    /// Either side: offers this node's own clipboard file list to `label`
-    /// (docs/bugs/14-clipboard-files.md #2).
-    ///
-    /// Nothing is read here. The clipboard read happens on its own dedicated
-    /// thread and the per-file stat pass on its own task, exactly like
-    /// [`Self::on_file_offer`]'s hash pass — this call only checks
-    /// permission and starts that task (ADR 0027).
-    fn on_file_offer_clipboard(&mut self, label: &str) -> Result<(), ActorError> {
-        let peer = self.resolve(label)?;
-        if !self.may_transfer_files(&peer) {
-            return Err(ActorError::Core(CoreError::NotPermitted));
-        }
-        if !self.speaks_clipboard_files.contains(&peer) {
-            return Err(ActorError::Unsupported);
-        }
-        let clipboard = self.clipboard_worker.clone();
+    /// Nothing is read or stat'd here. The per-file pass runs on its own
+    /// task rather than on the actor loop, and lands back as
+    /// [`ActorEvent::ClipboardFilesRead`] (ADR 0027). Permission is
+    /// checked by the caller and re-checked when that event arrives, because
+    /// the pass takes long enough for a revoke to land in the middle of it.
+    fn spawn_clipboard_offer(&self, peer: NodeId, paths: Vec<std::path::PathBuf>) {
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
         tokio::spawn(async move {
-            let Some(paths) = clipboard.read_files().await else {
-                tracing::debug!(peer = %tag, "no files on the local clipboard to offer");
-                return;
-            };
             let mut files = Vec::new();
             let mut kept_paths = Vec::new();
             for path in paths {
@@ -5724,7 +5645,6 @@ impl Actor {
                 })
                 .await;
         });
-        Ok(())
     }
 
     /// This node's own clipboard file list finished being read and measured,
@@ -5746,11 +5666,6 @@ impl Actor {
         self.send_to(&peer, MessageKind::ClipboardFileOffer { files });
         self.audit_file(&peer, "clipboard-offer-sent");
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
-    }
-
-    /// Offers to `peer` that are either being hashed or already announced.
-    fn outstanding_offers(&self, peer: &NodeId) -> usize {
-        self.file_offers_out.get(peer).map_or(0, VecDeque::len)
     }
 
     /// Either side: answer the oldest offer `label` made (§9.2).
@@ -6071,14 +5986,7 @@ impl Actor {
     /// One thing that happened to a transfer, back on the actor's own thread.
     fn on_file_event(&mut self, event: FileEvent) {
         match event {
-            FileEvent::Prepared {
-                peer,
-                path,
-                name,
-                size,
-                hash,
-            } => self.on_offer_prepared(peer, path, name, size, hash),
-            FileEvent::PrepareFailed { peer } | FileEvent::ConnectFailed { peer } => {
+            FileEvent::ConnectFailed { peer } => {
                 self.file_dialing.remove(&peer);
                 self.file_pending_sends.remove(&peer);
                 let _ = self.notify.send(ActorNotification::FileTransferChanged);
@@ -6101,44 +6009,6 @@ impl Actor {
                 let _ = self.notify.send(ActorNotification::FileTransferChanged);
             }
         }
-    }
-
-    /// A local file finished hashing and can be announced (§9.2).
-    fn on_offer_prepared(
-        &mut self,
-        peer: NodeId,
-        path: std::path::PathBuf,
-        name: String,
-        size: u64,
-        hash: [u8; 32],
-    ) {
-        // Re-checked rather than assumed: hashing a large file takes long
-        // enough for a revoke to land in the middle of it.
-        if !self.may_transfer_files(&peer)
-            || self.outstanding_offers(&peer) >= MAX_PENDING_FILE_OFFERS
-        {
-            tracing::warn!(peer = %self.label_of(&peer), "dropping a prepared offer");
-            return;
-        }
-        self.send_to(
-            &peer,
-            MessageKind::FileOffer {
-                name: name.clone(),
-                size,
-                hash,
-            },
-        );
-        self.file_offers_out
-            .entry(peer)
-            .or_default()
-            .push_back(OutgoingOffer {
-                path,
-                name,
-                size,
-                hash,
-            });
-        self.audit_file(&peer, "offer-sent");
-        let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
 
     /// `rd/file/1` towards `peer` is up (§4).
@@ -6674,7 +6544,12 @@ impl Actor {
     /// Two independent reasons can justify the read, and either is enough:
     ///
     /// - **Host side.** A session this node granted holds `clipboard_read`,
-    ///   so this desktop's own copies are due to that guest.
+    ///   so this desktop's own copies are due to that guest — or it holds
+    ///   `file_transfer`, which is the grant a *file* copied here travels
+    ///   under (`permits_files`; docs/bugs/14-clipboard-files.md #4). Both
+    ///   are read from the same poll, so leaving the second one out is what
+    ///   would make copying a file on a host that shares files but not text
+    ///   do nothing at all.
     /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). `self.views` is
     ///   non-empty: this node is watching at least one host, and its own
     ///   clipboard changes are worth *offering* there the moment they
@@ -6686,7 +6561,8 @@ impl Actor {
     fn refresh_clipboard_watch(&self) {
         let host_side = self.sessions.active().into_iter().any(|(peer, _, grants)| {
             self.sessions.state(&peer) == SessionState::Active
-                && clip::permits(grants, ClipboardFlow::HostToGuest)
+                && (clip::permits(grants, ClipboardFlow::HostToGuest)
+                    || clip::permits_files(grants))
         });
         let guest_side = !self.views.is_empty();
         self.clipboard_worker.set_watching(host_side || guest_side);
@@ -8064,6 +7940,24 @@ impl ActorStores {
     }
 }
 
+/// Removes what a *past* run received through the clipboard path and never
+/// got to clean up (a crash, a kill) — docs/bugs/14-clipboard-files.md #3.
+///
+/// Once per process, not once per actor. A running actor's receives live in
+/// this tree, so a second actor starting up alongside it would delete a
+/// transfer the first one is halfway through, which is exactly what "a past
+/// run" is not. Production spawns one actor, so this fires once there either
+/// way; the tests spawn many, and it is they that would otherwise sweep each
+/// other's files away mid-transfer.
+fn sweep_clipboard_files() {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        if let Some(dir) = crate::config::clipboard_files_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    });
+}
+
 /// Spawns the actor over an already bound endpoint. Split out of
 /// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
 /// relay or a Tauri window: `windows`, `media` and `clipboard` are the three
@@ -8128,9 +8022,9 @@ pub fn spawn_actor_with(
     // clean up (a crash, a kill) are a leak, not something to keep serving
     // (docs/bugs/14-clipboard-files.md #3). Swept once, here, rather than on
     // every session end, which already removes its own peer's subdirectory.
-    if let Some(dir) = crate::config::clipboard_files_dir() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    //
+    // Once per *process*, not once per actor — see `sweep_clipboard_files`.
+    sweep_clipboard_files();
     let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
     let mut install_salt = [0u8; 32];
     rand::rng().fill_bytes(&mut install_salt);
@@ -8776,9 +8670,35 @@ mod tests {
     ///
     /// The endpoints are not returned: the actor owns a clone of the one it
     /// was spawned with, so this side's copy has nothing left to hold.
-    async fn file_pair() -> (ActorHandle, ActorHandle, String, String) {
-        let (host, guest, guest_label, host_label, _host_capture) = session_pair().await;
-        (host, guest, guest_label, host_label)
+    async fn file_pair() -> (ActorHandle, ActorHandle, String, String, SharedTestClipboard) {
+        let (host, host_clipboard) = actor_with_clipboard(Arc::new(DetachedViewWindows)).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly).await.unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input) = recorder.opened().remove(0);
+        (host, guest, guest_label, host_label, host_clipboard)
+    }
+
+    /// Copies `paths` on that machine, the way a user pressing Ctrl+C does.
+    ///
+    /// The wait is the point rather than politeness: the watch takes its
+    /// baseline on the first poll after a grant turns it on, so a copy made
+    /// in the same instant as the grant is the starting point and not news
+    /// (`clipboard_os::run`). A real hand cannot copy that fast; a test can.
+    async fn copy_files(state: &SharedTestClipboard, paths: &[std::path::PathBuf]) {
+        a_few_poll_rounds().await;
+        set_clipboard_files(state, paths);
     }
 
     /// [`file_pair`], keeping the host's capture controller.
@@ -9182,9 +9102,10 @@ mod tests {
         .await;
     }
 
-    /// §9.2 and §4 through the actor: a granted host offers a file, the guest
-    /// accepts it into a directory of its own choosing, `rd/file/1` opens for
-    /// the first time, and the file lands verified under the offered basename.
+    /// §9.2 and §4 through the actor: a granted host copies a file, the
+    /// offer that reaches the guest by itself is accepted into a directory of
+    /// the guest's own choosing, `rd/file/1` opens for the first time, and the
+    /// file lands verified under the offered basename.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_granted_session_moves_a_file_end_to_end() {
         let scratch = Scratch::new("e2e");
@@ -9193,29 +9114,29 @@ mod tests {
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
         std::fs::write(&source, &bytes).unwrap();
-        let inbox = scratch.join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
-
-        let (host, guest, guest_label, host_label) = file_pair().await;
-        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+        let (host, guest, guest_label, host_label, host_clipboard) = file_pair().await;
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
 
-        host.file_offer(guest_label, source.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        copy_files(&host_clipboard, std::slice::from_ref(&source)).await;
         wait_for_files(&guest, "the offer never reached the guest", |files| {
             files.offers.len() == 1 && files.offers[0].name == "report.pdf"
         })
         .await;
+        // It arrived tagged as a clipboard offer, which is what tells the
+        // panel — and the accept below — that no directory is being chosen.
+        assert!(guest.file_transfers().await.unwrap().offers[0].from_clipboard);
 
-        guest
-            .file_accept(host_label, true, Some(inbox.to_string_lossy().into_owned()))
-            .await
-            .unwrap();
+        // The directory argument is ignored on this path: a clipboard receive
+        // lands in this node's own clipboard-receive directory so the paste it
+        // exists to serve has something to point at (docs/bugs/
+        // 14-clipboard-files.md #3).
+        guest.file_accept(host_label, true, None).await.unwrap();
 
         // The sender only claims completion once the receiver's final ack says
-        // the hash matched and the file is on disk.
+        // the hash matched and the file is on disk, so a `Completed` row on
+        // both sides is the verification, not a hopeful label.
         wait_for_files(&host, "the transfer never completed", |files| {
             files
                 .transfers
@@ -9223,16 +9144,16 @@ mod tests {
                 .any(|row| row.state == TransferState::Completed)
         })
         .await;
-        let landed = inbox.join("report.pdf");
-        assert!(landed.exists(), "the file never appeared");
-        assert_eq!(std::fs::read(&landed).unwrap(), bytes);
-        // And nothing of the staging file survived the export.
-        let leftovers: Vec<_> = std::fs::read_dir(&inbox)
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.file_name()))
-            .filter(|name| name.to_string_lossy().ends_with(".part"))
-            .collect();
-        assert!(leftovers.is_empty(), "staging outlived the transfer");
+        let received = guest.file_transfers().await.unwrap();
+        let row = received
+            .transfers
+            .iter()
+            .find(|row| row.name == "report.pdf")
+            .expect("the guest has no row for the file it received");
+        assert_eq!(row.state, TransferState::Completed);
+        assert!(row.incoming && row.from_clipboard);
+        assert_eq!(row.size, bytes.len() as u64);
+        assert_eq!(row.moved, row.size);
     }
 
     /// §8.1 and §4: switching `file_transfer` back off takes the file
@@ -9250,29 +9171,20 @@ mod tests {
         let first = scratch.join("first.pdf");
         std::fs::write(&first, b"the one that was allowed").unwrap();
         let second = scratch.join("second.pdf");
-        std::fs::write(&second, b"the one after the switch came back").unwrap();
-        let inbox = scratch.join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(&second, b"copied while the switch was off").unwrap();
+        let third = scratch.join("third.pdf");
+        std::fs::write(&third, b"the one after the switch came back").unwrap();
 
-        let (host, guest, guest_label, host_label) = file_pair().await;
+        let (host, guest, guest_label, host_label, host_clipboard) = file_pair().await;
         host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
-        host.file_offer(guest_label.clone(), first.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        copy_files(&host_clipboard, std::slice::from_ref(&first)).await;
         wait_for_files(&guest, "the offer never reached the guest", |files| {
             files.offers.len() == 1
         })
         .await;
-        guest
-            .file_accept(
-                host_label.clone(),
-                true,
-                Some(inbox.to_string_lossy().into_owned()),
-            )
-            .await
-            .unwrap();
+        guest.file_accept(host_label.clone(), true, None).await.unwrap();
         wait_for_files(&host, "the transfer never started", |files| {
             !files.transfers.is_empty()
         })
@@ -9289,64 +9201,61 @@ mod tests {
             after.transfers.is_empty() && after.offers.is_empty(),
             "the withdrawal left transfers behind"
         );
-        // And a new offer is refused by the core, as it was before the grant.
-        assert!(matches!(
-            host.file_offer(guest_label.clone(), second.to_string_lossy().into_owned())
-                .await,
-            Err(ActorError::Core(CoreError::NotPermitted))
-        ));
+        // And a new copy offers nothing, as it would not have before the
+        // grant: the watch is off with no grant left to justify reading this
+        // desktop's clipboard at all (§8.1).
+        copy_files(&host_clipboard, std::slice::from_ref(&second)).await;
+        a_few_poll_rounds().await;
+        assert!(
+            guest.file_transfers().await.unwrap().offers.is_empty(),
+            "a withdrawn grant still offered a copied file"
+        );
 
         // Given back, the path works again: the teardown took the grant, not
-        // the guest's ability to speak the feature.
-        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+        // the guest's ability to speak the feature. A file not yet copied,
+        // because what is already on the clipboard when the watch turns back
+        // on is its baseline rather than news.
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
-        host.file_offer(guest_label, second.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        copy_files(&host_clipboard, std::slice::from_ref(&third)).await;
         wait_for_files(&guest, "the second offer never arrived", |files| {
-            files.offers.iter().any(|row| row.name == "second.pdf")
+            files.offers.iter().any(|row| row.name == "third.pdf")
         })
         .await;
-        guest
-            .file_accept(host_label, true, Some(inbox.to_string_lossy().into_owned()))
-            .await
-            .unwrap();
+        guest.file_accept(host_label, true, None).await.unwrap();
         wait_for_files(&host, "the second transfer never completed", |files| {
             files
                 .transfers
                 .iter()
-                .any(|row| row.state == TransferState::Completed)
+                .any(|row| row.name == "third.pdf" && row.state == TransferState::Completed)
         })
         .await;
-        assert_eq!(
-            std::fs::read(inbox.join("second.pdf")).unwrap(),
-            b"the one after the switch came back"
-        );
     }
 
-    /// §8.2: without the `file_transfer` grant nothing is offered at all. The
-    /// refusal comes from the host's own core, before any byte or connection
-    /// exists — and the same file goes through once the host decides.
+    /// §8.2: without the `file_transfer` grant nothing is offered at all —
+    /// and, since the grant is also what justifies reading this desktop's
+    /// clipboard, the copy is not even looked at. The same file goes through
+    /// once the host decides.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_offer_without_the_grant_is_refused_by_the_core() {
+    async fn a_copy_without_the_grant_offers_nothing() {
         let scratch = Scratch::new("nogrant");
         let source = scratch.join("report.pdf");
         std::fs::write(&source, b"anything at all").unwrap();
-        let path = source.to_string_lossy().into_owned();
 
-        let (host, guest, guest_label, _host_label) = file_pair().await;
-        assert!(matches!(
-            host.file_offer(guest_label.clone(), path.clone()).await,
-            Err(ActorError::Core(CoreError::NotPermitted))
-        ));
+        let (host, guest, guest_label, _host_label, host_clipboard) = file_pair().await;
+        copy_files(&host_clipboard, std::slice::from_ref(&source)).await;
         a_few_poll_rounds().await;
         assert!(guest.file_transfers().await.unwrap().offers.is_empty());
 
-        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
-        host.file_offer(guest_label, path).await.unwrap();
+        // The list already on the clipboard when the grant arrives is the
+        // watch's baseline, not news: it was copied while nobody was allowed
+        // to look. Copying again is what a user does, and what is offered.
+        copy_files(&host_clipboard, &[]).await;
+        copy_files(&host_clipboard, std::slice::from_ref(&source)).await;
         wait_for_files(&guest, "the offer never reached the guest", |files| {
             files.offers.len() == 1
         })
@@ -9364,13 +9273,11 @@ mod tests {
         let inbox = scratch.join("inbox");
         std::fs::create_dir_all(&inbox).unwrap();
 
-        let (host, guest, guest_label, host_label) = file_pair().await;
-        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+        let (host, guest, guest_label, host_label, host_clipboard) = file_pair().await;
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
-        host.file_offer(guest_label, source.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        copy_files(&host_clipboard, std::slice::from_ref(&source)).await;
         wait_for_files(&guest, "the offer never reached the guest", |files| {
             files.offers.len() == 1
         })
@@ -9422,11 +9329,7 @@ mod tests {
             .await
             .unwrap();
 
-        set_clipboard_files(&pair.guest_clipboard, std::slice::from_ref(&source));
-        pair.guest
-            .file_offer_clipboard(pair.host_label.clone())
-            .await
-            .unwrap();
+        copy_files(&pair.guest_clipboard, std::slice::from_ref(&source)).await;
 
         a_few_poll_rounds().await;
         assert!(
@@ -9434,18 +9337,19 @@ mod tests {
             "clipboard grants alone let a clipboard file offer through"
         );
 
-        // The positive control: the same offer succeeds once `file_transfer`
-        // is the grant that is actually on, which is what proves the
-        // refusal above was the grant check and not, say, a feature
-        // negotiation that silently never happened.
+        // The positive control: the next copy goes through once
+        // `file_transfer` is the grant that is actually on, which is what
+        // proves the refusal above was the grant check and not, say, a
+        // feature negotiation that silently never happened. A fresh copy,
+        // because the list already on the clipboard is no longer news to the
+        // watch that has seen it.
         pair.host
             .set_grant(pair.guest_label, IndependentGrant::FileTransfer, true)
             .await
             .unwrap();
-        pair.guest
-            .file_offer_clipboard(pair.host_label)
-            .await
-            .unwrap();
+        let second = scratch.join("scan.png");
+        std::fs::write(&second, b"also just bytes").unwrap();
+        copy_files(&pair.guest_clipboard, std::slice::from_ref(&second)).await;
         wait_for_files(
             &pair.host,
             "the clipboard offer never arrived once file_transfer was on",
@@ -9453,7 +9357,7 @@ mod tests {
                 files
                     .offers
                     .iter()
-                    .any(|row| row.name == "photo.png" && row.from_clipboard)
+                    .any(|row| row.name == "scan.png" && row.from_clipboard)
             },
         )
         .await;
@@ -10951,6 +10855,73 @@ mod tests {
             guest.media_health().can_capture(),
             "the fault belongs to the host that has it, not to whoever heard about it"
         );
+    }
+
+    /// §11, ADR 0028: a guest holding the `input` grant can put the
+    /// Ctrl+Alt+Del request on the wire at all.
+    ///
+    /// The regression this pins: `on_sas_request` gated on `self.sessions`,
+    /// which is the *host* role's register of sessions this node has granted
+    /// to its own guests. A guest has no entry there for the host it watches,
+    /// so every request was refused before it could be sent and the toolbar
+    /// button and the Ctrl+Alt+Shift+D chord both did nothing — on a live
+    /// session with `input` granted. The gate belongs on `views`, which is
+    /// where this side keeps the grants the host announced, exactly as
+    /// `on_input` reads them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_with_the_input_grant_can_send_the_sas_request() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::FullControl).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, input) = recorder.opened().remove(0);
+        assert!(input, "FullControl carries a live input grant");
+
+        // The same grant that carries an ordinary keystroke carries this one.
+        guest
+            .input(peer_label.clone(), pointer_event(1, 2))
+            .await
+            .unwrap();
+        guest.sas_request(peer_label).await.unwrap();
+    }
+
+    /// The other half of the gate: without the grant nothing reaches the wire,
+    /// which is what the broken version got right by accident.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_only_guest_cannot_send_the_sas_request() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, _input) = recorder.opened().remove(0);
+        assert!(matches!(
+            guest.sas_request(peer_label).await,
+            Err(ActorError::Core(CoreError::NotPermitted))
+        ));
     }
 
     /// A `ViewOnly` session must not be able to forward input, and the guest

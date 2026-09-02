@@ -567,6 +567,22 @@ pub fn no_clipboard() -> ClipboardFactory {
     Box::new(|| Box::new(NoClipboard))
 }
 
+/// What the watch saw appear on this machine's clipboard.
+///
+/// File lists used to be read only on demand, for a button that offered
+/// them. They are polled on the same interval as text now, so copying files
+/// reaches the peer the same way copying words already did (ADR 0046 applied
+/// to docs/bugs/14-clipboard-files.md): the user presses Ctrl+C, and there
+/// is nothing further to press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardChange {
+    /// The clipboard holds this text.
+    Text(String),
+    /// The clipboard holds these files, by path on this machine. Paths never
+    /// leave this process: what goes on the wire is names and sizes (§15).
+    Files(Vec<PathBuf>),
+}
+
 /// One request from the actor to the clipboard thread.
 enum ClipboardJob {
     /// Put this text on the local clipboard (a peer's payload, already
@@ -576,11 +592,6 @@ enum ClipboardJob {
     /// paths, so pasting them actually works (docs/bugs/
     /// 14-clipboard-files.md #3).
     WriteFiles(Vec<PathBuf>),
-    /// Read the local clipboard's current file list, if it has one
-    /// (docs/bugs/14-clipboard-files.md #1). Answered on a oneshot rather
-    /// than through `on_change`: this is an on-demand request tied to one
-    /// IPC call, not a continuous watch like text's.
-    ReadFiles(tokio::sync::oneshot::Sender<Option<Vec<PathBuf>>>),
 }
 
 /// The actor's handle on the clipboard thread.
@@ -624,22 +635,6 @@ impl ClipboardWorker {
         }
     }
 
-    /// Reads this machine's own clipboard file list, on the dedicated
-    /// thread, exactly once (docs/bugs/14-clipboard-files.md #1).
-    ///
-    /// Unlike text, file lists are not polled continuously: this answers one
-    /// on-demand request (a user action offering the local clipboard's
-    /// files to a peer), so `None` covers both "not files" and "the
-    /// clipboard thread is gone" alike — the caller's response to either is
-    /// the same, offering nothing.
-    pub async fn read_files(&self) -> Option<Vec<PathBuf>> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.jobs.send(ClipboardJob::ReadFiles(reply)).is_err() {
-            return None;
-        }
-        rx.await.ok().flatten()
-    }
-
     /// Turns polling on or off.
     ///
     /// Called whenever the set of sessions that may read this machine's
@@ -655,15 +650,15 @@ impl ClipboardWorker {
 
 /// Starts the clipboard thread.
 ///
-/// `on_change` receives the clipboard's new text every time the poll sees it
-/// change while watching is on. It is a bounded channel on purpose: if the
-/// actor is far enough behind that it has filled up, the right answer is to
-/// skip this round and re-detect the same content next time, not to queue
-/// clipboard history.
+/// `on_change` receives the clipboard's new contents every time the poll
+/// sees them change while watching is on — text or a file list. It is a
+/// bounded channel on purpose: if the actor is far enough behind that it has
+/// filled up, the right answer is to skip this round and re-detect the same
+/// content next time, not to queue clipboard history.
 #[must_use]
 pub fn spawn(
     make: ClipboardFactory,
-    on_change: tokio::sync::mpsc::Sender<String>,
+    on_change: tokio::sync::mpsc::Sender<ClipboardChange>,
 ) -> ClipboardWorker {
     let (jobs_tx, jobs_rx) = std::sync::mpsc::channel();
     let watching = Arc::new(AtomicBool::new(false));
@@ -692,7 +687,7 @@ fn run(
     mut clipboard: Box<dyn OsClipboard>,
     jobs: &std::sync::mpsc::Receiver<ClipboardJob>,
     watching: &AtomicBool,
-    on_change: &tokio::sync::mpsc::Sender<String>,
+    on_change: &tokio::sync::mpsc::Sender<ClipboardChange>,
 ) {
     let interval = Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS);
     // What the clipboard held the last time this loop looked, or last put
@@ -700,6 +695,7 @@ fn run(
     // starts from a fresh baseline rather than from a memory of what the user
     // copied while nobody was allowed to see it.
     let mut seen: Option<String> = None;
+    let mut seen_files: Option<Vec<PathBuf>> = None;
     let mut had_baseline = false;
     let mut next_poll = Instant::now() + interval;
 
@@ -718,13 +714,17 @@ fn run(
                 continue;
             }
             Ok(ClipboardJob::WriteFiles(paths)) => {
-                if let Err(error) = clipboard.write_file_paths(&paths) {
-                    tracing::debug!(%error, "could not apply a clipboard file-list payload");
+                match clipboard.write_file_paths(&paths) {
+                    // The same echo suppression text has always had, and now
+                    // load-bearing rather than tidy: a received file that was
+                    // put on this clipboard would otherwise look like a fresh
+                    // local copy on the next poll and be offered straight
+                    // back to the peer it came from, forever.
+                    Ok(()) => seen_files = Some(paths),
+                    Err(error) => {
+                        tracing::debug!(%error, "could not apply a clipboard file-list payload");
+                    }
                 }
-                continue;
-            }
-            Ok(ClipboardJob::ReadFiles(reply)) => {
-                let _ = reply.send(clipboard.read_file_paths());
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -735,26 +735,53 @@ fn run(
         next_poll = Instant::now() + interval;
         if !watching.load(Ordering::Relaxed) {
             seen = None;
+            seen_files = None;
             had_baseline = false;
             continue;
         }
-        let Some(text) = clipboard.read_text() else {
-            continue;
-        };
+        let files = clipboard.read_file_paths();
+        let text = clipboard.read_text();
         if !had_baseline {
             // First look after a grant turned on. Whatever is on the clipboard
             // predates the decision, so it is the starting point, not news.
-            seen = Some(text);
+            seen = text;
+            seen_files = files;
             had_baseline = true;
             continue;
         }
+        if let Some(paths) = files {
+            // A file list wins over whatever text sits beside it. Copying in
+            // Explorer leaves both — the paths as `CF_HDROP` and, depending
+            // on the source, the same paths as plain text — and offering the
+            // files *and* pasting their private path strings into the peer's
+            // clipboard would be one copy reported twice, the second time as
+            // this machine's own directory layout (§15). The text is taken as
+            // the new baseline rather than sent.
+            seen = text;
+            if seen_files.as_deref() == Some(paths.as_slice()) {
+                continue;
+            }
+            if on_change
+                .try_send(ClipboardChange::Files(paths.clone()))
+                .is_ok()
+            {
+                seen_files = Some(paths);
+            }
+            continue;
+        }
+        // Nothing on the clipboard is a file list any more, so the next one
+        // that appears is news even if it is the same list as before.
+        seen_files = None;
+        let Some(text) = text else {
+            continue;
+        };
         if seen.as_deref() == Some(text.as_str()) {
             continue;
         }
         // `seen` moves forward only once the change is actually queued: a
         // full channel means this round is lost, and the same content has to
         // still look new on the next one.
-        if on_change.try_send(text.clone()).is_ok() {
+        if on_change.try_send(ClipboardChange::Text(text.clone())).is_ok() {
             seen = Some(text);
         }
     }
@@ -881,7 +908,88 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(change, "copied after the grant");
+        assert_eq!(
+            change,
+            ClipboardChange::Text("copied after the grant".to_owned())
+        );
+        drop(worker);
+    }
+
+    /// The same rule for file lists, which are watched on the same poll now
+    /// rather than read on demand: a copy after the grant reaches the peer
+    /// with nothing further to press (ADR 0046 applied to docs/bugs/
+    /// 14-clipboard-files.md).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_copied_file_list_is_reported_like_copied_text() {
+        let (factory, state) = fake();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let worker = spawn(factory, tx);
+        worker.set_watching(true);
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 3)).await;
+
+        let copied = vec![PathBuf::from("/tmp/report.pdf")];
+        state.lock().unwrap().files = Some(copied.clone());
+        let change = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(change, ClipboardChange::Files(copied));
+
+        // And the same list is not news twice: a poll that sees what it saw
+        // last time must not offer the peer the same files again.
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 3)).await;
+        assert!(rx.try_recv().is_err(), "the same file list was sent twice");
+        drop(worker);
+    }
+
+    /// The file half of the loop suppression: a received file placed on this
+    /// clipboard so it can be pasted must not look like a fresh local copy
+    /// and be offered straight back to the peer that sent it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_received_file_list_does_not_come_back_as_a_local_copy() {
+        let (factory, state) = fake();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let worker = spawn(factory, tx);
+        worker.set_watching(true);
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 2)).await;
+
+        worker.write_files(vec![PathBuf::from("/tmp/from-the-peer.pdf")]);
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 3)).await;
+        assert!(rx.try_recv().is_err(), "the received file list echoed back");
+        assert_eq!(
+            state.lock().unwrap().file_writes,
+            vec![vec![PathBuf::from("/tmp/from-the-peer.pdf")]]
+        );
+        drop(worker);
+    }
+
+    /// A clipboard holding files often holds their paths as text as well.
+    /// Reporting both would offer the files *and* paste this machine's own
+    /// directory layout into the peer's clipboard (§15), so the text beside
+    /// a file list is taken as a baseline and never sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn text_alongside_a_copied_file_list_is_not_reported() {
+        let (factory, state) = fake();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let worker = spawn(factory, tx);
+        worker.set_watching(true);
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 3)).await;
+
+        {
+            let mut held = state.lock().unwrap();
+            held.files = Some(vec![PathBuf::from("/home/someone/secret/report.pdf")]);
+            held.text = Some("/home/someone/secret/report.pdf".to_owned());
+        }
+        let change = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(change, ClipboardChange::Files(_)));
+        tokio::time::sleep(Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS * 3)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the paths were sent as text as well as files"
+        );
         drop(worker);
     }
 
