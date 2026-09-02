@@ -783,13 +783,14 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 6] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 7] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
         IndependentGrant::Recording,
         IndependentGrant::DisplayMode,
         IndependentGrant::SecureDesktop,
+        IndependentGrant::SecureDesktopInput,
     ];
 
     #[test]

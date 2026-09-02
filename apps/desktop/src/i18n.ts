@@ -38,6 +38,9 @@ export type TranslationKey =
   | 'status.inputOff'
   | 'status.revoke'
   | 'status.secureDesktop.active'
+  | 'status.secureDesktop.input.on'
+  | 'status.secureDesktop.input.off'
+  | 'status.secureDesktop.input.hint'
   | 'status.recording.start'
   | 'status.recording.stop'
   | 'status.recording.on'
@@ -324,6 +327,10 @@ const en: Dictionary = {
   // §17-equivalent) — distinct from the grant above the same way the
   // recording indicator is distinct from the recording grant.
   'status.secureDesktop.active': 'Viewing the administrator prompt or lock screen',
+  'status.secureDesktop.input.on': 'Can control the admin prompt',
+  'status.secureDesktop.input.off': 'Allow controlling the admin prompt',
+  'status.secureDesktop.input.hint':
+    'Lets this guest click the UAC prompt and type into the lock screen — approve elevation on this machine. Off for every role; turn on only when you mean it.',
   // The switch above is permission; these are the act. Both sides see an
   // indicator for as long as a recording runs — §2.2 has no quiet capture.
   'status.recording.start': 'Record session',
@@ -641,6 +648,10 @@ const ar: Dictionary = {
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
   'status.secureDesktop.active': 'تجري الآن مشاهدة طلب المسؤول أو شاشة القفل',
+  'status.secureDesktop.input.on': 'يمكنه التحكم في طلب المسؤول',
+  'status.secureDesktop.input.off': 'السماح بالتحكم في طلب المسؤول',
+  'status.secureDesktop.input.hint':
+    'يتيح لهذا الضيف النقر على طلب رفع الصلاحيات (UAC) والكتابة في شاشة القفل — أي الموافقة على رفع الصلاحيات على هذا الجهاز. مُعطَّل لكل الأدوار؛ فعّله فقط عندما تقصد ذلك.',
   'status.recording.start': 'تسجيل الجلسة',
   'status.recording.stop': 'إيقاف التسجيل',
   'status.recording.on': 'جارٍ التسجيل',

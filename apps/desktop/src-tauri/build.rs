@@ -71,8 +71,45 @@ const COMMANDS: &[&str] = &[
     "host_bar_focus_main",
 ];
 
+/// The Windows application manifest, replacing tauri-build's default.
+///
+/// Two changes from the default, and only two:
+///
+/// - `requestedExecutionLevel level="requireAdministrator"`. Lumepeer injects
+///   input with `SendInput`, and UIPI silently drops input a medium-integrity
+///   process aims at a higher-integrity window — every window an elevated app
+///   owns (`services.msc`, `regedit`, Task Manager, an installer's own UI).
+///   Running the client at high integrity is what lets a guest drive those.
+///   It does **not** reach the secure desktop (the UAC prompt itself, the lock
+///   screen): `Winsta0\Winlogon` is a different desktop object that no amount
+///   of elevation puts this process's thread onto — that half goes through the
+///   `LocalSystem` helper (ADR 0043, ADR 0049, ADR 0056). See ADR 0057 for why
+///   always-elevated was chosen over relaunch-on-demand and what it costs (a
+///   UAC prompt at every launch; no drag-and-drop from a non-elevated
+///   Explorer).
+/// - Nothing else. The `Microsoft.Windows.Common-Controls` v6 dependency is
+///   carried over verbatim from tauri-build's own default manifest, because
+///   dropping it breaks tauri's dialog APIs (tauri-build's docs warn of this)
+///   and this app depends on `tauri-plugin-dialog`.
+const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+  </dependency>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>"#;
+
 fn main() {
     let attrs = tauri_build::Attributes::new()
+        .windows_attributes(tauri_build::WindowsAttributes::new().app_manifest(APP_MANIFEST))
         .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
 
     // Default build reads capabilities/ (main.json, view.json) via tauri-

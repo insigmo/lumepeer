@@ -33,6 +33,7 @@ const fullControl: SessionStatus = {
   secure_desktop: true,
   recording_active: false,
   record_request: false,
+  secure_desktop_input: false,
   secure_desktop_active: false,
 };
 

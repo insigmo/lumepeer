@@ -50,7 +50,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
-use lumepeer_service::SECURE_DESKTOP_WORKER_ARG;
+use lumepeer_service::{SECURE_DESKTOP_INPUT_WORKER_ARG, SECURE_DESKTOP_WORKER_ARG};
 
 /// The secure desktop, as a desktop path for `STARTUPINFOW.lpDesktop`.
 const WINLOGON_DESKTOP: &str = r"WinSta0\Winlogon";
@@ -100,6 +100,24 @@ pub fn run_worker() -> u32 {
     }
 }
 
+/// The input worker body: performs one already-validated event on the desktop
+/// this process was launched onto and exits (ADR 0057).
+///
+/// Runs in the console session on `Winlogon` (the service put it there via
+/// `lpDesktop`), so its `SendInput` reaches the secure desktop that the
+/// elevated client's own thread cannot. Returns [`WORKER_OK`] when the OS
+/// accepted the event, non-zero otherwise — the one bit of outcome the
+/// service reports back, same as the capture worker.
+#[must_use]
+pub fn run_input_worker(action: lumepeer_service::protocol::InjectAction) -> u32 {
+    if crate::secure_desktop_input::perform(action) {
+        WORKER_OK
+    } else {
+        tracing::warn!("secure-desktop input worker: SendInput did not accept the event");
+        1
+    }
+}
+
 /// Launches the worker into the console session's secure desktop and waits
 /// for it (service side, session 0).
 ///
@@ -109,18 +127,40 @@ pub fn run_worker() -> u32 {
 /// function never touches the mapping itself, only the child process.
 #[must_use]
 pub fn capture_via_worker() -> bool {
+    run_worker_with_args(SECURE_DESKTOP_WORKER_ARG)
+}
+
+/// Launches the worker to perform one input event on the console session's
+/// secure desktop and waits for it (service side, session 0; ADR 0057).
+///
+/// The mirror of [`capture_via_worker`], with the event carried as the four
+/// bounded integers [`lumepeer_service::protocol::inject_to_args`] produces —
+/// never a peer string, so `spawn_worker`'s command line stays built from
+/// values this process controls.
+#[must_use]
+pub fn inject_via_worker(action: lumepeer_service::protocol::InjectAction) -> bool {
+    let [kind, logical, x, y] = lumepeer_service::protocol::inject_to_args(action);
+    run_worker_with_args(&format!(
+        "{SECURE_DESKTOP_INPUT_WORKER_ARG} {kind} {logical} {x} {y}"
+    ))
+}
+
+/// Duplicates this `LocalSystem` process's token into the console session and
+/// launches this binary there with `arg_tail`, waiting for it — the shared
+/// body of [`capture_via_worker`] and [`inject_via_worker`].
+fn run_worker_with_args(arg_tail: &str) -> bool {
     // SAFETY: a plain kernel32 export with no arguments; `0xFFFF_FFFF` is the
     // documented "no session attached to the console" answer.
     let console_session = unsafe { WTSGetActiveConsoleSessionId() };
     if console_session == u32::MAX {
-        tracing::warn!("no active console session; nothing to capture the secure desktop for");
+        tracing::warn!("no active console session for the secure-desktop worker");
         return false;
     }
 
     let Some(token) = duplicate_own_token_for_session(console_session) else {
         return false;
     };
-    let spawned = spawn_worker(token);
+    let spawned = spawn_worker(token, arg_tail);
     // SAFETY: `token` is a live handle from `duplicate_own_token_for_session`
     // and is not used again after the spawn above copied what it needed.
     unsafe {
@@ -194,10 +234,14 @@ fn duplicate_own_token_for_session(session: u32) -> Option<HANDLE> {
     Some(duplicate)
 }
 
-/// `CreateProcessAsUserW`s this binary with [`SECURE_DESKTOP_WORKER_ARG`] onto
-/// the console session's `Winlogon` desktop, waits for it, and returns whether
-/// it exited [`WORKER_OK`].
-fn spawn_worker(token: HANDLE) -> bool {
+/// `CreateProcessAsUserW`s this binary with `arg_tail` onto the console
+/// session's `Winlogon` desktop, waits for it, and returns whether it exited
+/// [`WORKER_OK`].
+///
+/// `arg_tail` is always a constant plus, for the input worker, integers this
+/// process formatted itself ([`inject_via_worker`]) — never a value from the
+/// peer, so the command line below cannot be steered by whatever asked.
+fn spawn_worker(token: HANDLE, arg_tail: &str) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         tracing::warn!("secure-desktop worker: cannot locate this executable");
         return false;
@@ -211,9 +255,9 @@ fn spawn_worker(token: HANDLE) -> bool {
         return false;
     }
     let application = wide(&exe);
-    // The command line is `"exe" --secure-desktop-worker`; the quotes keep a
+    // The command line is `"exe" <arg_tail>`; the quotes keep a
     // `C:\Program Files\...` path from being split into a command plus args.
-    let mut command_line = wide(&format!("\"{exe}\" {SECURE_DESKTOP_WORKER_ARG}"));
+    let mut command_line = wide(&format!("\"{exe}\" {arg_tail}"));
     let mut desktop = wide(WINLOGON_DESKTOP);
 
     let startup = STARTUPINFOW {

@@ -33,6 +33,7 @@ const noGrants = {
   recording_active: false,
   record_request: false,
   secure_desktop: false,
+  secure_desktop_input: false,
   secure_desktop_active: false,
 } as const;
 
