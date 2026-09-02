@@ -460,13 +460,14 @@ pub const CLIPBOARD_FILE_PATH_MAX_BYTES: usize = 4096;
 /// captured monitor, whether enumerated locally or announced in
 /// `DisplayModesList` (docs/bugs/16-host-display-mode.md #1; D7 point 2).
 ///
-/// A monitor's EDID can list dozens of near-duplicate entries — the same
-/// resolution at 59.94/60/60.00 Hz, or every refresh rate a GPU driver is
-/// willing to try — and a list that long is not a choice a human can make
-/// from a dropdown (§18: an honest but useless answer is still the wrong
-/// one). The real backends dedupe and sort before this bound is applied, so
-/// truncating here costs only the rarest, least-distinguishable entries.
-pub const MAX_DISPLAY_MODES_PER_HOST: usize = 24;
+/// A hostile-peer bound, not a shortlist: the real backends already fold
+/// their raw list down to one mode per resolution
+/// ([`crate::constants`]' consumers call
+/// `fold_display_modes_by_resolution`), so a real monitor lands well under
+/// this — a 4K Windows driver reports about thirty distinct resolutions,
+/// legacy VESA sizes included. What is left to bound is the count a peer
+/// can claim before anything downstream allocates per mode.
+pub const MAX_DISPLAY_MODES_PER_HOST: usize = 128;
 
 /// How long the host waits, after switching its own physical display mode,
 /// for something to confirm the new mode actually produces a picture before

@@ -194,11 +194,19 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         return None;
     }
 
+    // The `"DISPLAY"` driver name is what gives a device context for the
+    // whole screen of the calling thread's *current desktop*; the all-null
+    // form this used before always returned `NULL` (confirmed on real
+    // hardware — that was ADR 0049's silent failure). Since this runs in the
+    // worker, whose thread is on `Winsta0\Winlogon`, that screen is the
+    // secure desktop (ADR 0056).
+    let driver = wide("DISPLAY");
     // SAFETY: every call below takes plain values or owns what it creates;
     // the DCs and bitmap are released on every exit path via
-    // `DeleteDC`/`DeleteObject`.
+    // `DeleteDC`/`DeleteObject`. `driver` is a null-terminated wide string
+    // that outlives the `CreateDCW` call.
     unsafe {
-        let dc = CreateDCW(PCWSTR::null(), PCWSTR::null(), PCWSTR::null(), None);
+        let dc = CreateDCW(PCWSTR(driver.as_ptr()), PCWSTR::null(), PCWSTR::null(), None);
         if dc.is_invalid() {
             return None;
         }

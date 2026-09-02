@@ -35,6 +35,8 @@ mod install;
 #[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
+mod secure_desktop_launch;
+#[cfg(target_os = "windows")]
 mod windows_service;
 
 fn main() {
@@ -57,6 +59,17 @@ fn main() {
         // binary rather than a shell command line the client builds: the
         // client elevates *this*, and the elevated code is ours.
         let args: Vec<String> = std::env::args().collect();
+        // The secure-desktop capture worker (ADR 0056): the service
+        // re-executes this binary with this one argument into the console
+        // session on `Winsta0\Winlogon`. It captures one frame and exits with
+        // its outcome as the exit code, touching neither the SCM nor the
+        // pipe. Checked first so it can never be confused with a normal run.
+        if args
+            .iter()
+            .any(|arg| arg == lumepeer_service::SECURE_DESKTOP_WORKER_ARG)
+        {
+            std::process::exit(i32::try_from(secure_desktop_launch::run_worker()).unwrap_or(1));
+        }
         if args.iter().any(|arg| arg == "--install") {
             match install::install() {
                 Ok(()) => return,

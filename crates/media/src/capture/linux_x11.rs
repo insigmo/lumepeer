@@ -267,13 +267,32 @@ fn display_modes_for_inner(target: CaptureTarget) -> Option<Vec<crate::capture::
         .reply()
         .ok()?;
 
-    let modes = output_info
+    let modes: Vec<_> = output_info
         .modes
         .iter()
         .filter_map(|mode_id| resources.modes.iter().find(|info| info.id == *mode_id))
         .filter_map(mode_info_to_display_mode)
         .collect();
-    Some(crate::capture::dedupe_and_sort_display_modes(modes))
+    // The rate this output is running at right now, so folding one mode per
+    // resolution keeps it wherever the target resolution offers it. Read
+    // from the CRTC already reachable here rather than through
+    // `current_display_mode_for`, which would open a second X connection to
+    // answer the same question.
+    let current_hz = (output_info.crtc != 0)
+        .then(|| {
+            connection
+                .randr_get_crtc_info(output_info.crtc, resources.config_timestamp)
+                .ok()?
+                .reply()
+                .ok()
+        })
+        .flatten()
+        .and_then(|crtc_info| resources.modes.iter().find(|info| info.id == crtc_info.mode))
+        .and_then(mode_info_to_display_mode)
+        .map(|mode| mode.refresh_hz);
+    Some(crate::capture::fold_display_modes_by_resolution(
+        modes, current_hz,
+    ))
 }
 
 /// Converts one `RandR` `ModeInfo` into a [`crate::capture::DisplayMode`],
@@ -1688,17 +1707,18 @@ mod tests {
         for mode in &modes {
             assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 0);
         }
-        // Deduplicated and sorted largest-first (docs/bugs/
+        // One entry per resolution, largest first (docs/bugs/
         // 16-host-display-mode.md #1, #3): the native/current resolution
         // stays ahead of legacy VESA modes rather than being truncated away
         // by the cap.
-        let mut sorted = modes.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        sorted.reverse();
+        let sizes: Vec<_> = modes.iter().map(|mode| (mode.width, mode.height)).collect();
+        let mut unique = sizes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        unique.reverse();
         assert_eq!(
-            sorted, modes,
-            "the list was not deduplicated and sorted largest-first"
+            sizes, unique,
+            "the list was not folded to one mode per resolution, largest first"
         );
         assert!(
             modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,

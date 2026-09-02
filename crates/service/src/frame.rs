@@ -166,6 +166,48 @@ impl Writer {
         })
     }
 
+    /// Opens the mapping the service already [`create`](Self::create)d, for
+    /// write (ADR 0056).
+    ///
+    /// This is the worker's end: a second `LocalSystem` process, launched by
+    /// the service into the console session on the secure desktop, that only
+    /// ever *fills* a mapping the long-lived service is holding open — never
+    /// creates one of its own, so nothing keeps the mapping alive but the
+    /// service, and it stays alive exactly as long as ADR 0049's ordering
+    /// needs (the service holds it past the pipe reply the client reads
+    /// after). `None` if the mapping does not exist yet (the service never
+    /// created it) or cannot be opened for write (the caller is not
+    /// `LocalSystem`, which the DACL's `SY:GA` is the only writer for).
+    #[must_use]
+    pub fn open() -> Option<Self> {
+        let name = wide(SECURE_DESKTOP_MAPPING_NAME);
+        // SAFETY: `name` is a null-terminated wide string that outlives the
+        // call; opening an existing mapping by name needs no security
+        // attributes of its own.
+        let handle = unsafe {
+            windows::Win32::System::Memory::OpenFileMappingW(
+                FILE_MAP_ALL_ACCESS.0,
+                false,
+                PCWSTR(name.as_ptr()),
+            )
+        }
+        .ok()?;
+        // SAFETY: `handle` was just opened with `FILE_MAP_ALL_ACCESS`, which is
+        // exactly the access this writable view requests.
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+        if view.Value.is_null() {
+            // SAFETY: `handle` is live and owned here.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return None;
+        }
+        Some(Self {
+            handle,
+            base: view.Value.cast::<u8>(),
+        })
+    }
+
     /// Publishes one frame, overwriting whatever was there before.
     ///
     /// Refuses rather than truncates a payload larger than

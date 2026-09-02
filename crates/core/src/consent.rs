@@ -66,11 +66,14 @@ pub struct Grants {
     pub display_mode: bool,
     /// See the host's secure desktop (UAC prompt, lock screen, fast user
     /// switch) instead of the honest "can't see this" message
-    /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049).
+    /// (`docs/bugs/15-secure-desktop-capture.md`, ADR 0049, ADR 0056).
     ///
-    /// Independent of `view`, and never implied by a role below
-    /// `FullControl`: a guest that is only watching is not thereby a guest
-    /// who should watch an administrator authenticate.
+    /// On for every role by default (ADR 0056), the same as `view`: seeing
+    /// that the remote machine is asking for administrator consent is part of
+    /// watching the screen, not a capability above it — the honest message
+    /// already discloses that a prompt is up, this only replaces it with the
+    /// picture. Still an [`IndependentGrant`], so a host can withdraw it from
+    /// a running session and the actor re-reads it before every capture.
     pub secure_desktop: bool,
 }
 
@@ -114,6 +117,12 @@ impl Grants {
     /// moves each one on its own, which is what lets the host withdraw a
     /// single permission from a full-control session without ending it.
     /// See ADR 0054, which amends ADR 0029/0048/0049 on this point only.
+    ///
+    /// `secure_desktop` is the exception to "lesser roles imply nothing
+    /// beyond `view`": ADR 0056 turns it on for every role, because seeing
+    /// that the remote machine is asking for administrator consent is part of
+    /// watching the screen (the honest message already says as much). It
+    /// stays independent, so a host can still revoke it on its own.
     #[must_use]
     pub const fn from_role(role: Role) -> Self {
         let full = matches!(role, Role::FullControl);
@@ -125,7 +134,10 @@ impl Grants {
             file_transfer: full,
             recording: full,
             display_mode: full,
-            secure_desktop: full,
+            // On for every role, like `view` (ADR 0056), not just full
+            // control — a view-only guest is the case that needs to see the
+            // prompt instead of a frozen picture.
+            secure_desktop: true,
         }
     }
 
@@ -453,7 +465,10 @@ mod tests {
         assert!(grants.display_mode);
         assert!(grants.secure_desktop);
 
-        // Watching is watching: nothing else rides along with it.
+        // Watching is watching: nothing else rides along with it — except
+        // `secure_desktop`, which ADR 0056 puts on for every role the same
+        // way `view` is, so a view-only guest sees a UAC prompt instead of a
+        // frozen picture.
         for role in [Role::ViewOnly, Role::ControlLimited] {
             let lesser = Grants::from_role(role);
             assert!(lesser.view);
@@ -462,7 +477,7 @@ mod tests {
             assert!(!lesser.file_transfer);
             assert!(!lesser.recording);
             assert!(!lesser.display_mode);
-            assert!(!lesser.secure_desktop);
+            assert!(lesser.secure_desktop);
         }
     }
 
@@ -472,13 +487,14 @@ mod tests {
         assert!(!grants.get(IndependentGrant::DisplayMode));
         grants.set(IndependentGrant::DisplayMode, true);
         assert!(grants.get(IndependentGrant::DisplayMode));
-        // Nothing else moved.
+        // Nothing else moved. `secure_desktop` is on for a view-only base by
+        // default (ADR 0056) and toggling `display_mode` must not disturb it.
         assert!(grants.view && !grants.input);
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
         assert!(!grants.recording);
-        assert!(!grants.secure_desktop);
+        assert!(grants.secure_desktop);
         // And it is still withdrawable on its own from a session that got it
         // from the role rather than from a switch.
         let mut full = Grants::from_role(Role::FullControl);
@@ -489,7 +505,11 @@ mod tests {
 
     #[test]
     fn secure_desktop_is_independent_of_every_other_grant() {
+        // On by default for a view-only base (ADR 0056); withdraw it and put
+        // it back, checking nothing else moves either way.
         let mut grants = Grants::from_role(Role::ViewOnly);
+        assert!(grants.get(IndependentGrant::SecureDesktop));
+        grants.set(IndependentGrant::SecureDesktop, false);
         assert!(!grants.get(IndependentGrant::SecureDesktop));
         grants.set(IndependentGrant::SecureDesktop, true);
         assert!(grants.get(IndependentGrant::SecureDesktop));

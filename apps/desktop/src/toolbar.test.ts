@@ -11,7 +11,6 @@ import {
   hostResolutionKey,
   hostResolutionsFrom,
   mountToolbar,
-  refreshHzFor,
   renderToolbar,
   scalePercentFor,
   ToolbarState,
@@ -455,33 +454,6 @@ describe('the floating session toolbar', () => {
     });
   });
 
-  describe('refreshHzFor', () => {
-    // The five rates a real 4096x2160 mode list offers.
-    const rates = [30, 29, 25, 24, 23];
-
-    it('quality takes the highest rate, performance the middle one', () => {
-      expect(refreshHzFor('quality', rates)).toBe(30);
-      expect(refreshHzFor('performance', rates)).toBe(25);
-    });
-
-    it('balance sits between the middle and the highest', () => {
-      expect(refreshHzFor('balance', rates)).toBe(29);
-      // Eight rates, as a real 3840x2160 list has: middle 29, highest 60,
-      // and balance halfway between those two.
-      expect(refreshHzFor('balance', [23, 24, 25, 29, 30, 50, 59, 60])).toBe(50);
-    });
-
-    it('a single rate is what every preset gets', () => {
-      for (const preset of ['performance', 'balance', 'quality'] as const) {
-        expect(refreshHzFor(preset, [60])).toBe(60);
-      }
-    });
-
-    it('no rates at all is null, not a guess', () => {
-      expect(refreshHzFor('quality', [])).toBeNull();
-    });
-  });
-
   describe('hostResolutionsFrom', () => {
     it('folds one entry per refresh rate down to one entry per resolution', () => {
       const folded = hostResolutionsFrom([
@@ -559,14 +531,13 @@ describe('the floating session toolbar', () => {
     }
   });
 
-  it('a preset also moves the host screen to its refresh rate, at the size it is already at', async () => {
+  it('a preset caps the picture only, and never touches the host screen', async () => {
     const commands = fakeCommands();
     commands.monitorsList.mockResolvedValue([{ id: 0, width: 3840, height: 2160, primary: true }]);
     commands.hostDisplayModes.mockResolvedValue({
       modes: [
         { id: 0, width: 3840, height: 2160, refresh_hz: 60 },
-        { id: 1, width: 3840, height: 2160, refresh_hz: 30 },
-        { id: 2, width: 1920, height: 1080, refresh_hz: 60 },
+        { id: 1, width: 1920, height: 1080, refresh_hz: 60 },
       ],
       reason: null,
     });
@@ -585,33 +556,10 @@ describe('the floating session toolbar', () => {
         select.value = 'performance';
         select.dispatchEvent(new Event('change'));
       }
-      // Two rates at 3840x2160, so the middle one is the lower: mode 1.
-      // Nobody picked a host resolution, so it is the watched monitor's own
-      // size that the rate is chosen within — never the 1920x1080 entry.
-      await vi.waitFor(() => expect(commands.hostDisplaySetMode).toHaveBeenCalledWith('host-ab12', 1));
-    } finally {
-      stop();
-    }
-  });
-
-  it('leaves the host screen alone when it announced no modes of its own', async () => {
-    const commands = fakeCommands();
-    commands.hostDisplayModes.mockResolvedValue({ modes: [], reason: 'not_granted' });
-    const stop = mountToolbar(
-      container,
-      'en',
-      'host-ab12',
-      commands,
-      fakeHooks({ chatVisible: () => false }),
-    );
-    try {
-      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
-      await vi.waitFor(() => expect(commands.hostDisplayModes).toHaveBeenCalled());
-      const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-quality"]');
-      if (select) {
-        select.value = 'performance';
-        select.dispatchEvent(new Event('change'));
-      }
+      // The preset is this window's own picture ceiling. Refresh rate is not
+      // a choice this side makes, so the host's monitor is left exactly as
+      // its owner set it — mode switches happen only from the resolution
+      // picker below.
       await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalled());
       expect(commands.hostDisplaySetMode).not.toHaveBeenCalled();
     } finally {
@@ -694,7 +642,7 @@ describe('the floating session toolbar', () => {
     expect(select?.value).toBe('1920x1080');
   });
 
-  it('picking a host resolution switches the host at the preset\'s refresh rate (docs/bugs/16-host-display-mode.md #4)', async () => {
+  it('picking a host resolution switches the host to that size (docs/bugs/16-host-display-mode.md #4)', async () => {
     const commands = fakeCommands();
     commands.hostDisplayModes.mockResolvedValue({
       modes: [
@@ -727,8 +675,8 @@ describe('the floating session toolbar', () => {
         select.value = '2560x1440';
         select.dispatchEvent(new Event('change'));
       }
-      // The preset is still `quality`, which takes the highest rate on offer
-      // at that size: 144 Hz, mode 1.
+      // An older host announces one entry per rate, highest first: mode 1.
+      // A current host announces 2560x1440 once and this picks that entry.
       await vi.waitFor(() =>
         expect(commands.hostDisplaySetMode).toHaveBeenCalledWith('host-ab12', 1),
       );

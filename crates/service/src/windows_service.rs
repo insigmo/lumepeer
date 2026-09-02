@@ -183,12 +183,18 @@ fn report(
 /// Shared by the service path and `--console`, so the two cannot drift: the
 /// only difference between them is which privileges `SendSAS` runs with.
 pub fn serve_until_stopped(stopping: &AtomicBool) {
+    // The secure-desktop frame mapping, held for the service's whole run so a
+    // frame a worker writes survives past the pipe reply the client reads
+    // after it (ADR 0049's ordering, ADR 0056's worker). Created lazily on
+    // the first capture request, then kept — this is the only long-lived
+    // state the accept loop carries.
+    let mut secure_desktop_writer: Option<lumepeer_service::frame::Writer> = None;
     loop {
         let Some(pipe) = create_pipe() else {
             tracing::error!("cannot create the service endpoint; giving up");
             return;
         };
-        let served = accept_and_serve(pipe, stopping);
+        let served = accept_and_serve(pipe, stopping, &mut secure_desktop_writer);
         // SAFETY: `pipe` came from `CreateNamedPipeW` above and is not used
         // again after this call.
         unsafe {
@@ -258,7 +264,11 @@ fn create_pipe() -> Option<HANDLE> {
 ///
 /// Returns `false` when the endpoint itself failed, which ends the loop; a
 /// client that misbehaves only ends its own connection.
-fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
+fn accept_and_serve(
+    pipe: HANDLE,
+    stopping: &AtomicBool,
+    secure_desktop_writer: &mut Option<lumepeer_service::frame::Writer>,
+) -> bool {
     // SAFETY: `pipe` is a live named-pipe handle from `create_pipe`.
     let connected = unsafe { ConnectNamedPipe(pipe, None) };
     if connected.is_err() {
@@ -286,7 +296,7 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
     // `read` outlives the call.
     let ok = unsafe { ReadFile(pipe, Some(&mut frame), Some(&raw mut read), None) };
     let status = if ok.is_ok() && read as usize == FRAME_LEN {
-        serve(pipe, frame)
+        serve(pipe, frame, secure_desktop_writer)
     } else {
         // A short or failed read is not an operation. Answering `refused`
         // rather than staying silent keeps the client from waiting out its
@@ -321,7 +331,11 @@ fn accept_and_serve(pipe: HANDLE, stopping: &AtomicBool) -> bool {
 /// about who is allowed to run a session — `lumepeer-core`, in the main
 /// process, already decided this call was worth making before the pipe was
 /// ever touched.
-fn serve(pipe: HANDLE, frame: [u8; FRAME_LEN]) -> u8 {
+fn serve(
+    pipe: HANDLE,
+    frame: [u8; FRAME_LEN],
+    secure_desktop_writer: &mut Option<lumepeer_service::frame::Writer>,
+) -> u8 {
     match parse_request(&frame) {
         Some(OP_DELIVER_SAS) => {
             tracing::info!("delivering the secure attention sequence");
@@ -334,7 +348,9 @@ fn serve(pipe: HANDLE, frame: [u8; FRAME_LEN]) -> u8 {
             }
             STATUS_OK
         }
-        Some(OP_CAPTURE_SECURE_DESKTOP) => serve_secure_desktop_capture(pipe),
+        Some(OP_CAPTURE_SECURE_DESKTOP) => {
+            serve_secure_desktop_capture(pipe, secure_desktop_writer)
+        }
         _ => {
             tracing::warn!("refusing an unknown request");
             STATUS_REFUSED
@@ -343,25 +359,39 @@ fn serve(pipe: HANDLE, frame: [u8; FRAME_LEN]) -> u8 {
 }
 
 /// [`OP_CAPTURE_SECURE_DESKTOP`]'s half of [`serve`], split out so the
-/// session check and the capture-plus-publish sequence read as one thing
-/// rather than another branch of an already-branching match.
-fn serve_secure_desktop_capture(pipe: HANDLE) -> u8 {
+/// session check and the capture sequence read as one thing rather than
+/// another branch of an already-branching match.
+///
+/// The capture itself does not happen here: the service runs in session 0 and
+/// cannot reach the console session's `Winsta0\Winlogon`, so it launches a
+/// worker that can (`secure_desktop_launch`, ADR 0056). This function only
+/// makes the authorization-adjacent decisions the worker must not — the
+/// session-binding check (ADR 0049) — and keeps the frame mapping alive so
+/// the worker's frame outlives this reply for the client to read.
+fn serve_secure_desktop_capture(
+    pipe: HANDLE,
+    secure_desktop_writer: &mut Option<lumepeer_service::frame::Writer>,
+) -> u8 {
     if !caller_is_in_active_console_session(pipe) {
         tracing::warn!("refusing a secure-desktop capture from outside the active console session");
         return STATUS_REFUSED;
     }
-    let Some((width, height, data)) = crate::secure_desktop::capture() else {
-        tracing::warn!("could not capture the secure desktop");
-        return STATUS_REFUSED;
-    };
-    let Some(writer) = lumepeer_service::frame::Writer::create() else {
+    // Create the mapping the worker will fill, once, and hold it for the rest
+    // of the service's life. It has to exist before the worker runs (the
+    // worker only ever *opens* it) and stay alive after the worker exits
+    // (nothing else keeps it mapped), which is exactly what holding it in the
+    // accept loop's own state does.
+    if secure_desktop_writer.is_none() {
+        *secure_desktop_writer = lumepeer_service::frame::Writer::create();
+    }
+    if secure_desktop_writer.is_none() {
         tracing::error!("could not open the secure-desktop frame mapping");
         return STATUS_REFUSED;
-    };
-    if writer.write(width, height, &data) {
-        tracing::info!(width, height, "published a secure-desktop frame");
+    }
+    if crate::secure_desktop_launch::capture_via_worker() {
         STATUS_OK
     } else {
+        tracing::warn!("could not capture the secure desktop");
         STATUS_REFUSED
     }
 }

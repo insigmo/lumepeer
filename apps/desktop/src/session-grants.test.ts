@@ -36,7 +36,10 @@ const fullControl: SessionStatus = {
   secure_desktop_active: false,
 };
 
-/** A view-only session, holding nothing but the picture. */
+/**
+ * A view-only session, holding nothing but the picture — which now includes
+ * the secure desktop, on for every role (ADR 0056).
+ */
 const viewOnly: SessionStatus = {
   ...fullControl,
   peer_label: 'guest-cd34',
@@ -47,7 +50,7 @@ const viewOnly: SessionStatus = {
   file_transfer: false,
   recording: false,
   display_mode: false,
-  secure_desktop: false,
+  secure_desktop: true,
 };
 
 let container: HTMLElement;
