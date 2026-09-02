@@ -21,3 +21,13 @@ pub mod protocol;
 /// Shared so the installer, the status query and the service itself cannot
 /// disagree about what to look for.
 pub const SERVICE_NAME: &str = "LumepeerHelper";
+
+/// The single argument that re-executes this binary as the secure-desktop
+/// capture worker (ADR 0056).
+///
+/// The service launches a copy of itself with exactly this argument into the
+/// console session's `Winsta0\Winlogon` desktop; the worker opens the shared
+/// mapping, takes one GDI snapshot of that desktop, writes it and exits. Both
+/// the launcher and `main.rs`'s argument check read this one constant so they
+/// cannot drift.
+pub const SECURE_DESKTOP_WORKER_ARG: &str = "--secure-desktop-worker";

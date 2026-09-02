@@ -242,24 +242,39 @@ pub struct DisplayMode {
     pub refresh_hz: u32,
 }
 
-/// Deduplicates identical modes, sorts by resolution then refresh rate, and
-/// caps the result at [`MAX_DISPLAY_MODES_PER_HOST`]
-/// (docs/bugs/16-host-display-mode.md #1).
+/// Folds `modes` down to one entry per resolution, largest first, capped at
+/// [`MAX_DISPLAY_MODES_PER_HOST`] (docs/bugs/16-host-display-mode.md #1).
 ///
 /// Shared by every real backend below so "what counts as a duplicate" and
 /// "what order a human sees" are decided once, not per platform.
+///
+/// Refresh rate is not a choice this list offers: the guest picks a
+/// resolution and nothing else, so a driver that lists the same size at six
+/// rates would otherwise spend six slots — and, before the fold, six slots
+/// of a much smaller cap — on one row of the picker. Each surviving mode
+/// carries `prefer_hz` when its resolution offers that rate, which is how
+/// the host's own current refresh rate is kept across a resolution change
+/// rather than silently pushed to whatever the driver lists highest; where
+/// that rate does not exist, the highest one at that resolution wins.
 #[must_use]
-pub fn dedupe_and_sort_display_modes(mut modes: Vec<DisplayMode>) -> Vec<DisplayMode> {
-    modes.sort_unstable();
-    modes.dedup();
-    // Largest first, then truncate: a monitor whose full mode list exceeds
-    // the cap loses its smallest, least useful legacy VESA entries (640x480
-    // and friends) rather than the native or currently-set resolution a
-    // human is most likely to want back. Found on real 4K hardware, whose
-    // driver lists dozens of legacy modes below the cap and would otherwise
-    // make the monitor's own current mode disappear from its own list
-    // (docs/bugs/16-host-display-mode.md #1, #3).
-    modes.reverse();
+pub fn fold_display_modes_by_resolution(
+    mut modes: Vec<DisplayMode>,
+    prefer_hz: Option<u32>,
+) -> Vec<DisplayMode> {
+    // Sorted so that, within one resolution, the mode to keep sorts first:
+    // the preferred rate if this resolution has it, then the highest rate.
+    // Descending overall, so the fold below keeps the native resolution
+    // ahead of legacy VESA entries rather than truncating it away (docs/
+    // bugs/16-host-display-mode.md #1, #3).
+    modes.sort_unstable_by_key(|mode| {
+        (
+            std::cmp::Reverse(mode.width),
+            std::cmp::Reverse(mode.height),
+            prefer_hz != Some(mode.refresh_hz),
+            std::cmp::Reverse(mode.refresh_hz),
+        )
+    });
+    modes.dedup_by_key(|mode| (mode.width, mode.height));
     modes.truncate(MAX_DISPLAY_MODES_PER_HOST);
     modes
 }
@@ -350,8 +365,8 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// reporting nothing, not by inventing values (§18). Wayland has no such
     /// right without compositor privilege it does not have (ADR 0010), and
     /// macOS is out of scope this iteration — both keep this default.
-    /// Windows and X11 override it with a real enumeration, deduplicated and
-    /// sorted by [`dedupe_and_sort_display_modes`].
+    /// Windows and X11 override it with a real enumeration, one entry per
+    /// resolution, folded by [`fold_display_modes_by_resolution`].
     fn display_modes(&self, _target: CaptureTarget) -> Vec<DisplayMode> {
         Vec::new()
     }
@@ -1089,6 +1104,64 @@ mod tests {
     #[test]
     fn session_type_is_unknown_with_no_signal_at_all() {
         assert_eq!(session_type_from(None, None, None), SessionType::Unknown);
+    }
+
+    fn mode(width: u32, height: u32, refresh_hz: u32) -> DisplayMode {
+        DisplayMode {
+            width,
+            height,
+            refresh_hz,
+        }
+    }
+
+    /// The picker offers resolutions, not rates: a driver listing one size
+    /// at several rates must still cost one row (docs/bugs/
+    /// 16-host-display-mode.md #1).
+    #[test]
+    fn folding_keeps_one_mode_per_resolution_largest_first() {
+        let folded = fold_display_modes_by_resolution(
+            vec![
+                mode(1920, 1080, 60),
+                mode(3840, 2160, 30),
+                mode(1920, 1080, 144),
+                mode(3840, 2160, 60),
+                mode(1920, 1080, 60),
+            ],
+            None,
+        );
+        assert_eq!(folded, vec![mode(3840, 2160, 60), mode(1920, 1080, 144)]);
+    }
+
+    /// A resolution change must not also become a refresh-rate change: where
+    /// the host's current rate exists at the target resolution, that is the
+    /// mode announced, whatever higher rate the driver lists beside it.
+    #[test]
+    fn folding_prefers_the_rate_the_host_is_already_running() {
+        let folded = fold_display_modes_by_resolution(
+            vec![
+                mode(1920, 1080, 144),
+                mode(1920, 1080, 60),
+                mode(1280, 720, 75),
+                mode(1280, 720, 120),
+            ],
+            Some(60),
+        );
+        // 1280x720 has no 60 Hz mode at all, so its highest rate wins there.
+        assert_eq!(folded, vec![mode(1920, 1080, 60), mode(1280, 720, 120)]);
+    }
+
+    /// The cap is a hostile-peer bound, not a shortlist: it must not be
+    /// reachable by any real monitor, and what it does cut is the smallest
+    /// resolutions rather than the native one.
+    #[test]
+    fn folding_caps_at_the_protocol_bound_keeping_the_largest() {
+        let modes: Vec<_> = (1..=u32::try_from(MAX_DISPLAY_MODES_PER_HOST).unwrap() + 5)
+            .map(|n| mode(n * 100, n * 50, 60))
+            .collect();
+        let widest = modes.last().copied().unwrap();
+        let folded = fold_display_modes_by_resolution(modes, None);
+        assert_eq!(folded.len(), MAX_DISPLAY_MODES_PER_HOST);
+        assert_eq!(folded.first().copied(), Some(widest));
     }
 
     /// §8.1 covers the pointer too: an idle controller reports no cursor, for

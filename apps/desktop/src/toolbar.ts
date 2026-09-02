@@ -171,12 +171,12 @@ export const tauriToolbarCommands: ToolbarCommands = {
  * The three quality presets the guest chooses between (§11; D7, docs/bugs/
  * 13-stream-resolution.md task 4).
  *
- * One control with two effects: {@link scalePercentFor} turns it into the
- * ceiling on the picture *this window* receives, and {@link refreshHzFor}
- * turns it into the refresh rate the *host's own screen* runs at. They
- * replace the free-standing "picture resolution" list, which sat next to
- * the host-screen picker saying a similar-sounding thing about a different
- * machine — two controls a person had to keep consistent by hand.
+ * {@link scalePercentFor} turns one into the ceiling on the picture *this
+ * window* receives. It replaces the free-standing "picture resolution"
+ * list, which sat next to the host-screen picker saying a similar-sounding
+ * thing about a different machine — two controls a person had to keep
+ * consistent by hand. The host's own screen is not touched here: refresh
+ * rate is nothing this side chooses.
  *
  * Naming the tradeoff rather than a pixel count is what lets one choice
  * drive both: "720p at 50 Hz" is two decisions, "balance" is one.
@@ -225,29 +225,6 @@ export function scalePercentFor(preset: QualityPreset, monitor: MonitorDto | und
   return Math.max(percent, MIN_SCALE_PERCENT);
 }
 
-/**
- * The refresh rate `preset` maps to among `rates`, the distinct rates one
- * host resolution offers, or `null` when it offers none.
- *
- * Ordered by how much of the host's own hardware each preset is willing to
- * spend: `quality` takes the highest rate there is, `performance` the middle
- * one, and `balance` sits halfway between those two. Deliberately not "the
- * lowest": the bottom of a real mode list is 23–24 Hz, a cinema cadence
- * rather than a usable desktop, and nothing about "performance" should mean
- * "unusable".
- */
-export function refreshHzFor(preset: QualityPreset, rates: readonly number[]): number | null {
-  if (rates.length === 0) {
-    return null;
-  }
-  const sorted = [...rates].sort((a, b) => a - b);
-  const top = sorted.length - 1;
-  const middle = Math.floor(top / 2);
-  const index =
-    preset === 'quality' ? top : preset === 'performance' ? middle : Math.floor((middle + top) / 2);
-  return sorted[index] ?? null;
-}
-
 /** One resolution the host's screen offers, and every mode that reaches it. */
 export interface HostResolution {
   width: number;
@@ -260,11 +237,11 @@ export interface HostResolution {
  * The distinct resolutions among `modes`, each keeping the modes that reach
  * it (docs/bugs/16-host-display-mode.md #4).
  *
- * The host announces one entry per resolution *and* refresh rate, which made
- * the picker list "4096×2160" five times over — five rows to read carefully
- * apart, for a choice nobody was making. The rate is picked from the quality
- * preset by {@link refreshHzFor} instead, so the list folds down to what the
- * guest was actually choosing between.
+ * Hosts fold their own list to one mode per resolution, so this normally
+ * changes nothing. It stays because a host on an older build still
+ * announces one entry per resolution *and* refresh rate, which made the
+ * picker list "4096×2160" five times over — five rows to read carefully
+ * apart, for a choice nobody was making.
  */
 export function hostResolutionsFrom(modes: readonly HostDisplayModeDto[]): HostResolution[] {
   const bySize = new Map<string, HostResolution>();
@@ -884,27 +861,23 @@ export function mountToolbar(
   }
 
   /**
-   * Switches the host's own screen to `preset`'s refresh rate at the
-   * resolution it is already at.
+   * Switches the host's own screen to the resolution now selected.
    *
    * Does nothing at all when there is nothing to do it with: no announced
    * modes (no `display_mode` grant, or a platform that cannot switch), or a
    * resolution the announced list does not contain. Silence here is the
    * right answer — the host's screen is not this window's to guess at.
+   *
+   * The first mode at that size is the one asked for: a current host
+   * announces exactly one, already carrying the rate its screen runs at,
+   * and an older one announces its highest rate first.
    */
-  function applyHostMode(preset: QualityPreset): void {
+  function applyHostResolution(): void {
     const key = hostResolutionNow();
     const resolution = hostResolutionsFrom(state.hostDisplayModes.modes).find(
       (entry) => hostResolutionKey(entry) === key,
     );
-    if (!resolution) {
-      return;
-    }
-    const hz = refreshHzFor(
-      preset,
-      resolution.modes.map((mode) => mode.refresh_hz),
-    );
-    const mode = resolution.modes.find((entry) => entry.refresh_hz === hz);
+    const mode = resolution?.modes[0];
     if (!mode) {
       return;
     }
@@ -1044,17 +1017,11 @@ export function mountToolbar(
         // the selector keeps showing what was asked for, and the picture
         // simply does not change.
       });
-      // The preset names a refresh rate as well as a picture ceiling, so the
-      // host's own screen follows it — at whatever resolution it is already
-      // sitting at. A host that never announced any modes (no `display_mode`
-      // grant, or a platform that cannot switch) resolves to `null` here and
-      // is left alone.
-      applyHostMode(preset);
       draw();
     },
     pickHostResolution(key: string): void {
       state.hostResolution = key;
-      applyHostMode(state.quality);
+      applyHostResolution();
       draw();
     },
     zoomBy(steps: number): void {

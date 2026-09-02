@@ -1299,7 +1299,12 @@ mod dxgi {
                 });
             }
             modes.retain(|mode| mode.refresh_hz > 1);
-            crate::capture::dedupe_and_sort_display_modes(modes)
+            // The rate this monitor runs at right now, so folding one mode
+            // per resolution keeps it wherever the target resolution offers
+            // it rather than pushing the screen to the highest rate the
+            // driver lists there.
+            let current_hz = Self::current_display_mode_for(target).map(|mode| mode.refresh_hz);
+            crate::capture::fold_display_modes_by_resolution(modes, current_hz)
         }
 
         /// Switches `target`'s monitor to `mode` via `ChangeDisplaySettingsExW`
@@ -2176,15 +2181,16 @@ mod dxgi {
             for mode in &modes {
                 assert!(mode.width > 0 && mode.height > 0 && mode.refresh_hz > 1);
             }
-            // Deduplicated and sorted largest-first, per docs/bugs/
-            // 16-host-display-mode.md #1, #3: no duplicate triples, and the
-            // native/current resolution kept ahead of legacy VESA modes
+            // One entry per resolution, largest first, per docs/bugs/
+            // 16-host-display-mode.md #1, #3: no size appears twice, and the
+            // native/current resolution is kept ahead of legacy VESA modes
             // rather than truncated away by the cap.
-            let mut sorted = modes.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            sorted.reverse();
-            assert_eq!(sorted, modes);
+            let sizes: Vec<_> = modes.iter().map(|mode| (mode.width, mode.height)).collect();
+            let mut unique = sizes.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            unique.reverse();
+            assert_eq!(sizes, unique, "the list was not folded to one mode per resolution, largest first");
             assert!(
                 modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
                 "the list was not capped"

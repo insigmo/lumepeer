@@ -794,27 +794,37 @@ mod tests {
 
     #[test]
     fn every_independent_grant_can_be_turned_on_and_off() {
+        // A view-only session starts most grants off, but `secure_desktop` on
+        // (ADR 0056), so "moving one leaves the others where they were" is
+        // measured against the role's own defaults, not against all-off.
+        let base = Grants::from_role(Role::ViewOnly);
         for which in ALL_INDEPENDENT {
             let mut manager = SessionManager::new();
             manager.grant(peer(1), Role::ViewOnly).unwrap();
-            assert!(!manager.grants(&peer(1)).unwrap().get(which));
 
-            let event = manager.set_grant(peer(1), which, true).unwrap();
+            // Drive `which` to the opposite of its default and back, so every
+            // grant is exercised in both directions regardless of where it
+            // starts.
+            let default = base.get(which);
+            let event = manager.set_grant(peer(1), which, !default).unwrap();
             assert_eq!(
                 event,
                 AuditEvent::GrantChanged {
                     grant: which,
-                    enabled: true
+                    enabled: !default
                 }
             );
-            assert!(manager.grants(&peer(1)).unwrap().get(which));
-            // One grant moving leaves the other five where they were.
+            assert_eq!(manager.grants(&peer(1)).unwrap().get(which), !default);
+            // One grant moving leaves the other five at their defaults.
             for other in ALL_INDEPENDENT.into_iter().filter(|o| *o != which) {
-                assert!(!manager.grants(&peer(1)).unwrap().get(other));
+                assert_eq!(
+                    manager.grants(&peer(1)).unwrap().get(other),
+                    base.get(other)
+                );
             }
 
-            manager.set_grant(peer(1), which, false).unwrap();
-            assert!(!manager.grants(&peer(1)).unwrap().get(which));
+            manager.set_grant(peer(1), which, default).unwrap();
+            assert_eq!(manager.grants(&peer(1)).unwrap().get(which), default);
         }
     }
 
