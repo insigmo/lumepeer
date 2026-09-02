@@ -354,6 +354,11 @@ pub struct SessionStatusDto {
     /// message (ADR 0049). Independent of every other grant, `input`
     /// included, and off by default.
     pub secure_desktop: bool,
+    /// Whether this guest may inject input into the host's secure desktop —
+    /// click the UAC prompt, type into the lock screen (ADR 0057). The most
+    /// consequential grant: deny-by-default and derived from no role, not even
+    /// full control, so it is always the host toggling this switch by hand.
+    pub secure_desktop_input: bool,
     /// Whether this guest is, right now, actually seeing it. Distinct from
     /// `secure_desktop` above the same way `recording_active` is distinct
     /// from `recording`: the host's non-removable indicator hangs off this
@@ -672,6 +677,7 @@ pub async fn session_status(
             recording_active: s.recording_active,
             record_request: s.record_request,
             secure_desktop: s.grants.secure_desktop,
+            secure_desktop_input: s.grants.secure_desktop_input,
             secure_desktop_active: s.secure_desktop_active,
         })
         .collect())

@@ -18,7 +18,7 @@
 //! missing service degrades the privilege level or the picture, never leaves
 //! the caller unable to tell what happened (§18).
 
-use crate::protocol::{OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS};
+use crate::protocol::{InjectAction, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS};
 
 /// Asks the service to deliver the Secure Attention Sequence.
 ///
@@ -85,6 +85,30 @@ pub fn capture_secure_desktop_frame() -> Option<SecureDesktopFrame> {
     }
 }
 
+/// Asks the service to perform one input event on the secure desktop
+/// (ADR 0057).
+///
+/// Returns whether the service confirmed it. `false` covers every reason at
+/// once, exactly like [`deliver_sas`]: not installed, not reachable, the
+/// caller's session is not the one on the console, the worker could not reach
+/// `Winlogon`, or the descriptor was refused. The caller — the host actor,
+/// which has already checked the `secure_desktop_input` grant before calling —
+/// treats all of them the same: the event did not land.
+#[must_use]
+pub fn inject_secure_desktop(action: InjectAction) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        round_trip_inject(action)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No secure desktop concept off Windows, so no service, so nothing
+        // to ask.
+        let _ = action;
+        false
+    }
+}
+
 /// Whether the service is reachable right now.
 ///
 /// Distinct from "installed": a service that is installed but stopped is not
@@ -125,6 +149,33 @@ fn round_trip(op: u8) -> bool {
     // `read_exact`, not `read`: a short answer is not an answer. The service
     // always writes the whole frame, so anything less means the connection
     // died mid-reply and the operation's outcome is unknown — which is `false`.
+    if pipe.read_exact(&mut reply).is_err() {
+        return false;
+    }
+    succeeded(&reply)
+}
+
+/// The [`round_trip`] variant that carries an inject descriptor: the two-byte
+/// request frame followed by the fixed [`crate::protocol::INJECT_PAYLOAD_LEN`]
+/// descriptor, then the ordinary two-byte reply. Written as one contiguous
+/// buffer so the service reads a whole request or none of it.
+#[cfg(target_os = "windows")]
+fn round_trip_inject(action: InjectAction) -> bool {
+    use crate::protocol::{
+        FRAME_LEN, INJECT_PAYLOAD_LEN, OP_INJECT_SECURE_DESKTOP, encode_inject, request, succeeded,
+    };
+    use std::io::{Read as _, Write as _};
+
+    let Some(mut pipe) = open() else {
+        return false;
+    };
+    let mut message = [0u8; FRAME_LEN + INJECT_PAYLOAD_LEN];
+    message[..FRAME_LEN].copy_from_slice(&request(OP_INJECT_SECURE_DESKTOP));
+    message[FRAME_LEN..].copy_from_slice(&encode_inject(action));
+    if pipe.write_all(&message).is_err() || pipe.flush().is_err() {
+        return false;
+    }
+    let mut reply = [0u8; FRAME_LEN];
     if pipe.read_exact(&mut reply).is_err() {
         return false;
     }

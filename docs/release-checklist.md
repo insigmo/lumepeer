@@ -135,3 +135,27 @@ No automated gate, and deliberately none: installing it registers a
 - [ ] The pipe is not reachable from a non-interactive logon. Check it once per
       release with a scheduled task running as a different user: opening
       `\\.\pipe\lumepeer-service` must fail with access denied, not connect.
+
+### Full local control: elevated client and secure-desktop input (ADR 0057)
+
+No automated gate: these need a real elevated app, a live UAC prompt, and a
+second machine. All manual, once per release.
+
+- [ ] The client now requests administrator: launching `lumepeer-desktop.exe`
+      raises Windows' own UAC prompt every time. With a guest holding `input`,
+      open `services.msc` (or `regedit`) on the host and have the guest click a
+      control inside it — the click lands. Before ADR 0057 the same click was
+      dropped by UIPI, so this is the elevated-window half of the feature.
+- [ ] `secure_desktop_input` is off for every role: connect a guest at
+      **full control** and confirm the "Allow controlling the admin prompt"
+      switch starts off. No role turns it on.
+- [ ] With the helper installed, the switch on, and a UAC prompt up on the
+      host: the guest clicks `Yes`/`No` on the prompt and it is answered. This
+      is the whole secure-desktop-input feature; the worker runs as
+      `LocalSystem` on `Winlogon` for the one event, then exits.
+- [ ] Turn the switch off mid-prompt: the guest's next click on the secure
+      desktop is a no-op (the actor re-reads the grant per event). Turn it back
+      on: clicks land again.
+- [ ] With the helper **not** installed, or the switch off, the guest sees ADR
+      0056's honest "respond to it there" message and the picture, and nothing
+      the guest does reaches the prompt — the ADR 0011/0056 fallback is intact.

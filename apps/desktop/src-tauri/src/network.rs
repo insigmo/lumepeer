@@ -35,7 +35,8 @@ use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
     FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER,
     FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_UNATTENDED,
-    InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo, UnattendedRejection,
+    InputDetail, InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo,
+    UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -411,6 +412,30 @@ pub struct SessionSnapshot {
     /// this says it *is* happening. The host's non-removable indicator hangs
     /// off this one.
     pub secure_desktop_active: bool,
+}
+
+/// Translates one authorized guest event into the helper's secure-desktop
+/// inject descriptor (ADR 0057), or `None` for an event the secure desktop has
+/// no equivalent for (the scroll wheel).
+///
+/// The `logical` code is carried through unchanged: the helper's worker maps it
+/// to `SendInput` with the very same table `crates/media`'s in-session injector
+/// uses, so a click or keystroke on the secure desktop does what it does on the
+/// ordinary one.
+fn secure_desktop_action(
+    event: &InputEventPayload,
+) -> Option<lumepeer_service::protocol::InjectAction> {
+    use lumepeer_service::protocol::InjectAction;
+    match event.detail {
+        InputDetail::PointerMove { x, y } => Some(InjectAction::Move { x, y }),
+        InputDetail::Press => Some(InjectAction::Press {
+            logical: event.logical,
+        }),
+        InputDetail::Release => Some(InjectAction::Release {
+            logical: event.logical,
+        }),
+        InputDetail::Wheel { .. } => None,
+    }
 }
 
 /// What `invite_create` hands back to the UI.
@@ -2527,6 +2552,15 @@ struct Actor {
     /// Host side: platform input adapter, opened on the first authorized event
     /// so a host that never grants `input` never touches it.
     injector: Option<Box<dyn InputInjector>>,
+    /// Host side: the last pointer position a guest moved to *on the secure
+    /// desktop*, so a click there can be placed without spawning a helper
+    /// worker for every intervening move (ADR 0057).
+    ///
+    /// One slot, not a per-peer map: only one guest controls at a time (the
+    /// single-controller rule), so a later move from a different controller
+    /// simply overwrites it. A pointer move updates this and returns without
+    /// touching the helper; only a button or key spends a worker.
+    secure_desktop_pointer: Option<(u16, u16)>,
     /// Guest side: one open view window per host being watched.
     views: std::collections::HashMap<NodeId, ViewState>,
     /// The same windows as `views`, in the form the IPC layer reads directly.
@@ -3926,6 +3960,64 @@ impl Actor {
         let tag = self.label_of(&peer);
         if let Err(error) = self.sessions.authorize_input(&peer, event) {
             tracing::warn!(peer = %tag, %error, "dropping an unauthorized input event");
+            return;
+        }
+        // When the host is showing this guest its secure desktop, ordinary
+        // `SendInput` cannot reach `Winsta0\Winlogon` — no integrity level puts
+        // this process's thread on that desktop (ADR 0057). Route the event
+        // through the helper instead, but only if the guest additionally holds
+        // `secure_desktop_input`: a controller role (checked above) hands over
+        // the ordinary keyboard, approving a UAC prompt is a separate switch
+        // no role turns on. The grant is re-read here, per event, so a revoke
+        // lands on the very next one.
+        let on_secure_desktop = self
+            .media
+            .get(&peer)
+            .is_some_and(|session| session.control.secure_desktop_active());
+        if on_secure_desktop {
+            let permitted = self
+                .sessions
+                .grants(&peer)
+                .is_some_and(|grants| grants.secure_desktop_input);
+            if !permitted {
+                tracing::warn!(
+                    peer = %tag,
+                    "dropping a secure-desktop input event: secure_desktop_input not granted"
+                );
+                return;
+            }
+            // A pointer move does not spend a worker: every move would
+            // otherwise spawn a `LocalSystem` process on `Winlogon`, which a
+            // normal mouse drag would turn into a flood. Cache the position and
+            // return; a following button spends one worker to place the cursor
+            // there and one to click (ADR 0057).
+            if let InputDetail::PointerMove { x, y } = event.detail {
+                self.secure_desktop_pointer = Some((x, y));
+                return;
+            }
+            let Some(action) = secure_desktop_action(event) else {
+                // The wheel has no secure-desktop meaning; drop it.
+                return;
+            };
+            // Synchronous, and ordered: the worker performs one event per
+            // invocation, and a place-then-click must stay in that order, which
+            // spawning onto a blocking pool would not guarantee. Only a button
+            // or key reaches here (moves returned above), so the cost is one or
+            // two worker spawns per deliberate click, not per motion sample.
+            let mut ok = true;
+            if event.logical >= lumepeer_core::protocol::POINTER_BUTTON_LOGICAL_BASE
+                && let Some((x, y)) = self.secure_desktop_pointer
+            {
+                // Place the cursor where the guest last moved before clicking,
+                // since the move itself was not forwarded.
+                ok &= lumepeer_service::client::inject_secure_desktop(
+                    lumepeer_service::protocol::InjectAction::Move { x, y },
+                );
+            }
+            ok &= lumepeer_service::client::inject_secure_desktop(action);
+            if !ok {
+                tracing::warn!(peer = %tag, "secure-desktop input event did not land");
+            }
             return;
         }
         if self.injector.is_none() {
@@ -6740,7 +6832,7 @@ impl Actor {
         }
         if !allowed {
             // Exhaustive on purpose, with no `_` arm, for the reason
-            // `Grants::get` gives: a seventh independent grant must not be
+            // `Grants::get` gives: an eighth independent grant must not be
             // able to appear and quietly keep running after it is switched
             // off.
             match grant {
@@ -6755,9 +6847,14 @@ impl Actor {
                 // `clipboard_write` is spent by the peer, not here, and every
                 // inbound payload is checked against the live grant as it
                 // arrives. `secure_desktop` is already handled above too.
+                // `secure_desktop_input` needs no teardown either: every
+                // secure-desktop event is checked against the live grant in
+                // `inject` as it arrives (ADR 0057), so revoking it simply
+                // makes the next event a no-op.
                 IndependentGrant::ClipboardRead
                 | IndependentGrant::ClipboardWrite
-                | IndependentGrant::SecureDesktop => {}
+                | IndependentGrant::SecureDesktop
+                | IndependentGrant::SecureDesktopInput => {}
                 // Withdrawing the grant from whoever is actually holding the
                 // monitor in a switched mode restores it on the spot, the
                 // same way turning `recording` off stops the file rather
@@ -8068,6 +8165,7 @@ pub fn spawn_actor_with(
         record_requests: std::collections::HashSet::new(),
         record_request_rate: ConsentRateLimiter::new(),
         injector,
+        secure_desktop_pointer: None,
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
         host_addrs: std::collections::HashMap::new(),

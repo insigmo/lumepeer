@@ -35,6 +35,8 @@ mod install;
 #[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
+mod secure_desktop_input;
+#[cfg(target_os = "windows")]
 mod secure_desktop_launch;
 #[cfg(target_os = "windows")]
 mod windows_service;
@@ -69,6 +71,35 @@ fn main() {
             .any(|arg| arg == lumepeer_service::SECURE_DESKTOP_WORKER_ARG)
         {
             std::process::exit(i32::try_from(secure_desktop_launch::run_worker()).unwrap_or(1));
+        }
+        // The secure-desktop *input* worker (ADR 0057): this binary,
+        // re-executed onto `Winsta0\Winlogon` with the input arg followed by
+        // four integers `kind logical x y`. It performs one event and exits
+        // with the outcome. The integers were built by
+        // `secure_desktop_launch::inject_via_worker` from a descriptor the
+        // service already validated; `inject_from_args` validates them once
+        // more here — the last gate before a `SendInput` — and a set that does
+        // not parse exits non-zero, which the service reads as refusal.
+        if let Some(position) = args
+            .iter()
+            .position(|arg| arg == lumepeer_service::SECURE_DESKTOP_INPUT_WORKER_ARG)
+        {
+            let action = args.get(position + 1..position + 5).and_then(|tail| {
+                let parsed: Vec<u32> = tail.iter().filter_map(|a| a.parse().ok()).collect();
+                match parsed.as_slice() {
+                    &[kind, logical, x, y] => {
+                        lumepeer_service::protocol::inject_from_args(kind, logical, x, y)
+                    }
+                    _ => None,
+                }
+            });
+            let code = if let Some(action) = action {
+                secure_desktop_launch::run_input_worker(action)
+            } else {
+                eprintln!("secure-desktop input worker: malformed arguments");
+                1
+            };
+            std::process::exit(i32::try_from(code).unwrap_or(1));
         }
         if args.iter().any(|arg| arg == "--install") {
             match install::install() {

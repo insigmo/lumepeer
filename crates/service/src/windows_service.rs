@@ -41,8 +41,8 @@ use windows::core::{PCWSTR, PWSTR};
 
 use lumepeer_service::SERVICE_NAME;
 use lumepeer_service::protocol::{
-    ENDPOINT, FRAME_LEN, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS, STATUS_OK, STATUS_REFUSED,
-    parse_request, response,
+    ENDPOINT, FRAME_LEN, INJECT_PAYLOAD_LEN, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS,
+    OP_INJECT_SECURE_DESKTOP, STATUS_OK, STATUS_REFUSED, parse_inject, parse_request, response,
 };
 
 /// Who may open the pipe, in SDDL.
@@ -351,10 +351,50 @@ fn serve(
         Some(OP_CAPTURE_SECURE_DESKTOP) => {
             serve_secure_desktop_capture(pipe, secure_desktop_writer)
         }
+        Some(OP_INJECT_SECURE_DESKTOP) => serve_secure_desktop_inject(pipe),
         _ => {
             tracing::warn!("refusing an unknown request");
             STATUS_REFUSED
         }
+    }
+}
+
+/// [`OP_INJECT_SECURE_DESKTOP`]'s half of [`serve`] (ADR 0057).
+///
+/// Reads the fixed descriptor that follows the opcode, applies the same
+/// console-session binding [`serve_secure_desktop_capture`] does — a caller in
+/// another interactive session must not be able to drive the physical
+/// console's secure desktop — and, if it parses, launches the short-lived
+/// worker onto `Winlogon` to perform the one event.
+///
+/// The whole authorization question of "may *this guest* inject here" was
+/// already answered in `lumepeer-core`, in the main process, before this pipe
+/// was touched (ADR 0057 §4). What is left here is mechanical: whose desktop
+/// this even is, and whether the bytes name an event this protocol knows.
+fn serve_secure_desktop_inject(pipe: HANDLE) -> u8 {
+    if !caller_is_in_active_console_session(pipe) {
+        tracing::warn!("refusing a secure-desktop inject from outside the active console session");
+        return STATUS_REFUSED;
+    }
+    let mut payload = [0u8; INJECT_PAYLOAD_LEN];
+    let mut read = 0u32;
+    // SAFETY: `payload` is a live buffer of exactly the length passed, and
+    // `read` outlives the call. The size is the protocol's own constant, not a
+    // value the caller named (ADR 0057 §3).
+    let ok = unsafe { ReadFile(pipe, Some(&mut payload), Some(&raw mut read), None) };
+    if ok.is_err() || read as usize != INJECT_PAYLOAD_LEN {
+        tracing::warn!("secure-desktop inject: short or failed descriptor read");
+        return STATUS_REFUSED;
+    }
+    let Some(action) = parse_inject(&payload) else {
+        tracing::warn!("secure-desktop inject: descriptor names no known event");
+        return STATUS_REFUSED;
+    };
+    if crate::secure_desktop_launch::inject_via_worker(action) {
+        STATUS_OK
+    } else {
+        tracing::warn!("secure-desktop inject: the worker did not carry it out");
+        STATUS_REFUSED
     }
 }
 

@@ -31,3 +31,15 @@ pub const SERVICE_NAME: &str = "LumepeerHelper";
 /// the launcher and `main.rs`'s argument check read this one constant so they
 /// cannot drift.
 pub const SECURE_DESKTOP_WORKER_ARG: &str = "--secure-desktop-worker";
+
+/// The argument that re-executes this binary as the secure-desktop *input*
+/// worker (ADR 0057), followed by four bounded integers `kind logical x y`.
+///
+/// The mirror of [`SECURE_DESKTOP_WORKER_ARG`]: where that worker reads one
+/// frame off `Winsta0\Winlogon`, this one performs one input event on it and
+/// exits with the outcome as its exit code. The parameters travel as plain
+/// integers on the command line — never a peer string — because
+/// `secure_desktop_launch` builds the line itself from values the service has
+/// already validated, and `main.rs` re-parses them under the same bounds
+/// (ADR 0057 §3).
+pub const SECURE_DESKTOP_INPUT_WORKER_ARG: &str = "--secure-desktop-input-worker";
