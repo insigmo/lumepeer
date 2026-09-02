@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-bar-expand"
+description = "Enables the host_bar_expand command without any pre-configured scope."
+commands.allow = ["host_bar_expand"]
+
+[[permission]]
+identifier = "deny-host-bar-expand"
+description = "Denies the host_bar_expand command without any pre-configured scope."
+commands.deny = ["host_bar_expand"]

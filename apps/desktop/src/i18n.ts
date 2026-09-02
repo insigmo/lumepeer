@@ -37,13 +37,6 @@ export type TranslationKey =
   | 'status.inputOn'
   | 'status.inputOff'
   | 'status.revoke'
-  | 'status.grants.heading'
-  | 'status.grants.clipboardRead'
-  | 'status.grants.clipboardWrite'
-  | 'status.grants.fileTransfer'
-  | 'status.grants.recording'
-  | 'status.grants.displayMode'
-  | 'status.grants.secureDesktop'
   | 'status.secureDesktop.active'
   | 'status.recording.start'
   | 'status.recording.stop'
@@ -147,6 +140,9 @@ export type TranslationKey =
   | 'connections.refresh'
   | 'connections.emptyTitle'
   | 'connections.emptySubtext'
+  | 'hostbar.expand'
+  | 'hostbar.collapse'
+  | 'hostbar.openApp'
   | 'view.canvasLabel'
   | 'view.waiting'
   | 'view.reconnecting'
@@ -325,17 +321,6 @@ const en: Dictionary = {
   'status.inputOn': 'input on',
   'status.inputOff': 'input off',
   'status.revoke': 'Revoke',
-  // Named as consequences, not as flag names: the person deciding has to be
-  // able to read what the guest gets out of a switch being on (§19 phase 6).
-  'status.grants.heading': 'What this guest may do',
-  'status.grants.clipboardRead': 'Read my clipboard',
-  'status.grants.clipboardWrite': 'Change my clipboard',
-  'status.grants.fileTransfer': 'Send and receive files',
-  'status.grants.recording': 'Let this session be recorded',
-  'status.grants.displayMode': "Change this computer's screen resolution",
-  // Not "secure desktop": the person deciding needs to know what they are
-  // granting, not the Windows term for the mechanism (ADR 0049).
-  'status.grants.secureDesktop': 'See the administrator prompt and lock screen',
   // The non-removable indicator while it is actually happening (ADR 0049,
   // §17-equivalent) — distinct from the grant above the same way the
   // recording indicator is distinct from the recording grant.
@@ -345,7 +330,7 @@ const en: Dictionary = {
   'status.recording.start': 'Record session',
   'status.recording.stop': 'Stop recording',
   'status.recording.on': 'Recording',
-  'status.recording.needsGrant': 'Turn on "Let this session be recorded" first.',
+  'status.recording.needsGrant': 'Only a guest with full control can be recorded.',
   'status.recording.requested': (peer) => `${peer} asks you to record this session.`,
   'status.recording.allow': 'Start recording',
   'status.recording.decline': 'Not now',
@@ -446,6 +431,13 @@ const en: Dictionary = {
   'connections.refresh': 'Refresh',
   'connections.emptyTitle': 'No connections yet',
   'connections.emptySubtext': 'Connected devices will appear here.',
+  // The always-on-top session bar (ADR 0055). Its two chevrons are named for
+  // what they do to the bar, not for the direction they point: which way the
+  // arrow faces depends on `dir`, and a screen reader must not be told
+  // "right" on a layout where it goes left.
+  'hostbar.expand': 'Show the Lumepeer session bar',
+  'hostbar.collapse': 'Hide the Lumepeer session bar',
+  'hostbar.openApp': 'Open Lumepeer',
   'view.canvasLabel': 'Remote screen',
   'view.waiting': 'Waiting for the remote screen…',
   'view.reconnecting': 'Connection lost, reconnecting…',
@@ -641,18 +633,11 @@ const ar: Dictionary = {
   'status.inputOn': 'الإدخال مفعّل',
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
-  'status.grants.heading': 'ما الذي يُسمح به لهذا الضيف',
-  'status.grants.clipboardRead': 'قراءة الحافظة الخاصة بي',
-  'status.grants.clipboardWrite': 'تغيير الحافظة الخاصة بي',
-  'status.grants.fileTransfer': 'إرسال الملفات واستقبالها',
-  'status.grants.recording': 'السماح بتسجيل هذه الجلسة',
-  'status.grants.displayMode': 'تغيير دقة شاشة هذا الجهاز',
-  'status.grants.secureDesktop': 'رؤية طلب المسؤول وشاشة القفل',
   'status.secureDesktop.active': 'تجري الآن مشاهدة طلب المسؤول أو شاشة القفل',
   'status.recording.start': 'تسجيل الجلسة',
   'status.recording.stop': 'إيقاف التسجيل',
   'status.recording.on': 'جارٍ التسجيل',
-  'status.recording.needsGrant': 'فعّل «السماح بتسجيل هذه الجلسة» أولاً.',
+  'status.recording.needsGrant': 'لا يمكن تسجيل الجلسة إلا مع ضيف يملك التحكم الكامل.',
   'status.recording.requested': (peer) => `${peer} يطلب منك تسجيل هذه الجلسة.`,
   'status.recording.allow': 'بدء التسجيل',
   'status.recording.decline': 'ليس الآن',
@@ -753,6 +738,9 @@ const ar: Dictionary = {
   'connections.refresh': 'تحديث',
   'connections.emptyTitle': 'لا توجد اتصالات بعد',
   'connections.emptySubtext': 'ستظهر الأجهزة المتصلة هنا.',
+  'hostbar.expand': 'إظهار شريط جلسة Lumepeer',
+  'hostbar.collapse': 'إخفاء شريط جلسة Lumepeer',
+  'hostbar.openApp': 'فتح Lumepeer',
   'view.canvasLabel': 'الشاشة البعيدة',
   'view.waiting': 'في انتظار الشاشة البعيدة…',
   'view.reconnecting': 'انقطع الاتصال، جارٍ إعادة الاتصال…',

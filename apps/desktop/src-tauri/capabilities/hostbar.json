@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "host-bar-window",
+  "description": "Per-window capability of the host's always-on-top session bar (design doc §13; ADR 0055). The bar exists so the person at this machine keeps the two controls that matter while the main window is minimized or in the tray: who is connected, and the revoke. It gets exactly those, plus the geometry command its own collapse tab needs and the one that raises the main window - everything else, including every grant, setting, file, clipboard and audit command, is absent rather than denied. Deliberately NOT `core:default`: the only core permission here is dragging its own undecorated frame, scoped to its own label. No wildcard entries.",
+  "windows": ["hostbar"],
+  "local": true,
+  "permissions": [
+    {
+      "identifier": "core:window:allow-start-dragging",
+      "allow": [{ "label": "hostbar" }]
+    },
+    "allow-session-status",
+    "allow-session-revoke",
+    "allow-host-bar-expand",
+    "allow-host-bar-focus-main"
+  ]
+}

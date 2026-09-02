@@ -533,44 +533,6 @@ button {
   background: var(--panel-bg);
 }
 
-.connections-list .session-grants {
-  flex-basis: 100%;
-  margin: 0;
-  padding: 8px 10px 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
-  background: var(--sidebar-bg);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.connections-list .session-grants legend {
-  padding: 0 4px;
-  color: var(--text-secondary);
-  font-size: var(--fs-micro);
-  font-weight: 600;
-}
-
-.connections-list .grant-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: var(--fs-micro);
-  color: var(--text-heading);
-  cursor: pointer;
-}
-
-.connections-list .grant-row input {
-  margin: 0;
-  cursor: pointer;
-}
-
-.connections-list .grant-row input:focus-visible {
-  outline: 2px solid var(--blue-solid);
-  outline-offset: 1px;
-}
-
 .connections-list .peer-label {
   font-weight: 600;
   color: var(--text-heading);
@@ -1161,9 +1123,9 @@ button {
   font-size: var(--fs-micro);
 }
 
-/* Session recording (§17). Permission is the switch in `.session-grants`;
-   these are the act, and the indicator that goes with it. Neither the banner
-   nor the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
+/* Session recording (§17). Permission comes with the session's role; these
+   are the act, and the indicator that goes with it. Neither the banner nor
+   the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
    about what the person at this machine sees without going looking. */
 .recording-banner {
   display: flex;
