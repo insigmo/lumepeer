@@ -175,10 +175,11 @@ async fn a_correct_password_admits_the_guest_with_the_hosts_configured_role() {
     );
 }
 
-/// §8.2: passing the gate is admission, not a blanket permission. The four
-/// independent grants stay off however the session was admitted (ADR 0029).
+/// §8.2: passing the gate is admission, not an upgrade. However the session
+/// was admitted, it holds exactly what its role implies and nothing more —
+/// the lesser roles still reach none of the independent grants (ADR 0054).
 #[test]
-fn an_admitted_session_holds_none_of_the_independent_grants() {
+fn an_admitted_session_holds_only_what_its_role_implies() {
     let peer = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
 
     for role in [Role::ViewOnly, Role::ControlLimited, Role::FullControl] {
@@ -190,13 +191,19 @@ fn an_admitted_session_holds_none_of_the_independent_grants() {
         sessions.grant(peer, admitted).unwrap();
 
         let grants = sessions.grants(&peer).unwrap();
+        assert_eq!(
+            grants,
+            Grants::from_role(role),
+            "the gate must not add a grant the role does not imply"
+        );
         assert!(grants.view, "every role implies view");
-        assert_eq!(grants.input, role == Role::FullControl);
-        assert!(!grants.clipboard_read);
-        assert!(!grants.clipboard_write);
-        assert!(!grants.file_transfer);
-        assert!(!grants.recording);
-        assert!(!grants.display_mode);
+        let full = role == Role::FullControl;
+        assert_eq!(grants.input, full);
+        assert_eq!(grants.clipboard_read, full);
+        assert_eq!(grants.clipboard_write, full);
+        assert_eq!(grants.file_transfer, full);
+        assert_eq!(grants.recording, full);
+        assert_eq!(grants.display_mode, full);
     }
 }
 

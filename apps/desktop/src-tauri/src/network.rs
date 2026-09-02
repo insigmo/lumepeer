@@ -8670,7 +8670,13 @@ mod tests {
     ///
     /// The endpoints are not returned: the actor owns a clone of the one it
     /// was spawned with, so this side's copy has nothing left to hold.
-    async fn file_pair() -> (ActorHandle, ActorHandle, String, String, SharedTestClipboard) {
+    async fn file_pair() -> (
+        ActorHandle,
+        ActorHandle,
+        String,
+        String,
+        SharedTestClipboard,
+    ) {
         let (host, host_clipboard) = actor_with_clipboard(Arc::new(DetachedViewWindows)).await;
         let recorder = Arc::new(RecordingWindows::default());
         let (guest, _guest_endpoint, _guest_capture, _windows) =
@@ -8681,7 +8687,9 @@ mod tests {
         let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
-        host.grant(guest_label.clone(), Role::ViewOnly).await.unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
         wait_until("the guest never opened a view", || {
             !recorder.opened().is_empty()
         })
@@ -9184,7 +9192,10 @@ mod tests {
             files.offers.len() == 1
         })
         .await;
-        guest.file_accept(host_label.clone(), true, None).await.unwrap();
+        guest
+            .file_accept(host_label.clone(), true, None)
+            .await
+            .unwrap();
         wait_for_files(&host, "the transfer never started", |files| {
             !files.transfers.is_empty()
         })

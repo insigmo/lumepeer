@@ -187,23 +187,25 @@ async fn an_independent_grant_dies_with_the_session_that_held_it() {
                 .await
                 .unwrap();
 
-            // Nothing is implied by the role: the host has to say so.
-            assert!(!sessions.grants(&peer).unwrap().file_transfer);
-            sessions
-                .set_grant(peer, IndependentGrant::FileTransfer, true)
-                .unwrap();
+            // Full control starts with every independent grant on (ADR
+            // 0054), and the host can still withdraw exactly one of them
+            // without ending the session.
             assert!(sessions.grants(&peer).unwrap().file_transfer);
+            sessions
+                .set_grant(peer, IndependentGrant::FileTransfer, false)
+                .unwrap();
+            assert!(!sessions.grants(&peer).unwrap().file_transfer);
 
             sessions.revoke(peer).unwrap();
             control.send(MessageKind::ConsentRevoke).await.unwrap();
             assert_eq!(sessions.grants(&peer), None);
             assert_eq!(sessions.state(&peer), SessionState::Idle);
 
-            // Granting the same role again is a new session. The file
-            // transfer the previous one had reached does not come back with
-            // it, and the host has to decide a second time.
+            // Granting the same role again is a new session. It starts
+            // from the role's implied grants, not from where the previous
+            // one was left: the withdrawn file transfer comes back on.
             sessions.grant(peer, Role::FullControl).unwrap();
-            assert!(!sessions.grants(&peer).unwrap().file_transfer);
+            assert!(sessions.grants(&peer).unwrap().file_transfer);
             assert!(sessions.grants(&peer).unwrap().input);
 
             control

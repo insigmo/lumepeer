@@ -287,7 +287,12 @@ fn display_modes_for_inner(target: CaptureTarget) -> Option<Vec<crate::capture::
                 .ok()
         })
         .flatten()
-        .and_then(|crtc_info| resources.modes.iter().find(|info| info.id == crtc_info.mode))
+        .and_then(|crtc_info| {
+            resources
+                .modes
+                .iter()
+                .find(|info| info.id == crtc_info.mode)
+        })
         .and_then(mode_info_to_display_mode)
         .map(|mode| mode.refresh_hz);
     Some(crate::capture::fold_display_modes_by_resolution(

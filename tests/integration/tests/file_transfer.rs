@@ -612,9 +612,11 @@ async fn a_dropped_file_connection_resumes_from_the_last_ack() {
 /// §8.2: an offer from a session that does not hold `file_transfer` is
 /// declined by the host's core.
 ///
-/// The role is `FullControl`, which is the point: the most powerful role
-/// there is still implies nothing about files (§2.2), and the check that
-/// refuses this is `Grants::file_transfer` and not anything about the role.
+/// The role is `FullControl`, which is the point: the check that refuses this
+/// is `Grants::file_transfer` and not anything about the role. Full control
+/// starts with the grant on (ADR 0054), so the host withdraws it first — a
+/// session the host has taken files away from is refused exactly like one
+/// that never had them.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_offer_without_the_grant_is_declined() {
     let (host, guest) = endpoints().await;
@@ -631,16 +633,19 @@ async fn an_offer_without_the_grant_is_declined() {
                 .request_consent_as(peer, Role::FullControl)
                 .unwrap();
             sessions.grant(peer, Role::FullControl).unwrap();
+            sessions
+                .set_grant(peer, IndependentGrant::FileTransfer, false)
+                .unwrap();
 
             let MessageKind::FileOffer { .. } = control.recv().await.unwrap().kind else {
                 panic!("expected an offer");
             };
             let grants = sessions.grants(&peer).unwrap();
             assert!(grants.input, "the role did imply input");
-            assert!(!grants.file_transfer, "a role implied file transfer");
+            assert!(!grants.file_transfer, "the withdrawn grant came back");
             control.send(MessageKind::FileAccept(false)).await.unwrap();
 
-            // And once the host does decide, the same offer is takeable.
+            // And once the host puts it back, the same offer is takeable.
             sessions
                 .set_grant(peer, IndependentGrant::FileTransfer, true)
                 .unwrap();
