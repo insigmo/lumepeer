@@ -781,7 +781,10 @@ fn run(
         // `seen` moves forward only once the change is actually queued: a
         // full channel means this round is lost, and the same content has to
         // still look new on the next one.
-        if on_change.try_send(ClipboardChange::Text(text.clone())).is_ok() {
+        if on_change
+            .try_send(ClipboardChange::Text(text.clone()))
+            .is_ok()
+        {
             seen = Some(text);
         }
     }

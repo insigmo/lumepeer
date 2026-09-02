@@ -2190,7 +2190,10 @@ mod dxgi {
             unique.sort_unstable();
             unique.dedup();
             unique.reverse();
-            assert_eq!(sizes, unique, "the list was not folded to one mode per resolution, largest first");
+            assert_eq!(
+                sizes, unique,
+                "the list was not folded to one mode per resolution, largest first"
+            );
             assert!(
                 modes.len() <= lumepeer_core::constants::MAX_DISPLAY_MODES_PER_HOST,
                 "the list was not capped"

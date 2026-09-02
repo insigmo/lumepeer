@@ -206,7 +206,12 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
     // `DeleteDC`/`DeleteObject`. `driver` is a null-terminated wide string
     // that outlives the `CreateDCW` call.
     unsafe {
-        let dc = CreateDCW(PCWSTR(driver.as_ptr()), PCWSTR::null(), PCWSTR::null(), None);
+        let dc = CreateDCW(
+            PCWSTR(driver.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            None,
+        );
         if dc.is_invalid() {
             return None;
         }
