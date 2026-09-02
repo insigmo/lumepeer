@@ -27,6 +27,7 @@ import {
   decodeViewFrame,
   defaultLayout,
   displaySize,
+  effectiveScale,
   frameResized,
   imageRenderingFor,
   installPan,
@@ -282,9 +283,26 @@ function applyLayout(): void {
 }
 
 function setDisplayMode(mode: DisplayMode): void {
+  // Switching *into* `scaled` had nothing to switch to: `scale` starts at 1
+  // and only Ctrl+wheel ever moved it, so picking "Zoom" from the settings
+  // list landed on exactly what "Actual size" does and the two entries were
+  // indistinguishable. Seeding it with the scale already on screen makes the
+  // switch continuous — from a fitted 0.5 the picture stays where it was —
+  // and the zoom row in the popover is what moves it from there.
+  const scale =
+    mode === 'scaled'
+      ? effectiveScale(layout, frameSize, viewportBox(), window.devicePixelRatio || 1)
+      : layout.scale;
   // A mode change re-centres: the pan that made sense at one size is an
   // arbitrary offset at another.
-  layout = { ...layout, mode, offsetX: 0, offsetY: 0 };
+  layout = { ...layout, mode, scale, offsetX: 0, offsetY: 0 };
+  applyLayout();
+  toolbar?.redraw();
+}
+
+/** One zoom notch, from wherever the picture is now (§11). */
+function zoomView(steps: number): void {
+  layout = zoomBy(layout, steps, frameSize, viewportBox(), window.devicePixelRatio || 1);
   applyLayout();
   toolbar?.redraw();
 }
@@ -435,6 +453,11 @@ async function main(): Promise<void> {
       },
       displayMode: () => layout.mode,
       setDisplayMode,
+      zoomPercent: () =>
+        Math.round(
+          effectiveScale(layout, frameSize, viewportBox(), window.devicePixelRatio || 1) * 100,
+        ),
+      zoomBy: zoomView,
       cursorChannel: cursorChannelLive,
       localCursor: () => localCursor,
       toggleLocalCursor(): void {
@@ -471,15 +494,7 @@ async function main(): Promise<void> {
           return;
         }
         event.preventDefault();
-        layout = zoomBy(
-          layout,
-          event.deltaY < 0 ? 1 : -1,
-          frameSize,
-          viewportBox(),
-          window.devicePixelRatio || 1,
-        );
-        applyLayout();
-        toolbar?.redraw();
+        zoomView(event.deltaY < 0 ? 1 : -1);
       },
       { passive: false },
     );

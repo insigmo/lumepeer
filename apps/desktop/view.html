@@ -237,7 +237,7 @@
         border-radius: 0.35rem;
         cursor: pointer;
       }
-      .toolbar-btn:hover:not(.is-disabled):not(.toolbar-indicator) {
+      .toolbar-btn:hover:not(.is-disabled) {
         background: rgb(255 255 255 / 12%);
       }
       .toolbar-btn:focus-visible {
@@ -250,12 +250,6 @@
       .toolbar-btn.is-disabled {
         opacity: 0.4;
         cursor: not-allowed;
-      }
-      /* A status, not a control (docs/bugs/10-clipboard-auto.md #2): the
-         clipboard icon shows that sync is on, and nothing here responds to a
-         click. */
-      .toolbar-btn.toolbar-indicator {
-        cursor: default;
       }
       /* The transient "a clipboard just synced" note, next to the toolbar
          (§15: the fact only, never the content). */
@@ -299,6 +293,35 @@
         align-items: center;
         justify-content: space-between;
         gap: 0.5rem;
+      }
+      /* The zoom stepper, shown only while the picture size is "Zoom". */
+      .toolbar-zoom {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.3rem;
+      }
+      .toolbar-zoom button {
+        width: 1.4rem;
+        height: 1.4rem;
+        padding: 0;
+        background: rgb(255 255 255 / 10%);
+        color: inherit;
+        border: none;
+        border-radius: 0.25rem;
+        cursor: pointer;
+        line-height: 1;
+      }
+      .toolbar-zoom button:hover {
+        background: rgb(255 255 255 / 20%);
+      }
+      .toolbar-zoom button:focus-visible {
+        outline: 2px solid #9fd0ff;
+        outline-offset: 1px;
+      }
+      .toolbar-zoom output {
+        min-width: 3.2rem;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
       }
       .toolbar-pop-note {
         margin: 0.5rem 0 0;

@@ -28,14 +28,10 @@ vi.mock('@tauri-apps/api/core', () => ({
 const PEER = 'guest-ab12';
 
 function commands(): FileCommands & {
-  offer: ReturnType<typeof vi.fn>;
-  offerClipboard: ReturnType<typeof vi.fn>;
   accept: ReturnType<typeof vi.fn>;
   abort: ReturnType<typeof vi.fn>;
 } {
   return {
-    offer: vi.fn().mockResolvedValue(undefined),
-    offerClipboard: vi.fn().mockResolvedValue(undefined),
     accept: vi.fn().mockResolvedValue(undefined),
     abort: vi.fn().mockResolvedValue(undefined),
     list: vi.fn().mockResolvedValue({ offers: [], transfers: [] }),
@@ -183,26 +179,17 @@ describe('a running transfer', () => {
   });
 });
 
-describe('the send button', () => {
-  it('asks the Rust side to open the picker, and supplies no path itself', () => {
-    const cmds = commands();
-    draw({ offers: [], transfers: [] }, cmds);
-    container.querySelector<HTMLButtonElement>('[data-testid="file-send"]')?.click();
-    expect(cmds.offer).toHaveBeenCalledWith(PEER);
-    expect(cmds.offer).toHaveBeenCalledTimes(1);
-    // One argument only: the peer. A path would mean the webview had one.
-    expect(cmds.offer.mock.calls[0]).toHaveLength(1);
-  });
-});
-
-describe('the send-from-clipboard button', () => {
-  it('asks the Rust side to read the clipboard, and supplies no path itself', () => {
-    const cmds = commands();
-    draw({ offers: [], transfers: [] }, cmds);
-    container.querySelector<HTMLButtonElement>('[data-testid="file-send-clipboard"]')?.click();
-    expect(cmds.offerClipboard).toHaveBeenCalledWith(PEER);
-    expect(cmds.offerClipboard).toHaveBeenCalledTimes(1);
-    expect(cmds.offerClipboard.mock.calls[0]).toHaveLength(1);
+describe('sending', () => {
+  it('offers no button at all: copying the file is the whole of sending it', () => {
+    // Both buttons that used to live here asked for a gesture the user had
+    // already made. The clipboard watch does it on its own poll now
+    // (docs/bugs/14-clipboard-files.md), so the panel says so instead.
+    draw({ offers: [], transfers: [] }, commands());
+    expect(container.querySelector('[data-testid="file-send"]')).toBeNull();
+    expect(container.querySelector('[data-testid="file-send-clipboard"]')).toBeNull();
+    expect(container.querySelector('[data-testid="file-send-hint"]')?.textContent).toContain(
+      'Ctrl+C',
+    );
   });
 });
 
@@ -274,8 +261,6 @@ describe('presentation', () => {
         container,
       );
       for (const testid of [
-        'file-send',
-        'file-send-clipboard',
         'file-accept',
         'file-decline',
         'file-cancel',

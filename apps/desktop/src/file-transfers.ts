@@ -1,15 +1,22 @@
 // File transfer panel (design doc §9.2; ADR 0032).
 //
-// Two lists and three buttons. The first list is offers waiting for an
-// answer, because an incoming file is a decision and not a notification: it
-// arrives with a name and a size and goes nowhere until someone says yes. The
-// second is what is actually moving, with a cancel that works at any point.
+// Two lists. The first is offers waiting for an answer, because an incoming
+// file is a decision and not a notification: it arrives with a name and a
+// size and goes nowhere until someone says yes. The second is what is
+// actually moving, with a cancel that works at any point.
 //
-// Nothing here decides anything, and nothing here touches a filesystem. Both
-// pickers — the file to send, the directory to receive into — run in Rust,
-// because `capabilities/view.json` gives a view window no filesystem rights
-// and a picker in the webview would be that right under another name (§2.3).
-// What crosses the IPC boundary is a peer label, a basename and a byte count.
+// Nothing here *starts* a transfer any more. Sending is Ctrl+C: the clipboard
+// watch notices a copied file list on its own poll and offers it, the same
+// way copying text has reached the peer since ADR 0046 (docs/bugs/
+// 14-clipboard-files.md). The two buttons that used to live here — a file
+// picker and a "send what I copied" — were both asking for a gesture the
+// user had already made.
+//
+// Nothing here decides anything, and nothing here touches a filesystem. The
+// one remaining picker, the directory to receive into, runs in Rust, because
+// `capabilities/view.json` gives a view window no filesystem rights and a
+// picker in the webview would be that right under another name (§2.3). What
+// crosses the IPC boundary is a peer label, a basename and a byte count.
 
 import { html, type TemplateResult } from 'lit-html';
 
@@ -51,8 +58,6 @@ export interface FileTransfers {
 
 /** How this panel talks to Tauri; injectable so the logic is testable. */
 export interface FileCommands {
-  offer(peer: string): Promise<void>;
-  offerClipboard(peer: string): Promise<void>;
   accept(peer: string, accept: boolean, fromClipboard: boolean): Promise<void>;
   abort(peer: string, transferId: number): Promise<void>;
   list(): Promise<FileTransfers>;
@@ -60,14 +65,6 @@ export interface FileCommands {
 
 /** Default binding to the real IPC surface. */
 export const tauriFileCommands: FileCommands = {
-  async offer(peer) {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('file_offer', { peer });
-  },
-  async offerClipboard(peer) {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('file_offer_clipboard', { peer });
-  },
   async accept(peer, accept, fromClipboard) {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('file_accept', {
@@ -148,34 +145,9 @@ export function fileTransferPanel(
     <section class="file-panel" data-testid="file-panel">
       <div class="file-panel-head">
         <h3>${t(locale, 'files.heading')}</h3>
-        <button
-          type="button"
-          class="file-send-btn"
-          data-testid="file-send"
-          aria-label=${`${t(locale, 'files.send')}: ${peer}`}
-          @click=${() => {
-            void commands.offer(peer).then(onChange, (error: unknown) => {
-              console.error('file_offer failed:', error);
-              onChange();
-            });
-          }}
-        >
-          ${t(locale, 'files.send')}
-        </button>
-        <button
-          type="button"
-          class="file-send-clipboard-btn"
-          data-testid="file-send-clipboard"
-          aria-label=${`${t(locale, 'files.sendClipboard')}: ${peer}`}
-          @click=${() => {
-            void commands.offerClipboard(peer).then(onChange, (error: unknown) => {
-              console.error('file_offer_clipboard failed:', error);
-              onChange();
-            });
-          }}
-        >
-          ${t(locale, 'files.sendClipboard')}
-        </button>
+        <p class="file-panel-hint" data-testid="file-send-hint">
+          ${t(locale, 'files.sendHint')}
+        </p>
       </div>
       ${offers.length === 0
         ? ''

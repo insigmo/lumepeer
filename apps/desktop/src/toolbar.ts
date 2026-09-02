@@ -76,13 +76,6 @@ export interface ToolbarCommands {
    * discarded the moment it is read (§15) — never rendered, logged or held.
    */
   clipboardPull(peer: string): Promise<string | null>;
-  /**
-   * Opens the OS file picker on the Rust side and offers what was chosen.
-   *
-   * No path crosses the IPC boundary in either direction: this window never
-   * learns one and never supplies one (§2.3; ADR 0032).
-   */
-  fileOffer(peer: string): Promise<void>;
   sasRequest(peer: string): Promise<void>;
   /**
    * Asks the host to record the session (§17).
@@ -92,7 +85,6 @@ export interface ToolbarCommands {
    * is a refusal and an ordinary outcome rather than an error.
    */
   recordRequest(peer: string): Promise<void>;
-  sasAvailable(): Promise<boolean>;
   monitorsList(peer: string): Promise<MonitorDto[]>;
   monitorSelect(peer: string, monitorId: number): Promise<void>;
   /**
@@ -133,10 +125,6 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // command parameter, not a field of an `args` struct.
     return (await invoke('clipboard_pull', { peer })) as string | null;
   },
-  async fileOffer(peer) {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return invoke('file_offer', { peer });
-  },
   async sasRequest(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('sas_request', { args: { peer } });
@@ -144,10 +132,6 @@ export const tauriToolbarCommands: ToolbarCommands = {
   async recordRequest(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('record_request', { args: { peer } });
-  },
-  async sasAvailable() {
-    const { invoke } = await import('@tauri-apps/api/core');
-    return (await invoke('sas_available')) as boolean;
   },
   async monitorsList(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -184,20 +168,21 @@ export const tauriToolbarCommands: ToolbarCommands = {
 };
 
 /**
- * Fixed, hardware-independent resolution choices the guest may cap the
- * stream at (§11; D7, docs/bugs/13-stream-resolution.md task 4). Nothing is
- * collected at install time: what each one maps to is worked out from the
- * monitor size the host already announces via `monitors_list`.
+ * The three quality presets the guest chooses between (§11; D7, docs/bugs/
+ * 13-stream-resolution.md task 4).
  *
- * `25%` is not offered. §14's `ABR_MIN_SCALE_PERCENT` (50) is the floor below
- * which text stops being readable, and the host's decoder enforces it on the
- * wire — a raw 25% request would either be silently clamped to 50%, which
- * makes the two options indistinguishable, or, worse, be refused as a
- * malformed frame and end the session. Offering a choice this project's own
- * floor cannot honour is worse than not offering it.
+ * One control with two effects: {@link scalePercentFor} turns it into the
+ * ceiling on the picture *this window* receives, and {@link refreshHzFor}
+ * turns it into the refresh rate the *host's own screen* runs at. They
+ * replace the free-standing "picture resolution" list, which sat next to
+ * the host-screen picker saying a similar-sounding thing about a different
+ * machine — two controls a person had to keep consistent by hand.
+ *
+ * Naming the tradeoff rather than a pixel count is what lets one choice
+ * drive both: "720p at 50 Hz" is two decisions, "balance" is one.
  */
-export const RESOLUTION_OPTIONS = ['native', '1080p', '720p', 'half'] as const;
-export type ResolutionOption = (typeof RESOLUTION_OPTIONS)[number];
+export const QUALITY_PRESETS = ['performance', 'balance', 'quality'] as const;
+export type QualityPreset = (typeof QUALITY_PRESETS)[number];
 
 /**
  * Mirrors `crates/core/src/constants.rs::ABR_MIN_SCALE_PERCENT` (§11; ADR
@@ -206,33 +191,101 @@ export type ResolutionOption = (typeof RESOLUTION_OPTIONS)[number];
  */
 const MIN_SCALE_PERCENT = 50;
 
+/** The picture height `balance` aims the stream at, when it can reach it. */
+const BALANCE_TARGET_HEIGHT = 720;
+
 /**
- * The percentage `option` maps to for a host screen of `monitor`'s size, or
- * `null` when it makes no sense for it: bigger than the monitor's own size
- * (task 4.2 — a 1080p request against a 1280×1024 screen is meaningless), or
- * a target so far below the monitor's own height that reaching it would
- * need a ceiling under `MIN_SCALE_PERCENT` (a 4K screen cannot reach 720p
- * this way without crossing that floor).
+ * The percentage of the host's own captured size `preset` caps the picture
+ * at, for a host screen of `monitor`'s size.
+ *
+ * - `quality` is the host's own resolution, uncapped.
+ * - `performance` is `MIN_SCALE_PERCENT`, half of whatever that is.
+ * - `balance` aims at {@link BALANCE_TARGET_HEIGHT}, worked out from the
+ *   monitor's height.
+ *
+ * Always a number, never `null`: unlike the list this replaced, a preset is
+ * always on offer, so every screen has to mean *something* here. A screen
+ * already at or below the target has nothing to cap and gets 100; one so
+ * tall that 720p would need a ceiling under the floor (4K) gets the floor
+ * itself rather than 100, because a preset picked to spend less must never
+ * quietly spend more. The three stay ordered on every screen:
+ * `performance` <= `balance` <= `quality`.
  */
-export function scalePercentFor(
-  option: ResolutionOption,
-  monitor: MonitorDto | undefined,
-): number | null {
-  if (option === 'native') {
+export function scalePercentFor(preset: QualityPreset, monitor: MonitorDto | undefined): number {
+  if (preset === 'quality') {
     return 100;
   }
-  if (option === 'half') {
+  if (preset === 'performance') {
     return MIN_SCALE_PERCENT;
   }
-  if (!monitor || monitor.height <= 0) {
+  if (!monitor || monitor.height <= BALANCE_TARGET_HEIGHT) {
+    return 100;
+  }
+  const percent = Math.round((BALANCE_TARGET_HEIGHT / monitor.height) * 100);
+  return Math.max(percent, MIN_SCALE_PERCENT);
+}
+
+/**
+ * The refresh rate `preset` maps to among `rates`, the distinct rates one
+ * host resolution offers, or `null` when it offers none.
+ *
+ * Ordered by how much of the host's own hardware each preset is willing to
+ * spend: `quality` takes the highest rate there is, `performance` the middle
+ * one, and `balance` sits halfway between those two. Deliberately not "the
+ * lowest": the bottom of a real mode list is 23–24 Hz, a cinema cadence
+ * rather than a usable desktop, and nothing about "performance" should mean
+ * "unusable".
+ */
+export function refreshHzFor(preset: QualityPreset, rates: readonly number[]): number | null {
+  if (rates.length === 0) {
     return null;
   }
-  const targetHeight = option === '1080p' ? 1080 : 720;
-  if (monitor.height <= targetHeight) {
-    return null;
+  const sorted = [...rates].sort((a, b) => a - b);
+  const top = sorted.length - 1;
+  const middle = Math.floor(top / 2);
+  const index =
+    preset === 'quality' ? top : preset === 'performance' ? middle : Math.floor((middle + top) / 2);
+  return sorted[index] ?? null;
+}
+
+/** One resolution the host's screen offers, and every mode that reaches it. */
+export interface HostResolution {
+  width: number;
+  height: number;
+  /** The modes at this size — one per refresh rate, in announced order. */
+  modes: HostDisplayModeDto[];
+}
+
+/**
+ * The distinct resolutions among `modes`, each keeping the modes that reach
+ * it (docs/bugs/16-host-display-mode.md #4).
+ *
+ * The host announces one entry per resolution *and* refresh rate, which made
+ * the picker list "4096×2160" five times over — five rows to read carefully
+ * apart, for a choice nobody was making. The rate is picked from the quality
+ * preset by {@link refreshHzFor} instead, so the list folds down to what the
+ * guest was actually choosing between.
+ */
+export function hostResolutionsFrom(modes: readonly HostDisplayModeDto[]): HostResolution[] {
+  const bySize = new Map<string, HostResolution>();
+  for (const mode of modes) {
+    const existing = bySize.get(hostResolutionKey(mode));
+    if (existing) {
+      existing.modes.push(mode);
+    } else {
+      bySize.set(hostResolutionKey(mode), {
+        width: mode.width,
+        height: mode.height,
+        modes: [mode],
+      });
+    }
   }
-  const percent = Math.round((targetHeight / monitor.height) * 100);
-  return percent >= MIN_SCALE_PERCENT ? percent : null;
+  return [...bySize.values()];
+}
+
+/** How one resolution is addressed in the select, and parsed back on change. */
+export function hostResolutionKey(size: { width: number; height: number }): string {
+  return `${size.width}x${size.height}`;
 }
 
 /**
@@ -263,18 +316,19 @@ export class ToolbarState {
   openPopover: 'settings' | 'monitors' | null = null;
   /** Guest microphone streaming state (mirrors the actor's). */
   micOn = false;
-  /** Whether the host platform can deliver the SAS at all. */
-  sasReady = true;
   /** Monitors the host announced; empty until first fetched. */
   monitors: MonitorDto[] = [];
   /** Monitor currently being watched. */
   activeMonitor: number | null = null;
   /**
-   * The stream-resolution ceiling picked for this session (§11; D7,
-   * docs/bugs/13-stream-resolution.md task 4). Persists across a monitor
-   * switch; the percentage it maps to is recalculated for the new screen.
+   * The quality preset picked for this session (§11; D7, docs/bugs/
+   * 13-stream-resolution.md task 4). Persists across a monitor switch; the
+   * percentage it maps to is recalculated for the new screen.
+   *
+   * Starts at `quality`, which is the uncapped picture this window has
+   * always opened with.
    */
-  resolution: ResolutionOption = 'native';
+  quality: QualityPreset = 'quality';
   /**
    * The host's own physical display modes, as last fetched, and the reason
    * when there are none (docs/bugs/16-host-display-mode.md #4; ADR 0048).
@@ -283,11 +337,15 @@ export class ToolbarState {
    */
   hostDisplayModes: HostDisplayModesDto = { modes: [], reason: null };
   /**
-   * The host display mode id most recently picked, so the select can show
-   * it selected across a re-render. `null` until the guest picks one; the
-   * host's own current mode is not otherwise known to this window.
+   * The host resolution most recently picked, as a {@link hostResolutionKey},
+   * so the select can show it selected across a re-render.
+   *
+   * `null` until the guest picks one, which is not the same as "nothing is
+   * selected": the host announces no current mode of its own, so a `null`
+   * here falls back to the watched monitor's announced size — which *is* the
+   * resolution the host computer is sitting at right now.
    */
-  hostDisplayModeId: number | null = null;
+  hostResolution: string | null = null;
   /**
    * Whether a recording request has already been sent this session.
    *
@@ -338,6 +396,15 @@ export interface ToolbarHooks {
   displayMode(): DisplayMode;
   /** Asks the window to lay the picture out differently. */
   setDisplayMode(mode: DisplayMode): void;
+  /**
+   * The scale the picture is drawn at right now, as a whole percentage.
+   *
+   * Read, never held, for the same reason `displayMode` is: the window owns
+   * the zoom, and Ctrl+wheel moves it without passing through here.
+   */
+  zoomPercent(): number;
+  /** Asks the window to zoom by `steps` notches, positive being closer in. */
+  zoomBy(steps: number): void;
   /** Whether the window is full screen right now. */
   fullscreen(): boolean;
   /** Asks the window to enter or leave full screen. */
@@ -366,10 +433,12 @@ const ICONS = {
   chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="2.5" fill="#9fd0ff" stroke="none"/></svg>`,
   mic: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   micOff: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2M3 3l10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
-  file: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6L9 2Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><path d="M9 2v4h4" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
-  clipboard: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="4" y="3" width="8" height="11" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M6.5 3V2h3v1" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   record: html`<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" fill="currentColor"/><circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>`,
-  cad: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 6V4.5A1.5 1.5 0 0 1 4.5 3H6m4 0h1.5A1.5 1.5 0 0 1 13 4.5V6m0 4v1.5a1.5 1.5 0 0 1-1.5 1.5H10M6 13H4.5A1.5 1.5 0 0 1 3 11.5V10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
+  // A bolt. The corner brackets this used to wear were the full-screen icon
+  // with a gap in it, sitting one place away from the real full-screen
+  // button, so the control read as a broken duplicate of its neighbour
+  // rather than as the interrupt it is.
+  cad: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 1.5 3.5 9.5H8l-1.5 5 6-8H8l1.5-5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   fullscreen: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   fullscreenExit: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   collapse: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 10 4-4 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
@@ -397,10 +466,10 @@ export function renderToolbar(
     toggleMic(): void;
     sendCad(): void;
     askToRecord(): void;
-    sendFile(): void;
     pickMonitor(id: number): void;
-    pickResolution(option: ResolutionOption): void;
-    pickHostDisplayMode(modeId: number): void;
+    pickQuality(preset: QualityPreset): void;
+    pickHostResolution(key: string): void;
+    zoomBy(steps: number): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
   },
@@ -419,14 +488,17 @@ export function renderToolbar(
   const activeMonitorInfo = (state.monitors ?? []).find(
     (monitor) => monitor.id === (state.activeMonitor ?? 0),
   );
-  const resolutionChoices = RESOLUTION_OPTIONS.filter(
-    (option) => scalePercentFor(option, activeMonitorInfo) !== null,
-  );
   // Same guard as `activeMonitorInfo` above, for the same reason: a real
   // `ToolbarState` always has this field, but a test harness building one by
   // hand as a bare object literal may not (docs/bugs/16-host-display-mode.md
   // #4).
   const hostDisplayModes = state.hostDisplayModes ?? { modes: [], reason: null };
+  const hostResolutions = hostResolutionsFrom(hostDisplayModes.modes);
+  // Nothing picked yet means the host is still at the size it announced for
+  // the monitor being watched, so that is what the select shows selected —
+  // never a blank, and never the first row of a list the guest did not choose.
+  const selectedHostResolution =
+    state.hostResolution ?? (activeMonitorInfo ? hostResolutionKey(activeMonitorInfo) : null);
 
   const settingsPopover: TemplateResult =
     state.openPopover === 'settings'
@@ -447,19 +519,49 @@ export function renderToolbar(
                 )}
               </select>
             </label>
+            ${hooks.displayMode() === 'scaled'
+              ? html`
+                  <!-- "Zoom" is the one picture size with a number behind it,
+                       and until now there was no way to move that number from
+                       here: the entry looked identical to "Actual size" and
+                       read as broken. -->
+                  <div class="toolbar-pop-row" data-testid="toolbar-zoom">
+                    <span>${t(locale, 'toolbar.settings.zoom')}</span>
+                    <span class="toolbar-zoom">
+                      <button
+                        type="button"
+                        data-testid="toolbar-zoom-out"
+                        aria-label=${t(locale, 'toolbar.zoom.out')}
+                        title=${t(locale, 'toolbar.zoom.out')}
+                        @click=${() => actions.zoomBy(-1)}
+                      >
+                        −
+                      </button>
+                      <output data-testid="toolbar-zoom-value">${hooks.zoomPercent()}%</output>
+                      <button
+                        type="button"
+                        data-testid="toolbar-zoom-in"
+                        aria-label=${t(locale, 'toolbar.zoom.in')}
+                        title=${t(locale, 'toolbar.zoom.in')}
+                        @click=${() => actions.zoomBy(1)}
+                      >
+                        +
+                      </button>
+                    </span>
+                  </div>
+                `
+              : html``}
             <label class="toolbar-pop-row">
-              <span>${t(locale, 'toolbar.settings.resolution')}</span>
+              <span>${t(locale, 'toolbar.settings.quality')}</span>
               <select
-                data-testid="toolbar-resolution"
+                data-testid="toolbar-quality"
                 @change=${(event: Event) =>
-                  actions.pickResolution(
-                    (event.target as HTMLSelectElement).value as ResolutionOption,
-                  )}
+                  actions.pickQuality((event.target as HTMLSelectElement).value as QualityPreset)}
               >
-                ${resolutionChoices.map(
-                  (option) =>
-                    html`<option value=${option} ?selected=${option === state.resolution}>
-                      ${t(locale, `toolbar.resolution.${option}` as TranslationKeyAlias)}
+                ${QUALITY_PRESETS.map(
+                  (preset) =>
+                    html`<option value=${preset} ?selected=${preset === state.quality}>
+                      ${t(locale, `toolbar.quality.${preset}` as TranslationKeyAlias)}
                     </option>`,
                 )}
               </select>
@@ -473,14 +575,15 @@ export function renderToolbar(
                 : html`<select
                     data-testid="toolbar-host-resolution"
                     @change=${(event: Event) =>
-                      actions.pickHostDisplayMode(
-                        Number((event.target as HTMLSelectElement).value),
-                      )}
+                      actions.pickHostResolution((event.target as HTMLSelectElement).value)}
                   >
-                    ${hostDisplayModes.modes.map(
-                      (mode) =>
-                        html`<option value=${mode.id} ?selected=${mode.id === state.hostDisplayModeId}>
-                          ${mode.width}×${mode.height} @${mode.refresh_hz}Hz
+                    ${hostResolutions.map(
+                      (resolution) =>
+                        html`<option
+                          value=${hostResolutionKey(resolution)}
+                          ?selected=${hostResolutionKey(resolution) === selectedHostResolution}
+                        >
+                          ${resolution.width}×${resolution.height}
                         </option>`,
                     )}
                   </select>`}
@@ -611,25 +714,13 @@ export function renderToolbar(
         >
           ${state.micOn ? ICONS.mic : ICONS.micOff}
         </button>
-        <button
-          type="button"
-          class="toolbar-btn"
-          data-testid="toolbar-file"
-          aria-label=${t(locale, 'toolbar.file')}
-          title=${t(locale, 'toolbar.file')}
-          @click=${actions.sendFile}
-        >
-          ${ICONS.file}
-        </button>
-        <span
-          class="toolbar-btn toolbar-indicator"
-          data-testid="toolbar-clipboard"
-          role="img"
-          aria-label=${t(locale, 'toolbar.clipboard')}
-          title=${t(locale, 'toolbar.clipboard')}
-        >
-          ${ICONS.clipboard}
-        </span>
+        <!-- No file button and no clipboard indicator: both were doors onto
+             something that now happens by itself. Files travel on the
+             ordinary Ctrl+C/Ctrl+V a person already uses (ADR 0047), and
+             clipboard sync runs in both directions for as long as the grants
+             are live (ADR 0046) — a button offering to do either was offering
+             work nobody had to ask for. The transient note below stays: it is
+             the fact of a sync, which is still worth saying once. -->
         ${Date.now() - state.clipboardSyncedAt < CLIPBOARD_NOTE_MS
           ? html`<span class="toolbar-clipboard-note" data-testid="toolbar-clipboard-note">
               ${t(locale, 'status.clipboardSynced')}
@@ -646,13 +737,17 @@ export function renderToolbar(
         >
           ${ICONS.record}
         </button>
+        <!-- Never disabled. It used to gray itself out on the sas_available
+             command, which answered "is *this* machine Windows?" about the
+             guest's own computer — a fact about the wrong end of the session,
+             since the sequence is delivered on the host. The honest answer
+             only exists after asking, and it comes back as SasAck. -->
         <button
           type="button"
-          class="toolbar-btn ${state.sasReady ? '' : 'is-disabled'}"
+          class="toolbar-btn"
           data-testid="toolbar-cad"
           aria-label=${t(locale, 'toolbar.cad')}
           title=${t(locale, 'toolbar.cad')}
-          ?disabled=${!state.sasReady}
           @click=${actions.sendCad}
         >
           ${ICONS.cad}
@@ -775,6 +870,52 @@ export function mountToolbar(
     paint();
   }
 
+  /**
+   * The resolution the host's screen is at right now: the one the guest
+   * picked, or — until it picks one — the size the watched monitor itself
+   * announced, which is the same thing said by the other side.
+   */
+  function hostResolutionNow(): string | null {
+    if (state.hostResolution !== null) {
+      return state.hostResolution;
+    }
+    const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
+    return monitor ? hostResolutionKey(monitor) : null;
+  }
+
+  /**
+   * Switches the host's own screen to `preset`'s refresh rate at the
+   * resolution it is already at.
+   *
+   * Does nothing at all when there is nothing to do it with: no announced
+   * modes (no `display_mode` grant, or a platform that cannot switch), or a
+   * resolution the announced list does not contain. Silence here is the
+   * right answer — the host's screen is not this window's to guess at.
+   */
+  function applyHostMode(preset: QualityPreset): void {
+    const key = hostResolutionNow();
+    const resolution = hostResolutionsFrom(state.hostDisplayModes.modes).find(
+      (entry) => hostResolutionKey(entry) === key,
+    );
+    if (!resolution) {
+      return;
+    }
+    const hz = refreshHzFor(
+      preset,
+      resolution.modes.map((mode) => mode.refresh_hz),
+    );
+    const mode = resolution.modes.find((entry) => entry.refresh_hz === hz);
+    if (!mode) {
+      return;
+    }
+    void commands.hostDisplaySetMode(peer, mode.id).catch(() => {
+      // The host's `display_mode` grant is gone, the id is stale, or the
+      // session ended: the select keeps showing what was asked for, and the
+      // host's own monitor simply does not change — the same "refused is not
+      // shown as an error" contract `pickQuality` follows.
+    });
+  }
+
   const actions = {
     toggleCollapsed(): void {
       state.collapsed = !state.collapsed;
@@ -854,8 +995,11 @@ export function mountToolbar(
     },
     sendCad(): void {
       void commands.sasRequest(peer).catch(() => {
-        // The host answered SasAck(false) or the session ended; the button
-        // stays enabled but the failure is visible in the log, not silent.
+        // The session ended, or this guest holds no `input` grant: the host's
+        // own screen simply does not change. Whether the host managed to
+        // synthesize the sequence is a separate answer that arrives as
+        // `SasAck` — an unelevated host with no helper service installed is
+        // refused by Windows itself (ADR 0043).
       });
     },
     askToRecord(): void {
@@ -869,59 +1013,52 @@ export function mountToolbar(
         draw();
       });
     },
-    sendFile(): void {
-      void commands.fileOffer(peer).catch(() => {
-        // The picker was dismissed, the host has no `file_transfer` grant, or
-        // it runs a version without the message: nothing was offered, and
-        // nothing here claims otherwise.
-      });
-    },
     pickMonitor(id: number): void {
       void commands
         .monitorSelect(peer, id)
         .then(() => {
           state.activeMonitor = id;
           state.openPopover = null;
-          // The resolution choice persists across the switch, but the
-          // percentage it maps to does not: it was worked out from the old
-          // monitor's size (task 4.4). Recomputing for a screen that cannot
-          // reach it falls back to native rather than sending a ceiling the
-          // guest never actually asked for.
+          // The preset persists across the switch, but the percentage it maps
+          // to does not: it was worked out from the old monitor's size (task
+          // 4.4), so it is recomputed for the new one.
           const monitor = state.monitors.find((entry) => entry.id === id);
-          const percent = scalePercentFor(state.resolution, monitor);
-          if (percent === null) {
-            state.resolution = 'native';
-            void commands.viewSetScale(peer, 100).catch(() => {});
-          } else {
-            void commands.viewSetScale(peer, percent).catch(() => {});
-          }
+          void commands.viewSetScale(peer, scalePercentFor(state.quality, monitor)).catch(() => {});
+          // The host announces the modes of the monitor it is *targeting*, so
+          // the list and the pick both belonged to the old screen. Dropping
+          // them back to "not fetched yet" is what makes the next opening of
+          // the popover ask again, for this screen.
+          state.hostDisplayModes = { modes: [], reason: null };
+          state.hostResolution = null;
           draw();
         })
         .catch(() => {
           draw();
         });
     },
-    pickResolution(option: ResolutionOption): void {
-      state.resolution = option;
+    pickQuality(preset: QualityPreset): void {
+      state.quality = preset;
       const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
-      const percent = scalePercentFor(option, monitor);
-      if (percent !== null) {
-        void commands.viewSetScale(peer, percent).catch(() => {
-          // The host refused (grant gone, an old peer) or the session ended:
-          // the selector keeps showing what was asked for, and the picture
-          // simply does not change.
-        });
-      }
+      void commands.viewSetScale(peer, scalePercentFor(preset, monitor)).catch(() => {
+        // The host refused (grant gone, an old peer) or the session ended:
+        // the selector keeps showing what was asked for, and the picture
+        // simply does not change.
+      });
+      // The preset names a refresh rate as well as a picture ceiling, so the
+      // host's own screen follows it — at whatever resolution it is already
+      // sitting at. A host that never announced any modes (no `display_mode`
+      // grant, or a platform that cannot switch) resolves to `null` here and
+      // is left alone.
+      applyHostMode(preset);
       draw();
     },
-    pickHostDisplayMode(modeId: number): void {
-      state.hostDisplayModeId = modeId;
-      void commands.hostDisplaySetMode(peer, modeId).catch(() => {
-        // The host's `display_mode` grant is gone, the id is stale, or the
-        // session ended: the select keeps showing what was asked for, and
-        // the host's own monitor simply does not change — the same "refused
-        // is not shown as an error" contract `pickResolution` follows.
-      });
+    pickHostResolution(key: string): void {
+      state.hostResolution = key;
+      applyHostMode(state.quality);
+      draw();
+    },
+    zoomBy(steps: number): void {
+      hooks.zoomBy(steps);
       draw();
     },
     beginDrag(event: PointerEvent): void {
@@ -962,18 +1099,6 @@ export function mountToolbar(
     redraw: draw,
     toggleCollapsed: actions.toggleCollapsed,
   });
-
-  // Whether the host can even try the SAS: off-Windows hosts cannot, and the
-  // button says so instead of letting someone press it into a dead end.
-  void commands
-    .sasAvailable()
-    .then((available) => {
-      state.sasReady = available;
-      draw();
-    })
-    .catch(() => {
-      state.sasReady = true;
-    });
 
   const onPointerDownAnywhere = (event: PointerEvent): void => {
     if (state.openPopover === null) {

@@ -641,6 +641,15 @@ button {
   gap: 8px;
 }
 
+/* The panel starts no transfer of its own any more, so the head is a title
+   and the one line saying how sending actually works. */
+.connections-list .file-panel-hint {
+  margin: 0;
+  font-size: var(--fs-micro);
+  color: var(--text-secondary);
+  text-align: end;
+}
+
 .connections-list .file-panel h3 {
   margin: 0;
   font-size: var(--fs-micro);

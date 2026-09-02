@@ -18,28 +18,11 @@
 //! running, which is also the only shape that existed before it. Nothing here
 //! knows which case it is in — the caller does, and reports it.
 //!
-//! Every platform without a SAS mechanism at all reports "unavailable" —
-//! the actor turns that into a `SasAck(false)` on the wire and a disabled
-//! toolbar button on the guest, never a silent success.
-
-/// Whether this host can attempt to synthesize the sequence right now.
-///
-/// Windows: yes, optimistically — whether `SendSAS` is *permitted* is not
-/// observable without calling it, so the guest's button stays enabled and a
-/// refusal comes back as `SasAck(false)`. Everywhere else: no, and the
-/// guest grays the button out instead of letting someone press it into a
-/// dead end.
-#[must_use]
-pub fn sas_available() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        true
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
-}
+//! A platform with no SAS mechanism at all refuses from [`send_sas`], and
+//! the actor turns that into a `SasAck(false)` on the wire — never a silent
+//! success. There is deliberately no "can this host do it?" question to ask
+//! ahead of time: whether `SendSAS` is *permitted* is not observable without
+//! calling it, so attempting and reporting is the only honest answer.
 
 /// Asks the host OS to deliver the Secure Attention Sequence.
 ///
@@ -77,15 +60,6 @@ pub fn send_sas() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Availability is an honest per-platform answer: `true` only where a
-    /// SAS mechanism exists at all. The *permission* question is separate
-    /// and can only be answered by calling `send_sas`, which is why this is
-    /// not a promise of success.
-    #[test]
-    fn availability_matches_the_platform() {
-        assert_eq!(sas_available(), cfg!(target_os = "windows"));
-    }
 
     /// The real path runs against the actual system library on Windows.
     /// Whether `SendSAS` is *permitted* depends on elevation and policy,

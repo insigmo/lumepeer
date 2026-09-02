@@ -162,8 +162,7 @@ export type TranslationKey =
   | 'chat.open'
   | 'chat.close'
   | 'files.heading'
-  | 'files.send'
-  | 'files.sendClipboard'
+  | 'files.sendHint'
   | 'files.fromClipboard'
   | 'files.accept'
   | 'files.decline'
@@ -185,8 +184,6 @@ export type TranslationKey =
   | 'toolbar.cad'
   | 'toolbar.record'
   | 'toolbar.record.asked'
-  | 'toolbar.clipboard'
-  | 'toolbar.file'
   | 'toolbar.collapse'
   | 'toolbar.expand'
   | 'toolbar.fullscreen'
@@ -194,11 +191,13 @@ export type TranslationKey =
   | 'toolbar.settings.displayMode'
   | 'toolbar.settings.localCursor'
   | 'toolbar.settings.cursorEmbedded'
-  | 'toolbar.settings.resolution'
-  | 'toolbar.resolution.native'
-  | 'toolbar.resolution.1080p'
-  | 'toolbar.resolution.720p'
-  | 'toolbar.resolution.half'
+  | 'toolbar.settings.quality'
+  | 'toolbar.quality.performance'
+  | 'toolbar.quality.balance'
+  | 'toolbar.quality.quality'
+  | 'toolbar.settings.zoom'
+  | 'toolbar.zoom.in'
+  | 'toolbar.zoom.out'
   | 'toolbar.settings.hostResolution'
   | 'toolbar.settings.hostResolutionWarning'
   | 'toolbar.hostResolution.empty.notGranted'
@@ -460,8 +459,11 @@ const en: Dictionary = {
   'chat.open': 'Chat',
   'chat.close': 'Close chat',
   'files.heading': 'Files',
-  'files.send': 'Send a file',
-  'files.sendClipboard': 'Send clipboard files',
+  // No button starts a transfer any more: copying a file is the whole of
+  // sending it (docs/bugs/14-clipboard-files.md). Said once, here, because a
+  // panel that only ever shows incoming things otherwise looks broken to
+  // whoever is trying to send.
+  'files.sendHint': 'To send a file, copy it with Ctrl+C — it is offered here automatically.',
   'files.fromClipboard': 'From clipboard',
   'files.accept': 'Accept',
   'files.decline': 'Decline',
@@ -480,11 +482,9 @@ const en: Dictionary = {
   'toolbar.chat': 'Chat',
   'toolbar.chat.unread': 'Chat — a new message',
   'toolbar.mic': 'Microphone',
-  'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.cad': 'Send Ctrl+Alt+Del to the host',
   'toolbar.record': 'Ask the host to record this session',
   'toolbar.record.asked': 'Asked the host to record; waiting for an answer',
-  'toolbar.clipboard': 'Clipboard sync is automatic in both directions',
-  'toolbar.file': 'Send a file to the host',
   'toolbar.collapse': 'Collapse',
   'toolbar.expand': 'Expand',
   'toolbar.fullscreen': 'Full screen',
@@ -495,17 +495,24 @@ const en: Dictionary = {
   // on this host the pointer is part of the picture and nothing here can
   // change that.
   'toolbar.settings.cursorEmbedded': 'This device sends the pointer inside the picture.',
-  // D7, docs/bugs/13-stream-resolution.md: a ceiling on what the host sends
-  // to this window — see 'toolbar.settings.hostResolution' below for the
-  // separate control that switches the host's own physical screen.
-  'toolbar.settings.resolution': 'Picture resolution',
-  'toolbar.resolution.native': 'Native',
-  'toolbar.resolution.1080p': '1080p',
-  'toolbar.resolution.720p': '720p',
-  'toolbar.resolution.half': '50%',
+  // D7, docs/bugs/13-stream-resolution.md: one preset naming a tradeoff,
+  // where there used to be a "picture resolution" list sitting next to
+  // 'toolbar.settings.hostResolution' saying a similar-sounding thing about
+  // a different machine. It caps what the host sends to this window *and*
+  // picks the refresh rate the host's own screen runs at.
+  'toolbar.settings.quality': 'Quality',
+  'toolbar.quality.performance': 'Performance',
+  'toolbar.quality.balance': 'Balance',
+  'toolbar.quality.quality': 'Quality',
+  // Only shown while the picture size is "Zoom": the one mode with a number
+  // behind it, and this is how that number moves without a mouse wheel.
+  'toolbar.settings.zoom': 'Zoom level',
+  'toolbar.zoom.in': 'Zoom in',
+  'toolbar.zoom.out': 'Zoom out',
   // D7, docs/bugs/16-host-display-mode.md: switches the host's actual
-  // monitor, never merely what this window receives — see
-  // 'toolbar.settings.resolution' above for that one.
+  // monitor, never merely what this window receives. Refresh rates are not
+  // listed here — the quality preset above picks one, so the same resolution
+  // stops appearing five times over.
   'toolbar.settings.hostResolution': "Host's screen resolution",
   'toolbar.settings.hostResolutionWarning':
     'This changes the resolution of the host computer itself, not just what you see here.',
@@ -763,8 +770,7 @@ const ar: Dictionary = {
   'chat.open': 'المحادثة',
   'chat.close': 'إغلاق المحادثة',
   'files.heading': 'الملفات',
-  'files.send': 'إرسال ملف',
-  'files.sendClipboard': 'إرسال ملفات الحافظة',
+  'files.sendHint': 'لإرسال ملف، انسخه بـ Ctrl+C — وسيُعرض هنا تلقائيًا.',
   'files.fromClipboard': 'من الحافظة',
   'files.accept': 'قبول',
   'files.decline': 'رفض',
@@ -783,11 +789,9 @@ const ar: Dictionary = {
   'toolbar.chat': 'المحادثة',
   'toolbar.chat.unread': 'المحادثة — رسالة جديدة',
   'toolbar.mic': 'الميكروفون',
-  'toolbar.cad': 'Ctrl+Alt+Del',
+  'toolbar.cad': 'إرسال Ctrl+Alt+Del إلى المضيف',
   'toolbar.record': 'اطلب من المضيف تسجيل هذه الجلسة',
   'toolbar.record.asked': 'تم إرسال طلب التسجيل؛ في انتظار الرد',
-  'toolbar.clipboard': 'مزامنة الحافظة تلقائية في الاتجاهين',
-  'toolbar.file': 'إرسال ملف إلى المضيف',
   'toolbar.collapse': 'طي',
   'toolbar.expand': 'توسيع',
   'toolbar.fullscreen': 'ملء الشاشة',
@@ -795,11 +799,13 @@ const ar: Dictionary = {
   'toolbar.settings.displayMode': 'حجم الصورة',
   'toolbar.settings.localCursor': 'ارسم المؤشر هنا',
   'toolbar.settings.cursorEmbedded': 'يرسل هذا الجهاز المؤشر داخل الصورة.',
-  'toolbar.settings.resolution': 'دقة الصورة',
-  'toolbar.resolution.native': 'الدقة الأصلية',
-  'toolbar.resolution.1080p': '1080p',
-  'toolbar.resolution.720p': '720p',
-  'toolbar.resolution.half': '50%',
+  'toolbar.settings.quality': 'الجودة',
+  'toolbar.quality.performance': 'الأداء',
+  'toolbar.quality.balance': 'متوازن',
+  'toolbar.quality.quality': 'أعلى جودة',
+  'toolbar.settings.zoom': 'مستوى التكبير',
+  'toolbar.zoom.in': 'تكبير',
+  'toolbar.zoom.out': 'تصغير',
   'toolbar.settings.hostResolution': 'دقة شاشة المضيف',
   'toolbar.settings.hostResolutionWarning':
     'هذا يغيّر دقة شاشة جهاز المضيف نفسه، وليس فقط ما تراه هنا.',

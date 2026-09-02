@@ -30,6 +30,8 @@ function toolbarHooks(): ToolbarHooks {
     chatUnread: () => false,
     displayMode: () => 'fit',
     setDisplayMode: () => {},
+    zoomPercent: () => 100,
+    zoomBy: () => {},
     fullscreen: () => false,
     toggleFullscreen: () => {},
     cursorChannel: () => false,
@@ -124,10 +126,8 @@ describe("the guest toolbar's clipboard indicator", () => {
     return {
       micToggle: vi.fn().mockResolvedValue(undefined),
       clipboardPull: vi.fn().mockResolvedValue(null),
-      fileOffer: vi.fn().mockResolvedValue(undefined),
       sasRequest: vi.fn().mockResolvedValue(undefined),
       recordRequest: vi.fn().mockResolvedValue(undefined),
-      sasAvailable: vi.fn().mockResolvedValue(true),
       monitorsList: vi.fn().mockResolvedValue([]),
       monitorSelect: vi.fn().mockResolvedValue(undefined),
       viewSetScale: vi.fn().mockResolvedValue(undefined),
@@ -146,25 +146,21 @@ describe("the guest toolbar's clipboard indicator", () => {
       toggleMic: () => {},
       sendCad: () => {},
       askToRecord: () => {},
-      sendFile: () => {},
       pickMonitor: () => {},
-      pickResolution: () => {},
-      pickHostDisplayMode: () => {},
+      pickQuality: () => {},
+      pickHostResolution: () => {},
+      zoomBy: () => {},
       beginDrag: () => {},
       nudge: () => {},
     });
   }
 
-  it('is a status, not a control, and named in both locales', () => {
+  it('has no icon of its own: sync is automatic while the grants are live', () => {
+    // It was already a status rather than a control (docs/bugs/10-clipboard-
+    // auto.md #3), and a permanent status saying "this works" is a claim the
+    // note below makes better, only when there is something to report.
     draw(new ToolbarState());
-    const indicator = container.querySelector('[data-testid="toolbar-clipboard"]');
-    expect(indicator).not.toBeNull();
-    // Not a button: nothing responds to a click any more (docs/bugs/10-
-    // clipboard-auto.md #3).
-    expect(indicator?.tagName).not.toBe('BUTTON');
-    expect(indicator?.getAttribute('aria-label')).toBe(
-      'Clipboard sync is automatic in both directions',
-    );
+    expect(container.querySelector('[data-testid="toolbar-clipboard"]')).toBeNull();
   });
 
   it('shows a note right after a sync and hides it once the note ages out', () => {

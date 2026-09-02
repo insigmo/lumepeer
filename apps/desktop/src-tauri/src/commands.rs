@@ -1435,60 +1435,6 @@ pub async fn clipboard_pull(
     Ok(state.network.clipboard_pull(peer).await?)
 }
 
-/// Opens the OS file picker and offers whatever the user chose to `peer`
-/// (§9.2; ADR 0032).
-///
-/// The picker runs **here**, in Rust. The webview is never given the `dialog`
-/// or `fs` permissions: `capabilities/view.json` states that a view window
-/// has no filesystem rights, and a picker invoked from the webview would be
-/// that right wearing a different name (§2.3). What crosses the IPC boundary
-/// in the other direction is a peer label and, later, a basename and a byte
-/// count — never a path on this machine (§15).
-///
-/// Cancelling the picker is a success that offered nothing, not an error.
-///
-/// # Errors
-/// [`IpcError`] when the window is not allowed, the session holds no
-/// `file_transfer` grant, the peer is too old to name a transfer, or too many
-/// offers are already outstanding.
-#[tauri::command]
-pub async fn file_offer(
-    app: tauri::AppHandle,
-    window: Window,
-    state: tauri::State<'_, AppState>,
-    peer: String,
-) -> Result<(), IpcError> {
-    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
-    let Some(path) = pick_file(&app).await else {
-        return Ok(());
-    };
-    state.network.file_offer(peer, path).await?;
-    Ok(())
-}
-
-/// Offers this node's own clipboard file list to `peer` (docs/bugs/
-/// 14-clipboard-files.md #2).
-///
-/// No dialog runs here: the list comes from the OS clipboard itself, on its
-/// own dedicated thread, never through anything the webview names. What
-/// crosses the IPC boundary in the other direction is names and sizes, same
-/// as an ordinary offer — never a path on this machine (§15).
-///
-/// # Errors
-/// [`IpcError`] when the window is not allowed, the session holds no
-/// `file_transfer` grant, or the peer is too old to understand a clipboard
-/// file offer.
-#[tauri::command]
-pub async fn file_offer_clipboard(
-    window: Window,
-    state: tauri::State<'_, AppState>,
-    peer: String,
-) -> Result<(), IpcError> {
-    check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
-    state.network.file_offer_clipboard(peer).await?;
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 pub struct FileAcceptArgs {
     /// Pseudonymized label of the session partner.
@@ -1589,20 +1535,6 @@ pub async fn file_transfers(
         return Err(IpcError::denied());
     }
     Ok(state.network.file_transfers().await?)
-}
-
-/// Runs the OS file picker on a blocking-safe path.
-///
-/// `blocking_pick_file` must not be called from the async runtime's own
-/// threads, so the dialog is driven through its callback and awaited on a
-/// oneshot instead.
-async fn pick_file(app: &tauri::AppHandle) -> Option<String> {
-    use tauri_plugin_dialog::DialogExt as _;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_file(move |chosen| {
-        let _ = tx.send(chosen);
-    });
-    rx.await.ok().flatten().and_then(path_string)
 }
 
 /// Runs the OS directory picker, for where a received file should land.
@@ -1776,14 +1708,6 @@ pub async fn sas_request(
     check_view_window(&window, &args.peer)?;
     state.network.sas_request(args.peer).await?;
     Ok(())
-}
-
-/// Whether this platform can attempt to deliver the Secure Attention
-/// Sequence at all (§11; ADR 0028). The toolbar grays the button out on a
-/// `false` instead of letting someone press it into a dead end.
-#[tauri::command]
-pub fn sas_available() -> bool {
-    lumepeer_media::sas::sas_available()
 }
 
 #[derive(Debug, Deserialize)]
