@@ -132,6 +132,7 @@ describe("the guest toolbar's clipboard indicator", () => {
       monitorsList: vi.fn().mockResolvedValue([]),
       monitorSelect: vi.fn().mockResolvedValue(undefined),
       viewSetScale: vi.fn().mockResolvedValue(undefined),
+      viewSetSize: vi.fn().mockResolvedValue(undefined),
       hostDisplayModes: vi.fn().mockResolvedValue({ modes: [], reason: null }),
       hostDisplaySetMode: vi.fn().mockResolvedValue(undefined),
     };

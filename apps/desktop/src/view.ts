@@ -34,14 +34,17 @@ import {
   defaultLayout,
   displaySize,
   effectiveScale,
+  FALLBACK_PICTURE_CEILING,
   frameResized,
   imageRenderingFor,
   installPan,
+  NATIVE_PICTURE_CEILING,
   nextDisplayMode,
   paintCursor,
   paintFrame,
   pictureBox,
   recordingBadge,
+  streamSizeFor,
   suppressContextMenu,
   ViewInput,
   viewOverlay,
@@ -286,6 +289,73 @@ function applyLayout(): void {
   // and above and wrong for every fitted window below it.
   canvas.style.imageRendering = imageRenderingFor(layout, frameSize, viewport, ratio);
   placeCursor();
+  // Every reason this runs - a resize, a zoom, a display-mode change, a frame
+  // that arrived at a new size - is a reason the host's idea of the picture
+  // size may now be wrong. `streamSizeFor` deliberately does not read
+  // `frameSize`, so answering a resized frame here cannot feed back into
+  // another request (ADR 0060).
+  syncStreamSize();
+}
+
+/**
+ * How long a window has to stop changing size before the host is told about
+ * it (ADR 0060).
+ *
+ * A drag across the screen produces a `resize` per animation frame, and each
+ * distinct size the host accepts costs an encoder type renegotiation and the
+ * keyframe that follows it - the most expensive frame in the stream. Waiting
+ * for the gesture to end turns a drag into one request. Short enough that
+ * letting go of the window edge and seeing it sharpen reads as immediate.
+ */
+const STREAM_SIZE_SETTLE_MS = 250;
+
+/**
+ * The largest picture this window may ask for.
+ *
+ * Starts at the fallback ceiling and is raised once the `WebView` has proved
+ * it decodes the bitstream itself: until that is known, the RGBA slot of
+ * §11.3 is the path the picture might take, and that slot is what the
+ * smaller ceiling measures (ADR 0018, ADR 0060).
+ */
+let pictureCeiling: { width: number; height: number } = FALLBACK_PICTURE_CEILING;
+/** The size the host was last told about, so a repeat costs nothing. */
+let sentStreamSize: { width: number; height: number } | null = null;
+let streamSizeTimer: ReturnType<typeof setTimeout> | undefined;
+
+/**
+ * Tells the host the picture size this window is drawing, once the size has
+ * settled (§11; ADR 0060).
+ *
+ * Debounced rather than rate-limited: what matters is the size the window
+ * ends up at, and every value on the way there is one nobody will look at.
+ */
+function syncStreamSize(): void {
+  const wanted = streamSizeFor(layout, viewportBox(), window.devicePixelRatio || 1, pictureCeiling);
+  if (
+    !wanted ||
+    (sentStreamSize?.width === wanted.width && sentStreamSize.height === wanted.height)
+  ) {
+    return;
+  }
+  clearTimeout(streamSizeTimer);
+  streamSizeTimer = setTimeout(() => {
+    if (stopped) {
+      return;
+    }
+    // Recomputed rather than captured: the window may have moved again while
+    // this was waiting, and the point of waiting is to send where it landed.
+    const now = streamSizeFor(layout, viewportBox(), window.devicePixelRatio || 1, pictureCeiling);
+    if (!now || (sentStreamSize?.width === now.width && sentStreamSize.height === now.height)) {
+      return;
+    }
+    sentStreamSize = now;
+    void tauriToolbarCommands.viewSetSize(peer, now.width, now.height).catch(() => {
+      // An older host that never advertised the feature, or a session that
+      // just ended. Neither is worth a message: the picture keeps arriving
+      // at whatever size that host already chose.
+      sentStreamSize = null;
+    });
+  }, STREAM_SIZE_SETTLE_MS);
 }
 
 function setDisplayMode(mode: DisplayMode): void {
@@ -629,6 +699,11 @@ async function main(): Promise<void> {
   // off whichever command the first call uses — so asking here, once, is also
   // what tells it whether to start the worker process at all (ADR 0058).
   if (canvas && (await nativeDecodingAvailable())) {
+    // This window decodes for itself, so the RGBA slot of §11.3 is not on the
+    // path and its ceiling does not apply: the host may send its own screen
+    // at its own size (ADR 0058, ADR 0060).
+    pictureCeiling = NATIVE_PICTURE_CEILING;
+    syncStreamSize();
     nativeDecoder = new NativeDecoder(canvas, (width, height) => {
       frameSize = { width, height };
       applyLayout();

@@ -1833,6 +1833,46 @@ pub async fn view_set_scale(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ViewSetSizeArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Width, in this window's own device pixels, the picture will be drawn
+    /// at (§11; ADR 0060).
+    pub width: u32,
+    /// Height, in this window's own device pixels.
+    pub height: u32,
+}
+
+/// Guest side: names the picture size this window will draw (§11; ADR 0060).
+///
+/// Distinct from [`view_set_scale`], which names a fraction of the *host's*
+/// screen: this names device pixels on *this* screen, which is the only
+/// number that can make one frame pixel land on one device pixel. The host
+/// fits its capture inside the box and never enlarges it, so a request larger
+/// than the host's own screen is how a window says "send me everything you
+/// have".
+///
+/// The host re-checks the `view` grant and the range before applying
+/// anything; this call only says whether the request could be sent at all.
+///
+/// # Errors
+/// [`IpcError`] when unallowed, the size is outside the range §9.1 bounds, or
+/// the host never confirmed it understands the message.
+#[tauri::command]
+pub async fn view_set_size(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewSetSizeArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .set_stream_size(args.peer, args.width, args.height)
+        .await?;
+    Ok(())
+}
+
 /// DTO of one monitor of the watched host (§11 `MonitorsList`).
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorDto {

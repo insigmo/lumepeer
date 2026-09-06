@@ -94,6 +94,82 @@ export const SCALE_STEP = 0.25;
  */
 export const PIXELATED_MIN_SCALE = 1;
 
+/**
+ * Mirrors `crates/core/src/constants.rs::STREAM_SIZE_MIN_PX` (ADR 0060). Not
+ * importable across the IPC boundary, so restated here the way
+ * `MIN_SCALE_PERCENT` is in `toolbar.ts`, with the same reasoning: below this
+ * a desktop is not a picture of anything, and the host refuses it as
+ * malformed rather than encoding it.
+ */
+export const STREAM_SIZE_MIN_PX = 160;
+
+/**
+ * The largest picture a window that decodes in its own `WebView` may ask the
+ * host for - `crates/core/src/constants.rs::MAX_STREAM_PIXELS`, as the axes
+ * that pixel count is (ADR 0060).
+ */
+export const NATIVE_PICTURE_CEILING = { width: 3840, height: 2160 } as const;
+
+/**
+ * The largest picture a window on the RGBA fallback decoder may ask for -
+ * `MAX_PICTURE_PIXELS`, which is the size of the shared-memory slot the
+ * sandboxed worker of §11.3 returns pictures through (ADR 0018).
+ *
+ * A window on that path must keep asking for no more than this: the ceiling
+ * is not the host being cautious, it is the only picture that fits.
+ */
+export const FALLBACK_PICTURE_CEILING = { width: 1920, height: 1080 } as const;
+
+/**
+ * The picture size to ask the host to encode, in this window's own device
+ * pixels, or `null` while there is no viewport to measure (ADR 0060).
+ *
+ * The whole point is that one frame pixel should land on one device pixel.
+ * `StreamScaleRequest` could only name a percentage of the *host's* screen,
+ * which is a number this side cannot compute anything useful from - the host
+ * knows its own screen and this window knows its own, and every disagreement
+ * between the two was paid for twice: once in the host's box filter, once in
+ * the canvas's bilinear one.
+ *
+ * `fit` asks for the viewport, because that is the whole area the picture is
+ * about to be drawn into; the host fits its capture inside that box keeping
+ * its own aspect ratio, so the letterboxed axis costs nothing. `actual` and
+ * `scaled` ask for the ceiling instead: both draw at one frame pixel per
+ * device pixel or larger, so the sharpest picture that exists is the most
+ * pixels the host is willing to send, and the host clamps that to its own
+ * screen anyway.
+ *
+ * Deliberately blind to the current frame size. The answer feeding back into
+ * the frame it was computed from is how a resize loop starts, and this
+ * function is called from the same place that reacts to a resized frame.
+ */
+export function streamSizeFor(
+  layout: ViewLayout,
+  viewport: { width: number; height: number },
+  devicePixelRatio: number,
+  ceiling: { width: number; height: number },
+): { width: number; height: number } | null {
+  if (layout.mode !== 'fit') {
+    return { width: ceiling.width, height: ceiling.height };
+  }
+  const ratio = devicePixelRatio > 0 ? devicePixelRatio : 1;
+  // Down to an even number, which is what the host's own 4:2:0 rounding will
+  // do to it regardless; asking for the odd pixel only guarantees a one-pixel
+  // disagreement between what was asked for and what arrives.
+  const even = (value: number): number => Math.floor(value) & ~1;
+  const width = even(viewport.width * ratio);
+  const height = even(viewport.height * ratio);
+  if (width < STREAM_SIZE_MIN_PX || height < STREAM_SIZE_MIN_PX) {
+    // A window this small is one that has not been laid out yet. Asking for
+    // the floor would spend a keyframe on a size about to change.
+    return null;
+  }
+  return {
+    width: Math.min(width, ceiling.width),
+    height: Math.min(height, ceiling.height),
+  };
+}
+
 /** Everything about where the picture is and how big it is drawn. */
 export interface ViewLayout {
   mode: DisplayMode;

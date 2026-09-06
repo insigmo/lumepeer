@@ -96,6 +96,16 @@ export interface ToolbarCommands {
    */
   viewSetScale(peer: string, scalePercent: number): Promise<void>;
   /**
+   * Names the picture size this window will draw, in its own device pixels
+   * (§11; ADR 0060).
+   *
+   * Device pixels on *this* screen, not a fraction of the host's - the only
+   * number that can make one frame pixel land on one device pixel. The host
+   * fits its capture inside the box and never enlarges it, so asking for more
+   * than the host has is how a window says "send everything you have".
+   */
+  viewSetSize(peer: string, width: number, height: number): Promise<void>;
+  /**
    * The host's own physical display modes, or an honest reason there are
    * none (docs/bugs/16-host-display-mode.md #4; ADR 0048).
    *
@@ -153,6 +163,10 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // `scale_percent`, not `scalePercent`: same snake_case boundary as
     // `monitor_id` above.
     return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent } });
+  },
+  async viewSetSize(peer, width, height) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('view_set_size', { args: { peer, width, height } });
   },
   async hostDisplayModes(peer) {
     const { invoke } = await import('@tauri-apps/api/core');

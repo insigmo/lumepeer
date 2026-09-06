@@ -9,8 +9,8 @@ use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
     FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS,
-    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, STREAM_SCALE_MAX_PERCENT,
-    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT,
+    STREAM_SIZE_MIN_PX, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -118,7 +118,25 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// request from one, for the same minor-version reason every feature-gated
 /// message since minor 2 uses. See `docs/bugs/16-host-display-mode.md` and
 /// `docs/adr/0048-a-fifth-independent-grant-for-the-hosts-own-screen.md`.
-pub const PROTOCOL_MINOR: u16 = 9;
+///
+/// 10: appended [`MessageKind::StreamSizeRequest`] after `DisplaySetMode`.
+/// `StreamScaleRequest` (minor 7) can only name a *percentage of the host's
+/// own screen*, which is a number the guest cannot compute anything useful
+/// from: the size that matters is how many device pixels the guest is going
+/// to draw the picture into, and the host is the only side that knows its own
+/// screen size while the guest is the only side that knows its own window.
+/// The percentage therefore always disagreed with the window by some
+/// arbitrary factor, and every disagreement is a resample - once on the host
+/// with a box filter, once in the guest's canvas with a bilinear one. Naming
+/// the size directly is what makes one frame pixel land on one device pixel.
+/// It also lifts the [`crate::constants::MAX_PICTURE_PIXELS`] ceiling, which
+/// exists for the RGBA fallback decoder and has no business capping a guest
+/// that decodes in its own webview (ADR 0058). A guest sends it only to a
+/// host whose `HelloAck` minor is at least this one, and a host only reads it
+/// from a guest whose `Hello` advertised [`FEATURE_STREAM_SIZE`] - the same
+/// shape [`FEATURE_STREAM_SCALE`] uses, for the same reason. See
+/// `docs/adr/0060-the-guest-names-the-picture-size-it-will-draw.md`.
+pub const PROTOCOL_MINOR: u16 = 10;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -223,6 +241,17 @@ pub const FEATURE_CLIPBOARD_FILES: &str = "clipboard-files";
 /// peer that did not advertise this string — an older peer decodes either
 /// discriminant as unknown and closes the connection (§9.1).
 pub const FEATURE_DISPLAY_MODE: &str = "display-mode";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::StreamSizeRequest`], and therefore that this host may size
+/// the picture from the guest's own request rather than from
+/// [`crate::constants::MAX_PICTURE_PIXELS`] (ADR 0060).
+///
+/// Same compatibility shape as [`FEATURE_STREAM_SCALE`], and the same
+/// direction: a guest-to-host message, advertised by the guest in its own
+/// `Hello`. A guest that does not advertise it keeps the ADR 0018 ceiling
+/// exactly as before, which is the behaviour its decoder still needs.
+pub const FEATURE_STREAM_SIZE: &str = "stream-size";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -620,6 +649,35 @@ pub enum MessageKind {
         /// Mode id as announced in the most recent `DisplayModesList`.
         mode_id: u32,
     },
+    /// Guest to host: encode the picture at no more than `width`x`height`
+    /// (§11; ADR 0060). New in minor 10.
+    ///
+    /// The size the guest is actually going to *draw*, in its own device
+    /// pixels - not a percentage of a screen it cannot see. The host fits its
+    /// captured frame inside this box, keeping the aspect ratio and never
+    /// enlarging: a guest asking for more than the host has gets the host's
+    /// own size, which is the sharpest picture that exists.
+    ///
+    /// Sending it also states that this guest decodes the bitstream itself
+    /// (ADR 0058) and so is not bound by the RGBA slot of §11.3. That is why
+    /// it lifts [`crate::constants::MAX_PICTURE_PIXELS`] in favour of
+    /// [`MAX_STREAM_PIXELS`], and why a guest on the fallback decoder must
+    /// keep asking for no more than the smaller one.
+    ///
+    /// A ceiling like [`MessageKind::StreamScaleRequest`], not a target: the
+    /// adaptive controller of ADR 0037 stays free to sit below it. The two
+    /// compose rather than compete - this one bounds the pixels, that one
+    /// scales what is left.
+    ///
+    /// Bounded here, on decode, for the same reason `StreamScaleRequest` is:
+    /// a static range is exactly what §9.1 checks before anything downstream
+    /// allocates per pixel on an untrusted peer's number.
+    StreamSizeRequest {
+        /// Requested width in device pixels, at least [`STREAM_SIZE_MIN_PX`].
+        width: u32,
+        /// Requested height in device pixels, at least [`STREAM_SIZE_MIN_PX`].
+        height: u32,
+    },
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -923,6 +981,19 @@ impl MessageEnvelope {
             {
                 return Err(CoreError::Malformed);
             }
+            // The same untrusted-number rule one message down, on a value the
+            // host multiplies out into an allocation per frame. Both axes are
+            // floored so an encoder is never handed a degenerate picture, and
+            // the *product* is ceilinged rather than each axis on its own:
+            // 30000x120 passes any per-axis bound and is still an absurd
+            // number of pixels to ask a host to encode.
+            MessageKind::StreamSizeRequest { width, height }
+                if *width < STREAM_SIZE_MIN_PX
+                    || *height < STREAM_SIZE_MIN_PX
+                    || (*width as usize).saturating_mul(*height as usize) > MAX_STREAM_PIXELS =>
+            {
+                return Err(CoreError::Malformed);
+            }
             // `modes` and `reason` must never disagree about which state the
             // list is in (docs/bugs/16-host-display-mode.md #2): a populated
             // list next to an explanation for why it is empty, or an empty
@@ -973,7 +1044,7 @@ mod tests {
     use super::*;
     use crate::constants::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_DISPLAY_MODES_PER_HOST,
+        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
         UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
@@ -1141,6 +1212,14 @@ mod tests {
             "the minor-9 kinds must be appended after ClipboardFileAccept"
         );
         assert_eq!(kind_byte(MessageKind::DisplaySetMode { mode_id: 0 }), 42,);
+        assert_eq!(
+            kind_byte(MessageKind::StreamSizeRequest {
+                width: 1_920,
+                height: 1_080,
+            }),
+            43,
+            "the minor-10 kind must be appended after DisplaySetMode"
+        );
     }
 
     /// A receiver report is a claim, not a fact, so decoding never judges it:
@@ -1532,6 +1611,40 @@ mod tests {
             assert!(
                 matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
                 "scale_percent {scale_percent} outside the range was accepted"
+            );
+        }
+    }
+
+    /// ADR 0060: both axes have a floor so no encoder is handed a degenerate
+    /// picture, and the *product* has the ceiling, so a shape that passes any
+    /// per-axis bound and is still absurd (30000x120) does not.
+    #[test]
+    fn a_stream_size_request_roundtrips_within_its_range_and_is_malformed_outside_it() {
+        for (width, height) in [
+            (STREAM_SIZE_MIN_PX, STREAM_SIZE_MIN_PX),
+            (1_280, 720),
+            (2_560, 1_440),
+            (3_840, 2_160),
+        ] {
+            let original = envelope(MessageKind::StreamSizeRequest { width, height });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for (width, height) in [
+            (0, 0),
+            (STREAM_SIZE_MIN_PX - 1, 1_080),
+            (1_920, STREAM_SIZE_MIN_PX - 1),
+            (3_840, 2_162),
+            (30_000, 120),
+            (u32::MAX, u32::MAX),
+        ] {
+            let bytes = envelope(MessageKind::StreamSizeRequest { width, height })
+                .encode()
+                .unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "{width}x{height} outside the range was accepted"
             );
         }
     }

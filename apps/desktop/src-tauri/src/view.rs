@@ -40,7 +40,7 @@ use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelForm
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
 use lumepeer_media::error::MediaError;
-use lumepeer_media::scale::{fit_within_budget, scale_to_percent};
+use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerEndpoint, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -91,6 +91,12 @@ pub struct EncodeControl {
     /// its own — a ceiling this loop reads is not a target ABR stops
     /// adapting around.
     manual_cap: Arc<Mutex<Option<u32>>>,
+    /// The picture size the guest said it will draw, in its own device
+    /// pixels, if it asked for one (§11; ADR 0060). `None` is a guest that
+    /// never asked, which is the only case that still gets the
+    /// `MAX_PICTURE_PIXELS` ceiling of ADR 0018 - it may be decoding into
+    /// the RGBA slot of §11.3, and that slot is what the ceiling is for.
+    size_cap: Arc<Mutex<Option<(u32, u32)>>>,
     /// Whether this session currently holds the `secure_desktop` grant
     /// (ADR 0049). Written by the actor whenever the host flips the grant
     /// (`Network::on_set_grant`), read by the loop before every attempt to
@@ -118,6 +124,7 @@ impl EncodeControl {
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
             manual_cap: Arc::new(Mutex::new(None)),
+            size_cap: Arc::new(Mutex::new(None)),
             // Deny until told otherwise: the actor seeds this from the
             // session's live `secure_desktop` grant the moment it accepts the
             // media connection, and moves it again on every `on_set_grant`
@@ -204,6 +211,32 @@ impl EncodeControl {
     pub fn set_manual_cap(&self, cap: Option<u32>) -> bool {
         let mut current = self
             .manual_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = *current != cap;
+        *current = cap;
+        changed
+    }
+
+    /// The picture size the guest asked for right now, if any (§11; ADR 0060).
+    #[must_use]
+    pub fn size_cap(&self) -> Option<(u32, u32)> {
+        *self
+            .size_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the picture size the guest asked for, replacing whatever was
+    /// there.
+    ///
+    /// Returns whether this actually changed it, for the same reason
+    /// [`Self::set_manual_cap`] does: a request repeating the size already in
+    /// effect has nothing new to draw, and a keyframe is the most expensive
+    /// frame in the stream to spend on nothing.
+    pub fn set_size_cap(&self, cap: Option<(u32, u32)>) -> bool {
+        let mut current = self
+            .size_cap
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let changed = *current != cap;
@@ -1335,6 +1368,7 @@ pub fn spawn_encode_loop(
             // ceiling of §15 that no choice may exceed, so it goes last and
             // has the final say (ADR 0018).
             let scale_percent = effective_scale(control.manual_cap(), target.scale_percent);
+            let size_cap = control.size_cap();
 
             // The cursor rides its own channel when the guest asked for one,
             // and is read only then: a shape the loop would never send is a
@@ -1365,7 +1399,18 @@ pub fn spawn_encode_loop(
             // `next_frame` above does. The encoder travels with the closure
             // and back.
             let finished = tokio::task::spawn_blocking(move || {
-                let frame = fit_within_budget(scale_to_percent(frame, scale_percent));
+                let frame = scale_to_percent(frame, scale_percent);
+                // The guest's own box when it named one, the ADR 0018
+                // ceiling when it did not - never both. `MAX_PICTURE_PIXELS`
+                // sizes the RGBA slot of §11.3, so it binds exactly the
+                // guests that still decode through it; applying it to a
+                // guest that decodes in its own webview is what turned a
+                // 1440p host into a resampled 1080p picture the guest then
+                // stretched back out (ADR 0060).
+                let frame = match size_cap {
+                    Some((width, height)) => fit_within(frame, width, height),
+                    None => fit_within_budget(frame),
+                };
                 let mut encoder = encoder;
                 let bitstream = encoder.encode(&frame);
                 (encoder, bitstream)
