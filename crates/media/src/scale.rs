@@ -143,6 +143,75 @@ pub fn fit_within_budget(frame: Frame) -> Frame {
     }
 }
 
+/// Target dimensions for a picture fitted inside `max_width`x`max_height`,
+/// or `None` when it already fits (§11; ADR 0060).
+///
+/// The aspect ratio is preserved and the picture is **never enlarged**: a
+/// guest asking for a box bigger than the host's screen gets the host's own
+/// size, which is the sharpest picture that exists. Upscaling here would
+/// invent detail on the host and then spend bitrate sending it.
+///
+/// Both axes are rounded down to an even number for the same 4:2:0 reason
+/// [`target_size`] does.
+#[must_use]
+pub fn box_size(width: u32, height: u32, max_width: u32, max_height: u32) -> Option<(u32, u32)> {
+    if width < 2 || height < 2 || max_width == 0 || max_height == 0 {
+        return None;
+    }
+    if width <= max_width && height <= max_height {
+        return None;
+    }
+    let factor = (f64::from(max_width) / f64::from(width))
+        .min(f64::from(max_height) / f64::from(height))
+        .min(1.0);
+    let even = |value: u32| -> u32 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "factor is in (0, 1], so the product is at most `value` and never negative"
+        )]
+        let scaled = (f64::from(value) * factor) as u32;
+        (scaled & !1).max(2)
+    };
+    let (target_width, target_height) = (even(width), even(height));
+    if target_width >= width && target_height >= height {
+        return None;
+    }
+    Some((target_width, target_height))
+}
+
+/// Downscales `frame` to fit inside `max_width`x`max_height`, or returns it
+/// unchanged (§11; ADR 0060).
+///
+/// The guest's own request, applied *instead of* [`fit_within_budget`] rather
+/// than before it: [`MAX_PICTURE_PIXELS`] is the ceiling a guest gets when it
+/// has not said what it can take, and a guest that has said so has already
+/// been bounded by `MAX_STREAM_PIXELS` on decode.
+#[must_use]
+pub fn fit_within(frame: Frame, max_width: u32, max_height: u32) -> Frame {
+    if frame.format != PixelFormat::Bgra8 {
+        return frame;
+    }
+    let Some((width, height)) = box_size(frame.width, frame.height, max_width, max_height) else {
+        return frame;
+    };
+    let expected = (frame.width as usize)
+        .saturating_mul(frame.height as usize)
+        .saturating_mul(BGRA_BYTES);
+    if frame.data.len() < expected {
+        // Same reasoning as `fit_within_budget`: a short buffer is not this
+        // module's to interpret.
+        return frame;
+    }
+    Frame {
+        data: box_downscale(&frame.data, frame.width, frame.height, width, height),
+        width,
+        height,
+        format: frame.format,
+        timestamp_us: frame.timestamp_us,
+    }
+}
+
 /// Box-averages `src` (BGRA8, `src_width`x`src_height`) down to
 /// `dst_width`x`dst_height`.
 fn box_downscale(
@@ -310,6 +379,65 @@ mod tests {
         broken.data.truncate(16);
         let kept = fit_within_budget(broken);
         assert_eq!(kept.width, 3840);
+        assert_eq!(kept.data.len(), 16);
+    }
+
+    /// ADR 0060: a guest asking for a box at least as big as the host's
+    /// screen gets the host's own picture untouched. This is the case that
+    /// matters most - it is what makes a 1440p guest watching a 1440p host
+    /// see one frame pixel per device pixel, where the ADR 0018 ceiling used
+    /// to hand it a resampled 1080p one.
+    #[test]
+    fn a_box_at_or_above_the_picture_never_enlarges_it() {
+        assert_eq!(box_size(2560, 1440, 2560, 1440), None);
+        assert_eq!(box_size(1920, 1080, 3840, 2160), None);
+        let kept = fit_within(frame(64, 64, 0x20), 1920, 1080);
+        assert_eq!((kept.width, kept.height), (64, 64));
+    }
+
+    /// The aspect ratio decides which axis binds, not the order of the
+    /// arguments: a wide picture in a tall box is limited by its width.
+    #[test]
+    fn a_box_fits_the_picture_by_whichever_axis_binds_first() {
+        assert_eq!(box_size(2560, 1440, 1280, 1440), Some((1280, 720)));
+        assert_eq!(box_size(2560, 1440, 2560, 720), Some((1280, 720)));
+        assert_eq!(box_size(3840, 2160, 1920, 1080), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn every_boxed_size_is_even_and_inside_the_box() {
+        for (width, height, max_width, max_height) in [
+            (2560u32, 1440u32, 1366u32, 768u32),
+            (3840, 2160, 1000, 1000),
+            (1366, 768, 300, 900),
+            (1920, 1200, 1919, 1199),
+        ] {
+            let (out_width, out_height) =
+                box_size(width, height, max_width, max_height).expect("this shrinks");
+            assert_eq!(out_width % 2, 0, "{width}x{height} produced an odd width");
+            assert_eq!(out_height % 2, 0, "{width}x{height} produced an odd height");
+            assert!(
+                out_width <= max_width && out_height <= max_height,
+                "{width}x{height} escaped the {max_width}x{max_height} box as {out_width}x{out_height}"
+            );
+        }
+    }
+
+    #[test]
+    fn fitting_within_a_box_rewrites_the_frame_and_keeps_its_timestamp() {
+        let reduced = fit_within(frame(64, 32, 0x30), 32, 32);
+        assert_eq!((reduced.width, reduced.height), (32, 16));
+        assert_eq!(reduced.timestamp_us, 7);
+        assert_eq!(reduced.data.len(), 32 * 16 * BGRA_BYTES);
+        assert!(reduced.data.iter().all(|byte| *byte == 0x30));
+    }
+
+    #[test]
+    fn a_short_buffer_is_passed_through_by_the_box_fit_too() {
+        let mut broken = frame(2560, 1440, 0x11);
+        broken.data.truncate(16);
+        let kept = fit_within(broken, 1280, 720);
+        assert_eq!(kept.width, 2560);
         assert_eq!(kept.data.len(), 16);
     }
 }

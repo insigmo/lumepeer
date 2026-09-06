@@ -48,6 +48,7 @@ function fakeCommands(): ToolbarCommands & {
   monitorSelect: ReturnType<typeof vi.fn>;
   clipboardPull: ReturnType<typeof vi.fn>;
   viewSetScale: ReturnType<typeof vi.fn>;
+  viewSetSize: ReturnType<typeof vi.fn>;
   hostDisplayModes: ReturnType<typeof vi.fn>;
   hostDisplaySetMode: ReturnType<typeof vi.fn>;
 } {
@@ -59,6 +60,7 @@ function fakeCommands(): ToolbarCommands & {
     monitorsList: vi.fn().mockResolvedValue(MONITORS),
     monitorSelect: vi.fn().mockResolvedValue(undefined),
     viewSetScale: vi.fn().mockResolvedValue(undefined),
+    viewSetSize: vi.fn().mockResolvedValue(undefined),
     hostDisplayModes: vi.fn().mockResolvedValue({ modes: [], reason: null }),
     hostDisplaySetMode: vi.fn().mockResolvedValue(undefined),
   };

@@ -6,22 +6,55 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 65_536;
 /// Maximum size of one media frame payload on `rd/media/1`, checked before
 /// allocation exactly as `MAX_CONTROL_FRAME_BYTES` is on the control channel
 /// (§3.2, §9.1). Encoded video needs far more room than a control message, but
-/// still a bound: at the `ABR_MAX_BITRATE_KBPS` ceiling a single keyframe stays
-/// orders of magnitude below this. It is deliberately at or under
+/// still a bound: even at the `ABR_MAX_BITRATE_KBPS` ceiling a single keyframe
+/// stays well below this. It is deliberately at or under
 /// `lumepeer_media::decode::SLOT_PAYLOAD_BYTES`, so a frame that passed this
 /// check always fits the decoder's shared-memory slot.
-pub const MAX_MEDIA_FRAME_BYTES: usize = 4 * 1024 * 1024;
-/// Largest picture, in pixels, that travels through the media pipeline in one
-/// frame (§11, §15; ADR 0018).
 ///
-/// A host screen bigger than this is downscaled before it is encoded, so the
-/// wire, the sandboxed decoder's shared-memory slot and the guest's canvas all
-/// stay inside the memory budget of `ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB`.
-/// One RGBA8 picture of this size is 8 MiB, which is exactly what
-/// `lumepeer_media::decode::SLOT_PAYLOAD_BYTES` holds — the two are asserted
-/// against each other at compile time there, so raising one without the other
-/// does not build.
+/// Equal to that slot rather than half of it since [`MAX_STREAM_PIXELS`]: an
+/// intra frame of a 4K desktop, encoded at a quality preset's bitrate, is the
+/// one frame in the stream that can genuinely approach a megabyte or three,
+/// and dropping it is worse than carrying it - everything after it references
+/// it, so the guest sees nothing at all until the next one.
+pub const MAX_MEDIA_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Largest picture, in pixels, the host encodes for a guest that has not said
+/// what size it wants (§11, §15; ADR 0018, ADR 0060).
+///
+/// This is the *decoded RGBA* bound, and that is the whole reason for its
+/// value: a guest that cannot decode the bitstream in its own webview falls
+/// back to the sandboxed worker of §11.3, which returns pictures through a
+/// shared-memory slot. One RGBA8 picture of this size is 8 MiB, which is
+/// exactly what `lumepeer_media::decode::SLOT_PAYLOAD_BYTES` holds — the two
+/// are asserted against each other at compile time there, so raising one
+/// without the other does not build.
+///
+/// It is **not** a bound on what a guest may receive. Since ADR 0058 the
+/// picture normally never exists as RGBA outside the webview's own decoder,
+/// and a guest that knows this says so with
+/// [`crate::protocol::MessageKind::StreamSizeRequest`], which the host honors
+/// up to [`MAX_STREAM_PIXELS`]. Applying this ceiling to such a guest is what
+/// made a 1440p host arrive as a resampled 1080p picture that the guest's
+/// canvas then stretched back out — softening every glyph on the screen twice
+/// over.
 pub const MAX_PICTURE_PIXELS: usize = 1920 * 1080;
+/// Largest picture, in pixels, the host will encode for a guest that asked for
+/// a size with [`crate::protocol::MessageKind::StreamSizeRequest`] (§11;
+/// ADR 0060).
+///
+/// 4K, because that is the largest desktop the hardware H.264 encoders this
+/// project targets encode at a sensible rate, and because a guest asking for
+/// more pixels than its own screen has is asking for work that nothing can
+/// display. Nothing here has to fit `SLOT_PAYLOAD_BYTES`: a guest only sends
+/// the request when it decodes into its own webview, where the picture stays
+/// on the GPU and never crosses an IPC boundary as pixels at all.
+pub const MAX_STREAM_PIXELS: usize = 3840 * 2160;
+/// Smallest picture, per axis, a guest may ask for with
+/// [`crate::protocol::MessageKind::StreamSizeRequest`] (§9.1; ADR 0060).
+///
+/// A bound on an untrusted peer's number rather than a considered minimum:
+/// below this a desktop is not a picture of anything, and an encoder handed a
+/// two-pixel axis fails the frame instead of producing a smaller one.
+pub const STREAM_SIZE_MIN_PX: u32 = 160;
 /// Pause between redial attempts inside the one media recovery pass bounded by
 /// [`RECONNECT_WINDOW_SECS`]. Not a second reconnect window: it only keeps a
 /// host that refuses instantly from turning that window into a busy loop.
@@ -255,11 +288,31 @@ pub const ENCODE_DEFAULT_FPS: u8 = 30;
 /// budgets the session, not the box.
 pub const ENCODE_MAX_SOFTWARE_THREADS: u16 = 4;
 /// Default encoder bitrate (§11).
-pub const ENCODE_DEFAULT_BITRATE_KBPS: u32 = 4_000;
+///
+/// Where the adaptive ladder *starts*, not what it spends: the rate control
+/// of ADR 0059 is variable, so a still desktop encodes to a small fraction of
+/// this and only a screen that is actually moving reaches it. That asymmetry
+/// is why the starting point can afford to be generous - a target too low
+/// costs sharpness on every moving frame, while a target too high costs
+/// nothing at all on a screen nobody is touching.
+///
+/// Raised with ADR 0060, which is what makes it a different number than it
+/// was: a guest that names its own picture size is no longer held to
+/// `MAX_PICTURE_PIXELS`, so the same figure now has to cover a 1440p or 4K
+/// picture rather than a downscaled 1080p one. Recovery climbs 5% per
+/// adjustment, so starting a 1440p session where a 1080p one used to start
+/// meant most of a minute of soft picture before the ladder caught up.
+pub const ENCODE_DEFAULT_BITRATE_KBPS: u32 = 8_000;
 /// Lower bound of the adaptive bitrate range (§11).
 pub const ABR_MIN_BITRATE_KBPS: u32 = 300;
 /// Upper bound of the adaptive bitrate range (§11).
-pub const ABR_MAX_BITRATE_KBPS: u32 = 12_000;
+///
+/// Reached only by a link that has carried everything offered to it without
+/// loss for long enough to climb there, so this bounds what a *good* link is
+/// allowed to spend rather than what a session costs. Raised alongside
+/// [`ENCODE_DEFAULT_BITRATE_KBPS`] and for the same ADR 0060 reason: 12 Mbit
+/// is a ceiling a 1080p desktop rarely needed and a 4K one hits immediately.
+pub const ABR_MAX_BITRATE_KBPS: u32 = 25_000;
 /// Receiver feedback interval sent by the guest (§11).
 pub const ABR_FEEDBACK_INTERVAL_MS: u32 = 500;
 /// How long the host keeps treating a guest's last

@@ -28,15 +28,15 @@ use lumepeer_core::constants::{
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
     DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
     INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
-    MAX_PENDING_FILE_OFFERS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
-    STREAM_SCALE_MAX_PERCENT,
+    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
+    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
     FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER,
-    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_UNATTENDED,
-    InputDetail, InputEventPayload, MediaUnavailableReason, MessageKind, MonitorInfo,
-    UnattendedRejection,
+    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
+    FEATURE_UNATTENDED, InputDetail, InputEventPayload, MediaUnavailableReason, MessageKind,
+    MonitorInfo, UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -90,6 +90,14 @@ const RECEIVER_REPORT_MINOR: u16 = 6;
 /// guest's `FEATURE_STREAM_SCALE` string instead, which is the more precise
 /// signal, and `HelloAck` carries no feature list for the guest to read.
 const STREAM_SCALE_MINOR: u16 = 7;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::StreamSizeRequest`, and
+/// therefore the floor for naming the picture size this guest will draw
+/// (ADR 0060).
+///
+/// Guest side only, exactly like [`STREAM_SCALE_MINOR`]: a host reads the
+/// guest's `FEATURE_STREAM_SIZE` string instead.
+const STREAM_SIZE_MINOR: u16 = 10;
 
 /// First `PROTOCOL_MINOR` that carries `MessageKind::ClipboardFileOffer` and
 /// `MessageKind::ClipboardFileAccept`, and therefore the floor for offering
@@ -839,6 +847,14 @@ enum ActorCommand {
         scale_percent: u32,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Guest side: tell the watched host the picture size this window will
+    /// draw, in its own device pixels (§11; ADR 0060).
+    StreamSizeRequest {
+        label: String,
+        width: u32,
+        height: u32,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
     /// Guest side: the modes the watched host announced for its own physical
     /// monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
     DisplayModesList {
@@ -1511,6 +1527,39 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Guest side: tells the watched host the picture size this window will
+    /// draw, in its own device pixels (§11; ADR 0060).
+    ///
+    /// The host fits its captured frame inside the box and never enlarges it,
+    /// so asking for more than the host has is how a guest says "send me
+    /// everything you have" - which is exactly what a zoomed-in window, or one
+    /// larger than the host's own screen, wants.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] for a size outside the range §9.1
+    /// bounds; [`ActorError::Unsupported`] towards a host that never confirmed
+    /// it understands the message; [`ActorError::ChannelClosed`] if the actor
+    /// is gone.
+    pub async fn set_stream_size(
+        &self,
+        label: String,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::StreamSizeRequest {
+                label,
+                width,
+                height,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
     /// Guest side: the watched host's monitors, as it announced them when it
     /// granted this session (§11 `MonitorsList`; ADR 0028).
     ///
@@ -2148,6 +2197,18 @@ struct StreamScaleFeature {
     to_peer: bool,
 }
 
+/// Whether this build may send `StreamSizeRequest` towards a peer, and
+/// whether it may act on one received from it - the same shape
+/// [`StreamScaleFeature`] uses, for the same reason (ADR 0060).
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamSizeFeature {
+    /// Host side: the guest advertised [`FEATURE_STREAM_SIZE`].
+    from_peer: bool,
+    /// Guest side: the host answered with a minor of at least
+    /// [`STREAM_SIZE_MINOR`].
+    to_peer: bool,
+}
+
 /// Whether this build may announce `DisplayModesList` towards a peer and act
 /// on a `DisplaySetMode` from it, and whether it may send `DisplaySetMode`
 /// towards it and trust an incoming `DisplayModesList` — the same shape
@@ -2367,6 +2428,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
         /// docs/bugs/13-stream-resolution.md).
         speaks_stream_scale: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SIZE`
+        /// (ADR 0060).
+        speaks_stream_size: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2458,6 +2522,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SCALE` (D7,
         /// docs/bugs/13-stream-resolution.md).
         speaks_stream_scale: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SIZE`
+        /// (ADR 0060).
+        speaks_stream_size: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2553,6 +2620,9 @@ struct Actor {
     /// Which side of the `StreamScaleRequest` exchange each peer can speak
     /// (§9.1; D7, docs/bugs/13-stream-resolution.md).
     stream_scale: std::collections::HashMap<NodeId, StreamScaleFeature>,
+    /// Which side of the `StreamSizeRequest` exchange each peer can speak
+    /// (§9.1; ADR 0060).
+    stream_size: std::collections::HashMap<NodeId, StreamSizeFeature>,
     /// Which side of the `DisplayModesList`/`DisplaySetMode` exchange each
     /// peer can speak (§9.1; docs/bugs/16-host-display-mode.md; ADR 0048).
     display_mode: std::collections::HashMap<NodeId, DisplayModeFeature>,
@@ -3043,6 +3113,14 @@ impl Actor {
             .is_some_and(|speaks| speaks.to_peer)
     }
 
+    /// Guest side: whether `peer` speaks minor 10 and can decode a
+    /// `StreamSizeRequest` at all (§9.1; ADR 0060).
+    fn may_request_size_to(&self, peer: &NodeId) -> bool {
+        self.stream_size
+            .get(peer)
+            .is_some_and(|speaks| speaks.to_peer)
+    }
+
     /// Guest side: whether `peer` speaks minor 9 and can decode a
     /// `DisplaySetMode` at all (§9.1; docs/bugs/16-host-display-mode.md;
     /// ADR 0048).
@@ -3150,6 +3228,47 @@ impl Actor {
         // keyframe: task 2.4 asks for one on a *change*, not on every message
         // a guest happens to send (§11).
         if session.control.set_manual_cap(Some(scale_percent)) {
+            session.control.request_keyframe();
+        }
+    }
+
+    /// Host side: records the picture size a guest says it will draw, so the
+    /// encode loop can stop resampling towards a ceiling this guest does not
+    /// need (§11; ADR 0060).
+    ///
+    /// Authorization is re-checked from scratch for exactly the reason
+    /// [`Self::on_stream_scale_request`] re-checks it, and the size range was
+    /// already bounded on decode (§9.1) for exactly the reason the scale
+    /// percentage was. What is different is only what the value means: a box
+    /// in the guest's own device pixels rather than a fraction of a screen the
+    /// guest cannot measure.
+    fn on_stream_size_request(&mut self, peer: NodeId, width: u32, height: u32) {
+        let tag = self.label_of(&peer);
+        if !self
+            .stream_size
+            .get(&peer)
+            .is_some_and(|speaks| speaks.from_peer)
+        {
+            tracing::debug!(peer = %tag, "stream size request from a peer that never advertised one");
+            return;
+        }
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            tracing::warn!(peer = %tag, "stream size request without a live view grant; ignored");
+            return;
+        }
+        let Some(session) = self.media.get(&peer) else {
+            tracing::debug!(peer = %tag, "stream size request without a media session; ignored");
+            return;
+        };
+        // A repeated size has nothing new to draw, so it does not spend a
+        // keyframe - the same rule the scale ceiling follows, and it matters
+        // more here: a window being dragged to a new size produces a stream of
+        // these, and a keyframe each would be the most expensive possible
+        // answer to a resize.
+        if session.control.set_size_cap(Some((width, height))) {
             session.control.request_keyframe();
         }
     }
@@ -3394,6 +3513,7 @@ impl Actor {
                     speaks_receiver_report,
                     speaks_cursor_shape,
                     speaks_stream_scale,
+                    speaks_stream_size,
                     speaks_clipboard_files,
                     speaks_display_mode,
                 }) => ActorEvent::Handshaked {
@@ -3406,6 +3526,7 @@ impl Actor {
                     speaks_receiver_report,
                     speaks_cursor_shape,
                     speaks_stream_scale,
+                    speaks_stream_size,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     ticket: *ticket,
@@ -3531,6 +3652,7 @@ impl Actor {
                 speaks_receiver_report,
                 speaks_cursor_shape,
                 speaks_stream_scale,
+                speaks_stream_size,
                 speaks_clipboard_files,
                 speaks_display_mode,
             } => {
@@ -3541,6 +3663,9 @@ impl Actor {
                 // Same shape, for the manual scale ceiling (D7,
                 // docs/bugs/13-stream-resolution.md).
                 self.stream_scale.entry(peer).or_default().from_peer = speaks_stream_scale;
+                // Same shape again, for the picture size the guest names
+                // (ADR 0060).
+                self.stream_size.entry(peer).or_default().from_peer = speaks_stream_size;
                 // Same shape again, for the host's own display modes
                 // (docs/bugs/16-host-display-mode.md; ADR 0048).
                 self.display_mode.entry(peer).or_default().from_peer = speaks_display_mode;
@@ -4500,6 +4625,11 @@ impl Actor {
             MessageKind::StreamScaleRequest { scale_percent } => {
                 self.on_stream_scale_request(peer, scale_percent);
             }
+            // Host side: the guest named the picture size it will draw
+            // (§11; ADR 0060).
+            MessageKind::StreamSizeRequest { width, height } => {
+                self.on_stream_size_request(peer, width, height);
+            }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -4751,6 +4881,7 @@ impl Actor {
         self.last_keyframe.remove(&peer);
         self.receiver_reports.remove(&peer);
         self.stream_scale.remove(&peer);
+        self.stream_size.remove(&peer);
         self.display_mode.remove(&peer);
         // Reversibility, always, including an ungraceful disconnect: this is
         // the same per-peer teardown funnel every other kind of session
@@ -4943,6 +5074,14 @@ impl Actor {
                 reply,
             } => {
                 let _ = reply.send(self.on_request_stream_scale(&label, scale_percent));
+            }
+            ActorCommand::StreamSizeRequest {
+                label,
+                width,
+                height,
+                reply,
+            } => {
+                let _ = reply.send(self.on_request_stream_size(&label, width, height));
             }
             ActorCommand::DisplayModesList { label, reply } => {
                 let _ = reply.send(self.on_announced_display_modes(&label));
@@ -5374,6 +5513,40 @@ impl Actor {
             return Err(ActorError::Unsupported);
         }
         self.send_to(&peer, MessageKind::StreamScaleRequest { scale_percent });
+        Ok(())
+    }
+
+    /// Guest side: names the picture size this window will draw (§11;
+    /// ADR 0060).
+    ///
+    /// Bounded here as well as on the host's decode, for the same reason
+    /// [`Self::on_request_stream_scale`] is: a value nothing could satisfy has
+    /// no business on the wire, and a host that never confirmed it understands
+    /// the message must not be sent one at all (§9.1).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core::Malformed`] for a size below `STREAM_SIZE_MIN_PX`
+    /// on either axis or above `MAX_STREAM_PIXELS` in total;
+    /// [`ActorError::Unsupported`] when the host never answered with a minor
+    /// that carries `MessageKind::StreamSizeRequest`.
+    fn on_request_stream_size(
+        &mut self,
+        label: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if width < STREAM_SIZE_MIN_PX
+            || height < STREAM_SIZE_MIN_PX
+            || (width as usize).saturating_mul(height as usize) > MAX_STREAM_PIXELS
+        {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        if !self.may_request_size_to(&peer) {
+            return Err(ActorError::Unsupported);
+        }
+        self.send_to(&peer, MessageKind::StreamSizeRequest { width, height });
         Ok(())
     }
 
@@ -7335,6 +7508,10 @@ impl Actor {
         // (D7, docs/bugs/13-stream-resolution.md).
         self.stream_scale.entry(peer).or_default().to_peer =
             control.peer_minor() >= STREAM_SCALE_MINOR;
+        // Same reasoning for the picture size this node is about to name
+        // (ADR 0060).
+        self.stream_size.entry(peer).or_default().to_peer =
+            control.peer_minor() >= STREAM_SIZE_MINOR;
         // Same reasoning for the host's own display modes this node might ask
         // to change (docs/bugs/16-host-display-mode.md; ADR 0048).
         self.display_mode.entry(peer).or_default().to_peer =
@@ -7702,6 +7879,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_STREAM_SCALE),
+        speaks_stream_size: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_STREAM_SIZE),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -7815,6 +7996,7 @@ async fn connect_once(
         FEATURE_RECEIVER_REPORT.to_owned(),
         FEATURE_CURSOR_SHAPE.to_owned(),
         FEATURE_STREAM_SCALE.to_owned(),
+        FEATURE_STREAM_SIZE.to_owned(),
         FEATURE_DISPLAY_MODE.to_owned(),
     ];
     lumepeer_net::guest_handshake(connection, role, proof, features).await
@@ -8215,6 +8397,7 @@ pub fn spawn_actor_with(
         last_keyframe: std::collections::HashMap::new(),
         receiver_reports: std::collections::HashMap::new(),
         stream_scale: std::collections::HashMap::new(),
+        stream_size: std::collections::HashMap::new(),
         display_mode: std::collections::HashMap::new(),
         display_mode_state: None,
         display_mode_generation: 0,

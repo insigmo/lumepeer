@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-view-set-size"
+description = "Enables the view_set_size command without any pre-configured scope."
+commands.allow = ["view_set_size"]
+
+[[permission]]
+identifier = "deny-view-set-size"
+description = "Denies the view_set_size command without any pre-configured scope."
+commands.deny = ["view_set_size"]

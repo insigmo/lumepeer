@@ -23,9 +23,13 @@ import {
   defaultLayout,
   displaySize,
   effectiveScale,
+  FALLBACK_PICTURE_CEILING,
   frameResized,
   imageRenderingFor,
   installPan,
+  NATIVE_PICTURE_CEILING,
+  streamSizeFor,
+  STREAM_SIZE_MIN_PX,
   isLocalTextTarget,
   logicalOfButton,
   logicalOfKey,
@@ -409,6 +413,78 @@ describe('view window: how the picture is resampled', () => {
     canvas.style.imageRendering = 'pixelated';
     canvas.style.imageRendering = imageRenderingFor(defaultLayout(), frame, window960, 1);
     expect(canvas.style.imageRendering).toBe('auto');
+  });
+});
+
+describe('view window: the size the host is asked for', () => {
+  const ceiling = NATIVE_PICTURE_CEILING;
+
+  // ADR 0060, the whole point: the size asked for is the size drawn, so the
+  // host's own fit produces a frame the canvas draws at scale 1 and neither
+  // side resamples anything.
+  it('asks for exactly the device pixels the viewport has', () => {
+    expect(streamSizeFor(defaultLayout(), { width: 1280, height: 720 }, 1, ceiling)).toEqual({
+      width: 1280,
+      height: 720,
+    });
+  });
+
+  it('counts device pixels, not CSS pixels', () => {
+    expect(streamSizeFor(defaultLayout(), { width: 1280, height: 720 }, 1.5, ceiling)).toEqual({
+      width: 1920,
+      height: 1080,
+    });
+  });
+
+  it('never asks for an odd axis, which 4:2:0 could not encode anyway', () => {
+    const size = streamSizeFor(defaultLayout(), { width: 1281, height: 721 }, 1, ceiling);
+    expect(size).toEqual({ width: 1280, height: 720 });
+  });
+
+  // Zoomed in, one frame pixel covers a device pixel or more, so the sharpest
+  // picture available is the most the host is willing to send - it clamps to
+  // its own screen from there.
+  it('asks for everything the host has once the picture is no longer fitted', () => {
+    const actual: ViewLayout = { ...defaultLayout(), mode: 'actual' };
+    expect(streamSizeFor(actual, { width: 400, height: 300 }, 1, ceiling)).toEqual({
+      width: ceiling.width,
+      height: ceiling.height,
+    });
+    const zoomed: ViewLayout = { mode: 'scaled', scale: 3, offsetX: 0, offsetY: 0 };
+    expect(streamSizeFor(zoomed, { width: 400, height: 300 }, 1, ceiling)).toEqual({
+      width: ceiling.width,
+      height: ceiling.height,
+    });
+  });
+
+  // A window on the RGBA fallback decoder is bound by the shared-memory slot
+  // of §11.3, and that bound is not the host being cautious.
+  it('never asks past the ceiling this window can actually decode', () => {
+    const size = streamSizeFor(
+      defaultLayout(),
+      { width: 2560, height: 1440 },
+      1,
+      FALLBACK_PICTURE_CEILING,
+    );
+    expect(size).toEqual({ width: 1920, height: 1080 });
+  });
+
+  it('says nothing at all about a window that has not been laid out yet', () => {
+    expect(streamSizeFor(defaultLayout(), { width: 0, height: 0 }, 1, ceiling)).toBeNull();
+    expect(
+      streamSizeFor(defaultLayout(), { width: STREAM_SIZE_MIN_PX - 1, height: 720 }, 1, ceiling),
+    ).toBeNull();
+  });
+
+  // The guard against a resize loop: this window reacts to a frame arriving at
+  // a new size by re-running the layout, which is also where the request is
+  // made from. If the request could see the frame, the two would chase each
+  // other.
+  it('does not depend on the frame the host is currently sending', () => {
+    const viewport = { width: 1600, height: 900 };
+    expect(streamSizeFor(defaultLayout(), viewport, 1, ceiling)).toEqual(
+      streamSizeFor(defaultLayout(), viewport, 1, ceiling),
+    );
   });
 });
 

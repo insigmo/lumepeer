@@ -266,6 +266,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::monitor_select,
         commands::monitors_list,
         commands::view_set_scale,
+        commands::view_set_size,
         commands::host_display_modes,
         commands::host_display_set_mode,
         commands::recordings_list,
