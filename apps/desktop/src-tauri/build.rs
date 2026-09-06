@@ -33,6 +33,7 @@ const COMMANDS: &[&str] = &[
     "invite_create",
     "invite_connect",
     "view_next_frame",
+    "view_next_chunk",
     "view_cursor",
     "input_pointer_move",
     "input_press",

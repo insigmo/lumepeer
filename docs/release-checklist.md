@@ -159,3 +159,32 @@ second machine. All manual, once per release.
 - [ ] With the helper **not** installed, or the switch off, the guest sees ADR
       0056's honest "respond to it there" message and the picture, and nothing
       the guest does reaches the prompt — the ADR 0011/0056 fallback is intact.
+
+### The guest decodes for itself (ADR 0058, ADR 0059)
+
+The whole picture path changed, and the part that cannot be gated
+automatically is the part that needs two machines and a pair of eyes.
+
+- [ ] Open a session and watch the view window's console: it must not be
+      polling `view_next_frame`. A Chromium-based `WebView2` guest takes the
+      bitstream path, and the giveaway on the *host* is that no
+      `lumepeer-decoder-worker` process exists for the session — the worker is
+      the fallback now, and starting one means the probe said no.
+- [ ] Move a window on the host and watch it on the guest. The lag is the
+      thing being fixed; it should read as a live screen, not as a screen
+      being described.
+- [ ] Text is legible at 1:1. The encoder now asks for High profile with
+      CABAC, so a session that looks softer than before is a regression, not a
+      link.
+- [ ] Pull the network for a few seconds and put it back. The picture recovers
+      without a reload: the redial raises the desync flag, the window resets
+      its decoder and asks for an intra frame. A window that comes back as
+      coloured smears means the desync flag is not reaching it.
+- [ ] Start a recording mid-session and stop it. The container holds the same
+      bitstream the guest saw — the writer task records the frame it wrote, so
+      a recording that is short of frames means the two diverged.
+- [ ] Change the host's screen resolution mid-session. The guest's canvas
+      follows on the next keyframe (the decoder reconfigures from the new SPS).
+- [ ] On a guest whose webview has no `VideoDecoder` — a Linux build on an
+      older WebKitGTK — the session still works, through the worker and the
+      RGBA path, unchanged.

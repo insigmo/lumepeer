@@ -19,6 +19,7 @@
       "allow": [{ "label": "view-*" }]
     },
     "allow-view-next-frame",
+    "allow-view-next-chunk",
     "allow-view-cursor",
     "allow-input-pointer-move",
     "allow-input-press",
