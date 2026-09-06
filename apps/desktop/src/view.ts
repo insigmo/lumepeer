@@ -18,6 +18,12 @@ import {
 } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
+import {
+  decodeViewChunk,
+  NativeDecoder,
+  nativeDecodingAvailable,
+  type ViewChunk,
+} from './view-decoder';
 import { installHotkeys } from './view-hotkeys';
 import {
   clampPan,
@@ -334,7 +340,17 @@ let stopped = false;
 // Timestamp of the picture already painted, or 0 for none — sent back as
 // `since_us` so the actor can skip re-serializing pixels this window
 // already has when it's polled faster than the video actually updates.
+// Only the fallback path uses it; the bitstream path has no such round trip
+// to save (ADR 0058).
 let lastPaintedUs = 0;
+// The window's own H.264 decoder, when this `WebView` has one. `null` is the
+// fallback: the Rust side decodes into RGBA in the sandboxed worker of §11.3
+// and this window polls for pixels, which is what it always did.
+let nativeDecoder: NativeDecoder | null = null;
+// Whether the next chunk request also asks the host for an intra frame. Set
+// on the very first request — nothing can be decoded before one — and again
+// whenever the decoder loses its footing.
+let needKeyframe = true;
 
 function renderOverlay(): void {
   if (!overlay) {
@@ -369,19 +385,7 @@ async function tick(): Promise<void> {
     const invoke = await invoker();
     const response = await invoke('view_next_frame', { args: { peer, since_us: lastPaintedUs } });
     const frame = decodeViewFrame(response as ArrayBuffer);
-    if (frame.status !== status) {
-      status = frame.status;
-      renderOverlay();
-    }
-    // The grant is live: a host that lowered the role mid-session takes the
-    // listeners away again on the very next frame (§8.1).
-    input?.setEnabled(frame.input);
-    // The host is the only one who knows, and it says so on every frame: a
-    // recording that started a moment ago is on screen a moment later (§17).
-    if (frame.recording !== recording) {
-      recording = frame.recording;
-      renderRecording();
-    }
+    applySessionFlags(frame);
     if (paintFrame(canvas, frame)) {
       lastPaintedUs = frame.timestampUs;
       // The remote screen can change resolution mid-session, and every part
@@ -393,12 +397,6 @@ async function tick(): Promise<void> {
       if (frameResized(frame, frameSize)) {
         frameSize = { width: frame.width, height: frame.height };
         applyLayout();
-      }
-      // Nothing to point at while the input grant is withdrawn, so nothing to
-      // draw a pointer for either.
-      if (!frame.input && pointerAt !== null) {
-        pointerAt = null;
-        placeCursor();
       }
     }
   } catch {
@@ -413,6 +411,83 @@ function loop(): void {
   void tick().finally(() => {
     if (!stopped) {
       requestAnimationFrame(loop);
+    }
+  });
+}
+
+/**
+ * The three things every answer from the host carries, whichever path the
+ * picture itself took: how the pipeline is doing, whether this session may
+ * still send input, and whether the host says it is recording.
+ */
+function applySessionFlags(frame: { status: ViewStatus; input: boolean; recording: boolean }): void {
+  if (frame.status !== status) {
+    status = frame.status;
+    renderOverlay();
+  }
+  // The grant is live: a host that lowered the role mid-session takes the
+  // listeners away again on the very next answer (§8.1).
+  input?.setEnabled(frame.input);
+  // The host is the only one who knows, and it says so every time: a
+  // recording that started a moment ago is on screen a moment later (§17).
+  if (frame.recording !== recording) {
+    recording = frame.recording;
+    renderRecording();
+  }
+  // Nothing to point at while the input grant is withdrawn, so nothing to
+  // draw a pointer for either.
+  if (!frame.input && pointerAt !== null) {
+    pointerAt = null;
+    placeCursor();
+  }
+}
+
+/**
+ * One turn of the bitstream loop (ADR 0058).
+ *
+ * There is no pacing here on purpose. `view_next_chunk` does not answer until
+ * a frame exists, so this loop is asleep exactly as long as the host has
+ * nothing to show and wakes the moment it does — where the RGBA loop below
+ * asks on every animation frame and pays a full round trip whether or not
+ * anything changed. Everything that arrived since the last turn comes back in
+ * one answer, in order, because an inter frame is meaningless without the
+ * frames it references.
+ */
+async function nativeTick(): Promise<void> {
+  if (stopped || !nativeDecoder) {
+    return;
+  }
+  try {
+    const invoke = await invoker();
+    const response = await invoke('view_next_chunk', {
+      args: { peer, need_keyframe: needKeyframe },
+    });
+    needKeyframe = false;
+    const chunk: ViewChunk = decodeViewChunk(response as ArrayBuffer);
+    applySessionFlags(chunk);
+    if (chunk.desync) {
+      // Frames were lost or the media connection was redialled: everything
+      // the decoder holds refers to pictures it will never see.
+      nativeDecoder.reset();
+      needKeyframe = true;
+    }
+    if (nativeDecoder.push(chunk.frames).needKeyframe) {
+      needKeyframe = true;
+    }
+  } catch {
+    // The view is gone (session ended, window closing).
+    stopped = true;
+    input?.setEnabled(false);
+  }
+}
+
+function nativeLoop(): void {
+  void nativeTick().finally(() => {
+    if (!stopped) {
+      // Straight back in, not through `requestAnimationFrame`: the wait is
+      // already inside the call, and an animation frame would add a tick of
+      // its own and stop the stream entirely whenever the window is hidden.
+      nativeLoop();
     }
   });
 }
@@ -546,9 +621,22 @@ async function main(): Promise<void> {
   await getCurrentWindow().onCloseRequested(() => {
     stopped = true;
     input?.setEnabled(false);
+    nativeDecoder?.close();
     void endSession();
   });
-  loop();
+  // Which side decodes. The window is the only one that knows whether its own
+  // `WebView` has a usable `VideoDecoder`, and the Rust side reads the answer
+  // off whichever command the first call uses — so asking here, once, is also
+  // what tells it whether to start the worker process at all (ADR 0058).
+  if (canvas && (await nativeDecodingAvailable())) {
+    nativeDecoder = new NativeDecoder(canvas, (width, height) => {
+      frameSize = { width, height };
+      applyLayout();
+    });
+    nativeLoop();
+  } else {
+    loop();
+  }
 }
 
 void main();

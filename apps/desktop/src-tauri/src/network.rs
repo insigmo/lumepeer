@@ -60,9 +60,10 @@ use crate::connection_history::{ConnectionHistory, HistoryEntry};
 use crate::remembered_password::RememberedPasswordStore;
 use crate::unattended_store::UnattendedStore;
 use crate::view::{
-    CursorFeed, EncodeControl, HostMedia, MediaFault, MediaHealth, MediaReport, MediaTarget,
-    SharedCapture, ViewSlot, ViewStatus, ViewWindows, encode_cursor_response, encode_view_response,
-    lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
+    BITSTREAM_POLL_TIMEOUT_MS, BitstreamFeed, CursorFeed, DecodePath, EncodeControl, HostMedia,
+    MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
+    ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response, lock_capture,
+    slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
 /// First `PROTOCOL_MINOR` that carries `MessageKind::FileTransferStart`, and
@@ -327,6 +328,16 @@ struct ViewFeed {
     /// `None` means this host is still drawing the cursor into the picture,
     /// which is exactly what tells the window not to draw a second one.
     cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
+    /// Encoded frames for a window that decodes them itself (ADR 0058).
+    bitstream: Arc<BitstreamFeed>,
+    /// The host this view watches, and the channel its own decoder's
+    /// keyframe requests travel on.
+    ///
+    /// The same channel the media loop reports on, so a request that starts
+    /// in the `WebView`'s decoder goes through exactly the budget and the
+    /// control-stream path one from the worker process would (§11).
+    peer: NodeId,
+    reports: mpsc::Sender<(NodeId, MediaReport)>,
 }
 
 /// Live view feeds by window label, shared between the actor and the IPC layer.
@@ -1144,19 +1155,70 @@ impl ActorHandle {
     /// # Errors
     /// [`ActorError::UnknownPeer`] if no view window belongs to `label`.
     pub fn view_frame(&self, label: &str, since_us: u64) -> Result<Vec<u8>, ActorError> {
-        let feed = self
-            .views
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(label)
-            .cloned()
-            .ok_or(ActorError::UnknownPeer)?;
+        let feed = self.view_feed(label)?;
+        // Calling this at all is the window saying it cannot decode for
+        // itself, which is what starts the sandboxed worker (ADR 0058).
+        feed.bitstream.choose(DecodePath::Worker);
         let response = slot_for_poll(&feed.slot.borrow(), since_us);
         Ok(encode_view_response(
             &response,
             feed.input.load(Ordering::Relaxed),
             feed.recording.load(Ordering::Relaxed),
         ))
+    }
+
+    /// Encoded frames for a view window that decodes them itself (ADR 0058).
+    ///
+    /// Answers the moment a frame exists rather than on a clock: the caller
+    /// holds one call open and it returns with everything that has arrived
+    /// since the previous one. That is the whole difference between this and
+    /// the frame poll it replaces — no round trip in the per-frame budget, and
+    /// no re-serializing a picture the window already has.
+    ///
+    /// `need_keyframe` is the window's own decoder asking for an intra frame:
+    /// it has just been configured, or it failed on a frame and has nothing
+    /// left to decode against. It travels the same channel, and through the
+    /// same `KEYFRAME_MIN_INTERVAL_MS` budget, as a request from the worker
+    /// process would (§11).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`.
+    pub async fn view_chunk(
+        &self,
+        label: &str,
+        need_keyframe: bool,
+    ) -> Result<Vec<u8>, ActorError> {
+        let feed = self.view_feed(label)?;
+        feed.bitstream.choose(DecodePath::Native);
+        if need_keyframe
+            && feed
+                .reports
+                .try_send((feed.peer, MediaReport::KeyframeNeeded))
+                .is_err()
+        {
+            tracing::debug!(peer = %label, "dropping a keyframe request: the actor is backed up");
+        }
+        let (frames, desync) = feed
+            .bitstream
+            .take(Duration::from_millis(BITSTREAM_POLL_TIMEOUT_MS))
+            .await;
+        Ok(encode_chunk_response(
+            feed.slot.borrow().status,
+            feed.input.load(Ordering::Relaxed),
+            feed.recording.load(Ordering::Relaxed),
+            &frames,
+            desync,
+        ))
+    }
+
+    /// The live feed behind one view window's label.
+    fn view_feed(&self, label: &str) -> Result<ViewFeed, ActorError> {
+        self.views
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .cloned()
+            .ok_or(ActorError::UnknownPeer)
     }
 
     /// The host's cursor for a view window, as raw bytes (§11).
@@ -3792,6 +3854,7 @@ impl Actor {
         // the picture uses (§4.1; ADR 0028).
         let media_connection: Arc<std::sync::Mutex<Option<iroh::endpoint::Connection>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let bitstream = Arc::new(BitstreamFeed::default());
         let task = spawn_media_receiver(
             MediaTarget {
                 endpoint: self.endpoint.clone(),
@@ -3800,6 +3863,7 @@ impl Actor {
                 reports: self.reports_tx.clone(),
                 tag: tag.clone(),
                 worker: None,
+                bitstream: Arc::clone(&bitstream),
                 connection_cell: Arc::clone(&media_connection),
             },
             Arc::clone(&slot_tx),
@@ -3827,6 +3891,9 @@ impl Actor {
                     input: Arc::clone(&input),
                     recording: Arc::clone(&recording),
                     cursor: Arc::clone(&cursor),
+                    bitstream,
+                    peer,
+                    reports: self.reports_tx.clone(),
                 },
             );
         self.views.insert(

@@ -1187,6 +1187,12 @@ pub struct WheelArgs {
 
 /// Newest decoded picture for a view window, as raw bytes.
 ///
+/// The fallback path since ADR 0058, for a `WebView` with no usable
+/// `VideoDecoder`: calling this at all is what tells the Rust side to start
+/// the sandboxed worker of §11.3 and decode to RGBA. A window that can decode
+/// H.264 itself calls [`view_next_chunk`] instead and never pays for the
+/// pixels below.
+///
 /// Binary rather than JSON on purpose: a 1080p RGBA picture is ~8 MB, and
 /// base64-ing that per frame would spend the whole latency budget of §15 on
 /// encoding. Layout, little endian:
@@ -1208,6 +1214,56 @@ pub async fn view_next_frame(
 ) -> Result<tauri::ipc::Response, IpcError> {
     check_view_window(&window, &args.peer)?;
     let bytes = state.network.view_frame(&args.peer, args.since_us)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Argument of [`view_next_chunk`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewChunkArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Whether the caller's own decoder has nothing left to decode against
+    /// and needs an intra frame — it has just been configured, or it failed.
+    #[serde(default)]
+    pub need_keyframe: bool,
+}
+
+/// Encoded video for a view window that decodes it itself (ADR 0058).
+///
+/// The counterpart of [`view_next_frame`], and the reason that one is now the
+/// fallback rather than the path: this hands the window the H.264 bitstream —
+/// tens of kilobytes — instead of a decoded RGBA picture, which at 1080p is
+/// 8 MiB and cost over a hundred milliseconds per frame to push through
+/// `WebView2`'s IPC before anything could be drawn. The window decodes it with
+/// `VideoDecoder`, in the `WebView`'s own sandboxed renderer and on the same
+/// hardware decoder the sandboxed worker process would have used.
+///
+/// The call is held open until a frame exists rather than answered
+/// immediately, so a window is never polling and a frame is never waiting: it
+/// returns with everything that arrived since the previous call, in order,
+/// and with an empty body at most every
+/// `BITSTREAM_POLL_TIMEOUT_MS` so `status` and the grant flags stay live on a
+/// still screen.
+///
+/// Layout, little endian: `status:u8 | flags:u8 | count:u16 | reserved:u32`,
+/// then `count` frames of `keyframe:u8 | timestamp_us:u64 | length:u32 |
+/// bitstream`. `flags` bit 2 says the stream was broken since the previous
+/// call and the window must reset its decoder.
+///
+/// # Errors
+/// Rejects calls from anything but this peer's own view window; [`IpcError`]
+/// if no such view exists or the actor is gone.
+#[tauri::command]
+pub async fn view_next_chunk(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewChunkArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    let bytes = state
+        .network
+        .view_chunk(&args.peer, args.need_keyframe)
+        .await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 

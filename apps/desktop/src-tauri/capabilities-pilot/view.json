@@ -25,6 +25,7 @@
       ]
     },
     "allow-view-next-frame",
+    "allow-view-next-chunk",
     "allow-input-pointer-move",
     "allow-input-press",
     "allow-input-wheel",

@@ -64,45 +64,67 @@ fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
         return Err(MediaError::Encode("frame buffer is short".to_owned()));
     }
 
-    let mut y_plane = vec![0u8; width * height];
-    for row in 0..height {
-        let row_start = row * src_stride;
-        for col in 0..width {
-            let px = row_start + col * 4;
-            let (b, g, r) = (
-                i32::from(frame.data[px]),
-                i32::from(frame.data[px + 1]),
-                i32::from(frame.data[px + 2]),
-            );
-            y_plane[row * width + col] = bt601_y(r, g, b);
+    // One allocation, one pass, one read of every source pixel (ADR 0059).
+    //
+    // The shape is not incidental. This runs on every captured frame on the
+    // host's own machine, and at 1080p the naive version - a pass for luma,
+    // then a second pass over the same 8 MiB for chroma, then a copy of both
+    // planes into a third buffer - measured 4.5 ms per frame, which was half
+    // of everything `encode()` cost including the hardware encoder itself.
+    // Walking the picture in 2x2 blocks reads each pixel once, while it is
+    // still in L1 from the luma calculation, and writes straight into the
+    // buffer the encoder is handed.
+    let y_len = width * height;
+    let mut out = vec![0u8; y_len + width * (height / 2)];
+    let (y_plane, uv_plane) = out.split_at_mut(y_len);
+
+    for (block_row, uv_row) in uv_plane.chunks_exact_mut(width).enumerate() {
+        let top = block_row * 2;
+        let (y_top, y_bottom) = y_plane[top * width..][..width * 2].split_at_mut(width);
+
+        let src_top = &frame.data[top * src_stride..][..width * 4];
+        let src_bottom = &frame.data[(top + 1) * src_stride..][..width * 4];
+
+        // Four zipped iterators over exactly `width / 2` blocks: the two
+        // source row halves in 8-byte (two-pixel) steps, the two luma row
+        // halves and the interleaved chroma row in 2-byte steps. Written this
+        // way so every access is a slice of statically known length and the
+        // bounds checks fall out.
+        let blocks = src_top
+            .chunks_exact(8)
+            .zip(src_bottom.chunks_exact(8))
+            .zip(y_top.chunks_exact_mut(2))
+            .zip(y_bottom.chunks_exact_mut(2))
+            .zip(uv_row.chunks_exact_mut(2));
+
+        for ((((top_px, bottom_px), y_top_px), y_bottom_px), uv) in blocks {
+            let pixel = |px: &[u8], at: usize| -> (i32, i32, i32) {
+                (
+                    i32::from(px[at + 2]),
+                    i32::from(px[at + 1]),
+                    i32::from(px[at]),
+                )
+            };
+            let (r0, g0, b0) = pixel(top_px, 0);
+            let (r1, g1, b1) = pixel(top_px, 4);
+            let (r2, g2, b2) = pixel(bottom_px, 0);
+            let (r3, g3, b3) = pixel(bottom_px, 4);
+
+            y_top_px[0] = bt601_y(r0, g0, b0);
+            y_top_px[1] = bt601_y(r1, g1, b1);
+            y_bottom_px[0] = bt601_y(r2, g2, b2);
+            y_bottom_px[1] = bt601_y(r3, g3, b3);
+
+            // Averaged before conversion and truncated per channel, exactly
+            // as the two-pass version did: the chroma samples must not move.
+            let r = (r0 + r1 + r2 + r3) / 4;
+            let g = (g0 + g1 + g2 + g3) / 4;
+            let b = (b0 + b1 + b2 + b3) / 4;
+            uv[0] = bt601_u(r, g, b);
+            uv[1] = bt601_v(r, g, b);
         }
     }
 
-    let uv_stride = width; // 2 bytes/sample pair * (width/2) samples
-    let mut uv_plane = vec![0u8; uv_stride * (height / 2)];
-    for block_row in 0..height / 2 {
-        for block_col in 0..width / 2 {
-            let mut sums = (0i32, 0i32, 0i32); // (r, g, b)
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let row = block_row * 2 + dy;
-                    let col = block_col * 2 + dx;
-                    let px = row * src_stride + col * 4;
-                    sums.2 += i32::from(frame.data[px]);
-                    sums.1 += i32::from(frame.data[px + 1]);
-                    sums.0 += i32::from(frame.data[px + 2]);
-                }
-            }
-            let (r, g, b) = (sums.0 / 4, sums.1 / 4, sums.2 / 4);
-            let uv_off = block_row * uv_stride + block_col * 2;
-            uv_plane[uv_off] = bt601_u(r, g, b);
-            uv_plane[uv_off + 1] = bt601_v(r, g, b);
-        }
-    }
-
-    let mut out = Vec::with_capacity(y_plane.len() + uv_plane.len());
-    out.extend_from_slice(&y_plane);
-    out.extend_from_slice(&uv_plane);
     Ok((out, width_u32, height_u32))
 }
 

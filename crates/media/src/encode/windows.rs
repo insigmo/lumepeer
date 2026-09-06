@@ -21,12 +21,13 @@
 //! renegotiates at the real size on the first frame and again on any later
 //! resolution change.
 //!
-//! Bitrate changes rebuild the negotiated types rather than going through
-//! `ICodecAPI`, the same trade-off ADR 0005 accepted for the `openh264`
-//! fallback: `MF_MT_AVG_BITRATE` is read once at `SetOutputType` time by most
-//! encoder MFTs, so a genuinely live change needs `ICodecAPI::SetValue` with a
-//! `VARIANT`, which this module does not build. Rebuilding costs one
-//! keyframe, which is acceptable at `ABR_ADJUST_MAX_RATE_PER_SEC` = 1/sec.
+//! Bitrate changes go through `ICodecAPI::SetValue` on
+//! `CODECAPI_AVEncCommonMeanBitRate` and only fall back to rebuilding the
+//! negotiated types if the driver refuses (ADR 0059). Rebuilding is not free
+//! the way ADR 0005 assumed for the `openh264` fallback: `start_streaming`
+//! flushes the transform, the reference frames go, and the next picture is
+//! forced to IDR — once a second at `ABR_ADJUST_MAX_RATE_PER_SEC`, which is a
+//! visible hitch coming from the mechanism meant to smooth one over.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -34,19 +35,26 @@ use std::time::{Duration, Instant};
 use lumepeer_core::constants::ENCODE_HW_EVENT_TIMEOUT_MS;
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::Media::MediaFoundation::{
-    CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
-    IMFSample, IMFTransform, METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
+    CODECAPI_AVEncCommonLowLatency, CODECAPI_AVEncCommonMaxBitRate,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
+    CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncCommonRealTime,
+    CODECAPI_AVEncH264CABACEnable, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVEncVideoMaxNumRefFrame, CODECAPI_AVLowLatencyMode,
+    ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType, IMFSample, IMFTransform,
+    METransformDrainComplete, METransformHaveOutput, METransformNeedInput,
     MF_E_NO_EVENTS_AVAILABLE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
+    MF_EVENT_FLAG_NO_WAIT, MF_EVENT_TYPE, MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK,
-    MFCreateAlignedMemoryBuffer, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
-    MFMediaType_Video, MFSTARTUP_NOSOCKET, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
+    MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET,
+    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive,
+    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
+    eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
@@ -70,7 +78,46 @@ const PROBE_HEIGHT: u32 = 64;
 /// Busy-poll granularity while waiting for an async MFT event. Small enough
 /// to keep p50 latency negligible; the overall wait is still bounded by
 /// `ENCODE_HW_EVENT_TIMEOUT_MS`.
-const EVENT_POLL_INTERVAL_MS: u64 = 2;
+const EVENT_POLL_INTERVAL_MS: u64 = 1;
+
+/// How long the pipelined (no per-frame drain) path waits for the output of
+/// the frame it just submitted before giving up on it and falling back to the
+/// drain path for the rest of the session.
+///
+/// Deliberately far shorter than [`ENCODE_HW_EVENT_TIMEOUT_MS`]: this is not a
+/// "the driver is wedged" timeout, it is "this encoder wants more than one
+/// frame in flight before it emits anything". Answering that question must
+/// cost one frame interval, not two seconds — the drain path below still
+/// produces the picture either way.
+const LOW_LATENCY_PROBE_TIMEOUT_MS: u64 = 200;
+
+/// Peak-to-average ratio the rate controller may spend on a moving frame,
+/// in percent of the mean bitrate.
+///
+/// A remote desktop is mostly still, and the interesting frames are the ones
+/// where a window just moved. Constant bitrate spends the same bits on both,
+/// which is exactly backwards: it wastes them on a screen nobody touched and
+/// starves the one frame the user is waiting to see. A peak ceiling above the
+/// mean is what lets the encoder put the bits where the change is.
+const PEAK_BITRATE_PERCENT: u32 = 150;
+
+/// Quality-versus-speed knob, 0..=100, where lower is faster.
+///
+/// Below the midpoint on purpose: every millisecond the encoder spends
+/// looking for a better motion vector is a millisecond of hand-to-eye lag,
+/// and on a desktop — large flat regions, exact repeats, hard edges — the
+/// extra search buys very little.
+const QUALITY_VS_SPEED: u32 = 33;
+
+/// Frames between two unrequested intra frames.
+///
+/// Long, not infinite. A keyframe is the largest frame in the stream and
+/// every one of them is a visible hitch at low bitrates, so periodic ones are
+/// worth almost nothing here: the guest asks for an intra frame when it
+/// actually needs one (§11's `KeyframeRequest`), which is the only moment one
+/// helps. What this bounds is the drift a stream accumulates when no request
+/// ever comes.
+const GOP_SECONDS: u32 = 10;
 
 /// Whether a genuinely usable hardware H.264 encoder MFT is available right
 /// now (§18, ADR 0011). Runs the exact same activation and type negotiation
@@ -86,6 +133,13 @@ pub struct MediaFoundationEncoder {
     events: Option<IMFMediaEventGenerator>,
     config: EncoderConfig,
     dims: (u32, u32),
+    /// Async-MFT events that arrived while this side was waiting for a
+    /// different one. See [`EventPump`].
+    pump: EventPump,
+    /// Set once the transform has proved it will not hand back the frame it
+    /// was just given without a drain. From then on every frame pays for the
+    /// drain, which is what this module did unconditionally before.
+    needs_drain: bool,
     // Keeps `MFStartup`/`MFShutdown` balanced for as long as `transform` (and
     // any COM object it produced) is alive. Order matters: this must drop
     // after `transform`, which Rust guarantees by declaration order.
@@ -138,6 +192,8 @@ impl MediaFoundationEncoder {
             events,
             config,
             dims: (PROBE_WIDTH, PROBE_HEIGHT),
+            pump: EventPump::default(),
+            needs_drain: false,
             mf,
         })
     }
@@ -160,6 +216,10 @@ impl MediaFoundationEncoder {
         self.events = events;
         self.mf = mf;
         self.dims = (width, height);
+        // A different transform raises its own events; anything counted for
+        // the old one is not a promise this one made.
+        self.pump.reset();
+        self.needs_drain = false;
         Ok(())
     }
 
@@ -173,13 +233,17 @@ impl MediaFoundationEncoder {
     /// never comes and fails on `ENCODE_HW_EVENT_TIMEOUT_MS` - one picture
     /// reaches the guest and the view then sits on "waiting for the remote
     /// screen" for the rest of the session (§18).
-    fn restart_after_drain(&self) -> Result<()> {
+    fn restart_after_drain(&mut self) -> Result<()> {
         // The drain finishes with METransformDrainComplete; starting the next
         // stream before it lands is undefined for the driver, and the wait is
         // effectively free because the output this frame owns has already
         // been read by the time it runs.
         if let Some(events) = &self.events {
-            wait_for_event(events, METransformDrainComplete)?;
+            self.pump.take(
+                events,
+                METransformDrainComplete,
+                Duration::from_millis(ENCODE_HW_EVENT_TIMEOUT_MS),
+            )?;
         }
         // SAFETY: ProcessMessage with a message type that takes no pointer
         // parameter.
@@ -187,53 +251,88 @@ impl MediaFoundationEncoder {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
         }
-        .map_err(|e| MediaError::Encode(format!("START_OF_STREAM refused after a drain: {e}")))
+        .map_err(|e| MediaError::Encode(format!("START_OF_STREAM refused after a drain: {e}")))?;
+        // The new stream raises its own `METransformNeedInput`; a token left
+        // over from the stream that just ended would let the next frame call
+        // `ProcessInput` before the transform is ready for it.
+        self.pump.reset();
+        Ok(())
     }
-}
 
-impl VideoEncoder for MediaFoundationEncoder {
-    fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-        // Re-asserts MTA membership on whatever thread calls this; see the
-        // `unsafe impl Send` note above. Cheap and idempotent once the
-        // calling thread has already joined.
-        ensure_com_initialized()?;
-
-        let (nv12, width, height) = bgra_to_nv12(frame)?;
-        if self.dims != (width, height) {
-            self.reconfigure(width, height)?;
-        }
-
-        let sample = build_input_sample(&nv12, self.config.fps, frame.timestamp_us)?;
-
+    /// Hands one sample to the transform, waiting for the input request an
+    /// asynchronous MFT signals first.
+    fn submit(&mut self, sample: &IMFSample) -> Result<()> {
         if let Some(events) = &self.events {
-            wait_for_event(events, METransformNeedInput)?;
+            self.pump.take(
+                events,
+                METransformNeedInput,
+                Duration::from_millis(ENCODE_HW_EVENT_TIMEOUT_MS),
+            )?;
         }
         // SAFETY: `sample` wraps a single contiguous NV12 buffer sized to
-        // match the input type just negotiated by `reconfigure`/`new`;
+        // match the input type negotiated by `reconfigure`/`new`;
         // `ProcessInput` only reads it.
-        unsafe { self.transform.ProcessInput(0, &sample, 0) }
-            .map_err(|e| MediaError::Encode(format!("ProcessInput failed: {e}")))?;
+        unsafe { self.transform.ProcessInput(0, sample, 0) }
+            .map_err(|e| MediaError::Encode(format!("ProcessInput failed: {e}")))
+    }
 
-        // Hardware encoder MFTs commonly hold more than one frame of internal
-        // pipeline depth (rate-control lookahead, reordering) before they
-        // will emit output on their own, which the trait's one-in/one-out
-        // contract has no way to feed. DRAIN tells the transform to flush
-        // whatever it can produce from the input queued so far rather than
-        // waiting for enough further input to fill that pipeline (MSDN
-        // "Basic MFT Processing Model": DRAIN is exactly this operation, not
-        // a shutdown signal).
+    /// Reads the frame the transform owes for the sample just submitted,
+    /// without ending the stream.
+    ///
+    /// This is what `CODECAPI_AVLowLatencyMode` buys (ADR 0059): an encoder in that mode
+    /// has no reordering window and no lookahead, so it emits one picture per
+    /// picture it is given and the client never has to ask. The per-frame
+    /// `MFT_MESSAGE_COMMAND_DRAIN` this replaces cost a full pipeline flush, a
+    /// `METransformDrainComplete` round trip with the driver and a stream
+    /// restart *for every frame* - the encoder was being stopped and started
+    /// thirty times a second.
+    ///
+    /// `Err` here is not a session failure: the caller falls back to the drain
+    /// path and stays there.
+    fn collect(&mut self, width: u32, height: u32) -> Result<EncodedFrame> {
+        let deadline = Duration::from_millis(LOW_LATENCY_PROBE_TIMEOUT_MS);
+        loop {
+            if let Some(events) = &self.events {
+                self.pump.take(events, METransformHaveOutput, deadline)?;
+            }
+            match drain_output(&self.transform)? {
+                DrainResult::Frame(encoded) => return Ok(encoded),
+                DrainResult::NeedMoreInput => {
+                    return Err(MediaError::Encode(
+                        "the encoder holds this frame back until it is given more input".to_owned(),
+                    ));
+                }
+                DrainResult::StreamChanged => {
+                    negotiate_types(
+                        &self.transform,
+                        width,
+                        height,
+                        self.config.fps,
+                        self.config.bitrate_kbps,
+                    )?;
+                }
+            }
+        }
+    }
+
+    /// Forces out whatever the transform can produce from the input queued so
+    /// far, then restarts the stream. The original behaviour of this module,
+    /// kept for encoders that will not run one-in/one-out.
+    fn collect_by_draining(&mut self, width: u32, height: u32) -> Result<EncodedFrame> {
+        // MSDN "Basic MFT Processing Model": DRAIN is exactly "emit what you
+        // can from what you already have", not a shutdown signal.
         // SAFETY: ProcessMessage with a message type that takes no pointer
         // parameter.
         unsafe { self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0) }
             .map_err(|e| MediaError::Encode(format!("DRAIN refused: {e}")))?;
 
+        let deadline = Duration::from_millis(ENCODE_HW_EVENT_TIMEOUT_MS);
         loop {
             if let Some(events) = &self.events {
-                wait_for_event(events, METransformHaveOutput)?;
+                self.pump.take(events, METransformHaveOutput, deadline)?;
             }
             match drain_output(&self.transform)? {
-                DrainResult::Frame(mut encoded) => {
-                    encoded.timestamp_us = frame.timestamp_us;
+                DrainResult::Frame(encoded) => {
                     self.restart_after_drain()?;
                     return Ok(encoded);
                 }
@@ -260,6 +359,44 @@ impl VideoEncoder for MediaFoundationEncoder {
                 }
             }
         }
+    }
+}
+
+impl VideoEncoder for MediaFoundationEncoder {
+    fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
+        // Re-asserts MTA membership on whatever thread calls this; see the
+        // `unsafe impl Send` note above. Cheap and idempotent once the
+        // calling thread has already joined.
+        ensure_com_initialized()?;
+
+        let (nv12, width, height) = bgra_to_nv12(frame)?;
+        if self.dims != (width, height) {
+            self.reconfigure(width, height)?;
+        }
+
+        let sample = build_input_sample(&nv12, self.config.fps, frame.timestamp_us)?;
+        self.submit(&sample)?;
+
+        // One picture in, one picture out, with the transform left streaming.
+        // Encoders that will not do that say so once - by holding this frame
+        // back - and are driven with the per-frame drain from then on.
+        let mut encoded = if self.needs_drain {
+            self.collect_by_draining(width, height)?
+        } else {
+            match self.collect(width, height) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    tracing::info!(
+                        %error,
+                        "this encoder MFT will not run one-in/one-out; draining every frame"
+                    );
+                    self.needs_drain = true;
+                    self.collect_by_draining(width, height)?
+                }
+            }
+        };
+        encoded.timestamp_us = frame.timestamp_us;
+        Ok(encoded)
     }
 
     fn request_keyframe(&mut self) -> Result<()> {
@@ -291,14 +428,26 @@ impl VideoEncoder for MediaFoundationEncoder {
             bitrate_kbps,
             ..self.config
         };
-        negotiate_types(
-            &self.transform,
-            self.dims.0,
-            self.dims.1,
-            new_config.fps,
-            bitrate_kbps,
-        )?;
-        start_streaming(&self.transform)?;
+
+        // `ICodecAPI::SetValue` first, and renegotiation only if the driver
+        // refuses it. Renegotiating the output type resets the transform:
+        // `start_streaming` flushes it, the reference frames go, and the next
+        // picture has to be an IDR. The adaptive controller may move the
+        // target once a second (`ABR_ADJUST_MAX_RATE_PER_SEC`), so paying that
+        // put a keyframe-sized spike and a visible hitch into the stream every
+        // second the link was not perfectly steady - the very condition the
+        // adaptation exists to smooth over.
+        if set_mean_bitrate(&self.transform, bitrate_kbps).is_err() {
+            negotiate_types(
+                &self.transform,
+                self.dims.0,
+                self.dims.1,
+                new_config.fps,
+                bitrate_kbps,
+            )?;
+            start_streaming(&self.transform)?;
+            self.pump.reset();
+        }
         self.config = new_config;
         Ok(())
     }
@@ -453,7 +602,12 @@ fn try_activate_one(
         unlock_async(&transform)?;
     }
 
+    // Before the types, not after: `MF_LOW_LATENCY` and the rate-control mode
+    // change what the transform is willing to negotiate, and several drivers
+    // latch both at `SetOutputType` time.
+    request_low_latency(&transform);
     negotiate_types(&transform, width, height, config.fps, config.bitrate_kbps)?;
+    tune_for_low_latency(&transform, config);
     start_streaming(&transform)?;
 
     let events = if is_async {
@@ -586,11 +740,150 @@ fn build_output_type(width: u32, height: u32, fps: u8, bitrate_kbps: u32) -> Res
         media_type
             .SetUINT32(&MF_MT_INTERLACE_MODE, interlace_progressive())
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
+        // High profile, best-effort. It is the same decoder cost on anything
+        // built this decade and it buys CABAC and 8x8 transforms, which is
+        // real sharpness back on exactly the content a desktop is made of:
+        // text edges and flat fills. A driver that refuses it keeps whatever
+        // profile it defaults to, so this is set rather than negotiated.
+        let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, h264_high_profile());
     }
     set_frame_size(&media_type, width, height)?;
     set_frame_rate(&media_type, fps)?;
     set_pixel_aspect_ratio(&media_type)?;
     Ok(media_type)
+}
+
+/// `eAVEncH264VProfile_High` as the `u32` `MF_MT_MPEG2_PROFILE` wants; the
+/// constant is a fixed, non-negative platform enum value.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "eAVEncH264VProfile_High is a fixed, non-negative platform enum constant"
+)]
+fn h264_high_profile() -> u32 {
+    eAVEncH264VProfile_High.0 as u32
+}
+
+/// Asks the transform's own attribute store for low-latency processing.
+///
+/// Separate from [`tune_for_low_latency`] and run *before* type negotiation:
+/// `MF_LOW_LATENCY` is an MFT attribute rather than a codec property, and
+/// MSDN documents it as something the client sets on the transform before it
+/// starts. Best-effort throughout - an encoder that does not know the
+/// attribute simply keeps its defaults.
+fn request_low_latency(transform: &IMFTransform) {
+    // SAFETY: GetAttributes/SetUINT32 only touch the transform's own
+    // attribute store.
+    unsafe {
+        if let Ok(attrs) = transform.GetAttributes() {
+            let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+        }
+    }
+}
+
+/// Puts the encoder into the mode a remote desktop actually needs, through
+/// `ICodecAPI` (ADR 0059).
+///
+/// Every one of these is best-effort: `ICodecAPI` properties are optional per
+/// MFT, drivers differ in which ones they implement, and a refusal means
+/// "this encoder keeps its default", never "this session cannot run". What
+/// they are for:
+///
+/// - `AVLowLatencyMode` / `AVEncCommonLowLatency` / `AVEncCommonRealTime`:
+///   no reordering window, no lookahead, no B-frames held back waiting for a
+///   future picture. Without it an encoder is free to buffer one to three
+///   frames before emitting anything, which is 30-100 ms of lag that no
+///   amount of work anywhere else in the pipeline can win back.
+/// - `LowDelayVBR` (falling back to CBR): a desktop is still most of the
+///   time and interesting exactly when it is not. Constant bitrate spends the
+///   same bits on both.
+/// - `MaxNumRefFrame = 1` and no B-pictures: nothing may depend on a picture
+///   that has not been sent yet.
+/// - `GOPSize`: see [`GOP_SECONDS`] - the guest asks for an intra frame when
+///   it needs one, so periodic ones only cost.
+fn tune_for_low_latency(transform: &IMFTransform, config: EncoderConfig) {
+    let Ok(codec) = transform.cast::<ICodecAPI>() else {
+        // A transform with no ICodecAPI keeps every default it has. Not worth
+        // a warning: it is legal, and the session still runs.
+        return;
+    };
+    let set = |key: &windows::core::GUID, value: VARIANT| {
+        // SAFETY: both arguments outlive the call and `SetValue` only reads
+        // them.
+        unsafe { codec.SetValue(key, &raw const value) }.is_ok()
+    };
+
+    set(&CODECAPI_AVLowLatencyMode, VARIANT::from(true));
+    set(&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true));
+    set(&CODECAPI_AVEncCommonRealTime, VARIANT::from(true));
+
+    if !set(
+        &CODECAPI_AVEncCommonRateControlMode,
+        VARIANT::from(rate_control_mode(eAVEncCommonRateControlMode_LowDelayVBR)),
+    ) {
+        set(
+            &CODECAPI_AVEncCommonRateControlMode,
+            VARIANT::from(rate_control_mode(eAVEncCommonRateControlMode_CBR)),
+        );
+    }
+    set(
+        &CODECAPI_AVEncCommonMeanBitRate,
+        VARIANT::from(config.bitrate_kbps.saturating_mul(BITS_PER_KBIT)),
+    );
+    set(
+        &CODECAPI_AVEncCommonMaxBitRate,
+        VARIANT::from(peak_bitrate_bps(config.bitrate_kbps)),
+    );
+    set(
+        &CODECAPI_AVEncCommonQualityVsSpeed,
+        VARIANT::from(QUALITY_VS_SPEED),
+    );
+    set(&CODECAPI_AVEncVideoMaxNumRefFrame, VARIANT::from(1u32));
+    set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
+    set(&CODECAPI_AVEncH264CABACEnable, VARIANT::from(true));
+    set(
+        &CODECAPI_AVEncMPVGOPSize,
+        VARIANT::from(u32::from(config.fps.max(1)).saturating_mul(GOP_SECONDS)),
+    );
+}
+
+/// Moves the mean and peak bitrate on a live transform, without touching the
+/// negotiated types.
+///
+/// # Errors
+/// [`MediaError::Encode`] if the transform exposes no `ICodecAPI` or refuses
+/// the property - which is the caller's signal to renegotiate instead.
+fn set_mean_bitrate(transform: &IMFTransform, bitrate_kbps: u32) -> Result<()> {
+    let codec: ICodecAPI = transform
+        .cast()
+        .map_err(|e| MediaError::Encode(format!("this encoder MFT exposes no ICodecAPI: {e}")))?;
+    let mean = VARIANT::from(bitrate_kbps.saturating_mul(BITS_PER_KBIT));
+    // SAFETY: both arguments are locals that outlive the call, and `SetValue`
+    // only reads them.
+    unsafe { codec.SetValue(&CODECAPI_AVEncCommonMeanBitRate, &raw const mean) }
+        .map_err(|e| MediaError::Encode(format!("a live bitrate change was refused: {e}")))?;
+    let peak = VARIANT::from(peak_bitrate_bps(bitrate_kbps));
+    // SAFETY: as above. The peak is best-effort: an encoder that took the
+    // mean but not the peak is still following the target.
+    let _ = unsafe { codec.SetValue(&CODECAPI_AVEncCommonMaxBitRate, &raw const peak) };
+    Ok(())
+}
+
+/// The peak the rate controller may reach for a moving frame, in bits per
+/// second. See [`PEAK_BITRATE_PERCENT`].
+fn peak_bitrate_bps(bitrate_kbps: u32) -> u32 {
+    bitrate_kbps
+        .saturating_mul(BITS_PER_KBIT)
+        .saturating_div(100)
+        .saturating_mul(PEAK_BITRATE_PERCENT)
+}
+
+/// One `eAVEncCommonRateControlMode` value as the `u32` `ICodecAPI` wants.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "the rate-control modes are fixed, non-negative platform enum constants"
+)]
+fn rate_control_mode(mode: eAVEncCommonRateControlMode) -> u32 {
+    mode.0 as u32
 }
 
 fn build_input_type(width: u32, height: u32, fps: u8) -> Result<IMFMediaType> {
@@ -897,35 +1190,104 @@ fn bitstream_has_idr(data: &[u8]) -> bool {
     false
 }
 
-/// Waits for `expected` on `events`, bounded by `ENCODE_HW_EVENT_TIMEOUT_MS`
-/// so a stalled or crashed hardware encoder driver fails one `encode()` call
-/// instead of hanging the session forever (§24.5, ADR 0011).
-fn wait_for_event(events: &IMFMediaEventGenerator, expected: MF_EVENT_TYPE) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_millis(ENCODE_HW_EVENT_TIMEOUT_MS);
-    loop {
-        // SAFETY: GetEvent with MF_EVENT_FLAG_NO_WAIT returns immediately
-        // with either an owned IMFMediaEvent or MF_E_NO_EVENTS_AVAILABLE.
-        match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-            Ok(event) => {
-                // SAFETY: GetType only reads the event's own type field.
-                let ty = unsafe { event.GetType() }
-                    .map_err(|e| MediaError::Encode(format!("event GetType failed: {e}")))?;
-                if ty == expected.0.cast_unsigned() {
-                    return Ok(());
+/// Asynchronous-MFT events that arrived out of turn.
+///
+/// An async MFT signals `METransformNeedInput` and `METransformHaveOutput`
+/// whenever it is ready, in whatever order suits it, and every event is a
+/// one-shot credit: MSDN's asynchronous processing model says a client may
+/// call `ProcessInput` exactly once per `METransformNeedInput` it received.
+///
+/// The version of this that this replaced simply *discarded* every event it
+/// was not currently waiting for. That is why the per-frame drain existed: a
+/// `NeedInput` thrown away while collecting output is a credit the next frame
+/// then waits two seconds for and never gets, and restarting the stream was
+/// the only thing that made the driver issue a fresh one. Counting them
+/// instead is what makes running the transform without a drain possible at
+/// all.
+#[derive(Debug, Default)]
+struct EventPump {
+    need_input: u32,
+    have_output: u32,
+}
+
+impl EventPump {
+    /// Forgets every outstanding credit. Called wherever the transform's
+    /// stream is restarted or replaced, because credits belong to the stream
+    /// that issued them.
+    fn reset(&mut self) {
+        self.need_input = 0;
+        self.have_output = 0;
+    }
+
+    /// Records one event, if it is one of the two this cares about.
+    fn record(&mut self, ty: u32) {
+        if ty == METransformNeedInput.0.cast_unsigned() {
+            self.need_input = self.need_input.saturating_add(1);
+        } else if ty == METransformHaveOutput.0.cast_unsigned() {
+            self.have_output = self.have_output.saturating_add(1);
+        }
+    }
+
+    /// Spends one credit of `expected`, if one is already banked.
+    fn spend(&mut self, expected: MF_EVENT_TYPE) -> bool {
+        let slot = if expected.0 == METransformNeedInput.0 {
+            &mut self.need_input
+        } else if expected.0 == METransformHaveOutput.0 {
+            &mut self.have_output
+        } else {
+            // Anything else (a drain completing, say) is a one-off that is
+            // never banked, so it is always waited for.
+            return false;
+        };
+        if *slot == 0 {
+            return false;
+        }
+        *slot -= 1;
+        true
+    }
+
+    /// Waits until `expected` is available, banking anything else that
+    /// arrives on the way.
+    ///
+    /// Bounded by `timeout` so a stalled or crashed hardware encoder driver
+    /// fails one `encode()` call instead of hanging the session forever
+    /// (§24.5, ADR 0011).
+    ///
+    /// # Errors
+    /// [`MediaError::Encode`] on timeout or on a failing event queue.
+    fn take(
+        &mut self,
+        events: &IMFMediaEventGenerator,
+        expected: MF_EVENT_TYPE,
+        timeout: Duration,
+    ) -> Result<()> {
+        if self.spend(expected) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            // SAFETY: GetEvent with MF_EVENT_FLAG_NO_WAIT returns immediately
+            // with either an owned IMFMediaEvent or MF_E_NO_EVENTS_AVAILABLE.
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    // SAFETY: GetType only reads the event's own type field.
+                    let ty = unsafe { event.GetType() }
+                        .map_err(|e| MediaError::Encode(format!("event GetType failed: {e}")))?;
+                    if ty == expected.0.cast_unsigned() {
+                        return Ok(());
+                    }
+                    self.record(ty);
                 }
-                // A different event than the one this call is waiting for
-                // (e.g. a stray NeedInput while draining output) is not an
-                // error; keep waiting for the one we asked for.
-            }
-            Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
-                if Instant::now() >= deadline {
-                    return Err(MediaError::Encode(
-                        "timed out waiting for the hardware encoder".to_owned(),
-                    ));
+                Err(e) if e.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    if Instant::now() >= deadline {
+                        return Err(MediaError::Encode(
+                            "timed out waiting for the hardware encoder".to_owned(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(EVENT_POLL_INTERVAL_MS));
                 }
-                std::thread::sleep(Duration::from_millis(EVENT_POLL_INTERVAL_MS));
+                Err(e) => return Err(MediaError::Encode(format!("GetEvent failed: {e}"))),
             }
-            Err(e) => return Err(MediaError::Encode(format!("GetEvent failed: {e}"))),
         }
     }
 }

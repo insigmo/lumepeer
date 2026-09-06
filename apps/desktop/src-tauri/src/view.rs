@@ -8,14 +8,18 @@
 //!
 //! Two loops live here, one per side of a session:
 //!
-//! - The **host** loop pulls frames out of the shared [`CaptureController`],
-//!   encodes them and writes them onto that peer's `rd/media/1` stream. The
-//!   controller is the gate: with no viewer it refuses to produce a frame, so
-//!   the loop ends by itself when the last viewer leaves (§8.1, §11).
-//! - The **guest** loop dials `rd/media/1`, decodes in the sandboxed worker
-//!   process of §11.3 and keeps only the newest picture in a single-slot
-//!   `watch` channel. Reordering is the jitter buffer's problem upstream of
-//!   decode; the display side only ever wants the latest frame.
+//! - The **host** loop pulls frames out of the shared [`CaptureController`]
+//!   and encodes them; a second task writes them onto that peer's
+//!   `rd/media/1` stream, one frame deep, so a slow link cannot stall the
+//!   capture of the next picture (ADR 0059). The controller is the gate: with
+//!   no viewer it refuses to produce a frame, so the loop ends by itself when
+//!   the last viewer leaves (§8.1, §11).
+//! - The **guest** loop dials `rd/media/1` and hands what arrives to whichever
+//!   side of the window is decoding (ADR 0058). A window whose `WebView` has a
+//!   `VideoDecoder` takes the bitstream through [`BitstreamFeed`] and decodes
+//!   it itself; one that does not gets the sandboxed worker process of §11.3,
+//!   which decodes to RGBA into a single-slot `watch` channel. Reordering is
+//!   the jitter buffer's problem upstream of decode either way.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -492,6 +496,243 @@ fn decode_media_payload(bytes: &[u8]) -> Option<EncodedFrame> {
     })
 }
 
+/// Frames the guest's bitstream queue holds before it stops believing the
+/// window is draining it.
+///
+/// Two seconds at the default frame rate. A window that is merely busy
+/// catches up inside this; a window that has stopped answering is not going
+/// to, and holding its backlog forever would trade the picture for memory.
+const BITSTREAM_QUEUE_FRAMES: usize = 64;
+
+/// ...and the byte ceiling on the same queue, for the case the frames are
+/// keyframes rather than the small inter frames the count above assumes.
+const BITSTREAM_QUEUE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long [`BitstreamFeed::take`] waits for a frame before answering with
+/// the header alone.
+///
+/// Not a frame interval and not a poll rate: the call returns the instant a
+/// frame exists. This is only the ceiling that keeps `status`, the `input`
+/// grant and the recording indicator refreshing on a session where the
+/// picture has stopped — the three things that must reach the window
+/// precisely when no frames are arriving.
+pub const BITSTREAM_POLL_TIMEOUT_MS: u64 = 250;
+
+/// Who turns this session's bitstream into pictures.
+///
+/// Decided by the view window, on its first call, by which command it uses —
+/// nothing here guesses. The window is the only side that knows whether its
+/// own `WebView` has a usable `VideoDecoder`, and it can change its mind later
+/// (a decoder that fails repeatedly falls back by simply going back to
+/// `view_next_frame`), so this is a cell the newest caller wins rather than a
+/// setting fixed at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodePath {
+    /// No window has asked yet. Frames are queued for whoever does; nothing
+    /// is decoded, and in particular the sandboxed worker process is not
+    /// started for a session that may never need it.
+    Undecided,
+    /// The window decodes the bitstream itself, in the `WebView` (ADR 0058).
+    Native,
+    /// The sandboxed worker of §11.3 decodes to RGBA and the window polls for
+    /// pixels.
+    Worker,
+}
+
+impl DecodePath {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Undecided => 0,
+            Self::Native => 1,
+            Self::Worker => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Native,
+            2 => Self::Worker,
+            _ => Self::Undecided,
+        }
+    }
+}
+
+/// Encoded frames on their way from the media receiver to a view window that
+/// decodes them itself (ADR 0058).
+///
+/// The alternative this exists to avoid is the one the pipeline used to have:
+/// decode to RGBA in a worker process, then hand the *pixels* to the `WebView`
+/// over IPC. One 1080p picture is 8 MiB, and moving 8 MiB through `WebView2`'s
+/// IPC costs well over a hundred milliseconds — per frame, before anything is
+/// drawn. The same picture as H.264 is a few tens of kilobytes, so sending the
+/// bitstream instead is not an optimisation of that path, it is three orders
+/// of magnitude less work.
+///
+/// A queue rather than the single slot the RGBA path uses, and that is
+/// forced: RGBA pictures are independent, so keeping only the newest is
+/// exactly right, while an inter frame is meaningless without the frames it
+/// references. Dropping one silently would corrupt everything after it until
+/// the next intra frame.
+#[derive(Debug, Default)]
+pub struct BitstreamFeed {
+    queue: Mutex<BitstreamQueue>,
+    ready: tokio::sync::Notify,
+    path: std::sync::atomic::AtomicU8,
+}
+
+#[derive(Debug, Default)]
+struct BitstreamQueue {
+    frames: std::collections::VecDeque<EncodedFrame>,
+    bytes: usize,
+    /// Whether the stream the window is holding was broken since it last
+    /// looked — frames were dropped, or the media connection was redialled.
+    /// The window has to throw its decoder state away and wait for an intra
+    /// frame; nothing else can put it back in step.
+    desync: bool,
+}
+
+impl BitstreamFeed {
+    /// Who is decoding this session right now.
+    pub fn path(&self) -> DecodePath {
+        DecodePath::from_code(self.path.load(Ordering::Relaxed))
+    }
+
+    /// Records the choice the calling window just made by which command it
+    /// used.
+    pub fn choose(&self, path: DecodePath) {
+        self.path.store(path.code(), Ordering::Relaxed);
+    }
+
+    /// Queues one encoded frame and wakes whatever is waiting for it.
+    pub fn push(&self, frame: EncodedFrame) {
+        {
+            let mut queue = self.lock();
+            queue.bytes = queue.bytes.saturating_add(frame.data.len());
+            queue.frames.push_back(frame);
+            if queue.frames.len() > BITSTREAM_QUEUE_FRAMES || queue.bytes > BITSTREAM_QUEUE_BYTES {
+                // Nobody is draining this. Everything queued behind the
+                // overflow is undecodable anyway once a frame is missing, so
+                // the honest answer is to say so once and start clean.
+                queue.frames.clear();
+                queue.bytes = 0;
+                queue.desync = true;
+            }
+        }
+        self.ready.notify_waiters();
+    }
+
+    /// Marks the stream broken: the window must reset its decoder and the
+    /// host must be asked for an intra frame.
+    pub fn desync(&self) {
+        {
+            let mut queue = self.lock();
+            queue.frames.clear();
+            queue.bytes = 0;
+            queue.desync = true;
+        }
+        self.ready.notify_waiters();
+    }
+
+    /// Everything queued, waiting up to `timeout` for the first frame.
+    ///
+    /// Returns the frames in order and whether the stream was broken since
+    /// the previous call. An empty answer is normal and is what keeps the
+    /// window's status and grant flags live while the picture is still.
+    pub async fn take(&self, timeout: Duration) -> (Vec<EncodedFrame>, bool) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Registered before the queue is inspected, or a frame pushed
+            // between the two would be waited out to the timeout.
+            let notified = self.ready.notified();
+            if let Some(batch) = self.drain() {
+                return batch;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return (Vec::new(), false);
+            };
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.drain().unwrap_or_default();
+            }
+        }
+    }
+
+    /// Everything queued right now, or `None` when there is nothing to say.
+    fn drain(&self) -> Option<(Vec<EncodedFrame>, bool)> {
+        let mut queue = self.lock();
+        if queue.frames.is_empty() && !queue.desync {
+            return None;
+        }
+        let desync = std::mem::take(&mut queue.desync);
+        queue.bytes = 0;
+        Some((queue.frames.drain(..).collect(), desync))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BitstreamQueue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Bytes of the header [`encode_chunk_response`] always emits.
+pub const CHUNK_RESPONSE_HEADER_BYTES: usize = 8;
+
+/// Bytes of the per-frame header inside a chunk response.
+pub const CHUNK_FRAME_HEADER_BYTES: usize = 13;
+
+/// Flags byte bit: the stream was broken since the previous chunk, so the
+/// window must reset its decoder and wait for an intra frame.
+pub const VIEW_FLAG_DESYNC: u8 = 0b0000_0100;
+
+/// Serializes one batch of encoded frames for `view_next_chunk`.
+///
+/// Layout, little endian:
+/// `status:u8 | flags:u8 | count:u16 | reserved:u32`, then `count` frames of
+/// `flags:u8 | timestamp_us:u64 | length:u32 | bitstream`.
+///
+/// The `status`/`flags` header is the same contract
+/// [`encode_view_response`] carries and for the same reasons: the pipeline's
+/// health, the live `input` grant (§8.1) and the host's own recording
+/// statement (§2.2) all have to ride every answer, including the empty ones a
+/// still screen produces.
+#[must_use]
+pub fn encode_chunk_response(
+    status: ViewStatus,
+    input: bool,
+    recording: bool,
+    frames: &[EncodedFrame],
+    desync: bool,
+) -> Vec<u8> {
+    let payload: usize = frames
+        .iter()
+        .map(|f| CHUNK_FRAME_HEADER_BYTES + f.data.len())
+        .sum();
+    let mut out = Vec::with_capacity(CHUNK_RESPONSE_HEADER_BYTES + payload);
+    out.push(status.code());
+    out.push(
+        if input { VIEW_FLAG_INPUT } else { 0 }
+            | if recording { VIEW_FLAG_RECORDING } else { 0 }
+            | if desync { VIEW_FLAG_DESYNC } else { 0 },
+    );
+    out.extend_from_slice(
+        &u16::try_from(frames.len())
+            .unwrap_or(u16::MAX)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for frame in frames {
+        out.push(u8::from(frame.keyframe));
+        out.extend_from_slice(&frame.timestamp_us.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(frame.data.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&frame.data);
+    }
+    out
+}
+
 /// What the guest's view window is showing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewStatus {
@@ -879,13 +1120,28 @@ pub fn spawn_encode_loop(
     control: EncodeControl,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut writer = match open_media_stream(&connection).await {
+        let writer = match open_media_stream(&connection).await {
             Ok(writer) => writer,
             Err(error) => {
                 tracing::warn!(peer = %tag, %error, "cannot open the media stream");
                 return;
             }
         };
+        // The write goes on its own task, one frame deep (ADR 0059).
+        //
+        // It used to be the last step of this loop, which made the frame
+        // budget the *sum* of capture, scale, encode and network rather than
+        // the largest of them - and worse, a link that was momentarily slow
+        // stalled the capture of the next picture, so the delay compounded
+        // instead of being absorbed. With the write behind a one-slot channel
+        // the loop finds out about a busy link by not being able to reserve a
+        // slot, which is both the correct back-pressure signal and the moment
+        // to skip a *source* frame rather than queue a stale encoded one.
+        let (frames_tx, frames_rx) = mpsc::channel::<WriteJob>(1);
+        // Held so the writer dies with this loop: it owns the media stream,
+        // and a writer outliving the encoder would keep the session's stream
+        // open with nothing behind it.
+        let _writer_task = AbortOnDrop(spawn_media_writer(writer, frames_rx, tag.clone()));
         let mut encoder = match select_encoder(EncoderConfig::default()) {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -911,8 +1167,8 @@ pub fn spawn_encode_loop(
         // When the guest last told this side what it actually received. A
         // guest that reports is the authority on its own link; without one —
         // an older peer, or one that has gone quiet — the only congestion
-        // signal left is how long each write takes relative to the frame
-        // budget, which is what ADR 0015 settled for.
+        // signal left is the host's own [`Backlog`], which is what ADR 0015
+        // settled for and ADR 0059 made honest.
         let mut last_report: Option<Instant> = None;
         let feedback_stale = Duration::from_millis(ABR_FEEDBACK_STALE_AFTER_MS);
         // What this side actually put on the wire, over the window the guest
@@ -922,6 +1178,15 @@ pub fn spawn_encode_loop(
         // congestion on a link with no loss at all, and walked the whole
         // degradation ladder down on an idle LAN (docs/bugs/07-video-quality.md).
         let mut sent = SendRate::default();
+        // How many of the recent frame slots the link would not take. This is
+        // the host-local congestion signal, and it replaces one that measured
+        // how long `write_frame().await` happened to block: on a reliable
+        // ordered QUIC stream that duration is the congestion window filling,
+        // the OS scheduler, and the encoder's own jitter, all read as packet
+        // loss. Two frame intervals of it reported *total* loss, which walked
+        // the whole degradation ladder down over a hiccup
+        // (docs/bugs/07-video-quality.md).
+        let mut backlog = Backlog::default();
         // Session recording (§17): the actor swaps a recorder into the shared
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
@@ -942,6 +1207,25 @@ pub fn spawn_encode_loop(
 
         loop {
             let tick_started = Instant::now();
+            // Is the link still on the previous frame? Then it cannot take
+            // this one, and the honest thing is to not produce it: an encoded
+            // frame may not simply be dropped later (everything after it
+            // references it), and queueing it would only mean the guest is
+            // shown a picture of a moment that has already passed. Skipping
+            // the whole tick - capture included - costs nothing and is what
+            // the adaptive controller then reads as pressure.
+            let permit = match frames_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    backlog.skipped();
+                    sleep_for_the_rest_of(interval, tick_started).await;
+                    continue;
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    tracing::info!(peer = %tag, "media stream ended");
+                    return;
+                }
+            };
             // Pick up a recorder the actor may have swapped in (or out) since
             // the last frame; a poisoned lock here only means "record nothing
             // this frame", which is the safe direction.
@@ -991,6 +1275,22 @@ pub fn spawn_encode_loop(
                 // `docs/bugs/11-uac-degradation.md`'s unmodified fallback
                 // below, exactly as it behaved before this ADR existed.
                 Ok(Err(MediaError::SecureDesktopActive(reason))) => {
+                    // The ordinary capturer just reported the secure desktop is
+                    // in the foreground. That — not "a fresh picture landed this
+                    // tick" — is the authoritative signal the input path keys on
+                    // to route a guest's clicks and keys to the `Winlogon`
+                    // injector (ADR 0057). The *picture* is throttled to
+                    // `SECURE_DESKTOP_CAPTURE_INTERVAL_MS` (500 ms), so
+                    // `secure_desktop_frame` returns `None` on all but ~1 tick in
+                    // N; keying the flag off that None dropped it to false ~97%
+                    // of the time, and a click arriving in one of those gaps fell
+                    // through to the ordinary in-session injector, whose
+                    // `SendInput` cannot reach `Winlogon` and is silently dropped
+                    // (docs/bugs/11-uac-degradation.md). Latch it for the whole
+                    // episode instead, while the guest is actually being shown
+                    // the secure desktop (the viewing grant is on) — input is not
+                    // throttled just because the picture is.
+                    control.set_secure_desktop_active(control.secure_desktop_allowed());
                     if let Some(frame) = secure_desktop_frame(
                         &control,
                         &mut secure_desktop_next_attempt_at,
@@ -998,11 +1298,9 @@ pub fn spawn_encode_loop(
                     )
                     .await
                     {
-                        control.set_secure_desktop_active(true);
                         secure_desktop_notified = false;
                         frame
                     } else {
-                        control.set_secure_desktop_active(false);
                         if !secure_desktop_notified {
                             tracing::info!(
                                 peer = %tag,
@@ -1037,7 +1335,6 @@ pub fn spawn_encode_loop(
             // ceiling of §15 that no choice may exceed, so it goes last and
             // has the final say (ADR 0018).
             let scale_percent = effective_scale(control.manual_cap(), target.scale_percent);
-            let frame = fit_within_budget(scale_to_percent(frame, scale_percent));
 
             // The cursor rides its own channel when the guest asked for one,
             // and is read only then: a shape the loop would never send is a
@@ -1061,12 +1358,34 @@ pub fn spawn_encode_loop(
                 tracing::warn!(peer = %tag, %error, "the encoder refused a keyframe request");
             }
 
-            let bitstream = match encoder.encode(&frame) {
-                Ok(bitstream) => bitstream,
+            // Scaling and encoding are both blocking work on the whole
+            // picture - two CPU passes over several megabytes, then a
+            // hardware MFT round trip or a full software encode - and neither
+            // has any more business on a tokio worker thread than
+            // `next_frame` above does. The encoder travels with the closure
+            // and back.
+            let finished = tokio::task::spawn_blocking(move || {
+                let frame = fit_within_budget(scale_to_percent(frame, scale_percent));
+                let mut encoder = encoder;
+                let bitstream = encoder.encode(&frame);
+                (encoder, bitstream)
+            })
+            .await;
+            let bitstream = match finished {
+                Ok((returned, bitstream)) => {
+                    encoder = returned;
+                    match bitstream {
+                        Ok(bitstream) => bitstream,
+                        Err(error) => {
+                            tracing::warn!(peer = %tag, %error, "encoder refused a frame");
+                            sleep_for_the_rest_of(interval, tick_started).await;
+                            continue;
+                        }
+                    }
+                }
                 Err(error) => {
-                    tracing::warn!(peer = %tag, %error, "encoder refused a frame");
-                    sleep_for_the_rest_of(interval, tick_started).await;
-                    continue;
+                    tracing::warn!(peer = %tag, %error, "the encode task ended unexpectedly");
+                    return;
                 }
             };
             if bitstream.data.len() > MAX_MEDIA_FRAME_BYTES {
@@ -1077,17 +1396,15 @@ pub fn spawn_encode_loop(
                 );
                 continue;
             }
-            let write_started = Instant::now();
-            if let Err(error) = writer.write_frame(&encode_media_payload(&bitstream)).await {
-                tracing::info!(peer = %tag, %error, "media stream ended");
-                return;
-            }
             sent.wrote(bitstream.data.len());
-            // Recording rides the successfully written frame (§17): the
-            // container stores the same bitstream the guest received.
-            if let Some(recorder) = recorder_now.as_ref() {
-                recorder.write_video(bitstream.timestamp_us, &bitstream.data);
-            }
+            backlog.offered();
+            // Recording rides the frame the guest is being sent (§17): the
+            // container stores the same bitstream, written by the same task
+            // that writes the wire, so the two cannot diverge.
+            permit.send(WriteJob {
+                frame: bitstream,
+                recorder: recorder_now.clone(),
+            });
             // The guest's own measurement wins whenever there is a fresh one;
             // the host-local stand-in only speaks for a link nobody is
             // reporting on (ADR 0015, ADR 0037).
@@ -1098,15 +1415,15 @@ pub fn spawn_encode_loop(
                     // what was offered, and one without the other says
                     // nothing about the link.
                     feedback.sent_kbps = sent.take_kbps();
+                    // The guest is the authority on its own link while it is
+                    // talking; the local window has nothing to add and must
+                    // not carry over into the next silence.
+                    backlog.reset();
                     Some(feedback)
                 }
-                None if last_report.is_none_or(|at| at.elapsed() > feedback_stale) => {
-                    Some(write_congestion_feedback(
-                        write_started.elapsed(),
-                        interval,
-                        bitstream.data.len(),
-                    ))
-                }
+                None if last_report.is_none_or(|at| at.elapsed() > feedback_stale) => backlog
+                    .due()
+                    .map(|loss| backlog_feedback(loss, sent.take_kbps())),
                 None => None,
             };
             if let Some(feedback) = measured
@@ -1222,31 +1539,138 @@ async fn secure_desktop_frame(
     })
 }
 
-/// Turns how long one write actually took into the [`ReceiverFeedback`]
-/// shape [`AbrController`] expects, standing in for real loss on a stream
-/// that cannot lose bytes (see docs/adr/0015-host-local-abr.md).
+/// One frame on its way to the wire, and whatever recording was running when
+/// it was produced (§17).
+#[derive(Debug)]
+struct WriteJob {
+    frame: EncodedFrame,
+    recorder: Option<Arc<crate::recorder::SessionRecorder>>,
+}
+
+/// Host side: the only task that touches the media stream (ADR 0059).
 ///
-/// A write finishing inside the frame budget reports no congestion; one
-/// running twice the budget or beyond reports total loss, saturating the
-/// controller's multiplicative-decrease branch. `rtt_ms` has no local
-/// equivalent here, and the goodput half is deliberately self-cancelling:
-/// both `goodput_kbps` and `sent_kbps` are the same local write rate, so the
-/// controller's arrival check cannot fire on a measurement that never crossed
-/// the network. Congestion on this path is `loss`, and only `loss`.
-fn write_congestion_feedback(
-    write_elapsed: Duration,
-    interval: Duration,
-    frame_bytes: usize,
-) -> ReceiverFeedback {
-    let over_budget = write_elapsed.as_secs_f32() / interval.as_secs_f32().max(f32::EPSILON) - 1.0;
-    let bits = (frame_bytes as u128).saturating_mul(8);
-    let millis = write_elapsed.as_millis().max(1);
-    let goodput_kbps = u32::try_from(bits / millis).unwrap_or(u32::MAX);
+/// Its whole job is to be the thing that can be slow without the capture and
+/// encode stages having to wait for it. A frame arrives, it is written, and if
+/// a recording is running the same bytes go into the container - which is also
+/// why the recorder rides the job rather than being consulted here: the frame
+/// the guest is sent and the frame that is recorded must be the same one, and
+/// the actor may swap the recorder at any moment.
+fn spawn_media_writer(
+    mut writer: lumepeer_net::MediaFrameWriter<iroh::endpoint::SendStream>,
+    mut jobs: mpsc::Receiver<WriteJob>,
+    tag: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(job) = jobs.recv().await {
+            if let Err(error) = writer.write_frame(&encode_media_payload(&job.frame)).await {
+                tracing::info!(peer = %tag, %error, "media stream ended");
+                return;
+            }
+            if let Some(recorder) = job.recorder.as_ref() {
+                recorder.write_video(job.frame.timestamp_us, &job.frame.data);
+            }
+        }
+    })
+}
+
+/// How many of the recent frame slots the link would not take.
+///
+/// The host-local congestion signal of ADR 0015, measured honestly
+/// (ADR 0059). The
+/// version this replaces timed `write_frame().await` and called anything
+/// slower than the frame budget "loss": on a reliable ordered QUIC stream that
+/// duration is the congestion window filling, the peer's receive window, the
+/// OS scheduler and the encoder's own variance, and two frame intervals of it
+/// saturated at *total* loss. The controller then walked bitrate, frame rate
+/// and resolution all the way to their floors over a hiccup on a link with no
+/// loss at all (docs/bugs/07-video-quality.md).
+///
+/// What this counts instead is the one thing that unambiguously says the link
+/// cannot carry the load: the writer was still busy with the previous frame,
+/// so this frame was never produced.
+#[derive(Debug)]
+struct Backlog {
+    started: Instant,
+    offered: u32,
+    skipped: u32,
+}
+
+impl Default for Backlog {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            offered: 0,
+            skipped: 0,
+        }
+    }
+}
+
+impl Backlog {
+    /// A frame was produced and handed to the writer.
+    fn offered(&mut self) {
+        self.offered = self.offered.saturating_add(1);
+    }
+
+    /// A frame was not produced, because the writer was still busy.
+    fn skipped(&mut self) {
+        self.skipped = self.skipped.saturating_add(1);
+    }
+
+    /// Forgets the current window. Called whenever the guest's own report
+    /// takes over, so a window that spans the silence and the report is never
+    /// attributed to either.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// The share of slots the link would not take, once the window has run
+    /// its course, and starts the next one in the same call.
+    ///
+    /// A window, not a per-frame reading, and the same
+    /// [`ABR_FEEDBACK_INTERVAL_MS`] the guest measures its own arrivals
+    /// across. One frame is not a measurement of anything: the controller
+    /// halves the bitrate above `HEAVY_LOSS`, so reporting per frame would
+    /// mean a single scheduling hiccup halves the picture quality - which is
+    /// the exact failure of the timing-based signal this replaced.
+    fn due(&mut self) -> Option<f32> {
+        if self.started.elapsed() < Duration::from_millis(u64::from(ABR_FEEDBACK_INTERVAL_MS)) {
+            return None;
+        }
+        let total = self.offered.saturating_add(self.skipped);
+        let skipped = self.skipped;
+        self.reset();
+        // A window with nothing in it is an idle screen, not a congested
+        // link. No evidence is not evidence.
+        Some(if total == 0 {
+            0.0
+        } else {
+            f64_ratio(skipped, total)
+        })
+    }
+}
+
+/// `skipped / total` as the `f32` [`ReceiverFeedback`] wants.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a ratio of two frame counts, in 0.0..=1.0 by construction"
+)]
+fn f64_ratio(skipped: u32, total: u32) -> f32 {
+    (f64::from(skipped) / f64::from(total)) as f32
+}
+
+/// Dresses the host-local congestion measurement in the [`ReceiverFeedback`]
+/// shape [`AbrController`] expects (see docs/adr/0015-host-local-abr.md).
+///
+/// `rtt_ms` has no local equivalent, and the goodput half is deliberately
+/// self-cancelling: `goodput_kbps` and `sent_kbps` are the same local rate, so
+/// the controller's arrival check cannot fire on a measurement that never
+/// crossed the network. Congestion on this path is `loss`, and only `loss`.
+fn backlog_feedback(loss: f32, sent_kbps: u32) -> ReceiverFeedback {
     ReceiverFeedback {
-        loss: over_budget.clamp(0.0, 1.0),
+        loss,
         rtt_ms: 0,
-        goodput_kbps,
-        sent_kbps: goodput_kbps,
+        goodput_kbps: sent_kbps,
+        sent_kbps,
     }
 }
 
@@ -1304,6 +1728,13 @@ pub struct MediaTarget {
     pub tag: String,
     /// Decoder worker binary; `None` uses the one next to this executable.
     pub worker: Option<PathBuf>,
+    /// Encoded frames for a view window that decodes them itself (ADR 0058).
+    ///
+    /// Shared with the IPC layer, which is also where the choice between this
+    /// and the sandboxed worker is recorded — by the window, on its first
+    /// call. Until a window has asked for either, this loop decodes nothing
+    /// and only queues.
+    pub bitstream: Arc<BitstreamFeed>,
     /// Where the live media connection lands once dialed (§4.1; ADR 0028):
     /// the mic toggle reads it to open its tagged stream on the *same*
     /// connection, never a second one.
@@ -1352,6 +1783,10 @@ pub fn spawn_media_receiver(
             // Audio rides the very connection `stream_once` dials, so its
             // receiver is started in there, once per pass, and ends with it.
             let produced = stream_once(&target, &slot, &pcm_tx).await;
+            // Whatever the window was holding references frames from a stream
+            // that has ended. Saying so is what makes it throw its decoder
+            // away and wait for an intra frame instead of painting garbage.
+            target.bitstream.desync();
             if slot.is_closed() {
                 // The actor tore this view down; nothing left to serve.
                 return;
@@ -1397,6 +1832,43 @@ fn set_status(slot: &watch::Sender<ViewSlot>, status: ViewStatus) {
     });
 }
 
+/// Dials `rd/media/1` and accepts the stream the host opens on it.
+///
+/// `None` for either half failing, which is the ordinary outcome of a host
+/// that is not ready yet rather than an error worth reporting: the caller's
+/// recovery pass simply tries again.
+async fn dial_media(
+    target: &MediaTarget,
+) -> Option<(
+    Connection,
+    lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
+)> {
+    let connection = match target
+        .endpoint
+        .connect(target.addr.clone(), lumepeer_net::ALPN_MEDIA)
+        .await
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracing::debug!(peer = %target.tag, %error, "media dial failed");
+            return None;
+        }
+    };
+    // Publish the live connection before anything else: the mic toggle must
+    // see it the moment a picture can exist (§4.1; ADR 0028).
+    *target
+        .connection_cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection.clone());
+    match accept_media_stream(&connection).await {
+        Ok(reader) => Some((connection, reader)),
+        Err(error) => {
+            tracing::debug!(peer = %target.tag, %error, "host opened no media stream");
+            None
+        }
+    }
+}
+
 /// One media attempt: dial, decode until something fails.
 ///
 /// Returns whether at least one picture reached `slot`, which is what decides
@@ -1406,31 +1878,10 @@ async fn stream_once(
     slot: &watch::Sender<ViewSlot>,
     pcm: &watch::Sender<Option<Vec<i16>>>,
 ) -> bool {
-    let connection = match target
-        .endpoint
-        .connect(target.addr.clone(), lumepeer_net::ALPN_MEDIA)
-        .await
-    {
-        Ok(connection) => connection,
-        Err(error) => {
-            tracing::debug!(peer = %target.tag, %error, "media dial failed");
-            return false;
-        }
+    let Some((connection, mut reader)) = dial_media(target).await else {
+        return false;
     };
-    // Publish the live connection before anything else: the mic toggle must
-    // see it the moment a picture can exist (§4.1; ADR 0028).
-    *target
-        .connection_cell
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection.clone());
-    let mut reader = match accept_media_stream(&connection).await {
-        Ok(reader) => reader,
-        Err(error) => {
-            tracing::debug!(peer = %target.tag, %error, "host opened no media stream");
-            return false;
-        }
-    };
-    let _audio = spawn_audio_pass(connection.clone(), target.tag.clone(), pcm.clone());
+    let _audio = spawn_audio_pass(connection, target.tag.clone(), pcm.clone());
 
     // The sandboxed worker is spawned only once there is something to decode:
     // a session that never produces a frame must not leave a decoder process
@@ -1463,6 +1914,20 @@ async fn stream_once(
             window.lost();
             continue;
         };
+
+        // The window decodes for itself, or has not said yet. Either way the
+        // bitstream goes straight through: no worker process, no RGBA, no
+        // 8 MiB per picture across IPC (ADR 0058).
+        if target.bitstream.path() != DecodePath::Worker {
+            produced = offer_bitstream(target, slot, encoded, produced);
+            // Dropping the slot receiver is how the actor tells this loop the
+            // view is gone; on the worker path a failing `slot.send` says so,
+            // and this branch never calls it.
+            if slot.is_closed() {
+                return produced;
+            }
+            continue;
+        }
 
         let fresh_decoder = decoder.is_none();
         let handle = match decoder.take() {
@@ -1528,6 +1993,30 @@ async fn stream_once(
             }
         }
     }
+}
+
+/// Hands one encoded frame to the window that decodes for itself, and
+/// returns whether this pass has now delivered a picture (ADR 0058).
+///
+/// "Delivered" is the recovery budget's word, not the renderer's: it decides
+/// whether the media loop treats this pass as healthy. A window cannot start
+/// decoding before an intra frame arrives, so the first keyframe is the
+/// earliest honest moment to claim one — everything queued before it will be
+/// skipped on the other side.
+fn offer_bitstream(
+    target: &MediaTarget,
+    slot: &watch::Sender<ViewSlot>,
+    encoded: EncodedFrame,
+    produced: bool,
+) -> bool {
+    let live = produced || encoded.keyframe;
+    target.bitstream.push(encoded);
+    if live {
+        // Nothing reaches `slot` on this path, and the overlay reads its
+        // status from there.
+        set_status(slot, ViewStatus::Live);
+    }
+    live
 }
 
 /// Sends one report to the actor, dropping it rather than stalling the decode
@@ -2147,6 +2636,7 @@ mod tests {
                 reports,
                 tag: "test-peer".to_owned(),
                 worker: None,
+                bitstream: Arc::new(BitstreamFeed::default()),
                 connection_cell: Arc::new(std::sync::Mutex::new(None)),
             },
             Arc::new(slot_tx),
@@ -2267,42 +2757,237 @@ mod tests {
         assert!(slot_for_poll(&current, 0).frame.is_some());
     }
 
-    #[test]
-    fn a_write_inside_budget_reports_no_congestion() {
-        let interval = Duration::from_millis(33);
-        let feedback = write_congestion_feedback(Duration::from_millis(10), interval, 1_000);
-        assert!(feedback.loss.abs() < f32::EPSILON);
+    fn encoded(keyframe: bool, timestamp_us: u64, bytes: usize) -> EncodedFrame {
+        EncodedFrame {
+            keyframe,
+            timestamp_us,
+            data: vec![0xab; bytes],
+        }
     }
 
     #[test]
-    fn a_write_exactly_at_budget_reports_no_congestion() {
-        let interval = Duration::from_millis(33);
-        let feedback = write_congestion_feedback(interval, interval, 1_000);
-        assert!(feedback.loss.abs() < f32::EPSILON);
+    fn a_chunk_response_carries_every_frame_in_order() {
+        let frames = [encoded(true, 1_000, 3), encoded(false, 2_000, 5)];
+        let bytes = encode_chunk_response(ViewStatus::Live, true, false, &frames, false);
+
+        assert_eq!(bytes[0], ViewStatus::Live.code());
+        assert_eq!(bytes[1], VIEW_FLAG_INPUT);
+        assert_eq!(u16::from_le_bytes([bytes[2], bytes[3]]), 2);
+
+        let mut at = CHUNK_RESPONSE_HEADER_BYTES;
+        for expected in &frames {
+            assert_eq!(bytes[at] != 0, expected.keyframe);
+            let timestamp = u64::from_le_bytes(bytes[at + 1..at + 9].try_into().unwrap());
+            assert_eq!(timestamp, expected.timestamp_us);
+            let length = u32::from_le_bytes(bytes[at + 9..at + 13].try_into().unwrap()) as usize;
+            assert_eq!(length, expected.data.len());
+            at += CHUNK_FRAME_HEADER_BYTES + length;
+        }
+        assert_eq!(at, bytes.len(), "no bytes left over and none missing");
     }
 
+    /// The header has to ride an empty answer too: a still screen is exactly
+    /// when a lowered grant or a started recording has to reach the window,
+    /// and there is no frame to carry it.
     #[test]
-    fn a_write_double_the_budget_saturates_at_full_loss() {
-        let interval = Duration::from_millis(33);
-        let feedback = write_congestion_feedback(interval * 2, interval, 1_000);
-        assert!((feedback.loss - 1.0).abs() < f32::EPSILON);
+    fn an_empty_chunk_response_still_carries_the_status_and_flags() {
+        let bytes = encode_chunk_response(ViewStatus::SecureDesktop, false, true, &[], true);
+        assert_eq!(bytes.len(), CHUNK_RESPONSE_HEADER_BYTES);
+        assert_eq!(bytes[0], ViewStatus::SecureDesktop.code());
+        assert_eq!(bytes[1], VIEW_FLAG_RECORDING | VIEW_FLAG_DESYNC);
     }
 
-    #[test]
-    fn a_write_double_the_budget_or_worse_never_exceeds_full_loss() {
-        let interval = Duration::from_millis(33);
-        let feedback = write_congestion_feedback(interval * 10, interval, 1_000);
+    #[tokio::test]
+    async fn the_bitstream_feed_hands_back_every_frame_it_was_given() {
+        let feed = BitstreamFeed::default();
+        feed.push(encoded(true, 1, 4));
+        feed.push(encoded(false, 2, 4));
+
+        let (frames, desync) = feed.take(Duration::from_millis(50)).await;
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].timestamp_us, 1);
+        assert_eq!(frames[1].timestamp_us, 2);
+        assert!(!desync);
+    }
+
+    /// The whole reason this is a queue and not the single slot the RGBA path
+    /// uses: an inter frame is meaningless without the frames it references,
+    /// so keeping only the newest would corrupt everything after it.
+    #[tokio::test]
+    async fn a_frame_pushed_while_the_window_is_away_is_not_replaced_by_the_next() {
+        let feed = BitstreamFeed::default();
+        for i in 0..8 {
+            feed.push(encoded(i == 0, i, 4));
+        }
+        let (frames, _) = feed.take(Duration::from_millis(50)).await;
+        assert_eq!(frames.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn an_empty_feed_answers_with_nothing_rather_than_waiting_forever() {
+        let feed = BitstreamFeed::default();
+        let at = Instant::now();
+        let (frames, desync) = feed.take(Duration::from_millis(30)).await;
+        assert!(frames.is_empty());
+        assert!(!desync);
+        assert!(at.elapsed() >= Duration::from_millis(25));
+    }
+
+    #[tokio::test]
+    async fn a_frame_arriving_during_the_wait_ends_it_immediately() {
+        let feed = Arc::new(BitstreamFeed::default());
+        let pusher = Arc::clone(&feed);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            pusher.push(encoded(true, 7, 4));
+        });
+        let at = Instant::now();
+        let (frames, _) = feed.take(Duration::from_secs(5)).await;
+        assert_eq!(frames.len(), 1);
         assert!(
-            (feedback.loss - 1.0).abs() < f32::EPSILON,
+            at.elapsed() < Duration::from_secs(1),
+            "the call must return with the frame, not on the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queue_nobody_drains_is_bounded_and_says_so() {
+        let feed = BitstreamFeed::default();
+        for i in 0..(BITSTREAM_QUEUE_FRAMES + 2) {
+            feed.push(encoded(false, i as u64, 16));
+        }
+        let (frames, desync) = feed.take(Duration::from_millis(50)).await;
+        assert!(frames.len() <= BITSTREAM_QUEUE_FRAMES);
+        assert!(
+            desync,
+            "a window that lost frames has to be told, or it paints garbage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_stream_is_reported_once_and_then_forgotten() {
+        let feed = BitstreamFeed::default();
+        feed.desync();
+        let (_, desync) = feed.take(Duration::from_millis(50)).await;
+        assert!(desync);
+        let (_, again) = feed.take(Duration::from_millis(10)).await;
+        assert!(
+            !again,
+            "the window has already reset; saying so twice would reset it again"
+        );
+    }
+
+    #[test]
+    fn nobody_decodes_until_a_window_says_which_way() {
+        // The sandboxed worker process must not be started for a session
+        // whose window turns out to decode for itself (§8.1, ADR 0058).
+        let feed = BitstreamFeed::default();
+        assert_eq!(feed.path(), DecodePath::Undecided);
+        feed.choose(DecodePath::Native);
+        assert_eq!(feed.path(), DecodePath::Native);
+        // A window whose own decoder gave up falls back by simply going back
+        // to the frame poll, so the newest caller wins.
+        feed.choose(DecodePath::Worker);
+        assert_eq!(feed.path(), DecodePath::Worker);
+    }
+
+    /// Backdates the window so `due` answers without the test waiting out
+    /// `ABR_FEEDBACK_INTERVAL_MS` of wall clock.
+    fn window_elapsed(backlog: &mut Backlog) {
+        backlog.started -= Duration::from_millis(u64::from(ABR_FEEDBACK_INTERVAL_MS));
+    }
+
+    #[test]
+    fn a_link_that_took_every_frame_reports_no_congestion() {
+        let mut backlog = Backlog::default();
+        for _ in 0..30 {
+            backlog.offered();
+        }
+        window_elapsed(&mut backlog);
+        assert!(backlog.due().unwrap_or(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_window_with_nothing_in_it_reports_no_congestion() {
+        // No frames offered and none skipped is an idle screen, not a
+        // congested link. Reporting anything else here is exactly how the
+        // measurement this replaced walked an untouched desktop down to its
+        // quality floor.
+        let mut backlog = Backlog::default();
+        window_elapsed(&mut backlog);
+        assert!(backlog.due().unwrap_or(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    /// A single skipped frame must not be a measurement: the controller
+    /// halves the bitrate above `HEAVY_LOSS`, so a per-frame reading would
+    /// turn one scheduling hiccup into half the picture quality — which is
+    /// exactly what the timing-based signal this replaced did.
+    #[test]
+    fn nothing_is_reported_before_the_window_has_run() {
+        let mut backlog = Backlog::default();
+        backlog.skipped();
+        assert!(backlog.due().is_none());
+    }
+
+    #[test]
+    fn skipped_frames_are_reported_as_their_share_of_the_window() {
+        let mut backlog = Backlog::default();
+        for _ in 0..3 {
+            backlog.offered();
+        }
+        backlog.skipped();
+        window_elapsed(&mut backlog);
+        assert!((backlog.due().unwrap_or(f32::NAN) - 0.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_link_that_took_nothing_saturates_at_full_loss() {
+        let mut backlog = Backlog::default();
+        for _ in 0..10 {
+            backlog.skipped();
+        }
+        window_elapsed(&mut backlog);
+        let loss = backlog.due().unwrap_or(f32::NAN);
+        assert!(
+            (loss - 1.0).abs() < f32::EPSILON,
             "loss must stay within AbrController's 0.0..=1.0 contract"
         );
     }
 
     #[test]
-    fn a_write_halfway_over_budget_reports_half_loss() {
-        let interval = Duration::from_millis(100);
-        let feedback = write_congestion_feedback(Duration::from_millis(150), interval, 1_000);
-        assert!((feedback.loss - 0.5).abs() < 0.01);
+    fn reading_the_backlog_starts_the_next_window() {
+        let mut backlog = Backlog::default();
+        backlog.skipped();
+        window_elapsed(&mut backlog);
+        assert!((backlog.due().unwrap_or(f32::NAN) - 1.0).abs() < f32::EPSILON);
+        // The next window is compared against the frames it reports on, not
+        // against every frame of the session.
+        backlog.offered();
+        window_elapsed(&mut backlog);
+        assert!(backlog.due().unwrap_or(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    /// While the guest is reporting, the local window is not a second opinion
+    /// — it is stale evidence that must not be carried into the next silence.
+    #[test]
+    fn a_guests_own_report_clears_the_local_window() {
+        let mut backlog = Backlog::default();
+        for _ in 0..10 {
+            backlog.skipped();
+        }
+        backlog.reset();
+        window_elapsed(&mut backlog);
+        assert!(backlog.due().unwrap_or(f32::NAN).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_local_measurement_cannot_trip_the_goodput_branch() {
+        // `goodput_kbps` and `sent_kbps` are the same local number on
+        // purpose: nothing here crossed the network, so the controller's
+        // "less arrived than was offered" check must have nothing to say.
+        let feedback = backlog_feedback(0.0, 2_500);
+        assert_eq!(feedback.goodput_kbps, feedback.sent_kbps);
+        assert_eq!(feedback.rtt_ms, 0);
     }
 
     /// §18, docs/adr/0024: the two "no picture" states are their own terminal
