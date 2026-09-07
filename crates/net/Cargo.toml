@@ -39,6 +39,7 @@ rcgen = "0.14"
 # the plain `AudioChunk` struct and the constants, which build without any
 # feature.
 lumepeer-media.workspace = true
+iroh-mainline-address-lookup = "=0.5.0"
 
 [dev-dependencies]
 proptest.workspace = true

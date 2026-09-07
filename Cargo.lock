@@ -3582,6 +3582,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-mainline-address-lookup"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b22c9822c36917ef39bba3d507391192806e079a1787cc0f663c01e2e7ca18bd"
+dependencies = [
+ "derive_more",
+ "iroh",
+ "iroh-base",
+ "iroh-dns",
+ "n0-error",
+ "n0-future",
+ "n0-mainline",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "iroh-metrics"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4099,7 +4117,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "anyhow",
  "axum",
@@ -4119,7 +4137,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "argon2",
  "blake3",
@@ -4141,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "anyhow",
  "libc",
@@ -4154,7 +4172,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4191,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -4209,7 +4227,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "ashpd",
  "blake3",
@@ -4239,13 +4257,14 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "blake3",
  "chacha20poly1305",
  "data-encoding",
  "ed25519-dalek 2.2.0",
  "iroh",
+ "iroh-mainline-address-lookup",
  "keyring",
  "lumepeer-core",
  "lumepeer-media",
@@ -4267,7 +4286,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-service"
-version = "0.0.56"
+version = "0.0.58"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -4495,6 +4514,28 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "n0-mainline"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1350c6f72a2b3368ebf17779844746f246decd886d610f11b2317148fb9fd4"
+dependencies = [
+ "crc",
+ "dyn-clone",
+ "ed25519-dalek 3.0.0-rc.0",
+ "futures-core",
+ "lru",
+ "n0-error",
+ "noq-udp",
+ "rand 0.10.2",
+ "serde",
+ "serde_bencode",
+ "serde_bytes",
+ "sha1_smol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6807,6 +6848,16 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde_bencode"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a70dfc7b7438b99896e7f8992363ab8e2c4ba26aa5ec675d32d1c3c2c33d413e"
+dependencies = [
+ "serde",
+ "serde_bytes",
 ]
 
 [[package]]

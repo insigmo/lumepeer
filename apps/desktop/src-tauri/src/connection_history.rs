@@ -49,6 +49,15 @@ pub struct HistoryEntry {
     /// and never receives the code back (§13).
     #[serde(default)]
     pub code: String,
+    /// Whether a device password is remembered for this host (§8; ADR 0033).
+    ///
+    /// `#[serde(skip)]` on purpose: the OS keystore is the only thing that
+    /// knows, and duplicating the answer into this file would let the two
+    /// disagree after a keystore edit this app never saw. The actor fills it
+    /// in when it answers `ActorCommand::History`; a row read off disk always
+    /// starts `false`.
+    #[serde(skip)]
+    pub has_password: bool,
 }
 
 /// In-memory list backed by a best-effort-persisted JSON file.
@@ -119,6 +128,9 @@ impl ConnectionHistory {
                 role,
                 last_seen_at,
                 code,
+                // Answered by the keystore when the actor reads the list, not
+                // by whatever wrote this row.
+                has_password: false,
             },
         );
         self.entries.truncate(MAX_ENTRIES);

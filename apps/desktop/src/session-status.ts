@@ -100,6 +100,11 @@ export interface HistoryEntry {
    * task 4).
    */
   last_seen_at: number;
+  /**
+   * Whether this device has a password saved for that host (§8; ADR 0033),
+   * so the row can offer to forget it. Never the password itself.
+   */
+  has_password?: boolean;
 }
 
 async function revoke(peer: string): Promise<void> {
@@ -111,6 +116,17 @@ async function revoke(peer: string): Promise<void> {
 async function forgetHistory(peer: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('history_remove', { args: { peer } });
+}
+
+/**
+ * Drops the saved device password for one host without deleting its row.
+ *
+ * Removing the row does this as well; this is for the case where the host is
+ * still worth keeping in the list but signing in unasked is not.
+ */
+async function forgetPassword(peer: string): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('history_forget_password', { args: { peer } });
 }
 
 /**
@@ -470,6 +486,29 @@ export function sessionStatus(
                     <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
                     <span class="history-action">${t(locale, 'status.reconnect')}</span>
                   </button>
+                  ${entry.has_password
+                    ? html`<button
+                        type="button"
+                        class="history-forget-password"
+                        title=${t(locale, 'history.forgetPassword.hint')}
+                        aria-label=${`${t(locale, 'history.forgetPassword')}: ${entry.peer_label}`}
+                        @click=${() => {
+                          if (
+                            !globalThis.confirm(
+                              t(locale, 'history.forgetPassword.confirm', entry.peer_label),
+                            )
+                          ) {
+                            return;
+                          }
+                          void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
+                            console.error('history_forget_password failed:', error);
+                            onRefresh();
+                          });
+                        }}
+                      >
+                        ${t(locale, 'history.forgetPassword')}
+                      </button>`
+                    : ''}
                   <button
                     type="button"
                     class="history-remove"

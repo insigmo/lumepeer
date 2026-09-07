@@ -706,6 +706,12 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<bool>,
     },
+    /// Guest side: drop the device password remembered for one host, leaving
+    /// the history row itself in place (§8; ADR 0033).
+    HistoryForgetPassword {
+        label: String,
+        reply: oneshot::Sender<()>,
+    },
     /// Guest side: how this node's own outgoing connect attempt is going, and
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
@@ -730,7 +736,15 @@ enum ActorCommand {
     },
     InviteCreate {
         role: Role,
+        /// Retire every code handed out so far and issue a fresh one. `false`
+        /// asks for the code that is already live, issuing only if there is
+        /// none (ADR 0062).
+        renew: bool,
         reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    },
+    /// Host side: the live invite, if there is one. Never issues (ADR 0062).
+    InviteCurrent {
+        reply: oneshot::Sender<Option<InviteDto>>,
     },
     InviteConnect {
         ticket: String,
@@ -1058,6 +1072,26 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
+    /// Drops the device password remembered for one host, keeping its history
+    /// row (§8; ADR 0033).
+    ///
+    /// Deleting the row does this too, but the two are not the same wish: a
+    /// host worth keeping in the list is not necessarily one worth logging
+    /// into without being asked.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone. A label that
+    /// never had a password is not an error — the post-condition is "no
+    /// password is remembered for it".
+    pub async fn history_forget_password(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryForgetPassword { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     /// What every live connection's link actually looks like: round trip,
     /// path type, loss, goodput and the quality target being sent (§18).
     ///
@@ -1127,18 +1161,40 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
-    /// Issues and registers an invite for `role`.
+    /// Hands back this host's invite for `role`, issuing one if there is none.
+    ///
+    /// `renew` retires every code handed out so far and issues a fresh one;
+    /// without it the live code is returned unchanged, which is what makes a
+    /// saved connection keep working across restarts (ADR 0062).
     ///
     /// # Errors
     /// [`ActorError::Net`] if the ticket cannot be signed/encoded;
     /// [`ActorError::ChannelClosed`] if the actor is gone.
-    pub async fn invite_create(&self, role: Role) -> Result<InviteDto, ActorError> {
+    pub async fn invite_create(&self, role: Role, renew: bool) -> Result<InviteDto, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(ActorCommand::InviteCreate { role, reply })
+            .send(ActorCommand::InviteCreate { role, renew, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// The invite this host is already living with, if there is one.
+    ///
+    /// Read-only on purpose: the sidebar calls it on every start to show the
+    /// code without a click, and a call that quietly issued one would mean a
+    /// host that has never been asked to invite anybody still hands out a code
+    /// (ADR 0062).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn invite_current(&self) -> Result<Option<InviteDto>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::InviteCurrent { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
     /// Parses `ticket` and dials the host it names.
@@ -1903,6 +1959,29 @@ const HOST_LABEL_SALT: [u8; 32] = *b"lumepeer/connection-history/v1\0\0";
 fn host_tag(peer: &NodeId) -> String {
     let hash = lumepeer_core::audit::peer_hash(&HOST_LABEL_SALT, peer);
     hex_prefix(&hash)
+}
+
+/// Which of the remembered hosts have a device password in the keystore.
+///
+/// Run once, at startup, for the reason `Actor::remembered_password_tags`
+/// gives. A keystore that refuses the read leaves its host out: the button it
+/// gates is an offer to delete something, and offering to delete what may not
+/// be there is worse than not offering.
+fn remembered_password_tags(
+    passwords: &RememberedPasswordStore,
+    history: &ConnectionHistory,
+) -> std::collections::HashSet<String> {
+    history
+        .entries()
+        .iter()
+        .filter(|entry| {
+            passwords
+                .load(&entry.peer_label)
+                .unwrap_or_default()
+                .is_some()
+        })
+        .map(|entry| entry.peer_label.clone())
+        .collect()
 }
 
 fn hex_prefix(hash: &[u8; 32]) -> String {
@@ -2816,9 +2895,25 @@ struct Actor {
     /// told "could not connect" and nothing else, which is the report ADR 0026
     /// was written about (ADR 0027).
     connect_failure: Option<&'static str>,
+    /// Host side: the one live invite, kept across restarts (ADR 0062).
+    ///
+    /// `TicketRegistry` is memory-only, so without this every restart silently
+    /// revoked every code the host had ever handed out.
+    invite_store: crate::invite_store::InviteStore,
+    /// Host side: the code of the live invite, so asking for it again returns
+    /// the code already in someone's hands instead of retiring it.
+    live_invite: Option<InviteDto>,
     /// Guest side: remembered device passwords, one per host (§8; ADR 0033;
     /// docs/bugs/02-connect-form.md, task 6; docs/bugs/DECISIONS.md D2).
     remembered_passwords: RememberedPasswordStore,
+    /// Which host tags currently have a password in the keystore.
+    ///
+    /// The keystore is asked once per history row at startup and never again:
+    /// the history list is polled every second, and a native credential store
+    /// is far too expensive to interrogate at that rate just to decide whether
+    /// to draw a button. Every write goes through `remember_password` /
+    /// `forget_password`, so this set and the keystore move together.
+    remembered_password_tags: std::collections::HashSet<String>,
     /// Guest side: the password of an outstanding `unattended_submit`, held
     /// only until the host answers — saved to the keystore on a grant,
     /// dropped on a refusal. Never read back out of this field; the one copy
@@ -2834,6 +2929,32 @@ struct Actor {
 impl Actor {
     fn label_of(&self, peer: &NodeId) -> String {
         peer_tag(&self.install_salt, peer)
+    }
+
+    /// Remembers `password` for `host_tag`, keeping the tag set in step.
+    ///
+    /// A keystore that refuses the write leaves the tag out, so the UI never
+    /// offers to delete a password that was never stored.
+    fn remember_password(&mut self, host_tag: &str, password: &str) {
+        match self.remembered_passwords.save(host_tag, password) {
+            Ok(()) => {
+                self.remembered_password_tags.insert(host_tag.to_owned());
+            }
+            Err(error) => tracing::warn!(%error, "could not remember this device's password"),
+        }
+    }
+
+    /// Forgets the password remembered for `host_tag`, keeping the tag set in
+    /// step. Forgetting one that was never stored is not an error.
+    ///
+    /// The tag is dropped even when the keystore refuses the delete: the set
+    /// exists to decide whether to *offer* the deletion, and repeating an
+    /// offer that already failed once helps nobody. The warning is the record.
+    fn forget_password(&mut self, host_tag: &str) {
+        if let Err(error) = self.remembered_passwords.forget(host_tag) {
+            tracing::warn!(%error, "could not forget a remembered device password");
+        }
+        self.remembered_password_tags.remove(host_tag);
     }
 
     /// Records one audit event against `peer` (§15; ADR 0041).
@@ -4451,10 +4572,8 @@ impl Actor {
                 // with "remember" checked (§8; ADR 0033; docs/bugs/02-connect-
                 // form.md, task 6) — a grant reached through the ordinary
                 // consent dialog leaves this `None` and nothing happens here.
-                if let Some(password) = self.pending_remember.take()
-                    && let Err(error) = self.remembered_passwords.save(&host_tag(&peer), &password)
-                {
-                    tracing::warn!(%error, "could not remember this device's password");
+                if let Some(password) = self.pending_remember.take() {
+                    self.remember_password(&host_tag(&peer), &password);
                 }
                 self.connect_credentials_auto = false;
                 self.start_view(peer, role);
@@ -4698,9 +4817,7 @@ impl Actor {
                 self.pending_remember = None;
                 if self.connect_credentials_auto {
                     self.connect_credentials_auto = false;
-                    if let Err(error) = self.remembered_passwords.forget(&host_tag(&peer)) {
-                        tracing::warn!(%error, "could not forget a refused remembered password");
-                    }
+                    self.forget_password(&host_tag(&peer));
                 }
                 let (code, retry_secs) = match reason {
                     UnattendedRejection::BadPassword => ("UNATTENDED_BAD_PASSWORD", None),
@@ -4943,7 +5060,16 @@ impl Actor {
                 let _ = reply.send(snapshot);
             }
             ActorCommand::History { reply } => {
-                let _ = reply.send(self.history.entries().to_vec());
+                let rows = self
+                    .history
+                    .entries()
+                    .iter()
+                    .map(|entry| HistoryEntry {
+                        has_password: self.remembered_password_tags.contains(&entry.peer_label),
+                        ..entry.clone()
+                    })
+                    .collect();
+                let _ = reply.send(rows);
             }
             ActorCommand::HistoryConnect { label, reply } => {
                 let result = match self.history.code_of(&label).map(ToOwned::to_owned) {
@@ -4956,7 +5082,19 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::HistoryRemove { label, reply } => {
+                // The row and the remembered password are keyed on the same
+                // `host_tag`, and deleting the row is the user saying they are
+                // done with that host. Leaving the password behind meant a
+                // "forgotten" host still logged itself in on the next connect,
+                // which is not what deleting it looked like it did. The forget
+                // runs whether or not a row was there: the two stores are
+                // written independently, so one can outlive the other.
+                self.forget_password(&label);
                 let _ = reply.send(self.history.remove(&label));
+            }
+            ActorCommand::HistoryForgetPassword { label, reply } => {
+                self.forget_password(&label);
+                let _ = reply.send(());
             }
             ActorCommand::ConnectionStats { reply } => {
                 let _ = reply.send(self.connection_stats());
@@ -4984,12 +5122,17 @@ impl Actor {
                 self.rebuild_labels_and_snapshot();
                 let _ = reply.send(result);
             }
-            ActorCommand::InviteCreate { role, reply } => {
-                let result = self.on_invite_create(role);
+            ActorCommand::InviteCreate { role, renew, reply } => {
+                let result = self.on_invite_create(role, renew);
                 if let Err(ActorError::Net(ref error)) = result {
                     tracing::warn!(%error, "could not issue an invite");
                 }
                 let _ = reply.send(result);
+            }
+            ActorCommand::InviteCurrent { reply } => {
+                let now = unix_now();
+                let live = self.live_invite.clone().filter(|dto| dto.expires_at > now);
+                let _ = reply.send(live);
             }
             ActorCommand::InviteConnect { ticket, reply } => {
                 let result = self.spawn_dial(&ticket);
@@ -5692,8 +5835,23 @@ impl Actor {
 
     /// Issues an invite for `role`, refusing while the endpoint has no
     /// dialable address (§7).
-    fn on_invite_create(&mut self, role: Role) -> Result<InviteDto, ActorError> {
+    fn on_invite_create(&mut self, role: Role, renew: bool) -> Result<InviteDto, ActorError> {
         let now = unix_now();
+        // "Show me my code" and "give me a new code" are different wishes and
+        // used to be the same call (ADR 0062). Answering the first by issuing
+        // a replacement is what made an invite change every time the host
+        // looked at it — and, since issuing retires everything before it, what
+        // silently broke the code the guest already had. The stored invite is
+        // handed straight back unless the caller asked for a new one, or the
+        // role it was issued for no longer matches what is being asked.
+        if !renew
+            && let Some(live) = self.live_invite.clone()
+            && let Ok(ticket) = InviteTicket::from_code(&live.code)
+            && ticket.allowed_request == role
+            && !ticket.is_expired_at(now)
+        {
+            return Ok(live);
+        }
         let addr = self.endpoint.addr();
         // An invite is only worth anything if it carries somewhere to
         // dial. Until the endpoint has reached a relay (and, with the
@@ -5732,10 +5890,16 @@ impl Actor {
                     // code it read out earlier (ADR 0016).
                     self.tickets.retire_all();
                     self.tickets.register(&ticket);
-                    Ok(InviteDto {
-                        code,
+                    let dto = InviteDto {
+                        code: code.clone(),
                         expires_at: ticket.expires_at,
-                    })
+                    };
+                    // Written down before it is handed out, so a host that
+                    // crashes between the two still recognises the code the
+                    // guest is holding (ADR 0062).
+                    self.invite_store.set(code);
+                    self.live_invite = Some(dto.clone());
+                    Ok(dto)
                 }
                 Err(e) => Err(ActorError::Net(e)),
             },
@@ -7934,11 +8098,28 @@ async fn dial_with_retries(
     tag: &str,
 ) -> Result<ControlConnection, NetError> {
     let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
+    // The same host, named by its endpoint key alone. iroh only falls back to
+    // address lookup when the addresses it was handed fail *and* no relay URL
+    // came with them (`Endpoint::connect`), and an invite ticket always
+    // carries one — so a host that rebooted onto a new public IP was retried,
+    // five times, against the addresses it no longer has, and the user was
+    // told to ask for a fresh code (ADR 0062). Stripping the addresses is what
+    // makes the lookup run.
+    let by_id = iroh::EndpointAddr::from(addr.id);
     let mut last = NetError::Dial("no attempt was made".to_owned());
     for attempt in 1..=DIAL_ATTEMPTS {
+        // Alternated rather than "addresses first, then lookup": the ticket's
+        // addresses are the fast path while they are still true, and ADR 0050
+        // widened this loop precisely because one attempt each is not enough
+        // to ride out a flapping link. This way both routes get several tries.
+        let target = if attempt.is_multiple_of(2) {
+            &by_id
+        } else {
+            addr
+        };
         let outcome = tokio::time::timeout(
             attempt_budget,
-            connect_once(endpoint, addr, role, proof.clone()),
+            connect_once(endpoint, target, role, proof.clone()),
         )
         .await
         .unwrap_or_else(|_| {
@@ -7957,6 +8138,7 @@ async fn dial_with_retries(
             attempt,
             of = DIAL_ATTEMPTS,
             retryable,
+            by_lookup = attempt.is_multiple_of(2),
             "connect attempt failed"
         );
         if !retryable {
@@ -8089,6 +8271,7 @@ pub async fn spawn_actor(
     let stores = ActorStores {
         history_path: connection_history_path(&app),
         address_book_path: address_book_path(),
+        invite_path: invite_path(),
         // The same keystore the identity came from: the unattended password
         // hash and TOTP secret are secret material and `CLAUDE.md` keeps
         // secrets out of `config/*.toml` (§11.2; ADR 0033).
@@ -8134,6 +8317,20 @@ fn address_book_path() -> Option<std::path::PathBuf> {
         return None;
     };
     Some(dir.join("address_book.json"))
+}
+
+/// Where the live invite is remembered across restarts (ADR 0062).
+///
+/// Next to the address book rather than to the connection history: both belong
+/// to the host's own configuration, and neither is per-machine-install state.
+fn invite_path() -> Option<std::path::PathBuf> {
+    let Some(dir) = crate::config::config_dir() else {
+        tracing::warn!(
+            "cannot resolve the config directory; the invite code will not survive a restart"
+        );
+        return None;
+    };
+    Some(dir.join("invite.json"))
 }
 
 /// Opens the audit log and starts its daily retention sweep (§15; ADR 0041).
@@ -8244,6 +8441,10 @@ pub struct ActorStores {
     pub history_path: Option<std::path::PathBuf>,
     /// Host side: where the address book lives (§8; ADR 0034).
     pub address_book_path: Option<std::path::PathBuf>,
+    /// Host side: where the live invite is remembered (ADR 0062). `None` is
+    /// in-memory-only, which is what the tests want: two actors sharing one
+    /// invite file would each restore the other's code.
+    pub invite_path: Option<std::path::PathBuf>,
     /// Where the unattended credentials live (§8; ADR 0033). The OS keystore
     /// in the real application, an in-memory stand-in in tests — never a
     /// config file, which `CLAUDE.md` rules out for secrets.
@@ -8279,6 +8480,7 @@ impl ActorStores {
         Self {
             history_path: None,
             address_book_path: None,
+            invite_path: None,
             keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
             remembered_password_keystore: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
             audit: None,
@@ -8326,11 +8528,40 @@ pub fn spawn_actor_with(
     let ActorStores {
         history_path,
         address_book_path,
+        invite_path,
         keystore,
         remembered_password_keystore,
         audit,
     } = stores;
     let remembered_passwords = RememberedPasswordStore::new(remembered_password_keystore);
+    // Opened here rather than inside the struct literal below, so the keystore
+    // probe that seeds `remembered_password_tags` has the rows to probe for.
+    let history = ConnectionHistory::open(history_path);
+    let password_tags = remembered_password_tags(&remembered_passwords, &history);
+    // Put the invite this host handed out before it was last shut down back
+    // into the registry, so the code somebody wrote down still claims (ADR
+    // 0062). Nothing is re-signed: the stored code carries its own signature
+    // and `InviteStore::live` has already checked it parses and has not
+    // expired.
+    let mut tickets = TicketRegistry::new();
+    let invite_store = crate::invite_store::InviteStore::open(invite_path);
+    let live_invite = invite_store
+        .live(unix_now())
+        // Only this host's own invite. A stored code signed by some other
+        // identity — a keystore that was reset, a file copied between machines
+        // — would be handed to a guest that then dials a host this one cannot
+        // answer for, and the registry would be claiming a ticket whose
+        // signature is not ours. Verifying against the key that would sign a
+        // new one is the whole check.
+        .filter(|(_, ticket)| ticket.verify(&identity.verifying_key(), unix_now()).is_ok())
+        .map(|(code, ticket)| {
+            tickets.register(&ticket);
+            tracing::info!(expires_at = ticket.expires_at, "restored the live invite");
+            InviteDto {
+                code,
+                expires_at: ticket.expires_at,
+            }
+        });
     // One log, two handles: the actor writes through the `AuditSink` contract,
     // the IPC commands read through the handle below (§15; ADR 0041).
     let audit_reader = audit.clone();
@@ -8382,7 +8613,7 @@ pub fn spawn_actor_with(
         labels: std::collections::HashMap::new(),
         endpoint,
         identity,
-        tickets: TicketRegistry::new(),
+        tickets,
         connections: std::collections::HashMap::new(),
         next_connection_id: 0,
         handshake_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
@@ -8441,7 +8672,7 @@ pub fn spawn_actor_with(
         clipboard_changes,
         windows,
         host_bar_up: false,
-        history: ConnectionHistory::open(history_path),
+        history,
         unattended,
         unattended_store,
         unattended_pending: std::collections::HashSet::new(),
@@ -8452,6 +8683,9 @@ pub fn spawn_actor_with(
         connect_phase: ConnectPhase::Idle,
         connect_peer: None,
         connect_failure: None,
+        invite_store,
+        live_invite,
+        remembered_password_tags: password_tags,
         remembered_passwords,
         pending_remember: None,
         connect_credentials_auto: false,
@@ -8764,7 +8998,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -8962,7 +9196,7 @@ mod tests {
         let (guest, guest_clipboard) =
             actor_with_clipboard(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -9030,7 +9264,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -9067,7 +9301,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -9735,7 +9969,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         assert!(!windows.host_bar(), "the bar was up with nobody connected");
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10080,7 +10314,7 @@ mod tests {
     /// device cannot be trusted before the host has ever seen it, which is
     /// the whole shape of §8's model (ADR 0034).
     async fn introduce(host: &ActorHandle, guest: &ActorHandle) -> String {
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(host))
             .await
@@ -10130,7 +10364,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
         // The challenge, not a consent dialog.
@@ -10170,7 +10404,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         guest
@@ -10183,7 +10417,7 @@ mod tests {
         host.revoke(label).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::Idle).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         // No second `unattended_submit` call anywhere in this test: if the
         // remembered password were not tried automatically, the guest would
@@ -10203,7 +10437,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         guest
@@ -10221,7 +10455,7 @@ mod tests {
             .await
             .unwrap();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let state = wait_for_refusal(&guest, "UNATTENDED_BAD_PASSWORD").await;
         assert_eq!(state.phase, ConnectPhase::AwaitingCredentials);
@@ -10250,7 +10484,7 @@ mod tests {
         let label = trusted_host(&host, &guest).await;
         host.unattended_set_role(Role::FullControl).await.unwrap();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         guest
@@ -10284,7 +10518,7 @@ mod tests {
             .await
             .unwrap();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
         let pending = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -10309,7 +10543,7 @@ mod tests {
             .await
             .unwrap();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
         tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -10326,7 +10560,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
 
@@ -10394,7 +10628,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = trusted_host(&host, &guest).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
 
@@ -10442,7 +10676,7 @@ mod tests {
         assert!(!status.enabled);
         assert!(!status.totp_enabled);
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let pending = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10493,7 +10727,7 @@ mod tests {
         let _label = trusted_host(&host, &guest).await;
         host.unattended_set_totp(true).await.unwrap();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         assert!(
@@ -10575,7 +10809,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let mut events = guest.subscribe();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -10610,7 +10844,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let mut events = host.subscribe();
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
         let requested = tokio::time::timeout(TIMEOUT, events.recv()).await.unwrap();
@@ -10624,7 +10858,7 @@ mod tests {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10660,7 +10894,7 @@ mod tests {
 
         // Issued so the host has a live ticket: the ALPN must be what stops
         // this, not the absence of an invite.
-        let _invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let _invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         let connection = stranger
             .connect(host_endpoint.addr(), lumepeer_net::ALPN_MEDIA)
             .await
@@ -10690,7 +10924,7 @@ mod tests {
         assert_eq!(viewers(&capture), 0);
         assert!(!lock_capture(&capture).is_capturing());
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10714,7 +10948,7 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10743,7 +10977,7 @@ mod tests {
         assert!(host.history().await.unwrap().is_empty());
         assert!(guest.history().await.unwrap().is_empty());
 
-        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10769,7 +11003,7 @@ mod tests {
         let (host, host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10798,7 +11032,7 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10859,7 +11093,7 @@ mod tests {
         // Twice CONSENT_RATE_PER_MINUTE, comfortably past where the bug used
         // to bite on the very next cycle after the fifth.
         for attempt in 1..=2 * CONSENT_RATE_PER_MINUTE {
-            let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+            let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
             guest.invite_connect(invite.code).await.unwrap();
             let host_side_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
                 .await
@@ -10898,7 +11132,7 @@ mod tests {
             ConnectPhase::Idle
         );
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         // `invite_connect` returns when the attempt starts, not when it lands
         // (ADR 0027), so the form has to stay disabled through both waits —
@@ -10939,7 +11173,10 @@ mod tests {
         // the address is in a range that goes nowhere, so the dial runs its
         // full budget.
         let (unreachable, _endpoint, _capture) = actor().await;
-        let invite = unreachable.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = unreachable
+            .invite_create(Role::ViewOnly, false)
+            .await
+            .unwrap();
         drop(unreachable);
 
         guest.invite_connect(invite.code).await.unwrap();
@@ -10970,7 +11207,7 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -10989,7 +11226,7 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code.clone()).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11027,7 +11264,7 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code.clone()).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11054,8 +11291,11 @@ mod tests {
         let (host, _host_endpoint, _capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
 
-        let first = host.invite_create(Role::ViewOnly).await.unwrap();
-        let second = host.invite_create(Role::ViewOnly).await.unwrap();
+        let first = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        // `renew` is what asks for a replacement; without it the host hands
+        // the live code straight back (ADR 0062), which is a separate case the
+        // test below this one covers.
+        let second = host.invite_create(Role::ViewOnly, true).await.unwrap();
         assert_ne!(first.code, second.code);
 
         // Whether the dial itself reports success is a race and not the point:
@@ -11072,6 +11312,38 @@ mod tests {
         );
     }
 
+    /// The other half of the invite lifecycle (ADR 0062): asking for the code
+    /// again, without `renew`, must hand back the one already in someone's
+    /// hands. Before this the sidebar reissued on every look, which retired
+    /// the code the guest was holding and left it "out of date" for no reason
+    /// anyone could see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn asking_for_the_invite_again_returns_the_live_one_rather_than_a_new_one() {
+        let (host, _host_endpoint, _capture) = actor().await;
+
+        let first = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let again = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        assert_eq!(first.code, again.code);
+        assert_eq!(first.expires_at, again.expires_at);
+
+        // And the read-only accessor sees the same one, without issuing.
+        let current = host.invite_current().await.unwrap();
+        assert_eq!(current.map(|dto| dto.code), Some(first.code.clone()));
+
+        // A different role is a different invite, since the ticket carries the
+        // role the guest may ask for.
+        let elevated = host.invite_create(Role::FullControl, false).await.unwrap();
+        assert_ne!(first.code, elevated.code);
+    }
+
+    /// A host that has never issued an invite has none to report, and asking
+    /// must not quietly create one (ADR 0062).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_that_has_issued_nothing_reports_no_invite() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        assert!(host.invite_current().await.unwrap().is_none());
+    }
+
     /// A guest that disappears without a revoke must not leave the host
     /// capturing its own screen for nobody.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11079,7 +11351,7 @@ mod tests {
         let (host, _host_endpoint, capture) = actor().await;
         let (guest, guest_endpoint, _guest_capture) = actor().await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11105,7 +11377,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11169,7 +11441,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11234,7 +11506,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::FullControl).await.unwrap();
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11265,7 +11537,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
@@ -11292,7 +11564,7 @@ mod tests {
         let (guest, _guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
 
-        let invite = host.invite_create(Role::ViewOnly).await.unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await

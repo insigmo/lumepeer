@@ -1017,7 +1017,15 @@ impl ViewWindows for TauriViewWindows {
             .resizable(true)
             .build();
             match built {
-                Ok(_) => tracing::info!(window = %label, input, "view window opened"),
+                Ok(window) => {
+                    // A window Tauri built while the user was working in
+                    // another application does not reliably come to the front
+                    // on Windows: the session is live and the remote screen is
+                    // drawing behind whatever they were looking at. Raise it
+                    // the same way a consent request raises the main window.
+                    crate::raise_window(&window);
+                    tracing::info!(window = %label, input, "view window opened");
+                }
                 Err(error) => {
                     tracing::warn!(window = %label, %error, "cannot open the view window");
                 }

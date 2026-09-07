@@ -214,8 +214,19 @@ pub const IDLE_RAM_BUDGET_MIB: u32 = 60;
 pub const ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB: u32 = 150;
 /// Width of the random invite identifier (§7).
 pub const INVITE_ID_BITS: usize = 128;
-/// TTL of a one-shot invite ticket (§7).
-pub const INVITE_TICKET_TTL_SECS: u64 = 10 * 60;
+/// TTL of an invite ticket (§7, as amended by ADR 0062).
+///
+/// A year, not the ten minutes §7 first specified. The short TTL was written
+/// for a one-shot invite; ADR 0016 already made a ticket reusable, and what
+/// actually bounds one is the host retiring it by issuing a replacement. Ten
+/// minutes did not add a bound so much as break the saved-device button: a
+/// host that was reachable yesterday refused today's connection as "out of
+/// date", and the only cure was reading a fresh code out loud again.
+///
+/// A code is still not a key to the machine — every connection is decided by
+/// the host, every time (§2.3) — and it is still withdrawable at will from the
+/// settings window, which is the revocation this leans on.
+pub const INVITE_TICKET_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 /// Upper bound on the random padding added inside each obfuscated datagram
 /// (task 17 Fase 2, ADR 0051).
 ///

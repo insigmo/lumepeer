@@ -63,6 +63,34 @@ describe('remembered-host row', () => {
     });
   });
 
+  it('offers no forget-password control for a host with no saved password', () => {
+    render_();
+    expect(container.querySelector('.history-forget-password')).toBeNull();
+  });
+
+  it('offers a forget-password control for a host that signs in by itself', async () => {
+    vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    const onRefresh = vi.fn();
+    render(
+      sessionStatus([], 'en', onRefresh, [{ ...ENTRY, has_password: true }], () => {}),
+      container,
+    );
+
+    const forget = container.querySelector<HTMLButtonElement>('.history-forget-password');
+    expect(forget).not.toBeNull();
+    forget?.click();
+    expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining('host-ab12'));
+
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_forget_password', {
+        args: { peer: 'host-ab12' },
+      });
+      expect(onRefresh).toHaveBeenCalled();
+    });
+    // The row itself stays: forgetting the password is not forgetting the host.
+    expect(invoke).not.toHaveBeenCalledWith('history_remove', expect.anything());
+  });
+
   it('does nothing if the confirmation is declined', () => {
     vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
     const onRefresh = vi.fn();

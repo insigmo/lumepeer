@@ -23,6 +23,7 @@ import {
   isAwaitingCredentials,
   isConnecting,
   isCredentialsAuto,
+  loadLiveInvite,
   onInviteStateChange,
   reconnect,
   setConnectPhase,
@@ -379,6 +380,29 @@ onSettingsStateChange(renderNow);
 
 renderNow();
 void refresh();
+// The invite code this host already has, if any. Read once, never issued from
+// here (ADR 0062): a code that survives restarts is only useful if the host
+// can see it without pressing anything.
+void loadLiveInvite();
 setInterval(() => {
   void refresh();
 }, 1000);
+
+// The poll above is the floor, not the latency budget. A consent request or a
+// credentials challenge is something the far side is already waiting on, and
+// leaving it up to a second behind the actor is what made connecting look
+// like nothing was happening. The actor emits on every notification; the
+// event carries no payload, so this only decides *when* to ask, never what
+// the answer is (§15).
+void (async () => {
+  try {
+    const { listen } = await import('@tauri-apps/api/event');
+    await listen('lumepeer://actor-changed', () => {
+      void refresh();
+    });
+  } catch (error) {
+    // No Tauri host (unit tests, a plain browser): the interval alone is
+    // still a working, if slower, UI.
+    console.error('cannot subscribe to actor notifications:', error);
+  }
+})();
