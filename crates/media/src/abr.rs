@@ -74,19 +74,32 @@ impl Default for QualityTarget {
     }
 }
 
-/// Combines a guest's manual scale ceiling with what the adaptive controller
-/// would otherwise pick, into the one percentage the encode loop actually
-/// applies (§11; D7, docs/bugs/13-stream-resolution.md task 2).
+/// The fixed target a guest's chosen quality preset means, or `None` when it
+/// chose nothing (§11; ADR 0064, amending ADR 0037; D7,
+/// docs/bugs/13-stream-resolution.md task 2).
 ///
-/// `min` is the whole function, on purpose: the design constraint it encodes
-/// is that a manual choice and the adaptive ladder must never fight over the
-/// same variable. `manual_cap` is a ceiling, never a target of its own — ABR
-/// stays free to sit below it when the link cannot carry it, and stays free
-/// to recover only up to it, never past it. `None` means the guest asked for
-/// nothing, so ABR's own target is the whole answer.
+/// A preset used to be a *ceiling* the adaptive ladder was free to sit below,
+/// which sounded like the careful reading and was the wrong one: the two ends
+/// then had a hand each on the same three knobs, and the picture drifted
+/// between sharp and soft for the whole session no matter what the selector
+/// said. Recovery climbs 5% of the bitrate per adjustment and degradation
+/// takes 10% back, so on any link that is neither perfect nor plainly bad
+/// the controller oscillates — and an oscillation is exactly what a person
+/// sees as "the quality keeps changing by itself".
+///
+/// So a preset is a target, not a ceiling, and it pins all three knobs rather
+/// than the one it names: a bitrate that walks while the scale is held still
+/// is just as visible as a scale that walks. The cost is real and deliberate
+/// — a link that genuinely cannot carry the chosen picture now stutters
+/// instead of quietly softening, which is the trade a person makes when they
+/// pick a preset by name. Nothing adapts on its own again until the guest
+/// stops naming one.
 #[must_use]
-pub fn effective_scale(manual_cap: Option<u32>, abr_target: u32) -> u32 {
-    manual_cap.map_or(abr_target, |cap| abr_target.min(cap))
+pub fn pinned_target(manual_cap: Option<u32>) -> Option<QualityTarget> {
+    manual_cap.map(|scale_percent| QualityTarget {
+        scale_percent,
+        ..QualityTarget::default()
+    })
 }
 
 /// Which way the last feedback pushed the target.
@@ -482,36 +495,32 @@ mod tests {
         }
     }
 
-    /// D7, docs/bugs/13-stream-resolution.md task 2: a ceiling below the
-    /// adaptive target wins — the guest's own choice caps the picture even
-    /// when the link has room to spare.
+    /// D7, docs/bugs/13-stream-resolution.md task 2: the guest's chosen
+    /// preset is the picture, exactly, on a link with room to spare and on
+    /// one without.
     #[test]
-    fn effective_scale_prefers_the_lower_manual_ceiling() {
-        assert_eq!(effective_scale(Some(50), 100), 50);
-        assert_eq!(
-            effective_scale(Some(ABR_MIN_SCALE_PERCENT), 75),
-            ABR_MIN_SCALE_PERCENT
-        );
-    }
-
-    /// A ceiling is not a floor: ABR still gets to sit below it when the
-    /// link cannot carry what the guest asked for.
-    #[test]
-    fn effective_scale_lets_abr_sit_below_a_higher_manual_ceiling() {
-        assert_eq!(effective_scale(Some(100), 50), 50);
-        assert_eq!(
-            effective_scale(Some(75), ABR_MIN_SCALE_PERCENT),
-            ABR_MIN_SCALE_PERCENT
-        );
-    }
-
-    /// No manual choice at all: ABR's own target is the whole answer, as it
-    /// always was before this existed.
-    #[test]
-    fn effective_scale_with_no_manual_cap_is_just_the_abr_target() {
-        for target in [ABR_MIN_SCALE_PERCENT, 60, FULL_SCALE_PERCENT] {
-            assert_eq!(effective_scale(None, target), target);
+    fn a_named_preset_is_the_whole_target() {
+        for scale in [ABR_MIN_SCALE_PERCENT, 67, FULL_SCALE_PERCENT] {
+            let pinned = pinned_target(Some(scale)).expect("a named preset pins");
+            assert_eq!(pinned.scale_percent, scale);
         }
+    }
+
+    /// And it pins the other two knobs as well: a bitrate walking under a
+    /// held scale is the same flicker by another name
+    /// (docs/bugs/07-video-quality.md).
+    #[test]
+    fn a_named_preset_pins_the_bitrate_and_frame_rate_too() {
+        let pinned = pinned_target(Some(50)).expect("a named preset pins");
+        assert_eq!(pinned.bitrate_kbps, ENCODE_DEFAULT_BITRATE_KBPS);
+        assert_eq!(pinned.fps, ENCODE_DEFAULT_FPS);
+    }
+
+    /// No preset at all: nothing is pinned and the adaptive controller is
+    /// the whole answer, as it always was.
+    #[test]
+    fn no_preset_pins_nothing() {
+        assert_eq!(pinned_target(None), None);
     }
 
     #[test]

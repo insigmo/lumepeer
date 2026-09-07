@@ -415,28 +415,48 @@ describe('the floating session toolbar', () => {
       expect(scalePercentFor('quality', monitor(1920, 1080))).toBe(100);
     });
 
-    it('performance is always the ABR floor, regardless of the monitor', () => {
-      expect(scalePercentFor('performance', undefined)).toBe(50);
-      expect(scalePercentFor('performance', monitor(3840, 2160))).toBe(50);
+    it('performance is 720p worked out from the monitor height', () => {
+      expect(scalePercentFor('performance', monitor(1920, 1080))).toBe(67);
+      expect(scalePercentFor('performance', monitor(2560, 1440))).toBe(50);
     });
 
-    it('balance is 720p worked out from the monitor height', () => {
-      expect(scalePercentFor('balance', monitor(1920, 1080))).toBe(67);
-      expect(scalePercentFor('balance', monitor(2560, 1440))).toBe(50);
+    it('performance never goes under 720p, which is the whole point of it', () => {
+      // The flat half-of-whatever this replaced made the cheap preset 384
+      // lines on a 1366x768 laptop: unreadable, under a name that only ever
+      // promised to be faster.
+      for (const screen of [
+        monitor(1366, 768),
+        monitor(1920, 1080),
+        monitor(2560, 1440),
+        monitor(3840, 2160),
+      ]) {
+        const lines = Math.round((screen.height * scalePercentFor('performance', screen)) / 100);
+        expect(lines).toBeGreaterThanOrEqual(720);
+      }
     });
 
-    it('balance does not cap a screen already at or below 720p', () => {
-      expect(scalePercentFor('balance', monitor(1280, 720))).toBe(100);
-      expect(scalePercentFor('balance', monitor(1024, 600))).toBe(100);
+    it('balance sits halfway between performance and the screen itself', () => {
+      // 900 of 1080, 1080 of 1440, 1440 of 2160.
+      expect(scalePercentFor('balance', monitor(1920, 1080))).toBe(83);
+      expect(scalePercentFor('balance', monitor(2560, 1440))).toBe(75);
+      expect(scalePercentFor('balance', monitor(3840, 2160))).toBe(67);
+    });
+
+    it('neither preset caps a screen already at or below 720p', () => {
+      for (const screen of [monitor(1280, 720), monitor(1024, 600)]) {
+        expect(scalePercentFor('performance', screen)).toBe(100);
+        expect(scalePercentFor('balance', screen)).toBe(100);
+      }
       // Nothing is known about the screen yet: no cap rather than a guess.
+      expect(scalePercentFor('performance', undefined)).toBe(100);
       expect(scalePercentFor('balance', undefined)).toBe(100);
     });
 
-    it('balance clamps to the ABR floor rather than crossing it', () => {
-      // A 4K screen cannot express 720p without a ceiling under 50%, so it
+    it('performance clamps to the ABR floor rather than crossing it', () => {
+      // A 4K screen cannot express 720p without a percentage under 50, so it
       // gets the floor — never 100, which would spend *more* than the preset
       // was chosen to spend.
-      expect(scalePercentFor('balance', monitor(3840, 2160))).toBe(50);
+      expect(scalePercentFor('performance', monitor(3840, 2160))).toBe(50);
     });
 
     it('the three presets stay ordered on every screen', () => {
@@ -526,8 +546,8 @@ describe('the floating session toolbar', () => {
         select.value = 'balance';
         select.dispatchEvent(new Event('change'));
       }
-      // 720 of a 1080-tall screen.
-      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 67));
+      // 900 of a 1080-tall screen: halfway between 720p and the screen.
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83));
     } finally {
       stop();
     }
@@ -687,6 +707,48 @@ describe('the floating session toolbar', () => {
     }
   });
 
+  it('tells the host the opening preset without waiting for anyone to touch the selector', async () => {
+    // Until this window says something, the host has no preset to hold the
+    // picture at and runs its own adaptive controller instead — so the
+    // picture drifts between sharp and soft for the whole session while the
+    // selector calmly reads "Quality" (docs/bugs/07-video-quality.md).
+    const commands = fakeCommands();
+    commands.monitorsList.mockResolvedValue([{ id: 0, width: 1920, height: 1080, primary: true }]);
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      await vi.waitFor(() =>
+        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it('still names the opening preset when the host will not list its monitors', async () => {
+    const commands = fakeCommands();
+    commands.monitorsList.mockRejectedValue(new Error('no view grant'));
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      await vi.waitFor(() =>
+        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100),
+      );
+    } finally {
+      stop();
+    }
+  });
+
   it('a monitor switch recalculates the ceiling the preset maps to on the new screen', async () => {
     const commands = fakeCommands();
     commands.monitorsList.mockResolvedValue([
@@ -708,7 +770,7 @@ describe('the floating session toolbar', () => {
         select.value = 'balance';
         select.dispatchEvent(new Event('change'));
       }
-      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 67));
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83));
       commands.viewSetScale.mockClear();
 
       container.querySelector<HTMLButtonElement>('[data-testid="toolbar-monitors"]')?.click();

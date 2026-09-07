@@ -84,6 +84,10 @@ capture-windows = [
     "windows/Win32_Graphics_Dxgi_Common",
     "windows/Win32_Graphics_Gdi",
     "windows/Win32_UI_Input_KeyboardAndMouse",
+    # `GetCursorPos`/`GetSystemMetrics`, which is how the injector notices
+    # that an absolute move did not land and switches to relative motion
+    # (docs/bugs/17-remote-hotkeys.md).
+    "windows/Win32_UI_WindowsAndMessaging",
 ]
 
 [dependencies]

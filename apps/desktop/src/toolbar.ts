@@ -205,38 +205,63 @@ export type QualityPreset = (typeof QUALITY_PRESETS)[number];
  */
 const MIN_SCALE_PERCENT = 50;
 
-/** The picture height `balance` aims the stream at, when it can reach it. */
-const BALANCE_TARGET_HEIGHT = 720;
+/**
+ * The picture height `performance` aims the stream at.
+ *
+ * A floor rather than a target: `performance` used to be a flat half of
+ * whatever the host's screen was, which on a 1366x768 laptop meant 384 lines
+ * — a picture nobody can read, offered under a name that only promises to be
+ * *faster*. Aiming at a height instead means the cheap preset is 720p on
+ * every host that has at least that many lines, and the host's own size on
+ * one that has fewer.
+ */
+const PERFORMANCE_TARGET_HEIGHT = 720;
+
+/** The percentage of `height` that shows `target` lines, within the floor. */
+function percentForHeight(target: number, height: number): number {
+  if (height <= target) {
+    return 100;
+  }
+  return Math.max(Math.round((target / height) * 100), MIN_SCALE_PERCENT);
+}
 
 /**
- * The percentage of the host's own captured size `preset` caps the picture
+ * The percentage of the host's own captured size `preset` fixes the picture
  * at, for a host screen of `monitor`'s size.
  *
- * - `quality` is the host's own resolution, uncapped.
- * - `performance` is `MIN_SCALE_PERCENT`, half of whatever that is.
- * - `balance` aims at {@link BALANCE_TARGET_HEIGHT}, worked out from the
- *   monitor's height.
+ * - `quality` is the host's own resolution, untouched.
+ * - `performance` aims at {@link PERFORMANCE_TARGET_HEIGHT}.
+ * - `balance` aims halfway between the two, so it is a real middle rather
+ *   than a second name for one of the ends.
  *
  * Always a number, never `null`: unlike the list this replaced, a preset is
  * always on offer, so every screen has to mean *something* here. A screen
- * already at or below the target has nothing to cap and gets 100; one so
- * tall that 720p would need a ceiling under the floor (4K) gets the floor
+ * already at or below a target has nothing to cap and gets 100; one so tall
+ * that 720p would need a percentage under the floor (4K) gets the floor
  * itself rather than 100, because a preset picked to spend less must never
  * quietly spend more. The three stay ordered on every screen:
  * `performance` <= `balance` <= `quality`.
+ *
+ * A screen this window has not been told the size of yet is the one case
+ * with no honest answer, and it gets 100 rather than a guess: a number
+ * worked out from a height nobody knows would cap the picture by an
+ * arbitrary factor. {@link mountToolbar} asks for the monitor list before it
+ * sends the opening preset, so this is reached only when the host refuses
+ * to announce its screens at all.
  */
 export function scalePercentFor(preset: QualityPreset, monitor: MonitorDto | undefined): number {
-  if (preset === 'quality') {
+  if (preset === 'quality' || !monitor) {
     return 100;
   }
   if (preset === 'performance') {
-    return MIN_SCALE_PERCENT;
+    return percentForHeight(PERFORMANCE_TARGET_HEIGHT, monitor.height);
   }
-  if (!monitor || monitor.height <= BALANCE_TARGET_HEIGHT) {
-    return 100;
-  }
-  const percent = Math.round((BALANCE_TARGET_HEIGHT / monitor.height) * 100);
-  return Math.max(percent, MIN_SCALE_PERCENT);
+  // Halfway between the cheap preset's target and the screen's own height,
+  // in lines rather than in percent: percent is a ratio of the very number
+  // being halved, so averaging it lands somewhere that depends on the screen
+  // instead of between the two pictures a person is choosing among.
+  const midpoint = Math.round((PERFORMANCE_TARGET_HEIGHT + monitor.height) / 2);
+  return percentForHeight(midpoint, monitor.height);
 }
 
 /** One resolution the host's screen offers, and every mode that reaches it. */
@@ -861,6 +886,28 @@ export function mountToolbar(
     paint();
   }
 
+  /** The monitor being watched, if this window has been told about it. */
+  function watchedMonitor(): MonitorDto | undefined {
+    return state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
+  }
+
+  /**
+   * Tells the host what the current preset comes to on the watched screen.
+   *
+   * Sent on every change *and* once at mount, which is the part that used to
+   * be missing: until this window said something, the host had no preset to
+   * hold the picture at and ran its own adaptive controller instead — so the
+   * picture drifted between sharp and soft on its own for the whole session,
+   * whatever the selector said (§11; docs/bugs/07-video-quality.md).
+   */
+  function sendQuality(): void {
+    void commands.viewSetScale(peer, scalePercentFor(state.quality, watchedMonitor())).catch(() => {
+      // The host refused (grant gone, an old peer) or the session ended:
+      // the selector keeps showing what was asked for, and the picture
+      // simply does not change.
+    });
+  }
+
   /**
    * The resolution the host's screen is at right now: the one the guest
    * picked, or — until it picks one — the size the watched monitor itself
@@ -870,7 +917,7 @@ export function mountToolbar(
     if (state.hostResolution !== null) {
       return state.hostResolution;
     }
-    const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
+    const monitor = watchedMonitor();
     return monitor ? hostResolutionKey(monitor) : null;
   }
 
@@ -1009,8 +1056,7 @@ export function mountToolbar(
           // The preset persists across the switch, but the percentage it maps
           // to does not: it was worked out from the old monitor's size (task
           // 4.4), so it is recomputed for the new one.
-          const monitor = state.monitors.find((entry) => entry.id === id);
-          void commands.viewSetScale(peer, scalePercentFor(state.quality, monitor)).catch(() => {});
+          sendQuality();
           // The host announces the modes of the monitor it is *targeting*, so
           // the list and the pick both belonged to the old screen. Dropping
           // them back to "not fetched yet" is what makes the next opening of
@@ -1025,12 +1071,7 @@ export function mountToolbar(
     },
     pickQuality(preset: QualityPreset): void {
       state.quality = preset;
-      const monitor = state.monitors.find((entry) => entry.id === (state.activeMonitor ?? 0));
-      void commands.viewSetScale(peer, scalePercentFor(preset, monitor)).catch(() => {
-        // The host refused (grant gone, an old peer) or the session ended:
-        // the selector keeps showing what was asked for, and the picture
-        // simply does not change.
-      });
+      sendQuality();
       draw();
     },
     pickHostResolution(key: string): void {
@@ -1118,6 +1159,23 @@ export function mountToolbar(
         // closing, is what stops this rather than an error here.
       });
   }, clipboardPollIntervalMs);
+
+  // The monitor list is what turns the opening preset into a percentage, so
+  // it is asked for here rather than only when a popover opens: the answer
+  // decides what the host is told to hold the picture at, and a preset the
+  // host never hears is a preset that does nothing.
+  void commands
+    .monitorsList(peer)
+    .then((monitors) => {
+      state.monitors = monitors;
+      draw();
+    })
+    .catch(() => {
+      // The host refused or speaks an older protocol. The preset still goes
+      // out — on an unknown screen it is the uncapped picture, which is what
+      // a session with no preset at all already looked like.
+    })
+    .finally(sendQuality);
 
   draw();
 
