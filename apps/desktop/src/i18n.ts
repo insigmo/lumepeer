@@ -38,9 +38,6 @@ export type TranslationKey =
   | 'status.inputOff'
   | 'status.revoke'
   | 'status.secureDesktop.active'
-  | 'status.secureDesktop.input.on'
-  | 'status.secureDesktop.input.off'
-  | 'status.secureDesktop.input.hint'
   | 'status.recording.start'
   | 'status.recording.stop'
   | 'status.recording.on'
@@ -105,13 +102,6 @@ export type TranslationKey =
   | 'system.installing'
   | 'system.installedRestart'
   | 'system.updateFailed'
-  | 'system.serviceRunning'
-  | 'system.serviceOff'
-  | 'system.serviceInstall'
-  | 'system.serviceRemove'
-  | 'system.serviceWorking'
-  | 'system.serviceNote'
-  | 'system.serviceFailed'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'history.remove'
@@ -140,7 +130,6 @@ export type TranslationKey =
   | 'sidebar.settings'
   | 'settings.heading'
   | 'settings.close'
-  | 'settings.tab.devices'
   | 'settings.tab.access'
   | 'settings.tab.recordings'
   | 'settings.tab.system'
@@ -157,7 +146,6 @@ export type TranslationKey =
   | 'view.canvasLabel'
   | 'view.waiting'
   | 'view.reconnecting'
-  | 'view.secureDesktop'
   | 'view.failed.title'
   | 'view.failed.body'
   | 'view.failed.dismiss'
@@ -273,6 +261,7 @@ export type TranslationKey =
   | 'creds.code.label'
   | 'creds.code.placeholder'
   | 'creds.submit'
+  | 'creds.close'
   | 'creds.checking'
   | 'creds.remember'
   | 'creds.badPassword'
@@ -335,10 +324,6 @@ const en: Dictionary = {
   // §17-equivalent) — distinct from the grant above the same way the
   // recording indicator is distinct from the recording grant.
   'status.secureDesktop.active': 'Viewing the administrator prompt or lock screen',
-  'status.secureDesktop.input.on': 'Can control the admin prompt',
-  'status.secureDesktop.input.off': 'Allow controlling the admin prompt',
-  'status.secureDesktop.input.hint':
-    'Lets this guest click the UAC prompt and type into the lock screen — approve elevation on this machine. Off for every role; turn on only when you mean it.',
   // The switch above is permission; these are the act. Both sides see an
   // indicator for as long as a recording runs — §2.2 has no quiet capture.
   'status.recording.start': 'Record session',
@@ -405,13 +390,6 @@ const en: Dictionary = {
   'system.installing': 'Installing...',
   'system.installedRestart': 'Installed. Restart Lumepeer to run the new version.',
   'system.updateFailed': 'The update could not be completed. Nothing was installed.',
-  'system.serviceRunning': 'Ctrl+Alt+Del helper: running',
-  'system.serviceOff': 'Ctrl+Alt+Del helper: not running',
-  'system.serviceInstall': 'Install',
-  'system.serviceRemove': 'Remove',
-  'system.serviceWorking': 'Working...',
-  'system.serviceNote': 'A background service that does exactly one thing: send Ctrl+Alt+Del to this screen when a remote session asks for it. It lets nobody in and can be removed here at any time. Installing or removing it asks Windows for administrator permission.',
-  'system.serviceFailed': 'The helper service was not changed. Administrator permission is needed.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'history.remove': 'Remove',
@@ -444,7 +422,6 @@ const en: Dictionary = {
   'sidebar.settings': 'Settings',
   'settings.heading': 'Settings',
   'settings.close': 'Close settings',
-  'settings.tab.devices': 'Devices',
   'settings.tab.access': 'Access',
   'settings.tab.recordings': 'Recordings & log',
   'settings.tab.system': 'System',
@@ -465,8 +442,6 @@ const en: Dictionary = {
   'view.canvasLabel': 'Remote screen',
   'view.waiting': 'Waiting for the remote screen…',
   'view.reconnecting': 'Connection lost, reconnecting…',
-  'view.secureDesktop':
-    'A secure prompt (an administrator request, the lock screen, or a user switch) is showing on the remote machine. Respond to it there, or wait — the picture resumes on its own.',
   'view.failed.title': 'Connection lost',
   'view.failed.body': 'The remote screen could not be reconnected, so the session has ended.',
   'view.failed.dismiss': 'Close',
@@ -601,12 +576,13 @@ const en: Dictionary = {
   'book.connected': 'Connected now',
   'book.addFromSession': 'Save this device',
   'creds.heading': 'This device asks for a password',
-  'creds.body': 'Nobody is at the other end to approve you. Enter the device password its owner gave you.',
+  'creds.body': 'Enter the device password its owner gave you, or wait — somebody at that machine can let you in instead.',
   'creds.password.label': 'Device password',
   'creds.password.placeholder': 'Device password',
   'creds.code.label': 'One-time code',
   'creds.code.placeholder': '6 digits',
   'creds.submit': 'Sign in',
+  'creds.close': 'Cancel and disconnect',
   'creds.checking': 'Checking',
   'creds.remember': "Remember this device's password",
   'creds.badPassword': 'That password was not accepted.',
@@ -666,10 +642,6 @@ const ar: Dictionary = {
   'status.inputOff': 'الإدخال معطّل',
   'status.revoke': 'إلغاء',
   'status.secureDesktop.active': 'تجري الآن مشاهدة طلب المسؤول أو شاشة القفل',
-  'status.secureDesktop.input.on': 'يمكنه التحكم في طلب المسؤول',
-  'status.secureDesktop.input.off': 'السماح بالتحكم في طلب المسؤول',
-  'status.secureDesktop.input.hint':
-    'يتيح لهذا الضيف النقر على طلب رفع الصلاحيات (UAC) والكتابة في شاشة القفل — أي الموافقة على رفع الصلاحيات على هذا الجهاز. مُعطَّل لكل الأدوار؛ فعّله فقط عندما تقصد ذلك.',
   'status.recording.start': 'تسجيل الجلسة',
   'status.recording.stop': 'إيقاف التسجيل',
   'status.recording.on': 'جارٍ التسجيل',
@@ -734,13 +706,6 @@ const ar: Dictionary = {
   'system.installing': 'جارٍ التثبيت...',
   'system.installedRestart': 'تم التثبيت. أعد تشغيل Lumepeer لتشغيل الإصدار الجديد.',
   'system.updateFailed': 'تعذّر إكمال التحديث. لم يُثبَّت شيء.',
-  'system.serviceRunning': 'مساعد Ctrl+Alt+Del: قيد التشغيل',
-  'system.serviceOff': 'مساعد Ctrl+Alt+Del: متوقف',
-  'system.serviceInstall': 'تثبيت',
-  'system.serviceRemove': 'إزالة',
-  'system.serviceWorking': 'جارٍ التنفيذ...',
-  'system.serviceNote': 'خدمة في الخلفية تقوم بشيء واحد فقط: إرسال Ctrl+Alt+Del إلى هذه الشاشة عندما تطلبه جلسة بعيدة. لا تسمح لأحد بالدخول ويمكن إزالتها من هنا في أي وقت. التثبيت أو الإزالة يطلبان إذن المسؤول من Windows.',
-  'system.serviceFailed': 'لم تتغيّر الخدمة المساعدة. يلزم إذن المسؤول.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'history.remove': 'إزالة',
@@ -773,7 +738,6 @@ const ar: Dictionary = {
   'sidebar.settings': 'الإعدادات',
   'settings.heading': 'الإعدادات',
   'settings.close': 'إغلاق الإعدادات',
-  'settings.tab.devices': 'الأجهزة',
   'settings.tab.access': 'الوصول',
   'settings.tab.recordings': 'التسجيلات والسجل',
   'settings.tab.system': 'النظام',
@@ -790,8 +754,6 @@ const ar: Dictionary = {
   'view.canvasLabel': 'الشاشة البعيدة',
   'view.waiting': 'في انتظار الشاشة البعيدة…',
   'view.reconnecting': 'انقطع الاتصال، جارٍ إعادة الاتصال…',
-  'view.secureDesktop':
-    'تظهر على الجهاز البعيد نافذة آمنة (طلب صلاحيات المسؤول، شاشة القفل، أو تبديل المستخدم). أجب عنها هناك، أو انتظر — ستعود الصورة من تلقاء نفسها.',
   'view.failed.title': 'انقطع الاتصال',
   'view.failed.body': 'تعذّرت إعادة الاتصال بالشاشة البعيدة، لذلك انتهت الجلسة.',
   'view.failed.dismiss': 'إغلاق',
@@ -905,12 +867,13 @@ const ar: Dictionary = {
   'book.connected': 'متصل الآن',
   'book.addFromSession': 'احفظ هذا الجهاز',
   'creds.heading': 'هذا الجهاز يطلب كلمة مرور',
-  'creds.body': 'لا أحد على الطرف الآخر ليوافق عليك. أدخل كلمة مرور الجهاز التي أعطاك إياها مالكه.',
+  'creds.body': 'أدخل كلمة مرور الجهاز التي أعطاك إياها مالكه، أو انتظر — يمكن لشخص عند ذلك الجهاز أن يسمح لك بالدخول بدلاً من ذلك.',
   'creds.password.label': 'كلمة مرور الجهاز',
   'creds.password.placeholder': 'كلمة مرور الجهاز',
   'creds.code.label': 'رمز لمرة واحدة',
   'creds.code.placeholder': '٦ أرقام',
   'creds.submit': 'تسجيل الدخول',
+  'creds.close': 'إلغاء وقطع الاتصال',
   'creds.checking': 'جارٍ التحقق',
   'creds.remember': 'تذكّر كلمة مرور هذا الجهاز',
   'creds.badPassword': 'لم تُقبل كلمة المرور.',

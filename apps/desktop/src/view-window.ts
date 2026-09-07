@@ -959,12 +959,16 @@ export function viewOverlay(status: ViewStatus, locale: Locale, onDismiss: () =>
       onDismiss,
     );
   }
-  const key =
-    status === 'waiting'
-      ? 'view.waiting'
-      : status === 'secure-desktop'
-        ? 'view.secureDesktop'
-        : 'view.reconnecting';
+  if (status === 'secure-desktop') {
+    // Nothing at all, deliberately (ADR 0063). The host's capture is
+    // throttled behind a secure desktop, so this status alternates with
+    // `live` several times a second (`apps/desktop/src-tauri/src/view.rs`)
+    // and any banner keyed off it flickers at the top of the picture rather
+    // than informing anybody. The picture underneath is the secure desktop
+    // itself, which says what the sentence used to.
+    return html``;
+  }
+  const key = status === 'waiting' ? 'view.waiting' : 'view.reconnecting';
   return html`<p class="view-banner" role="status" aria-live="polite">${t(locale, key)}</p>`;
 }
 

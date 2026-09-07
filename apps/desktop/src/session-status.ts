@@ -263,48 +263,6 @@ function secureDesktopIndicator(session: SessionStatus, locale: Locale): Templat
     : '';
 }
 
-/**
- * The one per-grant switch the panel still carries (ADR 0057).
- *
- * `secure_desktop_input` lets a guest click the host's UAC prompt and type
- * into its lock screen — approve elevation on this machine — so, alone among
- * the grants, no role turns it on (not even full control) and it takes a
- * deliberate switch here. Shown only to a controller session (`input`): a
- * guest that cannot move the ordinary mouse has no use for the secure
- * desktop's, and the switch would only invite turning on the most dangerous
- * grant for a guest who holds nothing else.
- */
-function secureDesktopInputRow(
-  session: SessionStatus,
-  locale: Locale,
-  onChange: () => void,
-): TemplateResult | '' {
-  if (!session.input) {
-    return '';
-  }
-  const peer = session.peer_label;
-  const on = session.secure_desktop_input;
-  return html`
-    <div class="secure-desktop-input">
-      <button
-        type="button"
-        class="secure-desktop-input-btn ${on ? 'is-on' : ''}"
-        data-testid="secure-desktop-input-toggle"
-        role="switch"
-        aria-checked=${on ? 'true' : 'false'}
-        title=${t(locale, 'status.secureDesktop.input.hint')}
-        @click=${() =>
-          setGrant(peer, 'secure_desktop_input', !on).then(onChange, (error: unknown) => {
-            console.error('secure_desktop_input toggle failed:', error);
-            onChange();
-          })}
-      >
-        ${t(locale, on ? 'status.secureDesktop.input.on' : 'status.secureDesktop.input.off')}
-      </button>
-    </div>
-  `;
-}
-
 const MINUTE_SECS = 60;
 const HOUR_SECS = 60 * MINUTE_SECS;
 const DAY_SECS = 24 * HOUR_SECS;
@@ -464,7 +422,6 @@ export function sessionStatus(
                       )
                     : ''}
                   ${session.state === 'active' ? secureDesktopIndicator(session, locale) : ''}
-                  ${session.state === 'active' ? secureDesktopInputRow(session, locale, onRefresh) : ''}
                   ${session.state === 'active' && session.file_transfer
                     ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
                     : ''}

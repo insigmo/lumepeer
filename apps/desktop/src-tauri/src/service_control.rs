@@ -1,8 +1,7 @@
-//! Installing, removing and observing the privileged helper service
-//! (ADR 0043).
+//! Registering and observing the privileged helper service (ADR 0043).
 //!
-//! The service itself is `crates/service`; this is the unprivileged half that
-//! the settings panel drives. Three rules shape it:
+//! The service itself is `crates/service`; this is the unprivileged half the
+//! app drives. Three rules shape it:
 //!
 //! - **Nothing here is privileged.** Reading the service's state needs no
 //!   rights; changing it does, and the way this asks for them is to launch the
@@ -10,16 +9,17 @@
 //!   out of anything, so there is no quoting bug to turn into "run whatever
 //!   this path says as SYSTEM".
 //! - **Running is what matters.** "Installed" is a fact about the registry;
-//!   "reachable" is a fact about whether Ctrl+Alt+Del will work. The panel
-//!   shows both, because a service that is installed and stopped looks like a
-//!   working one otherwise.
-//! - **It can always be removed from here.** A privileged service a person
-//!   cannot uninstall from the app that installed it is the thing this project
-//!   must not ship.
+//!   "reachable" is a fact about whether Ctrl+Alt+Del will work. [`state`]
+//!   separates the two, because a service that is installed and stopped looks
+//!   like a working one otherwise.
+//! - **It can always be removed.** Uninstalling Lumepeer uninstalls the
+//!   service (`installer-hooks.nsh`); a privileged service a person cannot get
+//!   rid of is the thing this project must not ship. There is no switch for it
+//!   inside the app any more, because "off" was never an answer anyone had a
+//!   reason to give — see [`ensure_installed`].
 
 /// Where the service is, as far as this machine can tell without elevating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     /// There is no helper service to install here — either this platform has
     /// no privileged action for one to hold (ADR 0043: only Windows does), or
@@ -39,6 +39,8 @@ pub enum ServiceState {
 }
 
 /// What this machine's helper service is doing right now.
+///
+/// Reads the machine without elevating; [`ensure_installed`] acts on it.
 #[must_use]
 pub fn state() -> ServiceState {
     #[cfg(not(target_os = "windows"))]
@@ -65,33 +67,38 @@ pub fn state() -> ServiceState {
     }
 }
 
-/// Registers the service and starts it, prompting for administrator rights.
+/// Registers and starts the helper service if this machine is missing it.
 ///
-/// # Errors
-/// A description of what failed, or of the elevation being declined.
-pub fn install() -> Result<(), String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("this platform has no helper service".to_owned())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows_impl::elevate("--install")
-    }
-}
-
-/// Stops and removes the service, prompting for administrator rights.
+/// This used to be an Install/Remove pair in the settings panel (ADR 0063).
+/// The service is not a permission — it admits nobody, and holds exactly one
+/// capability — so the switch was a question the user had no basis to answer,
+/// and the only symptom of answering it wrong was a Ctrl+Alt+Del button that
+/// silently did nothing. It is on, always, and this is what keeps it that way.
 ///
-/// # Errors
-/// A description of what failed, or of the elevation being declined.
-pub fn uninstall() -> Result<(), String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        Err("this platform has no helper service".to_owned())
-    }
-    #[cfg(target_os = "windows")]
-    {
-        windows_impl::elevate("--uninstall")
+/// The third rule at the top of this file still holds, one level up: the
+/// installer registers the service (`installer-hooks.nsh`) and the
+/// **uninstaller removes it**, so removing the app removes the service. This
+/// covers what the installer cannot — a development run, an installation that
+/// could not finish its hook, and a service somebody stopped by hand.
+///
+/// Nothing is prompted for: the client already runs elevated (ADR 0057), so
+/// the elevation this needs is the one it was launched with. Blocking, and a
+/// failure is logged rather than raised — a missing service degrades
+/// Ctrl+Alt+Del, not the app (§18).
+pub fn ensure_installed() {
+    match state() {
+        // Nothing on this machine for a helper to hold.
+        ServiceState::Unsupported => {}
+        // Already answering: `--install` would only stop and restart it.
+        #[cfg(target_os = "windows")]
+        ServiceState::Running => {}
+        #[cfg(target_os = "windows")]
+        ServiceState::NotInstalled | ServiceState::Stopped => {
+            match windows_impl::elevate("--install") {
+                Ok(()) => tracing::info!("registered the Ctrl+Alt+Del helper service"),
+                Err(error) => tracing::warn!(%error, "cannot register the helper service"),
+            }
+        }
     }
 }
 
@@ -180,12 +187,11 @@ mod tests {
         }
     }
 
-    /// Off Windows both actions refuse rather than pretending to have done
-    /// something.
+    /// Off Windows there is nothing to register, and start-up says so by
+    /// doing nothing rather than by shelling out to a tool that is not there.
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn installing_is_refused_where_there_is_no_service() {
-        assert!(install().is_err());
-        assert!(uninstall().is_err());
+    fn registering_is_skipped_where_there_is_no_service() {
+        ensure_installed();
     }
 }

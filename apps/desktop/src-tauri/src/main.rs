@@ -169,6 +169,9 @@ fn setup_app(
     // hook to have done that either. A no-op on Windows and Linux, which get
     // autostart from a hook that runs exactly once already.
     autostart.reconcile_first_launch();
+    // Off the setup thread: `ensure_installed` shells out, and start-up is
+    // not the place to wait on a subprocess.
+    runtime.spawn_blocking(service_control::ensure_installed);
     app.manage(AppState {
         network,
         update_url,
@@ -320,8 +323,6 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::update_install,
         commands::autostart_status,
         commands::autostart_set,
-        commands::service_status,
-        commands::service_set,
         commands::host_bar_expand,
         commands::host_bar_focus_main,
     ]

@@ -939,8 +939,8 @@ describe('view window: status overlay', () => {
     expect(container.textContent?.trim()).toBe('');
   });
 
-  it('keeps waiting, reconnecting and secure-desktop non-blocking', () => {
-    for (const status of ['waiting', 'reconnecting', 'secure-desktop'] as ViewStatus[]) {
+  it('keeps waiting and reconnecting non-blocking', () => {
+    for (const status of ['waiting', 'reconnecting'] as ViewStatus[]) {
       render(viewOverlay(status, 'en', noop), container);
       const banner = container.querySelector('.view-banner');
       expect(banner).not.toBeNull();
@@ -949,10 +949,13 @@ describe('view window: status overlay', () => {
     }
   });
 
-  it('names the secure desktop instead of a generic reconnect message', () => {
+  // The host throttles secure-desktop capture, so this status alternates with
+  // `live` several times a second: anything rendered for it flickers over the
+  // picture rather than telling the operator something they cannot already see.
+  it('shows nothing at all over the secure desktop', () => {
     render(viewOverlay('secure-desktop', 'en', noop), container);
-    expect(container.textContent).toContain('administrator request');
-    expect(container.textContent).not.toContain('reconnecting');
+    expect(container.textContent?.trim()).toBe('');
+    expect(container.querySelector('.view-banner')).toBeNull();
   });
 
   it('says the host cannot send a picture instead of blaming the connection', () => {

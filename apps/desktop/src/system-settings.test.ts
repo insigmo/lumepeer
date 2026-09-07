@@ -23,7 +23,6 @@ let commands: SystemCommands;
 let setMock: ReturnType<typeof vi.fn>;
 let checkMock: ReturnType<typeof vi.fn>;
 let installMock: ReturnType<typeof vi.fn>;
-let serviceSetMock: ReturnType<typeof vi.fn>;
 
 function mount(): void {
   const paint = (): void => {
@@ -46,10 +45,7 @@ beforeEach(() => {
   setMock = vi.fn().mockResolvedValue(undefined);
   checkMock = vi.fn().mockResolvedValue(null);
   installMock = vi.fn().mockResolvedValue(undefined);
-  serviceSetMock = vi.fn().mockResolvedValue(undefined);
   commands = {
-    serviceStatus: vi.fn().mockResolvedValue('not_installed'),
-    serviceSet: serviceSetMock as unknown as SystemCommands['serviceSet'],
     autostartStatus: vi.fn().mockResolvedValue(false),
     autostartSet: setMock as unknown as SystemCommands['autostartSet'],
     updateCheck: checkMock as unknown as SystemCommands['updateCheck'],
@@ -131,25 +127,13 @@ describe('system settings', () => {
     expect(container.querySelector('[data-testid="update-installed"]')).not.toBeNull();
   });
 
-  it('installs the helper service and re-reads what the machine says', async () => {
+  // The Ctrl+Alt+Del helper is registered at start-up and removed by the
+  // uninstaller (`service_control.rs::ensure_installed`). It is not a
+  // permission and it admits nobody, so this panel offers nothing about it.
+  it('offers nothing about the helper service', () => {
     mount();
-    await settle();
-    (container.querySelector('[data-testid="service-toggle"]') as HTMLButtonElement).click();
-    await settle();
-    expect(serviceSetMock).toHaveBeenCalledWith(true);
-  });
-
-  it('never claims the helper service changed when the prompt was declined', async () => {
-    serviceSetMock.mockRejectedValue(new Error('elevation declined'));
-    vi.spyOn(console, 'error').mockImplementation(() => {});
-    mount();
-    await settle();
-    (container.querySelector('[data-testid="service-toggle"]') as HTMLButtonElement).click();
-    await settle();
-    expect(container.querySelector('[data-testid="service-error"]')).not.toBeNull();
-    expect(container.querySelector('[data-testid="service-row"]')?.textContent).toContain(
-      t('en', 'system.serviceOff'),
-    );
+    expect(container.querySelector('[data-testid="service-row"]')).toBeNull();
+    expect(container.querySelector('[data-testid="service-toggle"]')).toBeNull();
   });
 
   it('reports a refused install rather than a new version', async () => {
