@@ -15,7 +15,7 @@ import { addressBook } from './address-book';
 import type { AuditCommands } from './audit-log';
 import { auditPanel } from './audit-log';
 import { inviteRefreshPanel } from './invite-view';
-import type { Locale } from './i18n';
+import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
 import type { RecordingEntry, RecordingsCommands } from './recordings';
 import { recordingsPanel } from './recordings';
@@ -24,7 +24,28 @@ import { systemSettings } from './system-settings';
 import type { UnattendedStatus } from './unattended-settings';
 import { unattendedSettings } from './unattended-settings';
 
+/** The four sections the panels are grouped into. */
+export type SettingsTab = 'devices' | 'access' | 'recordings' | 'system';
+
+/**
+ * The tabs, in order, with the label key each one carries.
+ *
+ * A flat list of six panels had the address book, the unattended password,
+ * invite revocation, recordings, the audit log and the system switches in one
+ * scroll, which is what made finding any of them a hunt. The grouping is by
+ * the question being answered: who may connect, how they authenticate, what
+ * this machine has kept, and how the app itself behaves.
+ */
+const TABS: readonly { readonly id: SettingsTab; readonly label: TranslationKey }[] = [
+  { id: 'devices', label: 'settings.tab.devices' },
+  { id: 'access', label: 'settings.tab.access' },
+  { id: 'recordings', label: 'settings.tab.recordings' },
+  { id: 'system', label: 'settings.tab.system' },
+];
+
 let open = false;
+/** Which section is showing. Reset on close, so opening starts predictably. */
+let tab: SettingsTab = 'devices';
 let onChange: (() => void) | undefined;
 /** The element to return focus to on close: whatever had focus when opened. */
 let trigger: HTMLElement | null = null;
@@ -52,6 +73,7 @@ export function openSettings(): void {
   }
   trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   open = true;
+  tab = 'devices';
   focusToken += 1;
   notify();
 }
@@ -67,9 +89,46 @@ export function closeSettings(): void {
   trigger = null;
 }
 
+/** Switches section and re-renders. */
+export function selectTab(next: SettingsTab): void {
+  if (tab === next) {
+    return;
+  }
+  tab = next;
+  notify();
+}
+
+/** Which section is showing; exported for the tests. */
+export function activeTab(): SettingsTab {
+  return tab;
+}
+
+/**
+ * Arrow-key movement along the tab strip, as the WAI-ARIA tabs pattern wants
+ * it: only the selected tab is in the tab order, so the arrows are the only
+ * way a keyboard reaches the others. Direction follows the document, so it
+ * still reads left-to-right in Arabic's mirrored layout.
+ */
+function onTabKey(event: KeyboardEvent, id: SettingsTab): void {
+  const back = document.documentElement.dir === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
+  const forward = back === 'ArrowLeft' ? 'ArrowRight' : 'ArrowLeft';
+  const step = event.key === forward ? 1 : event.key === back ? -1 : 0;
+  if (step === 0) {
+    return;
+  }
+  event.preventDefault();
+  const at = TABS.findIndex((entry) => entry.id === id);
+  const next = TABS[(at + step + TABS.length) % TABS.length]?.id ?? id;
+  selectTab(next);
+  queueMicrotask(() => {
+    document.getElementById(`settings-tab-${next}`)?.focus();
+  });
+}
+
 /** Test seam: drops transient state (open, remembered focus) between cases. */
 export function resetSettingsView(): void {
   open = false;
+  tab = 'devices';
   trigger = null;
   focusToken = 0;
   focusedToken = -1;
@@ -86,11 +145,36 @@ export interface SettingsPanels {
   onRefresh: () => void;
 }
 
+/** The panels belonging to one section. */
+function section(panels: SettingsPanels): TemplateResult {
+  const { locale } = panels;
+  switch (tab) {
+    case 'devices':
+      // Who this machine lets in, and the code it hands out to invite them.
+      return html`
+        ${addressBook(panels.savedDevices, locale, panels.onRefresh)}
+        ${inviteRefreshPanel(locale)}
+      `;
+    case 'access':
+      // How a device that is already trusted proves it is itself.
+      return html`${unattendedSettings(panels.unattended, locale, panels.onRefresh)}`;
+    case 'recordings':
+      // What this machine has kept about sessions that already happened.
+      return html`
+        ${recordingsPanel(panels.recordings, locale, panels.recordingsCommands, panels.onRefresh)}
+        ${auditPanel(locale, panels.auditCommands)}
+      `;
+    case 'system':
+      return html`${systemSettings(locale, panels.systemCommands)}`;
+  }
+}
+
 /**
  * The settings screen: address book, unattended access, recordings, audit
  * log, this device, and invite revocation, moved here from the main panel
- * (DECISIONS.md D9). None of these panels are rewritten — each keeps its
- * own render function and arguments; this module only places them.
+ * (DECISIONS.md D9) and grouped into the four sections of [`TABS`]. None of
+ * these panels are rewritten — each keeps its own render function and
+ * arguments; this module only decides which of them are on screen.
  */
 export function settingsView(panels: SettingsPanels): TemplateResult | typeof nothing {
   if (!open) {
@@ -126,13 +210,32 @@ export function settingsView(panels: SettingsPanels): TemplateResult | typeof no
             ×
           </button>
         </div>
-        <div class="settings-body">
-          ${addressBook(panels.savedDevices, locale, panels.onRefresh)}
-          ${unattendedSettings(panels.unattended, locale, panels.onRefresh)}
-          ${inviteRefreshPanel(locale)}
-          ${recordingsPanel(panels.recordings, locale, panels.recordingsCommands, panels.onRefresh)}
-          ${auditPanel(locale, panels.auditCommands)}
-          ${systemSettings(locale, panels.systemCommands)}
+        <div class="settings-tabs" role="tablist" aria-label=${t(locale, 'settings.tabs.label')}>
+          ${TABS.map(
+            (entry) => html`
+              <button
+                type="button"
+                role="tab"
+                id=${`settings-tab-${entry.id}`}
+                class=${entry.id === tab ? 'settings-tab settings-tab-active' : 'settings-tab'}
+                aria-selected=${entry.id === tab}
+                aria-controls="settings-tabpanel"
+                tabindex=${entry.id === tab ? 0 : -1}
+                @keydown=${(event: KeyboardEvent) => onTabKey(event, entry.id)}
+                @click=${() => selectTab(entry.id)}
+              >
+                ${t(locale, entry.label)}
+              </button>
+            `,
+          )}
+        </div>
+        <div
+          class="settings-body"
+          id="settings-tabpanel"
+          role="tabpanel"
+          aria-labelledby=${`settings-tab-${tab}`}
+        >
+          ${section(panels)}
         </div>
       </section>
     </div>

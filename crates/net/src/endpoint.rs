@@ -52,6 +52,52 @@ pub fn relay_only_enabled() -> bool {
     }
 }
 
+/// Adds Mainline-DHT address lookup, so a peer can be found by its
+/// `EndpointId` alone after its address has changed (ADR 0062).
+///
+/// This is what makes a saved device permanently dialable. Everything else in
+/// this file locates a peer from addresses somebody wrote down earlier — the
+/// ones baked into an invite ticket — and those stop being true the moment the
+/// far machine reboots onto a new public IP. The DHT inverts that: the host
+/// publishes a record signed by its own endpoint key under its own public key,
+/// and a guest that knows only the key looks up wherever it is *now*.
+///
+/// No server of ours is involved, which is the point (ADR 0052's serverless
+/// line): the Mainline DHT is the public `BitTorrent` one. `presets::N0` already
+/// adds n0's pkarr relay and DNS lookup; this sits beside it, so a network
+/// that blocks one can still be reached through the other.
+///
+/// `AddrFilter::unfiltered` on purpose. The default publishes relay addresses
+/// only, which is exactly nothing for a host that cannot hold a relay — the
+/// case this whole change is about. The cost is stated plainly: anyone holding
+/// a host's `EndpointId` (that is, anyone holding its invite code) can read its
+/// current IP addresses out of the DHT. That is the trade a permanent invite
+/// code makes, and it is the same trade the code itself already made by
+/// carrying an address in the first place.
+///
+/// A DHT node that cannot be built is a warning, never a failed bind: it is an
+/// additional way to be found, and losing it must not cost the endpoint the
+/// ways it already had (§18).
+fn with_dht_lookup(builder: EndpointBuilder, secret_key: &iroh::SecretKey) -> EndpointBuilder {
+    use iroh::address_lookup::AddrFilter;
+    use iroh_mainline_address_lookup::DhtAddressLookup;
+
+    match DhtAddressLookup::builder()
+        .secret_key(secret_key.clone())
+        .addr_filter(AddrFilter::unfiltered())
+        .build()
+    {
+        Ok(lookup) => {
+            tracing::info!("mainline DHT address lookup is on");
+            builder.address_lookup(lookup)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no mainline DHT address lookup: falling back to DNS only");
+            builder
+        }
+    }
+}
+
 /// Owner of the Iroh endpoint and its per-ALPN accept loops.
 #[derive(Debug, Clone)]
 pub struct PeerEndpoint {
@@ -123,9 +169,10 @@ impl PeerEndpoint {
         relay_url: Option<&str>,
     ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
+            .secret_key(secret_key.clone())
             .alpns(alpn_list());
         builder = with_relay(builder, relay_url);
+        builder = with_dht_lookup(builder, &secret_key);
         let inner = builder
             .bind()
             .await
@@ -154,9 +201,10 @@ impl PeerEndpoint {
     ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
-            .secret_key(secret_key)
+            .secret_key(secret_key.clone())
             .alpns(alpn_list());
         builder = with_relay(builder, relay_url);
+        builder = with_dht_lookup(builder, &secret_key);
         let inner = builder
             .bind()
             .await

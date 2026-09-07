@@ -296,6 +296,14 @@ pub struct SessionRevokeArgs {
 pub struct InviteCreateArgs {
     /// Role the invite allows the guest to request.
     pub role: RoleDto,
+    /// Retire every code handed out so far and issue a fresh one (ADR 0062).
+    ///
+    /// Absent or `false` asks for the code that is already live, which is what
+    /// the sidebar wants: a code that changes every time the host looks at it
+    /// is not a code anyone can save. The settings window's "reissue" control
+    /// is the one that sends `true`.
+    #[serde(default)]
+    pub renew: bool,
 }
 
 /// What [`invite_create`] hands back to the UI to show as the invite code.
@@ -381,6 +389,11 @@ pub struct HistoryEntryDto {
     /// whichever happened most recently (docs/bugs/03-connection-list.md,
     /// task 4).
     pub last_seen_at: u64,
+    /// Whether a device password is remembered for this host (§8; ADR 0033).
+    ///
+    /// A boolean, never the password: the webview may know that reconnecting
+    /// will log itself in, so it can offer to stop that, and nothing more.
+    pub has_password: bool,
 }
 
 /// Argument of [`history_connect`].
@@ -393,6 +406,13 @@ pub struct HistoryConnectArgs {
 /// Argument of [`history_remove`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryRemoveArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+}
+
+/// Argument of [`history_forget_password`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryForgetPasswordArgs {
     /// Label of the remembered host, as `connection_history` handed it out.
     pub peer: String,
 }
@@ -738,6 +758,7 @@ pub async fn connection_history(
             peer_label: e.peer_label,
             role: e.role.into(),
             last_seen_at: e.last_seen_at,
+            has_password: e.has_password,
         })
         .collect())
 }
@@ -776,6 +797,27 @@ pub async fn history_remove(
 ) -> Result<(), IpcError> {
     check_window(&window)?;
     state.network.history_remove(args.peer).await?;
+    Ok(())
+}
+
+/// Forgets the device password remembered for one host, keeping its history
+/// row (§8; ADR 0033).
+///
+/// Deleting the row forgets the password too, but a host worth keeping in the
+/// list is not necessarily one worth logging into unasked, and until this
+/// existed there was no way to say so short of deleting the row.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone. A
+/// label that never had a password is not an error.
+#[tauri::command]
+pub async fn history_forget_password(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HistoryForgetPasswordArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.history_forget_password(args.peer).await?;
     Ok(())
 }
 
@@ -828,11 +870,34 @@ pub async fn invite_create(
     args: InviteCreateArgs,
 ) -> Result<InviteDto, IpcError> {
     check_window(&window)?;
-    let dto = state.network.invite_create(args.role.into()).await?;
+    let dto = state
+        .network
+        .invite_create(args.role.into(), args.renew)
+        .await?;
     Ok(InviteDto {
         code: dto.code,
         expires_at: dto.expires_at,
     })
+}
+
+/// Hands back the invite this host is already living with, or `null`.
+///
+/// Never issues one: the sidebar calls this on every start so the code is on
+/// screen without a click, and a host that has not been asked to invite
+/// anybody must not end up handing out a code anyway (ADR 0062).
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn invite_current(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<InviteDto>, IpcError> {
+    check_window(&window)?;
+    Ok(state.network.invite_current().await?.map(|dto| InviteDto {
+        code: dto.code,
+        expires_at: dto.expires_at,
+    }))
 }
 
 /// Starts connecting to the host named by `args.ticket`.

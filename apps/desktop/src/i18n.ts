@@ -116,6 +116,9 @@ export type TranslationKey =
   | 'status.reconnect'
   | 'history.remove'
   | 'history.remove.confirm'
+  | 'history.forgetPassword'
+  | 'history.forgetPassword.hint'
+  | 'history.forgetPassword.confirm'
   | 'status.lastSeenJustNow'
   | 'status.lastSeenMinutesAgo'
   | 'status.lastSeenHoursAgo'
@@ -137,6 +140,11 @@ export type TranslationKey =
   | 'sidebar.settings'
   | 'settings.heading'
   | 'settings.close'
+  | 'settings.tab.devices'
+  | 'settings.tab.access'
+  | 'settings.tab.recordings'
+  | 'settings.tab.system'
+  | 'settings.tabs.label'
   | 'panel.heading'
   | 'panel.subtext'
   | 'connections.header'
@@ -407,7 +415,12 @@ const en: Dictionary = {
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'history.remove': 'Remove',
-  'history.remove.confirm': (name) => `Remove ${name} from the connection list?`,
+  'history.remove.confirm': (name) =>
+    `Remove ${name} from the connection list? Any password saved for it is deleted too.`,
+  'history.forgetPassword': 'Forget password',
+  'history.forgetPassword.hint':
+    'This device signs in to that host automatically. Forget the saved password and be asked for it again.',
+  'history.forgetPassword.confirm': (name) => `Forget the password saved for ${name}?`,
   'status.lastSeenJustNow': 'Last seen just now',
   'status.lastSeenMinutesAgo': (n) => `Last seen ${n}m ago`,
   'status.lastSeenHoursAgo': (n) => `Last seen ${n}h ago`,
@@ -431,6 +444,11 @@ const en: Dictionary = {
   'sidebar.settings': 'Settings',
   'settings.heading': 'Settings',
   'settings.close': 'Close settings',
+  'settings.tab.devices': 'Devices',
+  'settings.tab.access': 'Access',
+  'settings.tab.recordings': 'Recordings & log',
+  'settings.tab.system': 'System',
+  'settings.tabs.label': 'Settings sections',
   'panel.heading': 'Connect to device',
   'panel.subtext': 'Paste an invite code to connect to a remote device.',
   'connections.header': 'Connections',
@@ -726,7 +744,12 @@ const ar: Dictionary = {
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'history.remove': 'إزالة',
-  'history.remove.confirm': (name) => `إزالة ${name} من قائمة الاتصالات؟`,
+  'history.remove.confirm': (name) =>
+    `إزالة ${name} من قائمة الاتصالات؟ سيُحذف أي كلمة مرور محفوظة له أيضًا.`,
+  'history.forgetPassword': 'نسيان كلمة المرور',
+  'history.forgetPassword.hint':
+    'يسجّل هذا الجهاز الدخول إلى ذلك المضيف تلقائيًا. انسَ كلمة المرور المحفوظة ليُطلب إدخالها من جديد.',
+  'history.forgetPassword.confirm': (name) => `نسيان كلمة المرور المحفوظة لـ ${name}؟`,
   'status.lastSeenJustNow': 'آخر ظهور قبل قليل',
   'status.lastSeenMinutesAgo': (n) => `آخر ظهور قبل ${n} د`,
   'status.lastSeenHoursAgo': (n) => `آخر ظهور قبل ${n} س`,
@@ -750,6 +773,11 @@ const ar: Dictionary = {
   'sidebar.settings': 'الإعدادات',
   'settings.heading': 'الإعدادات',
   'settings.close': 'إغلاق الإعدادات',
+  'settings.tab.devices': 'الأجهزة',
+  'settings.tab.access': 'الوصول',
+  'settings.tab.recordings': 'التسجيلات والسجل',
+  'settings.tab.system': 'النظام',
+  'settings.tabs.label': 'أقسام الإعدادات',
   'panel.heading': 'الاتصال بجهاز',
   'panel.subtext': 'الصق رمز الدعوة للاتصال بجهاز بعيد.',
   'connections.header': 'الاتصالات',

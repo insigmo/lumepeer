@@ -318,12 +318,46 @@ async function invoker(): Promise<(cmd: string, args?: unknown) => Promise<unkno
   return invoke as (cmd: string, args?: unknown) => Promise<unknown>;
 }
 
-async function createInvite(): Promise<void> {
+/**
+ * Puts the code this host is already living with on screen, without issuing
+ * one (ADR 0062).
+ *
+ * Called once at start-up. Before the invite survived restarts there was
+ * nothing to show and the sidebar could only offer a button; now the code is
+ * the same string it was yesterday, and a host reading it out to somebody
+ * should not have to press anything to see it.
+ */
+export async function loadLiveInvite(): Promise<void> {
+  try {
+    const invoke = await invoker();
+    const invite = (await invoke('invite_current')) as { code: string } | null;
+    if (invite && !lastCode) {
+      lastCode = invite.code;
+      notify();
+    }
+  } catch (error) {
+    // No invite yet, or no Tauri host: the create button is still there.
+    console.error('invite_current failed:', describeError(error));
+  }
+}
+
+/**
+ * Asks the host for its invite code.
+ *
+ * `renew` is the difference between "show me my code" and "give me a new one":
+ * without it the host hands back the code it is already living with, so the
+ * sidebar shows the same string after a restart and a saved connection on the
+ * other side keeps working (ADR 0062). With it, every code handed out before
+ * is retired — which is what the settings control is for.
+ */
+async function createInvite(renew = false): Promise<void> {
   creatingInvite = true;
   notify();
   try {
     const invoke = await invoker();
-    const invite = (await invoke('invite_create', { args: { role: 'view_only' } })) as {
+    const invite = (await invoke('invite_create', {
+      args: { role: 'view_only', renew },
+    })) as {
       code: string;
     };
     lastCode = invite.code;
@@ -515,9 +549,9 @@ export function inviteCodePanel(locale: Locale): TemplateResult {
  * Settings-window control that revokes every invite code handed out so far
  * and issues a fresh one (docs/bugs/05-settings-window.md, task 4).
  *
- * Reuses `createInvite`/`invite_create` rather than a new command: the actor
- * already retires the whole `TicketRegistry` on every call
- * (`network.rs::on_invite_create`), which is exactly "revoke and reissue".
+ * Reuses `createInvite`/`invite_create` rather than a new command, now with
+ * `renew` set: since ADR 0062 a plain call hands back the live code instead of
+ * retiring it, and this is the one caller that does want the old codes dead.
  */
 export function inviteRefreshPanel(locale: Locale): TemplateResult {
   return html`
@@ -526,7 +560,7 @@ export function inviteRefreshPanel(locale: Locale): TemplateResult {
         type="button"
         class="invite-refresh-btn"
         ?disabled=${creatingInvite}
-        @click=${() => void createInvite()}
+        @click=${() => void createInvite(true)}
       >
         ${t(locale, 'invite.refresh')}
       </button>

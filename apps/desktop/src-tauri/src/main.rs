@@ -18,6 +18,7 @@ mod clipboard_os;
 mod commands;
 mod config;
 mod connection_history;
+mod invite_store;
 mod logging;
 mod network;
 mod recorder;
@@ -40,23 +41,43 @@ pub struct AppState {
     pub autostart: autostart::Autostart,
 }
 
-/// Brings the main window back to the user: out of the tray, out of a
-/// minimized state and in front of whatever they were doing.
+/// Brings one window back to the user: out of the tray, out of a minimized
+/// state and in front of whatever they were doing.
 ///
-/// All three calls are needed and none of them subsumes the others: `show`
-/// undoes the hide the close handler in [`main`] does, `unminimize` undoes a
-/// minimize, and `set_focus` is what actually raises the window. Every caller
-/// wants all three, which is why they live here rather than being copied into
-/// the tray handlers, the single-instance callback and the consent listener.
+/// The first two calls are the obvious half — `show` undoes the hide the close
+/// handler in [`main`] does and `unminimize` undoes a minimize. `set_focus`
+/// alone is *not* the other half on Windows: the foreground-lock rules refuse
+/// `SetForegroundWindow` to a process the user is not already working in, so a
+/// consent request arriving while they are in another application would raise
+/// nothing and the guest would wait on a dialog nobody can see (the whole
+/// complaint behind ADR 0061's sibling fix). `HWND_TOPMOST` is not subject to
+/// that rule, so flipping always-on-top on and straight back off puts the
+/// window above everything without leaving it pinned there. A window that was
+/// deliberately always-on-top already — the host bar — is left as it is.
+///
+/// This lives here, rather than being copied into the tray handlers, the
+/// single-instance callback, the consent listener and the view-window builder,
+/// because every one of them wants exactly this sequence.
+pub fn raise_window(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    let _ = window.show();
+    let pinned = window.is_always_on_top().unwrap_or(false);
+    if !pinned {
+        let _ = window.set_always_on_top(true);
+    }
+    let _ = window.set_focus();
+    if !pinned {
+        let _ = window.set_always_on_top(false);
+    }
+}
+
+/// [`raise_window`] on the main window, if it exists.
 fn focus_main_window(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
-    let Some(window) = app.get_webview_window("main") else {
-        return;
-    };
-    let _ = window.unminimize();
-    let _ = window.show();
-    let _ = window.set_focus();
+    if let Some(window) = app.get_webview_window("main") {
+        raise_window(&window);
+    }
 }
 
 /// Installs the tray icon and its menu.
@@ -166,6 +187,12 @@ fn setup_app(
     Ok(())
 }
 
+/// Event this process emits to the webview whenever the actor reports
+/// anything, so the UI's poll loop refreshes at once instead of on its next
+/// tick. It carries no payload: what changed is read back through the same
+/// IPC commands the loop already calls, which keeps §15 out of the event bus.
+const WEBVIEW_WAKE_EVENT: &str = "lumepeer://actor-changed";
+
 /// Puts this app's window in front of the user when something needs their
 /// attention: a guest asking the host to decide (`ConsentRequested`), or a
 /// host asking this node, as a guest, for device credentials
@@ -184,24 +211,35 @@ async fn watch_for_window_raising_notifications(
     app: tauri::AppHandle,
     mut notifications: tokio::sync::broadcast::Receiver<network::ActorNotification>,
 ) {
-    use tauri::Manager as _;
+    use tauri::{Emitter as _, Manager as _};
     use tokio::sync::broadcast::error::RecvError;
 
     loop {
         match notifications.recv().await {
-            Ok(
-                network::ActorNotification::ConsentRequested
-                | network::ActorNotification::UnattendedChallenge,
-            ) => {
-                focus_main_window(&app);
-                // Raising the window can lose to the foreground-lock rules of
-                // the platform when the user is busy elsewhere. The taskbar
-                // button flashing is the fallback that still gets noticed.
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+            Ok(notification) => {
+                // Every notification wakes the webview's poll loop early. The
+                // loop itself still runs once a second, but a dialog the guest
+                // is already waiting on must not sit invisible for up to a
+                // second first: `refresh` is what puts the consent request and
+                // the credentials prompt on screen, and this is what makes it
+                // run the moment the actor has something to show.
+                let _ = app.emit(WEBVIEW_WAKE_EVENT, ());
+                if matches!(
+                    notification,
+                    network::ActorNotification::ConsentRequested
+                        | network::ActorNotification::UnattendedChallenge
+                ) {
+                    focus_main_window(&app);
+                    // Raising the window can still lose to the foreground-lock
+                    // rules of the platform when the user is busy elsewhere.
+                    // The taskbar button flashing is the fallback that gets
+                    // noticed anyway.
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ =
+                            window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+                    }
                 }
             }
-            Ok(_) => {}
             // A burst of notifications outran this listener. The ones that
             // were dropped are gone, but the next one that matters must still
             // raise the window, so keep reading.
@@ -238,12 +276,14 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::connection_history,
         commands::history_connect,
         commands::history_remove,
+        commands::history_forget_password,
         commands::connect_status,
         commands::connect_cancel,
         commands::network_status,
         commands::connection_stats,
         commands::license_status,
         commands::invite_create,
+        commands::invite_current,
         commands::invite_connect,
         commands::view_next_frame,
         commands::view_next_chunk,

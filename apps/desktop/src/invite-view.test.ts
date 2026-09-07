@@ -342,7 +342,25 @@ describe('invite refresh (docs/bugs/05-settings-window.md, task 4)', () => {
 
     container.querySelector<HTMLButtonElement>('.invite-refresh-btn')?.click();
     await vi.waitFor(() => {
-      expect(invoke).toHaveBeenCalledWith('invite_create', { args: { role: 'view_only' } });
+      // `renew` is what tells the host to retire the codes it handed out
+      // before. Without it the host returns the live code unchanged, which is
+      // what the sidebar asks for (ADR 0062).
+      expect(invoke).toHaveBeenCalledWith('invite_create', {
+        args: { role: 'view_only', renew: true },
+      });
+    });
+  });
+
+  it('asks the sidebar button for the code that is already live, not a new one', async () => {
+    invoke.mockResolvedValue({ code: 'lumepeer1:live' });
+    const view = await load();
+    render(view.inviteCodePanel('en'), container);
+
+    container.querySelector<HTMLButtonElement>('.create-btn')?.click();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('invite_create', {
+        args: { role: 'view_only', renew: false },
+      });
     });
   });
 

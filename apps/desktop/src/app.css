@@ -333,6 +333,10 @@ button {
 }
 
 .settings-btn {
+  /* Pushed to the far edge of the footer row rather than sitting against the
+     "Serverless" label: the two are unrelated, and a gear touching a word
+     reads as a control belonging to it. */
+  margin-inline-start: auto;
   appearance: none;
   border: 0;
   background: transparent;
@@ -787,6 +791,27 @@ button {
   white-space: nowrap;
 }
 
+/* Same chrome as Remove, minus the destructive red: forgetting a saved
+   password leaves the host in the list, it only stops the silent sign-in. */
+.connections-list .history-forget-password {
+  flex-shrink: 0;
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.connections-list .history-forget-password:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text-heading);
+}
+
 .connections-list .history-remove {
   flex-shrink: 0;
   appearance: none;
@@ -929,10 +954,17 @@ button {
 }
 
 /* ---------- Consent modal ---------- */
+/* Above the settings screen, deliberately. All three of these are modal and
+   all three used to sit at z-index 100, so the one rendered last won — which
+   is the settings screen. A guest asking to be let in, or a host asking for a
+   device password, would then be answered by nobody because it was drawn
+   behind a window the user had left open. Urgency, not render order, decides
+   the stack: a decision somebody is waiting on outranks a screen the user can
+   come back to. */
 .consent-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: 120;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1015,7 +1047,8 @@ button {
 .credentials-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  /* Above settings, for the reason given on `.consent-backdrop`. */
+  z-index: 120;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1096,6 +1129,42 @@ button {
 .settings-close:hover {
   background: rgba(0, 0, 0, 0.05);
   color: var(--text-heading);
+}
+
+/* Section strip under the settings heading. Six panels in one scroll was the
+   complaint; these are the four groups they fall into. */
+.settings-tabs {
+  flex: none;
+  display: flex;
+  gap: 2px;
+  padding: 8px 16px 0;
+  border-block-end: 1px solid var(--border-subtle);
+}
+
+.settings-tab {
+  appearance: none;
+  border: 0;
+  border-block-end: 2px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  padding: 9px 12px;
+  margin-block-end: -1px;
+  border-radius: 7px 7px 0 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings-tab:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--text-heading);
+}
+
+.settings-tab-active {
+  color: var(--text-heading);
+  border-block-end-color: var(--blue-solid);
 }
 
 .settings-body {

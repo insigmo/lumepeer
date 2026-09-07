@@ -80,14 +80,15 @@ pub struct Grants {
     /// ADR 0057).
     ///
     /// The most consequential grant there is: a guest holding it can approve
-    /// an administrator elevation on the host. So, unlike `secure_desktop`
-    /// (seeing the prompt, on for every role since ADR 0056), this is
-    /// deny-by-default and derived from **no** role, not even
-    /// [`Role::FullControl`] — approving elevation is a decision above handing
-    /// over the ordinary keyboard and mouse, and takes its own switch. It only
-    /// has meaning while `secure_desktop` is also on (you cannot aim at a
-    /// picture you are not shown), but it is a separate flag the actor re-reads
-    /// before every event, so a revoke lands on the next one.
+    /// an administrator elevation on the host. Deny-by-default for every role
+    /// below [`Role::FullControl`], and carried by that one (ADR 0061, which
+    /// amends ADR 0057 on this point): "this guest may do everything on this
+    /// machine" already includes typing the administrator password into an
+    /// elevated window, so withholding the click on the prompt itself bought
+    /// no safety and cost every session a switch the host had to find first.
+    /// It only has meaning while `secure_desktop` is also on (you cannot aim
+    /// at a picture you are not shown), and it stays a separate flag the actor
+    /// re-reads before every event, so a revoke lands on the next one.
     pub secure_desktop_input: bool,
 }
 
@@ -121,13 +122,11 @@ impl Grants {
     /// Grants implied by a role at the moment of `ConsentGrant` (§8.2).
     ///
     /// [`Role::FullControl`] is the host saying "this guest may do everything
-    /// on this machine", so it carries every independent grant with it — with
-    /// the single exception of `secure_desktop_input`, which no role turns on
-    /// (ADR 0057): approving a UAC prompt on the host is a decision above the
-    /// keyboard and mouse a controller role already hands over, so it takes its
-    /// own switch even here. A host that has already handed over the keyboard
-    /// and mouse would otherwise be asked to re-approve, one switch at a time,
-    /// permissions the guest can already exercise by typing. The lesser roles
+    /// on this machine", so it carries every independent grant with it,
+    /// `secure_desktop_input` included since ADR 0061 — a host that has
+    /// already handed over the keyboard and mouse would otherwise be asked to
+    /// re-approve, one switch at a time, permissions the guest can already
+    /// exercise by typing. The lesser roles
     /// imply nothing beyond
     /// `view` — a guest that is only watching gets no clipboard, no files, no
     /// recording, no display mode and no secure desktop, and there is no path
@@ -158,11 +157,12 @@ impl Grants {
             // control — a view-only guest is the case that needs to see the
             // prompt instead of a frozen picture.
             secure_desktop: true,
-            // Off for every role, including full control (ADR 0057): approving
-            // a UAC prompt on the host is a decision above handing over the
-            // ordinary keyboard, so it takes its own switch and no role turns
-            // it on.
-            secure_desktop_input: false,
+            // Full control and nothing below it (ADR 0061, amending ADR
+            // 0057). A guest that already holds the keyboard on an elevated
+            // window can type an administrator password there; refusing it
+            // the click on the prompt was a switch the host had to hunt for,
+            // not a boundary. Still independent, so it is revocable on its own.
+            secure_desktop_input: full,
         }
     }
 
@@ -491,10 +491,10 @@ mod tests {
         assert!(grants.recording);
         assert!(grants.display_mode);
         assert!(grants.secure_desktop);
-        // The one exception to "full control brings every grant": injecting
-        // into the secure desktop is off even here (ADR 0057). No role turns
-        // it on; only an explicit switch does.
-        assert!(!grants.secure_desktop_input);
+        // Full control means full control: the click on the UAC prompt rides
+        // along with the keyboard that can already type into the elevated
+        // window it opens (ADR 0061, amending ADR 0057).
+        assert!(grants.secure_desktop_input);
 
         // Watching is watching: nothing else rides along with it — except
         // `secure_desktop`, which ADR 0056 puts on for every role the same
@@ -514,21 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn secure_desktop_input_is_off_for_every_role_and_toggles_on_its_own() {
-        // Deny-by-default and derived from no role — not even full control
-        // (ADR 0057), unlike every other independent grant.
-        for role in [Role::ViewOnly, Role::ControlLimited, Role::FullControl] {
+    fn secure_desktop_input_follows_full_control_and_toggles_on_its_own() {
+        // Full control carries it; nothing below full control does (ADR 0061,
+        // amending ADR 0057). Watching, and watching plus a narrowed keyboard,
+        // still cannot approve an elevation.
+        for role in [Role::ViewOnly, Role::ControlLimited] {
             assert!(!Grants::from_role(role).get(IndependentGrant::SecureDesktopInput));
         }
+        assert!(Grants::from_role(Role::FullControl).get(IndependentGrant::SecureDesktopInput));
         // It is set and revoked on its own, and disturbs nothing else — in
         // particular not `secure_desktop`, the viewing grant it rides beside.
         let mut grants = Grants::from_role(Role::FullControl);
-        grants.set(IndependentGrant::SecureDesktopInput, true);
-        assert!(grants.get(IndependentGrant::SecureDesktopInput));
-        assert!(grants.get(IndependentGrant::SecureDesktop));
-        assert!(grants.input);
         grants.set(IndependentGrant::SecureDesktopInput, false);
         assert!(!grants.get(IndependentGrant::SecureDesktopInput));
+        assert!(grants.get(IndependentGrant::SecureDesktop));
+        assert!(grants.input);
+        grants.set(IndependentGrant::SecureDesktopInput, true);
+        assert!(grants.get(IndependentGrant::SecureDesktopInput));
         assert!(grants.get(IndependentGrant::SecureDesktop));
     }
 
