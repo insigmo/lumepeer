@@ -4368,64 +4368,59 @@ impl Actor {
             connection.close_with(&NetError::InvalidTicket);
             return;
         }
-        // A trusted device reaching a host with nobody at it answers to
-        // credentials instead of to a dialog nobody would see (§8; ADR 0033).
-        // The invite still had to verify and still had to be claimed above:
-        // this replaces the human's decision, not the ticket.
-        if self.may_try_unattended(&peer) {
-            let code_required = self.unattended.code_required();
-            self.adopt(
-                connection,
-                peer,
-                announces_media_faults,
-                self.speaks_remote_sas.contains(&peer),
-                true,
-            );
-            self.unattended_pending.insert(peer);
-            self.send_to(&peer, MessageKind::UnattendedChallenge { code_required });
-            tracing::info!(
-                peer = %tag,
-                code_required,
-                "unattended challenge offered to a trusted device"
-            );
-            self.rebuild_labels_and_snapshot();
-            return;
-        }
+        // Both ways in are offered, at the same time, to the same guest (ADR
+        // 0063): the credential challenge of §8 that a trusted device can
+        // answer on its own, and the consent dialog that the person at this
+        // machine can answer instead. Whichever lands first decides, and closes
+        // the other: `grant_role` and `on_revoke` each drop whatever the other
+        // way was still waiting on, so nobody is admitted twice and nobody is
+        // admitted by both.
+        //
+        // ADR 0033 offered only the challenge here, reasoning that a host with
+        // unattended access configured has nobody sitting at it. That is a
+        // guess about the room, not a fact, and when it was wrong it was wrong
+        // in the worst direction: the guest waited on a password while a
+        // person sat in front of a window that showed them nothing to answer.
+        // Configuring a password says a device *may* let itself in; it does
+        // not say the owner has stopped being able to decide.
+        let challenge = self.may_try_unattended(&peer);
         // Every connection, first time or reconnect, gets a fresh decision.
-        if let Err(error) = self
+        let consent = match self
             .sessions
             .request_consent_as(peer, ticket.allowed_request)
         {
-            tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
-            // Which refusal it was is worth a record: §15 separates "the host
-            // was too busy to ask" from "the plan does not allow another
-            // guest", and the two lead to different answers for the operator.
-            match error {
-                CoreError::PendingConsentQueueFull => self.audit(
-                    &peer,
-                    lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
-                ),
-                CoreError::ConcurrentGuestLimit { limit } => self.audit(
-                    &peer,
-                    lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
-                ),
-                // Anything else is not one of the two §15 names a rejection;
-                // the warning above is the whole record it gets.
-                _ => {}
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
+                // Which refusal it was is worth a record: §15 separates "the
+                // host was too busy to ask" from "the plan does not allow
+                // another guest", and the two lead to different answers for
+                // the operator.
+                match error {
+                    CoreError::PendingConsentQueueFull => self.audit(
+                        &peer,
+                        lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
+                    ),
+                    CoreError::ConcurrentGuestLimit { limit } => self.audit(
+                        &peer,
+                        lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
+                    ),
+                    // Anything else is not one of the two §15 names a
+                    // rejection; the warning above is the whole record it gets.
+                    _ => {}
+                }
+                if !challenge {
+                    // The ticket is already burned and nobody will ever decide
+                    // on this peer, so the connection must not linger: close it
+                    // here, before it is ever stored.
+                    connection.close_with(&NetError::ConsentUnavailable);
+                    return;
+                }
+                // A queue this host cannot extend is not a reason to refuse a
+                // device that can admit itself without the queue.
+                false
             }
-            // The ticket is already burned and nobody will ever decide on this
-            // peer, so the connection must not linger: close it here, before
-            // it is ever stored.
-            connection.close_with(&NetError::ConsentUnavailable);
-            return;
-        }
-        tracing::info!(peer = %tag, "consent request queued");
-        self.audit(
-            &peer,
-            lumepeer_core::audit::AuditEvent::ConsentRequested {
-                role: ticket.allowed_request,
-            },
-        );
+        };
         self.adopt(
             connection,
             peer,
@@ -4433,7 +4428,29 @@ impl Actor {
             self.speaks_remote_sas.contains(&peer),
             self.speaks_unattended.contains(&peer),
         );
-        let _ = self.notify.send(ActorNotification::ConsentRequested);
+        if challenge {
+            let code_required = self.unattended.code_required();
+            self.unattended_pending.insert(peer);
+            self.send_to(&peer, MessageKind::UnattendedChallenge { code_required });
+            tracing::info!(
+                peer = %tag,
+                code_required,
+                "unattended challenge offered to a trusted device"
+            );
+        }
+        if consent {
+            tracing::info!(peer = %tag, "consent request queued");
+            self.audit(
+                &peer,
+                lumepeer_core::audit::AuditEvent::ConsentRequested {
+                    role: ticket.allowed_request,
+                },
+            );
+            // What raises this app's window in front of whoever is here
+            // (`main.rs`). A trusted device used to skip this branch entirely,
+            // which is why a host with a device password saw nothing at all.
+            let _ = self.notify.send(ActorNotification::ConsentRequested);
+        }
         self.rebuild_labels_and_snapshot();
     }
 
@@ -7086,6 +7103,11 @@ impl Actor {
         let label = self.label_of(&peer);
         let label = label.as_str();
         self.sessions.grant(peer, role).map_err(ActorError::Core)?;
+        // This peer is in. A credential challenge it was also holding — both
+        // are offered together in `on_handshaked` — has been answered by
+        // somebody at this machine instead, and a password arriving after it
+        // must not be able to grant a second, different role.
+        self.unattended_pending.remove(&peer);
         self.send_to(&peer, MessageKind::ConsentGrant(role));
         if self.sessions.grants(&peer).is_some_and(|g| g.view) {
             if let Err(error) = lock_capture(&self.capture).add_viewer(peer) {
@@ -7164,6 +7186,10 @@ impl Actor {
         // who visited it: it decided once, the decision ended with the session,
         // and a list it never asked for is not the app's to build (ADR 0016).
         self.sessions.revoke(peer).map_err(ActorError::Core)?;
+        // "No" answers the credential challenge as well: with both offered
+        // together (`on_handshaked`), a peer left on this list could still
+        // type the device password and let itself in past a refusal.
+        self.unattended_pending.remove(&peer);
         self.send_to(&peer, MessageKind::ConsentRevoke);
         self.stop_media(peer);
         // A revoked session cannot be one of the reasons the clipboard is
@@ -10355,9 +10381,13 @@ mod tests {
         label
     }
 
-    /// §8: a trusted device reaching a host with nobody at it is asked for the
-    /// device password, and a correct one starts the session without any human
-    /// ever seeing a dialog (ADR 0033).
+    /// §8: a trusted device reaching a host with a device password is asked
+    /// for it, and a correct one starts the session at the host's configured
+    /// role (ADR 0033).
+    ///
+    /// The dialog is up at the same time, on the host — see
+    /// [`a_trusted_device_is_offered_the_dialog_as_well_as_the_password`] —
+    /// but nobody there has to touch it for this path to work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_trusted_device_signs_in_with_the_device_password() {
         let (host, _host_endpoint, _host_capture) = actor().await;
@@ -10367,18 +10397,9 @@ mod tests {
         let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
 
-        // The challenge, not a consent dialog.
         wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
         let state = guest.connect_state().await.unwrap();
         assert!(!state.code_required, "no second factor was configured");
-        assert!(
-            host.status()
-                .await
-                .unwrap()
-                .iter()
-                .all(|row| row.state != SessionStateDto::Pending),
-            "a trusted device must not also queue a consent request"
-        );
 
         guest
             .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
@@ -10392,6 +10413,101 @@ mod tests {
             .find(|row| row.label == label && row.state == SessionStateDto::Active)
             .expect("the admitted session is active on the host");
         assert_eq!(session.role, Role::ViewOnly, "the host's configured role");
+        assert!(
+            rows.iter().all(|row| row.state != SessionStateDto::Pending),
+            "the credential that admitted the guest also answered the dialog"
+        );
+    }
+
+    /// A device password says a machine *may* let itself in. It does not say
+    /// the owner has stopped being able to decide, so both are offered at
+    /// once: the guest sees the password prompt, the host sees the request.
+    ///
+    /// Before this, configuring a password made the host's window show nothing
+    /// at all while a guest waited on a password only the owner knew.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trusted_device_is_offered_the_dialog_as_well_as_the_password() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        let pending = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("the host is asked, even though the guest is trusted");
+        assert_eq!(pending, label);
+    }
+
+    /// Whoever answers first decides, and the other way in closes behind them:
+    /// the host admits the guest from the dialog and the credential prompt
+    /// goes away without a password ever being typed.
+    ///
+    /// The role is the dialog's, not the one the unattended settings carry —
+    /// this is the person at the machine deciding, not the machine.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_can_admit_a_trusted_device_from_the_dialog_instead() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+        // What a password would have bought, deliberately not what the host is
+        // about to grant.
+        host.unattended_set_role(Role::ViewOnly).await.unwrap();
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        host.grant(label.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        let rows = host.status().await.unwrap();
+        let session = rows
+            .iter()
+            .find(|row| row.label == label && row.state == SessionStateDto::Active)
+            .expect("the session the dialog admitted is active");
+        assert_eq!(
+            session.role,
+            Role::FullControl,
+            "the dialog's role, not the configured one"
+        );
+        assert!(
+            rows.iter().all(|row| row.state != SessionStateDto::Pending),
+            "the request the host answered is off the queue"
+        );
+    }
+
+    /// The other direction: "no" ends it for a trusted device too, and the
+    /// guest is told so rather than left holding a password prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denying_the_dialog_ends_it_for_a_trusted_device_too() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        let label = trusted_host(&host, &guest).await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Denied).await;
+        // And the password is no longer an answer to anything: the challenge
+        // it belonged to was refused.
+        assert!(
+            guest
+                .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
+                .await
+                .is_err(),
+            "a refused guest has no challenge left to answer"
+        );
     }
 
     /// docs/bugs/02-connect-form.md, task 6 (D2): a password remembered with

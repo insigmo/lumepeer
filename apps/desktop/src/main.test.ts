@@ -30,7 +30,6 @@ const RESPONSES: Record<string, unknown> = {
   audit_status: false,
   audit_kinds: [],
   audit_list: [],
-  service_status: 'unsupported',
   autostart_status: false,
 };
 
@@ -123,43 +122,44 @@ describe('panels moved to settings (task 3)', () => {
     expect(app().querySelector('main.main-panel [data-testid="system-settings"]')).toBeNull();
 
     app().querySelector<HTMLButtonElement>('.settings-btn')?.click();
-    // The panels live under four tabs now, so each one is checked on the tab
+    // The panels live under three tabs now, so each one is checked on the tab
     // that owns it — the point of the test is still "in settings and nowhere
     // else", not "all on one screen".
     const body = () => app().querySelector('.settings-body');
     const openTab = (id: string) => {
       app().querySelector<HTMLButtonElement>(`#settings-tab-${id}`)?.click();
     };
+    expect(body()?.querySelector('[data-testid="system-settings"]')).not.toBeNull();
     expect(body()?.querySelector('.address-book')).not.toBeNull();
     expect(body()?.querySelector('.invite-refresh-btn')).not.toBeNull();
     openTab('access');
     expect(body()?.querySelector('.unattended-panel')).not.toBeNull();
     openTab('recordings');
     expect(body()?.querySelector('.recordings')).not.toBeNull();
-    openTab('system');
-    expect(body()?.querySelector('[data-testid="system-settings"]')).not.toBeNull();
   });
 
-  it('groups the panels under four tabs and shows one section at a time', async () => {
+  it('groups the panels under three tabs and shows one section at a time', async () => {
     await boot();
     app().querySelector<HTMLButtonElement>('.settings-btn')?.click();
 
     const tabs = [...app().querySelectorAll('.settings-tabs [role="tab"]')];
     expect(tabs.map((tab) => tab.id)).toEqual([
-      'settings-tab-devices',
+      'settings-tab-system',
       'settings-tab-access',
       'settings-tab-recordings',
-      'settings-tab-system',
     ]);
-    // Devices is where an open starts, and nothing from another section is on
-    // screen with it.
+    // System is where an open starts — it absorbed the Devices tab, so the
+    // address book opens with it — and nothing from another section is on
+    // screen alongside.
     expect(tabs[0]?.getAttribute('aria-selected')).toBe('true');
+    expect(app().querySelector('.settings-body .address-book')).not.toBeNull();
     expect(app().querySelector('.settings-body .unattended-panel')).toBeNull();
-    expect(app().querySelector('.settings-body [data-testid="system-settings"]')).toBeNull();
+    expect(app().querySelector('.settings-body .recordings')).toBeNull();
 
     app().querySelector<HTMLButtonElement>('#settings-tab-access')?.click();
     expect(app().querySelector('.settings-body .unattended-panel')).not.toBeNull();
     expect(app().querySelector('.settings-body .address-book')).toBeNull();
+    expect(app().querySelector('.settings-body [data-testid="system-settings"]')).toBeNull();
     expect(
       app().querySelector('#settings-tab-access')?.getAttribute('aria-selected'),
     ).toBe('true');

@@ -24,8 +24,8 @@ import { systemSettings } from './system-settings';
 import type { UnattendedStatus } from './unattended-settings';
 import { unattendedSettings } from './unattended-settings';
 
-/** The four sections the panels are grouped into. */
-export type SettingsTab = 'devices' | 'access' | 'recordings' | 'system';
+/** The three sections the panels are grouped into. */
+export type SettingsTab = 'system' | 'access' | 'recordings';
 
 /**
  * The tabs, in order, with the label key each one carries.
@@ -33,19 +33,24 @@ export type SettingsTab = 'devices' | 'access' | 'recordings' | 'system';
  * A flat list of six panels had the address book, the unattended password,
  * invite revocation, recordings, the audit log and the system switches in one
  * scroll, which is what made finding any of them a hunt. The grouping is by
- * the question being answered: who may connect, how they authenticate, what
- * this machine has kept, and how the app itself behaves.
+ * the question being answered: what this machine is and who it lets in, how a
+ * trusted device authenticates, and what has been kept about sessions that
+ * already happened.
+ *
+ * `system` is first and holds what used to be a separate Devices tab. The two
+ * were the same subject read twice — this machine's own settings, and the
+ * devices this machine deals with — and the split only decided which of them
+ * an operator had to click past first.
  */
 const TABS: readonly { readonly id: SettingsTab; readonly label: TranslationKey }[] = [
-  { id: 'devices', label: 'settings.tab.devices' },
+  { id: 'system', label: 'settings.tab.system' },
   { id: 'access', label: 'settings.tab.access' },
   { id: 'recordings', label: 'settings.tab.recordings' },
-  { id: 'system', label: 'settings.tab.system' },
 ];
 
 let open = false;
 /** Which section is showing. Reset on close, so opening starts predictably. */
-let tab: SettingsTab = 'devices';
+let tab: SettingsTab = 'system';
 let onChange: (() => void) | undefined;
 /** The element to return focus to on close: whatever had focus when opened. */
 let trigger: HTMLElement | null = null;
@@ -73,7 +78,7 @@ export function openSettings(): void {
   }
   trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   open = true;
-  tab = 'devices';
+  tab = 'system';
   focusToken += 1;
   notify();
 }
@@ -128,7 +133,7 @@ function onTabKey(event: KeyboardEvent, id: SettingsTab): void {
 /** Test seam: drops transient state (open, remembered focus) between cases. */
 export function resetSettingsView(): void {
   open = false;
-  tab = 'devices';
+  tab = 'system';
   trigger = null;
   focusToken = 0;
   focusedToken = -1;
@@ -149,9 +154,11 @@ export interface SettingsPanels {
 function section(panels: SettingsPanels): TemplateResult {
   const { locale } = panels;
   switch (tab) {
-    case 'devices':
-      // Who this machine lets in, and the code it hands out to invite them.
+    case 'system':
+      // How the app itself behaves, who this machine lets in, and the code it
+      // hands out to invite them.
       return html`
+        ${systemSettings(locale, panels.systemCommands)}
         ${addressBook(panels.savedDevices, locale, panels.onRefresh)}
         ${inviteRefreshPanel(locale)}
       `;
@@ -164,16 +171,14 @@ function section(panels: SettingsPanels): TemplateResult {
         ${recordingsPanel(panels.recordings, locale, panels.recordingsCommands, panels.onRefresh)}
         ${auditPanel(locale, panels.auditCommands)}
       `;
-    case 'system':
-      return html`${systemSettings(locale, panels.systemCommands)}`;
   }
 }
 
 /**
- * The settings screen: address book, unattended access, recordings, audit
- * log, this device, and invite revocation, moved here from the main panel
- * (DECISIONS.md D9) and grouped into the four sections of [`TABS`]. None of
- * these panels are rewritten — each keeps its own render function and
+ * The settings screen: this device, the address book, invite revocation,
+ * unattended access, recordings and the audit log, moved here from the main
+ * panel (DECISIONS.md D9) and grouped into the three sections of [`TABS`].
+ * None of these panels are rewritten — each keeps its own render function and
  * arguments; this module only decides which of them are on screen.
  */
 export function settingsView(panels: SettingsPanels): TemplateResult | typeof nothing {

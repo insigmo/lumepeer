@@ -1065,10 +1065,38 @@ button {
   width: 100%;
 }
 
+.credentials-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .credentials-panel h2 {
   font-size: var(--fs-emphasis);
   font-weight: 700;
   margin: 0 0 8px;
+}
+
+/* The only way out for somebody who does not know the password. Same shape as
+   `.settings-close`, on a modal that has no other dismissal. */
+.credentials-close {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: #6b7280;
+  font-size: 18px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.credentials-close:hover {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--text-heading);
 }
 
 /* ---------- Settings screen (docs/bugs/05-settings-window.md) ----------

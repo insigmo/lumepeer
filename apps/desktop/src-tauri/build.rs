@@ -69,8 +69,6 @@ const COMMANDS: &[&str] = &[
     "update_install",
     "autostart_status",
     "autostart_set",
-    "service_status",
-    "service_set",
     "host_bar_expand",
     "host_bar_focus_main",
 ];

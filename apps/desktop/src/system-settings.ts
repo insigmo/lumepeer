@@ -17,10 +17,6 @@ import { html, type TemplateResult } from "lit-html";
 import type { Locale } from "./i18n";
 import { t } from "./i18n";
 
-/** Where the privileged helper service is, as `service_status` reports it. */
-export type ServiceState =
-  "unsupported" | "not_installed" | "stopped" | "running";
-
 /** What an update check found. */
 export interface UpdateInfo {
   version: string;
@@ -30,8 +26,6 @@ export interface UpdateInfo {
 
 /** How this panel reaches the core; injectable so tests need no Tauri. */
 export interface SystemCommands {
-  serviceStatus(): Promise<ServiceState>;
-  serviceSet(enabled: boolean): Promise<void>;
   autostartStatus(): Promise<boolean>;
   autostartSet(enabled: boolean): Promise<void>;
   updateCheck(): Promise<UpdateInfo | null>;
@@ -39,14 +33,6 @@ export interface SystemCommands {
 }
 
 export const tauriSystemCommands: SystemCommands = {
-  async serviceStatus() {
-    const { invoke } = await import("@tauri-apps/api/core");
-    return (await invoke("service_status")) as ServiceState;
-  },
-  async serviceSet(enabled: boolean) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("service_set", { args: { enabled } });
-  },
   async autostartStatus() {
     const { invoke } = await import("@tauri-apps/api/core");
     return (await invoke("autostart_status")) as boolean;
@@ -69,9 +55,6 @@ interface State {
   loaded: boolean;
   autostart: boolean;
   autostartError: boolean;
-  service: ServiceState;
-  serviceBusy: boolean;
-  serviceError: boolean;
   checking: boolean;
   checked: boolean;
   update: UpdateInfo | null;
@@ -84,9 +67,6 @@ const state: State = {
   loaded: false,
   autostart: false,
   autostartError: false,
-  service: "unsupported",
-  serviceBusy: false,
-  serviceError: false,
   checking: false,
   checked: false,
   update: null,
@@ -107,9 +87,6 @@ export function resetSystemSettings(): void {
   state.loaded = false;
   state.autostart = false;
   state.autostartError = false;
-  state.service = "unsupported";
-  state.serviceBusy = false;
-  state.serviceError = false;
   state.checking = false;
   state.checked = false;
   state.update = null;
@@ -132,15 +109,6 @@ export function systemSettings(
 ): TemplateResult {
   if (!state.loaded) {
     state.loaded = true;
-    void commands.serviceStatus().then(
-      (found) => {
-        state.service = found;
-        onChange?.();
-      },
-      (error: unknown) => {
-        console.error("service_status failed:", error);
-      },
-    );
     void commands.autostartStatus().then(
       (enabled) => {
         state.autostart = enabled;
@@ -199,74 +167,6 @@ export function systemSettings(
             </p>`
           : ""
       }
-      ${
-        state.service === "unsupported"
-          ? ""
-          : html`
-              <div class="system-row" data-testid="service-row">
-                <span
-                  >${t(
-                  locale,
-                  state.service === "running"
-                    ? "system.serviceRunning"
-                    : "system.serviceOff",
-                )}</span
-                >
-                <button
-                  type="button"
-                  data-testid="service-toggle"
-                  ?disabled=${state.serviceBusy}
-                  @click=${() => {
-                  const wanted =
-                    state.service !== "running" && state.service !== "stopped";
-                  state.serviceBusy = true;
-                  state.serviceError = false;
-                  onChange?.();
-                  void commands.serviceSet(wanted).then(
-                    () => {
-                      state.serviceBusy = false;
-                      void commands.serviceStatus().then((found) => {
-                        state.service = found;
-                        onChange?.();
-                      });
-                      onChange?.();
-                    },
-                    (error: unknown) => {
-                      console.error("service_set failed:", error);
-                      state.serviceBusy = false;
-                      state.serviceError = true;
-                      onChange?.();
-                    },
-                  );
-                }}
-                >
-                  ${
-                  state.serviceBusy
-                    ? t(locale, "system.serviceWorking")
-                    : t(
-                        locale,
-                        state.service === "not_installed"
-                          ? "system.serviceInstall"
-                          : "system.serviceRemove",
-                      )
-                }
-                </button>
-              </div>
-              <p class="system-note">${t(locale, "system.serviceNote")}</p>
-              ${
-              state.serviceError
-                ? html`<p
-                    class="system-error"
-                    role="status"
-                    data-testid="service-error"
-                  >
-                    ${t(locale, "system.serviceFailed")}
-                  </p>`
-                : ""
-            }
-            `
-      }
-
       <div class="system-row">
         <button
           type="button"

@@ -183,6 +183,18 @@ describe('device credential form', () => {
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('connect_cancel'));
   });
 
+  // Without this the modal has no visible way out: somebody who does not know
+  // the password is stuck with a dialog that only accepts the answer they do
+  // not have.
+  it('cancels the outstanding attempt from the close button', async () => {
+    setConnectPhase('awaiting_credentials', null, false);
+    render(credentialsPanel('en'), container);
+    const close = container.querySelector<HTMLButtonElement>('[data-testid="credentials-close"]');
+    expect(close?.getAttribute('aria-label')).toBe(t('en', 'creds.close'));
+    close?.click();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('connect_cancel'));
+  });
+
   it('is labelled in both locales, and the password field is a password field', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const scoped = document.createElement('div');

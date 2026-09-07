@@ -203,6 +203,11 @@ function failureKey(next: ConnectPhase, code?: string | null): TranslationKey | 
  * a password prompt is easy to scroll past as an inline block, the way a
  * consent dialog would be.
  *
+ * Escape and the close button both abandon the attempt outright, through the
+ * same `connect_cancel` the connect form's own Cancel uses. Somebody who does
+ * not know the password has no other answer to give, and a modal whose only
+ * two exits are a correct password and the window manager is a trap.
+ *
  * The password lives in the field and in the one IPC call that carries it. It
  * is cleared as soon as that call is made, and nothing in this module keeps a
  * copy — a wrong password means retyping it, which is the correct trade. That
@@ -237,7 +242,18 @@ export function credentialsPanel(locale: Locale): TemplateResult {
       }}
     >
       <section class="credentials-panel" role="dialog" aria-modal="true" aria-labelledby="credentials-heading">
-        <h2 id="credentials-heading">${t(locale, 'creds.heading')}</h2>
+        <div class="credentials-head">
+          <h2 id="credentials-heading">${t(locale, 'creds.heading')}</h2>
+          <button
+            type="button"
+            class="credentials-close"
+            data-testid="credentials-close"
+            aria-label=${t(locale, 'creds.close')}
+            @click=${() => void cancel()}
+          >
+            ×
+          </button>
+        </div>
         <p class="credentials-body">${t(locale, 'creds.body')}</p>
         <form
           class="credentials-form"
