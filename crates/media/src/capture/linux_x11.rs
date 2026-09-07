@@ -1042,15 +1042,34 @@ impl X11Injector {
 
     /// Presses or releases the key the guest asked for (§11).
     ///
-    /// A guest running in a webview has no physical scancode to send — the DOM
-    /// reports `KeyboardEvent.key`, so `scancode` arrives as 0 and `logical`
-    /// carries the meaning. Keying off the scancode therefore aimed every
-    /// keystroke at X11 keycode 8, which is bound to nothing: injection
-    /// succeeded, the server accepted it, and not one character was ever
-    /// typed. A scancode that *is* set still takes the direct evdev path, for
-    /// a future non-webview guest that has one.
+    /// Two ways in, and which one is right depends on what the keystroke *is*
+    /// (docs/bugs/17-remote-hotkeys.md):
+    ///
+    /// - Under Ctrl, Alt or Meta it is a command, and a command is a position
+    ///   on the keyboard. The guest's evdev code goes straight through, so
+    ///   Ctrl+C presses the key an application is listening for rather than
+    ///   handing it the letter its own layout happens to put there — which on
+    ///   a Cyrillic layout is not a letter this host's layout can reach at
+    ///   all. A key that names itself rather than a character goes the same
+    ///   way, and has to: a browser reports `ctrlKey` on Ctrl's keydown and
+    ///   not on its keyup, so a rule reading the modifiers alone would press
+    ///   and release one modifier by two different routes.
+    /// - Otherwise it is typing, and typing goes by character, so what the
+    ///   operator meant appears whatever layout this host is set to. Shift is
+    ///   not a chord modifier for exactly that reason: it selects a character
+    ///   rather than commanding with it.
+    ///
+    /// A guest that sends no scancode at all leaves only the second path,
+    /// which is where every webview guest sat until it learned to report
+    /// `KeyboardEvent.code`. Keying off the scancode *unconditionally* was
+    /// the older mistake in the other direction: it aimed a keystroke with no
+    /// scancode at X11 keycode 8, which is bound to nothing, so injection
+    /// succeeded and not one character was ever typed.
     fn key(&mut self, logical: u32, scancode: u32, modifiers: u32, pressed: bool) -> Result<()> {
-        if scancode != 0 {
+        if scancode != 0
+            && (lumepeer_core::protocol::is_chord(modifiers)
+                || lumepeer_core::protocol::names_a_key(logical))
+        {
             let keycode = Self::keycode(scancode)?;
             return self.fake_key(keycode, pressed);
         }
@@ -1161,11 +1180,23 @@ fn keysym_of(logical: u32) -> Option<u32> {
         0xe012 => 0xffe9, // Alt_L
         0xe013 => 0xffeb, // Super_L
         0xe014 => 0xffe5, // Caps_Lock
+        0xe015 => 0xff67, // Menu
+        0xe016 => 0xff61, // Print
+        0xe017 => 0xff14, // Scroll_Lock
+        0xe018 => 0xff13, // Pause
+        0xe019 => 0xff7f, // Num_Lock
         F_KEY_LOGICAL_FIRST..=F_KEY_LOGICAL_LAST => KEYSYM_F1 + (logical - F_KEY_LOGICAL_FIRST),
         _ => 0,
     };
     if named != 0 {
         return Some(named);
+    }
+    // 0 is the guest saying this key has no character meaning at all - a
+    // `PrintScreen`, a dead key, a `code` its layout leaves unlabelled. It is
+    // reached by position or not at all, and typing a NUL for it would be
+    // neither.
+    if logical == 0 {
+        return None;
     }
     // A lone surrogate or anything else that is not a scalar value is not a
     // character the host could type.
@@ -1526,6 +1557,57 @@ mod tests {
         assert_eq!(keysym_of(0x1_f600), Some(UNICODE_KEYSYM_BASE | 0x1_f600));
         // A lone surrogate is not a character anyone can type.
         assert_eq!(keysym_of(0xd800), None);
+        // 0 is the guest saying this key has no character meaning at all —
+        // a `PrintScreen`, a dead key, a `code` its own layout leaves
+        // unlabelled. It is reached by position or not at all; typing the NUL
+        // that `char::from_u32` happily hands back would be neither
+        // (ADR 0065).
+        assert_eq!(keysym_of(0), None);
+    }
+
+    /// The keys a webview guest could not name before this existed
+    /// (docs/bugs/17-remote-hotkeys.md), mirroring `NAMED_KEYS` in
+    /// `apps/desktop/src/view-window.ts` one for one as the rest of the table
+    /// does.
+    #[test]
+    fn the_newly_named_keys_map_to_their_keysym() {
+        assert_eq!(keysym_of(0xe015), Some(0xff67), "Menu");
+        assert_eq!(keysym_of(0xe016), Some(0xff61), "Print");
+        assert_eq!(keysym_of(0xe017), Some(0xff14), "Scroll_Lock");
+        assert_eq!(keysym_of(0xe018), Some(0xff13), "Pause");
+        assert_eq!(keysym_of(0xe019), Some(0xff7f), "Num_Lock");
+    }
+
+    /// ADR 0065: a keystroke under Ctrl, Alt or Meta is a command and goes by
+    /// position; anything else is typing and goes by character, so what the
+    /// operator meant appears whatever layout *this* host is set to.
+    ///
+    /// The injector needs a live X server, so what is asserted here is the
+    /// predicate it branches on, against the two cases that made the
+    /// difference visible: Ctrl+C on a Cyrillic layout, where the character
+    /// is one this host cannot reach at all, and the same key typed plainly,
+    /// where it is the only thing that matters.
+    #[test]
+    fn a_chord_is_a_position_and_typing_is_a_character() {
+        use lumepeer_core::protocol::{MODIFIER_CTRL, MODIFIER_SHIFT, is_chord};
+
+        assert!(is_chord(MODIFIER_CTRL));
+        assert!(!is_chord(MODIFIER_SHIFT));
+        assert!(!is_chord(0));
+        // The Cyrillic es a Russian-layout guest reports for Ctrl+C. It has a
+        // keysym, so the typing path would happily aim at it - and land on
+        // the scratch keycode, having borrowed a key to type a character
+        // nobody asked to type.
+        assert_eq!(
+            keysym_of(0x0441),
+            Some(UNICODE_KEYSYM_BASE | 0x0441),
+            "the character path is reachable, which is exactly why the chord must not take it"
+        );
+        // evdev 46 is the key marked C, whatever either layout prints on it.
+        assert_eq!(
+            u32::from(X11Injector::keycode(46).unwrap()),
+            46 + EVDEV_KEYCODE_OFFSET
+        );
     }
 
     /// Injection is opt-in through `LUMEPEER_TEST_XTEST=1`: it drives whatever

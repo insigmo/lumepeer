@@ -3347,7 +3347,9 @@ impl Actor {
         };
         // A repeated value has nothing new to draw, so it does not spend a
         // keyframe: task 2.4 asks for one on a *change*, not on every message
-        // a guest happens to send (§11).
+        // a guest happens to send (§11). A guest sends this once at the start
+        // of every session, which is also what tells the encode loop to hold
+        // the picture still rather than adapt it (docs/bugs/07-video-quality.md).
         if session.control.set_manual_cap(Some(scale_percent)) {
             session.control.request_keyframe();
         }

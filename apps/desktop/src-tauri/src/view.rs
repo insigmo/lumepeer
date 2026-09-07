@@ -35,7 +35,7 @@ use lumepeer_core::constants::{
     RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
-use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, effective_scale};
+use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, pinned_target};
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
@@ -85,11 +85,13 @@ pub struct EncodeControl {
     /// What the loop is encoding at right now, for the connection-quality
     /// panel of §18. Written by the loop, read by the actor.
     target: Arc<Mutex<QualityTarget>>,
-    /// The guest's manual scale ceiling, if it asked for one (§11; D7,
-    /// docs/bugs/13-stream-resolution.md task 2). Combined with the ABR
-    /// target by `lumepeer_media::abr::effective_scale`, never applied on
-    /// its own — a ceiling this loop reads is not a target ABR stops
-    /// adapting around.
+    /// The quality preset the guest picked, as a percentage of this host's
+    /// captured size, if it picked one (§11; D7,
+    /// docs/bugs/13-stream-resolution.md task 2). Turned into the whole
+    /// quality target by `lumepeer_media::abr::pinned_target`: while it is
+    /// set, the adaptive controller does not move any of the three knobs,
+    /// because a preset and a ladder both driving the picture is what a
+    /// person sees as the quality changing on its own.
     manual_cap: Arc<Mutex<Option<u32>>>,
     /// The picture size the guest said it will draw, in its own device
     /// pixels, if it asked for one (§11; ADR 0060). `None` is a guest that
@@ -194,7 +196,8 @@ impl EncodeControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = target;
     }
 
-    /// The guest's manual scale ceiling right now, if any (§11; D7).
+    /// The guest's chosen preset right now, as a scale percentage, if any
+    /// (§11; D7).
     #[must_use]
     pub fn manual_cap(&self) -> Option<u32> {
         *self
@@ -203,9 +206,9 @@ impl EncodeControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Sets the guest's manual scale ceiling, replacing whatever was there.
+    /// Sets the guest's chosen preset, replacing whatever was there.
     ///
-    /// Returns whether this actually changed the ceiling, which is what the
+    /// Returns whether this actually changed the preset, which is what the
     /// actor uses to decide whether a keyframe is owed: a request that
     /// repeats the value already in effect has nothing new to draw.
     pub fn set_manual_cap(&self, cap: Option<u32>) -> bool {
@@ -1367,15 +1370,14 @@ pub fn spawn_encode_loop(
                 }
             };
 
-            // Three reductions, in this order and for different reasons. The
-            // manual ceiling and the adaptive target are combined first,
-            // because they are not allowed to fight over the same variable
-            // (D7, docs/bugs/13-stream-resolution.md): a ceiling below the
-            // ABR target wins, and ABR stays free to sit below a higher one
-            // when the link cannot carry it. The budget reduction is the hard
-            // ceiling of §15 that no choice may exceed, so it goes last and
-            // has the final say (ADR 0018).
-            let scale_percent = effective_scale(control.manual_cap(), target.scale_percent);
+            // Two reductions, in this order and for different reasons. The
+            // target is whatever the guest's preset pinned, or whatever the
+            // adaptive controller settled on when it named none — the two
+            // are never combined, because they would be two hands on the same
+            // variable (D7, docs/bugs/13-stream-resolution.md). The budget
+            // reduction is the hard ceiling of §15 that no choice may exceed,
+            // so it goes last and has the final say (ADR 0018).
+            let scale_percent = target.scale_percent;
             let size_cap = control.size_cap();
 
             // The cursor rides its own channel when the guest asked for one,
@@ -1479,9 +1481,19 @@ pub fn spawn_encode_loop(
                     .map(|loss| backlog_feedback(loss, sent.take_kbps())),
                 None => None,
             };
-            if let Some(feedback) = measured
-                && let Some(next) = abr.on_feedback(feedback)
-            {
+            // A guest that named a preset has already said what it wants the
+            // picture to be, and the controller is then not a second opinion
+            // to weigh against it — it is a second hand on the same three
+            // knobs, and the picture drifts between the two for the whole
+            // session (docs/bugs/07-video-quality.md). The measurement above
+            // still runs while a preset is pinned: it is what keeps the
+            // backlog window and the report clock honest for the moment the
+            // guest stops naming one.
+            let settled = match pinned_target(control.manual_cap()) {
+                Some(pinned) => (pinned != target).then_some(pinned),
+                None => measured.and_then(|feedback| abr.on_feedback(feedback)),
+            };
+            if let Some(next) = settled {
                 if next.bitrate_kbps != target.bitrate_kbps
                     && let Err(error) = encoder.set_bitrate(next.bitrate_kbps)
                 {

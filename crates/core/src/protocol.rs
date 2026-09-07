@@ -38,6 +38,54 @@ pub const MODIFIER_ALT: u32 = 1 << 2;
 /// `Meta`/`Super`/`Command` bit of [`InputEventPayload::modifiers`].
 pub const MODIFIER_META: u32 = 1 << 3;
 
+/// Whether these modifiers make the keystroke a *chord* rather than typing,
+/// and so must be pressed by physical key instead of by character (ADR 0065;
+/// docs/bugs/17-remote-hotkeys.md).
+///
+/// The distinction is the whole of why remote hotkeys did not work. A guest
+/// webview reports `KeyboardEvent.key`, which is the character its *own*
+/// layout puts on the key: 'c' on a US layout, and the Cyrillic 'с' on a
+/// Russian one. Typed, that is exactly right and layout-independent — the
+/// character the operator meant appears on the host whatever keyboard the
+/// host thinks it has. Held under Ctrl it is exactly wrong: an accelerator
+/// listens for a *virtual key*, so a host asked for a character produced no
+/// Ctrl+C at all, and on a non-Latin layout there was not even a character
+/// the host's own layout could reach.
+///
+/// Shift is deliberately not one of these. It is the one modifier that
+/// selects a character rather than commanding with it, and a shifted key sent
+/// by position would type whatever the *host's* layout has there.
+#[must_use]
+pub const fn is_chord(modifiers: u32) -> bool {
+    modifiers & (MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_META) != 0
+}
+
+/// Whether [`InputEventPayload::logical`] names a *key* rather than a
+/// character, and so must be pressed by position wherever a position is known
+/// (ADR 0065).
+///
+/// The encoding is the guest's `NAMED_KEYS` table in
+/// `apps/desktop/src/view-window.ts`: the handful of C0 controls it reuses,
+/// `DEL`, and the private-use block from `0xe000` that carries the arrows,
+/// the modifiers and the function keys. 0 is the guest saying this key has no
+/// character meaning at all. Everything else is a Unicode code point.
+///
+/// This matters beyond tidiness because a modifier's press and its release
+/// do not carry the same modifier state: a browser reports `ctrlKey` on the
+/// Ctrl *keydown* and not on its keyup, so a rule that looked only at
+/// [`is_chord`] pressed the right-hand Ctrl by position and released a
+/// generic one — which clears the left-hand key on Windows and leaves the
+/// right one held down for the rest of the session. `AltGr` is the right-hand
+/// Alt on every European layout, so this is not a corner case
+/// (docs/bugs/17-remote-hotkeys.md).
+#[must_use]
+pub const fn names_a_key(logical: u32) -> bool {
+    matches!(
+        logical,
+        0 | 0x08 | 0x09 | 0x0d | 0x1b | 0x7f | 0xe000..=0xe1ff
+    )
+}
+
 /// Protocol major version. A mismatch closes the connection before consent (§9.1).
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// Protocol minor version. Unknown optional features are ignored (§9.1).
@@ -570,11 +618,14 @@ pub enum MessageKind {
     /// captured size (§11; D7, docs/bugs/13-stream-resolution.md). New in
     /// minor 7.
     ///
-    /// A ceiling, not a target: the host's adaptive controller (ADR 0037)
-    /// stays free to sit below it when the link cannot carry it, and stays
-    /// free to recover only up to it, never past it. Sent only towards a host
-    /// that speaks minor 7, and read only from a guest whose `Hello`
-    /// advertised [`FEATURE_STREAM_SCALE`].
+    /// The picture, not a ceiling on it: while a guest is naming one, the
+    /// host's adaptive controller (ADR 0037) does not move the bitrate, the
+    /// frame rate or the scale at all. It used to be read as a ceiling the
+    /// ladder could sit below, and a preset plus a ladder driving the same
+    /// picture is what a person sees as the quality changing on its own
+    /// (docs/bugs/07-video-quality.md). Sent only towards a host that speaks
+    /// minor 7, and read only from a guest whose `Hello` advertised
+    /// [`FEATURE_STREAM_SCALE`].
     ///
     /// Bounded here, on decode, because a static range is exactly what §9.1
     /// exists to check before anything downstream believes an untrusted
@@ -1047,6 +1098,45 @@ mod tests {
         FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
         UNATTENDED_LOCKOUT_DURATION_SECS,
     };
+
+    /// docs/bugs/17-remote-hotkeys.md: Shift selects a character, the other
+    /// three command with one, and only the second kind may be pressed by
+    /// position on a host whose layout is not the guest's.
+    #[test]
+    fn shift_is_typing_and_the_other_three_are_commands() {
+        assert!(is_chord(MODIFIER_CTRL));
+        assert!(is_chord(MODIFIER_ALT));
+        assert!(is_chord(MODIFIER_META));
+        assert!(is_chord(MODIFIER_CTRL | MODIFIER_SHIFT));
+        assert!(!is_chord(MODIFIER_SHIFT));
+        assert!(!is_chord(0));
+    }
+
+    /// A modifier's press and its release do not report the same modifier
+    /// state, so `is_chord` alone would press the right-hand Ctrl by position
+    /// and release a generic one — leaving it held for the rest of the
+    /// session (docs/bugs/17-remote-hotkeys.md). Naming keys separately from
+    /// characters is what keeps the two ends of one keystroke symmetric.
+    #[test]
+    fn a_named_key_is_a_key_and_a_code_point_is_a_character() {
+        // Every entry of the guest's `NAMED_KEYS`, at its edges.
+        for named in [
+            0, 0x08, 0x09, 0x0d, 0x1b, 0x7f, 0xe000, 0xe011, 0xe019, 0xe118, 0xe1ff,
+        ] {
+            assert!(names_a_key(named), "{named:#x} is a named key");
+        }
+        // Characters, including the Cyrillic es a Russian-layout guest
+        // reports for the key marked C.
+        for character in [
+            u32::from(b'a'),
+            u32::from(b'C'),
+            u32::from(b' '),
+            0x0441,
+            0x1_f600,
+        ] {
+            assert!(!names_a_key(character), "{character:#x} is a character");
+        }
+    }
 
     fn envelope(kind: MessageKind) -> MessageEnvelope {
         MessageEnvelope {

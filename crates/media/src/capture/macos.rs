@@ -861,6 +861,17 @@ mod screen_capture_kit {
             if let Some(vk) = named_key_vk(logical) {
                 return Self::key_vk(vk, pressed);
             }
+            // The guest's named-key identifiers sit in a private-use block,
+            // and one this table has no key for is a key this host cannot
+            // press — not a character to type. Typing it puts an
+            // unassigned code point into whatever has focus, which is
+            // indistinguishable from the session having gone wrong. Nothing
+            // is the honest answer, and the error says which key it was.
+            if (0xe000..=0xe1ff).contains(&logical) || logical == 0 {
+                return Err(MediaError::InputUnavailable(format!(
+                    "logical key {logical} has no macOS key code"
+                )));
+            }
             let ch = char::from_u32(logical).ok_or_else(|| {
                 MediaError::InputUnavailable(format!(
                     "logical key {logical} is neither a named key nor a valid code point"

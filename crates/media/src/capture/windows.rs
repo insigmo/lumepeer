@@ -92,17 +92,26 @@ mod dxgi {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK,
-        VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT,
-        VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+        MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY, VK_ADD, VK_APPS,
+        VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+        VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+        VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+        VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS,
+        VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+        VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
     };
     use windows::core::{Interface as _, PCWSTR};
 
     use lumepeer_core::protocol::{
-        CursorShapeData, InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE,
+        CursorShapeData, InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE, is_chord,
+        names_a_key,
     };
 
     use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
@@ -1715,19 +1724,271 @@ mod dxgi {
             0xe012 => VK_MENU,
             0xe013 => VK_LWIN,
             0xe014 => VK_CAPITAL,
+            0xe015 => VK_APPS,
+            0xe016 => VK_SNAPSHOT,
+            0xe017 => VK_SCROLL,
+            0xe018 => VK_PAUSE,
+            0xe019 => VK_NUMLOCK,
             0xe101..=0xe118 => VIRTUAL_KEY(VK_F1.0 + u16::try_from(logical - 0xe101).unwrap_or(0)),
             _ => return None,
         })
     }
 
+    /// One physical key, as this injector has to press it: the virtual key
+    /// Windows names it by, and whether its scan code carries the `E0`
+    /// prefix.
+    ///
+    /// Both halves matter. The virtual key is what an accelerator listens for
+    /// — Ctrl+C is `VK_CONTROL` plus `'C'`, not the letter 'c'. The scan code
+    /// is what anything reading the keyboard *below* the window sees, and
+    /// there is one on every desktop that matters here: a `VMware` Workstation
+    /// window with a virtual machine in it takes the keyboard through a
+    /// low-level hook and hands the guest OS scan codes. A `KEYEVENTF_UNICODE`
+    /// press carries no scan code at all, which is why keys typed towards a
+    /// VM arrived nowhere (docs/bugs/17-remote-hotkeys.md).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PhysicalKey {
+        vk: VIRTUAL_KEY,
+        /// Set for the keys the `E0` prefix distinguishes from a same-named
+        /// one elsewhere on the keyboard: the right-hand modifiers, the
+        /// navigation cluster (as opposed to the numpad), and the numpad's
+        /// own Enter and divide.
+        extended: bool,
+    }
+
+    /// A numpad virtual key, `offset` digits along from `VK_NUMPAD0`.
+    const fn numpad(offset: u16) -> VIRTUAL_KEY {
+        VIRTUAL_KEY(VK_NUMPAD0.0 + offset)
+    }
+
+    /// A function-key virtual key, `offset` along from `VK_F1`.
+    const fn function_key(offset: u16) -> VIRTUAL_KEY {
+        VIRTUAL_KEY(VK_F1.0 + offset)
+    }
+
+    /// The key an evdev code names, or `None` for one this table does not
+    /// know.
+    ///
+    /// evdev because that is what `InputEventPayload::scancode` has always
+    /// meant on this wire — the X11 injector reads it as `keycode - 8` — so
+    /// one physical encoding crosses the network and each host platform
+    /// translates from it. A code outside the table is not an error: the
+    /// caller falls back to typing the character, which is what every key did
+    /// before this existed.
+    fn physical_key(scancode: u32) -> Option<PhysicalKey> {
+        // Every arm below is a bounded range, so the subtraction cannot wrap
+        // and the result cannot exceed a `u16`; `unwrap_or` is there because
+        // the compiler has no way to know that, not because 0 is a sensible
+        // answer.
+        let from = |base: u32| u16::try_from(scancode.saturating_sub(base)).unwrap_or(0);
+        let (vk, extended) = match scancode {
+            1 => (VK_ESCAPE, false),
+            // The digit row. ASCII '1'..'9' then '0' are their own virtual
+            // keys, in the order the row is laid out.
+            2..=10 => (VIRTUAL_KEY(u16::from(b'1') + from(2)), false),
+            11 => (VIRTUAL_KEY(u16::from(b'0')), false),
+            12 => (VK_OEM_MINUS, false),
+            13 => (VK_OEM_PLUS, false),
+            14 => (VK_BACK, false),
+            15 => (VK_TAB, false),
+            16 => (VIRTUAL_KEY(u16::from(b'Q')), false),
+            17 => (VIRTUAL_KEY(u16::from(b'W')), false),
+            18 => (VIRTUAL_KEY(u16::from(b'E')), false),
+            19 => (VIRTUAL_KEY(u16::from(b'R')), false),
+            20 => (VIRTUAL_KEY(u16::from(b'T')), false),
+            21 => (VIRTUAL_KEY(u16::from(b'Y')), false),
+            22 => (VIRTUAL_KEY(u16::from(b'U')), false),
+            23 => (VIRTUAL_KEY(u16::from(b'I')), false),
+            24 => (VIRTUAL_KEY(u16::from(b'O')), false),
+            25 => (VIRTUAL_KEY(u16::from(b'P')), false),
+            26 => (VK_OEM_4, false),
+            27 => (VK_OEM_6, false),
+            28 => (VK_RETURN, false),
+            29 => (VK_LCONTROL, false),
+            30 => (VIRTUAL_KEY(u16::from(b'A')), false),
+            31 => (VIRTUAL_KEY(u16::from(b'S')), false),
+            32 => (VIRTUAL_KEY(u16::from(b'D')), false),
+            33 => (VIRTUAL_KEY(u16::from(b'F')), false),
+            34 => (VIRTUAL_KEY(u16::from(b'G')), false),
+            35 => (VIRTUAL_KEY(u16::from(b'H')), false),
+            36 => (VIRTUAL_KEY(u16::from(b'J')), false),
+            37 => (VIRTUAL_KEY(u16::from(b'K')), false),
+            38 => (VIRTUAL_KEY(u16::from(b'L')), false),
+            39 => (VK_OEM_1, false),
+            40 => (VK_OEM_7, false),
+            41 => (VK_OEM_3, false),
+            42 => (VK_LSHIFT, false),
+            43 => (VK_OEM_5, false),
+            44 => (VIRTUAL_KEY(u16::from(b'Z')), false),
+            45 => (VIRTUAL_KEY(u16::from(b'X')), false),
+            46 => (VIRTUAL_KEY(u16::from(b'C')), false),
+            47 => (VIRTUAL_KEY(u16::from(b'V')), false),
+            48 => (VIRTUAL_KEY(u16::from(b'B')), false),
+            49 => (VIRTUAL_KEY(u16::from(b'N')), false),
+            50 => (VIRTUAL_KEY(u16::from(b'M')), false),
+            51 => (VK_OEM_COMMA, false),
+            52 => (VK_OEM_PERIOD, false),
+            53 => (VK_OEM_2, false),
+            54 => (VK_RSHIFT, false),
+            55 => (VK_MULTIPLY, false),
+            56 => (VK_LMENU, false),
+            57 => (VK_SPACE, false),
+            58 => (VK_CAPITAL, false),
+            59..=68 => (function_key(from(59)), false),
+            69 => (VK_NUMLOCK, false),
+            70 => (VK_SCROLL, false),
+            71 => (numpad(7), false),
+            72 => (numpad(8), false),
+            73 => (numpad(9), false),
+            74 => (VK_SUBTRACT, false),
+            75 => (numpad(4), false),
+            76 => (numpad(5), false),
+            77 => (numpad(6), false),
+            78 => (VK_ADD, false),
+            79 => (numpad(1), false),
+            80 => (numpad(2), false),
+            81 => (numpad(3), false),
+            82 => (numpad(0), false),
+            83 => (VK_DECIMAL, false),
+            86 => (VK_OEM_102, false),
+            87 => (function_key(10), false),
+            88 => (function_key(11), false),
+            // The numpad's Enter is the same virtual key as the main one and
+            // is told apart only by the prefix — which is exactly what the
+            // flag is for.
+            96 => (VK_RETURN, true),
+            97 => (VK_RCONTROL, true),
+            98 => (VK_DIVIDE, true),
+            99 => (VK_SNAPSHOT, true),
+            100 => (VK_RMENU, true),
+            102 => (VK_HOME, true),
+            103 => (VK_UP, true),
+            104 => (VK_PRIOR, true),
+            105 => (VK_LEFT, true),
+            106 => (VK_RIGHT, true),
+            107 => (VK_END, true),
+            108 => (VK_DOWN, true),
+            109 => (VK_NEXT, true),
+            110 => (VK_INSERT, true),
+            111 => (VK_DELETE, true),
+            119 => (VK_PAUSE, false),
+            125 => (VK_LWIN, true),
+            126 => (VK_RWIN, true),
+            127 => (VK_APPS, true),
+            183..=194 => (function_key(from(183) + 12), false),
+            _ => return None,
+        };
+        Some(PhysicalKey { vk, extended })
+    }
+
+    /// Consecutive absolute moves that must fail to land before the injector
+    /// decides something has taken the pointer and starts sending relative
+    /// motion instead.
+    ///
+    /// More than one because a single miss is also what an ordinary race
+    /// looks like — the host's own mouse moving between the injection and the
+    /// read-back — and a session must not flip modes over one of those.
+    const GRAB_MISSES_BEFORE_RELATIVE: u8 = 3;
+
+    /// How far, in pixels, an absolute move may land from where it was aimed
+    /// and still count as having landed. Absolute injection is normalized
+    /// through a 0..=65535 grid, so a pixel or two of rounding is expected;
+    /// a grabbed pointer does not move at all.
+    const GRAB_TOLERANCE_PX: i32 = 4;
+
+    /// While relative, how many moves to send before spending one on an
+    /// absolute probe to find out whether the grab is over. About a second at
+    /// the frame rates §11 paces input at.
+    const GRAB_PROBE_EVERY: u8 = 30;
+
+    /// Denominator of the absolute-move coordinate space `MOUSEEVENTF_ABSOLUTE`
+    /// normalizes the primary display to.
+    const ABSOLUTE_RANGE: i32 = 65_535;
+
     /// Input injection through `SendInput` (§11).
     ///
-    /// Stateless: every call synthesizes one already-authorized event and
-    /// nothing here ever consults a grant (§2.3, §11), matching
-    /// `X11Injector`.
+    /// Almost stateless: every call synthesizes one already-authorized event
+    /// and nothing here ever consults a grant (§2.3, §11), matching
+    /// `X11Injector`. The one thing it does remember is where the pointer was
+    /// last asked to go, which is what {@link `Self::move_to`} needs to send
+    /// motion as a delta when the pointer has been taken away from it.
     #[derive(Debug, Default)]
     pub struct WindowsInjector {
-        _private: (),
+        /// The normalized position the guest last asked for, whether or not
+        /// the pointer actually went there.
+        asked: Option<(u16, u16)>,
+        /// Which mechanism is currently reaching the pointer.
+        grab: Grab,
+    }
+
+    /// How the next pointer move has to be sent.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PointerMode {
+        /// Straight to a position, which is what works while nothing else
+        /// holds the pointer.
+        Absolute,
+        /// As a delta, which is the only thing that reaches a pointer
+        /// something else has taken.
+        Relative,
+    }
+
+    /// Whether something else is holding the pointer, worked out from
+    /// whether absolute moves are landing.
+    ///
+    /// Separate from the injection itself so the decision can be tested
+    /// without a desktop: it is the part with states in it, and the part that
+    /// decides whether an operator can drive a virtual machine at all
+    /// (ADR 0065; docs/bugs/17-remote-hotkeys.md).
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Grab {
+        /// Consecutive absolute moves that did not land where they were
+        /// aimed.
+        misses: u8,
+        /// Whether this has concluded something else is holding the pointer.
+        held: bool,
+        /// Relative moves sent since the last absolute probe.
+        since_probe: u8,
+    }
+
+    impl Grab {
+        /// How the next move goes out, spending a probe slot when it is one.
+        fn next_mode(&mut self) -> PointerMode {
+            if !self.held {
+                return PointerMode::Absolute;
+            }
+            self.since_probe = self.since_probe.saturating_add(1);
+            if self.since_probe < GRAB_PROBE_EVERY {
+                return PointerMode::Relative;
+            }
+            // A probe: one absolute move spent finding out whether the grab
+            // is over. It is how a session recovers without the operator
+            // having to do anything.
+            self.since_probe = 0;
+            PointerMode::Absolute
+        }
+
+        /// Records whether an absolute move landed where it was aimed, and
+        /// answers whether that changed which mechanism is in use.
+        fn landed(&mut self, on_target: bool) -> bool {
+            if on_target {
+                let changed = self.held;
+                self.misses = 0;
+                self.held = false;
+                return changed;
+            }
+            // Already relative: a probe that missed says only that the grab
+            // is still on, which is what was already believed.
+            if self.held {
+                return false;
+            }
+            self.misses = self.misses.saturating_add(1);
+            if self.misses < GRAB_MISSES_BEFORE_RELATIVE {
+                return false;
+            }
+            self.held = true;
+            self.since_probe = 0;
+            true
+        }
     }
 
     impl WindowsInjector {
@@ -1738,7 +1999,14 @@ mod dxgi {
         /// # Errors
         /// Never, today.
         pub const fn connect() -> Result<Self> {
-            Ok(Self { _private: () })
+            Ok(Self {
+                asked: None,
+                grab: Grab {
+                    misses: 0,
+                    held: false,
+                    since_probe: 0,
+                },
+            })
         }
 
         fn send(inputs: &[INPUT]) -> Result<()> {
@@ -1763,17 +2031,50 @@ mod dxgi {
         }
 
         fn key_vk(vk: VIRTUAL_KEY, pressed: bool) -> Result<()> {
+            Self::key_physical(
+                PhysicalKey {
+                    vk,
+                    // Windows works the prefix out from the virtual key on
+                    // its own for the keys that only exist in one place; the
+                    // ones that exist twice come through `physical_key`,
+                    // which knows which of the two it is.
+                    extended: false,
+                },
+                pressed,
+            )
+        }
+
+        /// Presses one key by position, carrying the scan code a real
+        /// keyboard would have put on the wire.
+        ///
+        /// `wScan` is filled in even though `wVk` alone is enough for an
+        /// ordinary window, because an ordinary window is not the only thing
+        /// reading: a `VMware` Workstation window with a virtual machine in it
+        /// takes the keyboard through a low-level hook and forwards *scan
+        /// codes* into the guest OS, and a press with none reaches it as
+        /// nothing at all (docs/bugs/17-remote-hotkeys.md). `MapVirtualKeyW`
+        /// answers for the host's own current layout, which is the layout the
+        /// key is about to be pressed on.
+        fn key_physical(key: PhysicalKey, pressed: bool) -> Result<()> {
+            // SAFETY: a pure lookup against the calling thread's keyboard
+            // layout. It takes and returns plain integers, borrows nothing,
+            // and answers 0 for a virtual key with no scan code — which is
+            // the same "no scan code" a `wScan` of 0 already meant.
+            let scan = unsafe { MapVirtualKeyW(u32::from(key.vk.0), MAPVK_VK_TO_VSC) };
+            let mut flags = KEYBD_EVENT_FLAGS::default();
+            if key.extended {
+                flags |= KEYEVENTF_EXTENDEDKEY;
+            }
+            if !pressed {
+                flags |= KEYEVENTF_KEYUP;
+            }
             Self::send(&[INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: vk,
-                        wScan: 0,
-                        dwFlags: if pressed {
-                            KEYBD_EVENT_FLAGS::default()
-                        } else {
-                            KEYEVENTF_KEYUP
-                        },
+                        wVk: key.vk,
+                        wScan: u16::try_from(scan).unwrap_or(0),
+                        dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,
                     },
@@ -1804,20 +2105,52 @@ mod dxgi {
             }])
         }
 
-        fn key(logical: u32, pressed: bool) -> Result<()> {
+        /// Presses what the guest asked for, by position or by character.
+        ///
+        /// The order is the whole decision (docs/bugs/17-remote-hotkeys.md):
+        ///
+        /// 1. **By position, whenever there is one and the character is not
+        ///    the point.** That is every keystroke under Ctrl, Alt or Meta —
+        ///    a command is addressed to a virtual key, and Ctrl+C is
+        ///    `VK_CONTROL` plus `'C'`, not the letter 'c'; a host handed 'c'
+        ///    through `KEYEVENTF_UNICODE` produces a stray character with
+        ///    Ctrl held and no copy at all, and on a Cyrillic layout not even
+        ///    that, because the guest reports 'с' and a US-layout host cannot
+        ///    type it. And it is every key that names itself rather than a
+        ///    character: Enter, an arrow, a modifier, `PrintScreen`. Those
+        ///    have to go by position for a second reason — a browser reports
+        ///    `ctrlKey` on Ctrl's keydown and not on its keyup, so a rule
+        ///    that read the modifiers alone would press the right-hand Ctrl
+        ///    by position and release a generic one, which on Windows clears
+        ///    the *left* key and leaves the right one held.
+        /// 2. **By virtual key** when the guest sent no position for a key it
+        ///    named, which is every guest older than this rule.
+        /// 3. **By character** for the rest, which is typing, so the letter
+        ///    the operator meant appears whatever layout the host is set to.
+        ///    Shift is not a chord modifier for exactly this reason: it
+        ///    *selects* a character rather than commanding with it.
+        fn key(logical: u32, scancode: u32, modifiers: u32, pressed: bool) -> Result<()> {
+            let physical = physical_key(scancode);
+            if let Some(key) = physical
+                && (is_chord(modifiers) || names_a_key(logical))
+            {
+                return Self::key_physical(key, pressed);
+            }
             if let Some(vk) = named_key_vk(logical) {
                 return Self::key_vk(vk, pressed);
             }
-            let ch = char::from_u32(logical).ok_or_else(|| {
-                MediaError::InputUnavailable(format!(
-                    "logical key {logical} is neither a named key nor a valid code point"
-                ))
-            })?;
-            let mut buf = [0u16; 2];
-            for unit in ch.encode_utf16(&mut buf) {
-                Self::key_unicode(*unit, pressed)?;
+            match char::from_u32(logical).filter(|_| !names_a_key(logical)) {
+                Some(ch) => {
+                    let mut buf = [0u16; 2];
+                    for unit in ch.encode_utf16(&mut buf) {
+                        Self::key_unicode(*unit, pressed)?;
+                    }
+                    Ok(())
+                }
+                None => Err(MediaError::InputUnavailable(format!(
+                    "logical key {logical} is neither a named key nor a valid code point, and scancode {scancode} names no key"
+                ))),
             }
-            Ok(())
         }
 
         fn button(logical: u32, pressed: bool) -> Result<()> {
@@ -1858,20 +2191,109 @@ mod dxgi {
         /// (§9.1), which is exactly `MOUSEEVENTF_ABSOLUTE`'s coordinate space
         /// for the primary monitor — the same surface `CaptureTarget::
         /// PrimaryDisplay` captures — so no scaling is needed here.
-        fn move_to(x: u16, y: u16) -> Result<()> {
+        /// One mouse event carrying `dx`/`dy` under `flags`.
+        fn mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> Result<()> {
             Self::send(&[INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
                     mi: MOUSEINPUT {
-                        dx: i32::from(x),
-                        dy: i32::from(y),
+                        dx,
+                        dy,
                         mouseData: 0,
-                        dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                        dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,
                     },
                 },
             }])
+        }
+
+        /// Where a normalized position lands on the primary display.
+        ///
+        /// The primary display and not the virtual desktop, because that is
+        /// what `MOUSEEVENTF_ABSOLUTE` without `MOUSEEVENTF_VIRTUALDESK`
+        /// normalizes to — this is the read-back of the very mapping
+        /// `Self::mouse` is about to use, so it has to be the same one.
+        fn absolute_pixels(x: u16, y: u16) -> (i32, i32) {
+            // SAFETY: `GetSystemMetrics` takes an index by value and returns
+            // an `i32`. It borrows nothing and answers 0 for an index it does
+            // not know, which the `max(1)` below turns into a harmless
+            // one-pixel screen rather than a division by zero.
+            let (width, height) =
+                unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            let across = |value: u16, span: i32| {
+                (i32::from(value) * (span.max(1) - 1).max(1)) / ABSOLUTE_RANGE
+            };
+            (across(x, width), across(y, height))
+        }
+
+        /// Where the pointer actually is, or `None` when this desktop will
+        /// not say.
+        fn cursor_now() -> Option<(i32, i32)> {
+            let mut point = windows::Win32::Foundation::POINT::default();
+            // SAFETY: `point` is a live, fully initialized `POINT` for the
+            // duration of the call, which is all `GetCursorPos` requires; it
+            // retains no pointer into it. It fails rather than writing
+            // anything when the calling thread's desktop is not the input
+            // desktop, which is exactly the case this must not guess at.
+            unsafe { GetCursorPos(&raw mut point) }.ok()?;
+            Some((point.x, point.y))
+        }
+
+        /// Moves the pointer to a normalized position, by whichever mechanism
+        /// currently reaches it.
+        ///
+        /// Absolute motion is the right thing and stops working the moment
+        /// something takes the pointer. A `VMware` Workstation window with a
+        /// virtual machine in it does exactly that: while it holds the grab
+        /// the host cursor is pinned and hidden, and every absolute move —
+        /// injected or from the physical mouse — lands nowhere. What the VM
+        /// is being driven by then is *relative* motion, read below the
+        /// cursor, which is why a physical mouse still steers it and this
+        /// injector did not (docs/bugs/17-remote-hotkeys.md; the grab itself
+        /// is in docs/bugs/11-uac-degradation.md's neighbourhood but is not
+        /// UIPI — running elevated changes nothing).
+        ///
+        /// So the mechanism is chosen by measurement rather than by
+        /// configuration: aim, read the cursor back, and if it is not where
+        /// it was aimed enough times running, send deltas instead. A probe
+        /// every {@link `GRAB_PROBE_EVERY`} moves is what finds the grab has
+        /// ended. Nothing here needs the operator to know a grab is happening
+        /// or to press anything.
+        fn move_to(&mut self, x: u16, y: u16) -> Result<()> {
+            let previous = self.asked.replace((x, y));
+            let aimed = Self::absolute_pixels(x, y);
+            if self.grab.next_mode() == PointerMode::Relative {
+                let from = previous.map_or(aimed, |(px, py)| Self::absolute_pixels(px, py));
+                // A delta of nothing is not an event.
+                if aimed == from {
+                    return Ok(());
+                }
+                return Self::mouse(aimed.0 - from.0, aimed.1 - from.1, MOUSEEVENTF_MOVE);
+            }
+
+            Self::mouse(
+                i32::from(x),
+                i32::from(y),
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+            )?;
+            // A desktop that will not report the cursor tells this nothing
+            // either way, so it changes nothing either way.
+            let Some(landed) = Self::cursor_now() else {
+                return Ok(());
+            };
+            let on_target = (landed.0 - aimed.0).abs() <= GRAB_TOLERANCE_PX
+                && (landed.1 - aimed.1).abs() <= GRAB_TOLERANCE_PX;
+            if self.grab.landed(on_target) {
+                if on_target {
+                    tracing::info!("the pointer is free again: back to absolute motion");
+                } else {
+                    tracing::info!(
+                        "absolute pointer moves are not landing; something holds the pointer, sending relative motion"
+                    );
+                }
+            }
+            Ok(())
         }
 
         fn wheel(dx: i16, dy: i16) -> Result<()> {
@@ -1908,14 +2330,14 @@ mod dxgi {
     impl InputInjector for WindowsInjector {
         fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
             match event.detail {
-                InputDetail::PointerMove { x, y } => Self::move_to(x, y),
+                InputDetail::PointerMove { x, y } => self.move_to(x, y),
                 InputDetail::Wheel { dx, dy } => Self::wheel(dx, dy),
                 InputDetail::Press | InputDetail::Release => {
                     let pressed = matches!(event.detail, InputDetail::Press);
                     if event.logical >= POINTER_BUTTON_LOGICAL_BASE {
                         Self::button(event.logical, pressed)
                     } else {
-                        Self::key(event.logical, pressed)
+                        Self::key(event.logical, event.scancode, event.modifiers, pressed)
                     }
                 }
             }
@@ -1961,6 +2383,199 @@ mod dxgi {
             // A plain character code point is not a named key: `key` sends it
             // through `KEYEVENTF_UNICODE` instead.
             assert_eq!(named_key_vk(u32::from(b'a')), None);
+        }
+
+        /// The evdev codes a guest reports for the keys a chord is built out
+        /// of land on the virtual key an accelerator listens for — which is
+        /// the whole reason Ctrl+C copied nothing
+        /// (docs/bugs/17-remote-hotkeys.md).
+        #[test]
+        fn physical_keys_land_on_the_virtual_key_an_accelerator_listens_for() {
+            let letter = |code| physical_key(code).map(|key| key.vk);
+            assert_eq!(letter(46), Some(VIRTUAL_KEY(u16::from(b'C'))));
+            assert_eq!(letter(47), Some(VIRTUAL_KEY(u16::from(b'V'))));
+            assert_eq!(letter(30), Some(VIRTUAL_KEY(u16::from(b'A'))));
+            assert_eq!(letter(44), Some(VIRTUAL_KEY(u16::from(b'Z'))));
+            // The digit row, at both ends: evdev lays '1'..'9' out in order
+            // and puts '0' after them, which ASCII does not.
+            assert_eq!(letter(2), Some(VIRTUAL_KEY(u16::from(b'1'))));
+            assert_eq!(letter(10), Some(VIRTUAL_KEY(u16::from(b'9'))));
+            assert_eq!(letter(11), Some(VIRTUAL_KEY(u16::from(b'0'))));
+            // Both ends of each function-key run.
+            assert_eq!(letter(59), Some(VK_F1));
+            assert_eq!(letter(68).map(|vk| vk.0), Some(VK_F1.0 + 9));
+            assert_eq!(letter(87).map(|vk| vk.0), Some(VK_F1.0 + 10));
+            assert_eq!(letter(88).map(|vk| vk.0), Some(VK_F1.0 + 11));
+            assert_eq!(letter(183).map(|vk| vk.0), Some(VK_F1.0 + 12));
+            assert_eq!(letter(194).map(|vk| vk.0), Some(VK_F1.0 + 23));
+            // Keys the guest could not name at all before this existed.
+            assert_eq!(letter(99), Some(VK_SNAPSHOT));
+            assert_eq!(letter(127), Some(VK_APPS));
+            assert_eq!(letter(82), Some(VK_NUMPAD0));
+            // Nothing at all is a scancode this table does not know, which is
+            // not an error: the caller falls back to typing the character.
+            assert_eq!(physical_key(0), None);
+            assert_eq!(physical_key(255), None);
+        }
+
+        /// The `E0` prefix is the only thing telling two keys of the same
+        /// name apart, so it has to be carried: without it the navigation
+        /// cluster reads as the numpad, and a right-hand modifier as a
+        /// left-hand one.
+        #[test]
+        fn the_keys_that_exist_twice_carry_the_extended_flag() {
+            let extended = |code| physical_key(code).map(|key| key.extended);
+            // Left half plain, right half prefixed.
+            assert_eq!(extended(29), Some(false), "left control");
+            assert_eq!(extended(97), Some(true), "right control");
+            assert_eq!(extended(56), Some(false), "left alt");
+            assert_eq!(extended(100), Some(true), "right alt");
+            // The navigation cluster, against the numpad keys it shares its
+            // virtual keys with.
+            assert_eq!(extended(111), Some(true), "delete");
+            assert_eq!(extended(83), Some(false), "numpad decimal");
+            assert_eq!(extended(28), Some(false), "main enter");
+            assert_eq!(extended(96), Some(true), "numpad enter");
+            assert_eq!(physical_key(28).map(|key| key.vk), Some(VK_RETURN));
+            assert_eq!(physical_key(96).map(|key| key.vk), Some(VK_RETURN));
+        }
+
+        /// Both halves of the split, on one key: the letter C is a character
+        /// when typed and a position when commanded with.
+        #[test]
+        fn a_chord_takes_the_position_and_typing_takes_the_character() {
+            use lumepeer_core::protocol::{MODIFIER_CTRL, MODIFIER_SHIFT};
+
+            // `key` cannot be observed without actually injecting, so the
+            // decision it makes is asserted through the predicates it is
+            // built out of.
+            assert!(is_chord(MODIFIER_CTRL));
+            assert!(!is_chord(MODIFIER_SHIFT));
+            assert!(!is_chord(0));
+            // Under a chord there is a position to press...
+            assert!(physical_key(46).is_some());
+            // ...and the character that arrives alongside it is whatever the
+            // *guest's* layout puts there, which on a Cyrillic layout this
+            // host cannot type at all.
+            assert_eq!(named_key_vk(0x0441), None, "Cyrillic es is not a named key");
+            assert!(!names_a_key(0x0441));
+        }
+
+        /// A modifier is released by the same route it was pressed by.
+        ///
+        /// The browser reports `ctrlKey` on Ctrl's keydown and not on its
+        /// keyup, so a rule reading the modifiers alone pressed the
+        /// right-hand Ctrl as `VK_RCONTROL` and released a generic
+        /// `VK_CONTROL` — which Windows resolves to the *left* key, leaving
+        /// the right one held for the rest of the session
+        /// (docs/bugs/17-remote-hotkeys.md). `AltGr` is the right-hand Alt on
+        /// every European layout, so this is not a corner case.
+        #[test]
+        fn a_modifier_is_released_by_the_route_it_was_pressed_by() {
+            use lumepeer_core::protocol::MODIFIER_CTRL;
+
+            // The press carries the modifier; the release does not. Both take
+            // the physical path, because the key names itself.
+            for modifiers in [MODIFIER_CTRL, 0] {
+                assert!(is_chord(modifiers) || names_a_key(0xe011));
+            }
+            // And the position really does distinguish the two sides, which
+            // is what makes the asymmetry matter in the first place.
+            assert_eq!(physical_key(29).map(|key| key.vk), Some(VK_LCONTROL));
+            assert_eq!(physical_key(97).map(|key| key.vk), Some(VK_RCONTROL));
+            assert_eq!(
+                named_key_vk(0xe011),
+                Some(VK_CONTROL),
+                "and the old route did not"
+            );
+        }
+
+        /// docs/bugs/17-remote-hotkeys.md: while a `VMware` Workstation window
+        /// holds the pointer, the host cursor is pinned and every absolute
+        /// move lands nowhere — injected or from the physical mouse alike.
+        /// Relative motion is what still reaches the virtual machine, so the
+        /// injector has to notice and switch to it.
+        #[test]
+        fn a_pointer_something_else_is_holding_switches_to_relative_motion() {
+            let mut grab = Grab::default();
+            assert_eq!(grab.next_mode(), PointerMode::Absolute);
+
+            // One miss is also what a race with the host's own mouse looks
+            // like, so it is not enough on its own.
+            for _ in 1..GRAB_MISSES_BEFORE_RELATIVE {
+                assert!(!grab.landed(false));
+                assert_eq!(grab.next_mode(), PointerMode::Absolute);
+            }
+            assert!(grab.landed(false), "the switch is worth saying out loud");
+            assert_eq!(grab.next_mode(), PointerMode::Relative);
+        }
+
+        /// A single move that lands is proof the pointer is free, so the run
+        /// of misses starts again from nothing rather than accumulating
+        /// across a whole session.
+        #[test]
+        fn one_move_that_lands_clears_the_misses_before_them() {
+            let mut grab = Grab::default();
+            for _ in 1..GRAB_MISSES_BEFORE_RELATIVE {
+                grab.landed(false);
+            }
+            assert!(!grab.landed(true));
+            assert_eq!(grab.next_mode(), PointerMode::Absolute);
+
+            // And the count really did reset: one more miss must not be
+            // enough to trip it.
+            assert!(!grab.landed(false));
+            assert_eq!(grab.next_mode(), PointerMode::Absolute);
+        }
+
+        /// The grab ends when the operator presses Ctrl+Alt over there, and
+        /// nothing tells this side that it did. A probe every so often is
+        /// what finds out, so a session recovers on its own.
+        #[test]
+        fn a_probe_finds_the_grab_is_over_without_anyone_pressing_anything() {
+            let mut grab = Grab::default();
+            for _ in 0..GRAB_MISSES_BEFORE_RELATIVE {
+                grab.landed(false);
+            }
+            assert_eq!(grab.next_mode(), PointerMode::Relative);
+
+            // Everything up to the probe is a delta; the probe itself is one
+            // absolute move spent asking.
+            for _ in 1..GRAB_PROBE_EVERY - 1 {
+                assert_eq!(grab.next_mode(), PointerMode::Relative);
+            }
+            assert_eq!(
+                grab.next_mode(),
+                PointerMode::Absolute,
+                "no probe was ever spent"
+            );
+
+            // Still grabbed: a probe that misses changes nothing, and the
+            // next moves are deltas again.
+            assert!(!grab.landed(false));
+            assert_eq!(grab.next_mode(), PointerMode::Relative);
+
+            // Free again: the very next probe goes back to absolute. One
+            // move of the cycle has already been spent above, so this is the
+            // rest of it.
+            for _ in 2..GRAB_PROBE_EVERY {
+                assert_eq!(grab.next_mode(), PointerMode::Relative);
+            }
+            assert_eq!(grab.next_mode(), PointerMode::Absolute);
+            assert!(grab.landed(true), "the recovery is worth saying out loud");
+            assert_eq!(grab.next_mode(), PointerMode::Absolute);
+        }
+
+        /// A desktop nothing is holding must never spend a move on a delta:
+        /// absolute motion is the accurate mechanism and stays the default
+        /// for the whole of an ordinary session.
+        #[test]
+        fn an_ordinary_session_never_leaves_absolute_motion() {
+            let mut grab = Grab::default();
+            for _ in 0..1_000 {
+                assert_eq!(grab.next_mode(), PointerMode::Absolute);
+                assert!(!grab.landed(true));
+            }
         }
 
         /// The reopen loop's own logic, independent of DXGI: due immediately

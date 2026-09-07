@@ -323,10 +323,107 @@ describe('view window: input listeners follow the live grant', () => {
     expect(calls).toEqual(['wheel 0 -3 0']);
   });
 
-  it('drops keys it cannot map rather than inventing an identifier', () => {
+  it('drops keys with neither a character nor a position on the keyboard', () => {
     const { input, calls } = surface();
     input.setEnabled(true);
     container.dispatchEvent(new KeyboardEvent('keydown', { key: 'BrightnessUp', bubbles: true }));
+    expect(calls).toEqual([]);
+  });
+
+  // docs/bugs/17-remote-hotkeys.md: a character is not enough to press a key
+  // with. `key` under a chord is whatever the *guest's* layout puts there, and
+  // a host handed a character types it rather than pressing the key the
+  // accelerator is listening for.
+  it('carries the physical key alongside the character, so a chord can be pressed by position', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'c', code: 'KeyC', ctrlKey: true, bubbles: true }),
+    );
+    // evdev 46 is the key marked C on a US keyboard, whatever the guest's own
+    // layout prints on it.
+    expect(calls).toEqual(['press 99 46 2 true']);
+  });
+
+  it('carries the position for a Cyrillic layout too, where the character is one no US host can type', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'с', code: 'KeyC', ctrlKey: true, bubbles: true }),
+    );
+    expect(calls).toEqual([`press ${0x441} 46 2 true`]);
+  });
+
+  it('forwards a key that has a position and no character at all', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Unidentified', code: 'F13', bubbles: true }),
+    );
+    expect(calls).toEqual(['press 0 183 0 true']);
+  });
+
+  it('names the keys that had no identifier before: menu, print screen, the locks', () => {
+    for (const [key, code, scancode] of [
+      ['ContextMenu', 'ContextMenu', 127],
+      ['PrintScreen', 'PrintScreen', 99],
+      ['ScrollLock', 'ScrollLock', 70],
+      ['Pause', 'Pause', 119],
+      ['NumLock', 'NumLock', 69],
+    ] as const) {
+      const { input, calls } = surface();
+      input.setEnabled(true);
+      container.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true }));
+      expect(calls).toEqual([`press ${logicalOfKey(key)} ${scancode} 0 true`]);
+      input.setEnabled(false);
+    }
+  });
+
+  // The window stops receiving key events the moment it loses focus, so a
+  // chord interrupted by Alt+Tab delivers its press and never its release.
+  // The host then believes Ctrl is still down, and every later keystroke is
+  // silently a chord: 'c' copies, 'w' closes a window
+  // (docs/bugs/17-remote-hotkeys.md).
+  it('lets go, over there, of everything still held when the window loses focus', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Control', code: 'ControlLeft', ctrlKey: true, bubbles: true }),
+    );
+    calls.length = 0;
+
+    window.dispatchEvent(new Event('blur'));
+    expect(calls).toEqual([`press ${logicalOfKey('Control')} 29 0 false`]);
+
+    // And only once: a second blur has nothing left to release.
+    calls.length = 0;
+    window.dispatchEvent(new Event('blur'));
+    expect(calls).toEqual([]);
+  });
+
+  it('lets go of a held key when the grant drops input mid-press', () => {
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }),
+    );
+    calls.length = 0;
+    input.setEnabled(false);
+    expect(calls).toEqual(['press 97 30 0 false']);
+  });
+
+  it('matches a release to its press by position, not by the character it produced', () => {
+    // Shift released mid-chord changes the character the browser reports for
+    // the *same* physical key, so a release matched by character names a key
+    // nobody pressed and leaves the real one held.
+    const { input, calls } = surface();
+    input.setEnabled(true);
+    container.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', shiftKey: true, bubbles: true }),
+    );
+    container.dispatchEvent(new KeyboardEvent('keyup', { key: 'a', code: 'KeyA', bubbles: true }));
+    calls.length = 0;
+    window.dispatchEvent(new Event('blur'));
     expect(calls).toEqual([]);
   });
 

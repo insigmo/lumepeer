@@ -649,9 +649,179 @@ const NAMED_KEYS: Readonly<Record<string, number>> = {
   Alt: 0xe012,
   Meta: 0xe013,
   CapsLock: 0xe014,
+  ContextMenu: 0xe015,
+  PrintScreen: 0xe016,
+  ScrollLock: 0xe017,
+  Pause: 0xe018,
+  NumLock: 0xe019,
 };
 
-/** Logical identifier of a keyboard event, or `undefined` if unmappable. */
+/**
+ * Physical keys, as evdev codes, keyed by `KeyboardEvent.code`.
+ *
+ * A character is not enough to press a key with. `event.key` under a chord is
+ * whatever the *guest's* layout puts on that key — 'c' on a US layout, 'с' on
+ * a Russian one — and a host asked for a character types it, rather than
+ * pressing the key an accelerator is listening for. That is why Ctrl+C copied
+ * nothing: the host injected the letter through `KEYEVENTF_UNICODE`, which
+ * carries no virtual key at all, so the application saw a stray character
+ * arrive while Ctrl was held and no copy command ever fired
+ * (ADR 0065; docs/bugs/17-remote-hotkeys.md).
+ *
+ * evdev rather than a Windows scancode or a macOS key code, because
+ * `InputEventPayload::scancode` already meant an evdev code — the X11
+ * injector reads it as `keycode - 8` — and one physical encoding on the wire
+ * is what keeps the three host platforms translating from the same thing.
+ *
+ * `code` is the position on the keyboard, which is exactly what this needs to
+ * be: it does not move when the operator switches layouts on either side.
+ */
+const EVDEV_CODES: Readonly<Record<string, number>> = {
+  Escape: 1,
+  Digit1: 2,
+  Digit2: 3,
+  Digit3: 4,
+  Digit4: 5,
+  Digit5: 6,
+  Digit6: 7,
+  Digit7: 8,
+  Digit8: 9,
+  Digit9: 10,
+  Digit0: 11,
+  Minus: 12,
+  Equal: 13,
+  Backspace: 14,
+  Tab: 15,
+  KeyQ: 16,
+  KeyW: 17,
+  KeyE: 18,
+  KeyR: 19,
+  KeyT: 20,
+  KeyY: 21,
+  KeyU: 22,
+  KeyI: 23,
+  KeyO: 24,
+  KeyP: 25,
+  BracketLeft: 26,
+  BracketRight: 27,
+  Enter: 28,
+  ControlLeft: 29,
+  KeyA: 30,
+  KeyS: 31,
+  KeyD: 32,
+  KeyF: 33,
+  KeyG: 34,
+  KeyH: 35,
+  KeyJ: 36,
+  KeyK: 37,
+  KeyL: 38,
+  Semicolon: 39,
+  Quote: 40,
+  Backquote: 41,
+  ShiftLeft: 42,
+  Backslash: 43,
+  KeyZ: 44,
+  KeyX: 45,
+  KeyC: 46,
+  KeyV: 47,
+  KeyB: 48,
+  KeyN: 49,
+  KeyM: 50,
+  Comma: 51,
+  Period: 52,
+  Slash: 53,
+  ShiftRight: 54,
+  NumpadMultiply: 55,
+  AltLeft: 56,
+  Space: 57,
+  CapsLock: 58,
+  F1: 59,
+  F2: 60,
+  F3: 61,
+  F4: 62,
+  F5: 63,
+  F6: 64,
+  F7: 65,
+  F8: 66,
+  F9: 67,
+  F10: 68,
+  NumLock: 69,
+  ScrollLock: 70,
+  Numpad7: 71,
+  Numpad8: 72,
+  Numpad9: 73,
+  NumpadSubtract: 74,
+  Numpad4: 75,
+  Numpad5: 76,
+  Numpad6: 77,
+  NumpadAdd: 78,
+  Numpad1: 79,
+  Numpad2: 80,
+  Numpad3: 81,
+  Numpad0: 82,
+  NumpadDecimal: 83,
+  IntlBackslash: 86,
+  F11: 87,
+  F12: 88,
+  IntlRo: 89,
+  IntlYen: 124,
+  NumpadEnter: 96,
+  ControlRight: 97,
+  NumpadDivide: 98,
+  PrintScreen: 99,
+  AltRight: 100,
+  Home: 102,
+  ArrowUp: 103,
+  PageUp: 104,
+  ArrowLeft: 105,
+  ArrowRight: 106,
+  End: 107,
+  ArrowDown: 108,
+  PageDown: 109,
+  Insert: 110,
+  Delete: 111,
+  AudioVolumeMute: 113,
+  AudioVolumeDown: 114,
+  AudioVolumeUp: 115,
+  Pause: 119,
+  MetaLeft: 125,
+  MetaRight: 126,
+  ContextMenu: 127,
+  F13: 183,
+  F14: 184,
+  F15: 185,
+  F16: 186,
+  F17: 187,
+  F18: 188,
+  F19: 189,
+  F20: 190,
+  F21: 191,
+  F22: 192,
+  F23: 193,
+  F24: 194,
+};
+
+/**
+ * The physical key `code` names, as an evdev code, or 0 when this window does
+ * not recognize it.
+ *
+ * 0 is the "no physical key" the wire has always carried, so a `code` outside
+ * the table degrades to exactly the behaviour every key had before this
+ * existed: the character travels and the host types it.
+ */
+export function evdevOfCode(code: string): number {
+  return EVDEV_CODES[code] ?? 0;
+}
+
+/**
+ * Logical identifier of a keyboard event, or `undefined` if unmappable.
+ *
+ * `undefined` no longer means the key is unforwardable: {@link evdevOfCode}
+ * may still know where it sits, and a key with a position and no character
+ * — `AltGraph`, a dead key, a `code` the layout leaves unlabelled — is one
+ * the host can press by position. `ViewInput` sends 0 in that case, which is
+ * the "no character" the host already reads as "use the physical key".
+ */
 export function logicalOfKey(key: string): number | undefined {
   const named = NAMED_KEYS[key];
   if (named !== undefined) {
@@ -723,6 +893,17 @@ export function isLocalTextTarget(target: EventTarget | null): boolean {
 export class ViewInput {
   private attached = false;
 
+  /**
+   * Every key this window has told the host to hold down and not yet told it
+   * to let go of.
+   *
+   * Keyed by `code` so the release matches the press even when the character
+   * changed underneath it: holding Shift and letting go of it mid-chord makes
+   * the browser report a different `key` for the *same* physical key, and a
+   * release matched by character then names a key nobody pressed.
+   */
+  private readonly held = new Map<string, { logical: number; scancode: number }>();
+
   private readonly onPointerMove = (event: PointerEvent): void => {
     const remote = remotePointer(event.clientX, event.clientY, this.geometry());
     // Outside the picture: there is no remote pixel under the pointer, and
@@ -765,6 +946,8 @@ export class ViewInput {
 
   private readonly onKeyUp = (event: KeyboardEvent): void => this.forwardKey(event, false);
 
+  private readonly onBlur = (): void => this.releaseHeld();
+
   constructor(
     private readonly surface: HTMLElement,
     private readonly sink: InputSink,
@@ -795,6 +978,7 @@ export class ViewInput {
       this.surface.addEventListener('wheel', this.onWheel as EventListener, { passive: false });
       this.keyboard.addEventListener('keydown', this.onKeyDown as EventListener);
       this.keyboard.addEventListener('keyup', this.onKeyUp as EventListener);
+      window.addEventListener('blur', this.onBlur);
       return;
     }
     this.surface.removeEventListener('pointermove', this.onPointerMove as EventListener);
@@ -803,6 +987,11 @@ export class ViewInput {
     this.surface.removeEventListener('wheel', this.onWheel as EventListener);
     this.keyboard.removeEventListener('keydown', this.onKeyDown as EventListener);
     this.keyboard.removeEventListener('keyup', this.onKeyUp as EventListener);
+    window.removeEventListener('blur', this.onBlur);
+    // A session whose role was lowered mid-flight stops producing events, and
+    // anything it was mid-press on has to be let go of first: the host cannot
+    // work out on its own that the key is never coming back up.
+    this.releaseHeld();
   }
 
   private forwardKey(event: KeyboardEvent, pressed: boolean): void {
@@ -817,12 +1006,37 @@ export class ViewInput {
     if (isLocalTextTarget(event.target)) {
       return;
     }
-    const logical = logicalOfKey(event.key);
-    if (logical === undefined) {
+    const scancode = evdevOfCode(event.code);
+    const logical = logicalOfKey(event.key) ?? 0;
+    // Neither a character nor a position: nothing to press over there.
+    if (logical === 0 && scancode === 0) {
       return;
     }
     event.preventDefault();
-    this.sink.press(logical, 0, modifiersOf(event), pressed);
+    if (pressed) {
+      this.held.set(event.code, { logical, scancode });
+    } else {
+      this.held.delete(event.code);
+    }
+    this.sink.press(logical, scancode, modifiersOf(event), pressed);
+  }
+
+
+  /**
+   * Lets go, over there, of everything this window is still holding down.
+   *
+   * The window stops receiving key events the moment it loses focus, so a
+   * chord interrupted by Alt+Tab — or by the operator clicking away mid-press
+   * — delivers its press and never its release, and the host goes on believing
+   * Ctrl is down. Every later keystroke is then silently a chord: typing 'c'
+   * copies, 'w' closes a window, and the session reads as "some combinations
+   * just do not work" (docs/bugs/17-remote-hotkeys.md).
+   */
+  releaseHeld(): void {
+    for (const [, key] of this.held) {
+      this.sink.press(key.logical, key.scancode, 0, false);
+    }
+    this.held.clear();
   }
 }
 
