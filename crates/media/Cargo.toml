@@ -31,6 +31,25 @@ capture-screencapturekit = [
     "dep:block2",
     "dep:dispatch2",
 ]
+# ScreenCaptureKit desktop-audio capture for macOS (§11; docs/gap-tasks/
+# 01-macos-monitors-and-audio-capture.md). `SCStreamConfiguration.
+# capturesAudio(true)` on a dedicated stream hands back the desktop output
+# mix directly, so this needs no virtual output device and no CoreAudio
+# loopback. Lives inside the `capture-screencapturekit` module and reuses its
+# delegate, so it requires that feature rather than duplicating any of it.
+# Reading the delivered `AudioBufferList`/`AudioStreamBasicDescription` needs
+# the CoreAudioTypes struct layouts, which `objc2-core-media` already
+# resolves through its own optional `objc2-core-audio-types` dependency (see
+# Cargo.lock) at the same 0.3.2 the rest of the objc2 framework family here
+# is pinned to — enabling it adds no new objc2 major version, matching the
+# reasoning `capture-screencapturekit` above already documents.
+audio-capture-screencapturekit = [
+    "capture-screencapturekit",
+    "dep:objc2-core-audio-types",
+    "objc2-core-media/CMFormatDescription",
+    "objc2-core-media/CMBlockBuffer",
+    "objc2-core-media/objc2-core-audio-types",
+]
 # xdg-desktop-portal negotiation and PipeWire frame consumption for the
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
@@ -181,6 +200,15 @@ block2 = { version = "0.6.2", optional = true }
 dispatch2 = { version = "0.3.1", optional = true, default-features = false, features = [
     "std",
     "objc2",
+] }
+# AudioBufferList/AudioStreamBasicDescription for reading a ScreenCaptureKit
+# audio sample buffer's PCM data and format (audio-capture-screencapturekit).
+# Already resolved at this exact version through objc2-core-media's own
+# dependency tree (checked against Cargo.lock), so this is a direct edge onto
+# a crate already in the graph, not a new objc2 version.
+objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
 ] }
 
 # Used unconditionally on Windows (not gated by a Cargo feature): §11.3's
