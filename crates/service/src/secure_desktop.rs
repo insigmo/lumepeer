@@ -12,7 +12,7 @@
 //!    the one interactive window station.
 //! 2. [`OpenDesktopW`]/[`SetThreadDesktop`] onto `Winlogon`, the secure
 //!    desktop inside it.
-//! 3. An ordinary GDI screen capture (`CreateDCW`/`BitBlt`/
+//! 3. An ordinary GDI screen capture (`CreateDCW`/`StretchBlt`/
 //!    `CreateDIBSection`) — the same technique `crates/media`'s Windows
 //!    backend already uses for its own first-frame snapshot, reimplemented
 //!    here rather than shared, because `crates/service` does not depend on
@@ -39,8 +39,9 @@
 )]
 
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDCW, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, SRCCOPY, SelectObject,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDCW, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, HALFTONE, SRCCOPY, SelectObject, SetStretchBltMode,
+    StretchBlt,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, CloseWindowStation, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
@@ -51,8 +52,58 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 use windows::core::PCWSTR;
 
+use lumepeer_service::protocol::SECURE_DESKTOP_FRAME_CAPACITY_BYTES;
+
 /// Bytes per pixel of the BGRA8 this module always produces.
 const BYTES_PER_PIXEL: usize = 4;
+
+/// Denominator of the fraction [`fit_within_capacity`] scales by.
+///
+/// The search there is integer-only — no float casts on a path that decides a
+/// buffer length — so it walks numerators over this fixed denominator. 1/64 is
+/// finer than any difference visible on a lock screen and coarse enough that
+/// trying every step is a loop of at most sixty-four comparisons.
+const SCALE_STEPS: u32 = 64;
+
+/// The largest size not wider than `width`/`height` and the same shape, whose
+/// BGRA8 payload still fits [`SECURE_DESKTOP_FRAME_CAPACITY_BYTES`].
+///
+/// The mapping is fixed at one 1920×1080 frame and never resizes (ADR 0049),
+/// and `crate::frame::Writer::write` refuses — rather than truncates — a
+/// payload past that. A screen larger than 1080p is the ordinary case, not an
+/// edge one, so capturing it at native size meant every single secure-desktop
+/// capture on such a host was refused and the guest saw
+/// `docs/bugs/11-uac-degradation.md`'s "can't see this" message for the whole
+/// episode, with nothing on either side able to say why. Fitting the picture
+/// to the channel it has to travel over is what makes the feature work on the
+/// hosts people actually have.
+fn fit_within_capacity(width: i32, height: i32) -> (i32, i32) {
+    let max_pixels =
+        u64::try_from(SECURE_DESKTOP_FRAME_CAPACITY_BYTES / BYTES_PER_PIXEL).unwrap_or(0);
+    let (wide_px, high_px) = (
+        u64::try_from(width).unwrap_or(0),
+        u64::try_from(height).unwrap_or(0),
+    );
+    if wide_px * high_px <= max_pixels {
+        return (width, height);
+    }
+    for step in (1..SCALE_STEPS).rev() {
+        let scaled_width = wide_px * u64::from(step) / u64::from(SCALE_STEPS);
+        let scaled_height = high_px * u64::from(step) / u64::from(SCALE_STEPS);
+        if scaled_width > 0
+            && scaled_height > 0
+            && scaled_width * scaled_height <= max_pixels
+            && let (Ok(scaled_width), Ok(scaled_height)) =
+                (i32::try_from(scaled_width), i32::try_from(scaled_height))
+        {
+            return (scaled_width, scaled_height);
+        }
+    }
+    // Only reachable if the capacity is smaller than a single pixel, which
+    // the constants make impossible; a one-pixel frame is still a frame the
+    // writer can refuse honestly rather than a panic here.
+    (1, 1)
+}
 
 /// `WINSTA_ALL_ACCESS` (`winuser.h`): full rights on a window station. Not
 /// exposed as a named constant by this version of the `windows` crate's
@@ -193,6 +244,9 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
     if width <= 0 || height <= 0 {
         return None;
     }
+    // What the fixed mapping can actually carry. On a 1080p-or-smaller screen
+    // this is the screen itself and the blit below is one-to-one.
+    let (target_width, target_height) = fit_within_capacity(width, height);
 
     // The `"DISPLAY"` driver name is what gives a device context for the
     // whole screen of the calling thread's *current desktop*; the all-null
@@ -219,9 +273,9 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: u32::try_from(size_of::<BITMAPINFOHEADER>()).unwrap_or(u32::MAX),
-                biWidth: width,
+                biWidth: target_width,
                 // Top-down rows, matching the wire's row order.
-                biHeight: -height,
+                biHeight: -target_height,
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -244,10 +298,32 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         let memory_dc = CreateCompatibleDC(Some(dc));
         let old = SelectObject(memory_dc, section.into());
 
-        let blitted = BitBlt(memory_dc, 0, 0, width, height, Some(dc), 0, 0, SRCCOPY).is_ok();
+        // `StretchBlt` rather than `BitBlt` so a screen larger than the
+        // mapping's capacity arrives scaled instead of being refused whole.
+        // `HALFTONE` averages the pixels it drops, which is what keeps a UAC
+        // prompt's text legible after a reduction; it costs nothing when the
+        // sizes match, but asking for it then would be a mode set for no
+        // reason.
+        if (target_width, target_height) != (width, height) {
+            SetStretchBltMode(memory_dc, HALFTONE);
+        }
+        let blitted = StretchBlt(
+            memory_dc,
+            0,
+            0,
+            target_width,
+            target_height,
+            Some(dc),
+            0,
+            0,
+            width,
+            height,
+            SRCCOPY,
+        )
+        .as_bool();
 
-        let bytes = usize::try_from(width).unwrap_or(0)
-            * usize::try_from(height).unwrap_or(0)
+        let bytes = usize::try_from(target_width).unwrap_or(0)
+            * usize::try_from(target_height).unwrap_or(0)
             * BYTES_PER_PIXEL;
         let data = if blitted && !bits.is_null() {
             Some(std::slice::from_raw_parts(bits.cast::<u8>(), bytes).to_vec())
@@ -260,13 +336,50 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         let _ = DeleteDC(memory_dc);
         let _ = DeleteDC(dc);
 
-        data.map(|data| (width.cast_unsigned(), height.cast_unsigned(), data))
+        data.map(|data| {
+            (
+                target_width.cast_unsigned(),
+                target_height.cast_unsigned(),
+                data,
+            )
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A screen the mapping can already carry is captured at its own size;
+    /// one larger comes back smaller, in the same shape, and small enough to
+    /// publish. Before this, a 1440p or 4K host had every secure-desktop
+    /// capture refused by the writer and never saw the prompt at all.
+    #[test]
+    fn a_screen_larger_than_the_mapping_is_fitted_to_it_and_keeps_its_shape() {
+        let capacity_px = SECURE_DESKTOP_FRAME_CAPACITY_BYTES / BYTES_PER_PIXEL;
+        assert_eq!(fit_within_capacity(1920, 1080), (1920, 1080));
+        assert_eq!(fit_within_capacity(1280, 720), (1280, 720));
+
+        for (width, height) in [(2560, 1440), (3840, 2160), (5120, 1440), (7680, 4320)] {
+            let (fitted_width, fitted_height) = fit_within_capacity(width, height);
+            let pixels = usize::try_from(fitted_width).unwrap_or(usize::MAX)
+                * usize::try_from(fitted_height).unwrap_or(usize::MAX);
+            assert!(
+                pixels <= capacity_px,
+                "{width}x{height} fitted to {fitted_width}x{fitted_height}, which still does not fit"
+            );
+            assert!(fitted_width > 0 && fitted_height > 0);
+            assert!(fitted_width < width && fitted_height < height);
+            // Same shape to within one step of the search's granularity: a
+            // stretched lock screen would be worse than a smaller one.
+            let source_ratio = f64::from(width) / f64::from(height);
+            let fitted_ratio = f64::from(fitted_width) / f64::from(fitted_height);
+            assert!(
+                (source_ratio - fitted_ratio).abs() < 0.05,
+                "{width}x{height} became {fitted_width}x{fitted_height}, a different shape"
+            );
+        }
+    }
 
     /// `capture` never panics, on a machine with no active secure-desktop
     /// transition (the ordinary case in an automated test — this suite must

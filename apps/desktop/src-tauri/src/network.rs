@@ -4288,7 +4288,7 @@ impl Actor {
         let on_secure_desktop = self
             .media
             .get(&peer)
-            .is_some_and(|session| session.control.secure_desktop_active());
+            .is_some_and(|session| session.control.secure_desktop_blocked());
         if on_secure_desktop {
             let permitted = self
                 .sessions

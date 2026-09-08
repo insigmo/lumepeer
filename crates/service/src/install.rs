@@ -21,10 +21,12 @@ use windows::Win32::Foundation::{
     ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_EXISTS, ERROR_SERVICE_MARKED_FOR_DELETE,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
-    OpenServiceW, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS,
-    SERVICE_AUTO_START, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_START, SERVICE_STATUS,
-    SERVICE_WIN32_OWN_PROCESS, StartServiceW,
+    ChangeServiceConfigW, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
+    ENUM_SERVICE_TYPE, OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_HANDLE,
+    SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+    SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_STOP, SERVICE_ERROR, SERVICE_ERROR_NORMAL,
+    SERVICE_NO_CHANGE, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_START_TYPE, SERVICE_STATUS,
+    SERVICE_STOP, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
 use windows::core::{Error, HRESULT, PCWSTR};
 
@@ -32,6 +34,14 @@ use lumepeer_service::SERVICE_NAME;
 
 /// Shown in `services.msc`, so it has to say what it is without a manual.
 const DISPLAY_NAME: &str = "Lumepeer helper";
+
+/// How long [`stop_and_wait`] waits for a running service to drain before
+/// starting the new image anyway, in milliseconds. The same ten seconds the
+/// installer's own `LUMEPEER_STOP_SERVICE` macro waits.
+const STOP_TIMEOUT_MS: u64 = 10_000;
+
+/// How often [`stop_and_wait`] re-reads the service's state while waiting.
+const STOP_POLL_MS: u64 = 250;
 
 /// Shown as the service's description, for the same reason.
 const DESCRIPTION: &str = "Delivers Ctrl+Alt+Del to this computer's screen when Lumepeer's remote session asks for it. \
@@ -118,7 +128,9 @@ fn install_named(name: &str) -> Result<(), String> {
         // `install()` promises ("a Lumepeer helper service is registered and
         // running") already holds on the registration half; make sure it
         // holds on the running half too instead of reporting failure.
-        Err(error) if is_already_registered(&error) => start_registered(manager, &wide_name),
+        Err(error) if is_already_registered(&error) => {
+            adopt_registered(manager, &wide_name, &quoted)
+        }
         Err(error) => Err(format!("cannot create the service: {error}")),
     };
     // SAFETY: closing a handle this function opened, once.
@@ -131,7 +143,7 @@ fn install_named(name: &str) -> Result<(), String> {
 /// Starts a freshly created service, treating "already running" as success
 /// rather than a fault — it cannot normally happen right after creation, but
 /// there is no reason for this call to know that and every reason for it to
-/// share the same rule [`start_registered`] needs.
+/// share the same rule [`adopt_registered`] needs.
 fn start(service: windows::Win32::System::Services::SC_HANDLE) -> Result<(), String> {
     // SAFETY: `service` is live and owned by the caller for the duration of
     // this call.
@@ -145,22 +157,103 @@ fn start(service: windows::Win32::System::Services::SC_HANDLE) -> Result<(), Str
     }
 }
 
-/// Starts a service `install_named` found already registered under `name`.
+/// Takes over a service `install_named` found already registered under
+/// `name`, and leaves it running *this* binary.
 ///
-/// This is the idempotent half of `install()`: a second `--install` must
-/// succeed, and "succeed" means the service ends up running, not merely that
-/// the call did not error.
-fn start_registered(manager: SC_HANDLE, name: &[u16]) -> Result<(), String> {
+/// This is the idempotent half of `install()`, and it does more than start
+/// what is there. `--install` only ever runs just after the binary at
+/// `binary_path` has been put in place — the NSIS post-install hook, an
+/// updater's reinstall, the settings panel's own button — so the
+/// post-condition it owes is not "a service by this name is running" but
+/// "the service by this name is running *the binary that was just
+/// installed*". Two ways that used to come apart, both of which left the
+/// helper answering `refused` to every operation newer than whenever it was
+/// first started, while `sc query` cheerfully reported it `RUNNING`:
+///
+/// - The registered image path was never rewritten, so a service first
+///   registered from somewhere else (a development build, an install into a
+///   different directory) kept launching that other executable forever.
+/// - An already-running service was left running. The service control
+///   manager holds the image it started; replacing the file on disk does not
+///   touch the process, so the code actually serving the pipe stayed as old
+///   as the day it was first started.
+///
+/// So: rewrite the path, then restart. A restart costs a few seconds during
+/// which Ctrl+Alt+Del delivery is unavailable, which is a fair price for the
+/// property that the running helper is always the installed one.
+fn adopt_registered(manager: SC_HANDLE, name: &[u16], binary_path: &[u16]) -> Result<(), String> {
+    let access = SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | SERVICE_STOP;
     // SAFETY: `manager` is live and was opened with `SC_MANAGER_CONNECT`;
     // `name` is a live null-terminated wide string.
-    let service = unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_START) }
+    let service = unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), access) }
         .map_err(|error| format!("the service exists but cannot be reached: {error}"))?;
+
+    // Every field but the binary path is `SERVICE_NO_CHANGE`: this call is
+    // here to correct where the service manager looks for the executable, not
+    // to re-decide how the service is configured.
+    // SAFETY: `service` is live; `binary_path` is a null-terminated wide
+    // string that outlives the call; every other pointer argument is null.
+    let repointed = unsafe {
+        ChangeServiceConfigW(
+            service,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR(binary_path.as_ptr()),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+    };
+    if let Err(error) = repointed {
+        // Not fatal on its own: the path may well already be right, and a
+        // service that is running the correct binary is still the
+        // post-condition this function owes.
+        tracing::warn!(%error, "cannot correct the service's registered binary path");
+    }
+
+    stop_and_wait(service);
     let result = start(service);
     // SAFETY: closing a handle this function opened, once.
     unsafe {
         let _ = CloseServiceHandle(service);
     }
     result
+}
+
+/// Asks `service` to stop and waits for it to actually be stopped, bounded by
+/// [`STOP_TIMEOUT_MS`].
+///
+/// Best effort throughout: a service that is already stopped, that refuses the
+/// control, or that overruns the wait all lead to the same next step — try to
+/// start it — and a failure there is what gets reported to the caller.
+/// `ControlService` only *requests* a stop, so the poll is the part that makes
+/// the following `StartServiceW` see a stopped service rather than
+/// `ERROR_SERVICE_ALREADY_RUNNING` on the old image.
+fn stop_and_wait(service: SC_HANDLE) {
+    let mut status = SERVICE_STATUS::default();
+    // SAFETY: `service` is live and `status` is an owned struct that outlives
+    // the call.
+    if unsafe { ControlService(service, SERVICE_CONTROL_STOP, &raw mut status) }.is_err() {
+        // Already stopped, or not stoppable. Either way there is nothing to
+        // wait for.
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STOP_TIMEOUT_MS);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(STOP_POLL_MS));
+        // SAFETY: as above.
+        if unsafe { QueryServiceStatus(service, &raw mut status) }.is_err() {
+            return;
+        }
+        if status.dwCurrentState == SERVICE_STOPPED {
+            return;
+        }
+    }
+    tracing::warn!("the service did not stop in time; starting it anyway");
 }
 
 /// Stops and removes the service. Requires administrator rights.

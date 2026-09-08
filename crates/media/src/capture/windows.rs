@@ -62,10 +62,7 @@ pub use stub::{WindowsCapturer, WindowsInjector};
 mod dxgi {
     use std::time::{Duration, Instant};
 
-    use lumepeer_core::constants::{
-        ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS,
-        SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS,
-    };
+    use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS};
     use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, HMODULE};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
     use windows::Win32::Graphics::Direct3D11::{
@@ -1131,8 +1128,6 @@ mod dxgi {
     /// (`docs/bugs/11-uac-degradation.md`).
     #[derive(Debug)]
     struct Recovery {
-        /// Reopen attempts made so far, including the current one.
-        attempts: u32,
         /// Earliest instant the next reopen attempt may run.
         next_attempt_at: Instant,
         /// Reason from the most recent failed reopen (or the failure that
@@ -1145,7 +1140,6 @@ mod dxgi {
         /// there is no reason to wait out a backoff before ever trying once.
         fn started(reason: String) -> Self {
             Self {
-                attempts: 0,
                 next_attempt_at: Instant::now(),
                 reason,
             }
@@ -1154,13 +1148,6 @@ mod dxgi {
         /// Whether a reopen attempt is due at `now`.
         fn due(&self, now: Instant) -> bool {
             now >= self.next_attempt_at
-        }
-
-        /// Counts one more attempt and reports whether
-        /// [`SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`] is now exhausted.
-        fn record_attempt(&mut self) -> bool {
-            self.attempts += 1;
-            self.attempts > SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS
         }
 
         /// Schedules the next attempt one backoff interval after `now`, and
@@ -1433,15 +1420,24 @@ mod dxgi {
         /// A duplication lost to `MediaError::SecureDesktopActive` is not
         /// handed back to the caller as a failure on the spot: it is dropped
         /// here and reopening is retried on later polls, at most once per
-        /// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`], for up to
-        /// [`SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`] attempts. Every poll
-        /// while that is running still returns
-        /// `Err(MediaError::SecureDesktopActive)` — never `Ok` — so the
-        /// caller (`apps/desktop/src-tauri/src/view.rs::spawn_encode_loop`)
-        /// can tell "still stuck, keep the session up and say so" apart from
-        /// "gave up, revoke", without counting attempts of its own. Only once
-        /// the budget above is exhausted does this return the ordinary
-        /// [`MediaError::CaptureInterrupted`] that means revoke.
+        /// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`]. Every poll while that is
+        /// running returns `Err(MediaError::SecureDesktopActive)` — never
+        /// `Ok` — so the caller
+        /// (`apps/desktop/src-tauri/src/view.rs::spawn_encode_loop`) knows to
+        /// keep the session up and say so rather than to revoke.
+        ///
+        /// The retry has no attempt budget, and that is the point. It used to
+        /// give up after two minutes and return `CaptureInterrupted`, which
+        /// ended the encode loop for good and left this capturer with a
+        /// target but no duplication and no recovery — so every later media
+        /// session died on "capturer not started" too, and the guest's
+        /// session fell apart minutes after the host's screen locked, never
+        /// to come back when it unlocked. A lock screen is under the host
+        /// operator's control and clears on its own schedule, which is not a
+        /// deadline this side gets to set: the honest answer is to keep
+        /// saying "blocked" for as long as it lasts. Every failure that is
+        /// *not* the secure desktop still returns immediately, so a genuinely
+        /// dead display still ends the session.
         fn next_frame(&mut self) -> Result<Option<Frame>> {
             if let Some(active) = self.active.as_mut() {
                 match active.next_frame() {
@@ -1472,13 +1468,6 @@ mod dxgi {
             let now = Instant::now();
             if !recovery.due(now) {
                 return Err(MediaError::SecureDesktopActive(recovery.reason.clone()));
-            }
-            if recovery.record_attempt() {
-                let reason = recovery.reason.clone();
-                self.recovering = None;
-                return Err(MediaError::CaptureInterrupted(format!(
-                    "gave up reopening after the secure desktop, {SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS} attempts: {reason}"
-                )));
             }
             match Active::open(target) {
                 Ok(active) => {
@@ -2580,10 +2569,11 @@ mod dxgi {
 
         /// The reopen loop's own logic, independent of DXGI: due immediately
         /// on the first attempt, not due again until a full backoff elapses,
-        /// and exhausted only once `SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS`
-        /// attempts have actually been counted (docs/bugs/11-uac-degradation.md).
+        /// and never exhausted — a lock screen that outlasts any budget this
+        /// side could pick must not end the session
+        /// (docs/bugs/11-uac-degradation.md).
         #[test]
-        fn recovery_backoff_paces_attempts_and_has_a_bounded_budget() {
+        fn recovery_backoff_paces_attempts_and_never_gives_up() {
             let mut recovery = Recovery::started("secure desktop".to_owned());
             let start = Instant::now();
 
@@ -2596,16 +2586,18 @@ mod dxgi {
                 recovery.due(start + Duration::from_millis(SECURE_DESKTOP_RECOVERY_BACKOFF_MS))
             );
 
-            for attempt in 1..=SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS {
-                let exhausted = recovery.record_attempt();
-                assert_eq!(
-                    exhausted,
-                    attempt > SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS,
-                    "attempt {attempt} should not exhaust the budget early"
-                );
+            // An hour of lock screen, at one attempt per backoff, still leaves
+            // the recovery willing to try again.
+            let backoff = Duration::from_millis(SECURE_DESKTOP_RECOVERY_BACKOFF_MS);
+            // The `schedule_next` above already put the next attempt one
+            // backoff out, so that is where this walk starts.
+            let mut now = start + backoff;
+            for _ in 0..3_600 {
+                assert!(recovery.due(now));
+                recovery.schedule_next(now, "still blocked".to_owned());
+                now += backoff;
             }
-            // One more, past the budget, must exhaust it.
-            assert!(recovery.record_attempt());
+            assert!(recovery.due(now));
         }
 
         /// `COLOR` arrives with straight alpha and the wire wants it
