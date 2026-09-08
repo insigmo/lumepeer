@@ -97,6 +97,8 @@ export const ar: Dictionary = {
   'system.installing': 'جارٍ التثبيت...',
   'system.installedRestart': 'تم التثبيت. أعد تشغيل Lumepeer لتشغيل الإصدار الجديد.',
   'system.updateFailed': 'تعذّر إكمال التحديث. لم يُثبَّت شيء.',
+  'system.language': 'اللغة',
+  'system.language.systemDefault': 'لغة النظام',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'history.remove': 'إزالة',

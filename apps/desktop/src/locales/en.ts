@@ -104,6 +104,8 @@ export const en: Dictionary = {
   'system.installing': 'Installing...',
   'system.installedRestart': 'Installed. Restart Lumepeer to run the new version.',
   'system.updateFailed': 'The update could not be completed. Nothing was installed.',
+  'system.language': 'Language',
+  'system.language.systemDefault': 'System default',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'history.remove': 'Remove',
