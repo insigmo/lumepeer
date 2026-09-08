@@ -42,6 +42,22 @@ encode-openh264 = ["dep:openh264"]
 # shipped Linux feature set: a .deb must install and run on a machine with no
 # VA-API at all, falling back to openh264 (§18).
 encode-vaapi = ["dep:cros-libva"]
+# VideoToolbox hardware H.264 encoder for macOS (§5.1, §11, §18/§19 phase 4;
+# ADR 0066). Same convention as encode-mf/encode-vaapi: `cargo build
+# --workspace` needs no platform SDK, and every binding it needs is declared
+# optional in the macOS target table below, so the feature is inert (and the
+# crates are never built) on every other platform. It names the objc2
+# framework crates it uses itself rather than free-riding on
+# capture-screencapturekit's list, so a build that wants the encoder without
+# ScreenCaptureKit still gets them. Ships *alongside* encode-openh264 on
+# macOS, never instead of it: a Mac whose probe declines has to keep running
+# on the software fallback (§18).
+encode-videotoolbox = [
+    "dep:objc2-core-foundation",
+    "dep:objc2-core-media",
+    "dep:objc2-core-video",
+    "dep:objc2-video-toolbox",
+]
 # Opus audio encode/decode (§5.1; ADR 0023). audiopus_sys vendors libopus and
 # builds it with cmake — the same precedent as openh264-sys — so the default
 # build still needs no platform SDK. Without this feature every audio entry
@@ -138,6 +154,13 @@ objc2 = { version = "0.6.4", optional = true }
 objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
     "CFCGTypes",
+    # The three CF types `encode-videotoolbox` talks to VideoToolbox with:
+    # property keys are `CFString`s, their values `CFNumber`s and
+    # `CFBoolean`s (`CFNumber`), and `kVTEncodeFrameOptionKey_ForceKeyFrame`
+    # travels in a `CFDictionary` of per-frame options.
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
 ] }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
@@ -159,6 +182,12 @@ objc2-core-media = { version = "0.3.2", optional = true, default-features = fals
     "CMSampleBuffer",
     "CMTime",
     "objc2-core-video",
+    # `encode-videotoolbox` reads a compressed sample's bytes out of its
+    # `CMBlockBuffer` and its SPS/PPS out of its `CMFormatDescription` —
+    # VideoToolbox keeps the parameter sets there rather than in the
+    # bitstream, so without this a guest never sees an SPS.
+    "CMBlockBuffer",
+    "CMFormatDescription",
 ] }
 objc2-core-video = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
@@ -176,6 +205,22 @@ objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-feature
     "dispatch2",
     "objc2-core-graphics",
     "objc2-core-media",
+] }
+# The VideoToolbox compression session itself (ADR 0066), pulled in only by
+# `encode-videotoolbox`. Same objc2 0.3.2 framework-binding family, and the
+# same pinned version, as the ScreenCaptureKit crates above, so enabling the
+# encoder adds one framework crate rather than a second objc2 generation.
+# `objc2` interop is deliberately not enabled: nothing here is an
+# Objective-C object, only CoreFoundation types.
+objc2-video-toolbox = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "VTBase",
+    "VTErrors",
+    "VTSession",
+    "VTCompressionProperties",
+    "VTCompressionSession",
+    "objc2-core-media",
+    "objc2-core-video",
 ] }
 block2 = { version = "0.6.2", optional = true }
 dispatch2 = { version = "0.3.1", optional = true, default-features = false, features = [

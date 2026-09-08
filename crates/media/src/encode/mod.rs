@@ -116,8 +116,17 @@ pub trait VideoEncoder: Send {
 /// AV1 over VA-API is a different profile with different parameter buffers,
 /// and nothing here has checked it.
 ///
-/// `VideoToolbox` and `MediaCodec` remain phase 4 work (§19), so this is
-/// `None` on macOS and Android.
+/// On macOS, with `encode-videotoolbox` built in,
+/// [`macos_videotoolbox`] goes one step further than either of those: it
+/// opens a real `VTCompressionSession` *and pushes a frame through it*,
+/// reporting [`EncoderKind::Hardware`] only once a picture has actually come
+/// back out (ADR 0066). Every Mac of the last decade has an H.264 encoder, so
+/// "is one installed" is a question whose answer is almost always yes and
+/// almost never the reason a session shows nothing. `VideoCodec::Av1` is
+/// `None` there too, and for the same reason as the other two: `VideoToolbox`
+/// encodes AV1 through a different codec type that nothing here has checked.
+///
+/// `MediaCodec` remains phase 4 work (§19), so this is `None` on Android.
 #[must_use]
 pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
     // AV1 is refused up front, on every platform, rather than once per
@@ -142,6 +151,12 @@ pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
     ))]
     {
         if linux_vaapi::hardware_h264_available(config) {
+            return Some(EncoderKind::Hardware);
+        }
+    }
+    #[cfg(all(target_os = "macos", feature = "encode-videotoolbox"))]
+    {
+        if macos_videotoolbox::hardware_h264_available(config) {
             return Some(EncoderKind::Hardware);
         }
     }
@@ -193,6 +208,22 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
                 }
             }
         }
+        #[cfg(all(target_os = "macos", feature = "encode-videotoolbox"))]
+        {
+            tracing::info!("hardware H.264 encoder available, using VideoToolbox (§18)");
+            // Deliberately not `?`, for the same reason the VA-API arm above
+            // is not: the probe has already opened a session and encoded a
+            // frame through it, so a constructor that then fails is the
+            // framework changing its mind between two calls a microsecond
+            // apart. A session is worth more than being right about that, so
+            // it falls through to openh264 with a log line (§18, ADR 0066).
+            match macos_videotoolbox::VideoToolboxEncoder::new(config) {
+                Ok(encoder) => return Ok(Box::new(encoder) as Box<dyn VideoEncoder>),
+                Err(error) => {
+                    tracing::info!(%error, "the VideoToolbox encoder probed available but would not build; falling back to openh264");
+                }
+            }
+        }
         // A platform whose `probe_hardware` above can return `Hardware` but
         // that has no constructor wired up here would silently encode with
         // the software fallback while reporting hardware. This arm exists so
@@ -204,6 +235,7 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
                 not(target_os = "android"),
                 feature = "encode-vaapi"
             ),
+            all(target_os = "macos", feature = "encode-videotoolbox"),
         )))]
         {
             return Err(MediaError::EncoderUnavailable(
@@ -234,8 +266,19 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         not(target_os = "android"),
         feature = "encode-vaapi"
     ),
+    all(target_os = "macos", feature = "encode-videotoolbox"),
 ))]
 mod nv12;
+
+/// macOS `VideoToolbox` hardware H.264 encoder (§5.1, §11, §18/§19 phase 4;
+/// ADR 0066).
+///
+/// Compiled off macOS under `cfg(test)` as well as on it: the AVCC-to-Annex-B
+/// rewrite this backend owes the guest is pure byte manipulation, and running
+/// its tests on whatever machine happens to build the crate is worth more than
+/// keeping the module strictly Mac-only.
+#[cfg(all(feature = "encode-videotoolbox", any(target_os = "macos", test)))]
+pub mod macos_videotoolbox;
 
 /// VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4;
 /// ADR 0040).
