@@ -4,11 +4,36 @@
 // the `dir` switch actually gets exercised.
 
 import { ar } from './locales/ar';
+import { de } from './locales/de';
 import { en } from './locales/en';
+import { es } from './locales/es';
+import { fr } from './locales/fr';
+import { it } from './locales/it';
+import { ja } from './locales/ja';
+import { pl } from './locales/pl';
+import { pt } from './locales/pt';
+import { ru } from './locales/ru';
+import { tr } from './locales/tr';
+import { uk } from './locales/uk';
+import { zh } from './locales/zh';
 
-export type Locale = 'en' | 'ar';
+export type Locale = 'en' | 'ar' | 'ru' | 'de' | 'fr' | 'es' | 'pt' | 'it' | 'tr' | 'uk' | 'pl' | 'zh' | 'ja';
 
-export const SUPPORTED_LOCALES: readonly Locale[] = ['en', 'ar'];
+export const SUPPORTED_LOCALES: readonly Locale[] = [
+  'en',
+  'ar',
+  'ru',
+  'de',
+  'fr',
+  'es',
+  'pt',
+  'it',
+  'tr',
+  'uk',
+  'pl',
+  'zh',
+  'ja',
+];
 export const DEFAULT_LOCALE: Locale = 'en';
 
 // Each language's own name for itself, for the manual picker in the settings
@@ -17,6 +42,17 @@ export const DEFAULT_LOCALE: Locale = 'en';
 export const LOCALE_NAMES: Record<Locale, string> = {
   en: 'English',
   ar: 'العربية',
+  ru: 'Русский',
+  de: 'Deutsch',
+  fr: 'Français',
+  es: 'Español',
+  pt: 'Português',
+  it: 'Italiano',
+  tr: 'Türkçe',
+  uk: 'Українська',
+  pl: 'Polski',
+  zh: '中文',
+  ja: '日本語',
 };
 
 export type TranslationKey =
@@ -299,7 +335,21 @@ export type TranslationKey =
 
 export type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
-const dictionaries: Record<Locale, Dictionary> = { en, ar };
+const dictionaries: Record<Locale, Dictionary> = {
+  en,
+  ar,
+  ru,
+  de,
+  fr,
+  es,
+  pt,
+  it,
+  tr,
+  uk,
+  pl,
+  zh,
+  ja,
+};
 
 export function dirOf(locale: Locale): 'ltr' | 'rtl' {
   return locale === 'ar' ? 'rtl' : 'ltr';
