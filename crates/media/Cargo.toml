@@ -50,6 +50,24 @@ audio-capture-screencapturekit = [
     "objc2-core-media/CMBlockBuffer",
     "objc2-core-media/objc2-core-audio-types",
 ]
+# CoreAudio `AudioQueue` desktop-audio playout for macOS (§11; ADR 0028;
+# docs/gap-tasks/02-macos-audio-playout.md). Independent of
+# `audio-capture-screencapturekit`: playback shares none of ScreenCaptureKit's
+# plumbing, so this is its own feature rather than folded into that one, the
+# same way `audio-capture`/`audio-capture-pipewire` are their own features
+# next to `capture-windows`/`capture-portal`. `objc2-core-audio` (the
+# CoreAudio HAL) is already resolved at this exact version through
+# `objc2-core-media`'s own dependency tree (see the
+# `audio-capture-screencapturekit` comment above and Cargo.lock), so adding
+# it as a direct dependency here is not a new objc2 major version.
+# `objc2-audio-toolbox` (the `AudioQueue` API itself) is genuinely new to
+# this workspace, pinned at that same 0.3.2 the rest of the objc2 framework
+# family here already uses.
+audio-playout-coreaudio = [
+    "dep:objc2-audio-toolbox",
+    "dep:objc2-core-audio",
+    "dep:objc2-core-audio-types",
+]
 # xdg-desktop-portal negotiation and PipeWire frame consumption for the
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
@@ -209,6 +227,33 @@ dispatch2 = { version = "0.3.1", optional = true, default-features = false, feat
 objc2-core-audio-types = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
     "CoreAudioBaseTypes",
+] }
+# CoreAudio HAL (`AudioObjectGetPropertyData`,
+# `kAudioHardwarePropertyDefaultOutputDevice`) for reading the default output
+# device's real nominal sample rate before opening it (audio-playout-
+# coreaudio; docs/gap-tasks/02-macos-audio-playout.md) — the same "ask, don't
+# assume" discipline `WasapiPlayout::start`'s `GetMixFormat` call and
+# `capture_audio::linux_pipewire`'s negotiated-format handling both follow.
+# Already resolved at this exact version through objc2-core-media's own
+# dependency tree (checked against Cargo.lock), so this is a direct edge onto
+# a crate already in the graph, not a new objc2 version — the same reasoning
+# objc2-core-audio-types above documents.
+objc2-core-audio = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "AudioHardware",
+] }
+# `AudioQueue` (AudioToolbox framework) itself: the playback engine
+# audio-playout-coreaudio opens against the default output device. Needs its
+# own `objc2-core-audio-types` (AudioQueueBuffer/AudioStreamBasicDescription)
+# and `objc2-core-foundation` (the run-loop parameters `AudioQueueNewOutput`
+# takes) sub-features; both crates are already in this table above at the
+# same version, so this adds no new objc2 major version either — genuinely
+# new is only the `objc2-audio-toolbox` crate itself.
+objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "AudioQueue",
+    "objc2-core-audio-types",
+    "objc2-core-foundation",
 ] }
 
 # Used unconditionally on Windows (not gated by a Cargo feature): §11.3's
