@@ -69,14 +69,6 @@ pub const RECONNECT_WINDOW_SECS: u64 = 60;
 /// Duplication lost to the secure desktop (lock screen, UAC prompt or fast
 /// user switch), in milliseconds (docs/bugs/11-uac-degradation.md).
 pub const SECURE_DESKTOP_RECOVERY_BACKOFF_MS: u64 = 1_000;
-/// Consecutive reopen attempts `WindowsCapturer` makes before giving up and
-/// reporting the session as interrupted for good
-/// (docs/bugs/11-uac-degradation.md). At
-/// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`] this is a two-minute window —
-/// generous enough for someone to notice and answer a UAC prompt, bounded
-/// enough that a host with a permanently unattended monitor does not spin
-/// forever.
-pub const SECURE_DESKTOP_RECOVERY_MAX_ATTEMPTS: u32 = 120;
 /// How often the encode loop asks the privileged helper for a fresh frame of
 /// the secure desktop while it holds the `secure_desktop` grant and capture
 /// is stuck behind one, in milliseconds

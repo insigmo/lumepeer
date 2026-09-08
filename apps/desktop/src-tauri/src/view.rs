@@ -112,6 +112,20 @@ pub struct EncodeControl {
     /// Written by the loop, read by the actor for the host's own
     /// non-removable indicator (ADR 0049).
     secure_desktop_active: Arc<AtomicBool>,
+    /// Whether the host's own capture is, right now, blocked behind the
+    /// secure desktop — the capturer's report, with no grant in it.
+    ///
+    /// Distinct from `secure_desktop_active` above, which additionally
+    /// requires the `secure_desktop` *viewing* grant, because the two answer
+    /// different questions. "Is the guest being shown these pixels" decides
+    /// the indicator; "can an ordinary `SendInput` reach the desktop at all"
+    /// decides where a guest's click has to be routed (ADR 0057), and that
+    /// one is a fact about this machine that no grant changes. Keying the
+    /// routing off the viewing flag meant a session without the viewing
+    /// grant sent every click to the in-session injector, where `SendInput`
+    /// answered `ERROR_ACCESS_DENIED` and the event vanished
+    /// (`docs/bugs/15-secure-desktop-capture.md`).
+    secure_desktop_blocked: Arc<AtomicBool>,
 }
 
 impl EncodeControl {
@@ -134,6 +148,7 @@ impl EncodeControl {
             // window in which the core has not been consulted at all.
             secure_desktop_allowed: Arc::new(AtomicBool::new(false)),
             secure_desktop_active: Arc::new(AtomicBool::new(false)),
+            secure_desktop_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -278,6 +293,21 @@ impl EncodeControl {
     #[must_use]
     pub fn secure_desktop_active(&self) -> bool {
         self.secure_desktop_active.load(Ordering::Relaxed)
+    }
+
+    /// Records what the capturer just reported about the secure desktop,
+    /// grant or no grant.
+    fn set_secure_desktop_blocked(&self, blocked: bool) {
+        self.secure_desktop_blocked
+            .store(blocked, Ordering::Relaxed);
+    }
+
+    /// Host side: whether this machine's capture is currently behind the
+    /// secure desktop, which is what decides that an input event has to go
+    /// through the helper rather than through `SendInput` (ADR 0057).
+    #[must_use]
+    pub fn secure_desktop_blocked(&self) -> bool {
+        self.secure_desktop_blocked.load(Ordering::Relaxed)
     }
 }
 
@@ -1287,8 +1317,11 @@ pub fn spawn_encode_loop(
                     secure_desktop_notified = false;
                     // Ordinary capture just produced a real frame, so
                     // whatever the secure-desktop path was doing a moment
-                    // ago is not happening on this tick (ADR 0049).
+                    // ago is not happening on this tick (ADR 0049): the
+                    // desktop is reachable again, for pictures and for input
+                    // alike.
                     control.set_secure_desktop_active(false);
+                    control.set_secure_desktop_blocked(false);
                     frame
                 }
                 // The screen has not changed (§11.1): nothing to send. Also
@@ -1298,6 +1331,7 @@ pub fn spawn_encode_loop(
                 Ok(Ok(None)) => {
                     secure_desktop_notified = false;
                     control.set_secure_desktop_active(false);
+                    control.set_secure_desktop_blocked(false);
                     sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
@@ -1334,6 +1368,13 @@ pub fn spawn_encode_loop(
                     // episode instead, while the guest is actually being shown
                     // the secure desktop (the viewing grant is on) — input is not
                     // throttled just because the picture is.
+                    //
+                    // The *routing* flag carries no grant at all: whether an
+                    // ordinary `SendInput` can reach the desktop is a fact
+                    // about this machine, and a session without the viewing
+                    // grant used to send its clicks to an injector that could
+                    // only answer `ERROR_ACCESS_DENIED`.
+                    control.set_secure_desktop_blocked(true);
                     control.set_secure_desktop_active(control.secure_desktop_allowed());
                     if let Some(frame) = secure_desktop_frame(
                         &control,
@@ -3128,6 +3169,44 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// Where a guest's click is routed does not depend on whether that guest
+    /// is allowed to *see* the secure desktop. Both flags exist because they
+    /// answer different questions, and conflating them sent every click of a
+    /// session without the viewing grant to an injector whose `SendInput`
+    /// could only answer `ERROR_ACCESS_DENIED`
+    /// (`docs/bugs/15-secure-desktop-capture.md`).
+    #[test]
+    fn input_routing_follows_the_capturer_and_the_indicator_follows_the_grant() {
+        let peer = iroh::SecretKey::generate().public();
+        let control = EncodeControl::new(peer, None);
+
+        // What the encode loop does on a `SecureDesktopActive` tick, for a
+        // session that may not see the secure desktop.
+        control.set_secure_desktop_blocked(true);
+        control.set_secure_desktop_active(control.secure_desktop_allowed());
+        assert!(
+            control.secure_desktop_blocked(),
+            "input must be routed to the helper whenever the desktop is out of reach"
+        );
+        assert!(
+            !control.secure_desktop_active(),
+            "a session without the viewing grant is not being shown anything"
+        );
+
+        // The same tick, once the host grants the viewing permission.
+        control.set_secure_desktop_allowed(true);
+        control.set_secure_desktop_blocked(true);
+        control.set_secure_desktop_active(control.secure_desktop_allowed());
+        assert!(control.secure_desktop_blocked());
+        assert!(control.secure_desktop_active());
+
+        // And a tick where ordinary capture works again clears both.
+        control.set_secure_desktop_blocked(false);
+        control.set_secure_desktop_active(false);
+        assert!(!control.secure_desktop_blocked());
+        assert!(!control.secure_desktop_active());
     }
 
     /// The actor writes the host's reason into the slot and then aborts the

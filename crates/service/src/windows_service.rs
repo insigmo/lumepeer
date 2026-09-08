@@ -459,7 +459,21 @@ fn caller_is_in_active_console_session(pipe: HANDLE) -> bool {
     }
     // SAFETY: a plain kernel32 export with no arguments and no invariants.
     let active_console_session = unsafe { WTSGetActiveConsoleSessionId() };
-    client_session == active_console_session
+    if client_session != active_console_session {
+        // Named in the log, never in the reply: the client still learns only
+        // `refused` (`protocol.rs`), but somebody reading this machine's own
+        // log can tell this refusal apart from the five other ways a
+        // secure-desktop operation comes back `refused`. `0xffffffff` for the
+        // console session means no session is attached to it at all, which is
+        // a different problem from the two simply differing.
+        tracing::warn!(
+            client_session,
+            active_console_session,
+            "the caller is not in the session attached to the console"
+        );
+        return false;
+    }
+    true
 }
 
 /// A null-terminated UTF-16 copy of `text`, for the `W` entry points.

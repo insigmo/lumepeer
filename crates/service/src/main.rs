@@ -33,6 +33,8 @@
 #[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
+mod log;
+#[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
 mod secure_desktop_input;
@@ -42,6 +44,7 @@ mod secure_desktop_launch;
 mod windows_service;
 
 fn main() {
+    #[cfg(not(target_os = "windows"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -51,6 +54,10 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
+        // A file, not stdout: a process the service control manager starts has
+        // no stdout, so until this existed every line this crate logged about
+        // why an operation was refused went nowhere at all (`log.rs`).
+        let log_path = log::init();
         // `--console` runs the same listener in the foreground, as an ordinary
         // process. It is how the endpoint and the protocol are exercised
         // without registering anything with the SCM; it is *not* a way to get
@@ -100,6 +107,12 @@ fn main() {
                 1
             };
             std::process::exit(i32::try_from(code).unwrap_or(1));
+        }
+        // Only the long-lived runs say this, and only after the worker
+        // branches above have returned: a worker is spawned per click, and a
+        // line each would be the loudest thing in the file.
+        if let Some(path) = &log_path {
+            tracing::info!(path = %path.display(), "lumepeer-service is logging here");
         }
         if args.iter().any(|arg| arg == "--install") {
             match install::install() {
