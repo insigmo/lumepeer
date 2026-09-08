@@ -11,6 +11,14 @@ export type Locale = 'en' | 'ar';
 export const SUPPORTED_LOCALES: readonly Locale[] = ['en', 'ar'];
 export const DEFAULT_LOCALE: Locale = 'en';
 
+// Each language's own name for itself, for the manual picker in the settings
+// panel — a menu of languages is only readable if a person who doesn't yet
+// read the current UI language can still find their own in it.
+export const LOCALE_NAMES: Record<Locale, string> = {
+  en: 'English',
+  ar: 'العربية',
+};
+
 export type TranslationKey =
   | 'consent.none.title'
   | 'consent.none.body'
@@ -105,6 +113,8 @@ export type TranslationKey =
   | 'system.installing'
   | 'system.installedRestart'
   | 'system.updateFailed'
+  | 'system.language'
+  | 'system.language.systemDefault'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   | 'history.remove'
@@ -304,6 +314,45 @@ export function detectLocale(nav: Pick<Navigator, 'language' | 'languages'>): Lo
     }
   }
   return DEFAULT_LOCALE;
+}
+
+// The manual language picker (settings panel) is a single-window UI setting,
+// not session state, so it lives in localStorage rather than behind an
+// ActorStores path (which is for real on-disk stores shared across test
+// actors) or the read-only config.rs.
+const LOCALE_STORAGE_KEY = 'lumepeer.locale';
+
+/** The language a person picked by hand, or null for "system default". */
+export function getStoredLocaleChoice(): Locale | null {
+  try {
+    const raw = localStorage.getItem(LOCALE_STORAGE_KEY);
+    return raw !== null && (SUPPORTED_LOCALES as readonly string[]).includes(raw)
+      ? (raw as Locale)
+      : null;
+  } catch {
+    // Storage can be unavailable (private browsing, disabled site data). The
+    // picker still works for the running session, it just won't survive a
+    // restart.
+    return null;
+  }
+}
+
+/** Saves a manual choice, or clears it when `choice` is null ("system default"). */
+export function setStoredLocaleChoice(choice: Locale | null): void {
+  try {
+    if (choice === null) {
+      localStorage.removeItem(LOCALE_STORAGE_KEY);
+    } else {
+      localStorage.setItem(LOCALE_STORAGE_KEY, choice);
+    }
+  } catch {
+    // Nothing to recover: the choice still applies to this running session.
+  }
+}
+
+/** Resolution order: saved choice, then the OS/webview locale, then the default. */
+export function resolveLocale(nav: Pick<Navigator, 'language' | 'languages'>): Locale {
+  return getStoredLocaleChoice() ?? detectLocale(nav);
 }
 
 export function t(locale: Locale, key: TranslationKey, arg?: string): string {

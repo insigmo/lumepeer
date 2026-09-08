@@ -13,7 +13,7 @@ import {
 } from './address-book';
 import { ChatState, startChatPolling, tauriChatCommands } from './chat';
 import { consentDialog } from './consent-dialog';
-import { detectLocale, dirOf, type Locale } from './i18n';
+import { dirOf, resolveLocale, type Locale } from './i18n';
 import { t } from './i18n';
 import { SETTINGS_ICON } from './icons';
 import {
@@ -43,7 +43,7 @@ import { onUnattendedStateChange, unattendedIndicator, type UnattendedStatus } f
 
 const root = document.querySelector('#app');
 const chatPanel = document.querySelector<HTMLElement>('#host-chat-panel');
-let locale: Locale = detectLocale(navigator);
+let locale: Locale = resolveLocale(navigator);
 
 // Latest polled state (§ main.ts refresh loop below). Rendering is split
 // from fetching so invite-view's own async UI state (copy feedback, connect
@@ -248,6 +248,7 @@ function renderNow(): void {
         auditCommands: tauriAuditCommands,
         systemCommands: tauriSystemCommands,
         onRefresh: () => void refresh(),
+        onLocaleChange: setLocale,
       }),
     ],
     root as HTMLElement,
@@ -361,10 +362,11 @@ async function refresh(): Promise<void> {
   renderNow();
 }
 
-// Exposed for manual/e2e locale switching; the consent screen itself carries
-// no locale picker (§19 phase 6 doesn't ask for one, and adding UI chrome to
-// a screen that must render instantly is scope creep) — the OS/webview
-// locale via `navigator.language` is what `detectLocale` reads.
+// Applies a locale switch — from the manual picker in the settings panel, or
+// e2e tests — and re-renders immediately. The consent screen itself still
+// carries no picker of its own (§19 phase 6 doesn't ask for one, and adding
+// UI chrome to a screen that must render instantly is scope creep); it just
+// inherits whatever `locale` already resolved to.
 export function setLocale(next: Locale): void {
   locale = next;
   renderNow();
