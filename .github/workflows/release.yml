@@ -188,11 +188,11 @@ jobs:
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
-            features: capture-screencapturekit,encode-openh264,audio-capture-screencapturekit
+            features: capture-screencapturekit,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
           - name: macos-amd64
             os: macos-14
             target: x86_64-apple-darwin
-            features: capture-screencapturekit,encode-openh264,audio-capture-screencapturekit
+            features: capture-screencapturekit,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
