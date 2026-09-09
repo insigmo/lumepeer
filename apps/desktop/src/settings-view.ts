@@ -148,6 +148,8 @@ export interface SettingsPanels {
   auditCommands: AuditCommands;
   systemCommands: SystemCommands;
   onRefresh: () => void;
+  /** Applies a manual language choice; undefined leaves the picker inert. */
+  onLocaleChange?: (locale: Locale) => void;
 }
 
 /** The panels belonging to one section. */
@@ -158,7 +160,7 @@ function section(panels: SettingsPanels): TemplateResult {
       // How the app itself behaves, who this machine lets in, and the code it
       // hands out to invite them.
       return html`
-        ${systemSettings(locale, panels.systemCommands)}
+        ${systemSettings(locale, panels.systemCommands, panels.onLocaleChange)}
         ${addressBook(panels.savedDevices, locale, panels.onRefresh)}
         ${inviteRefreshPanel(locale)}
       `;

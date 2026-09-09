@@ -15,7 +15,7 @@
 import { html, type TemplateResult } from "lit-html";
 
 import type { Locale } from "./i18n";
-import { t } from "./i18n";
+import { getStoredLocaleChoice, LOCALE_NAMES, resolveLocale, setStoredLocaleChoice, SUPPORTED_LOCALES, t } from "./i18n";
 
 /** What an update check found. */
 export interface UpdateInfo {
@@ -106,6 +106,7 @@ export function resetSystemSettings(): void {
 export function systemSettings(
   locale: Locale,
   commands: SystemCommands = tauriSystemCommands,
+  onLocaleChange: (locale: Locale) => void = () => {},
 ): TemplateResult {
   if (!state.loaded) {
     state.loaded = true;
@@ -125,6 +126,31 @@ export function systemSettings(
   return html`
     <section class="system-settings" data-testid="system-settings">
       <h3>${t(locale, "system.heading")}</h3>
+
+      <div class="system-row">
+        <label for="system-language">${t(locale, "system.language")}</label>
+        <select
+          id="system-language"
+          data-testid="language-select"
+          @change=${(event: Event) => {
+            const value = (event.target as HTMLSelectElement).value;
+            const choice: Locale | null = value === "system" ? null : (value as Locale);
+            setStoredLocaleChoice(choice);
+            onLocaleChange(resolveLocale(navigator));
+          }}
+        >
+          <option value="system" ?selected=${getStoredLocaleChoice() === null}>
+            ${t(locale, "system.language.systemDefault")}
+          </option>
+          ${SUPPORTED_LOCALES.map(
+            (code) => html`
+              <option value=${code} ?selected=${getStoredLocaleChoice() === code}>
+                ${LOCALE_NAMES[code]}
+              </option>
+            `,
+          )}
+        </select>
+      </div>
 
       <label class="system-row">
         <input
