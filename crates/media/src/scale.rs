@@ -22,6 +22,21 @@ use crate::capture::{Frame, PixelFormat};
 /// Bytes per pixel of [`PixelFormat::Bgra8`].
 const BGRA_BYTES: usize = 4;
 
+/// `frame`'s pixels when there are at least as many of them as the picture
+/// claims, or `None` when there are not.
+///
+/// The pixels come through [`Frame::as_cpu`], so a frame the Windows
+/// zero-copy path left on the GPU (ADR 0073) is read back here — which is
+/// what makes reducing a picture and keeping it off main memory mutually
+/// exclusive, and why that path is only live while nothing needs reducing.
+fn usable_pixels(frame: &Frame) -> Option<&[u8]> {
+    let expected = (frame.width as usize)
+        .saturating_mul(frame.height as usize)
+        .saturating_mul(BGRA_BYTES);
+    let pixels = frame.as_cpu().ok()?;
+    (pixels.len() >= expected).then_some(pixels)
+}
+
 /// Target dimensions for a picture of `width`x`height`, or `None` when it
 /// already fits [`MAX_PICTURE_PIXELS`].
 ///
@@ -95,21 +110,13 @@ pub fn scale_to_percent(frame: Frame, percent: u32) -> Frame {
     let Some((width, height)) = scaled_size(frame.width, frame.height, percent) else {
         return frame;
     };
-    let expected = (frame.width as usize)
-        .saturating_mul(frame.height as usize)
-        .saturating_mul(BGRA_BYTES);
-    if frame.data.len() < expected {
+    let Some(pixels) = usable_pixels(&frame) else {
         // Same reasoning as `fit_within_budget`: a short buffer is not this
         // module's to interpret.
         return frame;
-    }
-    Frame {
-        data: box_downscale(&frame.data, frame.width, frame.height, width, height),
-        width,
-        height,
-        format: frame.format,
-        timestamp_us: frame.timestamp_us,
-    }
+    };
+    let data = box_downscale(pixels, frame.width, frame.height, width, height);
+    Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
 }
 
 /// Downscales `frame` to fit [`MAX_PICTURE_PIXELS`], or returns it unchanged.
@@ -126,21 +133,13 @@ pub fn fit_within_budget(frame: Frame) -> Frame {
     let Some((width, height)) = target_size(frame.width, frame.height) else {
         return frame;
     };
-    let expected = (frame.width as usize)
-        .saturating_mul(frame.height as usize)
-        .saturating_mul(BGRA_BYTES);
-    if frame.data.len() < expected {
+    let Some(pixels) = usable_pixels(&frame) else {
         // A short buffer is not this module's to interpret; the encoder
         // rejects it with a message that names the real problem.
         return frame;
-    }
-    Frame {
-        data: box_downscale(&frame.data, frame.width, frame.height, width, height),
-        width,
-        height,
-        format: frame.format,
-        timestamp_us: frame.timestamp_us,
-    }
+    };
+    let data = box_downscale(pixels, frame.width, frame.height, width, height);
+    Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
 }
 
 /// Target dimensions for a picture fitted inside `max_width`x`max_height`,
@@ -195,21 +194,13 @@ pub fn fit_within(frame: Frame, max_width: u32, max_height: u32) -> Frame {
     let Some((width, height)) = box_size(frame.width, frame.height, max_width, max_height) else {
         return frame;
     };
-    let expected = (frame.width as usize)
-        .saturating_mul(frame.height as usize)
-        .saturating_mul(BGRA_BYTES);
-    if frame.data.len() < expected {
+    let Some(pixels) = usable_pixels(&frame) else {
         // Same reasoning as `fit_within_budget`: a short buffer is not this
         // module's to interpret.
         return frame;
-    }
-    Frame {
-        data: box_downscale(&frame.data, frame.width, frame.height, width, height),
-        width,
-        height,
-        format: frame.format,
-        timestamp_us: frame.timestamp_us,
-    }
+    };
+    let data = box_downscale(pixels, frame.width, frame.height, width, height);
+    Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
 }
 
 /// Box-averages `src` (BGRA8, `src_width`x`src_height`) down to
@@ -266,13 +257,13 @@ mod tests {
     use super::*;
 
     fn frame(width: u32, height: u32, fill: u8) -> Frame {
-        Frame {
+        Frame::cpu(
             width,
             height,
-            format: PixelFormat::Bgra8,
-            timestamp_us: 7,
-            data: vec![fill; (width as usize) * (height as usize) * BGRA_BYTES],
-        }
+            PixelFormat::Bgra8,
+            7,
+            vec![fill; (width as usize) * (height as usize) * BGRA_BYTES],
+        )
     }
 
     #[test]

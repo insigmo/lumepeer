@@ -62,7 +62,7 @@ TeamViewer и AnyDesk на `v0.0.61`).
 | ~~30~~ | ~~H.265~~ | — | **снят**: лицензионное решение принято отрицательно, код удалён (ADR 0072) | — |
 | 31 | AV1 — доделать объявленный | M | 06 (механизм согласования) | `encode/mod.rs`, `linux_vaapi.rs`, webview-декод |
 | 32 | VP9/VP8 | M | 31 | то же |
-| 33 | GPU zero-copy: захват → энкодер без прохода через CPU | L | — | `capture/`, `encode/`, ADR 0058/0059 |
+| 33 | GPU zero-copy: захват → энкодер без прохода через CPU | L | — | Windows сделан за фичей `encode-mf-zero-copy` (ADR 0073); осталась Linux-половина, `pipewire_stream.rs` + `linux_vaapi.rs` |
 | 34 | Картинка выше 4K и кадры тяжелее 8 МиБ | M | 33 желательно | `constants.rs`, IPC до webview |
 
 ## Корпоративная обвязка

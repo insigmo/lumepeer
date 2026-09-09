@@ -504,13 +504,13 @@ pub mod software {
         use crate::capture::PixelFormat;
 
         fn frame(width: u32, height: u32, fill: u8) -> Frame {
-            Frame {
+            Frame::cpu(
                 width,
                 height,
-                format: PixelFormat::Bgra8,
-                timestamp_us: 0,
-                data: vec![fill; (width as usize) * (height as usize) * 4],
-            }
+                PixelFormat::Bgra8,
+                0,
+                vec![fill; (width as usize) * (height as usize) * 4],
+            )
         }
 
         #[test]

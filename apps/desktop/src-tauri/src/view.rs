@@ -1659,13 +1659,13 @@ async fn secure_desktop_frame(
         );
         return None;
     }
-    Some(Frame {
-        width: captured.width,
-        height: captured.height,
-        format: PixelFormat::Bgra8,
-        timestamp_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-        data: captured.data,
-    })
+    Some(Frame::cpu(
+        captured.width,
+        captured.height,
+        PixelFormat::Bgra8,
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        captured.data,
+    ))
 }
 
 /// One frame on its way to the wire, and whatever recording was running when

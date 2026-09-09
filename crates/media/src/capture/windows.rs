@@ -39,6 +39,10 @@
 //! building the stub below and pulls in none of the Direct3D 11/DXGI bindings
 //! (ADR 0012).
 
+#[cfg(feature = "encode-mf-zero-copy")]
+pub use dxgi::GpuTexture;
+#[cfg(all(test, feature = "encode-mf-zero-copy"))]
+pub(crate) use dxgi::gpu_test_frame;
 #[cfg(feature = "capture-windows")]
 pub use dxgi::{WindowsCapturer, WindowsInjector};
 #[cfg(not(feature = "capture-windows"))]
@@ -64,7 +68,14 @@ mod dxgi {
 
     use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS};
     use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, HMODULE};
+    #[cfg(all(test, feature = "encode-mf-zero-copy"))]
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+    #[cfg(feature = "encode-mf-zero-copy")]
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT,
+        ID3D11Multithread,
+    };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
@@ -367,6 +378,17 @@ mod dxgi {
         context: ID3D11DeviceContext,
         duplication: IDXGIOutputDuplication,
         staging: Staging,
+        /// Whether this device may hand frames out as GPU textures at all
+        /// (ADR 0073): false when Direct3D refused the multithread protection
+        /// that sharing the immediate context with the encoder depends on.
+        #[cfg(feature = "encode-mf-zero-copy")]
+        gpu_ready: bool,
+        /// The texture the previous GPU frame was handed out in, reused for
+        /// the next one as soon as nothing downstream still holds it — a
+        /// steady-state zero-copy session then allocates nothing per frame,
+        /// exactly as [`Staging`] does for the readback path.
+        #[cfg(feature = "encode-mf-zero-copy")]
+        last_gpu: Option<std::sync::Arc<GpuTexture>>,
         /// Hash of the last frame handed out, so a screen that was repainted
         /// without actually changing yields `None` instead of a duplicate
         /// (§11.1), exactly as the X11 backend does it.
@@ -496,11 +518,26 @@ mod dxgi {
             // re-creates this staging texture whenever it disagrees.
             let staging = Staging::new(&device, mode.Width.max(1), mode.Height.max(1))?;
 
+            // Sharing this device with the encoder (ADR 0073) means two
+            // threads call into the same immediate context — the capture
+            // thread copying the acquired surface, the encode thread blitting
+            // it into NV12. Direct3D 11 serializes that only once the
+            // multithread protection is on, which is also what Media
+            // Foundation requires of a device handed to an MFT (MSDN,
+            // "Direct3D Device Manager"). A driver that refuses it leaves
+            // this device on the readback path for the whole session.
+            #[cfg(feature = "encode-mf-zero-copy")]
+            let gpu_ready = enable_multithread_protection(&device);
+
             Ok(Self {
                 device,
                 context,
                 duplication,
                 staging,
+                #[cfg(feature = "encode-mf-zero-copy")]
+                gpu_ready,
+                #[cfg(feature = "encode-mf-zero-copy")]
+                last_gpu: None,
                 last_hash: None,
                 pointer_shape: None,
                 pointer_shape_seq: 0,
@@ -655,6 +692,17 @@ mod dxgi {
                 self.staging = Staging::new(&self.device, width, height)?;
             }
 
+            // The frame can stay on the GPU only if nothing on this side
+            // still has to look at its pixels, and the cursor is exactly that
+            // (ADR 0073): compositing it is a CPU pass over the picture, and
+            // so is the hash that answers §11.1. A guest that draws its own
+            // cursor (`FEATURE_CURSOR_SHAPE`) has already turned the first
+            // one off, and the second goes with it.
+            #[cfg(feature = "encode-mf-zero-copy")]
+            if self.gpu_ready && !self.embed_cursor {
+                return self.gpu_frame(&texture, width, height);
+            }
+
             // SAFETY: CopyResource is a GPU-side copy between two textures of
             // identical description, both created on or owned by this
             // struct's device. The immediate context is only ever touched
@@ -707,14 +755,325 @@ mod dxgi {
 
             let timestamp_us =
                 u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            Some(Frame {
-                width: self.staging.width,
-                height: self.staging.height,
-                format: PixelFormat::Bgra8,
+            Some(Frame::cpu(
+                self.staging.width,
+                self.staging.height,
+                PixelFormat::Bgra8,
                 timestamp_us,
                 data,
+            ))
+        }
+
+        /// Hands the acquired desktop surface on as a GPU texture, without it
+        /// ever passing through main memory (ADR 0073).
+        ///
+        /// The copy is still a copy — the surface DXGI lends out has to be
+        /// given back at `ReleaseFrame`, so it cannot be held past this
+        /// function — but it is a GPU-to-GPU one, which is what this path
+        /// exists to reduce the cost to.
+        ///
+        /// Unlike [`Active::finish_frame`] this cannot answer §11.1's
+        /// "identical to the previous one": hashing the picture would mean
+        /// reading it back. What is left is the compositor's own signal, the
+        /// `LastPresentTime` check above, which is a weaker filter — a screen
+        /// repainted with identical pixels is encoded here where the readback
+        /// path would have dropped it (ADR 0073).
+        #[cfg(feature = "encode-mf-zero-copy")]
+        fn gpu_frame(
+            &mut self,
+            source: &ID3D11Texture2D,
+            width: u32,
+            height: u32,
+        ) -> Result<Option<Frame>> {
+            let recycled = self
+                .last_gpu
+                .take()
+                .filter(|held| held.width == width && held.height == height)
+                .and_then(|mut held| {
+                    // Only when the previous frame is gone downstream: while
+                    // anything still holds it, overwriting its pixels would
+                    // change a picture somebody is already encoding.
+                    std::sync::Arc::get_mut(&mut held)?.readback.take();
+                    Some(held)
+                });
+            let gpu = match recycled {
+                Some(held) => held,
+                None => std::sync::Arc::new(GpuTexture::new(
+                    &self.device,
+                    &self.context,
+                    width,
+                    height,
+                )?),
+            };
+
+            // SAFETY: CopyResource is a GPU-side copy between two textures of
+            // identical description, both on this struct's device, and the
+            // destination is one this side owns exclusively (see the
+            // `Arc::get_mut` above). The immediate context is shared with the
+            // encoder, which is what `gpu_ready` established the multithread
+            // protection for.
+            unsafe {
+                self.context.CopyResource(&gpu.texture, source);
+            }
+
+            // Neither of these means anything once frames stop going through
+            // main memory, and a stale one would be worse than none: the hash
+            // would dedupe against a picture from before this path took over,
+            // and the cached pixels would redraw a cursor onto it.
+            self.last_hash = None;
+            self.last_frame_data = None;
+
+            self.last_gpu = Some(std::sync::Arc::clone(&gpu));
+            let timestamp_us =
+                u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            Ok(Some(Frame {
+                width,
+                height,
+                format: PixelFormat::Bgra8,
+                timestamp_us,
+                data: Vec::new(),
+                gpu: Some(gpu),
+            }))
+        }
+    }
+
+    /// Turns on Direct3D 11's multithread protection, reporting whether the
+    /// device accepted it (ADR 0073).
+    ///
+    /// Without it the immediate context may only be touched from one thread,
+    /// and the zero-copy path touches it from two: capture copies into the
+    /// frame's texture, the encoder blits that texture into NV12 on its own
+    /// thread. A `false` here is not a failure of the session — it only means
+    /// this device stays on the readback path.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn enable_multithread_protection(device: &ID3D11Device) -> bool {
+        let Ok(multithread) = device.cast::<ID3D11Multithread>() else {
+            tracing::info!(
+                "this Direct3D device exposes no ID3D11Multithread; capture stays on the readback path"
+            );
+            return false;
+        };
+        // SAFETY: SetMultithreadProtected takes a plain BOOL by value and
+        // returns the previous setting, which is of no interest here — what
+        // matters is what it reads back as below.
+        let _previous = unsafe { multithread.SetMultithreadProtected(true) };
+        // SAFETY: as above — a plain getter on an interface this function
+        // owns, used to confirm the driver honoured the request rather than
+        // trusting that it did.
+        let protected = unsafe { multithread.GetMultithreadProtected() }.as_bool();
+        if !protected {
+            tracing::info!(
+                "this Direct3D device refused multithread protection; capture stays on the readback path"
+            );
+        }
+        protected
+    }
+
+    /// A captured frame's pixels while they are still on the GPU (ADR 0073).
+    ///
+    /// Carries the device and immediate context it was made on, because the
+    /// two things anybody does with it — read it back into main memory, or
+    /// hand it to the Media Foundation encoder — both need them, and because
+    /// "the same device on both ends" is the whole point: two devices would
+    /// be a copy through main memory wearing a GPU texture's clothes.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    pub struct GpuTexture {
+        texture: ID3D11Texture2D,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        /// Filled by [`GpuTexture::pixels`] the first time somebody needs the
+        /// picture in main memory after all, and reset when the capture
+        /// backend recycles the texture for the next frame.
+        readback: std::sync::OnceLock<Vec<u8>>,
+    }
+
+    // SAFETY: `GpuTexture` holds Direct3D 11 COM interfaces, which
+    // `windows-rs` does not mark `Send`/`Sync` because arbitrary COM objects
+    // may be apartment-affine. Direct3D 11 is not: a device created without
+    // `D3D11_CREATE_DEVICE_SINGLETHREADED` is free-threaded, and its
+    // immediate context becomes safe to call from more than one thread once
+    // `ID3D11Multithread::SetMultithreadProtected` is on — which is exactly
+    // what `enable_multithread_protection` above establishes before a single
+    // `GpuTexture` is ever made, and a device that refuses it produces none.
+    // The only interior state is a `OnceLock`, which brings its own
+    // synchronization.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    unsafe impl Send for GpuTexture {}
+    // SAFETY: as above.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    unsafe impl Sync for GpuTexture {}
+
+    // As `Active` and `Monitor` above: COM state is not printable and must
+    // never be logged.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    impl std::fmt::Debug for GpuTexture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GpuTexture")
+                .field("width", &self.width)
+                .field("height", &self.height)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[cfg(feature = "encode-mf-zero-copy")]
+    impl GpuTexture {
+        /// Allocates a GPU-resident BGRA8 texture the video processor of
+        /// `encode::windows` can read as an input view.
+        fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+            width: u32,
+            height: u32,
+        ) -> Result<Self> {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                // What a `ID3D11VideoProcessorInputView` over an RGB texture
+                // is documented to need; nothing here is ever mapped, which
+                // is the difference from `Staging`.
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0)
+                    .cast_unsigned(),
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+            };
+            let mut texture: Option<ID3D11Texture2D> = None;
+            // SAFETY: `desc` is a local that outlives the call and is only
+            // read; `texture` receives an owned interface pointer on success.
+            unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }
+                .map_err(|e| {
+                    MediaError::CaptureUnavailable(format!(
+                        "allocating a {width}x{height} capture texture failed: {e}"
+                    ))
+                })?;
+            let texture = texture.ok_or_else(|| {
+                MediaError::CaptureUnavailable(
+                    "Direct3D reported success with no capture texture".to_owned(),
+                )
+            })?;
+            Ok(Self {
+                texture,
+                device: device.clone(),
+                context: context.clone(),
+                width,
+                height,
+                readback: std::sync::OnceLock::new(),
             })
         }
+
+        /// The picture in main memory, copied out of the GPU on the first
+        /// call and remembered for every later one.
+        ///
+        /// This is the cost the zero-copy path exists to avoid, so reaching
+        /// it means something downstream — scaling, the software encoder, a
+        /// test — needed the pixels after all. It is still the correct
+        /// answer, and it is why nothing had to learn about GPU frames to
+        /// keep working (ADR 0073).
+        ///
+        /// # Errors
+        /// [`MediaError::CaptureInterrupted`] when the copy or the map fails.
+        pub(crate) fn pixels(&self) -> Result<&[u8]> {
+            if let Some(cached) = self.readback.get() {
+                return Ok(cached);
+            }
+            let staging = Staging::new(&self.device, self.width, self.height)?;
+            // SAFETY: a GPU-side copy between two textures of identical
+            // description on this struct's own device, into a staging texture
+            // no other thread has ever seen.
+            unsafe {
+                self.context.CopyResource(&staging.texture, &self.texture);
+            }
+            let data = read_back(&self.context, &staging.texture, self.width, self.height)?;
+            Ok(self.readback.get_or_init(|| data))
+        }
+
+        /// The texture itself, for the encoder's video processor.
+        pub(crate) const fn texture(&self) -> &ID3D11Texture2D {
+            &self.texture
+        }
+
+        /// The device this texture lives on — the one the encoder has to
+        /// share for the path to mean anything.
+        pub(crate) const fn device(&self) -> &ID3D11Device {
+            &self.device
+        }
+
+        /// Width in pixels.
+        pub(crate) const fn width(&self) -> u32 {
+            self.width
+        }
+
+        /// Height in pixels.
+        pub(crate) const fn height(&self) -> u32 {
+            self.height
+        }
+    }
+
+    /// A GPU-resident frame of one flat colour, on a Direct3D device of this
+    /// function's own (ADR 0073).
+    ///
+    /// What a test of the zero-copy path needs and a live duplication cannot
+    /// give it: a frame whose exact pixels are known, on a machine that may
+    /// have no duplicable desktop, and without taking the one duplication
+    /// this process is allowed. `None` means this machine has no Direct3D 11
+    /// hardware device at all, which is a skip and not a failure.
+    #[cfg(all(test, feature = "encode-mf-zero-copy"))]
+    pub(crate) fn gpu_test_frame(width: u32, height: u32, fill: u8) -> Option<Frame> {
+        let mut device: Option<ID3D11Device> = None;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        // SAFETY: as `Active::open`'s call, except that no adapter is named,
+        // which is what D3D_DRIVER_TYPE_HARDWARE means: "the default one".
+        // Both out-parameters are locals that outlive the call.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE(std::ptr::null_mut()),
+                D3D11_CREATE_DEVICE_FLAG(0),
+                None,
+                D3D11_SDK_VERSION,
+                Some(&raw mut device),
+                None,
+                Some(&raw mut context),
+            )
+        }
+        .ok()?;
+        let (device, context) = (device?, context?);
+        if !enable_multithread_protection(&device) {
+            return None;
+        }
+        let texture = GpuTexture::new(&device, &context, width, height).ok()?;
+        let pixels = vec![fill; (width as usize) * (height as usize) * BYTES_PER_PIXEL];
+        // SAFETY: with no destination box the whole subresource is written,
+        // reading `RowPitch * Height` bytes from `pixels`, which is exactly
+        // that long and outlives the call.
+        unsafe {
+            context.UpdateSubresource(
+                &texture.texture,
+                0,
+                None,
+                pixels.as_ptr().cast(),
+                width * u32::try_from(BYTES_PER_PIXEL).ok()?,
+                0,
+            );
+        }
+        Some(Frame {
+            width,
+            height,
+            format: PixelFormat::Bgra8,
+            timestamp_us: 0,
+            data: Vec::new(),
+            gpu: Some(std::sync::Arc::new(texture)),
+        })
     }
 
     impl Staging {
@@ -2888,6 +3247,100 @@ mod dxgi {
                 capturer.next_frame(),
                 Err(MediaError::CaptureUnavailable(_))
             ));
+        }
+
+        /// A frame that never went through main memory still has to be able
+        /// to produce the picture, byte for byte, for anything that needs it
+        /// there after all (ADR 0073's `as_cpu`).
+        #[test]
+        #[cfg(feature = "encode-mf-zero-copy")]
+        fn a_frame_left_on_the_gpu_reads_back_to_exactly_what_was_put_there() {
+            const FILL: u8 = 0x5a;
+            const WIDTH: u32 = 64;
+            const HEIGHT: u32 = 32;
+            let Some(frame) = gpu_test_frame(WIDTH, HEIGHT, FILL) else {
+                eprintln!("skipping: no Direct3D 11 hardware device on this machine");
+                return;
+            };
+
+            assert!(
+                frame.gpu.is_some(),
+                "this frame was supposed to be on the GPU"
+            );
+            assert!(
+                frame.data.is_empty(),
+                "a GPU frame carries no pixels in main memory until it is asked for them"
+            );
+
+            let pixels = frame
+                .as_cpu()
+                .expect("the readback must produce the picture");
+            assert_eq!(
+                pixels.len(),
+                (WIDTH as usize) * (HEIGHT as usize) * BYTES_PER_PIXEL,
+                "the readback must be tightly packed, not RowPitch-strided"
+            );
+            assert!(
+                pixels.iter().all(|byte| *byte == FILL),
+                "the readback must be the picture that was uploaded"
+            );
+
+            // The second call is the memoized one: same bytes, same address,
+            // no second trip across the bus.
+            let again = frame.as_cpu().expect("the readback is remembered");
+            assert_eq!(again.as_ptr(), pixels.as_ptr());
+        }
+
+        /// Which path a live session takes is decided by one thing and said
+        /// out loud here (ADR 0073): while the host draws the cursor into the
+        /// picture, compositing it is a CPU pass and the frame has to be in
+        /// main memory; once the guest draws its own, the frame can stay on
+        /// the GPU.
+        #[test]
+        #[cfg(feature = "encode-mf-zero-copy")]
+        fn the_cursor_is_what_decides_whether_a_frame_stays_on_the_gpu() {
+            // See `capture_produces_a_frame_when_a_display_is_available`.
+            let _serialized = ONE_DUPLICATION_AT_A_TIME.lock();
+            let mut capturer = WindowsCapturer::new();
+            if let Err(e) = capturer.start(CaptureTarget::PrimaryDisplay) {
+                eprintln!("skipping: no duplicable desktop on this machine ({e})");
+                return;
+            }
+
+            for _ in 0..POLL_ATTEMPTS {
+                match capturer.next_frame() {
+                    Ok(Some(frame)) => {
+                        assert!(
+                            frame.gpu.is_none(),
+                            "a frame with the cursor embedded must carry its pixels in main memory"
+                        );
+                        assert!(!frame.data.is_empty());
+                    }
+                    Ok(None) => {}
+                    Err(e) => panic!("capture failed on a live desktop: {e}"),
+                }
+            }
+
+            capturer.set_cursor_embedded(false);
+            let mut seen = 0_u32;
+            for _ in 0..POLL_ATTEMPTS {
+                match capturer.next_frame() {
+                    Ok(Some(frame)) => {
+                        seen += 1;
+                        assert!(
+                            frame.gpu.is_some(),
+                            "with the cursor off the frame has no reason to be in main memory"
+                        );
+                        assert!(frame.data.is_empty());
+                        assert!(frame.as_cpu().is_ok_and(|pixels| !pixels.is_empty()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => panic!("capture failed on a live desktop: {e}"),
+                }
+            }
+            if seen == 0 {
+                eprintln!("skipping the GPU half: this desktop presented nothing new");
+            }
         }
 
         /// Every frame that does reach a viewer has to be a distinct picture:
