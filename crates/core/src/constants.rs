@@ -439,6 +439,36 @@ pub const CHAT_MAX_BYTES: usize = 4_096;
 /// chrome, never a second video channel; anything larger is malformed.
 pub const MAX_CURSOR_SHAPE_PIXELS: usize = 128 * 128;
 
+/// Maximum length of a path a guest may ask a host to list with
+/// [`crate::protocol::MessageKind::DirListRequest`] (§9.1; ADR 0075).
+///
+/// A hostile-peer bound checked before the path is parsed, not a considered
+/// maximum: `PATH_MAX` on Linux is this, Windows' extended-length limit is
+/// larger and its ordinary one much smaller, and no directory anybody browses
+/// comes near it. What it bounds is how much string a peer can make the host
+/// walk before it is refused.
+pub const DIR_PATH_MAX_BYTES: usize = 4_096;
+/// Maximum number of entries one `DirListResponse` may carry (§9.1;
+/// ADR 0075).
+///
+/// A directory with more than this is answered with the first
+/// [`MAX_DIR_ENTRIES_PER_RESPONSE`] of them and `truncated: true`, never silently
+/// cut short. The value is what fits: one entry is a name of at most
+/// [`FILE_NAME_MAX_BYTES`] plus a size, a flag and a timestamp, so 200 of
+/// them stay inside [`MAX_CONTROL_FRAME_BYTES`] with room for the envelope —
+/// which the assertion below is what actually checks.
+pub const MAX_DIR_ENTRIES_PER_RESPONSE: usize = 200;
+/// Worst-case encoded size of one `DirEntry`: the longest name it may carry,
+/// its postcard length prefix, and the varint forms of a `u64` size, a `bool`
+/// and a `u64` timestamp.
+const DIR_ENTRY_WORST_CASE_BYTES: usize = FILE_NAME_MAX_BYTES + 2 + 10 + 1 + 10;
+/// A full listing may not be a control frame the receiver has to refuse
+/// (§3.2, §9.1; ADR 0075).
+const _: () = assert!(
+    MAX_DIR_ENTRIES_PER_RESPONSE * DIR_ENTRY_WORST_CASE_BYTES <= MAX_CONTROL_FRAME_BYTES,
+    "a full DirListResponse cannot fit MAX_CONTROL_FRAME_BYTES"
+);
+
 /// Maximum number of monitors one host may report in `MonitorsList` (§11).
 pub const MAX_MONITORS_PER_HOST: usize = 8;
 

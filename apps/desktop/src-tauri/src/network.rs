@@ -27,18 +27,19 @@ use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
     DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
-    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_INFLIGHT_HANDSHAKES,
-    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_DIR_ENTRIES_PER_RESPONSE,
+    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, PING_INTERVAL_SECS,
+    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
 };
 use lumepeer_core::protocol::{
-    ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
-    FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9, FEATURE_CURSOR_SHAPE,
-    FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
-    FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED,
-    InputDetail, InputEventPayload, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
-    UnattendedRejection,
+    ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
+    DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
+    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE, FEATURE_FILE_TRANSFER,
+    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
+    FEATURE_UNATTENDED, InputDetail, InputEventPayload, MediaCodec, MediaUnavailableReason,
+    MessageKind, MonitorInfo, UnattendedRejection,
 };
+use lumepeer_core::remote_path::{is_safe_component, safe_browse_path};
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
@@ -120,6 +121,14 @@ const CLIPBOARD_FILES_MINOR: u16 = 8;
 /// guest's `FEATURE_DISPLAY_MODE` string instead, and `HelloAck` carries no
 /// feature list for the guest to read the other way.
 const DISPLAY_MODE_MINOR: u16 = 9;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::DirListRequest` and
+/// `MessageKind::DirListResponse` (ADR 0075).
+///
+/// Guest side only, exactly like [`DISPLAY_MODE_MINOR`]: a host reads the
+/// guest's `FEATURE_FILE_BROWSE` string instead, and `HelloAck` carries no
+/// feature list for the guest to read the other way.
+const FILE_BROWSE_MINOR: u16 = 12;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -687,6 +696,23 @@ pub enum ActorError {
     Unsupported,
 }
 
+/// One directory of a watched host, as it last answered (ADR 0075).
+///
+/// Carries the path it is an answer *about*, so a caller that asked for two
+/// directories in a row can tell which one it is looking at without keeping
+/// its own bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirListing {
+    /// The path this listing answers for.
+    pub path: String,
+    /// The entries, empty when `refused` is `Some`.
+    pub entries: Vec<DirEntry>,
+    /// Whether the host stopped at `MAX_DIR_ENTRIES_PER_RESPONSE`.
+    pub truncated: bool,
+    /// Why there are no entries, when there are none for a reason.
+    pub refused: Option<DirListRefusal>,
+}
+
 /// Reply type of [`ActorCommand::DisplayModesList`] (docs/bugs/
 /// 16-host-display-mode.md #2; ADR 0048): the modes, empty exactly when the
 /// reason is `Some`, mirroring the wire message's own shape.
@@ -883,6 +909,19 @@ enum ActorCommand {
         width: u32,
         height: u32,
         reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: ask the watched host what is in one of its directories
+    /// (ADR 0075).
+    DirList {
+        label: String,
+        path: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: the listing the watched host last answered with
+    /// (ADR 0075).
+    DirListing {
+        label: String,
+        reply: oneshot::Sender<Result<Option<DirListing>, ActorError>>,
     },
     /// Guest side: the modes the watched host announced for its own physical
     /// monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
@@ -1666,6 +1705,44 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::MonitorsList { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: asks the watched host to list one of its directories
+    /// (ADR 0075).
+    ///
+    /// Fire and forget, like every other guest-to-host request on the control
+    /// channel: the answer arrives as a `DirListResponse` and is read back
+    /// with [`Self::dir_listing`]. Nothing here waits for it, because a host
+    /// that never answers must not hold a caller open.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old to understand the
+    /// message; [`ActorError::Core`] with `Malformed` when the path is not
+    /// one this host would accept; [`ActorError::ChannelClosed`] if the actor
+    /// is gone.
+    pub async fn request_dir_list(&self, label: String, path: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::DirList { label, path, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: the listing the watched host last answered with, or `None`
+    /// while nothing has been asked or answered yet (ADR 0075).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn dir_listing(&self, label: String) -> Result<Option<DirListing>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::DirListing { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -2597,6 +2674,13 @@ struct ViewState {
     display_modes: Vec<DisplayModeInfo>,
     /// Why `display_modes` is empty, when it is.
     display_modes_reason: Option<DisplayModeUnavailableReason>,
+    /// The path of the listing this view is waiting for, if it asked for one
+    /// (ADR 0075). The wire response carries no path of its own — one
+    /// request is outstanding per view at a time — so this is what turns the
+    /// answer back into an answer *about something*.
+    dir_list_asked: Option<String>,
+    /// The last listing this host answered with (ADR 0075).
+    dir_listing: Option<DirListing>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -2664,6 +2748,10 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SIZE`
         /// (ADR 0060).
         speaks_stream_size: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_BROWSE`
+        /// (ADR 0075), so this host may answer a `DirListRequest` from it at
+        /// all.
+        speaks_file_browse: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2761,6 +2849,10 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_STREAM_SIZE`
         /// (ADR 0060).
         speaks_stream_size: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_BROWSE`
+        /// (ADR 0075), so this host may answer a `DirListRequest` from it at
+        /// all.
+        speaks_file_browse: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2889,6 +2981,13 @@ struct Actor {
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
+    /// Host side: peers whose `Hello` advertised `FEATURE_FILE_BROWSE`, and
+    /// which may therefore be answered with a `DirListResponse` (ADR 0075).
+    speaks_file_browse: std::collections::HashSet<NodeId>,
+    /// Guest side: hosts whose `HelloAck` minor is at least
+    /// [`FILE_BROWSE_MINOR`], and which may therefore be sent a
+    /// `DirListRequest` (ADR 0075).
+    file_browse_to_host: std::collections::HashMap<NodeId, bool>,
     /// Host side: cursor shapes the encode loops picked up, on their way to
     /// the control channel only this thread may write (§2.3).
     cursors_tx: mpsc::Sender<(NodeId, CursorShapeData)>,
@@ -3567,6 +3666,143 @@ impl Actor {
         }
     }
 
+    /// Host side: answers a guest's `DirListRequest` (§9.2, §18; ADR 0075).
+    ///
+    /// Three refusals before a single directory entry is read, and each of
+    /// them is said out loud rather than mimed as an empty list:
+    ///
+    /// 1. the `file_browse` grant, re-read **now** and not trusted from
+    ///    whenever the session started — the same discipline
+    ///    [`Self::on_display_set_mode`] applies to `display_mode` and the
+    ///    input path applies to every event (§2.3), so a grant withdrawn a
+    ///    moment ago is not honoured by a request already in flight;
+    /// 2. the path, which is a string an attacker chose
+    ///    (`lumepeer_core::remote_path::safe_browse_path`);
+    /// 3. the operating system's own answer, which is reported as one
+    ///    refusal and not as "no such directory" versus "permission denied" —
+    ///    that pair is an oracle for what exists on the host.
+    ///
+    /// Every request that got past the feature check is audited, refused or
+    /// not: what §15 wants recorded is that this peer asked to read this
+    /// machine's disk, and the peer travels as a salted hash while the path
+    /// does not travel at all.
+    ///
+    /// The directory is read on this thread. It is the same choice the rest
+    /// of this actor already makes for filesystem work (`create_dir_all` on
+    /// the download path), and a listing is bounded by
+    /// `MAX_DIR_ENTRIES_PER_RESPONSE`; a directory on a disconnected network
+    /// share is the case where it costs, and it is written down in ADR 0075
+    /// rather than solved here.
+    fn on_dir_list_request(&mut self, peer: NodeId, path: &str) {
+        let tag = self.label_of(&peer);
+        if !self.speaks_file_browse.contains(&peer) {
+            // Answering would put a discriminant this peer's minor does not
+            // know on the wire, which closes the connection it was trying to
+            // use (§9.1).
+            tracing::debug!(peer = %tag, "directory listing from a peer that never advertised the feature");
+            return;
+        }
+        // Audited before the grant is even read: what §15 wants recorded is
+        // that this peer asked to read this machine's disk, and a refused
+        // request is as much of that as a served one. Not through
+        // `audit_file`, whose log line says "file transfer" — the record is
+        // the same shape, the sentence is not.
+        tracing::info!(peer = %tag, "a guest asked for a directory listing");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action: "dir_list" },
+        );
+
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.file_browse);
+        if !granted {
+            tracing::warn!(peer = %tag, "directory listing without a live file_browse grant; refused");
+            self.refuse_dir_list(peer, DirListRefusal::NotGranted);
+            return;
+        }
+        let Some(path) = safe_browse_path(path) else {
+            tracing::warn!(peer = %tag, "directory listing for a path that is not one; refused");
+            self.refuse_dir_list(peer, DirListRefusal::BadPath);
+            return;
+        };
+        // A symbolic link is not followed even when the path that names it is
+        // otherwise fine: the directory it leads to is not the directory the
+        // guest asked for, and "where does this link go" is a question about
+        // the host's own layout (ADR 0075).
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+            tracing::warn!(peer = %tag, "directory listing for a symbolic link; refused");
+            self.refuse_dir_list(peer, DirListRefusal::Unreadable);
+            return;
+        }
+        let Ok(reader) = std::fs::read_dir(path) else {
+            tracing::info!(peer = %tag, "the host could not read the directory a guest asked for");
+            self.refuse_dir_list(peer, DirListRefusal::Unreadable);
+            return;
+        };
+
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        for entry in reader.flatten() {
+            if entries.len() == MAX_DIR_ENTRIES_PER_RESPONSE {
+                truncated = true;
+                break;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                // A name that is not UTF-8 has no representation on this wire
+                // and is skipped rather than lossily transliterated into a
+                // name that would not open.
+                continue;
+            };
+            if !is_safe_component(&name) {
+                continue;
+            }
+            // `file_type` does not follow links, so a link to a directory is
+            // reported as the ordinary entry it is; `metadata` here would
+            // stat through it and describe somewhere else.
+            let file_type = entry.file_type().ok();
+            let is_dir = file_type.is_some_and(|kind| kind.is_dir());
+            let meta = entry.metadata().ok();
+            let size = if is_dir {
+                0
+            } else {
+                meta.as_ref().map_or(0, std::fs::Metadata::len)
+            };
+            let modified_unix = meta
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_secs());
+            entries.push(DirEntry {
+                name,
+                size,
+                is_dir,
+                modified_unix,
+            });
+        }
+
+        self.send_to(
+            &peer,
+            MessageKind::DirListResponse {
+                entries,
+                truncated,
+                refused: None,
+            },
+        );
+    }
+
+    /// Sends the one answer a refused listing gets: no entries, and the
+    /// reason (ADR 0075).
+    fn refuse_dir_list(&mut self, peer: NodeId, refused: DirListRefusal) {
+        self.send_to(
+            &peer,
+            MessageKind::DirListResponse {
+                entries: Vec::new(),
+                truncated: false,
+                refused: Some(refused),
+            },
+        );
+    }
+
     /// Host side: switches this host's own physical monitor to `mode_id`
     /// (docs/bugs/16-host-display-mode.md #2, #3; ADR 0048).
     ///
@@ -3808,6 +4044,7 @@ impl Actor {
                     speaks_cursor_shape,
                     speaks_stream_scale,
                     speaks_stream_size,
+                    speaks_file_browse,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -3822,6 +4059,7 @@ impl Actor {
                     speaks_cursor_shape,
                     speaks_stream_scale,
                     speaks_stream_size,
+                    speaks_file_browse,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -3949,6 +4187,7 @@ impl Actor {
                 speaks_cursor_shape,
                 speaks_stream_scale,
                 speaks_stream_size,
+                speaks_file_browse,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -3970,6 +4209,14 @@ impl Actor {
                 // Same shape again, for the host's own display modes
                 // (docs/bugs/16-host-display-mode.md; ADR 0048).
                 self.display_mode.entry(peer).or_default().from_peer = speaks_display_mode;
+                // Whether a `DirListRequest` from this peer may be answered
+                // at all (ADR 0075). Not a grant and not a substitute for
+                // one: this only says the peer understands the reply.
+                if speaks_file_browse {
+                    self.speaks_file_browse.insert(peer);
+                } else {
+                    self.speaks_file_browse.remove(&peer);
+                }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
                 } else {
@@ -4361,6 +4608,8 @@ impl Actor {
                 monitors: Vec::new(),
                 display_modes: Vec::new(),
                 display_modes_reason: None,
+                dir_list_asked: None,
+                dir_listing: None,
                 slot: slot_rx,
                 slot_tx,
                 task,
@@ -4973,6 +5222,30 @@ impl Actor {
             MessageKind::StreamSizeRequest { width, height } => {
                 self.on_stream_size_request(peer, width, height);
             }
+            // Host side: the guest asked what is in one of this host's
+            // directories (§9.2; ADR 0075).
+            MessageKind::DirListRequest { ref path } => {
+                let path = path.clone();
+                self.on_dir_list_request(peer, &path);
+            }
+            // Guest side: the host answered a listing request (ADR 0075).
+            // Kept on the view, exactly as `DisplayModesList` is, and read
+            // back through `dir_listing`; the window that will draw it is
+            // gap-tasks `14`.
+            MessageKind::DirListResponse {
+                ref entries,
+                truncated,
+                refused,
+            } => {
+                if let Some(view) = self.views.get_mut(&peer) {
+                    view.dir_listing = Some(DirListing {
+                        path: view.dir_list_asked.clone().unwrap_or_default(),
+                        entries: entries.clone(),
+                        truncated,
+                        refused,
+                    });
+                }
+            }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -5228,6 +5501,8 @@ impl Actor {
         self.unattended_pending.remove(&peer);
         self.speaks_unattended.remove(&peer);
         self.speaks_cursor_shape.remove(&peer);
+        self.speaks_file_browse.remove(&peer);
+        self.file_browse_to_host.remove(&peer);
         // Link measurements belong to the connection that produced them: a
         // later connection to the same device measures its own path, and must
         // not inherit a round trip taken over one that no longer exists.
@@ -5474,6 +5749,12 @@ impl Actor {
             }
             ActorCommand::DisplayModesList { label, reply } => {
                 let _ = reply.send(self.on_announced_display_modes(&label));
+            }
+            ActorCommand::DirList { label, path, reply } => {
+                let _ = reply.send(self.on_request_dir_list(&label, &path));
+            }
+            ActorCommand::DirListing { label, reply } => {
+                let _ = reply.send(self.on_last_dir_listing(&label));
             }
             ActorCommand::DisplaySetMode {
                 label,
@@ -5950,6 +6231,46 @@ impl Actor {
     ///
     /// # Errors
     /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
+    /// Guest side: sends one `DirListRequest` towards the watched host
+    /// (ADR 0075).
+    ///
+    /// The path is checked here as well as on the host, and not because the
+    /// host is trusted to: a request the host is certain to refuse is one
+    /// round trip and one audit entry spent on a typo, and the caller gets a
+    /// better answer sooner.
+    fn on_request_dir_list(&mut self, label: &str, path: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self
+            .file_browse_to_host
+            .get(&peer)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(ActorError::Unsupported);
+        }
+        if safe_browse_path(path).is_none() {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        let Some(view) = self.views.get_mut(&peer) else {
+            return Err(ActorError::UnknownPeer);
+        };
+        view.dir_list_asked = Some(path.to_owned());
+        self.send_to(
+            &peer,
+            MessageKind::DirListRequest {
+                path: path.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Guest side: the listing this view last received (ADR 0075).
+    fn on_last_dir_listing(&self, label: &str) -> Result<Option<DirListing>, ActorError> {
+        let peer = self.resolve(label)?;
+        let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
+        Ok(view.dir_listing.clone())
+    }
+
     fn on_announced_display_modes(&self, label: &str) -> DisplayModesReply {
         let peer = self.resolve(label)?;
         let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
@@ -7509,9 +7830,13 @@ impl Actor {
                 // `secure_desktop_input` needs no teardown either: every
                 // secure-desktop event is checked against the live grant in
                 // `inject` as it arrives (ADR 0057), so revoking it simply
-                // makes the next event a no-op.
+                // makes the next event a no-op. `file_browse` is the same
+                // shape: each `DirListRequest` is checked against the live
+                // grant when it arrives (ADR 0075), so a revoke lands on the
+                // next one and there is nothing running to stop.
                 IndependentGrant::ClipboardRead
                 | IndependentGrant::ClipboardWrite
+                | IndependentGrant::FileBrowse
                 | IndependentGrant::SecureDesktop
                 | IndependentGrant::SecureDesktopInput => {}
                 // Withdrawing the grant from whoever is actually holding the
@@ -7940,6 +8265,10 @@ impl Actor {
         // to change (docs/bugs/16-host-display-mode.md; ADR 0048).
         self.display_mode.entry(peer).or_default().to_peer =
             control.peer_minor() >= DISPLAY_MODE_MINOR;
+        // Same reasoning for a directory listing this node might ask for
+        // (ADR 0075).
+        self.file_browse_to_host
+            .insert(peer, control.peer_minor() >= FILE_BROWSE_MINOR);
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -8307,6 +8636,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_STREAM_SIZE),
+        speaks_file_browse: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_FILE_BROWSE),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -8443,6 +8776,7 @@ async fn connect_once(
         FEATURE_STREAM_SCALE.to_owned(),
         FEATURE_STREAM_SIZE.to_owned(),
         FEATURE_DISPLAY_MODE.to_owned(),
+        FEATURE_FILE_BROWSE.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -8904,6 +9238,8 @@ pub fn spawn_actor_with(
         display_mode_state: None,
         display_mode_generation: 0,
         speaks_cursor_shape: std::collections::HashSet::new(),
+        speaks_file_browse: std::collections::HashSet::new(),
+        file_browse_to_host: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
@@ -9623,6 +9959,140 @@ mod tests {
             guest_clipboard,
             guest_label,
             host_label,
+        }
+    }
+
+    /// ADR 0075: a listing is refused out loud, never answered with an empty
+    /// directory. A `ViewOnly` session holds no `file_browse` grant, and the
+    /// guest is told exactly that rather than shown a machine with nothing on
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listing_without_the_grant_is_refused_rather_than_answered_empty() {
+        let scratch = Scratch::new("browse-ungranted");
+        std::fs::write(scratch.join("secret.txt"), b"not for this guest").unwrap();
+        let pair = clipboard_pair().await;
+
+        pair.guest
+            .request_dir_list(
+                pair.host_label.clone(),
+                scratch.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        let listing = wait_for_listing(&pair.guest, &pair.host_label).await;
+        assert_eq!(listing.refused, Some(DirListRefusal::NotGranted));
+        assert!(
+            listing.entries.is_empty(),
+            "a refusal may not carry the entries it refuses"
+        );
+    }
+
+    /// ADR 0075: the grant is read when the request arrives, not when the
+    /// session started, so a host that changes its mind is obeyed by the next
+    /// request rather than by the next session (§2.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_withdrawn_mid_session_refuses_the_next_listing() {
+        let scratch = Scratch::new("browse-revoked");
+        std::fs::write(scratch.join("notes.txt"), b"twelve bytes").unwrap();
+        std::fs::create_dir_all(scratch.join("projects")).unwrap();
+        let pair = clipboard_pair().await;
+        let path = scratch.0.to_string_lossy().into_owned();
+
+        pair.host
+            .set_grant(pair.guest_label.clone(), IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        pair.guest
+            .request_dir_list(pair.host_label.clone(), path.clone())
+            .await
+            .unwrap();
+
+        let listing = wait_for_listing(&pair.guest, &pair.host_label).await;
+        assert_eq!(listing.refused, None, "a granted listing was refused");
+        assert!(!listing.truncated);
+        let mut names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["notes.txt", "projects"]);
+        let notes = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == "notes.txt")
+            .expect("the file that was written");
+        assert!(!notes.is_dir);
+        assert_eq!(notes.size, 12);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "projects" && entry.is_dir)
+        );
+
+        // The host changes its mind mid-session.
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::FileBrowse,
+                false,
+            )
+            .await
+            .unwrap();
+        pair.guest
+            .request_dir_list(pair.host_label.clone(), path)
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let listing = pair
+                .guest
+                .dir_listing(pair.host_label.clone())
+                .await
+                .unwrap();
+            if listing.is_some_and(|listing| listing.refused == Some(DirListRefusal::NotGranted)) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the withdrawn grant was still honoured"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0075: a path that is not one never reaches the filesystem, and the
+    /// guest's own side refuses it before it costs the host a round trip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_traversal_is_refused_before_it_leaves_the_guest() {
+        let pair = clipboard_pair().await;
+        for path in ["/home/../etc/shadow", "relative/path", "\\\\server\\share"] {
+            let refused = pair
+                .guest
+                .request_dir_list(pair.host_label.clone(), path.to_owned())
+                .await;
+            assert!(
+                matches!(refused, Err(ActorError::Core(CoreError::Malformed))),
+                "{path} was sent to the host"
+            );
+        }
+    }
+
+    /// Polls for the listing a request is about to produce.
+    async fn wait_for_listing(guest: &ActorHandle, host_label: &str) -> DirListing {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if let Ok(Some(listing)) = guest.dir_listing(host_label.to_owned()).await {
+                return listing;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host never answered the listing request"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 

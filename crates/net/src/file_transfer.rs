@@ -296,10 +296,12 @@ fn map_io_eof(what: &'static str) -> impl Fn(io::Error) -> NetError {
 
 /// Windows device names, which are reserved as whole path components with or
 /// without an extension: `CON.txt` opens the console, not a file.
-const WINDOWS_DEVICE_NAMES: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
+///
+/// Lives in `lumepeer_core::remote_path` since ADR 0075, which needed the
+/// same table for whole paths rather than single names. One table and not
+/// two: a name refused here and accepted there would be exactly the gap
+/// either check exists to close.
+use lumepeer_core::remote_path::WINDOWS_DEVICE_NAMES;
 
 /// Reduces an offered file name to something safe to create inside a chosen
 /// directory, or refuses it (§9.2, §18).
