@@ -28,6 +28,7 @@ const COMMANDS: &[&str] = &[
     "history_forget_password",
     "connect_status",
     "connect_cancel",
+    "report_decoder_codecs",
     "network_status",
     "connection_stats",
     "license_status",

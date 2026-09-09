@@ -46,6 +46,7 @@
     "allow-history-forget-password",
     "allow-connect-status",
     "allow-connect-cancel",
+    "allow-report-decoder-codecs",
     "allow-network-status",
     "allow-connection-stats",
     "allow-license-status",

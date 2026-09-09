@@ -40,6 +40,7 @@ import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-
 import { statusPill } from './status-pill';
 import { titleBar } from './title-bar';
 import { onUnattendedStateChange, unattendedIndicator, type UnattendedStatus } from './unattended-settings';
+import { supportedOptionalCodecs } from './view-decoder';
 
 const root = document.querySelector('#app');
 const chatPanel = document.querySelector<HTMLElement>('#host-chat-panel');
@@ -382,6 +383,22 @@ onSettingsStateChange(renderNow);
 
 renderNow();
 void refresh();
+// What this process's WebView can decode, asked of the browser and told to
+// the actor once, before any connect (§11; ADR 0070). It has to happen here
+// rather than in the view window: `Hello` is sent while dialing, and the view
+// window only opens after `HelloAck` and consent. Both windows are the same
+// WebView runtime in the same process, so the answer this one gives is the
+// answer that one will give.
+void (async () => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('report_decoder_codecs', { args: { codecs: await supportedOptionalCodecs() } });
+  } catch (error) {
+    // No Tauri host (unit tests, a plain browser), or a WebView that answered
+    // nothing: the session simply negotiates H.264, which every peer decodes.
+    console.error('cannot report decoder codecs:', error);
+  }
+})();
 // The invite code this host already has, if any. Read once, never issued from
 // here (ADR 0062): a code that survives restarts is only useful if the host
 // can see it without pressing anything.
