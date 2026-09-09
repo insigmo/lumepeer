@@ -17,8 +17,12 @@
 //!   (`feature = "audio-capture-pipewire"`, module [`linux_pipewire`]), the
 //!   same "what plays out of the speakers" semantics. PulseAudio-only hosts
 //!   reach it through the pipewire-pulse compatibility layer.
-//! - **macOS** — not implemented yet; [`platform_audio_capturer`] refuses
-//!   loudly (§18: degrade towards safety and say so, never pass silence).
+//! - **macOS** — `ScreenCaptureKit`'s own audio capture
+//!   (`feature = "audio-capture-screencapturekit"`), which hands back the
+//!   desktop output mix directly with no virtual output device and no
+//!   `CoreAudio` loopback. Implemented in `crate::capture::macos` alongside
+//!   the screen capturer, since it reuses that module's `SCStream` delegate;
+//!   see [`crate::capture::macos::MacosAudioCapturer`].
 //!
 //! Without any of these features every entry point is inert and the session
 //! runs video-only, mirroring the `audio-opus` contract. The pure conversion
@@ -31,6 +35,7 @@
         not(target_os = "android"),
         feature = "audio-capture-pipewire"
     ),
+    all(target_os = "macos", feature = "audio-capture-screencapturekit"),
 ))]
 use std::time::Duration;
 
@@ -121,6 +126,7 @@ pub trait MicCapturer: Send + std::fmt::Debug {
         not(target_os = "android"),
         feature = "audio-capture-pipewire"
     ),
+    all(target_os = "macos", feature = "audio-capture-screencapturekit"),
 ))]
 pub(crate) fn capture_timestamp_us() -> u64 {
     std::time::SystemTime::now()
@@ -138,6 +144,7 @@ pub(crate) fn capture_timestamp_us() -> u64 {
         not(target_os = "android"),
         feature = "audio-capture-pipewire"
     ),
+    all(target_os = "macos", feature = "audio-capture-screencapturekit"),
 ))]
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -185,6 +192,10 @@ pub fn platform_audio_capturer() -> Result<Box<dyn AudioCapturer>> {
     {
         Ok(Box::new(linux_pipewire::PipewireMonitorCapturer::new()))
     }
+    #[cfg(all(target_os = "macos", feature = "audio-capture-screencapturekit"))]
+    {
+        Ok(Box::new(crate::capture::macos::MacosAudioCapturer::new()))
+    }
     #[cfg(not(any(
         all(target_os = "windows", feature = "audio-capture"),
         all(
@@ -192,6 +203,7 @@ pub fn platform_audio_capturer() -> Result<Box<dyn AudioCapturer>> {
             not(target_os = "android"),
             feature = "audio-capture-pipewire"
         ),
+        all(target_os = "macos", feature = "audio-capture-screencapturekit"),
     )))]
     {
         Err(crate::error::MediaError::CaptureUnavailable(
@@ -341,6 +353,7 @@ mod tests {
             not(target_os = "android"),
             feature = "audio-capture-pipewire"
         ),
+        all(target_os = "macos", feature = "audio-capture-screencapturekit"),
     )))]
     #[test]
     fn without_a_backend_the_entry_point_refuses_loudly() {

@@ -85,18 +85,21 @@ pub fn host_monitors() -> Result<Vec<HostMonitor>> {
     {
         linux_host_monitors()
     }
+    #[cfg(target_os = "macos")]
+    {
+        macos::MacosCapturer::attached_monitors_info()
+    }
     #[cfg(not(any(
         target_os = "windows",
-        all(target_os = "linux", not(target_os = "android"))
+        all(target_os = "linux", not(target_os = "android")),
+        target_os = "macos"
     )))]
     {
-        // macOS is the only platform left here, and its ScreenCaptureKit
-        // backend does not enumerate displays yet: report the primary as
-        // the only monitor rather than an empty list, which would read as
-        // "this host has no screens" (§18: degrade honestly, never lie).
-        //
-        // TODO(docs/tasks/12-macos-completion.md): once that backend can
-        // enumerate, this arm becomes the "no backend at all" case only.
+        // iOS is the only platform left here (§1.2: viewer-only, no capture
+        // backend exists there), plus any future target with none at all:
+        // report the primary as the only monitor rather than an empty list,
+        // which would read as "this host has no screens" (§18: degrade
+        // honestly, never lie).
         Ok(vec![HostMonitor {
             id: 0,
             width: 0,
@@ -216,9 +219,17 @@ pub fn host_display_count() -> Result<usize> {
         // checked against and that list is what the guest picked from.
         linux_host_monitors().map(|monitors| monitors.len())
     }
+    #[cfg(target_os = "macos")]
+    {
+        // Same reasoning as the Linux arm above: derived from `host_monitors`'
+        // own enumeration rather than counted separately, so the two cannot
+        // disagree about how many displays `CaptureTarget::Display` may name.
+        macos::MacosCapturer::attached_monitors_info().map(|monitors| monitors.len())
+    }
     #[cfg(not(any(
         target_os = "windows",
-        all(target_os = "linux", not(target_os = "android"))
+        all(target_os = "linux", not(target_os = "android")),
+        target_os = "macos"
     )))]
     {
         Ok(1)
