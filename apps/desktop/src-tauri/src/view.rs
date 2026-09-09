@@ -38,7 +38,7 @@ use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
 use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, pinned_target};
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
-use lumepeer_media::encode::{EncodedFrame, EncoderConfig, select_encoder};
+use lumepeer_media::encode::{EncodedFrame, EncoderConfig, VideoCodec, select_encoder};
 use lumepeer_media::error::MediaError;
 use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerEndpoint, STREAM_MIC, accept_media_stream, open_media_stream};
@@ -741,7 +741,9 @@ impl BitstreamFeed {
 }
 
 /// Bytes of the header [`encode_chunk_response`] always emits.
-pub const CHUNK_RESPONSE_HEADER_BYTES: usize = 8;
+///
+/// 8 through minor 10; ADR 0066 appended one codec byte for minor 11 (§11).
+pub const CHUNK_RESPONSE_HEADER_BYTES: usize = 9;
 
 /// Bytes of the per-frame header inside a chunk response.
 pub const CHUNK_FRAME_HEADER_BYTES: usize = 13;
@@ -753,14 +755,17 @@ pub const VIEW_FLAG_DESYNC: u8 = 0b0000_0100;
 /// Serializes one batch of encoded frames for `view_next_chunk`.
 ///
 /// Layout, little endian:
-/// `status:u8 | flags:u8 | count:u16 | reserved:u32`, then `count` frames of
-/// `flags:u8 | timestamp_us:u64 | length:u32 | bitstream`.
+/// `status:u8 | flags:u8 | count:u16 | reserved:u32 | codec:u8`, then `count`
+/// frames of `flags:u8 | timestamp_us:u64 | length:u32 | bitstream`.
 ///
 /// The `status`/`flags` header is the same contract
 /// [`encode_view_response`] carries and for the same reasons: the pipeline's
 /// health, the live `input` grant (§8.1) and the host's own recording
 /// statement (§2.2) all have to ride every answer, including the empty ones a
-/// still screen produces.
+/// still screen produces. `codec` rides the same way, for the same reason
+/// (ADR 0066): a session's negotiated codec can only change alongside a full
+/// decoder reset (like `desync`), so the window has to see it on every
+/// answer rather than fetch it once and risk missing a change.
 #[must_use]
 pub fn encode_chunk_response(
     status: ViewStatus,
@@ -768,6 +773,7 @@ pub fn encode_chunk_response(
     recording: bool,
     frames: &[EncodedFrame],
     desync: bool,
+    codec: u8,
 ) -> Vec<u8> {
     let payload: usize = frames
         .iter()
@@ -786,6 +792,7 @@ pub fn encode_chunk_response(
             .to_le_bytes(),
     );
     out.extend_from_slice(&0u32.to_le_bytes());
+    out.push(codec);
     for frame in frames {
         out.push(u8::from(frame.keyframe));
         out.extend_from_slice(&frame.timestamp_us.to_le_bytes());
@@ -1178,17 +1185,30 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
 /// `recorder` is the recording slot of §17: whatever sits in it when a frame
 /// has been written also receives that frame, so starting or stopping a
 /// recording mid-session never restarts the pipeline.
+///
+/// `codec` is the caller's already-settled choice (§11; ADR 0066) — the
+/// intersection of what the guest advertised understanding with what this
+/// host can actually encode right now, computed once before this loop starts
+/// and never revisited: a mid-session codec change is not supported, so a
+/// redial simply starts a fresh loop with whatever the actor decides then.
 #[allow(
     clippy::too_many_lines,
     reason = "one uninterrupted pass over one frame — capture, scale, encode, \
               write, record, adapt — and every split would put a step of it \
               behind a call that hides the order the steps must happen in"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "codec (ADR 0066) is the eighth: a struct just to carry these \
+              past the one call site that assembles them would be indirection \
+              with no second caller to justify it"
+)]
 pub fn spawn_encode_loop(
     connection: Connection,
     capture: SharedCapture,
     recorder: SharedRecorder,
     tag: String,
+    codec: VideoCodec,
     peer: NodeId,
     faults: mpsc::Sender<MediaFault>,
     control: EncodeControl,
@@ -1216,7 +1236,10 @@ pub fn spawn_encode_loop(
         // and a writer outliving the encoder would keep the session's stream
         // open with nothing behind it.
         let _writer_task = AbortOnDrop(spawn_media_writer(writer, frames_rx, tag.clone()));
-        let mut encoder = match select_encoder(EncoderConfig::default()) {
+        let mut encoder = match select_encoder(EncoderConfig {
+            codec,
+            ..EncoderConfig::default()
+        }) {
             Ok(encoder) => encoder,
             Err(error) => {
                 // §18: no silent degradation. The log alone was not enough —
@@ -2874,7 +2897,7 @@ mod tests {
     #[test]
     fn a_chunk_response_carries_every_frame_in_order() {
         let frames = [encoded(true, 1_000, 3), encoded(false, 2_000, 5)];
-        let bytes = encode_chunk_response(ViewStatus::Live, true, false, &frames, false);
+        let bytes = encode_chunk_response(ViewStatus::Live, true, false, &frames, false, 0);
 
         assert_eq!(bytes[0], ViewStatus::Live.code());
         assert_eq!(bytes[1], VIEW_FLAG_INPUT);
@@ -2897,10 +2920,20 @@ mod tests {
     /// and there is no frame to carry it.
     #[test]
     fn an_empty_chunk_response_still_carries_the_status_and_flags() {
-        let bytes = encode_chunk_response(ViewStatus::SecureDesktop, false, true, &[], true);
+        let bytes = encode_chunk_response(ViewStatus::SecureDesktop, false, true, &[], true, 0);
         assert_eq!(bytes.len(), CHUNK_RESPONSE_HEADER_BYTES);
         assert_eq!(bytes[0], ViewStatus::SecureDesktop.code());
         assert_eq!(bytes[1], VIEW_FLAG_RECORDING | VIEW_FLAG_DESYNC);
+    }
+
+    /// ADR 0066: the negotiated codec rides the last header byte of every
+    /// answer, including an empty one, so the window sees a mid-session
+    /// change (or the lack of one) on every poll rather than fetching it once.
+    #[test]
+    fn a_chunk_response_carries_the_negotiated_codec_byte() {
+        let bytes = encode_chunk_response(ViewStatus::Live, true, false, &[], false, 3);
+        assert_eq!(bytes.len(), CHUNK_RESPONSE_HEADER_BYTES);
+        assert_eq!(bytes[8], 3);
     }
 
     #[tokio::test]
