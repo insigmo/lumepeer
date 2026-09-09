@@ -30,6 +30,7 @@ capture-windows = ["lumepeer-media/capture-windows"]
 capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
 encode-openh264 = ["lumepeer-media/encode-openh264"]
 encode-mf = ["lumepeer-media/encode-mf"]
+encode-videotoolbox = ["lumepeer-media/encode-videotoolbox"]
 decode-openh264 = ["lumepeer-media/decode-openh264"]
 # Off by default: never part of `cargo build --workspace`, the Task client
 # builds, or the release CI matrix. Opt in locally with

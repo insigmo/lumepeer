@@ -4244,6 +4244,7 @@ dependencies = [
  "objc2-core-video",
  "objc2-foundation",
  "objc2-screen-capture-kit",
+ "objc2-video-toolbox",
  "openh264",
  "opus",
  "pipewire",
@@ -5321,6 +5322,18 @@ checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
 dependencies = [
  "objc2",
  "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-video-toolbox"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05bf9a3c14831a7d9641b0d81d87dd913ee238a012b2fde27db5a84b56f5df3e"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-core-video",
 ]
 
 [[package]]
