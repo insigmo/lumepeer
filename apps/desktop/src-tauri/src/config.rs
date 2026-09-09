@@ -304,7 +304,10 @@ pub fn clipboard_files_dir() -> Option<PathBuf> {
     data_dir().map(|base| base.join("clipboard-files"))
 }
 
-fn home() -> Option<PathBuf> {
+/// The user's own home directory, which is where the local half of the file
+/// manager starts (ADR 0076).
+#[must_use]
+pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)

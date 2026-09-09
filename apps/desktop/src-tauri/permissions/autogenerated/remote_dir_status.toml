@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remote-dir-status"
+description = "Enables the remote_dir_status command without any pre-configured scope."
+commands.allow = ["remote_dir_status"]
+
+[[permission]]
+identifier = "deny-remote-dir-status"
+description = "Denies the remote_dir_status command without any pre-configured scope."
+commands.deny = ["remote_dir_status"]

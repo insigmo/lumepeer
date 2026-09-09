@@ -1694,6 +1694,316 @@ pub async fn file_transfers(
     Ok(state.network.file_transfers().await?)
 }
 
+// -------------------------------------------------------------------------
+// File manager (§9.2; ADR 0075, ADR 0076)
+// -------------------------------------------------------------------------
+
+/// One entry of either pane of the file manager.
+///
+/// The same four fields on both sides on purpose: the local pane shows what
+/// the remote pane would show of the same directory, so a person comparing
+/// them is comparing like with like (ADR 0075 fixes the set — no attributes,
+/// no owner, no permissions).
+#[derive(Debug, Clone, Serialize)]
+pub struct DirEntryDto {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub modified_unix: u64,
+}
+
+impl From<lumepeer_core::protocol::DirEntry> for DirEntryDto {
+    fn from(entry: lumepeer_core::protocol::DirEntry) -> Self {
+        Self {
+            name: entry.name,
+            size: entry.size,
+            is_dir: entry.is_dir,
+            modified_unix: entry.modified_unix,
+        }
+    }
+}
+
+/// Why a directory listing carries no entries (§18; ADR 0075).
+///
+/// A code and not a sentence: the window owns the wording, in the user's own
+/// language, and the three cases need three different sentences — "ask the
+/// host for permission", "that is not a path", "that directory would not
+/// open" — rather than one "nothing found" for all of them.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirRefusalDto {
+    NotGranted,
+    BadPath,
+    Unreadable,
+}
+
+impl From<lumepeer_core::protocol::DirListRefusal> for DirRefusalDto {
+    fn from(refusal: lumepeer_core::protocol::DirListRefusal) -> Self {
+        use lumepeer_core::protocol::DirListRefusal;
+        match refusal {
+            DirListRefusal::NotGranted => Self::NotGranted,
+            DirListRefusal::BadPath => Self::BadPath,
+            DirListRefusal::Unreadable => Self::Unreadable,
+        }
+    }
+}
+
+/// Why the host will not send a file this window asked for (§18; ADR 0076).
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchRefusalDto {
+    NotGranted,
+    BadPath,
+    Unreadable,
+    TooMany,
+}
+
+impl From<lumepeer_core::protocol::FileFetchRefusal> for FetchRefusalDto {
+    fn from(refusal: lumepeer_core::protocol::FileFetchRefusal) -> Self {
+        use lumepeer_core::protocol::FileFetchRefusal;
+        match refusal {
+            FileFetchRefusal::NotGranted => Self::NotGranted,
+            FileFetchRefusal::BadPath => Self::BadPath,
+            FileFetchRefusal::Unreadable => Self::Unreadable,
+            FileFetchRefusal::TooMany => Self::TooMany,
+        }
+    }
+}
+
+/// One directory of this machine, for the local pane.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalDirDto {
+    /// The directory this listing is about, as it was resolved.
+    pub path: String,
+    /// The directory above it, or `None` at a root — what the "up" button
+    /// uses, so no path arithmetic happens in the webview.
+    pub parent: Option<String>,
+    pub entries: Vec<DirEntryDto>,
+    /// Whether the listing stopped at the same entry bound the wire uses.
+    pub truncated: bool,
+}
+
+/// The remote pane's whole state in one poll (ADR 0075, ADR 0076).
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteDirDto {
+    /// The directory the last answer was about, empty before the first one.
+    pub path: String,
+    /// The directory above it, or `None` at a root.
+    pub parent: Option<String>,
+    pub entries: Vec<DirEntryDto>,
+    pub truncated: bool,
+    /// Why `entries` is empty, when it is empty for a reason.
+    pub refused: Option<DirRefusalDto>,
+    /// Why the last download was refused, if one was.
+    pub fetch_refused: Option<FetchRefusalDto>,
+    /// Whether an answer has arrived at all yet.
+    pub answered: bool,
+}
+
+/// The directory above `path`, or `None` when `path` is already a root.
+///
+/// Its own string arithmetic rather than `std::path::Path::parent`, for the
+/// same reason `lumepeer_core::remote_path` parses paths itself: the remote
+/// pane's paths belong to an operating system that need not be this one, so
+/// `/` and `\` are both separators here whatever this build was compiled for.
+fn parent_of(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    // A Unix root, or a Windows drive root: nothing above either.
+    if trimmed.is_empty() || (trimmed.len() == 2 && trimmed.ends_with(':')) {
+        return None;
+    }
+    let cut = trimmed.rfind(['/', '\\'])?;
+    let head = &trimmed[..cut];
+    if head.is_empty() {
+        // `/a` sits directly under the Unix root.
+        Some("/".to_owned())
+    } else if head.len() == 2 && head.ends_with(':') {
+        // `C:\a` sits directly under the drive root, which keeps its
+        // separator: `C:` on its own is drive-relative, not a directory.
+        Some(format!("{head}\\"))
+    } else {
+        Some(head.to_owned())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalDirListArgs {
+    /// Pseudonymized label of the host being watched, for the window check.
+    pub peer: String,
+    /// Directory to list; `None` starts at this user's home directory.
+    pub path: Option<String>,
+}
+
+/// Guest side: one directory of *this* machine, for the local pane of the
+/// file manager (ADR 0076).
+///
+/// The path goes through the same parser a path from the wire goes through.
+/// Nothing here arrives from a peer, but the webview is not a source of
+/// authority either (§2.3), and one parser for both panes is what keeps a
+/// path that the remote side refuses from being browsable on the local side
+/// of the same window.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, when the path is not one
+/// this build will resolve, or when the directory will not open.
+#[tauri::command]
+pub async fn local_dir_list(
+    window: Window,
+    args: LocalDirListArgs,
+) -> Result<LocalDirDto, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    let path = match args.path {
+        Some(path) => path,
+        None => crate::config::home()
+            .map(|home| home.to_string_lossy().into_owned())
+            .ok_or(IpcError {
+                code: "NO_HOME_DIR",
+                message: "this machine has no home directory".to_owned(),
+            })?,
+    };
+    let resolved = lumepeer_core::remote_path::safe_browse_path(&path).ok_or(IpcError {
+        code: "BAD_PATH",
+        message: "that is not a directory this build will open".to_owned(),
+    })?;
+    let (entries, truncated) = crate::network::read_directory(std::path::Path::new(resolved))
+        .map_err(|_| IpcError {
+            code: "UNREADABLE",
+            message: "that directory could not be read".to_owned(),
+        })?;
+    Ok(LocalDirDto {
+        parent: parent_of(resolved),
+        path: resolved.to_owned(),
+        entries: entries.into_iter().map(DirEntryDto::from).collect(),
+        truncated,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteDirListArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Absolute path on the host.
+    pub path: String,
+}
+
+/// Guest side: asks the watched host to list one of its directories
+/// (ADR 0075).
+///
+/// Nothing is authorized here: the host re-reads its own `file_browse` grant
+/// when the request lands, and answers or refuses on its own. The answer is
+/// read back with [`remote_dir_status`].
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old to
+/// understand the message, or the path is not one this build will send.
+#[tauri::command]
+pub async fn remote_dir_list(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RemoteDirListArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state.network.request_dir_list(args.peer, args.path).await?;
+    Ok(())
+}
+
+/// Guest side: the remote pane's state — the last listing and the last
+/// refused download (ADR 0075, ADR 0076).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's or the session is gone.
+#[tauri::command]
+pub async fn remote_dir_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<RemoteDirDto, IpcError> {
+    check_view_window(&window, &peer)?;
+    let status = state.network.dir_listing(peer).await?;
+    let fetch_refused = status.fetch_refused.map(FetchRefusalDto::from);
+    let Some(listing) = status.listing else {
+        return Ok(RemoteDirDto {
+            path: String::new(),
+            parent: None,
+            entries: Vec::new(),
+            truncated: false,
+            refused: None,
+            fetch_refused,
+            answered: false,
+        });
+    };
+    Ok(RemoteDirDto {
+        parent: parent_of(&listing.path),
+        path: listing.path,
+        entries: listing.entries.into_iter().map(DirEntryDto::from).collect(),
+        truncated: listing.truncated,
+        refused: listing.refused.map(DirRefusalDto::from),
+        fetch_refused,
+        answered: true,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteDownloadArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Absolute path of the file on the host.
+    pub path: String,
+    /// Directory on this machine the file lands in — the one the local pane
+    /// is showing, which is why no picker runs here.
+    pub into: String,
+}
+
+/// Guest side: asks the watched host for one file (ADR 0076).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old, the
+/// path is not one this build will send, or `into` is not a directory on this
+/// machine.
+#[tauri::command]
+pub async fn remote_download(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RemoteDownloadArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .remote_download(args.peer, args.path, args.into)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteUploadArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Absolute path of the file on this machine, as the local pane named it.
+    pub local_path: String,
+    /// Absolute path of the directory on the host it is for.
+    pub remote_dir: String,
+}
+
+/// Guest side: offers one local file to the watched host, for a directory on
+/// the host's own disk (ADR 0076).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old, or
+/// the destination is not a path this build will send.
+#[tauri::command]
+pub async fn remote_upload(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RemoteUploadArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .remote_upload(args.peer, args.local_path, args.remote_dir)
+        .await?;
+    Ok(())
+}
+
 /// Runs the OS directory picker, for where a received file should land.
 async fn pick_directory(app: &tauri::AppHandle) -> Option<String> {
     use tauri_plugin_dialog::DialogExt as _;
