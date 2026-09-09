@@ -212,6 +212,7 @@ export type TranslationKey =
   | 'files.heading'
   | 'files.sendHint'
   | 'files.fromClipboard'
+  | 'files.directory'
   | 'files.accept'
   | 'files.decline'
   | 'files.cancel'

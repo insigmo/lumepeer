@@ -18,6 +18,7 @@ mod clipboard_os;
 mod commands;
 mod config;
 mod connection_history;
+mod disk;
 mod invite_store;
 mod logging;
 mod network;

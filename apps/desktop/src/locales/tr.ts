@@ -168,6 +168,7 @@ export const tr: Dictionary = {
   'files.sendHint':
     'Bir dosya göndermek için Ctrl+C ile kopyalayın — burada otomatik olarak sunulur.',
   'files.fromClipboard': 'Panodan',
+  'files.directory': 'Klasör',
   'files.accept': 'Kabul et',
   'files.decline': 'Reddet',
   'files.cancel': 'İptal',
