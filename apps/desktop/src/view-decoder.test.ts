@@ -4,15 +4,24 @@ import {
   avcCodecString,
   CHUNK_FRAME_HEADER_BYTES,
   CHUNK_RESPONSE_HEADER_BYTES,
+  configStringFor,
   decodeViewChunk,
   nativeDecodingAvailable,
+  supportedOptionalCodecs,
+  WireCodec,
 } from './view-decoder';
 
-/** Builds the bytes `view_next_chunk` would return. Mirrors `encode_chunk_response`. */
+/**
+ * Builds the bytes `view_next_chunk` would return. Mirrors
+ * `encode_chunk_response`. `codec` defaults to H.264 (0), the byte a
+ * zero-initialized `ArrayBuffer` already carries, so existing callers that do
+ * not care about it need no change.
+ */
 function chunkResponse(
   status: number,
   flags: number,
   frames: readonly { keyframe: boolean; timestampUs: number; data: number[] }[],
+  codec: number = WireCodec.H264,
 ): ArrayBuffer {
   const size =
     CHUNK_RESPONSE_HEADER_BYTES +
@@ -23,6 +32,7 @@ function chunkResponse(
   view.setUint8(0, status);
   view.setUint8(1, flags);
   view.setUint16(2, frames.length, true);
+  view.setUint8(8, codec);
   let at = CHUNK_RESPONSE_HEADER_BYTES;
   for (const frame of frames) {
     view.setUint8(at, frame.keyframe ? 1 : 0);
@@ -75,6 +85,20 @@ describe('decodeViewChunk', () => {
     const buffer = chunkResponse(1, 0, [{ keyframe: true, timestampUs: 0, data: [1, 2] }]);
     new DataView(buffer).setUint32(CHUNK_RESPONSE_HEADER_BYTES + 9, 4096, true);
     expect(() => decodeViewChunk(buffer)).toThrow();
+  });
+
+  it('defaults to H.264 when the host never negotiated a codec', () => {
+    expect(decodeViewChunk(chunkResponse(1, 0, [])).codec).toBe(WireCodec.H264);
+  });
+
+  it('reads every assigned codec byte (ADR 0066)', () => {
+    for (const codec of [WireCodec.H264, WireCodec.Av1, WireCodec.H265, WireCodec.Vp9]) {
+      expect(decodeViewChunk(chunkResponse(1, 0, [], codec)).codec).toBe(codec);
+    }
+  });
+
+  it('refuses a codec byte it has no name for, rather than guessing', () => {
+    expect(() => decodeViewChunk(chunkResponse(1, 0, [], 200))).toThrow();
   });
 
   it('refuses a status byte it has no name for', () => {
@@ -147,6 +171,68 @@ describe('nativeDecodingAvailable', () => {
     scope.VideoDecoder = { isConfigSupported: () => Promise.resolve({ supported: true }) };
     try {
       await expect(nativeDecodingAvailable()).resolves.toBe(true);
+    } finally {
+      delete scope.VideoDecoder;
+    }
+  });
+});
+
+describe('configStringFor', () => {
+  const keyframe = (data: number[]) => ({ keyframe: true, timestampUs: 0, data: new Uint8Array(data) });
+
+  it('reads H.264 out of the stream itself, exactly like avcCodecString', () => {
+    const sps = [0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0x00];
+    expect(configStringFor(WireCodec.H264, keyframe(sps))).toBe(avcCodecString(new Uint8Array(sps)));
+  });
+
+  it('answers a fixed config string for each optional codec (ADR 0066)', () => {
+    // Nothing has encoded any of these yet (batches 07/08/09), so unlike
+    // H.264 there is no stream to read a profile out of — the frame's own
+    // bytes are irrelevant to the answer.
+    const frame = keyframe([0xff]);
+    expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.04M.08');
+    expect(configStringFor(WireCodec.H265, frame)).toBe('hev1.1.6.L93.B0');
+    expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
+  });
+
+  it('answers nothing for a codec byte it has no config for, rather than guessing', () => {
+    expect(configStringFor(99 as WireCodec, keyframe([0]))).toBeNull();
+  });
+});
+
+describe('supportedOptionalCodecs', () => {
+  it('answers nothing when this WebView has no VideoDecoder at all', async () => {
+    expect(typeof (globalThis as { VideoDecoder?: unknown }).VideoDecoder).toBe('undefined');
+    await expect(supportedOptionalCodecs()).resolves.toEqual([]);
+  });
+
+  it('asks the browser once per optional codec, never a table of assumptions', async () => {
+    const asked: unknown[] = [];
+    const scope = globalThis as { VideoDecoder?: unknown };
+    scope.VideoDecoder = {
+      isConfigSupported: (config: { codec: string }) => {
+        asked.push(config.codec);
+        // Only the AV1 config this module uses is "supported" here, so a
+        // table that assumed every codec is available would be caught by
+        // the exact set this asserts on below.
+        return Promise.resolve({ supported: config.codec === 'av01.0.04M.08' });
+      },
+    };
+    try {
+      await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
+      expect(asked).toEqual(['av01.0.04M.08', 'hev1.1.6.L93.B0', 'vp09.00.10.08']);
+    } finally {
+      delete scope.VideoDecoder;
+    }
+  });
+
+  it('treats a throwing probe as unsupported rather than failing the whole call', async () => {
+    const scope = globalThis as { VideoDecoder?: unknown };
+    scope.VideoDecoder = {
+      isConfigSupported: () => Promise.reject(new Error('not implemented')),
+    };
+    try {
+      await expect(supportedOptionalCodecs()).resolves.toEqual([]);
     } finally {
       delete scope.VideoDecoder;
     }

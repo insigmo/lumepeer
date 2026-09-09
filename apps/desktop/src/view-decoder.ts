@@ -34,7 +34,7 @@ const STATUS_BY_CODE: readonly ViewStatus[] = [
 ];
 
 /** Bytes of the fixed header every `view_next_chunk` response carries. */
-export const CHUNK_RESPONSE_HEADER_BYTES = 8;
+export const CHUNK_RESPONSE_HEADER_BYTES = 9;
 
 /** Bytes of the header in front of each frame inside a chunk response. */
 export const CHUNK_FRAME_HEADER_BYTES = 13;
@@ -51,6 +51,20 @@ const CHUNK_FLAG_RECORDING = 0b010;
  * one thing a bitstream transport has to say that a pixel transport does not.
  */
 const CHUNK_FLAG_DESYNC = 0b100;
+
+/**
+ * Video codec identifier as [`MessageKind::MediaCodec`]'s wire byte and the
+ * ninth byte of every `view_next_chunk` header encode it
+ * (`crates/core/src/protocol.rs`, `apps/desktop/src-tauri/src/view.rs`; ADR
+ * 0066). H.264 is the mandatory baseline and the value every session starts
+ * on until a `MediaCodec` message says otherwise.
+ */
+export enum WireCodec {
+  H264 = 0,
+  Av1 = 1,
+  H265 = 2,
+  Vp9 = 3,
+}
 
 /** One encoded picture as `view_next_chunk` delivers it. */
 export interface ChunkFrame {
@@ -71,6 +85,8 @@ export interface ViewChunk {
   recording: boolean;
   /** Whether the decoder must be reset before these frames are used. */
   desync: boolean;
+  /** The codec this batch of frames is encoded with (ADR 0066). */
+  codec: WireCodec;
   /** Encoded pictures, in the order the host produced them. */
   frames: ChunkFrame[];
 }
@@ -78,14 +94,15 @@ export interface ViewChunk {
 /**
  * Parses the binary response of `view_next_chunk`.
  *
- * Layout, little endian: `status:u8 | flags:u8 | count:u16 | reserved:u32`,
- * then `count` frames of `keyframe:u8 | timestamp_us:u64 | length:u32 |
- * bitstream`.
+ * Layout, little endian: `status:u8 | flags:u8 | count:u16 | reserved:u32 |
+ * codec:u8`, then `count` frames of `keyframe:u8 | timestamp_us:u64 |
+ * length:u32 | bitstream`.
  *
  * A response that does not describe itself consistently is refused rather
  * than half-read: it is the same untrusted-input rule the rest of the wire
  * follows (§21), and a truncated length here would otherwise be handed
- * straight to a decoder.
+ * straight to a decoder. An unrecognized codec byte is refused the same way
+ * (ADR 0066) — this side never guesses at a codec it has no name for.
  */
 export function decodeViewChunk(buffer: ArrayBuffer): ViewChunk {
   if (buffer.byteLength < CHUNK_RESPONSE_HEADER_BYTES) {
@@ -100,6 +117,11 @@ export function decodeViewChunk(buffer: ArrayBuffer): ViewChunk {
   }
   const flags = header.getUint8(1);
   const count = header.getUint16(2, true);
+  const codecByte = header.getUint8(8);
+  const codec = codecByte as WireCodec;
+  if (WireCodec[codec] === undefined) {
+    throw new Error(`unknown view codec ${codecByte}`);
+  }
 
   const frames: ChunkFrame[] = [];
   let at = CHUNK_RESPONSE_HEADER_BYTES;
@@ -127,6 +149,7 @@ export function decodeViewChunk(buffer: ArrayBuffer): ViewChunk {
     input: (flags & CHUNK_FLAG_INPUT) !== 0,
     recording: (flags & CHUNK_FLAG_RECORDING) !== 0,
     desync: (flags & CHUNK_FLAG_DESYNC) !== 0,
+    codec,
     frames,
   };
 }
@@ -218,6 +241,77 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
 }
 
 /**
+ * Fixed `VideoDecoder` config string for each optional codec (ADR 0066).
+ *
+ * Unlike H.264 (see {@link avcCodecString}), nothing here yet reads a real
+ * profile out of the stream itself: no encoder for any of these three exists
+ * in this workspace (batches 07/08/09 add them), so there is no bitstream to
+ * read one from. These name the baseline profile/level each of those batches
+ * is expected to actually produce — AV1 Main profile level 4.0 main tier
+ * 8-bit, H.265 Main profile main tier level 3.1, VP9 profile 0 level 1.0
+ * 8-bit — and are exercised here purely as the config each codec probes and
+ * configures with until a real encoder gives a real stream to read instead.
+ */
+const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.H265 | WireCodec.Vp9, string>> = {
+  [WireCodec.Av1]: 'av01.0.04M.08',
+  [WireCodec.H265]: 'hev1.1.6.L93.B0',
+  [WireCodec.Vp9]: 'vp09.00.10.08',
+};
+
+/**
+ * Which optional codecs (beyond the mandatory H.264 baseline) this `WebView`
+ * can actually decode right now (ADR 0066).
+ *
+ * Asked one profile at a time from `VideoDecoder.isConfigSupported` itself,
+ * never assumed from a table of "we think this platform can" — an unverified
+ * assumption is the same shape of mistake as v0.0.14's blank screen (see the
+ * comment above the build matrix in `.github/workflows/release.yml`), where a
+ * release shipped without the software-encoder fallback a hardware-less host
+ * actually needed. H.264 is not asked about here: it is the mandatory baseline
+ * every peer can decode and has no
+ * `Hello.features` string of its own (see {@link nativeDecodingAvailable}
+ * for that one's own baseline probe).
+ */
+export async function supportedOptionalCodecs(): Promise<WireCodec[]> {
+  if (typeof VideoDecoder === 'undefined') {
+    return [];
+  }
+  const supported: WireCodec[] = [];
+  for (const codec of [WireCodec.Av1, WireCodec.H265, WireCodec.Vp9] as const) {
+    try {
+      const support = await VideoDecoder.isConfigSupported({
+        codec: OPTIONAL_CODEC_CONFIGS[codec],
+        optimizeForLatency: true,
+      });
+      if (support.supported === true) {
+        supported.push(codec);
+      }
+    } catch {
+      // Treated as unsupported, the same as `nativeDecodingAvailable` does.
+    }
+  }
+  return supported;
+}
+
+/**
+ * The `VideoDecoder` config string for `codec`, given the keyframe that is
+ * about to configure a decoder for it (ADR 0066).
+ *
+ * H.264 alone reads its profile out of the stream (see {@link avcCodecString}):
+ * its encoder can pick High, Main or Baseline depending on what the host's
+ * hardware gives, so nothing else can name the right string. The other three
+ * have exactly one fixed {@link OPTIONAL_CODEC_CONFIGS} entry each, because
+ * nothing in this workspace encodes them yet with a profile of its own
+ * choosing to read back.
+ */
+export function configStringFor(codec: WireCodec, keyframe: ChunkFrame): string | null {
+  if (codec === WireCodec.H264) {
+    return avcCodecString(keyframe.data);
+  }
+  return OPTIONAL_CODEC_CONFIGS[codec] ?? null;
+}
+
+/**
  * Turns the host's bitstream into pictures on `canvas`.
  *
  * Configured lazily from the first intra frame, because that is the first
@@ -234,6 +328,12 @@ export class NativeDecoder {
   /** Set by the decoder's own error callback, read after the next batch. */
   #broken = false;
   #painted = false;
+  /**
+   * The codec the current decoder (if any) was configured for (ADR 0066).
+   * `null` until the first successful {@link NativeDecoder.#configure} call,
+   * so the very first keyframe of a session is never mistaken for a change.
+   */
+  #codec: WireCodec | null = null;
 
   constructor(canvas: HTMLCanvasElement, onResize: (width: number, height: number) => void) {
     this.#canvas = canvas;
@@ -275,14 +375,24 @@ export class NativeDecoder {
   }
 
   /**
-   * Feeds one batch of frames and says what the window owes the host.
+   * Feeds one batch of frames, encoded with `codec`, and says what the window
+   * owes the host.
    *
    * Frames go in as they come: `VideoDecoder.decode` is asynchronous and the
    * pictures come back on the output callback, so this returns long before
    * anything is on screen. Painting from the callback rather than from here
    * is what keeps the decode off the critical path.
+   *
+   * A mid-session codec change is not a supported transition (ADR 0066): the
+   * decoder holds state for the codec it was configured with, so a `codec`
+   * that differs from the last call's gets the same treatment as
+   * `CHUNK_FLAG_DESYNC` — thrown away and rebuilt from the next intra frame.
    */
-  push(frames: readonly ChunkFrame[]): DecodeOutcome {
+  push(frames: readonly ChunkFrame[], codec: WireCodec): DecodeOutcome {
+    if (this.#codec !== null && this.#codec !== codec) {
+      this.reset();
+    }
+    this.#codec = codec;
     let needKeyframe = false;
     for (const frame of frames) {
       if (!this.#decoder) {
@@ -309,7 +419,7 @@ export class NativeDecoder {
 
   /** Builds a decoder for the stream this keyframe describes. */
   #configure(keyframe: ChunkFrame): boolean {
-    const codec = avcCodecString(keyframe.data);
+    const codec = configStringFor(this.#codec ?? WireCodec.H264, keyframe);
     if (!codec) {
       // A keyframe with no SPS in it is one the host split differently than
       // this expects; the next one will carry it.

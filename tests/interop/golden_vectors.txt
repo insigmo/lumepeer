@@ -140,3 +140,13 @@ valid minor9_display_modes_list_two_entries abababababababababababababababab0000
 valid minor9_display_modes_list_not_granted abababababababababababababababab00002900010000
 valid minor9_display_set_mode abababababababababababababababab01002a0300
 invalid minor9_display_modes_list_contradiction abababababababababababababababab0000290100800fb8083c010000
+
+# --- Frozen for PROTOCOL_MINOR 11: the host announcing which video codec the
+# --- media stream is about to carry (ADR 0066). Host to guest only, sent
+# --- before the first media frame, and only to a guest whose Hello
+# --- advertised at least one of the "codec-av1"/"codec-h265"/"codec-vp9"
+# --- feature strings. The codec byte is decoded through MediaCodec::try_from;
+# --- anything outside 0..=3 is malformed rather than a codec to guess at.
+valid minor11_media_codec_h264 abababababababababababababababab00002c0000
+valid minor11_media_codec_av1 abababababababababababababababab00002c0100
+invalid minor11_media_codec_unknown_byte abababababababababababababababab00002c0400
