@@ -16,7 +16,27 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 65_536;
 /// one frame in the stream that can genuinely approach a megabyte or three,
 /// and dropping it is worse than carrying it - everything after it references
 /// it, so the guest sees nothing at all until the next one.
+///
+/// It did **not** have to move when [`MAX_STREAM_PIXELS`] did (ADR 0074),
+/// and the reason is that it was never a function of the picture's size. What
+/// bounds an encoded frame is rate control: at [`ABR_MAX_BITRATE_KBPS`] a
+/// whole *second* of video is 3.1 MiB, so one frame cannot reach this bound
+/// without the encoder having ignored its own bitrate — which is what the
+/// assertion below states, and it holds at any resolution. Measured on real
+/// hardware to check the arithmetic against reality: a 4K intra frame at that
+/// ceiling came out at 368 KiB on H.264 and 1.3 MiB on AV1, 4.4% and 15.8% of
+/// this bound (`encode::windows::tests::what_a_picture_above_4k_costs`).
 pub const MAX_MEDIA_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// One frame may not be asked to carry more than a second of peak bitrate
+/// (§11, §14; ADR 0074).
+///
+/// This is what makes [`MAX_MEDIA_FRAME_BYTES`] independent of the picture
+/// size: raising [`MAX_STREAM_PIXELS`] changes how many pixels a frame
+/// describes, never how many bits rate control will spend describing them.
+const _: () = assert!(
+    (ABR_MAX_BITRATE_KBPS as usize) * 1_000 / 8 <= MAX_MEDIA_FRAME_BYTES,
+    "MAX_MEDIA_FRAME_BYTES cannot hold one second at ABR_MAX_BITRATE_KBPS"
+);
 /// Largest picture, in pixels, the host encodes for a guest that has not said
 /// what size it wants (§11, §15; ADR 0018, ADR 0060).
 ///
@@ -41,13 +61,29 @@ pub const MAX_PICTURE_PIXELS: usize = 1920 * 1080;
 /// a size with [`crate::protocol::MessageKind::StreamSizeRequest`] (§11;
 /// ADR 0060).
 ///
-/// 4K, because that is the largest desktop the hardware H.264 encoders this
-/// project targets encode at a sensible rate, and because a guest asking for
-/// more pixels than its own screen has is asking for work that nothing can
-/// display. Nothing here has to fit `SLOT_PAYLOAD_BYTES`: a guest only sends
-/// the request when it decodes into its own webview, where the picture stays
-/// on the GPU and never crosses an IPC boundary as pixels at all.
-pub const MAX_STREAM_PIXELS: usize = 3840 * 2160;
+/// 5K (5120x2880), the largest desktop panel in ordinary use, raised from 4K
+/// by ADR 0074. Nothing here has to fit `SLOT_PAYLOAD_BYTES`: a guest only
+/// sends the request when it decodes into its own webview, where the picture
+/// stays on the GPU and never crosses an IPC boundary as pixels at all.
+///
+/// 5K and not 8K, and that is a measurement rather than a preference. Encoded
+/// frames are not the limit — see [`MAX_MEDIA_FRAME_BYTES`]. What is, on both
+/// sides:
+///
+/// - **The encoder.** On the reference machine both hardware MFTs — H.264 and
+///   AV1 — negotiate 3840x2160 and refuse every size above it. A host whose
+///   own panel is larger than what its encoder takes falls back to the
+///   [`MAX_PICTURE_PIXELS`] ceiling for the rest of the session rather than
+///   sending nothing (ADR 0074); that is honest degradation, not a picture at
+///   this size.
+/// - **Main memory.** One BGRA frame at this size is 56 MiB, and the readback
+///   capture path holds two of them plus an NV12 buffer — about 155 MiB,
+///   against the 150 MiB `active_extra_rss_mib` budget of §15
+///   (`ci/resource-budget.yml`). A host reaches this size inside its budget
+///   only on the zero-copy path of ADR 0073, where those buffers are GPU
+///   textures instead. 8K would be four times that in either direction, and
+///   raising the budget to fit it is exactly what §15 forbids.
+pub const MAX_STREAM_PIXELS: usize = 5120 * 2880;
 /// Smallest picture, per axis, a guest may ask for with
 /// [`crate::protocol::MessageKind::StreamSizeRequest`] (§9.1; ADR 0060).
 ///

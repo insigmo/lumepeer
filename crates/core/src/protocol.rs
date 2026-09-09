@@ -1882,6 +1882,8 @@ mod tests {
             (1_280, 720),
             (2_560, 1_440),
             (3_840, 2_160),
+            // The ceiling itself, raised to 5K by ADR 0074.
+            (5_120, 2_880),
         ] {
             let original = envelope(MessageKind::StreamSizeRequest { width, height });
             let bytes = original.encode().unwrap();
@@ -1892,7 +1894,7 @@ mod tests {
             (0, 0),
             (STREAM_SIZE_MIN_PX - 1, 1_080),
             (1_920, STREAM_SIZE_MIN_PX - 1),
-            (3_840, 2_162),
+            (5_120, 2_882),
             (30_000, 120),
             (u32::MAX, u32::MAX),
         ] {

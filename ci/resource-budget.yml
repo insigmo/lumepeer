@@ -30,6 +30,19 @@ budgets:
   active_extra_rss_mib:
     target: 150 # ACTIVE_SESSION_EXTRA_RAM_BUDGET_MIB
     gate_p95: 180
+    # What MAX_STREAM_PIXELS costs against this number, measured as
+    # arithmetic on the buffers the host actually holds (ADR 0074). On the
+    # readback capture path a session holds one BGRA frame, the cursor-free
+    # copy of it, and the NV12 conversion buffer:
+    #   1920x1080  ->  7.9 +  7.9 + 3.0 =  18.8 MiB
+    #   3840x2160  -> 31.6 + 31.6 + 11.9 =  75.1 MiB
+    #   5120x2880  -> 56.3 + 56.3 + 21.1 = 133.7 MiB
+    # 5K is the ceiling MAX_STREAM_PIXELS now allows, and on the readback
+    # path it leaves 16 MiB of this budget for the whole rest of the session.
+    # A host reaches that size inside the budget only with the zero-copy path
+    # of ADR 0073, where all three are GPU textures and none of them is
+    # resident here. 8K would be 534 MiB and is why MAX_STREAM_PIXELS is not
+    # 7680x4320: the budget is the answer, not the thing to raise.
   active_cpu_percent:
     target_range: [5, 15]
     gate_p95: 20
