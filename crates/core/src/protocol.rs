@@ -184,7 +184,21 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// from a guest whose `Hello` advertised [`FEATURE_STREAM_SIZE`] - the same
 /// shape [`FEATURE_STREAM_SCALE`] uses, for the same reason. See
 /// `docs/adr/0060-the-guest-names-the-picture-size-it-will-draw.md`.
-pub const PROTOCOL_MINOR: u16 = 10;
+///
+/// 11: appended [`MessageKind::MediaCodec`] after `StreamSizeRequest`. Before
+/// this, a guest simply guessed the codec of the bitstream it was handed
+/// (`avcCodecString` reading it out of the stream's own SPS) rather than
+/// being told, which only ever worked because every host could only ever
+/// produce H.264. This is the foundation the AV1/H.265/VP9 batches build on:
+/// the guest names which optional codecs it can actually decode with
+/// [`FEATURE_CODEC_AV1`]/[`FEATURE_CODEC_H265`]/[`FEATURE_CODEC_VP9`] (H.264
+/// has no string of its own — every peer can decode it), and the host
+/// announces its choice with this message, sent before the first media frame
+/// and only to a guest that advertised at least one of the three strings —
+/// the same reasoning [`FEATURE_MEDIA_UNAVAILABLE`]'s doc comment gives for
+/// gating on a string rather than the minor alone. See
+/// `docs/adr/0066-codec-negotiation-guest-advertises-host-intersects.md`.
+pub const PROTOCOL_MINOR: u16 = 11;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -300,6 +314,24 @@ pub const FEATURE_DISPLAY_MODE: &str = "display-mode";
 /// `Hello`. A guest that does not advertise it keeps the ADR 0018 ceiling
 /// exactly as before, which is the behaviour its decoder still needs.
 pub const FEATURE_STREAM_SIZE: &str = "stream-size";
+
+/// `Hello.features` string a guest sends to say it can actually decode AV1,
+/// one of the three optional codecs [`MessageKind::MediaCodec`] can name
+/// (ADR 0066). H.264 has no string of its own: it is the mandatory baseline
+/// every peer can decode, so there is nothing to advertise.
+///
+/// Same compatibility shape as [`FEATURE_STREAM_SIZE`]: a host must never
+/// choose AV1 for, or send `MediaCodec` naming AV1 to, a peer that did not
+/// advertise this string.
+pub const FEATURE_CODEC_AV1: &str = "codec-av1";
+
+/// `Hello.features` string a guest sends to say it can actually decode
+/// H.265/HEVC (ADR 0066). Same compatibility shape as [`FEATURE_CODEC_AV1`].
+pub const FEATURE_CODEC_H265: &str = "codec-h265";
+
+/// `Hello.features` string a guest sends to say it can actually decode VP9
+/// (ADR 0066). Same compatibility shape as [`FEATURE_CODEC_AV1`].
+pub const FEATURE_CODEC_VP9: &str = "codec-vp9";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -729,6 +761,81 @@ pub enum MessageKind {
         /// Requested height in device pixels, at least [`STREAM_SIZE_MIN_PX`].
         height: u32,
     },
+    /// Host to guest: this is the video codec the media stream is about to
+    /// carry (§11; ADR 0066). New in minor 11.
+    ///
+    /// Sent once, before the first frame of the media stream, and only to a
+    /// guest whose `Hello` advertised at least one of
+    /// [`FEATURE_CODEC_AV1`]/[`FEATURE_CODEC_H265`]/[`FEATURE_CODEC_VP9`] —
+    /// exactly the [`FEATURE_MEDIA_UNAVAILABLE`] reasoning applied to a
+    /// three-way choice instead of a single string: a guest that advertised
+    /// none of them is left exactly where it was before this message
+    /// existed, decoding H.264 by reading the stream's own SPS
+    /// (`avcCodecString`), because sending it anyway would put a discriminant
+    /// its minor does not know on the wire (§9.1).
+    ///
+    /// `codec` is [`MediaCodec::to_wire`]'s byte, decoded with
+    /// [`MediaCodec::try_from`]; an unrecognized byte is
+    /// [`crate::error::CoreError::Malformed`] rather than a codec to guess
+    /// at. The value is the intersection of what the guest's `Hello`
+    /// advertised understanding with what the host can actually encode right
+    /// now, falling back to `MediaCodec::H264` whenever that intersection is
+    /// empty — which today is always, since no build of this workspace can
+    /// yet encode anything else (AV1 needs mutual hardware support that
+    /// nothing currently reports, and H.265/VP9 have no encoder at all;
+    /// batches 07/08/09 build on top of this message rather than inside it).
+    MediaCodec {
+        /// [`MediaCodec`] as a wire byte.
+        codec: u8,
+    },
+}
+
+/// Video codec identifier carried in [`MessageKind::MediaCodec`]'s `codec`
+/// byte (§11; ADR 0066).
+///
+/// A closed set, and untrusted the moment it arrives: [`Self::try_from`]
+/// refuses any byte outside it with [`crate::error::CoreError::Malformed`]
+/// rather than guessing at an unknown codec (§9.1) — the same discipline
+/// [`UnattendedRejection`] and [`MediaUnavailableReason`] already apply to
+/// their own closed sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCodec {
+    /// Mandatory desktop baseline; every peer can decode it. Has no
+    /// `Hello.features` string of its own.
+    H264 = 0,
+    /// Optional; chosen only with mutual hardware support
+    /// (`lumepeer_media::encode::VideoCodec::Av1`; §11). Gated on
+    /// [`FEATURE_CODEC_AV1`].
+    Av1 = 1,
+    /// Optional; H.265/HEVC. Gated on [`FEATURE_CODEC_H265`].
+    H265 = 2,
+    /// Optional; VP9. Gated on [`FEATURE_CODEC_VP9`].
+    Vp9 = 3,
+}
+
+impl MediaCodec {
+    /// This codec's [`MessageKind::MediaCodec`] wire byte.
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for MediaCodec {
+    type Error = CoreError;
+
+    /// # Errors
+    /// [`CoreError::Malformed`] for any byte this enum has not assigned —
+    /// the untrusted-input rule of §9.1 applied to a peer's numeric claim.
+    fn try_from(byte: u8) -> Result<Self> {
+        match byte {
+            0 => Ok(Self::H264),
+            1 => Ok(Self::Av1),
+            2 => Ok(Self::H265),
+            3 => Ok(Self::Vp9),
+            _ => Err(CoreError::Malformed),
+        }
+    }
 }
 
 /// Why an unattended admission was refused (§8, §18).
@@ -1066,6 +1173,13 @@ impl MessageEnvelope {
                     }
                 }
             }
+            // An unassigned codec byte is a peer claiming something this
+            // build has never heard of, refused here rather than guessed at
+            // by whichever encoder or decoder would otherwise have to decide
+            // what to do with it (§9.1; ADR 0066).
+            MessageKind::MediaCodec { codec } if MediaCodec::try_from(*codec).is_err() => {
+                return Err(CoreError::Malformed);
+            }
             _ => {}
         }
         Ok(())
@@ -1206,6 +1320,12 @@ mod tests {
     /// froze: the golden vectors of §17.2 encode those discriminants
     /// literally.
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one assertion per minor bump so far, each depending on \
+                  every earlier one staying exactly as frozen; splitting it \
+                  would only hide that they are one invariant"
+    )]
     fn the_new_kind_did_not_move_an_older_discriminant() {
         // Byte 18 is the kind discriminant: 16 session id bytes, direction,
         // then a single-byte `seq` of 0.
@@ -1310,6 +1430,57 @@ mod tests {
             43,
             "the minor-10 kind must be appended after DisplaySetMode"
         );
+        assert_eq!(
+            kind_byte(MessageKind::MediaCodec { codec: 0 }),
+            44,
+            "the minor-11 kind must be appended after StreamSizeRequest"
+        );
+    }
+
+    /// ADR 0066: every assigned byte round-trips as itself, and the intent of
+    /// [`MediaCodec::try_from`] is that nothing outside `0..=3` ever reaches a
+    /// caller as a codec to act on.
+    #[test]
+    fn media_codec_wire_bytes_roundtrip_through_the_enum() {
+        for (codec, byte) in [
+            (MediaCodec::H264, 0u8),
+            (MediaCodec::Av1, 1),
+            (MediaCodec::H265, 2),
+            (MediaCodec::Vp9, 3),
+        ] {
+            assert_eq!(codec.to_wire(), byte);
+            assert_eq!(MediaCodec::try_from(byte).unwrap(), codec);
+        }
+    }
+
+    /// §9.1: a codec byte this build has never assigned is a malformed frame,
+    /// never a value some downstream `match` has to guess about or panic on.
+    #[test]
+    fn an_unrecognized_codec_byte_is_malformed_not_a_panic() {
+        for codec in [4u8, 5, 200, u8::MAX] {
+            assert!(matches!(
+                MediaCodec::try_from(codec),
+                Err(CoreError::Malformed)
+            ));
+            let bytes = envelope(MessageKind::MediaCodec { codec })
+                .encode()
+                .unwrap();
+            assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            ));
+        }
+    }
+
+    /// A `MediaCodec` naming an assigned byte round-trips like any other
+    /// message.
+    #[test]
+    fn media_codec_message_roundtrips() {
+        for codec in [0u8, 1, 2, 3] {
+            let original = envelope(MessageKind::MediaCodec { codec });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
     }
 
     /// A receiver report is a claim, not a fact, so decoding never judges it:
