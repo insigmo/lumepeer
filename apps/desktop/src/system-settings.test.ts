@@ -7,7 +7,7 @@
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { t } from './i18n';
+import { getStoredLocaleChoice, setStoredLocaleChoice, t } from './i18n';
 import {
   onSystemStateChange,
   resetSystemSettings,
@@ -40,6 +40,7 @@ async function settle(): Promise<void> {
 
 beforeEach(() => {
   resetSystemSettings();
+  localStorage.clear();
   container = document.createElement('div');
   document.body.appendChild(container);
   setMock = vi.fn().mockResolvedValue(undefined);
@@ -56,6 +57,7 @@ beforeEach(() => {
 afterEach(() => {
   container.remove();
   resetSystemSettings();
+  localStorage.clear();
 });
 
 describe('system settings', () => {
@@ -149,5 +151,39 @@ describe('system settings', () => {
 
     expect(container.querySelector('[data-testid="update-error"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="update-installed"]')).toBeNull();
+  });
+});
+
+describe('language picker', () => {
+  it('shows "system default" selected when nothing is stored', () => {
+    render(systemSettings('en', commands), container);
+    const select = container.querySelector('[data-testid="language-select"]') as HTMLSelectElement;
+    expect(select.value).toBe('system');
+    expect(getStoredLocaleChoice()).toBeNull();
+  });
+
+  it('persists a manual choice and reports the resolved locale', () => {
+    const onLocaleChange = vi.fn();
+    render(systemSettings('en', commands, onLocaleChange), container);
+    const select = container.querySelector('[data-testid="language-select"]') as HTMLSelectElement;
+    select.value = 'ar';
+    select.dispatchEvent(new Event('change'));
+
+    expect(getStoredLocaleChoice()).toBe('ar');
+    expect(onLocaleChange).toHaveBeenCalledWith('ar');
+  });
+
+  it('clears the stored choice when "system default" is picked again', () => {
+    setStoredLocaleChoice('ar');
+    const onLocaleChange = vi.fn();
+    render(systemSettings('en', commands, onLocaleChange), container);
+    const select = container.querySelector('[data-testid="language-select"]') as HTMLSelectElement;
+    expect(select.value).toBe('ar');
+
+    select.value = 'system';
+    select.dispatchEvent(new Event('change'));
+
+    expect(getStoredLocaleChoice()).toBeNull();
+    expect(onLocaleChange).toHaveBeenCalledTimes(1);
   });
 });
