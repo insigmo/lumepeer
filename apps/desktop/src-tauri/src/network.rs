@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -33,10 +33,11 @@ use lumepeer_core::constants::{
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
-    FEATURE_CLIPBOARD_FILES, FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER,
-    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
-    FEATURE_UNATTENDED, InputDetail, InputEventPayload, MediaUnavailableReason, MessageKind,
-    MonitorInfo, UnattendedRejection,
+    FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_H265, FEATURE_CODEC_VP9,
+    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
+    FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED,
+    InputDetail, InputEventPayload, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
+    UnattendedRejection,
 };
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -45,6 +46,7 @@ use lumepeer_media::capture::{
     CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
+use lumepeer_media::encode::{EncoderConfig, EncoderKind, VideoCodec, probe_hardware};
 use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
@@ -338,6 +340,12 @@ struct ViewFeed {
     cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
     /// Encoded frames for a window that decodes them itself (ADR 0058).
     bitstream: Arc<BitstreamFeed>,
+    /// The negotiated video codec, as a [`lumepeer_core::protocol::MediaCodec`]
+    /// wire byte (§11; ADR 0066). Starts at 0 (H.264) and is written only when
+    /// a `MessageKind::MediaCodec` arrives, which an older host never sends —
+    /// so a guest that never hears otherwise stays on the baseline every host
+    /// can produce.
+    codec: Arc<AtomicU8>,
     /// The host this view watches, and the channel its own decoder's
     /// keyframe requests travel on.
     ///
@@ -1280,6 +1288,7 @@ impl ActorHandle {
             feed.recording.load(Ordering::Relaxed),
             &frames,
             desync,
+            feed.codec.load(Ordering::Relaxed),
         ))
     }
 
@@ -2304,6 +2313,82 @@ struct DisplayModeFeature {
     to_peer: bool,
 }
 
+/// Host side: which optional codecs (beyond the mandatory H.264 baseline) a
+/// guest's `Hello` advertised understanding of (§11; ADR 0066).
+///
+/// Unlike [`ReceiverReports`]/[`StreamScaleFeature`] this has no `to_peer`
+/// half: only a host ever chooses and announces a codec
+/// (`MessageKind::MediaCodec`), so there is no mirror direction for a guest
+/// to track about itself.
+#[derive(Debug, Clone, Copy, Default)]
+struct GuestCodecSupport {
+    /// The guest's `Hello` advertised [`FEATURE_CODEC_AV1`].
+    av1: bool,
+    /// The guest's `Hello` advertised [`FEATURE_CODEC_H265`].
+    h265: bool,
+    /// The guest's `Hello` advertised [`FEATURE_CODEC_VP9`].
+    vp9: bool,
+}
+
+impl GuestCodecSupport {
+    fn from_features(features: &[String]) -> Self {
+        Self {
+            av1: features.iter().any(|f| f == FEATURE_CODEC_AV1),
+            h265: features.iter().any(|f| f == FEATURE_CODEC_H265),
+            vp9: features.iter().any(|f| f == FEATURE_CODEC_VP9),
+        }
+    }
+
+    /// Whether this guest advertised understanding of codec negotiation at
+    /// all — the gate for sending it `MessageKind::MediaCodec` in the first
+    /// place (§9.1): a guest that advertised none of the three strings would
+    /// decode the discriminant as unknown and close the connection.
+    const fn understands_negotiation(self) -> bool {
+        self.av1 || self.h265 || self.vp9
+    }
+}
+
+/// Host side: what this host could show as `MediaCodec.codec` to a guest with
+/// `support`, given what this host can actually encode right now (§11; ADR
+/// 0066).
+///
+/// AV1 is only chosen with mutual hardware support, asked through
+/// [`probe_hardware`] — the exact question `select_encoder` asks again later
+/// when it actually builds the encoder, rather than a second opinion that
+/// could disagree with it (§11's mutual-hardware-support rule). H.265 and VP9
+/// have no encoder anywhere in this workspace yet (batches 08/09), so they
+/// are never chosen no matter what a guest advertises: an honest "not yet",
+/// not an unverified assumption that a path works — the same shape of mistake
+/// the comment above the build matrix in `.github/workflows/release.yml`
+/// records from v0.0.14, where a release shipped without the `encode-openh264`
+/// fallback next to `encode-mf` and a host with no hardware encoder went
+/// permanently blank because nothing had confirmed a usable encoder actually
+/// existed before relying on one.
+fn choose_media_codec(support: GuestCodecSupport) -> VideoCodec {
+    if support.av1
+        && probe_hardware(EncoderConfig {
+            codec: VideoCodec::Av1,
+            ..EncoderConfig::default()
+        }) == Some(EncoderKind::Hardware)
+    {
+        return VideoCodec::Av1;
+    }
+    VideoCodec::H264
+}
+
+/// The wire-level [`MediaCodec`] naming the same codec as `codec`, for the
+/// `MessageKind::MediaCodec` this host is about to send (§11; ADR 0066).
+///
+/// Infallible because [`choose_media_codec`] never returns a
+/// `lumepeer_media` codec this cannot name — the day it can, this match grows
+/// an arm alongside it.
+const fn wire_media_codec(codec: VideoCodec) -> MediaCodec {
+    match codec {
+        VideoCodec::H264 => MediaCodec::H264,
+        VideoCodec::Av1 => MediaCodec::Av1,
+    }
+}
+
 /// Host side: this host's own physical monitor has been switched at least
 /// once this "reversibility window", and has not been restored yet
 /// (docs/bugs/16-host-display-mode.md #3; ADR 0048).
@@ -2428,6 +2513,10 @@ struct ViewState {
     /// `CursorShape` arrives, and never inferred: a host that composites its
     /// cursor into the picture sends none, and this stays `None`.
     cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
+    /// The negotiated video codec, as the frame poll reads it (§11; ADR
+    /// 0066). Written when a `MessageKind::MediaCodec` arrives; starts at 0
+    /// (H.264), the only codec a host that never sends one can mean.
+    codec: Arc<AtomicU8>,
     /// The host's monitors, as it announced them when it granted the session
     /// (§11 `MonitorsList`; ADR 0028).
     ///
@@ -2516,6 +2605,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
+        /// Which optional codecs the guest's `Hello` advertised understanding
+        /// of (§11; ADR 0066).
+        guest_codec_support: GuestCodecSupport,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -2610,6 +2702,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
+        /// Which optional codecs the guest's `Hello` advertised understanding
+        /// of (§11; ADR 0066).
+        guest_codec_support: GuestCodecSupport,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -2705,6 +2800,9 @@ struct Actor {
     /// Which side of the `DisplayModesList`/`DisplaySetMode` exchange each
     /// peer can speak (§9.1; docs/bugs/16-host-display-mode.md; ADR 0048).
     display_mode: std::collections::HashMap<NodeId, DisplayModeFeature>,
+    /// Host side: which optional codecs each guest's `Hello` advertised
+    /// understanding of (§11; ADR 0066).
+    guest_codec_support: std::collections::HashMap<NodeId, GuestCodecSupport>,
     /// Host side: the host's own monitor's original mode, and who is
     /// responsible for restoring it, while a switch this session made has
     /// not been undone yet (docs/bugs/16-host-display-mode.md #3; ADR 0048).
@@ -3639,6 +3737,7 @@ impl Actor {
                     speaks_stream_size,
                     speaks_clipboard_files,
                     speaks_display_mode,
+                    guest_codec_support,
                 }) => ActorEvent::Handshaked {
                     connection,
                     peer,
@@ -3652,6 +3751,7 @@ impl Actor {
                     speaks_stream_size,
                     speaks_clipboard_files,
                     speaks_display_mode,
+                    guest_codec_support,
                     ticket: *ticket,
                 },
                 Some(Accepted::Media { connection, peer }) => {
@@ -3778,11 +3878,16 @@ impl Actor {
                 speaks_stream_size,
                 speaks_clipboard_files,
                 speaks_display_mode,
+                guest_codec_support,
             } => {
                 // Host side of the exchange: whether this guest's own reports
                 // may be read at all (ADR 0037). The guest side is recorded in
                 // `on_dialed`, from the `HelloAck` minor.
                 self.receiver_reports.entry(peer).or_default().from_peer = speaks_receiver_report;
+                // Which optional codecs this guest can actually decode, for
+                // the choice `on_media_accepted` makes before its encode loop
+                // starts (§11; ADR 0066).
+                self.guest_codec_support.insert(peer, guest_codec_support);
                 // Same shape, for the manual scale ceiling (D7,
                 // docs/bugs/13-stream-resolution.md).
                 self.stream_scale.entry(peer).or_default().from_peer = speaks_stream_scale;
@@ -3905,11 +4010,31 @@ impl Actor {
                 .grants(&peer)
                 .is_some_and(|grants| grants.secure_desktop),
         );
+        // §11, ADR 0066: the intersection of what this guest can decode with
+        // what this host can encode right now, falling back to H.264 — sent
+        // before the first frame and only to a guest that proved it
+        // understands the message by advertising at least one codec string.
+        let codec_support = self
+            .guest_codec_support
+            .get(&peer)
+            .copied()
+            .unwrap_or_default();
+        let codec = choose_media_codec(codec_support);
+        if codec_support.understands_negotiation() {
+            tracing::info!(peer = %tag, ?codec, "video codec negotiated");
+            self.send_to(
+                &peer,
+                MessageKind::MediaCodec {
+                    codec: wire_media_codec(codec).to_wire(),
+                },
+            );
+        }
         let task = spawn_encode_loop(
             connection.clone(),
             Arc::clone(&self.capture),
             Arc::clone(&recorder),
             tag.clone(),
+            codec,
             peer,
             self.faults_tx.clone(),
             control.clone(),
@@ -4126,6 +4251,11 @@ impl Actor {
         // guess would be a second cursor next to the real one (§11).
         let cursor: Arc<std::sync::RwLock<Option<CursorFeed>>> =
             Arc::new(std::sync::RwLock::new(None));
+        // Starts at H.264 (0): a host that never sends `MediaCodec` at all —
+        // every host built before ADR 0066, and any newer one this guest gave
+        // no codec feature string to negotiate with — can only ever mean the
+        // mandatory baseline.
+        let codec = Arc::new(AtomicU8::new(0));
         // Keyed by the peer tag: that is the only name the view window knows
         // itself by across IPC — `view_next_frame` takes `peer`, and the
         // window label is derived from it, not the other way round.
@@ -4140,6 +4270,7 @@ impl Actor {
                     recording: Arc::clone(&recording),
                     cursor: Arc::clone(&cursor),
                     bitstream,
+                    codec: Arc::clone(&codec),
                     peer,
                     reports: self.reports_tx.clone(),
                 },
@@ -4153,6 +4284,7 @@ impl Actor {
                 input,
                 recording,
                 cursor,
+                codec,
                 monitors: Vec::new(),
                 display_modes: Vec::new(),
                 display_modes_reason: None,
@@ -4787,6 +4919,20 @@ impl Actor {
             }
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
+            // Guest side: the host announced which codec the media stream is
+            // about to carry (§11; ADR 0066). The byte already passed
+            // `MessageEnvelope::decode`'s `check_limits`, so it is one of the
+            // assigned `MediaCodec` values; a view for this peer may not exist
+            // yet if the message somehow raced the window closing, in which
+            // case there is nothing left to tell.
+            MessageKind::MediaCodec { codec } => {
+                if let Some(state) = self.views.get(&peer) {
+                    state.codec.store(codec, Ordering::Relaxed);
+                    tracing::info!(peer = %tag, codec, "the host negotiated a video codec");
+                } else {
+                    tracing::debug!(peer = %tag, codec, "media codec without a view; ignored");
+                }
+            }
             // Guest side: this host wants credentials rather than a dialog
             // (§8; ADR 0033). Only ever acted on for the host this node is
             // actually dialing: an inbound peer has no business telling this
@@ -8083,6 +8229,7 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_DISPLAY_MODE),
+        guest_codec_support: GuestCodecSupport::from_features(&hello.features),
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -8198,6 +8345,20 @@ async fn connect_once(
     // What this build understands, for a host to decide what it may send.
     // An older host ignores an unknown string (§9.1) and simply never sends
     // the message behind it.
+    //
+    // No `FEATURE_CODEC_AV1`/`FEATURE_CODEC_H265`/`FEATURE_CODEC_VP9` here
+    // (§11; ADR 0066). The real answer — `VideoDecoder.isConfigSupported`,
+    // asked by `view-decoder.ts`'s `supportedOptionalCodecs()` — can only run
+    // inside the view window, and the view window does not exist yet at this
+    // point: it opens only after `HelloAck` and consent, both of which come
+    // after the `Hello` this call is about to send. Advertising a codec this
+    // process has not actually asked its `WebView` about would be relying on
+    // an unverified assumption exactly like the one ADR 0066 rejects (the
+    // v0.0.14 blank screen, `.github/workflows/release.yml`'s build matrix
+    // comment). Nothing is lost by staying quiet: no build
+    // of this workspace can encode anything but H.264 either yet (batches
+    // 07/08/09), so the host's own intersection would fall back to H.264
+    // regardless of what a guest claims.
     let features = vec![
         FEATURE_MEDIA_UNAVAILABLE.to_owned(),
         FEATURE_FILE_TRANSFER.to_owned(),
@@ -8658,6 +8819,7 @@ pub fn spawn_actor_with(
         stream_scale: std::collections::HashMap::new(),
         stream_size: std::collections::HashMap::new(),
         display_mode: std::collections::HashMap::new(),
+        guest_codec_support: std::collections::HashMap::new(),
         display_mode_state: None,
         display_mode_generation: 0,
         speaks_cursor_shape: std::collections::HashSet::new(),
@@ -8784,6 +8946,75 @@ mod tests {
         // And a second echo of an already-answered nonce changes nothing.
         assert_eq!(tracker.pong(7), None);
         assert_eq!(tracker.smoothed(), after_the_real_one);
+    }
+
+    /// §9.1, ADR 0066: a guest that advertised none of the three codec
+    /// feature strings must be indistinguishable, at the negotiation layer,
+    /// from one that predates this message entirely — the whole point being
+    /// that `on_media_accepted` never sends it such a guest `MediaCodec` at
+    /// all, so it keeps decoding H.264 the way it always did.
+    #[test]
+    fn a_guest_that_advertised_no_codec_string_gets_h264_and_no_negotiation() {
+        let support = GuestCodecSupport::default();
+        assert!(!support.understands_negotiation());
+        assert_eq!(choose_media_codec(support), VideoCodec::H264);
+    }
+
+    /// `GuestCodecSupport::from_features` reads exactly the three strings
+    /// ADR 0066 defines and nothing else, and any one of them alone is
+    /// enough to prove this guest understands the message.
+    #[test]
+    fn from_features_reads_each_codec_string_independently() {
+        assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_AV1.to_owned()]).av1);
+        assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_H265.to_owned()]).h265);
+        assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_VP9.to_owned()]).vp9);
+        assert!(
+            !GuestCodecSupport::from_features(&["something-unrelated".to_owned()])
+                .understands_negotiation()
+        );
+        for features in [
+            vec![FEATURE_CODEC_AV1.to_owned()],
+            vec![FEATURE_CODEC_H265.to_owned()],
+            vec![FEATURE_CODEC_VP9.to_owned()],
+        ] {
+            assert!(GuestCodecSupport::from_features(&features).understands_negotiation());
+        }
+    }
+
+    /// AV1 is chosen only with mutual hardware support (§11): today
+    /// `probe_hardware` reports `None` for AV1 on every platform (no backend
+    /// implements the probe yet), so a guest claiming AV1 support still gets
+    /// H.264 — the empty-intersection fallback, not a guess that the claim
+    /// and the build's own feature flags agree.
+    #[test]
+    fn av1_is_not_chosen_without_a_real_hardware_probe_saying_so() {
+        let support = GuestCodecSupport {
+            av1: true,
+            h265: false,
+            vp9: false,
+        };
+        assert_eq!(choose_media_codec(support), VideoCodec::H264);
+    }
+
+    /// H.265 and VP9 have no encoder anywhere in this workspace yet (batches
+    /// 08/09): claiming either one, or all three, never moves the choice off
+    /// H.264.
+    #[test]
+    fn h265_and_vp9_are_never_chosen_without_an_encoder() {
+        let support = GuestCodecSupport {
+            av1: false,
+            h265: true,
+            vp9: true,
+        };
+        assert_eq!(choose_media_codec(support), VideoCodec::H264);
+    }
+
+    /// The wire byte `on_media_accepted` sends is exactly the one
+    /// `MediaCodec::try_from` reads back, for the only codec this workspace
+    /// can ever choose today.
+    #[test]
+    fn wire_media_codec_round_trips_through_the_wire_enum() {
+        assert_eq!(wire_media_codec(VideoCodec::H264).to_wire(), 0);
     }
 
     /// A guest that asks on every frame must not be able to decide what the
