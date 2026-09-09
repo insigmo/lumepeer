@@ -3,7 +3,7 @@
 //!
 //! The third sibling of [`super::windows`] (Media Foundation, ADR 0011) and
 //! [`super::linux_vaapi`] (VA-API, ADR 0040), built to the same rule the other
-//! two follow: [`hardware_h264_available`] is not a capability query, it is a
+//! two follow: [`hardware_available`] is not a capability query, it is a
 //! rehearsal. Every Mac since 2011 has a Quick Sync or Apple-silicon H.264
 //! encoder behind `VideoToolbox`, so "does this machine have one" is nearly
 //! always yes and nearly always useless to ask — the question that decides
@@ -123,7 +123,7 @@ fn avcc_to_annex_b(avcc: &[u8], length_size: usize) -> Result<(Vec<u8>, bool)> {
 pub use self::video_toolbox::VideoToolboxEncoder;
 
 #[cfg(target_os = "macos")]
-pub(super) use self::video_toolbox::hardware_h264_available;
+pub(super) use self::video_toolbox::hardware_available;
 
 #[cfg(target_os = "macos")]
 mod video_toolbox {
@@ -228,9 +228,9 @@ mod video_toolbox {
     /// through a different codec type with its own parameter sets and its own
     /// `kVTProfileLevel`; answering an AV1 question with an H.264 rehearsal is
     /// exactly the mismatch §11's mutual-hardware-support rule exists to
-    /// prevent, so the caller checks the codec first (see
-    /// [`super::super::probe_hardware`]).
-    pub(in crate::encode) fn hardware_h264_available(config: EncoderConfig) -> bool {
+    /// prevent, so the codec is checked here — in the backend that would
+    /// otherwise answer for a codec it never opened a session for (ADR 0069).
+    pub(in crate::encode) fn hardware_available(config: EncoderConfig) -> bool {
         if config.codec != VideoCodec::H264 {
             return false;
         }
@@ -954,7 +954,7 @@ mod video_toolbox {
         /// tests below skip gracefully rather than failing on a machine
         /// without one.
         fn try_new_encoder() -> Option<VideoToolboxEncoder> {
-            if !hardware_h264_available(EncoderConfig::default()) {
+            if !hardware_available(EncoderConfig::default()) {
                 return None;
             }
             VideoToolboxEncoder::new(EncoderConfig::default()).ok()
@@ -966,14 +966,14 @@ mod video_toolbox {
         /// `encode::linux_vaapi`.
         #[test]
         fn probe_hardware_agrees_with_whether_construction_actually_works() {
-            let probed = hardware_h264_available(EncoderConfig::default());
+            let probed = hardware_available(EncoderConfig::default());
             let constructed = VideoToolboxEncoder::new(EncoderConfig::default())
                 .and_then(|mut encoder| encoder.encode(&frame(64, 64, 0x20)))
                 .is_ok();
             assert_eq!(
                 probed,
                 constructed,
-                "hardware_h264_available reported {probed} but encoding {}",
+                "hardware_available reported {probed} but encoding {}",
                 if constructed { "worked" } else { "failed" }
             );
         }
@@ -987,7 +987,7 @@ mod video_toolbox {
                 codec: VideoCodec::Av1,
                 ..EncoderConfig::default()
             };
-            assert!(!hardware_h264_available(config));
+            assert!(!hardware_available(config));
             assert!(VideoToolboxEncoder::new(config).is_err());
         }
 

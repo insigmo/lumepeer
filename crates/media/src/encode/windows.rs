@@ -1,5 +1,12 @@
-//! Windows Media Foundation hardware H.264 encoder (design doc §5.1, §11,
-//! §18/§19 phase 4; ADR 0011).
+//! Windows Media Foundation hardware video encoder (design doc §5.1, §11,
+//! §18/§19 phase 4; ADR 0011, ADR 0069).
+//!
+//! H.264 is the mandatory baseline; AV1 rides the same MFT machinery through
+//! a different output subtype ([`mf_subtype`]) on hardware that has an AV1
+//! encoder — Intel Arc and 12th-generation graphics onwards, NVIDIA 40
+//! series, AMD RDNA 3 — and is simply absent everywhere else, which
+//! [`hardware_available`] reports honestly rather than falling back to the
+//! H.264 answer (ADR 0069).
 //!
 //! Hardware H.264 encoder MFTs (Intel Quick Sync, NVENC, AMD AMF, all exposed
 //! through Media Foundation) are documented by Microsoft as always
@@ -52,17 +59,17 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_NV12,
+    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
     eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::Interface as _;
+use windows::core::{GUID, Interface as _};
 
 use super::nv12::bgra_to_nv12;
 use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder};
-use crate::capture::Frame;
+use crate::capture::{Frame, PixelFormat};
 use crate::error::{MediaError, Result};
 
 /// Bits per kilobit, for the kbps of §14 against the bps of `MF_MT_AVG_BITRATE`.
@@ -119,12 +126,70 @@ const QUALITY_VS_SPEED: u32 = 33;
 /// ever comes.
 const GOP_SECONDS: u32 = 10;
 
-/// Whether a genuinely usable hardware H.264 encoder MFT is available right
-/// now (§18, ADR 0011). Runs the exact same activation and type negotiation
+/// The Media Foundation output subtype for one codec.
+///
+/// The one place a codec turns into a GUID, so enumeration
+/// ([`enum_hardware_encoders`]) and the negotiated output type
+/// ([`build_output_type`]) can never ask for different things — a transform
+/// enumerated for one subtype and configured for another is the mismatch that
+/// makes a driver hand back a bitstream the guest cannot decode (ADR 0069).
+const fn mf_subtype(codec: VideoCodec) -> GUID {
+    match codec {
+        VideoCodec::H264 => MFVideoFormat_H264,
+        VideoCodec::Av1 => MFVideoFormat_AV1,
+    }
+}
+
+/// Whether a genuinely usable hardware encoder MFT for `config.codec` is
+/// available right now (§18; ADR 0011, ADR 0069).
+///
+/// H.264 runs the exact same activation and type negotiation
 /// [`MediaFoundationEncoder::new`] would use, so this cannot claim
 /// availability that construction then fails to back up.
-pub(super) fn hardware_h264_available(config: EncoderConfig) -> bool {
-    activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok()
+///
+/// AV1 goes one step further and encodes a frame, the way the
+/// `VideoToolbox` probe does (ADR 0066). The reason is the same one that
+/// applies there: on H.264 the interesting question is whether an encoder
+/// exists at all, and on AV1 — hardware that is at most a few years old,
+/// through driver paths that are much younger than the H.264 ones next to
+/// them — it is whether the transform that just enumerated actually produces
+/// a picture. §11 only allows AV1 with real hardware behind it on both sides,
+/// and "it enumerated" is not that evidence.
+pub(super) fn hardware_available(config: EncoderConfig) -> bool {
+    match config.codec {
+        VideoCodec::H264 => activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok(),
+        VideoCodec::Av1 => encodes_one_frame(config),
+    }
+}
+
+/// Builds an encoder for `config` and pushes one picture through it,
+/// answering `true` only when a non-empty bitstream comes back.
+fn encodes_one_frame(config: EncoderConfig) -> bool {
+    let Ok(mut encoder) = MediaFoundationEncoder::new(config) else {
+        return false;
+    };
+    match encoder.encode(&probe_frame()) {
+        Ok(frame) => !frame.data.is_empty(),
+        Err(error) => {
+            tracing::info!(%error, codec = ?config.codec, "a hardware encoder MFT activated but produced no picture");
+            false
+        }
+    }
+}
+
+/// A flat grey [`PROBE_WIDTH`]x[`PROBE_HEIGHT`] picture for [`encodes_one_frame`]
+/// to push through a transform it just activated.
+fn probe_frame() -> Frame {
+    /// Mid grey, so the picture is neither degenerate black nor saturated
+    /// white; nothing depends on the value beyond it being a real image.
+    const FILL: u8 = 0x80;
+    Frame {
+        width: PROBE_WIDTH,
+        height: PROBE_HEIGHT,
+        format: PixelFormat::Bgra8,
+        timestamp_us: 0,
+        data: vec![FILL; (PROBE_WIDTH as usize) * (PROBE_HEIGHT as usize) * 4],
+    }
 }
 
 /// Hardware H.264 encoder backed by a Media Foundation MFT.
@@ -171,20 +236,19 @@ impl std::fmt::Debug for MediaFoundationEncoder {
 }
 
 impl MediaFoundationEncoder {
-    /// Activates a hardware H.264 encoder MFT and negotiates types at
-    /// [`PROBE_WIDTH`]x[`PROBE_HEIGHT`]; `encode` renegotiates at the real
-    /// frame size on first use.
+    /// Activates a hardware encoder MFT for `config.codec` and negotiates
+    /// types at [`PROBE_WIDTH`]x[`PROBE_HEIGHT`]; `encode` renegotiates at the
+    /// real frame size on first use.
+    ///
+    /// Every [`VideoCodec`] this crate knows has an [`mf_subtype`], so there
+    /// is no codec check here: a machine without an encoder for the one asked
+    /// for simply enumerates nothing, and this returns the same error it
+    /// returns for a machine with no hardware encoder at all (ADR 0069).
     ///
     /// # Errors
-    /// [`MediaError::EncoderUnavailable`] if no hardware H.264 encoder MFT is
-    /// available and usable, or if `config.codec` is not H.264 (AV1 hardware
-    /// is not implemented by this backend).
+    /// [`MediaError::EncoderUnavailable`] if no hardware encoder MFT for that
+    /// codec is available and usable.
     pub fn new(config: EncoderConfig) -> Result<Self> {
-        if config.codec != VideoCodec::H264 {
-            return Err(MediaError::EncoderUnavailable(
-                "the Media Foundation hardware backend only implements H.264".to_owned(),
-            ));
-        }
         let (mf, transform, events) =
             activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config)?;
         Ok(Self {
@@ -295,7 +359,7 @@ impl MediaFoundationEncoder {
             if let Some(events) = &self.events {
                 self.pump.take(events, METransformHaveOutput, deadline)?;
             }
-            match drain_output(&self.transform)? {
+            match drain_output(&self.transform, self.config.codec)? {
                 DrainResult::Frame(encoded) => return Ok(encoded),
                 DrainResult::NeedMoreInput => {
                     return Err(MediaError::Encode(
@@ -303,13 +367,7 @@ impl MediaFoundationEncoder {
                     ));
                 }
                 DrainResult::StreamChanged => {
-                    negotiate_types(
-                        &self.transform,
-                        width,
-                        height,
-                        self.config.fps,
-                        self.config.bitrate_kbps,
-                    )?;
+                    negotiate_types(&self.transform, width, height, self.config)?;
                 }
             }
         }
@@ -331,7 +389,7 @@ impl MediaFoundationEncoder {
             if let Some(events) = &self.events {
                 self.pump.take(events, METransformHaveOutput, deadline)?;
             }
-            match drain_output(&self.transform)? {
+            match drain_output(&self.transform, self.config.codec)? {
                 DrainResult::Frame(encoded) => {
                     self.restart_after_drain()?;
                     return Ok(encoded);
@@ -349,13 +407,7 @@ impl MediaFoundationEncoder {
                     // normal; keep waiting for the HaveOutput this frame owns.
                 }
                 DrainResult::StreamChanged => {
-                    negotiate_types(
-                        &self.transform,
-                        width,
-                        height,
-                        self.config.fps,
-                        self.config.bitrate_kbps,
-                    )?;
+                    negotiate_types(&self.transform, width, height, self.config)?;
                 }
             }
         }
@@ -438,13 +490,7 @@ impl VideoEncoder for MediaFoundationEncoder {
         // second the link was not perfectly steady - the very condition the
         // adaptation exists to smooth over.
         if set_mean_bitrate(&self.transform, bitrate_kbps).is_err() {
-            negotiate_types(
-                &self.transform,
-                self.dims.0,
-                self.dims.1,
-                new_config.fps,
-                bitrate_kbps,
-            )?;
+            negotiate_types(&self.transform, self.dims.0, self.dims.1, new_config)?;
             start_streaming(&self.transform)?;
             self.pump.reset();
         }
@@ -545,10 +591,10 @@ fn ensure_com_initialized() -> Result<()> {
     }
 }
 
-/// Enumerates hardware H.264 encoder MFTs, activates the first one that
-/// accepts NV12 input / H.264 output at `width`x`height`, and starts
-/// streaming. Returns the [`MfRuntime`] guard alongside so the caller can
-/// keep `MFStartup` balanced for as long as the transform lives.
+/// Enumerates hardware encoder MFTs for `config.codec`, activates the first
+/// one that accepts NV12 input / that codec's output at `width`x`height`, and
+/// starts streaming. Returns the [`MfRuntime`] guard alongside so the caller
+/// can keep `MFStartup` balanced for as long as the transform lives.
 fn activate_hardware_transform(
     width: u32,
     height: u32,
@@ -563,7 +609,7 @@ fn activate_hardware_transform(
     };
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_H264,
+        guidSubtype: mf_subtype(config.codec),
     };
 
     for activate in enum_hardware_encoders(&input_info, &output_info)? {
@@ -578,9 +624,10 @@ fn activate_hardware_transform(
             }
         }
     }
-    Err(MediaError::EncoderUnavailable(
-        "no usable hardware H.264 encoder MFT is registered on this system".to_owned(),
-    ))
+    Err(MediaError::EncoderUnavailable(format!(
+        "no usable hardware {:?} encoder MFT is registered on this system",
+        config.codec
+    )))
 }
 
 /// Tries to activate and fully configure one candidate MFT. Any failure at
@@ -606,7 +653,7 @@ fn try_activate_one(
     // change what the transform is willing to negotiate, and several drivers
     // latch both at `SetOutputType` time.
     request_low_latency(&transform);
-    negotiate_types(&transform, width, height, config.fps, config.bitrate_kbps)?;
+    negotiate_types(&transform, width, height, config)?;
     tune_for_low_latency(&transform, config);
     start_streaming(&transform)?;
 
@@ -702,23 +749,22 @@ fn negotiate_types(
     transform: &IMFTransform,
     width: u32,
     height: u32,
-    fps: u8,
-    bitrate_kbps: u32,
+    config: EncoderConfig,
 ) -> Result<()> {
-    let output_type = build_output_type(width, height, fps, bitrate_kbps)?;
+    let output_type = build_output_type(width, height, config)?;
     // SAFETY: SetOutputType takes a reference to a media type this function
     // owns; `dwflags = 0` commits it rather than merely testing it.
     unsafe { transform.SetOutputType(0, &output_type, 0) }
         .map_err(|e| MediaError::EncoderUnavailable(format!("SetOutputType refused: {e}")))?;
 
-    let input_type = build_input_type(width, height, fps)?;
+    let input_type = build_input_type(width, height, config.fps)?;
     // SAFETY: same as above, for the input side.
     unsafe { transform.SetInputType(0, &input_type, 0) }
         .map_err(|e| MediaError::EncoderUnavailable(format!("SetInputType refused: {e}")))?;
     Ok(())
 }
 
-fn build_output_type(width: u32, height: u32, fps: u8, bitrate_kbps: u32) -> Result<IMFMediaType> {
+fn build_output_type(width: u32, height: u32, config: EncoderConfig) -> Result<IMFMediaType> {
     // SAFETY: MFCreateMediaType and the attribute setters below are COM
     // calls on a media type this function owns exclusively until it returns
     // it to the caller.
@@ -729,12 +775,12 @@ fn build_output_type(width: u32, height: u32, fps: u8, bitrate_kbps: u32) -> Res
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
         media_type
-            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)
+            .SetGUID(&MF_MT_SUBTYPE, &mf_subtype(config.codec))
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
         media_type
             .SetUINT32(
                 &MF_MT_AVG_BITRATE,
-                bitrate_kbps.saturating_mul(BITS_PER_KBIT),
+                config.bitrate_kbps.saturating_mul(BITS_PER_KBIT),
             )
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
         media_type
@@ -745,10 +791,20 @@ fn build_output_type(width: u32, height: u32, fps: u8, bitrate_kbps: u32) -> Res
         // real sharpness back on exactly the content a desktop is made of:
         // text edges and flat fills. A driver that refuses it keeps whatever
         // profile it defaults to, so this is set rather than negotiated.
-        let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, h264_high_profile());
+        //
+        // H.264 only, and deliberately: `MF_MT_MPEG2_PROFILE` carries an
+        // `eAVEncH264VProfile` value, so setting it on an AV1 output type
+        // would be naming an H.264 profile number to an AV1 encoder. AV1 gets
+        // no profile attribute at all — Main is the only profile any hardware
+        // AV1 encoder produces for the 8-bit 4:2:0 input this feeds it, so the
+        // driver's own default is already the right answer and there is
+        // nothing here worth guessing at (ADR 0069).
+        if config.codec == VideoCodec::H264 {
+            let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, h264_high_profile());
+        }
     }
     set_frame_size(&media_type, width, height)?;
-    set_frame_rate(&media_type, fps)?;
+    set_frame_rate(&media_type, config.fps)?;
     set_pixel_aspect_ratio(&media_type)?;
     Ok(media_type)
 }
@@ -839,7 +895,12 @@ fn tune_for_low_latency(transform: &IMFTransform, config: EncoderConfig) {
     );
     set(&CODECAPI_AVEncVideoMaxNumRefFrame, VARIANT::from(1u32));
     set(&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32));
-    set(&CODECAPI_AVEncH264CABACEnable, VARIANT::from(true));
+    // H.264 only. CABAC is an H.264 entropy coder and the property names it;
+    // AV1 has one entropy coder with nothing to select, so asking would be
+    // asking a question that codec does not have (ADR 0069).
+    if config.codec == VideoCodec::H264 {
+        set(&CODECAPI_AVEncH264CABACEnable, VARIANT::from(true));
+    }
     set(
         &CODECAPI_AVEncMPVGOPSize,
         VARIANT::from(u32::from(config.fps.max(1)).saturating_mul(GOP_SECONDS)),
@@ -1042,7 +1103,7 @@ enum DrainResult {
 /// Calls `ProcessOutput` once and extracts a frame, allocating the output
 /// sample ourselves unless the transform provides its own (MSDN: check
 /// `MFT_OUTPUT_STREAM_PROVIDES_SAMPLES` on `GetOutputStreamInfo` first).
-fn drain_output(transform: &IMFTransform) -> Result<DrainResult> {
+fn drain_output(transform: &IMFTransform, codec: VideoCodec) -> Result<DrainResult> {
     // SAFETY: GetOutputStreamInfo only reads transform state into a plain
     // `#[repr(C)]` struct.
     let stream_info = unsafe { transform.GetOutputStreamInfo(0) }
@@ -1090,7 +1151,7 @@ fn drain_output(transform: &IMFTransform) -> Result<DrainResult> {
                     "hardware encoder reported success with no output sample".to_owned(),
                 )
             })?;
-            Ok(DrainResult::Frame(sample_to_encoded_frame(&sample)?))
+            Ok(DrainResult::Frame(sample_to_encoded_frame(&sample, codec)?))
         }
         Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(DrainResult::NeedMoreInput),
         Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => Ok(DrainResult::StreamChanged),
@@ -1121,7 +1182,7 @@ fn allocate_output_sample(size: u32, alignment: u32) -> Result<IMFSample> {
     }
 }
 
-fn sample_to_encoded_frame(sample: &IMFSample) -> Result<EncodedFrame> {
+fn sample_to_encoded_frame(sample: &IMFSample, codec: VideoCodec) -> Result<EncodedFrame> {
     // SAFETY: ConvertToContiguousBuffer/Lock/Unlock/GetUINT32 are COM calls
     // on a sample this function owns; `Lock` guarantees `ptr` is valid for
     // `current_len` bytes until the matching `Unlock`.
@@ -1144,17 +1205,31 @@ fn sample_to_encoded_frame(sample: &IMFSample) -> Result<EncodedFrame> {
             .map_err(|e| MediaError::Encode(format!("output buffer Unlock failed: {e}")))?;
 
         // `MFSampleExtension_CleanPoint` is the documented keyframe marker,
-        // but not every driver sets it faithfully; cross-check the Annex-B
-        // bitstream itself for an IDR NAL so a missing attribute cannot turn
-        // a real keyframe into a false negative.
+        // but not every driver sets it faithfully; cross-check the bitstream
+        // itself so a missing attribute cannot turn a real keyframe into a
+        // false negative.
         let clean_point = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0);
-        let keyframe = clean_point != 0 || bitstream_has_idr(&data);
+        let keyframe = clean_point != 0 || bitstream_is_random_access(codec, &data);
 
         Ok(EncodedFrame {
             keyframe,
             timestamp_us: 0, // overwritten by the caller with the input frame's timestamp
             data,
         })
+    }
+}
+
+/// Whether `data` can be decoded without anything before it, read from the
+/// bitstream itself rather than from the driver's own claim.
+///
+/// The cross-check behind `MFSampleExtension_CleanPoint`, so it answers per
+/// codec: the two bitstreams have nothing structurally in common, and asking
+/// an AV1 temporal unit whether it contains an H.264 IDR NAL would find
+/// whatever the byte pattern happened to hit (ADR 0069).
+fn bitstream_is_random_access(codec: VideoCodec, data: &[u8]) -> bool {
+    match codec {
+        VideoCodec::H264 => bitstream_has_idr(data),
+        VideoCodec::Av1 => av1_has_sequence_header(data),
     }
 }
 
@@ -1188,6 +1263,93 @@ fn bitstream_has_idr(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// `obu_forbidden_bit` of an AV1 OBU header; always 0 in a well-formed
+/// stream, so a 1 means this is not an OBU boundary at all.
+const AV1_OBU_FORBIDDEN_BIT: u8 = 0b1000_0000;
+/// `obu_type` occupies the four bits below `obu_forbidden_bit`.
+const AV1_OBU_TYPE_SHIFT: u32 = 3;
+/// See [`AV1_OBU_TYPE_SHIFT`].
+const AV1_OBU_TYPE_MASK: u8 = 0b1111;
+/// `obu_extension_flag`: one more header byte follows when it is set.
+const AV1_OBU_EXTENSION_FLAG: u8 = 0b0000_0100;
+/// `obu_has_size_field`: a leb128 payload length follows the header. Media
+/// Foundation emits the low-overhead bitstream format, where it is always set.
+const AV1_OBU_HAS_SIZE_FIELD: u8 = 0b0000_0010;
+/// `OBU_SEQUENCE_HEADER` (AV1 specification, section 6.2.2).
+const AV1_OBU_SEQUENCE_HEADER: u8 = 1;
+/// Bytes a leb128 value may occupy in AV1 (specification, section 4.10.5).
+const AV1_LEB128_MAX_BYTES: usize = 8;
+/// Payload bits carried by one leb128 byte; the eighth is the continuation
+/// flag.
+const AV1_LEB128_PAYLOAD_BITS: u32 = 7;
+/// The [`AV1_LEB128_PAYLOAD_BITS`] payload bits of one leb128 byte.
+const AV1_LEB128_PAYLOAD_MASK: u8 = 0b0111_1111;
+/// The continuation flag of one leb128 byte: another byte follows.
+const AV1_LEB128_CONTINUATION: u8 = 0b1000_0000;
+
+/// Whether an AV1 temporal unit carries a sequence header OBU, which is what
+/// makes it a point a decoder can start from.
+///
+/// A sequence header rather than a key frame header: AV1 puts the decoder
+/// configuration — resolution, bit depth, the enabled coding tools — in the
+/// sequence header, and a decoder that has not read one cannot decode the key
+/// frame that follows it either. An encoder therefore emits one alongside
+/// every random-access point, which makes "does this temporal unit contain a
+/// sequence header" the same question as "can a decoder join here", and it is
+/// answerable by walking OBU sizes instead of parsing a frame header's
+/// variable-length bit fields (ADR 0069).
+///
+/// Refuses rather than guesses at anything it cannot walk: a header with no
+/// size field ends the scan, because from there the next OBU boundary is not
+/// discoverable and a byte picked out of the middle of a payload would be
+/// noise. This runs on encoder output rather than on a peer's bytes, but it
+/// is a bitstream parser either way, so it neither panics nor loops on one
+/// (§21).
+fn av1_has_sequence_header(data: &[u8]) -> bool {
+    let mut at = 0usize;
+    while let Some(&header) = data.get(at) {
+        if header & AV1_OBU_FORBIDDEN_BIT != 0 {
+            return false;
+        }
+        if (header >> AV1_OBU_TYPE_SHIFT) & AV1_OBU_TYPE_MASK == AV1_OBU_SEQUENCE_HEADER {
+            return true;
+        }
+        if header & AV1_OBU_HAS_SIZE_FIELD == 0 {
+            return false;
+        }
+        let after_header = at + 1 + usize::from(header & AV1_OBU_EXTENSION_FLAG != 0);
+        let Some((payload, leb_bytes)) = read_leb128(data, after_header) else {
+            return false;
+        };
+        // Always strictly greater than `at`: `after_header` is at least
+        // `at + 1` and `leb_bytes` is at least 1, so the walk cannot stand
+        // still even on a zero-length payload.
+        let Some(next) = after_header
+            .checked_add(leb_bytes)
+            .and_then(|end| end.checked_add(payload))
+        else {
+            return false;
+        };
+        at = next;
+    }
+    false
+}
+
+/// Reads the leb128 at `at`, returning its value and how many bytes it took,
+/// or `None` if it runs off the end or past [`AV1_LEB128_MAX_BYTES`].
+fn read_leb128(data: &[u8], at: usize) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    for index in 0..AV1_LEB128_MAX_BYTES {
+        let byte = *data.get(at + index)?;
+        value |= usize::from(byte & AV1_LEB128_PAYLOAD_MASK)
+            .checked_shl(u32::try_from(index).ok()? * AV1_LEB128_PAYLOAD_BITS)?;
+        if byte & AV1_LEB128_CONTINUATION == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
 }
 
 /// Asynchronous-MFT events that arrived out of turn.
@@ -1313,7 +1475,7 @@ mod tests {
     /// that need real hardware skip gracefully on a machine that has none
     /// rather than failing.
     fn try_new_encoder() -> Option<MediaFoundationEncoder> {
-        if !hardware_h264_available(EncoderConfig::default()) {
+        if !hardware_available(EncoderConfig::default()) {
             return None;
         }
         MediaFoundationEncoder::new(EncoderConfig::default()).ok()
@@ -1325,26 +1487,50 @@ mod tests {
         // requirement, checked mechanically rather than by inspection: this
         // runs identically whether or not the machine has a hardware H.264
         // encoder MFT, because it only asserts that the two answers match.
-        let probed = hardware_h264_available(EncoderConfig::default());
+        let probed = hardware_available(EncoderConfig::default());
         let constructed = MediaFoundationEncoder::new(EncoderConfig::default()).is_ok();
         assert_eq!(
             probed,
             constructed,
-            "hardware_h264_available reported {probed} but construction {}",
+            "hardware_available reported {probed} but construction {}",
             if constructed { "succeeded" } else { "failed" }
         );
     }
 
+    /// The AV1 half of the rule above, and one notch stricter, because that is
+    /// what [`hardware_available`] promises for AV1: a `true` answer must be
+    /// backed by a transform that actually produced a picture, not merely by
+    /// one that constructed (ADR 0069). Runs identically on a machine with an
+    /// AV1 encoder and on one without.
     #[test]
-    fn av1_is_refused_regardless_of_hardware_availability() {
+    fn an_av1_probe_that_says_yes_is_backed_by_a_real_picture() {
         let config = EncoderConfig {
             codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         };
-        assert!(matches!(
-            MediaFoundationEncoder::new(config),
-            Err(MediaError::EncoderUnavailable(_))
-        ));
+        if !hardware_available(config) {
+            eprintln!("skipping: no hardware AV1 encoder MFT on this machine");
+            return;
+        }
+        // The probe above already built one of these and encoded through it.
+        let mut encoder = MediaFoundationEncoder::new(config).unwrap();
+        let first = encoder.encode(&probe_frame()).unwrap();
+        assert!(!first.data.is_empty());
+        assert!(first.keyframe, "the first frame must be decodable alone");
+        assert_eq!(encoder.kind(), EncoderKind::Hardware);
+    }
+
+    /// Each codec is enumerated and negotiated under its own Media Foundation
+    /// subtype. The failure this guards is the copy-paste one: an AV1 request
+    /// that enumerates `MFVideoFormat_H264` finds the H.264 encoder every
+    /// machine has, activates it, and hands a guest expecting AV1 an H.264
+    /// bitstream — §11's mutual-hardware-support rule violated with every
+    /// individual step apparently succeeding.
+    #[test]
+    fn each_codec_has_its_own_media_foundation_subtype() {
+        assert_eq!(mf_subtype(VideoCodec::H264), MFVideoFormat_H264);
+        assert_eq!(mf_subtype(VideoCodec::Av1), MFVideoFormat_AV1);
+        assert_ne!(mf_subtype(VideoCodec::H264), mf_subtype(VideoCodec::Av1));
     }
 
     #[test]
@@ -1418,5 +1604,56 @@ mod tests {
     fn bitstream_has_idr_is_false_for_non_idr_nals() {
         let data = [0x00, 0x00, 0x01, 0x41, 0xAA, 0xBB]; // NAL type 1 = non-IDR slice
         assert!(!bitstream_has_idr(&data));
+    }
+
+    /// One OBU header byte: `obu_type` in bits 6..3, `obu_has_size_field` set,
+    /// everything else clear — the low-overhead form Media Foundation emits.
+    const fn obu_header(obu_type: u8) -> u8 {
+        (obu_type << AV1_OBU_TYPE_SHIFT) | AV1_OBU_HAS_SIZE_FIELD
+    }
+
+    #[test]
+    fn av1_finds_a_sequence_header_after_a_temporal_delimiter() {
+        // OBU_TEMPORAL_DELIMITER (2), empty, then OBU_SEQUENCE_HEADER (1).
+        let data = [obu_header(2), 0x00, obu_header(1), 0x01, 0x00];
+        assert!(av1_has_sequence_header(&data));
+    }
+
+    #[test]
+    fn av1_is_false_for_a_temporal_unit_that_only_carries_a_frame() {
+        // OBU_TEMPORAL_DELIMITER (2), empty, then OBU_FRAME (6).
+        let data = [obu_header(2), 0x00, obu_header(6), 0x03, 0xAA, 0xBB, 0xCC];
+        assert!(!av1_has_sequence_header(&data));
+    }
+
+    #[test]
+    fn av1_walks_past_an_obu_whose_length_took_two_leb128_bytes() {
+        // OBU_FRAME (6) of 200 bytes — 0xC8 0x01 in leb128 — then a sequence
+        // header. Reading the length as one byte would land mid-payload.
+        let mut data = vec![obu_header(6), 0xC8, 0x01];
+        data.extend(std::iter::repeat_n(0x5Au8, 200));
+        data.extend_from_slice(&[obu_header(1), 0x01, 0x00]);
+        assert!(av1_has_sequence_header(&data));
+    }
+
+    #[test]
+    fn av1_refuses_a_truncated_temporal_unit_rather_than_running_off_the_end() {
+        assert!(!av1_has_sequence_header(&[]));
+        assert!(!av1_has_sequence_header(&[obu_header(2)]));
+        // A length that claims more than is there.
+        assert!(!av1_has_sequence_header(&[obu_header(6), 0x40, 0x00]));
+    }
+
+    /// The two scanners must never be applied to each other's bitstream: an
+    /// H.264 IDR is a byte pattern an OBU walk can wander into, and vice
+    /// versa.
+    #[test]
+    fn random_access_detection_does_not_cross_codecs() {
+        let h264_idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0xAA];
+        let av1_keyframe = [obu_header(2), 0x00, obu_header(1), 0x01, 0x00];
+        assert!(bitstream_is_random_access(VideoCodec::H264, &h264_idr));
+        assert!(!bitstream_is_random_access(VideoCodec::Av1, &h264_idr));
+        assert!(bitstream_is_random_access(VideoCodec::Av1, &av1_keyframe));
+        assert!(!bitstream_is_random_access(VideoCodec::H264, &av1_keyframe));
     }
 }

@@ -93,54 +93,54 @@ pub trait VideoEncoder: Send {
     fn kind(&self) -> EncoderKind;
 }
 
-/// Whether a platform hardware encoder can be used right now.
+/// Whether a platform hardware encoder can be used right now for the codec
+/// `config` names.
 ///
-/// On Windows, with the `encode-mf` feature built in and `config.codec`
-/// asking for H.264, this genuinely enumerates and activates a
-/// hardware-accelerated H.264 encoder MFT via Media Foundation (`MFTEnumEx`
-/// filtered to `MFT_ENUM_FLAG_HARDWARE`) and only reports
+/// Each backend answers for its own codecs, and only after a real activation.
+/// Nothing is refused here up front: a central "H.264 only" gate is what
+/// would have to be remembered and edited every time a backend learns a new
+/// codec, and the mismatch §11's mutual-hardware-support rule actually
+/// guards against — handing back an H.264 rehearsal as an answer about
+/// another codec — is prevented by each backend checking `config.codec`
+/// itself before it claims anything (ADR 0069).
+///
+/// On Windows, with the `encode-mf` feature built in, [`windows`] genuinely
+/// enumerates and activates a hardware-accelerated encoder MFT via Media
+/// Foundation (`MFTEnumEx` filtered to `MFT_ENUM_FLAG_HARDWARE`) for the
+/// output subtype the codec names, and only reports
 /// [`EncoderKind::Hardware`] if one actually activates and accepts NV12
-/// input / H.264 output — never a hopeful guess (ADR 0011). The `windows`
-/// submodule only ever probes and builds H.264; AV1 hardware is not
-/// implemented, so this deliberately reports `None` for `VideoCodec::Av1`
-/// here rather than reusing the H.264 answer for a codec it never checked
-/// (that mismatch is exactly the bug §11's mutual-hardware-support rule for
-/// AV1 exists to prevent).
+/// input — never a hopeful guess (ADR 0011). For [`VideoCodec::Av1`] it goes
+/// one step further and pushes a frame through the transform it just
+/// activated, because "it enumerated" and "it produces a picture" are
+/// different questions on a codec whose hardware is a few years old at most
+/// (ADR 0069).
 ///
 /// On Linux, with `encode-vaapi` built in, [`linux_vaapi`] does the same
-/// thing through VA-API: opens a DRM display, creates an H.264
+/// thing through VA-API for H.264: opens a DRM display, creates an H.264
 /// `VAEntrypointEncSlice` config, allocates NV12 surfaces and creates the
 /// encode context, reporting [`EncoderKind::Hardware`] only when all of that
-/// actually succeeds (ADR 0040). It too answers `None` for
-/// [`VideoCodec::Av1`] explicitly rather than reusing its H.264 answer:
-/// AV1 over VA-API is a different profile with different parameter buffers,
-/// and nothing here has checked it.
+/// actually succeeds (ADR 0040). It answers `None` for [`VideoCodec::Av1`],
+/// and not because nobody looked: VA-API's AV1 encode entrypoint cannot be
+/// driven through this workspace's libva bindings at all, which ADR 0069
+/// records rather than leaving as an unexplained gap.
 ///
 /// On macOS, with `encode-videotoolbox` built in,
-/// [`macos_videotoolbox`] goes one step further than either of those: it
-/// opens a real `VTCompressionSession` *and pushes a frame through it*,
-/// reporting [`EncoderKind::Hardware`] only once a picture has actually come
-/// back out (ADR 0066). Every Mac of the last decade has an H.264 encoder, so
-/// "is one installed" is a question whose answer is almost always yes and
-/// almost never the reason a session shows nothing. `VideoCodec::Av1` is
-/// `None` there too, and for the same reason as the other two: `VideoToolbox`
-/// encodes AV1 through a different codec type that nothing here has checked.
+/// [`macos_videotoolbox`] goes one step further than the H.264 paths of
+/// either of those: it opens a real `VTCompressionSession` *and pushes a
+/// frame through it*, reporting [`EncoderKind::Hardware`] only once a picture
+/// has actually come back out (ADR 0066). Every Mac of the last decade has an
+/// H.264 encoder, so "is one installed" is a question whose answer is almost
+/// always yes and almost never the reason a session shows nothing.
+/// `VideoCodec::Av1` is `None` there: `VideoToolbox` encodes AV1 through a
+/// different codec type with its own parameter sets that nothing here has
+/// checked.
 ///
 /// `MediaCodec` remains phase 4 work (§19), so this is `None` on Android.
 #[must_use]
 pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
-    // AV1 is refused up front, on every platform, rather than once per
-    // backend: no backend implements an AV1 probe, and the failure mode this
-    // guards against — handing back an H.264 answer to an AV1 question — is
-    // one that a new backend would reintroduce silently if the check lived
-    // inside each of them.
-    if config.codec != VideoCodec::H264 {
-        return None;
-    }
-
     #[cfg(all(target_os = "windows", feature = "encode-mf"))]
     {
-        if windows::hardware_h264_available(config) {
+        if windows::hardware_available(config) {
             return Some(EncoderKind::Hardware);
         }
     }
@@ -150,16 +150,25 @@ pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
         feature = "encode-vaapi"
     ))]
     {
-        if linux_vaapi::hardware_h264_available(config) {
+        if linux_vaapi::hardware_available(config) {
             return Some(EncoderKind::Hardware);
         }
     }
     #[cfg(all(target_os = "macos", feature = "encode-videotoolbox"))]
     {
-        if macos_videotoolbox::hardware_h264_available(config) {
+        if macos_videotoolbox::hardware_available(config) {
             return Some(EncoderKind::Hardware);
         }
     }
+    // Says which codec found nothing, which is the whole answer to "why did
+    // this session negotiate H.264" on a machine whose hardware does not
+    // encode the codec the guest asked for (§18). It also keeps `config` used
+    // in a build with no encoder backend compiled in at all, which every
+    // branch above is behind a `cfg` for.
+    tracing::debug!(
+        codec = ?config.codec,
+        "no hardware encoder backend on this machine reports support"
+    );
     None
 }
 
@@ -174,18 +183,19 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     // it is computed once rather than once per branch below.
     let hardware = probe_hardware(config);
 
-    if config.codec == VideoCodec::Av1 && hardware != Some(EncoderKind::Hardware) {
-        // §11: AV1 only with mutual hardware support, and there is no software
-        // AV1 fallback in v1.
-        return Err(MediaError::EncoderUnavailable(
-            "AV1 needs hardware support on both sides and has no software fallback".to_owned(),
-        ));
+    if config.codec != VideoCodec::H264 && hardware != Some(EncoderKind::Hardware) {
+        // §11: an optional codec is only ever used with mutual hardware
+        // support, and none of them has a software fallback in v1.
+        return Err(MediaError::EncoderUnavailable(format!(
+            "{:?} needs hardware support on both sides and has no software fallback",
+            config.codec
+        )));
     }
 
     if let Some(EncoderKind::Hardware) = hardware {
         #[cfg(all(target_os = "windows", feature = "encode-mf"))]
         {
-            tracing::info!("hardware H.264 encoder available, using Media Foundation (§18)");
+            tracing::info!(codec = ?config.codec, "hardware encoder available, using Media Foundation (§18)");
             return windows::MediaFoundationEncoder::new(config)
                 .map(|e| Box::new(e) as Box<dyn VideoEncoder>);
         }
@@ -245,6 +255,19 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         }
     }
 
+    // The backstop for the other half of the rule above: the probe said
+    // hardware was there and the constructor then failed, so control fell
+    // through to the software fallback — which is H.264 and nothing else
+    // (§11). Encoding H.264 into a session that has already announced another
+    // codec on the wire would be a black window with no error anywhere, so
+    // this fails instead.
+    if config.codec != VideoCodec::H264 {
+        return Err(MediaError::EncoderUnavailable(format!(
+            "the hardware encoder for {:?} probed available but would not build, and there is no software fallback for it",
+            config.codec
+        )));
+    }
+
     #[cfg(feature = "encode-openh264")]
     {
         tracing::info!("no hardware encoder available, falling back to openh264 (§18)");
@@ -289,8 +312,8 @@ pub mod macos_videotoolbox;
 ))]
 pub mod linux_vaapi;
 
-/// Windows Media Foundation hardware H.264 encoder (§5.1, §11, §18/§19 phase
-/// 4; ADR 0011).
+/// Windows Media Foundation hardware video encoder — H.264 and AV1 (§5.1,
+/// §11, §18/§19 phase 4; ADR 0011, ADR 0069).
 ///
 /// The second and only other place in the crate that needs `unsafe`, besides
 /// `decode::shm` (ADR 0005): every `IMFTransform`/`IMFActivate`/`IMFSample`
@@ -542,15 +565,28 @@ mod tests {
         assert_eq!(config.codec, VideoCodec::H264);
     }
 
+    /// §11's mutual-hardware-support rule, checked mechanically rather than by
+    /// inspection so it runs the same on a machine with an AV1 encoder and on
+    /// one without: AV1 is either refused outright or served by genuine
+    /// hardware, and never by the software fallback (ADR 0069).
     #[test]
-    fn av1_is_refused_without_hardware_support() {
+    fn av1_is_served_by_hardware_or_refused_and_never_by_software() {
         let config = EncoderConfig {
             codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         };
-        assert!(matches!(
-            select_encoder(config),
-            Err(MediaError::EncoderUnavailable(_))
-        ));
+        match select_encoder(config) {
+            Ok(encoder) => assert_eq!(
+                encoder.kind(),
+                EncoderKind::Hardware,
+                "AV1 has no software encoder in v1"
+            ),
+            Err(MediaError::EncoderUnavailable(_)) => assert_ne!(
+                probe_hardware(config),
+                Some(EncoderKind::Hardware),
+                "AV1 was refused even though the probe reported hardware"
+            ),
+            Err(other) => panic!("unexpected error selecting an AV1 encoder: {other}"),
+        }
     }
 }

@@ -97,6 +97,31 @@ describe('decodeViewChunk', () => {
     }
   });
 
+  it('takes the keyframe flag from the header, never from the bitstream (ADR 0069)', () => {
+    // The AV1 stream a host produces is a sequence of OBUs, not Annex-B NAL
+    // units, so nothing on this side could derive "is this a random access
+    // point" from the bytes even if it wanted to. It does not want to: the
+    // host already knows, and says so in the frame header. These two payloads
+    // are chosen to be wrong in both directions if anything ever looked —
+    // the first is a real AV1 keyframe temporal unit with no start code in
+    // it, the second carries the exact byte pattern of an Annex-B IDR.
+    const av1Keyframe = [0x12, 0x00, 0x0a, 0x01, 0x00];
+    const looksLikeAnIdr = [0x00, 0x00, 0x00, 0x01, 0x65, 0xaa];
+    const chunk = decodeViewChunk(
+      chunkResponse(
+        1,
+        0,
+        [
+          { keyframe: true, timestampUs: 0, data: av1Keyframe },
+          { keyframe: false, timestampUs: 33, data: looksLikeAnIdr },
+        ],
+        WireCodec.Av1,
+      ),
+    );
+    expect(chunk.codec).toBe(WireCodec.Av1);
+    expect(chunk.frames.map((f) => f.keyframe)).toEqual([true, false]);
+  });
+
   it('refuses a codec byte it has no name for, rather than guessing', () => {
     expect(() => decodeViewChunk(chunkResponse(1, 0, [], 200))).toThrow();
   });
@@ -186,13 +211,29 @@ describe('configStringFor', () => {
   });
 
   it('answers a fixed config string for each optional codec (ADR 0067)', () => {
-    // Nothing has encoded any of these yet (batches 07/08/09), so unlike
-    // H.264 there is no stream to read a profile out of — the frame's own
-    // bytes are irrelevant to the answer.
+    // None of the three reads a profile out of the stream — AV1 because its
+    // profile lives in a sequence header OBU and the host only ever produces
+    // Main 8-bit, the other two because nothing encodes them yet (batches
+    // 08/09). The frame's own bytes are irrelevant to the answer.
     const frame = keyframe([0xff]);
-    expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.04M.08');
+    expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.05M.08');
     expect(configStringFor(WireCodec.H265, frame)).toBe('hev1.1.6.L93.B0');
     expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
+  });
+
+  it('never walks an AV1 temporal unit as if it were Annex-B (ADR 0069)', () => {
+    // A real AV1 keyframe temporal unit: OBU_TEMPORAL_DELIMITER then
+    // OBU_SEQUENCE_HEADER. It carries no Annex-B start code and no SPS, so a
+    // path that fell back to avcCodecString would answer null and the window
+    // would sit waiting for a keyframe that already arrived.
+    const temporalUnit = keyframe([0x12, 0x00, 0x0a, 0x01, 0x00]);
+    expect(configStringFor(WireCodec.Av1, temporalUnit)).toBe('av01.0.05M.08');
+    expect(avcCodecString(temporalUnit.data)).toBeNull();
+
+    // And the reverse: a buffer that does contain a start code must not make
+    // the AV1 answer any different, because the answer never looks.
+    const looksLikeAnnexB = keyframe([0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0x00]);
+    expect(configStringFor(WireCodec.Av1, looksLikeAnnexB)).toBe('av01.0.05M.08');
   });
 
   it('answers nothing for a codec byte it has no config for, rather than guessing', () => {
@@ -215,12 +256,12 @@ describe('supportedOptionalCodecs', () => {
         // Only the AV1 config this module uses is "supported" here, so a
         // table that assumed every codec is available would be caught by
         // the exact set this asserts on below.
-        return Promise.resolve({ supported: config.codec === 'av01.0.04M.08' });
+        return Promise.resolve({ supported: config.codec === 'av01.0.05M.08' });
       },
     };
     try {
       await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
-      expect(asked).toEqual(['av01.0.04M.08', 'hev1.1.6.L93.B0', 'vp09.00.10.08']);
+      expect(asked).toEqual(['av01.0.05M.08', 'hev1.1.6.L93.B0', 'vp09.00.10.08']);
     } finally {
       delete scope.VideoDecoder;
     }

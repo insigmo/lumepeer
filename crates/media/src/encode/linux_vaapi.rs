@@ -1,7 +1,7 @@
 //! VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4).
 //!
 //! The Linux counterpart of [`super::windows`] (ADR 0011), built to the same
-//! rule: [`hardware_h264_available`] is not a capability query, it is a
+//! rule: [`hardware_available`] is not a capability query, it is a
 //! rehearsal. It runs the identical open/configure/context sequence
 //! [`VaapiEncoder::new`] runs and reports `true` only when that sequence
 //! actually succeeds, because a driver that *lists* `VAEntrypointEncSlice`
@@ -72,23 +72,31 @@ const SLICE_TYPE_I: u8 = 2;
 /// `KeyframeRequest` is the responsive path and this is the backstop.
 const IDR_PERIOD: u32 = 120;
 
-/// Whether a genuinely usable VA-API H.264 encoder exists right now (§18).
+/// Whether a genuinely usable VA-API encoder for `config.codec` exists right
+/// now (§18).
 ///
-/// Runs the exact same sequence [`VaapiEncoder::new`] runs — open the DRM
-/// display, create a config for H.264 + `VAEntrypointEncSlice`, allocate NV12
-/// surfaces and create the encode context — so this cannot claim an
-/// availability that construction then fails to back up.
+/// For H.264 this runs the exact same sequence [`VaapiEncoder::new`] runs —
+/// open the DRM display, create a config for H.264 + `VAEntrypointEncSlice`,
+/// allocate NV12 surfaces and create the encode context — so it cannot claim
+/// an availability that construction then fails to back up.
 ///
-/// H.264 only. AV1 over VA-API would need `VAProfileAV1Profile0` and its own
-/// parameter buffers, and answering an AV1 question with an H.264 rehearsal
-/// is exactly the mismatch §11's mutual-hardware-support rule for AV1 exists
-/// to prevent, so the caller checks the codec before asking (see
-/// [`super::probe_hardware`]).
-pub(super) fn hardware_h264_available(config: EncoderConfig) -> bool {
-    if config.codec != VideoCodec::H264 {
-        return false;
+/// AV1 is `false`, and not for want of hardware: VA-API's AV1 encode
+/// entrypoint cannot be driven through `cros-libva` at all.
+/// `VAEncPictureParameterBufferAV1` carries bit offsets
+/// (`bit_offset_qindex`, `byte_offset_frame_hdr_obu_size`,
+/// `size_in_bits_frame_hdr_obu`, …) into a frame-header OBU the *application*
+/// must write and hand over as a packed header, and `cros-libva`'s
+/// `BufferType` has no packed-header variant to hand it over with. An
+/// AV1 session opened without one produces a stream with no frame header,
+/// which is not a picture and would fail §11's mutual-hardware-support rule
+/// in the worst way: with every individual call returning success. ADR 0069
+/// records this so the next person does not rediscover it from a black
+/// window.
+pub(super) fn hardware_available(config: EncoderConfig) -> bool {
+    match config.codec {
+        VideoCodec::H264 => VaapiEncoder::open(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok(),
+        VideoCodec::Av1 => false,
     }
-    VaapiEncoder::open(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok()
 }
 
 /// Everything libva hands back for one encode session.
@@ -755,12 +763,12 @@ mod tests {
     /// session (§18).
     #[test]
     fn probe_hardware_agrees_with_whether_construction_actually_works() {
-        let probed = hardware_h264_available(EncoderConfig::default());
+        let probed = hardware_available(EncoderConfig::default());
         let constructed = VaapiEncoder::new(EncoderConfig::default()).is_ok();
         assert_eq!(
             probed,
             constructed,
-            "hardware_h264_available reported {probed} but construction {}",
+            "hardware_available reported {probed} but construction {}",
             if constructed { "succeeded" } else { "failed" }
         );
     }
@@ -774,7 +782,7 @@ mod tests {
             codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         };
-        assert!(!hardware_h264_available(config));
+        assert!(!hardware_available(config));
         assert!(VaapiEncoder::open(PROBE_WIDTH, PROBE_HEIGHT, config).is_err());
     }
 

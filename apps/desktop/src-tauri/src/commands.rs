@@ -859,6 +859,36 @@ pub async fn connect_cancel(
     Ok(())
 }
 
+/// What one [`report_decoder_codecs`] call carries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecoderCodecsArgs {
+    /// `MediaCodec` wire bytes this window's `VideoDecoder` said it supports,
+    /// as `view-decoder.ts`'s `supportedOptionalCodecs()` answered.
+    pub codecs: Vec<u8>,
+}
+
+/// Records which optional video codecs this process's `WebView` can decode,
+/// so this node's next `Hello` can advertise them (§11; ADR 0070).
+///
+/// Called once by the main window at startup. It carries no authorization:
+/// the only thing a wrong answer changes is which codec this guest asks a
+/// host for, and this guest is the side that would fail to decode it (§2.3).
+/// A byte the core has no `MediaCodec` name for is dropped rather than
+/// refused, so a webview bundle newer than this binary is not an error.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn report_decoder_codecs(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: DecoderCodecsArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.report_decoder_codecs(args.codecs).await?;
+    Ok(())
+}
+
 /// Issues an invite for `args.role` and returns its code.
 ///
 /// # Errors

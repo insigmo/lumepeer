@@ -780,10 +780,10 @@ pub enum MessageKind {
     /// at. The value is the intersection of what the guest's `Hello`
     /// advertised understanding with what the host can actually encode right
     /// now, falling back to `MediaCodec::H264` whenever that intersection is
-    /// empty — which today is always, since no build of this workspace can
-    /// yet encode anything else (AV1 needs mutual hardware support that
-    /// nothing currently reports, and H.265/VP9 have no encoder at all;
-    /// batches 07/08/09 build on top of this message rather than inside it).
+    /// empty. AV1 is reachable on a Windows host whose hardware encodes it
+    /// (ADR 0069); H.265 and VP9 still have no encoder anywhere in this
+    /// workspace, so they are never chosen no matter what a guest advertises
+    /// (batches 08/09).
     MediaCodec {
         /// [`MediaCodec`] as a wire byte.
         codec: u8,

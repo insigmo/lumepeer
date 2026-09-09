@@ -43,6 +43,7 @@
     "allow-connection-history",
     "allow-history-connect",
     "allow-connect-status",
+    "allow-report-decoder-codecs",
     "allow-network-status",
     "allow-license-status",
     "allow-invite-create",
