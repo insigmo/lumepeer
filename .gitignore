@@ -60,3 +60,4 @@ installers/
 # client build (ci/provision-linux-arm64-cross.sh). ~1.3G of extracted
 # Debian packages, local to the machine that built it.
 .cross/
+.impeccable/
