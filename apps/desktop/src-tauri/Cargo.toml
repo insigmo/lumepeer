@@ -76,6 +76,11 @@ serde_json.workspace = true
 sqlx.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+# Free space on a volume, for the check a transfer is accepted against
+# (ADR 0077). `statvfs` and `GetDiskFreeSpaceExW` are FFI and therefore
+# `unsafe`, which this crate forbids crate-wide; this carries that unsafe in
+# its own compiled crate, exactly as `keyring` does for the Windows keystore.
+fs4 = "0.13"
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -168,6 +168,7 @@ export const uk: Dictionary = {
   'files.sendHint':
     "Щоб надіслати файл, скопіюйте його комбінацією Ctrl+C — він з'явиться тут автоматично.",
   'files.fromClipboard': 'З буфера обміну',
+  'files.directory': 'Тека',
   'files.accept': 'Прийняти',
   'files.decline': 'Відхилити',
   'files.cancel': 'Скасувати',

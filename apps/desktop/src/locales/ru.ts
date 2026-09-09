@@ -167,6 +167,7 @@ export const ru: Dictionary = {
   'files.heading': 'Файлы',
   'files.sendHint': 'Чтобы отправить файл, скопируйте его сочетанием Ctrl+C — он появится здесь автоматически.',
   'files.fromClipboard': 'Из буфера обмена',
+  'files.directory': 'Папка',
   'files.accept': 'Принять',
   'files.decline': 'Отклонить',
   'files.cancel': 'Отмена',

@@ -48,6 +48,12 @@ export interface TransferRow {
   /** Whether this transfer started from the peer's clipboard (docs/bugs/
    *  14-clipboard-files.md #3). */
   from_clipboard: boolean;
+  /** Whether this row is a whole directory rather than one file (ADR 0077).
+   *
+   *  The files inside it are not listed separately: a tree is what was asked
+   *  for, so a tree is what the progress and the cancel are about, and
+   *  `transfer_id` is then the group the cancel names. */
+  directory: boolean;
 }
 
 /** What `file_transfers` returns in one poll. */
@@ -196,6 +202,11 @@ export function fileTransferPanel(
                     >
                     <span class="file-name">${row.name}</span>
                     <span class="file-size">${formatSize(row.size)}</span>
+                    ${row.directory
+                      ? html`<span class="file-directory-tag" data-testid="file-directory-tag"
+                          >${t(locale, 'files.directory')}</span
+                        >`
+                      : ''}
                     ${row.from_clipboard
                       ? html`<span class="file-clipboard-tag" data-testid="file-clipboard-tag"
                           >${t(locale, 'files.fromClipboard')}</span

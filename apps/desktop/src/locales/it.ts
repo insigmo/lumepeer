@@ -168,6 +168,7 @@ export const it: Dictionary = {
   'files.sendHint':
     'Per inviare un file, copialo con Ctrl+C — verrà offerto qui automaticamente.',
   'files.fromClipboard': 'Dagli appunti',
+  'files.directory': 'Cartella',
   'files.accept': 'Accetta',
   'files.decline': 'Rifiuta',
   'files.cancel': 'Annulla',

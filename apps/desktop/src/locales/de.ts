@@ -168,6 +168,7 @@ export const de: Dictionary = {
   'files.sendHint':
     'Um eine Datei zu senden, kopieren Sie sie mit Strg+C — sie wird hier automatisch angeboten.',
   'files.fromClipboard': 'Aus der Zwischenablage',
+  'files.directory': 'Ordner',
   'files.accept': 'Annehmen',
   'files.decline': 'Ablehnen',
   'files.cancel': 'Abbrechen',

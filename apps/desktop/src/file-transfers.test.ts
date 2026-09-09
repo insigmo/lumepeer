@@ -47,6 +47,7 @@ const running: TransferRow = {
   incoming: true,
   state: 'running',
   from_clipboard: false,
+  directory: false,
 };
 
 const session: SessionStatus = {
@@ -273,5 +274,27 @@ describe('presentation', () => {
       }
       expect(container.textContent).toContain(t(locale, 'files.heading'));
     }
+  });
+});
+
+describe('a directory in flight', () => {
+  it('is one row with one cancel, and says it is a folder (ADR 0077)', () => {
+    const cmds = commands();
+    const tree: TransferRow = {
+      ...running,
+      transfer_id: 9,
+      name: 'project',
+      size: 4096,
+      moved: 1024,
+      directory: true,
+    };
+    draw({ offers: [], transfers: [tree] }, cmds);
+    expect(container.querySelectorAll('[data-testid="file-transfer"]')).toHaveLength(1);
+    expect(container.querySelector('[data-testid="file-directory-tag"]')?.textContent).toBe(
+      t('en', 'files.directory'),
+    );
+    // The cancel names the group, which is what stops every file in it.
+    container.querySelector<HTMLButtonElement>('[data-testid="file-cancel"]')?.click();
+    expect(cmds.abort).toHaveBeenCalledWith(PEER, 9);
   });
 });

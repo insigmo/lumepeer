@@ -55,6 +55,18 @@ impl IpcError {
         }
     }
 
+    /// The volume the file was going to has no room for it (ADR 0077).
+    ///
+    /// Its own code because it is the one refusal here the person reading it
+    /// can act on: free some space and try again. Answered before the first
+    /// byte moves rather than after most of them have (§18).
+    fn no_space() -> Self {
+        Self {
+            code: "NO_SPACE",
+            message: "there is not enough free space where that file was going".to_owned(),
+        }
+    }
+
     fn poisoned() -> Self {
         Self {
             code: "STATE_POISONED",
@@ -166,6 +178,7 @@ impl From<ActorError> for IpcError {
             ActorError::Unattended(e) => Self::unattended(&e),
             ActorError::ChannelClosed => Self::poisoned(),
             ActorError::Unsupported => Self::unsupported(),
+            ActorError::NoSpace => Self::no_space(),
         }
     }
 }

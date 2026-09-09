@@ -224,8 +224,40 @@ pub const CLIPBOARD_MAX_BYTES: usize = 64 * 1024;
 /// The poll runs only while a grant is live; without one the clipboard is
 /// never read at all.
 pub const CLIPBOARD_POLL_INTERVAL_MS: u64 = 500;
-/// Maximum size of a single offered file (§9.2).
-pub const FILE_OFFER_MAX_BYTES: u64 = 500 * 1024 * 1024;
+/// Maximum size of a single offered file (§9.2, as amended by ADR 0077).
+///
+/// 64 GiB, and it is a *policy* rather than a protection. Nothing downstream
+/// allocates this: a chunk is bounded by [`FILE_CHUNK_MAX_BYTES`] and checked
+/// before a byte of it is read (§9.1), the hash is computed streaming, and
+/// the receiver writes to staging rather than to memory. What this number
+/// actually says is "a peer claiming more than this is not describing a file
+/// anyone meant to send", which the old 500 MiB said about a disk image, a
+/// video and half the things a person reaches for a remote desktop to move.
+///
+/// The real ceiling on a receive is free space where the file is going, which
+/// [`STAGING_FREE_SPACE_MARGIN_BYTES`] and the receiver's own check enforce
+/// **before the first byte** rather than at ninety per cent (§18; ADR 0077).
+///
+/// A peer built before `PROTOCOL_MINOR` 14 decodes an offer above
+/// [`FILE_OFFER_LEGACY_MAX_BYTES`] as malformed and closes the connection, so
+/// a sender must not make one to a peer below that minor — the one place this
+/// relaxation is visible on the wire.
+pub const FILE_OFFER_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// What a peer below `PROTOCOL_MINOR` 14 accepts in a `FileOffer`,
+/// `FileTransferStart` or `FilePutOffer` (ADR 0077).
+///
+/// Frozen at what [`FILE_OFFER_MAX_BYTES`] used to be. Kept as its own
+/// constant rather than written into the sender as a number, because it is
+/// the definition of a peer's behaviour and not a choice this build makes.
+pub const FILE_OFFER_LEGACY_MAX_BYTES: u64 = 500 * 1024 * 1024;
+/// Free space a receiver keeps back when deciding whether a transfer fits
+/// (§18; ADR 0077).
+///
+/// A filesystem needs room for its own metadata, the destination volume can
+/// be written by something else between the answer and the last chunk, and a
+/// volume filled to its last byte by a transfer is a machine that stops
+/// working for reasons that have nothing to do with the transfer.
+pub const STAGING_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum byte length of the file name in a `FileOffer` or a
 /// `FileTransferStart` (§9.2; ADR 0032).
 ///
@@ -236,6 +268,16 @@ pub const FILE_OFFER_MAX_BYTES: u64 = 500 * 1024 * 1024;
 pub const FILE_NAME_MAX_BYTES: usize = 255;
 /// Maximum number of pending file offers per session (§9.2).
 pub const MAX_PENDING_FILE_OFFERS: usize = 3;
+/// How many times a sender picks a file up again after its stream ended
+/// early, before calling the transfer failed (§10; ADR 0077).
+///
+/// A file connection can drop while the control connection it was authorized
+/// on stays up — a NAT rebinding, a link that flapped — and the receiver's
+/// staging file and acked offset both survive that. Picking the file up from
+/// the last acked offset is what §10's resume point is for; a bound on the
+/// number of attempts is what keeps a destination that refuses every write
+/// from becoming a loop.
+pub const FILE_RESUME_ATTEMPTS: u32 = 3;
 /// Idle desktop RSS budget (§15).
 pub const IDLE_RAM_BUDGET_MIB: u32 = 60;
 /// Extra RSS budget for an active session with hardware encode (§15).
@@ -467,6 +509,36 @@ const DIR_ENTRY_WORST_CASE_BYTES: usize = FILE_NAME_MAX_BYTES + 2 + 10 + 1 + 10;
 const _: () = assert!(
     MAX_DIR_ENTRIES_PER_RESPONSE * DIR_ENTRY_WORST_CASE_BYTES <= MAX_CONTROL_FRAME_BYTES,
     "a full DirListResponse cannot fit MAX_CONTROL_FRAME_BYTES"
+);
+
+/// Maximum number of files one `DirOffer` manifest may name (§9.2;
+/// ADR 0077).
+///
+/// A manifest is one control frame, and a control frame is
+/// [`MAX_CONTROL_FRAME_BYTES`] — so this is not a judgement about how many
+/// files a person might want to send, it is what fits, with the assertion
+/// below as the actual check. A directory with more entries than this is
+/// refused out loud before anything is offered, rather than silently
+/// truncated into a tree that arrives missing files (§18).
+pub const MAX_DIR_MANIFEST_ENTRIES: usize = 200;
+/// Longest relative path one manifest entry may carry (§9.2; ADR 0077).
+///
+/// A path inside the offered directory, not a path on either machine, so
+/// [`DIR_PATH_MAX_BYTES`] would be four kilobytes of room for something that
+/// has to fit two hundred times into one frame. 255 is [`FILE_NAME_MAX_BYTES`]
+/// again: every component of it must pass the same check a file name passes,
+/// and a tree deeper than this is one the receiving filesystem would refuse
+/// anyway.
+pub const MANIFEST_PATH_MAX_BYTES: usize = 255;
+/// Worst-case encoded size of one manifest entry: the longest relative path,
+/// its postcard length prefix, and the varint forms of a `u64` size and a
+/// `bool`.
+const MANIFEST_ENTRY_WORST_CASE_BYTES: usize = MANIFEST_PATH_MAX_BYTES + 2 + 10 + 1;
+/// A full manifest may not be a control frame the receiver has to refuse
+/// (§3.2, §9.1; ADR 0077).
+const _: () = assert!(
+    MAX_DIR_MANIFEST_ENTRIES * MANIFEST_ENTRY_WORST_CASE_BYTES <= MAX_CONTROL_FRAME_BYTES,
+    "a full DirOffer cannot fit MAX_CONTROL_FRAME_BYTES"
 );
 
 /// Maximum number of monitors one host may report in `MonitorsList` (§11).

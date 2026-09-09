@@ -381,7 +381,19 @@ impl StagedReceive {
     /// [`Self::export`] is a rename on the same volume rather than a second
     /// pass over up to `FILE_OFFER_MAX_BYTES` of data — and so that a
     /// destination which turns out to be unwritable fails at the first chunk
-    /// instead of after the last one.
+    /// instead of after the last one. With a 64 GiB ceiling (ADR 0077) that
+    /// second pass is the difference between a transfer that finishes and one
+    /// that copies the whole file again, so staging stays here rather than
+    /// moving to the app's own data directory.
+    ///
+    /// It is also why this sweeps first: staging beside the destination means
+    /// a process that is killed mid-transfer leaves a `.lumepeer-*.part` in
+    /// somebody's Downloads folder, and every path that would normally remove
+    /// it — cancel, abort, hash mismatch, session end — runs inside a process
+    /// that is no longer there. [`sweep_stale`] takes those away the next
+    /// time anything is received into that directory, which is the answer to
+    /// "what happens to a partial file when the app exits": it is deleted,
+    /// at the latest when the directory is next used (ADR 0077).
     ///
     /// # Errors
     /// [`NetError::Io`] when the directory cannot be created or the file
@@ -390,10 +402,11 @@ impl StagedReceive {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
+        sweep_stale(dir).await;
         // Named by the transfer id alone: the offered name is untrusted, and
         // nothing hostile should be able to decide a path, even inside a
         // directory this side chose.
-        let path = dir.join(format!(".lumepeer-{id}.part"));
+        let path = dir.join(format!("{STAGING_PREFIX}{id}{STAGING_SUFFIX}"));
         let file = tokio::fs::File::create(&path)
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
@@ -461,6 +474,67 @@ impl StagedReceive {
         drop(self.file);
         if let Err(error) = tokio::fs::remove_file(&self.path).await {
             tracing::debug!(%error, "could not remove a staging file");
+        }
+    }
+}
+
+/// Prefix and suffix of a staging file's name, which is all that identifies
+/// one to [`sweep_stale`].
+const STAGING_PREFIX: &str = ".lumepeer-";
+const STAGING_SUFFIX: &str = ".part";
+
+/// When this process started, as the filesystem measures time.
+///
+/// Set on the first sweep rather than at startup: this crate is a library
+/// with no `main` to hook, and the first sweep is the first moment the answer
+/// is needed. Anything this process stages is created after it, so the
+/// comparison below cannot take a live transfer's own file.
+static PROCESS_EPOCH: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+/// Removes staging files in `dir` that this process did not create
+/// (ADR 0077).
+///
+/// A partial file has no name a person would recognise and no content anyone
+/// asked for, so leaving one behind after a crash is litter in somebody's own
+/// folder. Every ordinary end of a transfer already removes its own; this is
+/// for the end that is not ordinary — the process killed, the machine reset —
+/// where nothing ran at all.
+///
+/// Deliberately narrow. Only names matching `.lumepeer-<id>.part` exactly,
+/// only files, and only ones modified before this process started, so a
+/// transfer running right now in another directory of the same user, or in
+/// this one, is never touched. Failures are logged and ignored: a sweep that
+/// cannot read a directory must not stop the transfer that is about to write
+/// into it.
+pub async fn sweep_stale(dir: &Path) {
+    let epoch = *PROCESS_EPOCH.get_or_init(std::time::SystemTime::now);
+    let Ok(mut reader) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(STAGING_PREFIX) || !name.ends_with(STAGING_SUFFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        // No modification time is no evidence, and no evidence is not a
+        // reason to delete somebody's file.
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified >= epoch {
+            continue;
+        }
+        if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+            tracing::debug!(%error, "could not remove a staging file from an earlier run");
         }
     }
 }
@@ -809,6 +883,76 @@ mod tests {
         assert!(!tracker.finish(1, expected));
         staged.discard().await;
         assert!(!staging_path.exists());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// ADR 0077: a staging file left behind by a process that was killed is
+    /// removed the next time anything is received into that directory, and a
+    /// staging file this process is still writing is not.
+    #[tokio::test]
+    async fn a_staging_file_from_an_earlier_run_is_swept_and_a_live_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("lumepeer-sweep-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Dated before this process started, which is what a file from an
+        // earlier run looks like. Stamped rather than merely written first:
+        // the epoch is taken on the first sweep anywhere in the process, and
+        // another test in this binary may already have taken it.
+        let stale = dir.join(".lumepeer-41.part");
+        tokio::fs::write(&stale, b"half a file nobody asked for")
+            .await
+            .unwrap();
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        // Not ours, and not touched however old it is.
+        let innocent = dir.join("holiday.jpg");
+        tokio::fs::write(&innocent, b"somebody's own file")
+            .await
+            .unwrap();
+        let odd = dir.join(".lumepeer-41.part.bak");
+        tokio::fs::write(&odd, b"not a staging file").await.unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&odd)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&innocent)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let live = StagedReceive::create(&dir, 42).await.unwrap();
+        assert!(
+            !stale.exists(),
+            "a staging file from an earlier run survived"
+        );
+        assert!(innocent.exists(), "the sweep took a file that was not ours");
+        assert!(
+            odd.exists(),
+            "the sweep took a file whose name only looks like ours"
+        );
+        assert!(live.path().exists());
+
+        // A second transfer into the same directory does not take the first
+        // one's staging file with it: it was created after the epoch.
+        let live_path = live.path().to_path_buf();
+        let second = StagedReceive::create(&dir, 43).await.unwrap();
+        assert!(
+            live_path.exists(),
+            "the sweep took a live transfer's staging file"
+        );
+        second.discard().await;
+        live.discard().await;
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 

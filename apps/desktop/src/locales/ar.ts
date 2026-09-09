@@ -166,6 +166,7 @@ export const ar: Dictionary = {
   'files.heading': 'الملفات',
   'files.sendHint': 'لإرسال ملف، انسخه بـ Ctrl+C — وسيُعرض هنا تلقائيًا.',
   'files.fromClipboard': 'من الحافظة',
+  'files.directory': 'مجلد',
   'files.accept': 'قبول',
   'files.decline': 'رفض',
   'files.cancel': 'إلغاء',
