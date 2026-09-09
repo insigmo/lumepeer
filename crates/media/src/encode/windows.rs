@@ -2206,6 +2206,121 @@ mod tests {
         assert_eq!(encoder.kind(), EncoderKind::Hardware);
     }
 
+    /// What a picture above 4K actually costs on this machine's hardware
+    /// encoder, which is the measurement gap-tasks `12` opens with:
+    ///
+    /// ```text
+    /// cargo test -p lumepeer-media \
+    ///   --features capture-windows,encode-mf,encode-openh264 \
+    ///   -- --ignored --nocapture what_a_picture_above_4k_costs
+    /// ```
+    ///
+    /// Reports, for each candidate ceiling: whether the MFT negotiates that
+    /// size at all, the size of the intra frame at `ABR_MAX_BITRATE_KBPS`,
+    /// the size of the frames after it, and the encode time. The source is
+    /// blocky pseudo-noise rather than a flat fill, so the encoder has real
+    /// residuals to spend bits on; a genuine desktop is easier than this.
+    #[test]
+    #[ignore = "a measurement, not an assertion; run it by name with --nocapture"]
+    fn what_a_picture_above_4k_costs() {
+        use lumepeer_core::constants::{ABR_MAX_BITRATE_KBPS, MAX_MEDIA_FRAME_BYTES};
+
+        /// Side of one flat block of the synthetic picture, in pixels.
+        const BLOCK: usize = 8;
+        /// Frames encoded after the intra one, to see the steady state.
+        const FOLLOWING: u32 = 8;
+
+        /// `bytes` as a percentage of [`MAX_MEDIA_FRAME_BYTES`].
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "both operands are far inside f64's exactly representable integer range"
+        )]
+        fn percent_of_bound(bytes: usize) -> f64 {
+            bytes as f64 * 100.0 / MAX_MEDIA_FRAME_BYTES as f64
+        }
+
+        /// A picture of `BLOCK`-sized flat squares in pseudo-random colours:
+        /// enough edges and residual to work an encoder, without the
+        /// per-pixel noise that would make it incompressible in a way no
+        /// desktop is.
+        fn blocky(width: u32, height: u32) -> Frame {
+            let (w, h) = (width as usize, height as usize);
+            let mut data = vec![0u8; w * h * 4];
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            let blocks_across = w.div_ceil(BLOCK);
+            let mut colors = vec![[0u8; 4]; blocks_across * h.div_ceil(BLOCK)];
+            for color in &mut colors {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let bytes = state.to_le_bytes();
+                *color = [bytes[0], bytes[1], bytes[2], 0xff];
+            }
+            for row in 0..h {
+                let block_row = row / BLOCK;
+                for column in 0..w {
+                    let color = colors[block_row * blocks_across + column / BLOCK];
+                    data[(row * w + column) * 4..][..4].copy_from_slice(&color);
+                }
+            }
+            Frame::cpu(width, height, PixelFormat::Bgra8, 0, data)
+        }
+
+        for (codec, label, width, height) in [
+            (VideoCodec::H264, "H.264 4K", 3840_u32, 2160_u32),
+            (VideoCodec::H264, "H.264 5K", 5120, 2880),
+            (VideoCodec::H264, "H.264 6K", 6016, 3384),
+            (VideoCodec::H264, "H.264 8K", 7680, 4320),
+            (VideoCodec::Av1, "AV1   4K", 3840, 2160),
+            (VideoCodec::Av1, "AV1   5K", 5120, 2880),
+            (VideoCodec::Av1, "AV1   6K", 6016, 3384),
+            (VideoCodec::Av1, "AV1   8K", 7680, 4320),
+        ] {
+            let config = EncoderConfig {
+                fps: 60,
+                bitrate_kbps: ABR_MAX_BITRATE_KBPS,
+                codec,
+            };
+            let Ok(mut encoder) = MediaFoundationEncoder::new(config) else {
+                eprintln!("{label}: no hardware encoder MFT for this codec on this machine");
+                continue;
+            };
+            let source = blocky(width, height);
+            let started = std::time::Instant::now();
+            let intra = match encoder.encode(&source) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    eprintln!("{label} {width}x{height}: refused by the encoder: {error}");
+                    continue;
+                }
+            };
+            let intra_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut largest_inter = 0_usize;
+            let started = std::time::Instant::now();
+            for _ in 0..FOLLOWING {
+                match encoder.encode(&source) {
+                    Ok(frame) => largest_inter = largest_inter.max(frame.data.len()),
+                    Err(error) => {
+                        eprintln!(
+                            "{label} {width}x{height}: stopped after the intra frame: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+            let inter_ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(FOLLOWING);
+            eprintln!(
+                "{label} {width}x{height}: BGRA {:.1} MiB/frame, intra {} B ({:.1}% of the \
+                 {MAX_MEDIA_FRAME_BYTES} B bound, keyframe={}), largest later frame {largest_inter} B, \
+                 {intra_ms:.1} ms intra, {inter_ms:.1} ms/frame after",
+                f64::from(width) * f64::from(height) * 4.0 / (1024.0 * 1024.0),
+                intra.data.len(),
+                percent_of_bound(intra.data.len()),
+                intra.keyframe,
+            );
+        }
+    }
+
     /// Each codec is enumerated and negotiated under its own Media Foundation
     /// subtype. The failure this guards is the copy-paste one: an AV1 request
     /// that enumerates `MFVideoFormat_H264` finds the H.264 encoder every
@@ -2283,7 +2398,9 @@ mod tests {
 
         // A second frame on the same texture: the session must not
         // re-activate anything, and must keep producing pictures.
-        let second = encoder.encode(&source).expect("the second GPU frame");
+        let second = encoder
+            .encode(&source)
+            .unwrap_or_else(|error| panic!("the second GPU frame failed: {error}"));
         assert!(!second.data.is_empty());
     }
 
@@ -2307,7 +2424,7 @@ mod tests {
 
         let output = encoder
             .encode(&source)
-            .expect("the readback path has to carry the session");
+            .unwrap_or_else(|error| panic!("the readback path has to carry the session: {error}"));
         assert!(!output.data.is_empty(), "the fallback encoded to nothing");
         assert!(
             !encoder.d3d_attached,
@@ -2345,6 +2462,15 @@ mod tests {
         const FRAMES: u32 = 120;
         /// 100-nanosecond ticks per millisecond, the unit `FILETIME` counts.
         const HNS_PER_MS: u64 = 10_000;
+
+        /// `hns` 100-nanosecond ticks as milliseconds.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a process's CPU time in 100 ns ticks is far inside f64's exactly                       representable integer range"
+        )]
+        fn hns_as_ms(hns: u64) -> f64 {
+            hns as f64 / HNS_PER_MS as f64
+        }
 
         /// This process's kernel+user CPU time so far, in 100 ns ticks.
         fn cpu_hns() -> u64 {
@@ -2390,7 +2516,9 @@ mod tests {
             let cpu_before = cpu_hns();
             let started = Instant::now();
             for _ in 0..FRAMES {
-                encoder.encode(&source).expect("the frame has to encode");
+                encoder
+                    .encode(&source)
+                    .unwrap_or_else(|error| panic!("the frame has to encode: {error}"));
             }
             let wall = started.elapsed();
             let cpu = cpu_hns().saturating_sub(cpu_before);
@@ -2398,7 +2526,7 @@ mod tests {
                 "{label}: {FRAMES} frames of {WIDTH}x{HEIGHT}, \
                  {:.2} ms/frame wall, {:.2} ms/frame CPU",
                 wall.as_secs_f64() * 1000.0 / f64::from(FRAMES),
-                (cpu as f64 / HNS_PER_MS as f64) / f64::from(FRAMES),
+                hns_as_ms(cpu) / f64::from(FRAMES),
             );
         };
 

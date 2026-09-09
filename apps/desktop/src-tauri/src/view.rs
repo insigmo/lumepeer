@@ -1301,6 +1301,9 @@ pub fn spawn_encode_loop(
         // loop's own start, the same role `Active::started_at` plays inside
         // `WindowsCapturer` for its ordinary frames.
         let media_started = Instant::now();
+        // Whether the guest's own picture size (ADR 0060) has been withdrawn
+        // because the encoder would not take it (ADR 0074).
+        let mut size_cap_refused = false;
 
         loop {
             let tick_started = Instant::now();
@@ -1442,7 +1445,13 @@ pub fn spawn_encode_loop(
             // reduction is the hard ceiling of §15 that no choice may exceed,
             // so it goes last and has the final say (ADR 0018).
             let scale_percent = target.scale_percent;
-            let size_cap = control.size_cap();
+            // Ignored for the rest of the session once the encoder has
+            // refused it: see the `encoder refused a frame` arm below.
+            let size_cap = if size_cap_refused {
+                None
+            } else {
+                control.size_cap()
+            };
 
             // The cursor rides its own channel when the guest asked for one,
             // and is read only then: a shape the loop would never send is a
@@ -1496,7 +1505,25 @@ pub fn spawn_encode_loop(
                     match bitstream {
                         Ok(bitstream) => bitstream,
                         Err(error) => {
-                            tracing::warn!(peer = %tag, %error, "encoder refused a frame");
+                            // §18: a size the encoder will not take is not a
+                            // reason to send nothing at all. The guest's own
+                            // size is the one thing in this pipeline that can
+                            // exceed what a hardware encoder negotiates —
+                            // measured, both MFTs on the reference machine
+                            // refuse every size above 4K while
+                            // `MAX_STREAM_PIXELS` now allows 5K (ADR 0074) —
+                            // so it is the first thing given up, once, and the
+                            // picture continues at the ADR 0018 budget.
+                            if size_cap.is_some() && !size_cap_refused {
+                                size_cap_refused = true;
+                                tracing::warn!(
+                                    peer = %tag,
+                                    %error,
+                                    "the encoder refused the size this guest asked for;                                      the rest of this session runs at the picture budget"
+                                );
+                            } else {
+                                tracing::warn!(peer = %tag, %error, "encoder refused a frame");
+                            }
                             sleep_for_the_rest_of(interval, tick_started).await;
                             continue;
                         }
