@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-09
+Amended: 2026-09-09 by [ADR 0071](0071-h265-is-a-licensing-switch-not-a-default.md), which found the AV1 probe was asking at a size the hardware declines. See "Still open".
 
 Follows [ADR 0011](0011-windows-hardware-encoder.md),
 [ADR 0040](0040-the-vaapi-encoder-and-what-a-probe-is-allowed-to-claim.md) and
@@ -127,17 +128,25 @@ what was decided then and are left as written.
 
 ## Still open
 
-- **No machine with a hardware AV1 encoder was reachable.** The development host
-  has an RTX 3070 (Ampere: NVENC encodes H.264 and HEVC, not AV1) and an older
-  Intel UHD, so `hardware_available` for AV1 returns `false` here — the "no AV1
-  hardware" half of the plan's acceptance, which *is* verified: the probe
-  declines, negotiation stays on H.264, and the log says which codec was chosen.
-  Everything on the other side of a `true` answer — that a real AV1 MFT
-  activates, that the bitstream a guest gets is decodable, that the
-  sequence-header scan finds what a real encoder emits — has not run.
-- **No measurement.** The plan requires bitrate at equal visual quality and
-  end-to-end latency, AV1 against H.264, before AV1 is made preferable. Until
-  those numbers exist, "the guest asked and the hardware is there" is the whole
-  of the selection rule.
-- The OBU walk is unit-tested against hand-built temporal units, not against a
-  real encoder's output.
+- ~~**No machine with a hardware AV1 encoder was reachable.**~~ Corrected
+  while ADR 0071 was being written, and the correction matters more than the
+  claim did. The development host does have one — an "Intel Hardware
+  Accelerated AV1 Encoder MFT" — and this ADR's probe was reporting `false`
+  for it because it rehearses at ADR 0011's 64x64, a size both that MFT and
+  both HEVC MFTs on the same machine decline. The AV1 path shipped here could
+  therefore never have been selected on hardware that has it. `probe_dims` in
+  `encode::windows` now answers per codec (256x256 for the optional ones) and
+  the probe says `true`, activates a real AV1 MFT, and gets a picture back
+  with a sequence header in it. What still has not happened is a session: no
+  guest has decoded an AV1 stream from this encoder.
+- **No quality-matched measurement.** ADR 0071 records what was measured —
+  achieved bitrate and per-frame encode latency for all three codecs on this
+  machine — and why the bitrate half of it does not answer the question the
+  plan asked. The latency half does: AV1 costs two to three times an H.264
+  frame here, p50 above the 33 ms budget of a 30 fps 1080p session, so it is
+  not made preferable. "The guest asked and the hardware is there" remains
+  the whole of the selection rule.
+- The OBU walk is unit-tested against hand-built temporal units, and now also
+  runs against a real encoder's first frame in
+  `an_av1_probe_that_says_yes_is_backed_by_a_real_picture` — but only as far
+  as "the keyframe flag came out true".

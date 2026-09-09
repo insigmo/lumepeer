@@ -33,6 +33,11 @@ audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio"]
 encode-openh264 = ["lumepeer-media/encode-openh264"]
 encode-mf = ["lumepeer-media/encode-mf"]
 encode-videotoolbox = ["lumepeer-media/encode-videotoolbox"]
+# H.265/HEVC, off by default and off in every release row. Turning it on is a
+# licensing decision rather than a technical one — see ADR 0071 and the
+# feature's own comment in `crates/media/Cargo.toml`. It is passed through
+# here so that decision is one flag on the client build rather than a patch.
+encode-h265 = ["lumepeer-media/encode-h265"]
 decode-openh264 = ["lumepeer-media/decode-openh264"]
 # Off by default: never part of `cargo build --workspace`, the Task client
 # builds, or the release CI matrix. Opt in locally with
