@@ -53,6 +53,16 @@ pub struct Grants {
     pub clipboard_write: bool,
     /// Exchange files over `rd/file/1`.
     pub file_transfer: bool,
+    /// List the contents of the host's directories (ADR 0075).
+    ///
+    /// Deliberately not implied by `file_transfer`, which only covers files
+    /// both sides have already named to each other. Reading a directory is
+    /// strictly more: it discloses what is on the machine — project names,
+    /// client names, the shape of someone's work — to a guest who could not
+    /// otherwise have asked for any of it, and it does so without the host
+    /// choosing a single file. Carried by [`Role::FullControl`] alone, and
+    /// separately revocable like every other flag here.
+    pub file_browse: bool,
     /// Record the session.
     pub recording: bool,
     /// Switch the host's own physical display mode (docs/bugs/
@@ -92,7 +102,7 @@ pub struct Grants {
     pub secure_desktop_input: bool,
 }
 
-/// One of the seven grants a host may toggle on a session that is already
+/// One of the eight grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -107,6 +117,8 @@ pub enum IndependentGrant {
     ClipboardWrite,
     /// Exchange files over `rd/file/1`.
     FileTransfer,
+    /// List the contents of the host's directories (ADR 0075).
+    FileBrowse,
     /// Record the session.
     Recording,
     /// Switch the host's own physical display mode (docs/bugs/
@@ -151,6 +163,7 @@ impl Grants {
             clipboard_read: full,
             clipboard_write: full,
             file_transfer: full,
+            file_browse: full,
             recording: full,
             display_mode: full,
             // On for every role, like `view` (ADR 0056), not just full
@@ -169,12 +182,13 @@ impl Grants {
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: an eighth permission must
+        // Exhaustive on purpose, with no `_` arm: a ninth permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
             IndependentGrant::ClipboardWrite => self.clipboard_write,
             IndependentGrant::FileTransfer => self.file_transfer,
+            IndependentGrant::FileBrowse => self.file_browse,
             IndependentGrant::Recording => self.recording,
             IndependentGrant::DisplayMode => self.display_mode,
             IndependentGrant::SecureDesktop => self.secure_desktop,
@@ -188,6 +202,7 @@ impl Grants {
             IndependentGrant::ClipboardRead => self.clipboard_read = allowed,
             IndependentGrant::ClipboardWrite => self.clipboard_write = allowed,
             IndependentGrant::FileTransfer => self.file_transfer = allowed,
+            IndependentGrant::FileBrowse => self.file_browse = allowed,
             IndependentGrant::Recording => self.recording = allowed,
             IndependentGrant::DisplayMode => self.display_mode = allowed,
             IndependentGrant::SecureDesktop => self.secure_desktop = allowed,
@@ -488,6 +503,7 @@ mod tests {
         assert!(grants.clipboard_read);
         assert!(grants.clipboard_write);
         assert!(grants.file_transfer);
+        assert!(grants.file_browse);
         assert!(grants.recording);
         assert!(grants.display_mode);
         assert!(grants.secure_desktop);
@@ -506,6 +522,7 @@ mod tests {
             assert!(!lesser.clipboard_read);
             assert!(!lesser.clipboard_write);
             assert!(!lesser.file_transfer);
+            assert!(!lesser.file_browse);
             assert!(!lesser.recording);
             assert!(!lesser.display_mode);
             assert!(lesser.secure_desktop);
@@ -534,6 +551,38 @@ mod tests {
         assert!(grants.get(IndependentGrant::SecureDesktop));
     }
 
+    /// ADR 0075: reading the host's directories is not something exchanging
+    /// agreed files implies, and not something watching the screen implies
+    /// either. Full control brings it, nothing below does, and it comes and
+    /// goes on its own.
+    #[test]
+    fn file_browse_is_its_own_grant_and_file_transfer_does_not_imply_it() {
+        for role in [Role::ViewOnly, Role::ControlLimited] {
+            assert!(!Grants::from_role(role).get(IndependentGrant::FileBrowse));
+        }
+        assert!(Grants::from_role(Role::FullControl).get(IndependentGrant::FileBrowse));
+
+        // The implication this grant exists to refuse: a session may exchange
+        // files without being able to enumerate the disk they came from.
+        let mut grants = Grants::from_role(Role::ViewOnly);
+        grants.set(IndependentGrant::FileTransfer, true);
+        assert!(grants.get(IndependentGrant::FileTransfer));
+        assert!(!grants.get(IndependentGrant::FileBrowse));
+
+        // Withdrawn on its own from a session that got it from the role,
+        // and nothing else moves with it.
+        let mut full = Grants::from_role(Role::FullControl);
+        full.set(IndependentGrant::FileBrowse, false);
+        assert!(!full.get(IndependentGrant::FileBrowse));
+        assert!(full.get(IndependentGrant::FileTransfer));
+        assert!(full.get(IndependentGrant::ClipboardRead));
+        assert!(full.get(IndependentGrant::Recording));
+        assert!(full.get(IndependentGrant::DisplayMode));
+        assert!(full.get(IndependentGrant::SecureDesktop));
+        assert!(full.get(IndependentGrant::SecureDesktopInput));
+        assert!(full.view && full.input);
+    }
+
     #[test]
     fn display_mode_is_independent_of_every_other_grant() {
         let mut grants = Grants::from_role(Role::ViewOnly);
@@ -546,6 +595,7 @@ mod tests {
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
+        assert!(!grants.file_browse);
         assert!(!grants.recording);
         assert!(grants.secure_desktop);
         // And it is still withdrawable on its own from a session that got it
@@ -571,6 +621,7 @@ mod tests {
         assert!(!grants.clipboard_read);
         assert!(!grants.clipboard_write);
         assert!(!grants.file_transfer);
+        assert!(!grants.file_browse);
         assert!(!grants.recording);
         assert!(!grants.display_mode);
         let mut full = Grants::from_role(Role::FullControl);

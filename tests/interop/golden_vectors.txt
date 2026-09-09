@@ -150,3 +150,18 @@ invalid minor9_display_modes_list_contradiction abababababababababababababababab
 valid minor11_media_codec_h264 abababababababababababababababab00002c0000
 valid minor11_media_codec_av1 abababababababababababababababab00002c0100
 invalid minor11_media_codec_unknown_byte abababababababababababababababab00002c0400
+
+# --- Frozen for PROTOCOL_MINOR 12: listing a directory (ADR 0075). The
+# --- request is guest to host, sent only towards a host that answered with at
+# --- least this minor and only by a guest whose Hello advertised the
+# --- "file-browse" feature string; the response is host to guest. An empty
+# --- path is malformed rather than "the current directory", since a listing
+# --- has no current directory to be relative to. entries and refused may
+# --- never both be populated: a refusal explains an absence, so it cannot
+# --- arrive next to the thing it says is absent - the same rule
+# --- DisplayModesList's modes/reason pair carries.
+valid minor12_dir_list_request abababababababababababababababab01002d0a2f686f6d652f6265746100
+invalid minor12_dir_list_request_empty_path abababababababababababababababab01002d0000
+valid minor12_dir_list_response_two_entries abababababababababababababababab00002e02096e6f7465732e74787480080080e2cfaa060870726f6a65637473000181e2cfaa06000000
+valid minor12_dir_list_response_not_granted abababababababababababababababab00002e0000010000
+invalid minor12_dir_list_response_contradiction abababababababababababababababab00002e01096e6f7465732e74787480080080e2cfaa0600010200

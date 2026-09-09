@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-    FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS,
-    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT,
-    STREAM_SIZE_MIN_PX, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
+    MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DISPLAY_MODES_PER_HOST,
+    MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -198,7 +199,23 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// the same reasoning [`FEATURE_MEDIA_UNAVAILABLE`]'s doc comment gives for
 /// gating on a string rather than the minor alone. See
 /// `docs/adr/0067-codec-negotiation-guest-advertises-host-intersects.md`.
-pub const PROTOCOL_MINOR: u16 = 11;
+///
+/// 12: appended [`MessageKind::DirListRequest`] and
+/// [`MessageKind::DirListResponse`] after `MediaCodec`. §9.2's file transfer
+/// could already move a file both sides had named to each other, and nothing
+/// let a guest find out what was on the host to name in the first place —
+/// there was no listing message in any form. Reading a directory is more than
+/// exchanging agreed files, so it is a grant of its own (`file_browse`)
+/// rather than something `file_transfer` implies, and the request is refused
+/// out loud rather than answered with an empty list. A guest sends the
+/// request only to a host whose `HelloAck` minor is at least this one, and a
+/// host answers only a guest whose `Hello` advertised
+/// [`FEATURE_FILE_BROWSE`] — the same shape [`FEATURE_STREAM_SIZE`] uses, for
+/// the same reason. The listing rides the control channel; the lazy
+/// `rd/file/1` connection of ADR 0032 is not opened for it, because a listing
+/// is not a transfer. See
+/// `docs/adr/0075-listing-a-directory-is-its-own-grant.md`.
+pub const PROTOCOL_MINOR: u16 = 12;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -314,6 +331,22 @@ pub const FEATURE_DISPLAY_MODE: &str = "display-mode";
 /// `Hello`. A guest that does not advertise it keeps the ADR 0018 ceiling
 /// exactly as before, which is the behaviour its decoder still needs.
 pub const FEATURE_STREAM_SIZE: &str = "stream-size";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::DirListRequest`]/[`MessageKind::DirListResponse`]
+/// (ADR 0075).
+///
+/// Same compatibility shape as [`FEATURE_STREAM_SIZE`]: a guest-to-host
+/// message advertised by the guest in its own `Hello`, and a host must never
+/// answer a listing request from a peer that did not advertise this string —
+/// an older peer decodes the response's discriminant as unknown and closes
+/// the connection (§9.1).
+///
+/// Advertising it is not asking for anything: the `file_browse` grant is a
+/// separate decision the host makes, and a guest that advertises the string
+/// without holding the grant is refused with
+/// [`DirListRefusal::NotGranted`].
+pub const FEATURE_FILE_BROWSE: &str = "file-browse";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -784,6 +817,48 @@ pub enum MessageKind {
         /// [`MediaCodec`] as a wire byte.
         codec: u8,
     },
+    /// Guest to host: list this directory (§9.2; ADR 0075). New in minor 12.
+    ///
+    /// Sent only to a host whose `HelloAck` minor is at least this one and
+    /// only by a guest whose `Hello` advertised [`FEATURE_FILE_BROWSE`] — the
+    /// same shape [`FEATURE_STREAM_SIZE`] uses, since this is also a
+    /// guest-to-host message and `HelloAck` carries no feature list of its
+    /// own.
+    ///
+    /// One request, one directory: there is no recursive form, because a
+    /// recursive walk is an unbounded amount of the host's disk read on a
+    /// peer's say-so, and the guest that wants a subtree can ask for it one
+    /// directory at a time and be refused at any of them.
+    ///
+    /// `path` is untrusted input, bounded here by
+    /// [`crate::constants::DIR_PATH_MAX_BYTES`] before anything parses it and
+    /// checked by `lumepeer_core::remote_path::safe_browse_path` before
+    /// anything opens it.
+    DirListRequest {
+        /// Absolute path of the directory to list.
+        path: String,
+    },
+    /// Host to guest: what that directory contains, or why it does not say
+    /// (§9.2, §18; ADR 0075). New in minor 12.
+    ///
+    /// `entries` is empty exactly when `refused` is `Some`, or when the
+    /// directory really is empty — the two are told apart by `refused`, and
+    /// never by an empty list alone (§18: a refusal is said out loud, not
+    /// mimed as "nothing here").
+    ///
+    /// `truncated` is the host saying it stopped at
+    /// [`crate::constants::MAX_DIR_ENTRIES_PER_RESPONSE`], so a guest that
+    /// sees it knows the directory has more in it rather than believing a
+    /// short list.
+    DirListResponse {
+        /// Entries of the directory, in whatever order the platform reported
+        /// them.
+        entries: Vec<DirEntry>,
+        /// Whether the host stopped at the entry bound.
+        truncated: bool,
+        /// Why the list is empty, when it is empty for a reason.
+        refused: Option<DirListRefusal>,
+    },
 }
 
 /// Video codec identifier carried in [`MessageKind::MediaCodec`]'s `codec`
@@ -969,6 +1044,61 @@ pub enum DisplayModeUnavailableReason {
     NoModesReported,
 }
 
+/// One entry of a `DirListResponse` (§9.2; ADR 0075).
+///
+/// Four fields, and no more, on purpose: a name, a size, whether it is a
+/// directory and when it was last written. Attributes, owner, permissions and
+/// link targets are all information about the host's machine and its accounts
+/// rather than about the file a guest is going to ask for (§15), and a guest
+/// deciding what to fetch needs none of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    /// Entry name, a single path component and never a path
+    /// (`lumepeer_core::remote_path::is_safe_component`).
+    pub name: String,
+    /// Size in bytes; zero for a directory, whose size means nothing the
+    /// guest can use.
+    pub size: u64,
+    /// Whether this entry is a directory. A symbolic link is **not** reported
+    /// as one even when it points at a directory: the host does not follow
+    /// it, so calling it a directory would promise a listing that the next
+    /// request cannot produce.
+    pub is_dir: bool,
+    /// Last modification time, Unix seconds, or zero when the platform did
+    /// not report one.
+    pub modified_unix: u64,
+}
+
+/// Why a host answered a `DirListRequest` with no entries (§18; ADR 0075).
+///
+/// A closed set, not a free-text reason, exactly as
+/// [`DisplayModeUnavailableReason`] is and for the same §15 reason: an OS
+/// error string names paths, accounts and products of the host's machine.
+///
+/// The distinction matters to the guest and not only to a log: "you may not"
+/// is a permission the host can grant, "I could not read it" is a directory
+/// to skip, and an empty list with neither is a directory that is genuinely
+/// empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirListRefusal {
+    /// This guest does not hold the `file_browse` grant (ADR 0075).
+    ///
+    /// The answer to a guest that never had it and to one whose host
+    /// withdrew it mid-session; from the wire the two are the same fact.
+    NotGranted,
+    /// The path was refused before it reached the filesystem: not absolute,
+    /// a traversal, a UNC or device path, or over the length bound
+    /// (`lumepeer_core::remote_path::safe_browse_path`).
+    BadPath,
+    /// The operating system refused the directory, or it is not a directory.
+    ///
+    /// Deliberately one variant and not two: "no such directory" and
+    /// "permission denied" told apart is an oracle for what exists on the
+    /// host, which is the one thing a listing must not answer about places
+    /// the guest may not read.
+    Unreadable,
+}
+
 /// Input event payload: logical key plus physical scancode, never raw OS
 /// handles (§11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1004,6 +1134,31 @@ pub enum InputDetail {
         /// Vertical delta.
         dy: i16,
     },
+}
+
+/// The bounds of one `DirListResponse` (§9.1; ADR 0075).
+///
+/// The same three questions `DisplayModesList` is asked in `check_limits`,
+/// and for the same reason: a count before anything downstream allocates per
+/// entry, a name bound per entry, and a refusal that cannot arrive alongside
+/// the entries it says are absent.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for any of the three.
+fn check_dir_listing(entries: &[DirEntry], refused: Option<DirListRefusal>) -> Result<()> {
+    if entries.len() > MAX_DIR_ENTRIES_PER_RESPONSE {
+        return Err(CoreError::Malformed);
+    }
+    if refused.is_some() && !entries.is_empty() {
+        return Err(CoreError::Malformed);
+    }
+    if entries
+        .iter()
+        .any(|entry| entry.name.is_empty() || entry.name.len() > FILE_NAME_MAX_BYTES)
+    {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
 }
 
 impl MessageEnvelope {
@@ -1170,6 +1325,17 @@ impl MessageEnvelope {
                     }
                 }
             }
+            // A path is untrusted input, bounded as a *string* before it is
+            // parsed (§9.1; ADR 0075), so a peer cannot make the host walk
+            // four kilobytes of separators to find out the path is bad.
+            MessageKind::DirListRequest { path }
+                if path.is_empty() || path.len() > DIR_PATH_MAX_BYTES =>
+            {
+                return Err(CoreError::Malformed);
+            }
+            MessageKind::DirListResponse {
+                entries, refused, ..
+            } => check_dir_listing(entries, *refused)?,
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide
@@ -1256,6 +1422,98 @@ mod tests {
             seq: 0,
             kind,
             body: Vec::new(),
+        }
+    }
+
+    /// ADR 0075: the path is bounded as a string before anything parses it,
+    /// and the bound is enforced by `decode` rather than trusted from the
+    /// sender.
+    #[test]
+    fn a_dir_list_request_roundtrips_and_is_malformed_outside_its_bound() {
+        for path in ["/", "/home/beta", r"C:\Users\beta"] {
+            let original = envelope(MessageKind::DirListRequest {
+                path: path.to_owned(),
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for path in [String::new(), "a".repeat(DIR_PATH_MAX_BYTES + 1)] {
+            let bytes = envelope(MessageKind::DirListRequest { path })
+                .encode()
+                .unwrap();
+            assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            ));
+        }
+    }
+
+    /// ADR 0075: a listing is bounded in entries and in name length, and a
+    /// refusal may not arrive alongside the entries it explains the absence
+    /// of — the same "these two fields may not disagree" rule
+    /// `DisplayModesList` carries.
+    #[test]
+    fn a_dir_list_response_is_bounded_and_cannot_both_refuse_and_list() {
+        let entry = |name: &str| DirEntry {
+            name: name.to_owned(),
+            size: 12,
+            is_dir: false,
+            modified_unix: 1_700_000_000,
+        };
+
+        let original = envelope(MessageKind::DirListResponse {
+            entries: vec![entry("notes.txt"), entry("projects")],
+            truncated: false,
+            refused: None,
+        });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        // An empty directory and a refused one are both empty lists, and the
+        // difference between them travels.
+        for refused in [None, Some(DirListRefusal::NotGranted)] {
+            let original = envelope(MessageKind::DirListResponse {
+                entries: Vec::new(),
+                truncated: false,
+                refused,
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        // Too many entries, an empty name, an overlong name, and a refusal
+        // next to a list: all malformed rather than merely unusual.
+        let too_many = (0..=MAX_DIR_ENTRIES_PER_RESPONSE)
+            .map(|index| entry(&format!("f{index}")))
+            .collect();
+        for kind in [
+            MessageKind::DirListResponse {
+                entries: too_many,
+                truncated: true,
+                refused: None,
+            },
+            MessageKind::DirListResponse {
+                entries: vec![entry("")],
+                truncated: false,
+                refused: None,
+            },
+            MessageKind::DirListResponse {
+                entries: vec![entry(&"a".repeat(FILE_NAME_MAX_BYTES + 1))],
+                truncated: false,
+                refused: None,
+            },
+            MessageKind::DirListResponse {
+                entries: vec![entry("notes.txt")],
+                truncated: false,
+                refused: Some(DirListRefusal::Unreadable),
+            },
+        ] {
+            let bytes = envelope(kind).encode().unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "a malformed listing was accepted"
+            );
         }
     }
 

@@ -19,6 +19,7 @@ pub mod constants;
 pub mod error;
 pub mod license;
 pub mod protocol;
+pub mod remote_path;
 pub mod session;
 pub mod unattended;
 
