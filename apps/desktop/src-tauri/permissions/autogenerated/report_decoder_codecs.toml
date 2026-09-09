@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-report-decoder-codecs"
+description = "Enables the report_decoder_codecs command without any pre-configured scope."
+commands.allow = ["report_decoder_codecs"]
+
+[[permission]]
+identifier = "deny-report-decoder-codecs"
+description = "Denies the report_decoder_codecs command without any pre-configured scope."
+commands.deny = ["report_decoder_codecs"]
