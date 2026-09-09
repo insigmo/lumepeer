@@ -29,7 +29,10 @@ vars:
   # desktop audio at all (docs/gap-tasks/01-macos-monitors-and-audio-capture.md);
   # without it a macOS host streams no sound (matches .github/workflows/
   # release.yml's macos-arm64/macos-amd64 rows).
-  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit
+  # audio-playout-coreaudio is the other half of that pair — without it a
+  # macOS host plays back none of the guest's microphone audio
+  # (docs/gap-tasks/02-macos-audio-playout.md).
+  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
   # Unpacked aarch64 cross toolchain + arm64 sysroot the linux-arm64 target
   # links against, provisioned by ci/provision-linux-arm64-cross.sh (see
   # cross:linux-arm64 below). Gitignored and local to whichever machine built

@@ -29,6 +29,7 @@ capture-scap = ["lumepeer-media/capture-scap"]
 capture-windows = ["lumepeer-media/capture-windows"]
 capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
 audio-capture-screencapturekit = ["lumepeer-media/audio-capture-screencapturekit"]
+audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio"]
 encode-openh264 = ["lumepeer-media/encode-openh264"]
 encode-mf = ["lumepeer-media/encode-mf"]
 encode-videotoolbox = ["lumepeer-media/encode-videotoolbox"]
@@ -119,8 +120,16 @@ percent-encoding.workspace = true
 # capturer lives inside that module), so a macOS build now always pulls in
 # the ScreenCaptureKit/objc2 tree the comment above `[target.'cfg(target_os =
 # "windows")'.dependencies]` describes as otherwise opt-in.
+#
+# `audio-playout-coreaudio` sits alongside it for the same reason: without
+# it a macOS host plays no guest microphone audio. Independent of
+# `audio-capture-screencapturekit` (playback shares none of ScreenCaptureKit's
+# plumbing), but unconditional here too, matching every other platform's
+# playout backend being unconditional (WASAPI on Windows, PipeWire via
+# `audio-capture-pipewire` below on Linux).
 lumepeer-media = { workspace = true, features = [
     "audio-capture-screencapturekit",
+    "audio-playout-coreaudio",
 ] }
 # `NSPasteboardTypeFileURL` clipboard file lists (docs/bugs/
 # 14-clipboard-files.md #1, #3; ADR 0047). Same `objc2` framework bindings

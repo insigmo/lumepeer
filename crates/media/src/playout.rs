@@ -13,14 +13,18 @@
 //! stays decided by the same constants. A silent chunk is real silence, so
 //! gaps in the sender's clock never click.
 //!
-//! Two backends today, gated behind the [`AudioPlayer`] trait exactly as
-//! [`crate::capture_audio`] gates its capturers: WASAPI on Windows, and
-//! PipeWire on Linux (module [`linux_pipewire`], `feature =
+//! Three backends today, gated behind the [`AudioPlayer`] trait exactly as
+//! [`crate::capture_audio`] gates its capturers: WASAPI on Windows, PipeWire
+//! on Linux (module [`linux_pipewire`], `feature =
 //! "audio-capture-pipewire"` — the same feature that carries the capture
-//! direction, because it is the same binding set). macOS has none yet and
-//! gets a refusal from [`platform_player`], running without guest audio and
-//! saying so (§18). The conversion helper is platform-independent and always
-//! tested.
+//! direction, because it is the same binding set), and `CoreAudio`'s
+//! `AudioQueue` on macOS (module [`macos_coreaudio`], `feature =
+//! "audio-playout-coreaudio"` — its own feature, independent of
+//! `audio-capture-screencapturekit`, since playback shares none of
+//! ScreenCaptureKit's plumbing; docs/gap-tasks/02-macos-audio-playout.md). A
+//! platform with no backend compiled in refuses in [`platform_player`]
+//! rather than swallowing the audio (§18). The conversion helper is
+//! platform-independent and always tested.
 
 #[cfg(target_os = "windows")]
 use std::sync::Arc;
@@ -33,13 +37,17 @@ use windows::Win32::Media::Audio::{self as wasapi, IAudioClient, IAudioRenderCli
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
 // Every non-doc use of `MediaError` in this file is inside the Windows
-// backend or the "no backend" arm of `platform_player`, so a Linux build with
-// PipeWire compiled in uses the name only in doc links.
+// backend or the "no backend" arm of `platform_player`, so a Linux build
+// with PipeWire compiled in, or a macOS build with the CoreAudio backend
+// compiled in, uses the name only in doc links.
 #[cfg_attr(
-    all(
-        target_os = "linux",
-        not(target_os = "android"),
-        feature = "audio-capture-pipewire"
+    any(
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "audio-capture-pipewire"
+        ),
+        all(target_os = "macos", feature = "audio-playout-coreaudio")
     ),
     allow(unused_imports, reason = "used in doc links on this configuration")
 )]
@@ -97,6 +105,14 @@ pub mod linux_pipewire;
 ))]
 pub use linux_pipewire::PipewirePlayout;
 
+/// `CoreAudio` `AudioQueue` playback for macOS (§11; ADR 0028;
+/// docs/gap-tasks/02-macos-audio-playout.md).
+#[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+pub mod macos_coreaudio;
+
+#[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+pub use macos_coreaudio::CoreAudioPlayout;
+
 /// Opens the playback backend of the current platform (§11; ADR 0028).
 ///
 /// # Errors
@@ -115,6 +131,10 @@ pub fn platform_player() -> Result<Box<dyn AudioPlayer>> {
     {
         Ok(Box::new(linux_pipewire::PipewirePlayout::new()))
     }
+    #[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+    {
+        Ok(Box::new(macos_coreaudio::CoreAudioPlayout::new()))
+    }
     #[cfg(not(any(
         target_os = "windows",
         all(
@@ -122,6 +142,7 @@ pub fn platform_player() -> Result<Box<dyn AudioPlayer>> {
             not(target_os = "android"),
             feature = "audio-capture-pipewire"
         ),
+        all(target_os = "macos", feature = "audio-playout-coreaudio"),
     )))]
     {
         Err(MediaError::CaptureUnavailable(
@@ -564,5 +585,42 @@ mod tests {
         assert!(to_device_pcm(&[], AUDIO_SAMPLE_RATE_HZ, 2).is_empty());
         assert!(to_device_pcm(&[0, 0], 0, 2).is_empty());
         assert!(to_device_pcm(&[0, 0], AUDIO_SAMPLE_RATE_HZ, 0).is_empty());
+    }
+
+    /// 44.1 kHz is the nominal rate macOS reports for a lot of real output
+    /// hardware (built-in speakers on many Mac models, plenty of USB audio
+    /// interfaces). One wire chunk (`SAMPLES_PER_CHUNK` = 960 frames at
+    /// 48 kHz) resamples onto it to 960 * 44100 / 48000 = 882 frames in exact
+    /// rational arithmetic; `to_device_pcm`'s `f64` division can floor that
+    /// one frame short (the same tail truncation
+    /// `linux_pipewire`'s own equivalent test documents), so this allows the
+    /// same one-frame tolerance rather than asserting exact equality.
+    #[test]
+    fn macos_common_output_rate_44100_resamples_exactly() {
+        let input = vec![0x1000i16; crate::capture_audio::SAMPLES_PER_CHUNK * 2];
+        let out = to_device_pcm(&input, 44_100, 2);
+        let frames = out.len() / 2;
+        assert!(
+            frames.abs_diff(882) <= 1,
+            "expected ~882 frames, got {frames}"
+        );
+        let expected = f32::from(0x1000i16) / f32::from(i16::MAX);
+        assert!((out[0] - expected).abs() < 0.001);
+        assert!((out[out.len() - 1] - expected).abs() < 0.001);
+    }
+
+    /// 48 kHz is macOS's other common default output rate (it matches the
+    /// wire rate exactly, so this is the identity path
+    /// `same_rate_stereo_is_a_scaled_copy` above already exercises — pinned
+    /// again here under its own name because the `CoreAudio` backend queries
+    /// this specific value from the device rather than assuming it).
+    #[test]
+    fn macos_common_output_rate_48000_is_identity() {
+        let input: Vec<i16> = vec![0x2000, -0x2000, 0x2000, -0x2000];
+        let out = to_device_pcm(&input, 48_000, 2);
+        assert_eq!(out.len(), input.len());
+        let expected = f32::from(0x2000i16) / f32::from(i16::MAX);
+        assert!((out[0] - expected).abs() < 0.001);
+        assert!((out[1] + expected).abs() < 0.001);
     }
 }

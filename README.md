@@ -232,8 +232,9 @@ range; what shipped:
 - The guest view window carries a real toolbar: fullscreen and scaling with
   hotkeys, cursor-shape updates (ADR 0038), a monitor picker, Ctrl+Alt+Del
   delivery and a microphone back-channel (ADR 0028).
-- Audio runs both ways — desktop mix out, guest microphone in — on WASAPI and
-  PipeWire (ADR 0023 §5, ADR 0028).
+- Audio runs both ways — desktop mix out, guest microphone in — on WASAPI,
+  PipeWire, and on macOS ScreenCaptureKit out with CoreAudio `AudioQueue` back
+  in (ADR 0023 §5, ADR 0028).
 - Linux ships both session types: X11 capture/XTEST and the Wayland portal
   with its PipeWire stream, plus PipeWire audio (ADR 0039).
 - Chat rides the control channel with a bounded, non-persisted transcript
@@ -260,10 +261,6 @@ Named here rather than left to be rediscovered:
   being removed, because every message after them would renumber and the
   golden vectors of §17.2 exist to make exactly that impossible without a
   major version. Read them as reserved, not as pending.
-- **macOS audio and monitors.** `platform_audio_capturer` and
-  `platform_player` both refuse on macOS, so a macOS host streams no sound and
-  plays no guest microphone; `host_monitors()` reports a single primary
-  display because nothing enumerates them there.
 - **Running before anyone signs in.** The helper service of ADR 0043 is a
   privileged process, but it holds one capability — Ctrl+Alt+Del — and does
   not serve a screen. Reaching a machine before somebody signs in needs a
