@@ -45,10 +45,11 @@ fn nv12_passthrough(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
             "odd-dimension NV12 input is not supported".to_owned(),
         ));
     }
-    if frame.data.len() < nv12_size(width, height) {
+    let pixels = frame.as_cpu()?;
+    if pixels.len() < nv12_size(width, height) {
         return Err(MediaError::Encode("NV12 frame buffer is short".to_owned()));
     }
-    Ok((frame.data.clone(), width, height))
+    Ok((pixels.to_vec(), width, height))
 }
 
 fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
@@ -60,7 +61,11 @@ fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
         return Err(MediaError::Encode("frame is smaller than 2x2".to_owned()));
     }
     let src_stride = frame.width as usize * 4;
-    if frame.data.len() < src_stride * height {
+    // Through `as_cpu`, not `data`: a frame the Windows zero-copy path left
+    // on the GPU (ADR 0073) has nothing in `data` until it is read back, and
+    // reaching this function is exactly the case where it has to be.
+    let pixels = frame.as_cpu()?;
+    if pixels.len() < src_stride * height {
         return Err(MediaError::Encode("frame buffer is short".to_owned()));
     }
 
@@ -82,8 +87,8 @@ fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
         let top = block_row * 2;
         let (y_top, y_bottom) = y_plane[top * width..][..width * 2].split_at_mut(width);
 
-        let src_top = &frame.data[top * src_stride..][..width * 4];
-        let src_bottom = &frame.data[(top + 1) * src_stride..][..width * 4];
+        let src_top = &pixels[top * src_stride..][..width * 4];
+        let src_bottom = &pixels[(top + 1) * src_stride..][..width * 4];
 
         // Four zipped iterators over exactly `width / 2` blocks: the two
         // source row halves in 8-byte (two-pixel) steps, the two luma row
@@ -154,13 +159,13 @@ mod tests {
     use super::*;
 
     fn frame(width: u32, height: u32, fill: u8) -> Frame {
-        Frame {
+        Frame::cpu(
             width,
             height,
-            format: PixelFormat::Bgra8,
-            timestamp_us: 0,
-            data: vec![fill; (width as usize) * (height as usize) * 4],
-        }
+            PixelFormat::Bgra8,
+            0,
+            vec![fill; (width as usize) * (height as usize) * 4],
+        )
     }
 
     #[test]

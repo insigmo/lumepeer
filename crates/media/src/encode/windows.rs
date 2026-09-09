@@ -72,6 +72,19 @@ use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder};
 use crate::capture::{Frame, PixelFormat};
 use crate::error::{MediaError, Result};
 
+/// The Direct3D device manager a transform can be activated against
+/// (ADR 0073).
+///
+/// Uninhabited on a build without the zero-copy path, so that the activation
+/// path below has one shape instead of two: `Option<&D3dManager>` is then a
+/// value that can only ever be `None`, and every `is_some()` branch folds
+/// away with it.
+#[cfg(feature = "encode-mf-zero-copy")]
+type D3dManager = windows::Win32::Media::MediaFoundation::IMFDXGIDeviceManager;
+/// See the feature-enabled definition above.
+#[cfg(not(feature = "encode-mf-zero-copy"))]
+type D3dManager = std::convert::Infallible;
+
 /// Bits per kilobit, for the kbps of §14 against the bps of `MF_MT_AVG_BITRATE`.
 const BITS_PER_KBIT: u32 = 1_000;
 /// Probe/initial negotiation size. Real dimensions arrive with the first
@@ -220,7 +233,9 @@ const fn platform_profile(profile: i32) -> u32 {
 /// evidence. It costs one 64x64 frame, once, at encoder selection.
 pub(super) fn hardware_available(config: EncoderConfig) -> bool {
     match config.codec {
-        VideoCodec::H264 => activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok(),
+        VideoCodec::H264 => {
+            activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config, None).is_ok()
+        }
         VideoCodec::Av1 => encodes_one_frame(config),
     }
 }
@@ -247,13 +262,13 @@ fn probe_frame(codec: VideoCodec) -> Frame {
     /// white; nothing depends on the value beyond it being a real image.
     const FILL: u8 = 0x80;
     let (width, height) = probe_dims(codec);
-    Frame {
+    Frame::cpu(
         width,
         height,
-        format: PixelFormat::Bgra8,
-        timestamp_us: 0,
-        data: vec![FILL; (width as usize) * (height as usize) * 4],
-    }
+        PixelFormat::Bgra8,
+        0,
+        vec![FILL; (width as usize) * (height as usize) * 4],
+    )
 }
 
 /// Hardware H.264 encoder backed by a Media Foundation MFT.
@@ -269,6 +284,21 @@ pub struct MediaFoundationEncoder {
     /// was just given without a drain. From then on every frame pays for the
     /// drain, which is what this module did unconditionally before.
     needs_drain: bool,
+    /// Everything the GPU path needs, once a frame has arrived on the GPU to
+    /// establish which device to share (ADR 0073).
+    #[cfg(feature = "encode-mf-zero-copy")]
+    gpu: Option<zero_copy::GpuPath>,
+    /// Whether the transform currently in `transform` was activated with a
+    /// Direct3D device manager attached. A transform bound to one is not the
+    /// transform to hand a buffer in main memory to, and vice versa, so a
+    /// session that mixes the two kinds of frame re-activates between them.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    d3d_attached: bool,
+    /// Latched the first time the GPU path fails, so the session says so once
+    /// and then stays on the readback path instead of re-trying — and
+    /// re-logging — every frame (ADR 0073).
+    #[cfg(feature = "encode-mf-zero-copy")]
+    gpu_refused: bool,
     // Keeps `MFStartup`/`MFShutdown` balanced for as long as `transform` (and
     // any COM object it produced) is alive. Order matters: this must drop
     // after `transform`, which Rust guarantees by declaration order.
@@ -314,7 +344,7 @@ impl MediaFoundationEncoder {
     /// codec is available and usable.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let (width, height) = probe_dims(config.codec);
-        let (mf, transform, events) = activate_hardware_transform(width, height, config)?;
+        let (mf, transform, events) = activate_hardware_transform(width, height, config, None)?;
         Ok(Self {
             transform,
             events,
@@ -322,6 +352,12 @@ impl MediaFoundationEncoder {
             dims: (width, height),
             pump: EventPump::default(),
             needs_drain: false,
+            #[cfg(feature = "encode-mf-zero-copy")]
+            gpu: None,
+            #[cfg(feature = "encode-mf-zero-copy")]
+            d3d_attached: false,
+            #[cfg(feature = "encode-mf-zero-copy")]
+            gpu_refused: false,
             mf,
         })
     }
@@ -339,16 +375,108 @@ impl MediaFoundationEncoder {
     /// simpler and more portable than depending on each driver's support, or
     /// lack of it, for dynamic reconfiguration.
     fn reconfigure(&mut self, width: u32, height: u32) -> Result<()> {
-        let (mf, transform, events) = activate_hardware_transform(width, height, self.config)?;
+        self.reactivate(width, height, None)
+    }
+
+    /// [`Self::reconfigure`], plus the choice of whether the fresh transform
+    /// is bound to a Direct3D device manager (ADR 0073).
+    ///
+    /// `d3d` is `None` for every frame that arrives in main memory, and the
+    /// capture device's manager for one that arrives as a texture. It is a
+    /// re-activation rather than a message on the live transform because
+    /// `MFT_MESSAGE_SET_D3D_MANAGER` is documented to be sent before the
+    /// types are set, which is the same reason [`Self::reconfigure`] does not
+    /// try to resize a streaming transform either.
+    fn reactivate(&mut self, width: u32, height: u32, d3d: Option<&D3dManager>) -> Result<()> {
+        let (mf, transform, events) = activate_hardware_transform(width, height, self.config, d3d)?;
         self.transform = transform;
         self.events = events;
         self.mf = mf;
         self.dims = (width, height);
+        #[cfg(feature = "encode-mf-zero-copy")]
+        {
+            self.d3d_attached = d3d.is_some();
+        }
         // A different transform raises its own events; anything counted for
         // the old one is not a promise this one made.
         self.pump.reset();
         self.needs_drain = false;
         Ok(())
+    }
+
+    /// Encodes a frame that is still a GPU texture, without it ever passing
+    /// through main memory (ADR 0073).
+    ///
+    /// The texture is BGRA, which no hardware H.264 or AV1 encoder MFT takes;
+    /// the conversion to NV12 happens on the same GPU, in a Direct3D 11 video
+    /// processor, so what the transform is handed is a texture and not a
+    /// buffer. The device is the capture device — not one this encoder made,
+    /// which would put the copy back where it was, in main memory, wearing a
+    /// texture's clothes.
+    ///
+    /// # Errors
+    /// [`MediaError::Encode`] for anything that means this machine cannot do
+    /// it: no D3D11-aware MFT, a device the manager will not take, a video
+    /// processor that will not convert. The caller treats all of them the
+    /// same way — fall back to the readback path for the session.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn encode_on_gpu(
+        &mut self,
+        frame: &Frame,
+        gpu: &crate::capture::GpuTexture,
+    ) -> Result<EncodedFrame> {
+        let (width, height) = (gpu.width(), gpu.height());
+        if width == 0 || height == 0 {
+            return Err(MediaError::Encode("the GPU frame is empty".to_owned()));
+        }
+
+        // A new device means a new manager and a new transform. In a session
+        // this happens once, on the first GPU frame; a second time would mean
+        // capture reopened on a different adapter, which is a monitor moving
+        // between GPUs.
+        if !self
+            .gpu
+            .as_ref()
+            .is_some_and(|path| path.shares_device(gpu.device()))
+        {
+            self.gpu = Some(zero_copy::GpuPath::bind(gpu.device())?);
+            self.d3d_attached = false;
+        }
+        if !self.d3d_attached || self.dims != (width, height) {
+            let manager = self
+                .gpu
+                .as_ref()
+                .ok_or_else(|| MediaError::Encode("the GPU path lost its device".to_owned()))?
+                .manager()
+                .clone();
+            self.reactivate(width, height, Some(&manager))?;
+        }
+
+        let fps = self.config.fps;
+        let path = self
+            .gpu
+            .as_mut()
+            .ok_or_else(|| MediaError::Encode("the GPU path lost its device".to_owned()))?;
+        let sample = path.nv12_sample(gpu, fps, frame.timestamp_us)?;
+        self.submit(&sample)?;
+
+        let mut encoded = if self.needs_drain {
+            self.collect_by_draining(width, height)?
+        } else {
+            match self.collect(width, height) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    tracing::info!(
+                        %error,
+                        "this encoder MFT will not run one-in/one-out; draining every frame"
+                    );
+                    self.needs_drain = true;
+                    self.collect_by_draining(width, height)?
+                }
+            }
+        };
+        encoded.timestamp_us = frame.timestamp_us;
+        Ok(encoded)
     }
 
     /// Puts the transform back into its streaming state after the per-frame
@@ -485,8 +613,39 @@ impl VideoEncoder for MediaFoundationEncoder {
         // calling thread has already joined.
         ensure_com_initialized()?;
 
+        // The frame never left the GPU, and this is the whole point of
+        // ADR 0073: hand the texture to the transform rather than reading it
+        // back into main memory first. A refusal — no D3D11-aware MFT, a
+        // device the encoder cannot share, a video processor that will not
+        // convert — is not a failed frame: it falls through to the readback
+        // path below, once, for the rest of the session.
+        #[cfg(feature = "encode-mf-zero-copy")]
+        if let Some(gpu) = frame.gpu.as_ref()
+            && !self.gpu_refused
+        {
+            match self.encode_on_gpu(frame, gpu) {
+                Ok(encoded) => return Ok(encoded),
+                Err(error) => {
+                    tracing::info!(
+                        %error,
+                        "this encoder will not take frames on the GPU; \
+                         the rest of this session goes through main memory"
+                    );
+                    self.gpu_refused = true;
+                    self.gpu = None;
+                }
+            }
+        }
+
         let (nv12, width, height) = bgra_to_nv12(frame)?;
-        if self.dims != (width, height) {
+        // A transform still bound to a Direct3D device manager is not the one
+        // to hand a buffer in main memory to, so the fallback re-activates a
+        // plain transform before it feeds one (ADR 0073).
+        #[cfg(feature = "encode-mf-zero-copy")]
+        let bound_to_a_device = self.d3d_attached;
+        #[cfg(not(feature = "encode-mf-zero-copy"))]
+        let bound_to_a_device = false;
+        if self.dims != (width, height) || bound_to_a_device {
             self.reconfigure(width, height)?;
         }
 
@@ -663,6 +822,7 @@ fn activate_hardware_transform(
     width: u32,
     height: u32,
     config: EncoderConfig,
+    d3d: Option<&D3dManager>,
 ) -> Result<(MfRuntime, IMFTransform, Option<IMFMediaEventGenerator>)> {
     // Before `MFStartup`, deliberately: a build that cannot ask for this
     // codec at all must not start Media Foundation to find that out
@@ -686,7 +846,7 @@ fn activate_hardware_transform(
     };
 
     for activate in enum_hardware_encoders(&input_info, &output_info)? {
-        match try_activate_one(&activate, width, height, config) {
+        match try_activate_one(&activate, width, height, config, d3d) {
             Ok((transform, events)) => return Ok((mf, transform, events)),
             Err(_) => {
                 // SAFETY: ShutdownObject releases the MFT this Activate
@@ -711,6 +871,7 @@ fn try_activate_one(
     width: u32,
     height: u32,
     config: EncoderConfig,
+    d3d: Option<&D3dManager>,
 ) -> Result<(IMFTransform, Option<IMFMediaEventGenerator>)> {
     // SAFETY: ActivateObject creates the MFT this IMFActivate describes and
     // hands back an owned interface pointer on success.
@@ -721,6 +882,18 @@ fn try_activate_one(
     if is_async {
         unlock_async(&transform)?;
     }
+
+    // Before the types as well, and before `MF_LOW_LATENCY`: MSDN's
+    // "Direct3D-Aware MFTs" has `MFT_MESSAGE_SET_D3D_MANAGER` sent while the
+    // transform is still unconfigured, and a transform told about the device
+    // afterwards negotiates the software input type it would have picked
+    // anyway (ADR 0073).
+    #[cfg(feature = "encode-mf-zero-copy")]
+    if let Some(manager) = d3d {
+        zero_copy::attach_device_manager(&transform, manager)?;
+    }
+    #[cfg(not(feature = "encode-mf-zero-copy"))]
+    let _: Option<&D3dManager> = d3d;
 
     // Before the types, not after: `MF_LOW_LATENCY` and the rate-control mode
     // change what the transform is willing to negotiate, and several drivers
@@ -1520,6 +1693,453 @@ impl EventPump {
     }
 }
 
+/// The Direct3D side of the encoder: what it takes to hand a captured
+/// texture straight to a Media Foundation transform (ADR 0073).
+///
+/// Kept as an inline module, like `capture::windows`'s `dxgi`, so the file
+/// list of §6 stays exact. Every call in here crosses into COM, which is why
+/// `unsafe` is allowed in this module and nowhere else in this file beyond
+/// what ADR 0011 already established.
+#[cfg(feature = "encode-mf-zero-copy")]
+#[allow(
+    unsafe_code,
+    reason = "Direct3D 11 video processing and the Media Foundation DXGI buffer are COM; every call in the `windows` crate's bindings for them is `unsafe fn`. See ADR 0073."
+)]
+mod zero_copy {
+    use std::mem::ManuallyDrop;
+
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_BIND_RENDER_TARGET, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+        D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+        D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device,
+        ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+        ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_NV12, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    };
+    use windows::Win32::Media::MediaFoundation::{
+        IMF2DBuffer, IMFDXGIDeviceManager, IMFSample, IMFTransform, MF_SA_D3D11_AWARE,
+        MFCreateDXGIDeviceManager, MFCreateDXGISurfaceBuffer, MFCreateSample,
+        MFT_MESSAGE_SET_D3D_MANAGER,
+    };
+    use windows::core::Interface as _;
+
+    use crate::capture::GpuTexture;
+    use crate::error::{MediaError, Result};
+
+    use super::{hns_from_us, hns_per_frame};
+
+    /// Full-range RGB going into the video processor.
+    ///
+    /// `D3D11_VIDEO_PROCESSOR_COLOR_SPACE` is a bitfield — `Usage` (1),
+    /// `RGB_Range` (1), `YCbCr_Matrix` (1), `YCbCr_xvYCC` (1),
+    /// `Nominal_Range` (2) — and all-zero means playback usage, full-range
+    /// RGB, which is what a desktop surface is.
+    const RGB_FULL_RANGE: u32 = 0;
+
+    /// BT.601, studio range, coming out of it.
+    ///
+    /// Bit 2 (`YCbCr_Matrix`) stays 0 for BT.601 and bits 4-5
+    /// (`Nominal_Range`) carry 1 for 16-235. Both halves have to match what
+    /// `encode::nv12` produces on the readback path, or the same session
+    /// would change colour the moment it switched paths.
+    const YCBCR_BT601_STUDIO: u32 = 1 << 4;
+
+    /// Tells `transform` which Direct3D device it will be given textures on.
+    ///
+    /// # Errors
+    /// [`MediaError::Encode`] when the transform is not D3D11-aware or
+    /// refuses the manager — either way this machine has no GPU path.
+    pub(super) fn attach_device_manager(
+        transform: &IMFTransform,
+        manager: &IMFDXGIDeviceManager,
+    ) -> Result<()> {
+        // SAFETY: GetAttributes hands back an owned attribute store, and
+        // GetUINT32 only reads it. An MFT that exposes neither is simply not
+        // one that takes textures.
+        let aware = unsafe { transform.GetAttributes() }
+            .and_then(|attributes| unsafe { attributes.GetUINT32(&MF_SA_D3D11_AWARE) })
+            .unwrap_or(0);
+        if aware == 0 {
+            return Err(MediaError::Encode(
+                "this encoder MFT is not Direct3D 11 aware".to_owned(),
+            ));
+        }
+        // SAFETY: ProcessMessage takes the manager as a borrowed raw pointer
+        // for the duration of the call; `manager` outlives it, and the
+        // transform takes its own reference if it keeps one.
+        unsafe {
+            transform.ProcessMessage(
+                MFT_MESSAGE_SET_D3D_MANAGER,
+                windows::core::Interface::as_raw(manager) as usize,
+            )
+        }
+        .map_err(|e| MediaError::Encode(format!("the encoder MFT refused the D3D manager: {e}")))
+    }
+
+    /// The encoder's GPU state for one capture device.
+    pub(super) struct GpuPath {
+        device: ID3D11Device,
+        manager: IMFDXGIDeviceManager,
+        video: ID3D11VideoDevice,
+        context: ID3D11VideoContext,
+        /// Rebuilt whenever the picture changes size, which is a monitor mode
+        /// change rather than anything per-frame.
+        converter: Option<Converter>,
+    }
+
+    // SAFETY: same reasoning as `unsafe impl Send for MediaFoundationEncoder`
+    // above and `GpuTexture` in `capture::windows`: Direct3D 11 devices are
+    // free-threaded, the capture side turns on the multithread protection
+    // that makes the immediate context safe to share before it hands out a
+    // single texture, and Media Foundation's DXGI device manager is
+    // documented as usable from the work-queue thread that drives the MFT.
+    unsafe impl Send for GpuPath {}
+
+    impl GpuPath {
+        /// Wraps `device` — the capture device — in the Media Foundation
+        /// device manager an MFT is bound to, and opens the video processing
+        /// interfaces the BGRA-to-NV12 conversion needs.
+        ///
+        /// # Errors
+        /// [`MediaError::Encode`] when Media Foundation will not take the
+        /// device, or the device has no video processing at all.
+        pub(super) fn bind(device: &ID3D11Device) -> Result<Self> {
+            let mut token = 0u32;
+            let mut manager: Option<IMFDXGIDeviceManager> = None;
+            // SAFETY: both out-parameters are locals that outlive the call
+            // and receive, on success, an owned interface pointer and the
+            // reset token that goes with it.
+            unsafe { MFCreateDXGIDeviceManager(&raw mut token, &raw mut manager) }.map_err(
+                |e| MediaError::Encode(format!("MFCreateDXGIDeviceManager failed: {e}")),
+            )?;
+            let manager = manager.ok_or_else(|| {
+                MediaError::Encode(
+                    "Media Foundation reported success with no device manager".to_owned(),
+                )
+            })?;
+            // SAFETY: ResetDevice borrows the device for the call and takes
+            // its own reference; `token` is the one just handed back, which
+            // is what proves this caller is the manager's owner.
+            unsafe { manager.ResetDevice(device, token) }.map_err(|e| {
+                MediaError::Encode(format!(
+                    "the device manager refused the capture device: {e}"
+                ))
+            })?;
+
+            let video: ID3D11VideoDevice = device.cast().map_err(|e| {
+                MediaError::Encode(format!("this device has no video processing: {e}"))
+            })?;
+            // SAFETY: GetImmediateContext hands back an owned interface
+            // pointer and reads nothing this side owns.
+            let context: ID3D11VideoContext = unsafe { device.GetImmediateContext() }
+                .map_err(|e| {
+                    MediaError::Encode(format!("this device has no immediate context: {e}"))
+                })?
+                .cast()
+                .map_err(|e| {
+                    MediaError::Encode(format!("this context has no video processing: {e}"))
+                })?;
+
+            Ok(Self {
+                device: device.clone(),
+                manager,
+                video,
+                context,
+                converter: None,
+            })
+        }
+
+        /// Whether this path is bound to `device` — the check that keeps the
+        /// promise the whole thing rests on, that capture and encode are on
+        /// one GPU.
+        pub(super) fn shares_device(&self, device: &ID3D11Device) -> bool {
+            self.device == *device
+        }
+
+        /// The manager to activate a transform against.
+        pub(super) const fn manager(&self) -> &IMFDXGIDeviceManager {
+            &self.manager
+        }
+
+        /// Converts `gpu` to NV12 on the GPU and wraps the result in a sample
+        /// the transform can take.
+        ///
+        /// # Errors
+        /// [`MediaError::Encode`] when the video processor or Media
+        /// Foundation refuses any step of it.
+        pub(super) fn nv12_sample(
+            &mut self,
+            gpu: &GpuTexture,
+            fps: u8,
+            timestamp_us: u64,
+        ) -> Result<IMFSample> {
+            let (width, height) = (gpu.width(), gpu.height());
+            let stale = self
+                .converter
+                .as_ref()
+                .is_none_or(|converter| converter.dims != (width, height));
+            if stale {
+                self.converter = Some(Converter::new(
+                    &self.video,
+                    &self.context,
+                    &self.device,
+                    width,
+                    height,
+                    fps,
+                )?);
+            }
+            let converter = self
+                .converter
+                .as_ref()
+                .ok_or_else(|| MediaError::Encode("the video processor is gone".to_owned()))?;
+            converter.convert(&self.video, &self.context, gpu)?;
+            sample_over(&converter.output, fps, timestamp_us)
+        }
+    }
+
+    /// One video processor, sized for one picture size.
+    struct Converter {
+        enumerator: ID3D11VideoProcessorEnumerator,
+        processor: ID3D11VideoProcessor,
+        output: ID3D11Texture2D,
+        view: ID3D11VideoProcessorOutputView,
+        dims: (u32, u32),
+    }
+
+    impl Converter {
+        fn new(
+            video: &ID3D11VideoDevice,
+            context: &ID3D11VideoContext,
+            device: &ID3D11Device,
+            width: u32,
+            height: u32,
+            fps: u8,
+        ) -> Result<Self> {
+            let rate = DXGI_RATIONAL {
+                Numerator: u32::from(fps.max(1)),
+                Denominator: 1,
+            };
+            let desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+                InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                InputFrameRate: rate,
+                InputWidth: width,
+                InputHeight: height,
+                OutputFrameRate: rate,
+                OutputWidth: width,
+                OutputHeight: height,
+                Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+            };
+            // SAFETY: `desc` is a local that outlives the call and is only
+            // read; both calls hand back owned interface pointers.
+            let enumerator = unsafe { video.CreateVideoProcessorEnumerator(&raw const desc) }
+                .map_err(|e| {
+                    MediaError::Encode(format!("no video processor for {width}x{height}: {e}"))
+                })?;
+            // SAFETY: as above; rate conversion 0 is the one every driver
+            // exposes, and nothing here asks for frame-rate conversion.
+            let processor = unsafe { video.CreateVideoProcessor(&enumerator, 0) }
+                .map_err(|e| MediaError::Encode(format!("CreateVideoProcessor failed: {e}")))?;
+
+            let output = nv12_texture(device, width, height)?;
+            let view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut view: Option<ID3D11VideoProcessorOutputView> = None;
+            // SAFETY: the descriptor and the out-parameter are locals that
+            // outlive the call; the texture and enumerator are borrowed for
+            // it and the view takes its own references.
+            unsafe {
+                video.CreateVideoProcessorOutputView(
+                    &output,
+                    &enumerator,
+                    &raw const view_desc,
+                    Some(&raw mut view),
+                )
+            }
+            .map_err(|e| {
+                MediaError::Encode(format!("CreateVideoProcessorOutputView failed: {e}"))
+            })?;
+            let view = view.ok_or_else(|| {
+                MediaError::Encode("Direct3D reported success with no output view".to_owned())
+            })?;
+
+            // Colour is not a detail here: the readback path converts with
+            // BT.601 at studio range (`encode::nv12`), and a video processor
+            // left at its default would hand the same desktop to the same
+            // encoder in a different colour space.
+            let source_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                _bitfield: RGB_FULL_RANGE,
+            };
+            let target_space = D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                _bitfield: YCBCR_BT601_STUDIO,
+            };
+            // SAFETY: both take the processor by borrow and read a colour
+            // space out of a local that outlives the call.
+            unsafe {
+                context.VideoProcessorSetStreamColorSpace(&processor, 0, &raw const source_space);
+                context.VideoProcessorSetOutputColorSpace(&processor, &raw const target_space);
+            }
+
+            Ok(Self {
+                enumerator,
+                processor,
+                output,
+                view,
+                dims: (width, height),
+            })
+        }
+
+        /// Blits `gpu` into this converter's NV12 texture.
+        fn convert(
+            &self,
+            video: &ID3D11VideoDevice,
+            context: &ID3D11VideoContext,
+            gpu: &GpuTexture,
+        ) -> Result<()> {
+            let input_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: 0,
+                    },
+                },
+            };
+            let mut input: Option<
+                windows::Win32::Graphics::Direct3D11::ID3D11VideoProcessorInputView,
+            > = None;
+            // SAFETY: the descriptor and out-parameter are locals that
+            // outlive the call; the texture and enumerator are borrowed and
+            // the view takes its own references.
+            unsafe {
+                video.CreateVideoProcessorInputView(
+                    gpu.texture(),
+                    &self.enumerator,
+                    &raw const input_desc,
+                    Some(&raw mut input),
+                )
+            }
+            .map_err(|e| {
+                MediaError::Encode(format!("CreateVideoProcessorInputView failed: {e}"))
+            })?;
+            let input = input.ok_or_else(|| {
+                MediaError::Encode("Direct3D reported success with no input view".to_owned())
+            })?;
+
+            let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: true.into(),
+                pInputSurface: ManuallyDrop::new(Some(input)),
+                ..Default::default()
+            };
+            // SAFETY: one stream, borrowed from a local that outlives the
+            // call, over a processor and output view this struct owns.
+            // Borrowed and not copied on purpose: the input view lives in a
+            // `ManuallyDrop`, so a second copy of the struct would be a
+            // second reference nothing releases.
+            let blitted = unsafe {
+                context.VideoProcessorBlt(
+                    &self.processor,
+                    &self.view,
+                    0,
+                    std::slice::from_ref(&stream),
+                )
+            };
+            // SAFETY: the struct holds the input view in a ManuallyDrop, so
+            // its reference is this function's to release, on the failure
+            // path as much as on the success one.
+            unsafe { ManuallyDrop::drop(&mut stream.pInputSurface) };
+            blitted.map_err(|e| MediaError::Encode(format!("VideoProcessorBlt failed: {e}")))
+        }
+    }
+
+    /// Allocates the NV12 texture the video processor writes into and the
+    /// transform reads out of.
+    fn nv12_texture(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            // What a video processor output view needs, and nothing more:
+            // this texture is never mapped and never sampled.
+            BindFlags: D3D11_BIND_RENDER_TARGET.0.cast_unsigned(),
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        // SAFETY: `desc` is a local that outlives the call and is only read;
+        // `texture` receives an owned interface pointer on success.
+        unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }.map_err(
+            |e| {
+                MediaError::Encode(format!(
+                    "allocating a {width}x{height} NV12 texture failed: {e}"
+                ))
+            },
+        )?;
+        texture.ok_or_else(|| {
+            MediaError::Encode("Direct3D reported success with no NV12 texture".to_owned())
+        })
+    }
+
+    /// Wraps `texture` in the sample the transform is fed.
+    fn sample_over(texture: &ID3D11Texture2D, fps: u8, timestamp_us: u64) -> Result<IMFSample> {
+        // SAFETY: MFCreateDXGISurfaceBuffer borrows the texture for the call
+        // and hands back an owned buffer that holds its own reference to it;
+        // the IID is a compile-time constant and subresource 0 is the only
+        // one this texture has.
+        let buffer = unsafe { MFCreateDXGISurfaceBuffer(&ID3D11Texture2D::IID, texture, 0, false) }
+            .map_err(|e| MediaError::Encode(format!("MFCreateDXGISurfaceBuffer failed: {e}")))?;
+
+        // A DXGI buffer starts with a current length of zero, and a transform
+        // handed one reports "no input". The contiguous length is what the
+        // 2D view of the same buffer says the picture occupies.
+        let two_d: IMF2DBuffer = buffer
+            .cast()
+            .map_err(|e| MediaError::Encode(format!("the DXGI buffer is not 2D: {e}")))?;
+        // SAFETY: a plain getter on a buffer this function owns.
+        let length = unsafe { two_d.GetContiguousLength() }
+            .map_err(|e| MediaError::Encode(format!("GetContiguousLength failed: {e}")))?;
+        // SAFETY: sets the buffer's own bookkeeping to a length it just
+        // reported for itself.
+        unsafe { buffer.SetCurrentLength(length) }
+            .map_err(|e| MediaError::Encode(format!("SetCurrentLength failed: {e}")))?;
+
+        // SAFETY: MFCreateSample takes nothing; AddBuffer, SetSampleTime and
+        // SetSampleDuration all borrow what they are given and are called on
+        // a sample this function owns.
+        unsafe {
+            let sample = MFCreateSample()
+                .map_err(|e| MediaError::Encode(format!("MFCreateSample failed: {e}")))?;
+            sample
+                .AddBuffer(&buffer)
+                .map_err(|e| MediaError::Encode(format!("AddBuffer failed: {e}")))?;
+            sample
+                .SetSampleTime(hns_from_us(timestamp_us))
+                .map_err(|e| MediaError::Encode(format!("SetSampleTime failed: {e}")))?;
+            sample
+                .SetSampleDuration(hns_per_frame(fps))
+                .map_err(|e| MediaError::Encode(format!("SetSampleDuration failed: {e}")))?;
+            Ok(sample)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1528,13 +2148,13 @@ mod tests {
     use crate::capture::PixelFormat;
 
     fn frame(width: u32, height: u32, fill: u8) -> Frame {
-        Frame {
+        Frame::cpu(
             width,
             height,
-            format: PixelFormat::Bgra8,
-            timestamp_us: 0,
-            data: vec![fill; (width as usize) * (height as usize) * 4],
-        }
+            PixelFormat::Bgra8,
+            0,
+            vec![fill; (width as usize) * (height as usize) * 4],
+        )
     }
 
     /// Builds an encoder only if hardware is genuinely available, so tests
@@ -1630,6 +2250,171 @@ mod tests {
                 .encode(&source)
                 .unwrap_or_else(|error| panic!("frame {index} failed to encode: {error}"));
             assert!(!output.data.is_empty(), "frame {index} encoded to nothing");
+        }
+    }
+
+    /// The point of ADR 0073: a frame that is a texture goes to the encoder
+    /// as a texture, and nothing on the way reads it back.
+    #[test]
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn a_frame_that_stayed_on_the_gpu_encodes_without_a_readback() {
+        let Some(mut encoder) = try_new_encoder() else {
+            eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
+            return;
+        };
+        let Some(source) = crate::capture::windows::gpu_test_frame(256, 256, 0x60) else {
+            eprintln!("skipping: no Direct3D 11 hardware device on this machine");
+            return;
+        };
+
+        let output = match encoder.encode(&source) {
+            Ok(output) => output,
+            Err(error) => panic!("a GPU frame failed to encode: {error}"),
+        };
+        assert!(!output.data.is_empty(), "the GPU frame encoded to nothing");
+        assert!(
+            !encoder.gpu_refused,
+            "this frame was supposed to go through the GPU path, not the fallback"
+        );
+        assert!(
+            encoder.d3d_attached,
+            "the transform has to be bound to the capture device for this to mean anything"
+        );
+
+        // A second frame on the same texture: the session must not
+        // re-activate anything, and must keep producing pictures.
+        let second = encoder.encode(&source).expect("the second GPU frame");
+        assert!(!second.data.is_empty());
+    }
+
+    /// The fallback of ADR 0073: whatever the GPU path could not do, a
+    /// picture still comes out, through the readback the path exists to
+    /// avoid.
+    #[test]
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn a_refused_gpu_path_still_produces_a_picture() {
+        let Some(mut encoder) = try_new_encoder() else {
+            eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
+            return;
+        };
+        let Some(source) = crate::capture::windows::gpu_test_frame(256, 256, 0x60) else {
+            eprintln!("skipping: no Direct3D 11 hardware device on this machine");
+            return;
+        };
+        // Exactly what one failed `encode_on_gpu` leaves behind, without
+        // needing a machine on which it actually fails.
+        encoder.gpu_refused = true;
+
+        let output = encoder
+            .encode(&source)
+            .expect("the readback path has to carry the session");
+        assert!(!output.data.is_empty(), "the fallback encoded to nothing");
+        assert!(
+            !encoder.d3d_attached,
+            "a transform fed from main memory must not be bound to a device manager"
+        );
+    }
+
+    /// The before/after ADR 0073 rests on, run on whatever machine you are
+    /// on rather than quoted from the ADR:
+    ///
+    /// ```text
+    /// cargo test -p lumepeer-media \
+    ///   --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 \
+    ///   -- --ignored --nocapture zero_copy_costs_less_per_frame
+    /// ```
+    ///
+    /// Not an assertion, because the answer is a property of the machine and
+    /// not of the code: a GPU whose readback is cheap and whose video
+    /// processor is slow would be a real result, and the honest response to
+    /// it is to leave the feature off there (ADR 0073).
+    #[test]
+    #[ignore = "a measurement, not an assertion; run it by name with --nocapture"]
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn zero_copy_costs_less_per_frame() {
+        use std::time::Instant;
+
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+        /// 1080p, the size §14's defaults are written for.
+        const WIDTH: u32 = 1920;
+        /// See [`WIDTH`].
+        const HEIGHT: u32 = 1080;
+        /// Long enough for the mean to settle, short enough to run in a test.
+        const FRAMES: u32 = 120;
+        /// 100-nanosecond ticks per millisecond, the unit `FILETIME` counts.
+        const HNS_PER_MS: u64 = 10_000;
+
+        /// This process's kernel+user CPU time so far, in 100 ns ticks.
+        fn cpu_hns() -> u64 {
+            let mut created = FILETIME::default();
+            let mut exited = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            // SAFETY: all four out-parameters are locals that outlive the
+            // call, and the pseudo-handle for the current process needs no
+            // closing.
+            let read = unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &raw mut created,
+                    &raw mut exited,
+                    &raw mut kernel,
+                    &raw mut user,
+                )
+            };
+            if read.is_err() {
+                return 0;
+            }
+            let ticks = |time: FILETIME| -> u64 {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            ticks(kernel) + ticks(user)
+        }
+
+        let Some(mut encoder) = try_new_encoder() else {
+            eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
+            return;
+        };
+        let Some(source) = crate::capture::windows::gpu_test_frame(WIDTH, HEIGHT, 0x60) else {
+            eprintln!("skipping: no Direct3D 11 hardware device on this machine");
+            return;
+        };
+
+        let mut run = |label: &str, refused: bool| {
+            encoder.gpu_refused = refused;
+            // One warm-up frame: the first one of either path activates a
+            // transform and, on the GPU path, a video processor.
+            let _ = encoder.encode(&source);
+            let cpu_before = cpu_hns();
+            let started = Instant::now();
+            for _ in 0..FRAMES {
+                encoder.encode(&source).expect("the frame has to encode");
+            }
+            let wall = started.elapsed();
+            let cpu = cpu_hns().saturating_sub(cpu_before);
+            eprintln!(
+                "{label}: {FRAMES} frames of {WIDTH}x{HEIGHT}, \
+                 {:.2} ms/frame wall, {:.2} ms/frame CPU",
+                wall.as_secs_f64() * 1000.0 / f64::from(FRAMES),
+                (cpu as f64 / HNS_PER_MS as f64) / f64::from(FRAMES),
+            );
+        };
+
+        // Both paths in one process by default, which is the fair comparison
+        // for CPU time. `LUMEPEER_MEASURE_PATH=readback` (or `zero-copy`)
+        // runs one of them alone instead, which is what it takes to read a
+        // resident-set figure off the process from outside without the other
+        // path's peak in it.
+        let only = std::env::var("LUMEPEER_MEASURE_PATH").unwrap_or_default();
+        // The readback path first, so the GPU path cannot be flattered by a
+        // warmed-up encoder the other one paid for.
+        if only.is_empty() || only == "readback" {
+            run("readback ", true);
+        }
+        if only.is_empty() || only == "zero-copy" {
+            run("zero-copy", false);
         }
     }
 

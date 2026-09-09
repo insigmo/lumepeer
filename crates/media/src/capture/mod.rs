@@ -14,6 +14,10 @@ use crate::error::{MediaError, Result};
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+/// A captured frame's pixels while they are still on the GPU (ADR 0073).
+#[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+pub use windows::GpuTexture;
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
@@ -310,8 +314,64 @@ pub struct Frame {
     pub format: PixelFormat,
     /// Monotonic capture timestamp in microseconds.
     pub timestamp_us: u64,
-    /// Raw pixels.
+    /// Raw pixels, or empty while they are still only on the GPU.
+    ///
+    /// Read it through [`Frame::as_cpu`] rather than directly: a frame the
+    /// Windows zero-copy path produced (ADR 0073) carries its pixels in
+    /// [`Frame::gpu`] and fills this the first time somebody asks for them.
     pub data: Vec<u8>,
+    /// The same pixels as a GPU texture, when this frame never went through
+    /// main memory (ADR 0073).
+    ///
+    /// The field exists only on the one build where a producer for it exists,
+    /// so no other backend and no other platform has to know about it. Shared
+    /// rather than owned because the capture backend reuses the texture for
+    /// the next frame once nothing downstream still holds this one.
+    #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+    pub gpu: Option<std::sync::Arc<GpuTexture>>,
+}
+
+impl Frame {
+    /// A frame whose pixels are already in main memory — what every capture
+    /// backend but the Windows zero-copy path of ADR 0073 produces.
+    #[must_use]
+    pub fn cpu(
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        timestamp_us: u64,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            timestamp_us,
+            data,
+            #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+            gpu: None,
+        }
+    }
+
+    /// This frame's pixels in main memory, reading them back from the GPU on
+    /// the first call and remembering the result (ADR 0073).
+    ///
+    /// Every consumer that works on pixels — scaling, the software encoder,
+    /// the recorder, the tests — goes through this rather than through
+    /// [`Frame::data`], so that a GPU-resident frame is exactly as usable as
+    /// any other one, at the cost of the readback this path exists to avoid.
+    /// On every other build it is a borrow of `data` and nothing else.
+    ///
+    /// # Errors
+    /// [`MediaError::CaptureInterrupted`] when a GPU-resident frame cannot be
+    /// copied back into main memory.
+    pub fn as_cpu(&self) -> Result<&[u8]> {
+        #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+        if let Some(gpu) = self.gpu.as_ref() {
+            return gpu.pixels();
+        }
+        Ok(&self.data)
+    }
 }
 
 /// Platform screen capture backend (§11.1).
@@ -998,13 +1058,7 @@ mod tests {
 
         fn next_frame(&mut self) -> Result<Option<Frame>> {
             assert!(self.running, "frames must never be produced while stopped");
-            Ok(Some(Frame {
-                width: 2,
-                height: 1,
-                format: PixelFormat::Bgra8,
-                timestamp_us: 0,
-                data: vec![0; 8],
-            }))
+            Ok(Some(Frame::cpu(2, 1, PixelFormat::Bgra8, 0, vec![0; 8])))
         }
 
         fn stop(&mut self) {

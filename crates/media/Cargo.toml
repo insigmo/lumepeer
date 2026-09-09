@@ -124,6 +124,17 @@ decode-openh264 = ["dep:openh264"]
 # bindings, and that is how `VideoEncoder::request_keyframe` asks a hardware
 # MFT for an IDR (`CODECAPI_AVEncVideoForceKeyFrame`, §11).
 encode-mf = ["windows/Win32_System_Ole"]
+# Hands the captured frame to the encoder as a GPU texture instead of as
+# bytes in main memory (§11, backlog item 33; ADR 0073). Its own feature
+# rather than part of `encode-mf`, for the reason ADR 0073 records: it needs
+# both halves of the pipeline at once — DXGI Desktop Duplication has to keep
+# the frame on the GPU and Media Foundation has to accept it there — so a
+# build with only one of them cannot have it, and a shipped build takes it
+# only once it has been measured on the machine it ships to. Adds no
+# dependency and no `windows` binding module of its own: everything it needs
+# is what `capture-windows` (Direct3D 11/DXGI) and the unconditional
+# `Win32_Media_MediaFoundation` already bring in.
+encode-mf-zero-copy = ["encode-mf", "capture-windows"]
 # DXGI Desktop Duplication screen capture (§11, §18; ADR 0012). Same
 # convention as capture-x11/encode-mf above, so `cargo build --workspace`
 # needs no platform SDK and pulls in no extra bindings. The `windows` crate
