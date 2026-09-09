@@ -26,21 +26,25 @@ use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role}
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
-    DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_MAX_BYTES, FILE_TRANSFER_START_TIMEOUT_SECS,
-    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_DIR_ENTRIES_PER_RESPONSE,
-    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, PING_INTERVAL_SECS,
-    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES,
+    FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
+    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
+    MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
+    PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
+    STREAM_SIZE_MIN_PX,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
-    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE, FEATURE_FILE_MANAGE,
-    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
+    FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
+    FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
     FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED, FileFetchRefusal, InputDetail,
-    InputEventPayload, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
+    InputEventPayload, ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
     UnattendedRejection,
 };
-use lumepeer_core::remote_path::{is_safe_component, safe_browse_path};
+use lumepeer_core::remote_path::{
+    is_safe_component, relative_components, safe_browse_path, safe_relative_path,
+};
 use lumepeer_core::session::{SessionManager, SessionState};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
@@ -139,6 +143,16 @@ const FILE_BROWSE_MINOR: u16 = 12;
 /// guest's `FEATURE_FILE_MANAGE` string instead, and `HelloAck` carries no
 /// feature list for the guest to read the other way.
 const FILE_MANAGE_MINOR: u16 = 13;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::DirOffer` and
+/// `MessageKind::DirAccept`, and the first that accepts a `FileOffer` above
+/// `FILE_OFFER_LEGACY_MAX_BYTES` (ADR 0077).
+///
+/// Read in **both** directions, unlike the feature strings around it. A
+/// feature string exists because `HelloAck` carries no feature list for a
+/// guest to read; a minor is announced by both sides, and the size ceiling is
+/// a thing each side has to know about the other before it offers anything.
+const DIR_TRANSFER_MINOR: u16 = 14;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -704,6 +718,12 @@ pub enum ActorError {
     /// that this session cannot do it — never a transfer that starts and then
     /// cannot be acked, aborted or resumed.
     Unsupported,
+    /// There is not enough room where the file was going (§18; ADR 0077).
+    ///
+    /// Produced before the first byte rather than at ninety per cent, and
+    /// distinct from every other refusal because it is the one the person at
+    /// this end can actually do something about.
+    NoSpace,
 }
 
 /// One directory of a watched host, as it last answered (ADR 0075).
@@ -2229,6 +2249,37 @@ struct PendingFetch {
     into: std::path::PathBuf,
 }
 
+/// One directory this node has offered and not yet been answered about
+/// (§9.2; ADR 0077).
+struct PendingDirOffer {
+    /// The directory on this machine, never sent on the wire (§15).
+    root: std::path::PathBuf,
+    /// Its own basename, which is what the tree lands under on the far side.
+    name: String,
+    /// The manifest, in the order the files will be sent.
+    entries: Vec<ManifestEntry>,
+}
+
+/// One directory offer waiting for this user's answer (§9.2; ADR 0077).
+struct IncomingDirOffer {
+    name: String,
+    /// Where the sender says it goes, when it says: a file manager's upload
+    /// names the folder it is looking at, a plain offer names nothing.
+    dir: Option<String>,
+    entries: Vec<ManifestEntry>,
+}
+
+impl IncomingDirOffer {
+    /// Bytes the whole manifest adds up to, saturating rather than wrapping:
+    /// the total is a peer's arithmetic, and it is only ever compared against
+    /// free space.
+    fn total_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .fold(0u64, |total, entry| total.saturating_add(entry.size))
+    }
+}
+
 /// One offer this node accepted, waiting for the sender's
 /// `FileTransferStart` to name it (§9.2; ADR 0032).
 struct AcceptedOffer {
@@ -2280,6 +2331,18 @@ impl IncomingOffer {
             Self::Clipboard(entry) => entry.size,
         }
     }
+}
+
+/// One directory being moved as a whole: the transfers under it, and the one
+/// row the window shows for all of them (§9.2; ADR 0077).
+///
+/// Progress is the sum of its members and a cancel takes all of them, which
+/// is what "the directory" means to the person watching: a tree that is half
+/// there is not half a result.
+struct DirGroup {
+    name: String,
+    incoming: bool,
+    members: Vec<TransferId>,
 }
 
 /// One offer that arrived through the sender's file picker and is waiting
@@ -2341,7 +2404,23 @@ struct SendJob {
     id: TransferId,
     path: std::path::PathBuf,
     /// Resume point: the last offset the receiver acked (§10).
+    ///
+    /// Zero on a first attempt and the acked offset on a retry, which is what
+    /// makes a file connection dropping mid-transfer cost the bytes still in
+    /// flight rather than every byte already written (ADR 0077).
     from: u64,
+    /// How many times this file has already been picked up again after a
+    /// stream ended early, bounded by `FILE_RESUME_ATTEMPTS`.
+    attempts: u32,
+    /// The `FileTransferStart` to send immediately before this file's first
+    /// chunk, for a file whose start has not been sent yet (ADR 0077).
+    ///
+    /// A single offer announces its start when it is accepted, because there
+    /// is exactly one. A directory cannot: its files are started in turn, at
+    /// the rate `MAX_CONCURRENT_FILE_TRANSFERS` allows, and announcing all of
+    /// them at once would have the receiver refusing every start past the
+    /// third. `None` on a resume — that file was announced the first time.
+    announce: Option<(String, u64, [u8; 32])>,
 }
 
 /// How a transfer ended, as the UI shows it.
@@ -2379,6 +2458,10 @@ pub struct TransferRow {
     /// Whether this transfer started from the peer's clipboard rather than
     /// its file picker (docs/bugs/14-clipboard-files.md #3).
     pub from_clipboard: bool,
+    /// Whether this row is a whole directory rather than one file
+    /// (ADR 0077). `transfer_id` is then the group's id, which is what a
+    /// cancel names.
+    pub directory: bool,
 }
 
 /// One offer waiting for this user's answer, as the UI lists it.
@@ -2443,6 +2526,51 @@ enum FileEvent {
     /// hashed or named after all — moved or deleted since it was announced,
     /// say. Nothing starts.
     ClipboardPrepareFailed { peer: NodeId },
+    /// Every file of an accepted directory finished being hashed off the
+    /// actor loop, and the tree can start moving (§9.2; ADR 0077).
+    DirFilesReady {
+        peer: NodeId,
+        /// The group these files belong to, which is what a cancel names.
+        group: u64,
+        /// The files in manifest order, or the first one that could not be
+        /// read: a directory arrives whole or not at all.
+        files: PreparedDirFiles,
+    },
+    /// A directory tree finished being walked off the actor loop, and can now
+    /// be offered as a manifest (§9.2; ADR 0077).
+    DirWalked {
+        peer: NodeId,
+        /// The directory on this machine, never sent on the wire (§15).
+        root: std::path::PathBuf,
+        /// Its own basename.
+        name: String,
+        /// Where it goes on the far side, when this node names it.
+        dir: Option<String>,
+        /// The manifest, or why there is not one.
+        walked: Result<WalkedTree, NetError>,
+    },
+}
+
+/// The files of an accepted directory, hashed and ready to announce, or the
+/// first one that could not be read (§9.2; ADR 0077).
+///
+/// Each entry is the transfer id, the real local path (never sent on the
+/// wire, §15), and the name, size and BLAKE3 its own `FileTransferStart`
+/// carries.
+type PreparedDirFiles =
+    Result<Vec<(TransferId, std::path::PathBuf, String, u64, [u8; 32])>, NetError>;
+
+/// What a walk of one directory found (§9.2; ADR 0077).
+#[derive(Debug, Default)]
+pub struct WalkedTree {
+    /// Files and empty directories, in the order they will be sent.
+    pub entries: Vec<ManifestEntry>,
+    /// How many symbolic links were skipped, for the report the sender
+    /// makes: a link is neither followed (its target is a file this side did
+    /// not offer) nor recreated (a link is a claim about the *receiver's*
+    /// filesystem), so it is left out and counted rather than silently
+    /// dropped.
+    pub skipped_links: usize,
 }
 
 /// The actor's end of one live control connection.
@@ -2471,6 +2599,13 @@ struct ConnectionHandle {
     /// (§9.1; ADR 0033). Always false on the guest side, which never sends
     /// either.
     speaks_unattended: bool,
+    /// `PROTOCOL_MINOR` the far side announced, in whichever of `Hello` and
+    /// `HelloAck` it sent (ADR 0077).
+    ///
+    /// Both sides announce one, which is what makes it usable where a feature
+    /// string is not: the size ceiling of ADR 0077 has to be known about a
+    /// peer *before* an offer is made to it, in both directions.
+    peer_minor: u16,
 }
 
 /// Whether this build may send `ReceiverReport` towards a peer, from the only
@@ -2872,6 +3007,9 @@ enum ActorEvent {
         /// (ADR 0076), so this host may refuse a `FileFetchRequest` from it
         /// out loud rather than in silence.
         speaks_file_manage: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_DIR_TRANSFER`
+        /// (ADR 0077), so a whole directory may be offered to it.
+        speaks_dir_transfer: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3000,6 +3138,9 @@ enum Accepted {
         /// (ADR 0076), so this host may refuse a `FileFetchRequest` from it
         /// out loud rather than in silence.
         speaks_file_manage: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_DIR_TRANSFER`
+        /// (ADR 0077), so a whole directory may be offered to it.
+        speaks_dir_transfer: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3128,6 +3269,14 @@ struct Actor {
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
+    /// Peers whose `Hello` advertised `FEATURE_DIR_TRANSFER`, and which may
+    /// therefore be sent a `DirOffer` (ADR 0077).
+    ///
+    /// Both directions, unlike the host-only sets around it: either end of a
+    /// session may offer a directory, so either end has to know whether the
+    /// other can be sent one. On the guest side it is filled from the host's
+    /// `HelloAck` minor, which is all a guest has to read.
+    speaks_dir_transfer: std::collections::HashSet<NodeId>,
     /// Host side: peers whose `Hello` advertised `FEATURE_FILE_MANAGE`, and
     /// which may therefore be answered with a `FileFetchRefused` (ADR 0076).
     speaks_file_manage: std::collections::HashSet<NodeId>,
@@ -3144,6 +3293,21 @@ struct Actor {
     /// where the accepted one goes without asking the user a second time for
     /// a directory they already navigated to (ADR 0076).
     fetches_out: std::collections::HashMap<NodeId, VecDeque<PendingFetch>>,
+    /// Every outgoing file this node has started and not finished, kept so a
+    /// stream that ends early can be picked up again from the acked offset
+    /// (§10; ADR 0077).
+    ///
+    /// The `SendJob` itself is moved into the send task, and the task is
+    /// gone by the time its failure is reported; this is the copy that says
+    /// which file it was and how many times it has already been retried.
+    file_resumable: std::collections::HashMap<(NodeId, TransferId), SendJob>,
+    /// Directories this node has offered, keyed by peer, waiting for a
+    /// `DirAccept` (§9.2; ADR 0077).
+    dir_offers_out: std::collections::HashMap<NodeId, PendingDirOffer>,
+    /// Directory offers waiting for this user's answer, keyed by peer.
+    dir_offers_in: std::collections::HashMap<NodeId, IncomingDirOffer>,
+    /// Directories in flight, keyed by the group id the window cancels by.
+    dir_groups: std::collections::HashMap<(NodeId, u64), DirGroup>,
     /// Host side: how many fetches from each peer are being hashed right now.
     ///
     /// Counted separately from `file_offers_out` because a hash pass is where
@@ -3986,6 +4150,27 @@ impl Actor {
             self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
             return;
         }
+        // A guest may name a directory as easily as a file, and the answer to
+        // "send me that" is then the manifest of ADR 0077 rather than one
+        // offer. The guest's own request is still the acceptance, and the
+        // tree lands where that request named.
+        if std::path::Path::new(path).is_dir() {
+            if !self.may_offer_directory(&peer) {
+                tracing::debug!(peer = %tag, "a directory fetch from a peer that cannot take one");
+                self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
+                return;
+            }
+            let Some(name) = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(safe_file_name)
+            else {
+                self.refuse_fetch(peer, FileFetchRefusal::BadPath);
+                return;
+            };
+            self.spawn_dir_walk(peer, std::path::PathBuf::from(path), name, None);
+            return;
+        }
         let outstanding = self.file_offers_out.get(&peer).map_or(0, VecDeque::len)
             + self.fetch_preparing.get(&peer).copied().unwrap_or(0);
         if outstanding >= MAX_PENDING_FILE_OFFERS {
@@ -4058,6 +4243,11 @@ impl Actor {
                 return;
             }
         };
+        if size > self.offer_ceiling_for(&peer) {
+            tracing::warn!(peer = %tag, "a fetched file is larger than that peer accepts; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
+            return;
+        }
         self.file_offers_out
             .entry(peer)
             .or_default()
@@ -4124,6 +4314,12 @@ impl Actor {
             self.send_to(&peer, MessageKind::FileAccept(false));
             return;
         }
+        if !Self::has_room(directory, size) {
+            tracing::warn!(peer = %tag, "a put with no room where it was going; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            self.audit_file(&peer, "put-declined-no-space");
+            return;
+        }
         let accepted = self.file_accepted.entry(peer).or_default();
         if accepted.len() >= MAX_PENDING_FILE_OFFERS {
             tracing::warn!(peer = %tag, "declining a put past the pending limit");
@@ -4188,6 +4384,10 @@ impl Actor {
             tracing::warn!(peer = %tag, "a local file could not be offered for upload");
             return;
         };
+        if size > self.offer_ceiling_for(&peer) {
+            tracing::warn!(peer = %tag, "an upload is larger than that host accepts; not offered");
+            return;
+        }
         self.file_offers_out
             .entry(peer)
             .or_default()
@@ -4208,6 +4408,444 @@ impl Actor {
         );
         self.audit_file(&peer, "put-offered");
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    // ---------------------------------------------------------------------
+    // Directories (§9.2; ADR 0077)
+    // ---------------------------------------------------------------------
+
+    /// Whether a directory may be offered to `peer` at all.
+    ///
+    /// Both halves, and both are about the peer rather than about this node:
+    /// it has to understand the message, and it has to have said so.
+    fn may_offer_directory(&self, peer: &NodeId) -> bool {
+        self.speaks_dir_transfer.contains(peer)
+            && self
+                .connections
+                .get(peer)
+                .is_some_and(|c| c.peer_minor >= DIR_TRANSFER_MINOR)
+    }
+
+    /// Walks `root` off the actor loop and offers what it finds (ADR 0077).
+    ///
+    /// A walk of somebody's home directory is a real amount of `stat`, so it
+    /// runs on its own task and lands back as [`FileEvent::DirWalked`], the
+    /// same shape a clipboard offer and a fetch both use (ADR 0027).
+    fn spawn_dir_walk(
+        &self,
+        peer: NodeId,
+        root: std::path::PathBuf,
+        name: String,
+        dir: Option<String>,
+    ) {
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let walked = walk_directory(&root).await;
+            let _ = events
+                .send(ActorEvent::File(FileEvent::DirWalked {
+                    peer,
+                    root,
+                    name,
+                    dir,
+                    walked,
+                }))
+                .await;
+        });
+    }
+
+    /// A directory finished being walked and can now be offered (ADR 0077).
+    fn on_dir_walked(
+        &mut self,
+        peer: NodeId,
+        root: std::path::PathBuf,
+        name: String,
+        dir: Option<String>,
+        walked: Result<WalkedTree, NetError>,
+    ) {
+        let tag = self.label_of(&peer);
+        // Re-checked rather than assumed: a walk takes long enough for a
+        // grant to be withdrawn in the middle of it (§2.3).
+        if !self.may_transfer_files(&peer) || !self.may_offer_directory(&peer) {
+            tracing::warn!(peer = %tag, "dropping a walked directory");
+            return;
+        }
+        let Ok(walked) = walked else {
+            // The path is this machine's own and stays out of the log (§15).
+            tracing::warn!(peer = %tag, "a directory could not be walked and was not offered");
+            return;
+        };
+        if walked.skipped_links > 0 {
+            tracing::info!(
+                peer = %tag,
+                skipped = walked.skipped_links,
+                "symbolic links were left out of a directory offer"
+            );
+        }
+        let ceiling = self.offer_ceiling_for(&peer);
+        if walked.entries.iter().any(|entry| entry.size > ceiling) {
+            tracing::warn!(peer = %tag, "a file in that directory is larger than the peer accepts");
+            return;
+        }
+        self.dir_offers_out.insert(
+            peer,
+            PendingDirOffer {
+                root,
+                name: name.clone(),
+                entries: walked.entries.clone(),
+            },
+        );
+        self.send_to(
+            &peer,
+            MessageKind::DirOffer {
+                name,
+                dir,
+                entries: walked.entries,
+            },
+        );
+        self.audit_file(&peer, "directory-offered");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `DirOffer`: a peer wants to send this node a whole directory
+    /// (§9.2; ADR 0077).
+    ///
+    /// Three shapes arrive here and they are told apart by what the sender
+    /// named. A manifest with a `dir` is a file manager's upload, authorized
+    /// exactly as `FilePutOffer` is — `file_browse` and `file_transfer`, both
+    /// re-read now — and accepted without a second question for the reason
+    /// ADR 0076 gives. A manifest with no `dir` that answers a download this
+    /// node asked for lands where that request named. Anything else is an
+    /// offer, and an offer waits for a person.
+    fn on_dir_offer_inbound(
+        &mut self,
+        peer: NodeId,
+        name: &str,
+        dir: Option<&str>,
+        entries: Vec<ManifestEntry>,
+    ) {
+        let tag = self.label_of(&peer);
+        if !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %tag, "a directory offer without a grant; declined");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            return;
+        }
+        // The name and every entry are the sender's strings. Refused rather
+        // than repaired: this is where "zip slip" would be, and a rewritten
+        // path is a file written where neither side said (§18; ADR 0077).
+        let Some(name) = safe_file_name(name) else {
+            tracing::warn!(peer = %tag, "a directory offer whose name is not a plain basename");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            return;
+        };
+        if entries.len() > MAX_DIR_MANIFEST_ENTRIES
+            || entries
+                .iter()
+                .any(|entry| relative_components(&entry.path).is_none())
+        {
+            tracing::warn!(peer = %tag, "a directory manifest with a path that climbs out of it");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            return;
+        }
+        let offer = IncomingDirOffer {
+            name,
+            dir: dir.map(str::to_owned),
+            entries,
+        };
+
+        // An upload into a directory this peer named: same authorization as
+        // a put of a single file, same absence of a dialog (ADR 0076).
+        if let Some(destination) = offer.dir.clone() {
+            if !self.may_fetch_or_put(&peer) {
+                tracing::warn!(peer = %tag, "a directory put without browse and transfer; declined");
+                self.send_to(&peer, MessageKind::DirAccept(false));
+                return;
+            }
+            let Some(destination) = safe_browse_path(&destination).map(std::path::PathBuf::from)
+            else {
+                tracing::warn!(peer = %tag, "a directory put whose destination is not a path");
+                self.send_to(&peer, MessageKind::DirAccept(false));
+                return;
+            };
+            self.accept_dir_offer(peer, &offer, &destination);
+            return;
+        }
+
+        // A directory this node asked for: the request was the acceptance,
+        // exactly as it is for a single fetched file (ADR 0076).
+        let fetched = self
+            .fetches_out
+            .get(&peer)
+            .and_then(VecDeque::front)
+            .is_some_and(|fetch| fetch.name == offer.name);
+        if fetched
+            && let Some(fetch) = self
+                .fetches_out
+                .get_mut(&peer)
+                .and_then(VecDeque::pop_front)
+        {
+            let into = fetch.into.clone();
+            self.accept_dir_offer(peer, &offer, &into);
+            return;
+        }
+
+        // Everything else is a decision for a person, and one directory at a
+        // time: a second offer while one is unanswered is refused rather than
+        // queued, because the answer to "which directory is this" would then
+        // be "the older one", which nothing on screen says.
+        if self.dir_offers_in.contains_key(&peer) {
+            tracing::warn!(peer = %tag, "declining a directory offer while one is unanswered");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            return;
+        }
+        self.dir_offers_in.insert(peer, offer);
+        self.audit_file(&peer, "directory-offer-received");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Takes a whole directory, or refuses it for want of room (§18;
+    /// ADR 0077).
+    ///
+    /// Empty directories are created here, before a byte moves, because they
+    /// are the part of the tree no file implies: a directory that arrives
+    /// missing its empty folders is not the directory that was sent. Every
+    /// file becomes an ordinary accepted offer, in manifest order, which is
+    /// the order the sender sends them in.
+    fn accept_dir_offer(
+        &mut self,
+        peer: NodeId,
+        offer: &IncomingDirOffer,
+        destination: &std::path::Path,
+    ) {
+        let tag = self.label_of(&peer);
+        let root = unique_destination(destination, &offer.name);
+        if !Self::has_room(destination, offer.total_bytes()) {
+            tracing::warn!(peer = %tag, "a directory with no room where it was going; declined");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            self.audit_file(&peer, "directory-declined-no-space");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(&root) {
+            tracing::warn!(peer = %tag, %error, "a directory could not be created; declined");
+            self.send_to(&peer, MessageKind::DirAccept(false));
+            return;
+        }
+
+        let group_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        let mut members = Vec::new();
+        for entry in &offer.entries {
+            let Some(path) = manifest_destination(&root, entry) else {
+                continue;
+            };
+            if entry.is_dir {
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    tracing::warn!(peer = %tag, %error, "an empty directory could not be created");
+                }
+                continue;
+            }
+            if let Some(parent) = path.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                tracing::warn!(peer = %tag, %error, "a subdirectory could not be created");
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let id = self.next_transfer_id;
+            self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+            self.file_accepted
+                .entry(peer)
+                .or_default()
+                .push_back(AcceptedOffer {
+                    name,
+                    size: entry.size,
+                    // A manifest carries sizes and no hashes: hashing a whole
+                    // tree before offering it would read every byte of it
+                    // twice. Each file's own `FileTransferStart` still names
+                    // the hash the receiver verifies before it exports.
+                    hash: None,
+                    destination: path,
+                    from_clipboard: false,
+                });
+            members.push(id);
+        }
+        self.dir_groups.insert(
+            (peer, group_id),
+            DirGroup {
+                name: offer.name.clone(),
+                incoming: true,
+                members: members.clone(),
+            },
+        );
+        self.send_to(&peer, MessageKind::DirAccept(true));
+        self.audit_file(&peer, "directory-accepted");
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Inbound `DirAccept`: the far side answered the directory this node
+    /// offered (§9.2; ADR 0077).
+    fn on_dir_accept_inbound(&mut self, peer: NodeId, accepted: bool) {
+        let Some(offer) = self.dir_offers_out.remove(&peer) else {
+            tracing::warn!(peer = %self.label_of(&peer), "a directory answer with no offer outstanding");
+            return;
+        };
+        if !accepted {
+            self.audit_file(&peer, "directory-offer-refused");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return;
+        }
+        if !self.may_transfer_files(&peer) {
+            return;
+        }
+        let tag = self.label_of(&peer);
+        let group_id = self.next_transfer_id;
+        self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+        let mut members = Vec::new();
+        let mut files = Vec::new();
+        for entry in &offer.entries {
+            if entry.is_dir {
+                continue;
+            }
+            let Some(path) = manifest_destination(&offer.root, entry) else {
+                continue;
+            };
+            let Some(name) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(safe_file_name)
+            else {
+                continue;
+            };
+            let id = self.next_transfer_id;
+            self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
+            self.file_transfers.insert(
+                (peer, id),
+                TransferRow {
+                    peer_label: tag.clone(),
+                    transfer_id: id,
+                    name,
+                    size: entry.size,
+                    moved: 0,
+                    incoming: false,
+                    state: TransferState::Running,
+                    from_clipboard: false,
+                    directory: false,
+                },
+            );
+            members.push(id);
+            files.push((id, path));
+        }
+        self.dir_groups.insert(
+            (peer, group_id),
+            DirGroup {
+                name: offer.name,
+                incoming: false,
+                members,
+            },
+        );
+        // Hashed here rather than during the walk: a manifest carries sizes
+        // so that offering a directory does not read every byte of it, and
+        // the hash each file's own `FileTransferStart` carries is what the
+        // receiver verifies before it exports (ADR 0077). One task for the
+        // tree, in manifest order, because that is the order the receiver
+        // accepted them in.
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let mut prepared = Vec::new();
+            for (id, path) in files {
+                match prepare_offer(&path).await {
+                    Ok((name, size, hash)) => prepared.push((id, path, name, size, hash)),
+                    Err(error) => {
+                        let _ = events
+                            .send(ActorEvent::File(FileEvent::DirFilesReady {
+                                peer,
+                                group: group_id,
+                                files: Err(error),
+                            }))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            let _ = events
+                .send(ActorEvent::File(FileEvent::DirFilesReady {
+                    peer,
+                    group: group_id,
+                    files: Ok(prepared),
+                }))
+                .await;
+        });
+        self.audit_file(&peer, "directory-started");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Every file of an accepted directory finished being hashed, and the
+    /// tree can start moving (ADR 0077).
+    ///
+    /// Whole or nothing, in both directions: one file that cannot be read is
+    /// a directory that will not arrive as the directory that was offered, so
+    /// the group is cancelled rather than delivered short.
+    fn on_dir_files_ready(&mut self, peer: NodeId, group: u64, files: PreparedDirFiles) {
+        let tag = self.label_of(&peer);
+        if !self.may_transfer_files(&peer) {
+            tracing::warn!(peer = %tag, "dropping a hashed directory");
+            return;
+        }
+        let files = match files {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "a file of an offered directory could not be read");
+                if let Some(members) = self.group_members(peer, group) {
+                    for id in members {
+                        self.cancel_transfer(peer, id);
+                    }
+                }
+                let _ = self.notify.send(ActorNotification::FileTransferChanged);
+                return;
+            }
+        };
+        for (id, path, name, size, hash) in files {
+            // The size the manifest announced is what the receiver accepted;
+            // a file that changed on disk since the walk would start a
+            // transfer the receiver refuses, so it ends the tree here instead.
+            if self
+                .file_transfers
+                .get(&(peer, id))
+                .is_none_or(|row| row.size != size)
+            {
+                tracing::warn!(peer = %tag, "a file changed size between the offer and the send");
+                if let Some(members) = self.group_members(peer, group) {
+                    for id in members {
+                        self.cancel_transfer(peer, id);
+                    }
+                }
+                return;
+            }
+            self.file_pending_sends
+                .entry(peer)
+                .or_default()
+                .push(SendJob {
+                    id,
+                    path,
+                    from: 0,
+                    attempts: 0,
+                    announce: Some((name, size, hash)),
+                });
+        }
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// The group `transfer_id` names, if it names one (ADR 0077).
+    fn group_members(&self, peer: NodeId, transfer_id: u64) -> Option<Vec<TransferId>> {
+        self.dir_groups
+            .get(&(peer, transfer_id))
+            .map(|group| group.members.clone())
     }
 
     /// Host side: switches this host's own physical monitor to `mode_id`
@@ -4453,6 +5091,7 @@ impl Actor {
                     speaks_stream_size,
                     speaks_file_browse,
                     speaks_file_manage,
+                    speaks_dir_transfer,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -4469,6 +5108,7 @@ impl Actor {
                     speaks_stream_size,
                     speaks_file_browse,
                     speaks_file_manage,
+                    speaks_dir_transfer,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -4505,6 +5145,7 @@ impl Actor {
         let id = self.next_connection_id;
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
         let quic = connection.connection().clone();
+        let peer_minor = connection.peer_minor();
         let (mut reader, mut writer) = connection.split();
         let tag = self.label_of(&peer);
 
@@ -4564,6 +5205,7 @@ impl Actor {
                 announces_media_faults,
                 speaks_remote_sas,
                 speaks_unattended,
+                peer_minor,
             },
         );
     }
@@ -4582,6 +5224,10 @@ impl Actor {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per event kind reads best; splitting arms into                   helper fns would scatter the actor's own protocol"
+    )]
     fn handle_event(&mut self, event: ActorEvent) {
         match event {
             ActorEvent::Handshaked {
@@ -4598,6 +5244,7 @@ impl Actor {
                 speaks_stream_size,
                 speaks_file_browse,
                 speaks_file_manage,
+                speaks_dir_transfer,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -4634,6 +5281,12 @@ impl Actor {
                     self.speaks_file_manage.insert(peer);
                 } else {
                     self.speaks_file_manage.remove(&peer);
+                }
+                // Same shape again, for a whole directory (ADR 0077).
+                if speaks_dir_transfer {
+                    self.speaks_dir_transfer.insert(peer);
+                } else {
+                    self.speaks_dir_transfer.remove(&peer);
                 }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
@@ -5697,6 +6350,18 @@ impl Actor {
                 let (dir, name) = (dir.clone(), name.clone());
                 self.on_file_put_offer(peer, &dir, &name, size, hash);
             }
+            // Either side: a whole directory, as the list of files in it
+            // (ADR 0077).
+            MessageKind::DirOffer {
+                ref name,
+                ref dir,
+                ref entries,
+            } => {
+                let (name, dir, entries) = (name.clone(), dir.clone(), entries.clone());
+                self.on_dir_offer_inbound(peer, &name, dir.as_deref(), entries);
+            }
+            // Either side: the answer to a directory this node offered.
+            MessageKind::DirAccept(accepted) => self.on_dir_accept_inbound(peer, accepted),
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -5956,6 +6621,7 @@ impl Actor {
         self.file_browse_to_host.remove(&peer);
         self.speaks_file_manage.remove(&peer);
         self.file_manage_to_host.remove(&peer);
+        self.speaks_dir_transfer.remove(&peer);
         self.fetches_out.remove(&peer);
         self.fetch_preparing.remove(&peer);
         // Link measurements belong to the connection that produced them: a
@@ -6833,6 +7499,22 @@ impl Actor {
         }
         let dir = remote_dir.to_owned();
         let path = std::path::PathBuf::from(local_path);
+        // A directory is a manifest, not an archive and not a file (ADR
+        // 0077). Told apart here rather than in the window, because whether
+        // a path is a directory is a fact about this machine's disk and the
+        // window has no way to ask.
+        if path.is_dir() {
+            if !self.may_offer_directory(&peer) {
+                return Err(ActorError::Unsupported);
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(safe_file_name)
+                .ok_or(ActorError::Core(CoreError::Malformed))?;
+            self.spawn_dir_walk(peer, path, name, Some(dir));
+            return Ok(());
+        }
         let events = self.events_tx.clone();
         tokio::spawn(async move {
             let prepared = prepare_offer(&path).await;
@@ -7208,6 +7890,37 @@ impl Actor {
     // File transfer (§9.2, §4; ADR 0032)
     // ---------------------------------------------------------------------
 
+    /// Whether a receive of `bytes` into `directory` can be accepted at all
+    /// (§18; ADR 0077).
+    ///
+    /// Asked before the answer to the offer goes out, which is the whole
+    /// point: a receiver that discovers there is no room at ninety per cent
+    /// has spent the sender's time and its own and has a staging file to
+    /// throw away. A volume that will not answer is treated as room — see
+    /// `disk::has_room_for`.
+    fn has_room(directory: &std::path::Path, bytes: u64) -> bool {
+        crate::disk::has_room_for(directory, bytes)
+    }
+
+    /// The largest single file this peer will accept an offer of (ADR 0077).
+    ///
+    /// A peer below `DIR_TRANSFER_MINOR` decodes anything above the old
+    /// ceiling as malformed and closes the connection, so an offer that large
+    /// is never made to one — the same "ask what the far side speaks first"
+    /// rule the feature strings apply, read off the minor because the ceiling
+    /// has to be known in both directions.
+    fn offer_ceiling_for(&self, peer: &NodeId) -> u64 {
+        if self
+            .connections
+            .get(peer)
+            .is_some_and(|c| c.peer_minor >= DIR_TRANSFER_MINOR)
+        {
+            FILE_OFFER_MAX_BYTES
+        } else {
+            FILE_OFFER_LEGACY_MAX_BYTES
+        }
+    }
+
     /// Whether this node may exchange files with `peer` right now.
     ///
     /// The same asymmetry as the clipboard, and for the same reason (§2.3;
@@ -7316,6 +8029,22 @@ impl Actor {
         directory: Option<String>,
     ) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
+        // A directory offer is answered before the file offers behind it: it
+        // is one decision about many files, and the panel shows it as one
+        // row (ADR 0077).
+        if let Some(offer) = self.dir_offers_in.remove(&peer) {
+            if !accept {
+                self.send_to(&peer, MessageKind::DirAccept(false));
+                self.audit_file(&peer, "directory-offer-declined");
+                let _ = self.notify.send(ActorNotification::FileTransferChanged);
+                return Ok(());
+            }
+            let into = directory
+                .map(std::path::PathBuf::from)
+                .ok_or(ActorError::Core(CoreError::Malformed))?;
+            self.accept_dir_offer(peer, &offer, &into);
+            return Ok(());
+        }
         let offer = self
             .file_offers_in
             .get_mut(&peer)
@@ -7352,6 +8081,14 @@ impl Actor {
         let directory = directory
             .map(std::path::PathBuf::from)
             .ok_or(ActorError::Core(CoreError::Malformed))?;
+        if !Self::has_room(&directory, offer.size) {
+            // Declined out loud on both sides: the sender hears "no", and the
+            // caller hears why, before a byte moves (§18; ADR 0077).
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            self.audit_file(&peer, "offer-declined-no-space");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return Err(ActorError::NoSpace);
+        }
         let destination = unique_destination(&directory, &offer.name);
         self.file_accepted
             .entry(peer)
@@ -7404,6 +8141,12 @@ impl Actor {
         let directory = base.join(&tag);
         std::fs::create_dir_all(&directory)
             .map_err(|error| ActorError::Net(NetError::Io(error.to_string())))?;
+        if !Self::has_room(&directory, entry.size) {
+            self.send_to(&peer, MessageKind::ClipboardFileAccept(false));
+            self.audit_file(&peer, "clipboard-offer-declined-no-space");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return Err(ActorError::NoSpace);
+        }
         let destination = unique_destination(&directory, &entry.name);
         self.file_accepted
             .entry(peer)
@@ -7425,6 +8168,19 @@ impl Actor {
     /// Either side: stop one running transfer (§9.2).
     fn on_file_abort(&mut self, label: &str, transfer_id: TransferId) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
+        // A directory is cancelled as a whole, because it arrived as a whole:
+        // stopping one file of a tree leaves a result nobody asked for
+        // (ADR 0077).
+        if let Some(members) = self.group_members(peer, transfer_id) {
+            for id in members {
+                self.send_to(&peer, MessageKind::FileAbort { transfer_id: id });
+                self.cancel_transfer(peer, id);
+            }
+            self.file_pending_sends.remove(&peer);
+            self.audit_file(&peer, "directory-cancelled");
+            let _ = self.notify.send(ActorNotification::FileTransferChanged);
+            return Ok(());
+        }
         if !self.file_transfers.contains_key(&(peer, transfer_id)) {
             return Err(ActorError::UnknownPeer);
         }
@@ -7439,6 +8195,7 @@ impl Actor {
         if let Some(task) = self.file_send_tasks.remove(&(peer, transfer_id)) {
             task.abort();
         }
+        self.file_resumable.remove(&(peer, transfer_id));
         if let Some(row) = self.file_transfers.get_mut(&(peer, transfer_id))
             && row.state == TransferState::Running
         {
@@ -7472,9 +8229,88 @@ impl Actor {
                 });
             }
         }
-        let mut transfers: Vec<TransferRow> = self.file_transfers.values().cloned().collect();
-        transfers.sort_by_key(|row| row.transfer_id);
-        FileTransfersDto { offers, transfers }
+        // A directory offer is one decision, so it is one row in the list
+        // that decisions are made from — its size is the manifest's total,
+        // and answering it answers every file in it (ADR 0077).
+        for (peer, offer) in &self.dir_offers_in {
+            offers.push(OfferRow {
+                peer_label: self.label_of(peer),
+                name: offer.name.clone(),
+                size: offer.total_bytes(),
+                from_clipboard: false,
+            });
+        }
+        FileTransfersDto {
+            offers,
+            transfers: self.transfer_rows(),
+        }
+    }
+
+    /// Every transfer as the window lists it, with the files of a directory
+    /// collapsed into the one row that directory is (ADR 0077).
+    ///
+    /// The members stay in `file_transfers` because that is what the engine
+    /// acks, aborts and resumes by; what the window sees is the tree, whose
+    /// progress is the sum of its files and whose cancel takes all of them.
+    fn transfer_rows(&self) -> Vec<TransferRow> {
+        let mut grouped: std::collections::HashSet<(NodeId, TransferId)> =
+            std::collections::HashSet::new();
+        let mut rows: Vec<TransferRow> = Vec::new();
+        for ((peer, group_id), group) in &self.dir_groups {
+            let members: Vec<&TransferRow> = group
+                .members
+                .iter()
+                .filter_map(|id| self.file_transfers.get(&(*peer, *id)))
+                .collect();
+            for id in &group.members {
+                grouped.insert((*peer, *id));
+            }
+            if members.is_empty() {
+                continue;
+            }
+            let size = members
+                .iter()
+                .fold(0u64, |total, row| total.saturating_add(row.size));
+            let moved = members
+                .iter()
+                .fold(0u64, |total, row| total.saturating_add(row.moved));
+            // The worst state any file in the tree is in, because that is
+            // what the tree is in: one failed file is a directory that did
+            // not arrive.
+            let state = if members.iter().any(|row| row.state == TransferState::Failed) {
+                TransferState::Failed
+            } else if members
+                .iter()
+                .any(|row| row.state == TransferState::Cancelled)
+            {
+                TransferState::Cancelled
+            } else if members
+                .iter()
+                .any(|row| row.state == TransferState::Running)
+            {
+                TransferState::Running
+            } else {
+                TransferState::Completed
+            };
+            rows.push(TransferRow {
+                peer_label: self.label_of(peer),
+                transfer_id: *group_id,
+                name: group.name.clone(),
+                size,
+                moved,
+                incoming: group.incoming,
+                state,
+                from_clipboard: false,
+                directory: true,
+            });
+        }
+        for (key, row) in &self.file_transfers {
+            if !grouped.contains(key) {
+                rows.push(row.clone());
+            }
+        }
+        rows.sort_by_key(|row| row.transfer_id);
+        rows
     }
 
     /// The peer's `rd/file/1` connection, if there is still one that is up.
@@ -7533,12 +8369,61 @@ impl Actor {
         });
     }
 
-    /// Starts every send that was waiting for the connection.
+    /// Starts sends that were waiting for the connection, up to the limit
+    /// the *receiver* enforces (§9.2; ADR 0077).
+    ///
+    /// `MAX_CONCURRENT_FILE_TRANSFERS` is what `ReceiveTracker::begin_with`
+    /// refuses past, so starting more than that at once is starting transfers
+    /// that will be refused on arrival. It never showed with a clipboard copy
+    /// of two or three files; a directory manifest is where it would have,
+    /// and parallelism there does not make a directory arrive sooner anyway —
+    /// it makes every file in it arrive later.
     fn start_pending_sends(&mut self, peer: NodeId) {
         let Some(connection) = self.live_file_connection(peer) else {
             return;
         };
-        for job in self.file_pending_sends.remove(&peer).unwrap_or_default() {
+        loop {
+            let running = self
+                .file_send_tasks
+                .keys()
+                .filter(|(p, _)| *p == peer)
+                .count();
+            if running >= MAX_CONCURRENT_FILE_TRANSFERS {
+                return;
+            }
+            let Some(queue) = self.file_pending_sends.get_mut(&peer) else {
+                return;
+            };
+            if queue.is_empty() {
+                self.file_pending_sends.remove(&peer);
+                return;
+            }
+            let job = queue.remove(0);
+            // A file of a directory names itself here rather than at accept
+            // time: the receiver refuses a fourth concurrent start, so the
+            // announcement has to follow the same throttle the sends do
+            // (ADR 0077).
+            if let Some((name, size, hash)) = job.announce.clone() {
+                self.send_to(
+                    &peer,
+                    MessageKind::FileTransferStart {
+                        transfer_id: job.id,
+                        name,
+                        size,
+                        hash,
+                    },
+                );
+            }
+            self.file_resumable.insert(
+                (peer, job.id),
+                SendJob {
+                    id: job.id,
+                    path: job.path.clone(),
+                    from: job.from,
+                    attempts: job.attempts,
+                    announce: None,
+                },
+            );
             self.spawn_send(peer, connection.clone(), job);
         }
     }
@@ -7641,6 +8526,16 @@ impl Actor {
                 size,
                 hash,
             } => self.on_clipboard_transfer_ready(peer, path, name, size, hash),
+            FileEvent::DirFilesReady { peer, group, files } => {
+                self.on_dir_files_ready(peer, group, files);
+            }
+            FileEvent::DirWalked {
+                peer,
+                root,
+                name,
+                dir,
+                walked,
+            } => self.on_dir_walked(peer, root, name, dir, walked),
             FileEvent::ClipboardPrepareFailed { peer } => {
                 tracing::warn!(
                     peer = %self.label_of(&peer),
@@ -7703,6 +8598,13 @@ impl Actor {
 
     /// A transfer ended on this side.
     fn on_file_finished(&mut self, peer: NodeId, id: TransferId, state: TransferState) {
+        // An outgoing send whose stream died is not over: the receiver's
+        // staging file and its acked offset both survived, so §10's resume
+        // point is right there to pick up from (ADR 0077). Tried before the
+        // row is marked failed, because nothing failed if it starts again.
+        if state == TransferState::Failed && self.resume_send(peer, id) {
+            return;
+        }
         let Some(row) = self.file_transfers.get_mut(&(peer, id)) else {
             return;
         };
@@ -7713,6 +8615,8 @@ impl Actor {
             row.moved = size;
         }
         self.file_send_tasks.remove(&(peer, id));
+        // Nothing left to pick up again: this one ended for good.
+        self.file_resumable.remove(&(peer, id));
         // A verified, on-disk clipboard receive is put back on this
         // machine's own clipboard, so the paste it exists to serve actually
         // works (docs/bugs/14-clipboard-files.md #3).
@@ -7749,7 +8653,76 @@ impl Actor {
                 TransferState::Running => "transfer-running",
             },
         );
+        // A finished send frees one of the slots `start_pending_sends`
+        // counts, so whatever is queued behind it goes now.
+        self.start_pending_sends(peer);
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Picks an outgoing file up again from the offset the receiver acked,
+    /// or says it will not (§10; ADR 0077).
+    ///
+    /// The case this is for is a file connection that dropped while the
+    /// control connection it was authorized on stayed up: a NAT rebinding, a
+    /// link that flapped, a peer that closed `rd/file/1` and nothing else.
+    /// Everything the resume needs is already true — the receiver keeps its
+    /// staging file keyed by `TransferId`, refuses any chunk that is not at
+    /// its own resume point, and has been acking that point all along — so
+    /// what was missing was only that nothing ever asked for it. The far side
+    /// having gone entirely is a different thing, and `drop_file_state` still
+    /// ends every transfer with the session that paid for it.
+    ///
+    /// Returns whether the transfer was re-queued.
+    fn resume_send(&mut self, peer: NodeId, id: TransferId) -> bool {
+        let Some(job) = self.file_resumable.get(&(peer, id)) else {
+            return false;
+        };
+        if job.attempts >= FILE_RESUME_ATTEMPTS {
+            return false;
+        }
+        // The grant that paid for the transfer has to still be live, read now
+        // rather than assumed from when it started (§2.3).
+        if !self.may_transfer_files(&peer) || !self.connections.contains_key(&peer) {
+            return false;
+        }
+        let Some(row) = self.file_transfers.get(&(peer, id)) else {
+            return false;
+        };
+        if row.incoming || row.state != TransferState::Running {
+            return false;
+        }
+        let from = row.moved;
+        let path = job.path.clone();
+        let attempts = job.attempts + 1;
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            attempt = attempts,
+            "picking a file up again from the acked offset"
+        );
+        self.file_send_tasks.remove(&(peer, id));
+        self.file_resumable.insert(
+            (peer, id),
+            SendJob {
+                id,
+                path: path.clone(),
+                from,
+                attempts,
+                announce: None,
+            },
+        );
+        self.file_pending_sends
+            .entry(peer)
+            .or_default()
+            .push(SendJob {
+                id,
+                path,
+                from,
+                attempts,
+                announce: None,
+            });
+        self.audit_file(&peer, "transfer-resumed");
+        self.ensure_file_connection(peer);
+        true
     }
 
     /// Inbound `FileOffer`: someone wants to send this node a file (§9.2).
@@ -7853,6 +8826,7 @@ impl Actor {
                 incoming: false,
                 state: TransferState::Running,
                 from_clipboard: false,
+                directory: false,
             },
         );
         self.file_pending_sends
@@ -7862,6 +8836,8 @@ impl Actor {
                 id,
                 path: offer.path,
                 from: 0,
+                attempts: 0,
+                announce: None,
             });
         self.ensure_file_connection(peer);
         self.audit_file(&peer, "transfer-started");
@@ -7919,6 +8895,7 @@ impl Actor {
                 incoming: true,
                 state: TransferState::Running,
                 from_clipboard: accepted.from_clipboard,
+                directory: false,
             },
         );
         let channel = self.file_channel(peer);
@@ -8103,12 +9080,19 @@ impl Actor {
                 incoming: false,
                 state: TransferState::Running,
                 from_clipboard: true,
+                directory: false,
             },
         );
         self.file_pending_sends
             .entry(peer)
             .or_default()
-            .push(SendJob { id, path, from: 0 });
+            .push(SendJob {
+                id,
+                path,
+                from: 0,
+                attempts: 0,
+                announce: None,
+            });
         self.ensure_file_connection(peer);
         self.audit_file(&peer, "clipboard-transfer-started");
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
@@ -8176,6 +9160,10 @@ impl Actor {
             }
         });
         self.file_transfers.retain(|(p, _), _| *p != peer);
+        self.file_resumable.retain(|(p, _), _| *p != peer);
+        self.dir_offers_out.remove(&peer);
+        self.dir_offers_in.remove(&peer);
+        self.dir_groups.retain(|(p, _), _| *p != peer);
         if let Some(channel) = self.file_channels.remove(&peer) {
             tokio::spawn(async move {
                 let mut inbox = channel.inbox.lock().await;
@@ -8878,6 +9866,14 @@ impl Actor {
         // (ADR 0076).
         self.file_manage_to_host
             .insert(peer, control.peer_minor() >= FILE_MANAGE_MINOR);
+        // Same reasoning for a whole directory (ADR 0077). A host below this
+        // minor has no `DirOffer` to decode, and `HelloAck` carries no
+        // feature list for a guest to read instead.
+        if control.peer_minor() >= DIR_TRANSFER_MINOR {
+            self.speaks_dir_transfer.insert(peer);
+        } else {
+            self.speaks_dir_transfer.remove(&peer);
+        }
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -8941,6 +9937,119 @@ async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
 /// A transfer must never quietly replace a file the user already had. The
 /// suffix goes before the extension so the result still opens in the same
 /// application.
+/// Turns one manifest entry into the path it lands at under `root`, or
+/// refuses it (§9.1, §18; ADR 0077).
+///
+/// The one line where a hostile manifest would do its damage, which is why it
+/// is a function of its own: an entry naming `..`, an absolute path or a
+/// Windows drive would otherwise be joined to a directory the receiving user
+/// chose and write outside it. `safe_relative_path` decides, and it decides
+/// here rather than only on arrival, so no later edit can add a second path
+/// into the join that skipped the check.
+fn manifest_destination(
+    root: &std::path::Path,
+    entry: &ManifestEntry,
+) -> Option<std::path::PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative_components(&entry.path)? {
+        path.push(component);
+    }
+    Some(path)
+}
+
+/// Walks `root` into the manifest of a `DirOffer` (§9.2; ADR 0077).
+///
+/// Breadth first and bounded by `MAX_DIR_MANIFEST_ENTRIES`, which is what
+/// fits one control frame: a tree with more in it is refused here rather than
+/// truncated into one that arrives missing files (§18).
+///
+/// Symbolic links are skipped and counted. Following one would offer a file
+/// outside the directory the sender picked — which is the sender's half of
+/// the same rule `safe_relative_path` enforces on the receiver's — and
+/// recreating one on the far side would be a claim about a filesystem this
+/// side cannot see.
+///
+/// Empty directories are kept as entries of their own. Every other directory
+/// is implied by the paths of the things inside it.
+///
+/// # Errors
+/// [`NetError::Io`] when `root` cannot be read, or when it holds more than
+/// `MAX_DIR_MANIFEST_ENTRIES` entries.
+async fn walk_directory(root: &std::path::Path) -> Result<WalkedTree, NetError> {
+    let mut out = WalkedTree::default();
+    let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), String::new())]);
+    while let Some((dir, prefix)) = queue.pop_front() {
+        let mut reader = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?;
+        let mut empty = true;
+        while let Some(entry) = reader
+            .next_entry()
+            .await
+            .map_err(|e| NetError::Io(e.to_string()))?
+        {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                // A name that is not UTF-8 has no representation on this wire
+                // and is skipped rather than transliterated into a name that
+                // would not open.
+                continue;
+            };
+            if !is_safe_component(name) {
+                continue;
+            }
+            let relative = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if safe_relative_path(&relative).is_none() {
+                // Too long for a manifest entry, or a name this side would
+                // refuse on arrival. Refused here too, so the two ends of one
+                // transfer never disagree about what is in it.
+                continue;
+            }
+            let Ok(kind) = entry.file_type().await else {
+                continue;
+            };
+            if kind.is_symlink() {
+                out.skipped_links += 1;
+                continue;
+            }
+            empty = false;
+            if out.entries.len() >= MAX_DIR_MANIFEST_ENTRIES {
+                return Err(NetError::Io(
+                    "the directory holds too many files".to_owned(),
+                ));
+            }
+            if kind.is_dir() {
+                queue.push_back((entry.path(), relative));
+                continue;
+            }
+            let size = entry.metadata().await.map_or(0, |meta| meta.len());
+            out.entries.push(ManifestEntry {
+                path: relative,
+                size,
+                is_dir: false,
+            });
+        }
+        // An empty directory is the one thing no file's path implies.
+        if empty && !prefix.is_empty() {
+            if out.entries.len() >= MAX_DIR_MANIFEST_ENTRIES {
+                return Err(NetError::Io(
+                    "the directory holds too many files".to_owned(),
+                ));
+            }
+            out.entries.push(ManifestEntry {
+                path: prefix,
+                size: 0,
+                is_dir: true,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Reads one directory into the entries a `DirListResponse` carries, bounded
 /// by `MAX_DIR_ENTRIES_PER_RESPONSE` (ADR 0075).
 ///
@@ -9206,6 +10315,10 @@ const fn rejection_of(error: &UnattendedError) -> UnattendedRejection {
 /// Authenticates; authorizes nothing. Whether a media connection may exist,
 /// and whether a verified ticket may become a session, are questions only the
 /// actor can answer, because only the actor can read `SessionManager` (§2.3).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one field per feature string the handshake reads; splitting it               would separate a string from the flag it sets"
+)]
 async fn classify_incoming(
     connection: Option<iroh::endpoint::Connection>,
     verifying_key: &ed25519_dalek::VerifyingKey,
@@ -9308,6 +10421,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_FILE_MANAGE),
+        speaks_dir_transfer: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_DIR_TRANSFER),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -9446,6 +10563,7 @@ async fn connect_once(
         FEATURE_DISPLAY_MODE.to_owned(),
         FEATURE_FILE_BROWSE.to_owned(),
         FEATURE_FILE_MANAGE.to_owned(),
+        FEATURE_DIR_TRANSFER.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -9910,9 +11028,14 @@ pub fn spawn_actor_with(
         speaks_file_browse: std::collections::HashSet::new(),
         file_browse_to_host: std::collections::HashMap::new(),
         speaks_file_manage: std::collections::HashSet::new(),
+        speaks_dir_transfer: std::collections::HashSet::new(),
         file_manage_to_host: std::collections::HashMap::new(),
         fetches_out: std::collections::HashMap::new(),
         fetch_preparing: std::collections::HashMap::new(),
+        file_resumable: std::collections::HashMap::new(),
+        dir_offers_out: std::collections::HashMap::new(),
+        dir_offers_in: std::collections::HashMap::new(),
+        dir_groups: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
@@ -10935,6 +12058,170 @@ mod tests {
             refused,
             Err(ActorError::Core(CoreError::Malformed))
         ));
+    }
+
+    /// ADR 0077: a directory travels as a manifest of files, and what arrives
+    /// is the tree that was sent — the nested folders, the empty one, and the
+    /// bytes of every file, verified one by one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_arrives_with_the_structure_it_was_sent_with() {
+        let source = Scratch::new("dir-source");
+        let tree = source.join("project");
+        std::fs::create_dir_all(tree.join("docs").join("2026")).unwrap();
+        std::fs::create_dir_all(tree.join("empty")).unwrap();
+        std::fs::write(tree.join("readme.md"), b"the top level file").unwrap();
+        std::fs::write(tree.join("docs").join("notes.txt"), b"a nested file").unwrap();
+        std::fs::write(
+            tree.join("docs").join("2026").join("plan.txt"),
+            b"a file two levels down",
+        )
+        .unwrap();
+        let target = Scratch::new("dir-target");
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+
+        host.set_grant(guest_label.clone(), IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        guest
+            .remote_upload(
+                host_label,
+                tree.to_string_lossy().into_owned(),
+                target.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        // One row for the whole directory, not one per file: the tree is what
+        // was asked for, so the tree is what progress is about.
+        wait_for_files(&guest, "the directory never finished", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.directory && row.state == TransferState::Completed)
+        })
+        .await;
+        let rows = guest.file_transfers().await.unwrap();
+        let row = rows
+            .transfers
+            .iter()
+            .find(|row| row.directory)
+            .expect("no row for the directory");
+        assert_eq!(row.name, "project");
+        assert_eq!(row.moved, row.size);
+        assert_eq!(
+            rows.transfers.iter().filter(|row| !row.directory).count(),
+            0,
+            "the files of a directory are shown as themselves as well as as the tree"
+        );
+
+        let landed = target.join("project");
+        assert_eq!(
+            std::fs::read(landed.join("readme.md")).unwrap(),
+            b"the top level file"
+        );
+        assert_eq!(
+            std::fs::read(landed.join("docs").join("notes.txt")).unwrap(),
+            b"a nested file"
+        );
+        assert_eq!(
+            std::fs::read(landed.join("docs").join("2026").join("plan.txt")).unwrap(),
+            b"a file two levels down"
+        );
+        assert!(
+            landed.join("empty").is_dir(),
+            "an empty directory inside the tree was not preserved"
+        );
+    }
+
+    /// ADR 0077: the walk skips symbolic links rather than following them —
+    /// the file one points at is outside the directory that was offered, and
+    /// recreating the link would be a claim about the receiver's filesystem.
+    ///
+    /// Unix only: creating a symbolic link on Windows needs a privilege this
+    /// test process may not hold, and the rule it checks is in the walk
+    /// rather than in the platform.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_symbolic_link_inside_a_directory_is_skipped_and_not_recreated() {
+        let source = Scratch::new("dir-link-source");
+        let tree = source.join("project");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("real.txt"), b"an ordinary file").unwrap();
+        std::fs::write(source.join("outside.txt"), b"not part of the offer").unwrap();
+        std::os::unix::fs::symlink(source.join("outside.txt"), tree.join("link.txt")).unwrap();
+        let target = Scratch::new("dir-link-target");
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+
+        host.set_grant(guest_label.clone(), IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        guest
+            .remote_upload(
+                host_label,
+                tree.to_string_lossy().into_owned(),
+                target.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_files(&guest, "the directory never finished", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.directory && row.state == TransferState::Completed)
+        })
+        .await;
+        let landed = target.join("project");
+        assert!(landed.join("real.txt").exists());
+        assert!(
+            !landed.join("link.txt").exists(),
+            "a symbolic link was followed or recreated"
+        );
+    }
+
+    /// ADR 0077: the zip-slip check, at the seam it protects. A manifest
+    /// entry that climbs out of its own directory never becomes a path on
+    /// this machine — checked on the function that does the joining, which
+    /// is the one line where getting it wrong would matter.
+    #[test]
+    fn a_manifest_entry_that_climbs_out_never_becomes_a_path() {
+        let root = std::path::Path::new("/home/beta/inbox/project");
+        for path in [
+            "../escaped.txt",
+            r"..\escaped.txt",
+            "/etc/shadow",
+            r"C:\Windows\System32\x",
+            "a/../../escaped.txt",
+            "a//b",
+            ".",
+            "",
+        ] {
+            let entry = ManifestEntry {
+                path: path.to_owned(),
+                size: 4,
+                is_dir: false,
+            };
+            assert!(
+                manifest_destination(root, &entry).is_none(),
+                "{path} was turned into a path"
+            );
+        }
+
+        let entry = ManifestEntry {
+            path: "docs/notes.txt".to_owned(),
+            size: 4,
+            is_dir: false,
+        };
+        assert_eq!(
+            manifest_destination(root, &entry),
+            Some(root.join("docs").join("notes.txt"))
+        );
     }
 
     /// Polls for the refusal a download is about to produce.

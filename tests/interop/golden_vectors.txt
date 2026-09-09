@@ -73,7 +73,14 @@ valid minor3_sas_ack_refused abababababababababababababababab0000200000
 valid minor5_file_transfer_start abababababababababababababababab010024070a7265706f72742e706466d209070707070707070707070707070707070707070707070707070707070707070700
 valid minor5_file_transfer_start_host_side abababababababababababababababab00002400016100000000000000000000000000000000000000000000000000000000000000000000
 invalid minor5_file_transfer_start_overlong_name abababababababababababababababab0100240180026e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e01000000000000000000000000000000000000000000000000000000000000000000
-invalid file_offer_over_the_size_limit abababababababababababababababab01000d0178818080fa01000000000000000000000000000000000000000000000000000000000000000000
+# The one verdict in this file that ever changed, and the bytes did not:
+# minor 14 raised FILE_OFFER_MAX_BYTES from 500 MiB to 64 GiB (ADR 0077),
+# so this offer - 500 MiB plus one byte - decodes today where it was
+# malformed through minor 13. An interop partner replaying these bytes
+# against a build below minor 14 still gets the old answer, which is why
+# a sender must not make an offer this large to a peer below that minor.
+# The bound itself is still checked: see minor14_file_offer_over_the_size_limit.
+valid file_offer_over_the_minor13_size_limit abababababababababababababababab01000d0178818080fa01000000000000000000000000000000000000000000000000000000000000000000
 
 # --- Frozen for PROTOCOL_MINOR 4: the unattended admission exchange of §8
 # --- (docs/adr/0033). The challenge and the rejection are host to guest, the
@@ -178,3 +185,16 @@ invalid minor13_file_fetch_request_empty_path abababababababababababababababab01
 valid minor13_file_fetch_refused_not_granted abababababababababababababababab0000300000
 valid minor13_file_put_offer abababababababababababababababab010031102f686f6d652f626574612f696e626f78096e6f7465732e7478748020030303030303030303030303030303030303030303030303030303030303030300
 invalid minor13_file_put_offer_empty_dir abababababababababababababababab01003100096e6f7465732e7478748020030303030303030303030303030303030303030303030303030303030303030300
+
+# --- Frozen for PROTOCOL_MINOR 14: a directory is a manifest (ADR 0077).
+# --- The offer names the directory, optionally names a destination on the
+# --- receiver, and lists every file in the tree with its size; an entry with
+# --- is_dir set is an empty directory to create, so one claiming a size is two
+# --- facts that disagree and is malformed. Either side may send it, gated on
+# --- the "dir-transfer" feature string. The last line is the offer ceiling
+# --- itself, still checked one byte past its new value.
+valid minor14_dir_offer_two_entries abababababababababababababababab0100320770726f6a6563740002096e6f7465732e7478740c0005656d707479000100
+valid minor14_dir_offer_with_destination abababababababababababababababab0100320770726f6a656374010a2f686f6d652f626574610107612f622e62696e80200000
+invalid minor14_dir_offer_directory_with_a_size abababababababababababababababab0100320770726f6a656374000105656d707479010100
+valid minor14_dir_accept abababababababababababababababab0000330100
+invalid minor14_file_offer_over_the_size_limit abababababababababababababababab01000d086469736b2e696d67818080808002010101010101010101010101010101010101010101010101010101010101010100

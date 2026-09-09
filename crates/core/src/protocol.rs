@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-    DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
-    MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DISPLAY_MODES_PER_HOST,
-    MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
-    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
+    MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE,
+    MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, UNATTENDED_CODE_MAX_BYTES,
+    UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -229,7 +230,24 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// guest to host and gated on [`FEATURE_FILE_MANAGE`], and the host requires
 /// `file_browse` *and* `file_transfer` before it acts on any of them. See
 /// `docs/adr/0076-naming-a-file-on-the-host-is-browse-plus-transfer.md`.
-pub const PROTOCOL_MINOR: u16 = 13;
+///
+/// 14: appended [`MessageKind::DirOffer`] and [`MessageKind::DirAccept`]
+/// after `FilePutOffer`, and raised
+/// [`crate::constants::FILE_OFFER_MAX_BYTES`] from 500 MiB to 64 GiB. A
+/// directory travels as a **manifest of files** — the sender walks the tree
+/// and names every file in it once, the receiver takes the whole thing or
+/// none of it, and each file then moves on the ordinary engine of §9.2. Not
+/// as an archive: an archive breaks resume, hides its contents from the
+/// check the receiver makes and adds a dependency to do it.
+///
+/// The size ceiling is the one relaxation on this wire that an older peer can
+/// see. A peer below this minor decodes an offer above
+/// [`crate::constants::FILE_OFFER_LEGACY_MAX_BYTES`] as malformed and closes
+/// the connection, so a sender must not make one to a peer below it — the
+/// same "check what the far side speaks before sending" rule every feature
+/// string here exists for, read off the minor because both sides announce
+/// one. See `docs/adr/0077-a-directory-is-a-manifest-and-the-ceiling-is-free-space.md`.
+pub const PROTOCOL_MINOR: u16 = 14;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -377,6 +395,16 @@ pub const FEATURE_FILE_BROWSE: &str = "file-browse";
 /// a peer that can name a file inside it are two different builds, and a
 /// guest that only browses must not have to claim it can do more.
 pub const FEATURE_FILE_MANAGE: &str = "file-manage";
+
+/// `Hello.features` string a peer sends to say it understands
+/// [`MessageKind::DirOffer`] and [`MessageKind::DirAccept`] (ADR 0077).
+///
+/// Same compatibility shape as [`FEATURE_FILE_TRANSFER`], and the same
+/// reason it is that one rather than a guest-only string: either end of a
+/// session may copy a directory, so either end may be the one that has to
+/// send the offer, and both sides advertise and check it. Without it on the
+/// far side a directory is simply never offered.
+pub const FEATURE_DIR_TRANSFER: &str = "dir-transfer";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -950,6 +978,63 @@ pub enum MessageKind {
         /// BLAKE3 of the whole file, verified before export from staging.
         hash: [u8; 32],
     },
+    /// Sender to receiver: a whole directory, as the list of files in it
+    /// (§9.2; ADR 0077). New in minor 14.
+    ///
+    /// A manifest, not an archive. The sender walks the tree once and names
+    /// every file in it with its size; the receiver answers
+    /// [`Self::DirAccept`] for the whole thing or for none of it, and each
+    /// file then moves as an ordinary transfer — same `rd/file/1`, same
+    /// chunks, same BLAKE3 per file. Archiving would have been one transfer
+    /// instead of many, and would have cost the resume point of every file
+    /// after the first, hidden the contents from the check the receiver
+    /// makes before it accepts, and added a compression dependency to the
+    /// TCB.
+    ///
+    /// Symbolic links are not in here at all: they are skipped by the walk
+    /// rather than followed (a link out of the tree is a file the sender did
+    /// not offer) and never recreated on the far side (a link is a claim
+    /// about the *receiver's* filesystem). Empty directories are, as entries
+    /// with `is_dir` set — a tree that arrives missing its empty folders is
+    /// not the tree that was sent.
+    ///
+    /// Every `path` is a relative path inside the offered directory, checked
+    /// by `lumepeer_core::remote_path::safe_relative_path` before anything
+    /// joins it to a destination. That check is the whole of this message's
+    /// risk: an entry naming `..`, an absolute path or a Windows drive would
+    /// otherwise write outside the directory the receiver chose.
+    DirOffer {
+        /// Basename of the directory being offered, never a path.
+        name: String,
+        /// Absolute path of the directory on the *receiver* this is for, or
+        /// `None` to let the receiver choose — a copied directory names
+        /// nowhere, a file manager's upload names the folder it is looking
+        /// at.
+        dir: Option<String>,
+        /// The files, at most `MAX_DIR_MANIFEST_ENTRIES` of them.
+        entries: Vec<ManifestEntry>,
+    },
+    /// Answer to [`Self::DirOffer`]; `true` starts the files in manifest
+    /// order (§9.2; ADR 0077). New in minor 14.
+    DirAccept(bool),
+}
+
+/// One file or empty directory inside a [`MessageKind::DirOffer`] manifest
+/// (§9.2; ADR 0077).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    /// Path relative to the offered directory, `/`-separated, never
+    /// absolute and never containing `..`
+    /// (`lumepeer_core::remote_path::safe_relative_path`).
+    pub path: String,
+    /// Size in bytes; zero for a directory.
+    pub size: u64,
+    /// Whether this entry is a directory to create and not a file to move.
+    ///
+    /// Only ever an *empty* one: a directory with anything in it is implied
+    /// by the paths of the things in it, and naming it as well would be the
+    /// same fact twice.
+    pub is_dir: bool,
 }
 
 /// Video codec identifier carried in [`MessageKind::MediaCodec`]'s `codec`
@@ -1318,6 +1403,39 @@ fn check_display_modes(
     Ok(())
 }
 
+/// Bounds a directory manifest before anything walks it (§9.1; ADR 0077).
+///
+/// The count first, because everything after it is per entry; then the two
+/// strings that become paths on this machine, and then each entry's own path
+/// as a *string* — `safe_relative_path` is what decides whether it is a path
+/// this side will join to anything, and it runs where the joining happens,
+/// not here.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for a manifest over the entry bound, an empty or
+/// overlong directory name, a destination over the path bound, an entry with
+/// an empty or overlong path, or a directory entry claiming a size.
+fn check_manifest(name: &str, dir: Option<&str>, entries: &[ManifestEntry]) -> Result<()> {
+    if entries.len() > MAX_DIR_MANIFEST_ENTRIES {
+        return Err(CoreError::Malformed);
+    }
+    if name.is_empty() || name.len() > FILE_NAME_MAX_BYTES {
+        return Err(CoreError::Malformed);
+    }
+    if dir.is_some_and(|dir| dir.is_empty() || dir.len() > DIR_PATH_MAX_BYTES) {
+        return Err(CoreError::Malformed);
+    }
+    if entries.iter().any(|entry| {
+        entry.path.is_empty()
+            || entry.path.len() > MANIFEST_PATH_MAX_BYTES
+            || entry.size > FILE_OFFER_MAX_BYTES
+            || (entry.is_dir && entry.size != 0)
+    }) {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
 /// Bounds both halves of a put offer's destination (§9.1; ADR 0076).
 ///
 /// The directory as a string like every other path on this wire, before
@@ -1498,6 +1616,9 @@ impl MessageEnvelope {
             MessageKind::FilePutOffer {
                 dir, name, size, ..
             } => check_put_offer(dir, name, *size)?,
+            MessageKind::DirOffer { name, dir, entries } => {
+                check_manifest(name, dir.as_deref(), entries)?;
+            }
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide
@@ -1534,7 +1655,8 @@ mod tests {
     use super::*;
     use crate::constants::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
+        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
+        MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
         UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
@@ -1743,6 +1865,89 @@ mod tests {
                 "a malformed put offer was accepted"
             );
         }
+    }
+
+    /// ADR 0077: a manifest is bounded on its count, its name, its
+    /// destination and every entry — all before anything walks it, and all
+    /// on the untrusted-input rule of §9.1.
+    #[test]
+    fn a_directory_manifest_is_bounded_on_every_field_it_carries() {
+        let entry = |path: &str, size: u64, is_dir: bool| ManifestEntry {
+            path: path.to_owned(),
+            size,
+            is_dir,
+        };
+        let offer =
+            |name: &str, dir: Option<&str>, entries: Vec<ManifestEntry>| MessageKind::DirOffer {
+                name: name.to_owned(),
+                dir: dir.map(str::to_owned),
+                entries,
+            };
+
+        for kind in [
+            offer(
+                "project",
+                None,
+                vec![entry("notes.txt", 12, false), entry("empty", 0, true)],
+            ),
+            offer(
+                "project",
+                Some("/home/beta"),
+                vec![entry("a/b.bin", 4096, false)],
+            ),
+        ] {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        let too_many = (0..=MAX_DIR_MANIFEST_ENTRIES)
+            .map(|index| entry(&format!("f{index}"), 1, false))
+            .collect();
+        for kind in [
+            offer("project", None, too_many),
+            offer("", None, vec![entry("a", 1, false)]),
+            offer(&"n".repeat(FILE_NAME_MAX_BYTES + 1), None, vec![]),
+            offer("project", Some(""), vec![]),
+            offer("project", None, vec![entry("", 1, false)]),
+            offer(
+                "project",
+                None,
+                vec![entry(&"a".repeat(MANIFEST_PATH_MAX_BYTES + 1), 1, false)],
+            ),
+            // A directory that claims a size is two facts that disagree.
+            offer("project", None, vec![entry("empty", 1, true)]),
+        ] {
+            let bytes = envelope(kind).encode().unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "a malformed manifest was accepted"
+            );
+        }
+    }
+
+    /// ADR 0077: the ceiling moved, and the check still exists — an offer at
+    /// the new bound is ordinary and one byte past it is malformed.
+    #[test]
+    fn the_offer_ceiling_is_sixty_four_gibibytes_and_still_checked() {
+        let offer = |size| MessageKind::FileOffer {
+            name: "disk.img".to_owned(),
+            size,
+            hash: [1u8; 32],
+        };
+        let bytes = envelope(offer(FILE_OFFER_MAX_BYTES)).encode().unwrap();
+        assert!(MessageEnvelope::decode(&bytes).is_ok());
+        let bytes = envelope(offer(FILE_OFFER_MAX_BYTES + 1)).encode().unwrap();
+        assert!(matches!(
+            MessageEnvelope::decode(&bytes),
+            Err(CoreError::Malformed)
+        ));
+        // What a peer below minor 14 would have refused, and this one does
+        // not: the one relaxation of ADR 0077 that is visible on the wire.
+        let bytes = envelope(offer(crate::constants::FILE_OFFER_LEGACY_MAX_BYTES + 1))
+            .encode()
+            .unwrap();
+        assert!(MessageEnvelope::decode(&bytes).is_ok());
     }
 
     #[test]

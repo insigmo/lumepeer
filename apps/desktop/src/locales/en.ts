@@ -181,6 +181,7 @@ export const en: Dictionary = {
   // whoever is trying to send.
   'files.sendHint': 'To send a file, copy it with Ctrl+C — it is offered here automatically.',
   'files.fromClipboard': 'From clipboard',
+  'files.directory': 'Folder',
   'files.accept': 'Accept',
   'files.decline': 'Decline',
   'files.cancel': 'Cancel',

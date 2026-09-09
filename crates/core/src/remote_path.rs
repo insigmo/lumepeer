@@ -14,7 +14,7 @@
 //! it was compiled for. Everything here treats `/` and `\` as separators on
 //! every platform, which is the only reading that is safe on all of them.
 
-use crate::constants::{DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES};
+use crate::constants::{DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, MANIFEST_PATH_MAX_BYTES};
 
 /// Windows device names, which address a device rather than a file no matter
 /// which directory they appear in.
@@ -135,9 +135,124 @@ pub fn safe_browse_path(path: &str) -> Option<&str> {
     }
 }
 
+/// Accepts a relative path from inside a peer's directory manifest, or
+/// refuses it (§9.1, §18; ADR 0077).
+///
+/// This is the check that stops "zip slip". Every entry of a
+/// [`crate::protocol::MessageKind::DirOffer`] is joined to a directory the
+/// receiving user chose, so an entry spelling `..`, an absolute path or a
+/// Windows drive would write *outside* that directory — under a name the
+/// receiver never agreed to, on a machine that agreed only to a folder.
+///
+/// Accepted, and nothing else: one or more components, each of which
+/// [`is_safe_component`] accepts, separated by `/` or `\` (both, on every
+/// platform, for the reason the module comment gives), and no longer than
+/// [`MANIFEST_PATH_MAX_BYTES`].
+///
+/// Refused, whichever platform is reading: anything absolute (`/a`, `C:\a`,
+/// a bare `\`), any `.` or `..` component, an empty component (`a//b`, a
+/// trailing separator), and everything [`is_safe_component`] refuses per
+/// component — which is where the Windows device names, the control
+/// characters, the colons and the trailing dots go.
+///
+/// Refused rather than sanitized, exactly as [`safe_browse_path`] is: an
+/// entry rewritten into something safe is a file written where neither side
+/// said.
+#[must_use]
+pub fn safe_relative_path(path: &str) -> Option<&str> {
+    if path.is_empty() || path.len() > MANIFEST_PATH_MAX_BYTES {
+        return None;
+    }
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    // Absolute in either dialect. A drive letter is caught by
+    // `is_safe_component`'s colon rule, but `C:\a` is refused here rather
+    // than left to it, so the reason a caller sees is the true one.
+    if path.starts_with(['/', '\\']) {
+        return None;
+    }
+    if path.split(['/', '\\']).all(is_safe_component) {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Splits a manifest entry's path into the components a receiver joins, in
+/// order (ADR 0077).
+///
+/// Returns `None` for anything [`safe_relative_path`] refuses, so a caller
+/// cannot join a path this module never accepted by taking the components of
+/// it separately.
+#[must_use]
+pub fn relative_components(path: &str) -> Option<Vec<&str>> {
+    Some(safe_relative_path(path)?.split(['/', '\\']).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0077: the zip-slip check. Every one of these joined to a chosen
+    /// directory would write outside it, and every one is refused before
+    /// anything joins it — a unit test, so it says the same thing on all
+    /// three platforms.
+    #[test]
+    fn a_manifest_entry_can_never_climb_out_of_its_directory() {
+        for path in [
+            "../secrets",
+            "a/../../secrets",
+            "a/..",
+            "..",
+            ".",
+            "./a",
+            "/etc/shadow",
+            "\\Windows\\System32",
+            "C:\\Windows\\System32",
+            "C:/Windows",
+            "a//b",
+            "a/",
+            "a\\..\\..\\b",
+            "a/b/../../../c",
+            // A device name anywhere in the path, and a name Windows would
+            // silently rewrite.
+            "a/NUL",
+            "a/CON.txt",
+            "a/b.",
+            "a/b ",
+            "",
+        ] {
+            assert!(
+                safe_relative_path(path).is_none(),
+                "{path} was accepted as a manifest entry"
+            );
+            assert!(relative_components(path).is_none());
+        }
+    }
+
+    /// ADR 0077: an ordinary relative path, in either dialect, is accepted
+    /// unchanged and splits into the components a receiver joins.
+    #[test]
+    fn an_ordinary_relative_path_is_accepted_and_splits() {
+        for path in [
+            "notes.txt",
+            "docs/notes.txt",
+            "docs\\notes.txt",
+            "a/b/c/d.bin",
+        ] {
+            assert_eq!(safe_relative_path(path), Some(path));
+        }
+        assert_eq!(
+            relative_components("docs/2026/notes.txt"),
+            Some(vec!["docs", "2026", "notes.txt"])
+        );
+        assert_eq!(
+            relative_components("docs\\notes.txt"),
+            Some(vec!["docs", "notes.txt"])
+        );
+        assert!(safe_relative_path(&"a".repeat(MANIFEST_PATH_MAX_BYTES + 1)).is_none());
+    }
 
     /// The traversal itself, in every spelling, refused on every platform —
     /// this is a unit test on purpose: it touches no filesystem, so it says

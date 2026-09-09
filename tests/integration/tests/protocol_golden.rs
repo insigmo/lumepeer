@@ -12,9 +12,16 @@
 //! `DisplaySetMode` (docs/bugs/16-host-display-mode.md; ADR 0048), minor 11
 //! appended `MediaCodec` (ADR 0067), minor 12 appended `DirListRequest` and
 //! `DirListResponse` (ADR 0075), minor 13 appended `FileFetchRequest`,
-//! `FileFetchRefused` and `FilePutOffer` (ADR 0076) — and every earlier
-//! vector is still in the file unchanged, which is the compatibility claim
-//! this test checks.
+//! `FileFetchRefused` and `FilePutOffer` (ADR 0076), minor 14 appended
+//! `DirOffer` and `DirAccept` (ADR 0077) — and every earlier vector is still
+//! in the file with the same bytes, which is the compatibility claim this
+//! test checks.
+//!
+//! One verdict has changed in the file's life, and it is written down where
+//! it happened: minor 14 raised the offer ceiling, so an offer of 500 MiB
+//! plus one byte decodes today where it was malformed before (ADR 0077). The
+//! bytes of that vector are untouched; what an interop partner learns from it
+//! is which minor the far side is speaking.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,
 //! so a stable toolchain still exercises them on every CI run; the nightly
@@ -81,7 +88,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 13,
+        PROTOCOL_MINOR, 14,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 
