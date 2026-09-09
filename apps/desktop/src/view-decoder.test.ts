@@ -6,6 +6,7 @@ import {
   CHUNK_RESPONSE_HEADER_BYTES,
   configStringFor,
   decodeViewChunk,
+  NativeDecoder,
   nativeDecodingAvailable,
   supportedOptionalCodecs,
   WireCodec,
@@ -217,7 +218,7 @@ describe('configStringFor', () => {
     // 08/09). The frame's own bytes are irrelevant to the answer.
     const frame = keyframe([0xff]);
     expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.05M.08');
-    expect(configStringFor(WireCodec.H265, frame)).toBe('hev1.1.6.L93.B0');
+    expect(configStringFor(WireCodec.H265, frame)).toBe('hev1.1.6.L120.B0');
     expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
   });
 
@@ -261,7 +262,7 @@ describe('supportedOptionalCodecs', () => {
     };
     try {
       await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
-      expect(asked).toEqual(['av01.0.05M.08', 'hev1.1.6.L93.B0', 'vp09.00.10.08']);
+      expect(asked).toEqual(['av01.0.05M.08', 'hev1.1.6.L120.B0', 'vp09.00.10.08']);
     } finally {
       delete scope.VideoDecoder;
     }
@@ -276,6 +277,69 @@ describe('supportedOptionalCodecs', () => {
       await expect(supportedOptionalCodecs()).resolves.toEqual([]);
     } finally {
       delete scope.VideoDecoder;
+    }
+  });
+});
+
+describe('NativeDecoder configuration', () => {
+  /** Records every `configure()` the decoder is given. */
+  function captureConfigs(): { configs: Record<string, unknown>[]; restore: () => void } {
+    const configs: Record<string, unknown>[] = [];
+    const scope = globalThis as { VideoDecoder?: unknown; EncodedVideoChunk?: unknown };
+    scope.VideoDecoder = class {
+      state = 'unconfigured';
+      constructor(_init: unknown) {}
+      configure(config: Record<string, unknown>) {
+        configs.push(config);
+        this.state = 'configured';
+      }
+      decode(_chunk: unknown) {}
+      close() {}
+    };
+    scope.EncodedVideoChunk = class {
+      constructor(init: Record<string, unknown>) {
+        Object.assign(this, init);
+      }
+    };
+    return {
+      configs,
+      restore: () => {
+        delete scope.VideoDecoder;
+        delete scope.EncodedVideoChunk;
+      },
+    };
+  }
+
+  const keyframe = (data: number[]) => ({ keyframe: true, timestampUs: 0, data: new Uint8Array(data) });
+
+  it('pairs the hev1 string with an Annex-B stream by sending no description (ADR 0071)', () => {
+    // The one claim the H.265 path rests on: `hev1` says the parameter sets
+    // travel in the bitstream, and WebCodecs reads a configuration with no
+    // `description` as Annex-B. A `description` here would mean hvcC, which
+    // is not what the host sends, and the decoder would fail on every
+    // picture rather than refuse the configuration.
+    const { configs, restore } = captureConfigs();
+    try {
+      const decoder = new NativeDecoder(document.createElement('canvas'), () => {});
+      // An HEVC IDR_W_RADL (nal_unit_type 19) behind a start code.
+      decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaa])], WireCodec.H265);
+      expect(configs).toHaveLength(1);
+      expect(configs[0]?.codec).toBe('hev1.1.6.L120.B0');
+      expect(configs[0]).not.toHaveProperty('description');
+    } finally {
+      restore();
+    }
+  });
+
+  it('rebuilds the decoder when the negotiated codec changes (ADR 0067)', () => {
+    const { configs, restore } = captureConfigs();
+    try {
+      const decoder = new NativeDecoder(document.createElement('canvas'), () => {});
+      decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x26, 0x01])], WireCodec.H265);
+      decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, 0x00])], WireCodec.H264);
+      expect(configs.map((config) => config.codec)).toEqual(['hev1.1.6.L120.B0', 'avc1.640028']);
+    } finally {
+      restore();
     }
   });
 });
