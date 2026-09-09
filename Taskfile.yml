@@ -19,11 +19,13 @@ vars:
   # have, and without the openh264 software fallback such a host reports
   # "no usable encoder" and the guest never gets a picture.
   WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-openh264
-  # macOS has no hardware encoder wired up yet (encode::select_encoder only
-  # implements the Media Foundation one), so the openh264 software fallback
-  # is what an Apple host encodes with; without it select_encoder errors and
-  # the guest sits on "waiting for the remote screen" until it gives up.
-  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-openh264
+  # Both encoders, for the same reason Windows carries both: VideoToolbox
+  # (ADR 0066) is what an Apple host should encode with, but its probe opens
+  # a real session and pushes a frame through it before it says so, and a Mac
+  # where that fails has to keep running on the openh264 software fallback —
+  # without it select_encoder errors and the guest sits on "waiting for the
+  # remote screen" until it gives up.
+  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-videotoolbox,encode-openh264
   # Unpacked aarch64 cross toolchain + arm64 sysroot the linux-arm64 target
   # links against, provisioned by ci/provision-linux-arm64-cross.sh (see
   # cross:linux-arm64 below). Gitignored and local to whichever machine built

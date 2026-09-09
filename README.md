@@ -169,8 +169,8 @@ capture and `CGEvent` injection on macOS (ADR 0013), the Windows keystore, and
 a decoder sandbox on all three platforms — seccomp-BPF, `AppContainer` and
 `sandbox_init(3)` (ADR 0019). Hardware encoding is Media Foundation on Windows
 (`encode-mf`; ADR 0011) and VA-API on Linux (`encode-vaapi`; ADR 0040); macOS
-still encodes in software, as no VideoToolbox backend exists yet. ADR 0007 has
-the detail on why phase 4 was scoped to Linux first.
+has VideoToolbox too (`encode-videotoolbox`; ADR 0066), which no Mac has run
+yet. ADR 0007 has the detail on why phase 4 was scoped to Linux first.
 
 Phase 5: `cargo audit`/`cargo deny` (already wired since phase 0/3) are joined
 by a `cargo cyclonedx` SBOM step in the same `supply-chain` CI job, uploaded as
