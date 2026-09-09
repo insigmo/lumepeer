@@ -66,6 +66,16 @@
 службу в состоянии Running → Ctrl+Alt+Del работает без ручных действий →
 деинсталляция → `sc query` службу не находит.
 
+**Что оказалось на самом деле.** Пункт 2 предполагает, что «инсталлятор уже
+идёт с правами администратора». Это верно только если `nsis.installMode`
+выставлен явно: по схеме `tauri.conf.json` (`NsisConfig.installMode`,
+`@tauri-apps/cli/config.schema.json`) значение по умолчанию —
+`currentUser`, которое **не** запрашивает права администратора и ставит
+приложение в каталог, не требующий их. Без `perMachine` `CreateServiceW` из
+`NSIS_HOOK_POSTINSTALL` падал бы с отказом в доступе. Добавлено
+`bundle.windows.nsis.installMode: "perMachine"` — это и делает предположение
+задачи верным, а не отклонение от неё.
+
 ### Задача 2 — Идемпотентность установки и удаления
 
 Обязательное условие: `--install` на уже установленной службе и
@@ -168,4 +178,71 @@ from the app that installed it is the thing this project must not ship.»
 деинсталлятор снимает службу, машина возвращается в состояние, которое тест
 ожидает. Отдельно стоит подумать, не должен ли тест пропускаться (`ignore`)
 при уже занятом канале вместо падения.
+
+**Как починено.** Тест теперь проверяет `is_reachable()` в начале и
+пропускает себя (печатает причину в stderr и возвращается без паники) вместо
+падения, если канал уже занят — ровно предложение из абзаца выше. Это не
+альтернатива структурному фиксу задачи 1, а его дополнение: на чистой машине
+без установленной службы тест по-прежнему проходит полный сценарий; на
+машине с реальной `LumepeerHelper` (в том числе рабочей машине этого
+агента — служба на ней стояла и была `Running` уже на момент начала работы)
+он больше не красит `cargo test --workspace` без причины.
+
+### Ureq 2.x/3.x в `tests/integration/tests/broker.rs`
+
+Найдено при прогоне проверки перед коммитом задачи 1: `cargo clippy
+--workspace --all-targets` и `cargo test --workspace` не собираются вовсе —
+`tests/integration/tests/broker.rs` использует API `ureq` 2.x
+(`ureq::AgentBuilder`, `ureq::Error::Status`, `.into_json()`,
+`RequestBuilder::set`), а `Cargo.lock`/`Cargo.toml` уже закрепляют `ureq
+3.4.0`, чья API несовместима (typestate-билдер, другие варианты `Error`,
+`hyper::Response` вместо старого ответа). Это никак не связано с сервисом:
+проверено, что файл не менялся с коммита `b29fd36`, а `ureq` подняли позже,
+в одном из `fix pipelines`/`chore: release` коммитов, без правки теста.
+
+Из-за этого весь `--workspace` прогон в этой пачке шёл с флагом `--exclude
+lumepeer-integration-tests` — иначе задачу 12 в принципе нельзя закрыть ни на
+одной машине с чистым `master`. Сам файл не тронут; чинить `ureq` — отдельная
+задача, не по этому документу.
+
+**Уже неактуально на момент влития (2026-09-09).** `broker.rs` в master
+переписан под API `ureq` 3.x (`Agent::new_with_config`,
+`Agent::config_builder`); `--exclude lumepeer-integration-tests` больше не
+нужен. Запись оставлена как история находки, а не как открытый дефект.
+
+### `ci.yml` стейджит только один из двух `externalBin`
+
+`tauri.conf.json`, `bundle.externalBin`, перечисляет два сайдкара:
+`binaries/lumepeer-decoder-worker` и `binaries/lumepeer-service`.
+`tauri-build` (`build.rs`) на этапе компиляции `lumepeer-desktop` требует,
+чтобы **оба** существовали на диске как `binaries/<имя>-<target-triple>.exe`
+— иначе паника `resource path ... doesn't exist`, ещё до clippy/test.
+`.github/workflows/release.yml` копирует туда оба (`for BIN in
+lumepeer-decoder-worker lumepeer-service`), а `.github/workflows/ci.yml`,
+job `build`, — только `lumepeer-decoder-worker`. Похоже, что обычный `cargo
+build --workspace`/`clippy --workspace`/`test --workspace` в этом CI job'е
+должен падать на `lumepeer-service` тем же образом, каким он падал здесь до
+ручного `cargo build -p lumepeer-service` и копирования бинаря в
+`binaries/`. Не проверено на самом GitHub Actions (агент туда не пушил), но
+воспроизведено локально: тот же `build.rs`, та же паника, стейджинг только
+первого сайдкара из списка её не убирает. Не по этому документу —
+`12-service-lifecycle.md` про инсталлятор/деинсталлятор, а не про CI.
+
+**Уже неактуально на момент влития (2026-09-09).** Job `build` в `ci.yml`
+стейджит оба сайдкара — `lumepeer-decoder-worker` и `lumepeer-service`.
+Остальные job'ы (`media backends`, `resource budget`) десктопный крейт не
+собирают, так что второй сайдкар им и не нужен.
+
+### Разовая нестабильность `network::tests::a_remembered_host_can_be_dialed_again_and_still_needs_consent`
+
+Один прогон `cargo test --workspace --exclude lumepeer-integration-tests` (на
+машине, уже нагруженной несколькими параллельными `cargo`/`rustc` от
+верификации этой же пачки) уронил этот тест
+`apps/desktop/src-tauri/src/network.rs` с `Result::unwrap() on an Err value:
+Net(AlreadyConnected)`. Файл `network.rs` в этой пачке не трогался.
+Повторный прогон именно этого теста в изоляции (`--test-threads=1`, без
+конкурентной нагрузки) прошёл зелёным с первого раза. Похоже на состояние
+гонки под нагрузкой между обновлением `connection_history` и очисткой
+`connections` после `revoke` — тест ждёт первое, не дожидаясь второго — а не
+на дефект, специфичный для этой пачки. Не по этому документу; не чинилось.
 

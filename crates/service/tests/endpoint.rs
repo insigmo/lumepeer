@@ -69,12 +69,24 @@ fn connect_when_ready() -> std::fs::File {
 /// two services cannot listen on it at once, and `cargo test` runs test
 /// functions in parallel. Splitting these would make them race for the one
 /// endpoint the service is allowed to have.
+///
+/// Skips rather than fails when something is already listening on the
+/// channel, instead of assuming this machine has none of its own
+/// (`docs/bugs/12-service-lifecycle.md`, "Найдено попутно"): the real
+/// `LumepeerHelper` service occupies the same single-instance pipe this test
+/// needs, so a machine where it is installed and running — including a
+/// contributor's own dev machine, once the settings panel has ever been used
+/// to install it — cannot run this test at all, and that is a fact about the
+/// machine, not a defect this suite should report.
 #[test]
 fn the_endpoint_answers_and_refuses() {
-    assert!(
-        !lumepeer_service::client::is_reachable(),
-        "nothing must be listening before the service starts"
-    );
+    if lumepeer_service::client::is_reachable() {
+        eprintln!(
+            "skipping: something is already listening on {ENDPOINT}, most likely the real \
+             LumepeerHelper service installed on this machine"
+        );
+        return;
+    }
     let _service = start();
 
     // An unknown opcode: the whole path — create the pipe with its access
