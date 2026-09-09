@@ -129,7 +129,7 @@ cargo clippy -p lumepeer-media --all-targets --features capture-screencapturekit
 | `05` | Упаковка: ARM, ChromeOS, FreeBSD | 10 | — | Raspberry Pi |
 | `06` | Согласование кодека на проводе | фундамент 30/31/32 | — | — |
 | `07` | AV1 | 31 | 06 | GPU с AV1-энкодером |
-| `08` | H.265 | 30 | 06 | — |
+| ~~`08`~~ | ~~H.265~~ — снят, см. ADR 0072 | 30 | — | — |
 | `09` | VP9/VP8 | 32 | 06 | — |
 | `10` | Zero-copy на Windows | 33 | — | Windows + GPU |
 | `11` | Zero-copy на Linux | 33 | — | Linux + VA-API |

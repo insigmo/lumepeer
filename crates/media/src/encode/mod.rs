@@ -1,10 +1,10 @@
 //! Encoder selection: hardware first, software fallback second (design doc
 //! §11, §18).
 //!
-//! H.264 baseline/main is the mandatory desktop baseline. AV1 and H.265 are
-//! optional and only when both sides have hardware support; there is no
-//! software fallback for either of them (ADR 0069, ADR 0071). Opus is the
-//! only audio codec.
+//! H.264 baseline/main is the mandatory desktop baseline, and AV1 is what a
+//! session prefers whenever both sides have hardware for it; there is no
+//! software fallback for AV1 (ADR 0069, ADR 0072). Opus is the only audio
+//! codec.
 
 use lumepeer_core::constants::{ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS};
 
@@ -20,14 +20,9 @@ use crate::error::{MediaError, Result};
 pub enum VideoCodec {
     /// Mandatory desktop baseline.
     H264,
-    /// Optional, only with mutual hardware support (ADR 0069).
+    /// Preferred over the baseline, but only with mutual hardware support
+    /// (ADR 0069, ADR 0072).
     Av1,
-    /// Optional, only with mutual hardware support, and only in a build made
-    /// with the `encode-h265` feature — which is a licensing decision, not a
-    /// technical one (ADR 0071). The variant itself is unconditional so that
-    /// every `match` over this enum reads the same in both builds; what the
-    /// feature gates is whether any backend will ever answer for it.
-    H265,
 }
 
 /// Where the encoding happens (§18).
@@ -120,21 +115,17 @@ pub trait VideoEncoder: Send {
 /// Foundation (`MFTEnumEx` filtered to `MFT_ENUM_FLAG_HARDWARE`) for the
 /// output subtype the codec names, and only reports
 /// [`EncoderKind::Hardware`] if one actually activates and accepts NV12
-/// input — never a hopeful guess (ADR 0011). For the optional codecs
-/// ([`VideoCodec::Av1`], and [`VideoCodec::H265`] where `encode-h265` is
-/// built in too) it goes one step further and pushes a frame through the
-/// transform it just activated, because "it enumerated" and "it produces a
-/// picture" are different questions for a codec a session only reaches by
-/// deliberately asking for it (ADR 0069, ADR 0071).
+/// input — never a hopeful guess (ADR 0011). For [`VideoCodec::Av1`] it goes
+/// one step further and pushes a frame through the transform it just
+/// activated, because "it enumerated" and "it produces a picture" are
+/// different questions for a codec whose encoder is far younger than the
+/// baseline's (ADR 0069).
 ///
 /// On Linux, with `encode-vaapi` built in, [`linux_vaapi`] does the same
 /// thing through VA-API for H.264: opens a DRM display, creates an H.264
 /// `VAEntrypointEncSlice` config, allocates NV12 surfaces and creates the
 /// encode context, reporting [`EncoderKind::Hardware`] only when all of that
-/// actually succeeds (ADR 0040). With `encode-h265` built in as well it
-/// answers the same way for [`VideoCodec::H265`] through
-/// `VAProfileHEVCMain`, with its own sequence, picture and slice parameter
-/// buffers rather than the H.264 ones (ADR 0071). It answers `None` for
+/// actually succeeds (ADR 0040). It answers `None` for
 /// [`VideoCodec::Av1`], and not because nobody looked: VA-API's AV1 encode
 /// entrypoint cannot be driven through this workspace's libva bindings at
 /// all, which ADR 0069 records rather than leaving as an unexplained gap.
@@ -146,9 +137,9 @@ pub trait VideoEncoder: Send {
 /// has actually come back out (ADR 0066). Every Mac of the last decade has an
 /// H.264 encoder, so "is one installed" is a question whose answer is almost
 /// always yes and almost never the reason a session shows nothing.
-/// `VideoCodec::Av1` and `VideoCodec::H265` are `None` there: `VideoToolbox`
-/// encodes both through different codec types with their own parameter sets
-/// that nothing here has checked.
+/// `VideoCodec::Av1` is `None` there, and not for want of looking: no Mac
+/// has an AV1 hardware encoder at all — Apple silicon decodes AV1 from M3
+/// onwards and encodes none of it.
 ///
 /// `MediaCodec` remains phase 4 work (§19), so this is `None` on Android.
 #[must_use]
