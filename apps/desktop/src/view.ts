@@ -541,7 +541,7 @@ async function nativeTick(): Promise<void> {
       nativeDecoder.reset();
       needKeyframe = true;
     }
-    if (nativeDecoder.push(chunk.frames).needKeyframe) {
+    if (nativeDecoder.push(chunk.frames, chunk.codec).needKeyframe) {
       needKeyframe = true;
     }
   } catch {
