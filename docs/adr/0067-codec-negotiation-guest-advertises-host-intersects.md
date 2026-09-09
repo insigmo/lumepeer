@@ -1,4 +1,4 @@
-# ADR 0066 — Codec negotiation: the guest advertises, the host intersects, H.264 is the floor
+# ADR 0067 — Codec negotiation: the guest advertises, the host intersects, H.264 is the floor
 
 Status: accepted
 Date: 2026-09-09

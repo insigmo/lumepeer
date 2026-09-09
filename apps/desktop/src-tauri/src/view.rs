@@ -742,7 +742,7 @@ impl BitstreamFeed {
 
 /// Bytes of the header [`encode_chunk_response`] always emits.
 ///
-/// 8 through minor 10; ADR 0066 appended one codec byte for minor 11 (§11).
+/// 8 through minor 10; ADR 0067 appended one codec byte for minor 11 (§11).
 pub const CHUNK_RESPONSE_HEADER_BYTES: usize = 9;
 
 /// Bytes of the per-frame header inside a chunk response.
@@ -763,7 +763,7 @@ pub const VIEW_FLAG_DESYNC: u8 = 0b0000_0100;
 /// health, the live `input` grant (§8.1) and the host's own recording
 /// statement (§2.2) all have to ride every answer, including the empty ones a
 /// still screen produces. `codec` rides the same way, for the same reason
-/// (ADR 0066): a session's negotiated codec can only change alongside a full
+/// (ADR 0067): a session's negotiated codec can only change alongside a full
 /// decoder reset (like `desync`), so the window has to see it on every
 /// answer rather than fetch it once and risk missing a change.
 #[must_use]
@@ -1186,7 +1186,7 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
 /// has been written also receives that frame, so starting or stopping a
 /// recording mid-session never restarts the pipeline.
 ///
-/// `codec` is the caller's already-settled choice (§11; ADR 0066) — the
+/// `codec` is the caller's already-settled choice (§11; ADR 0067) — the
 /// intersection of what the guest advertised understanding with what this
 /// host can actually encode right now, computed once before this loop starts
 /// and never revisited: a mid-session codec change is not supported, so a
@@ -1199,7 +1199,7 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
 )]
 #[allow(
     clippy::too_many_arguments,
-    reason = "codec (ADR 0066) is the eighth: a struct just to carry these \
+    reason = "codec (ADR 0067) is the eighth: a struct just to carry these \
               past the one call site that assembles them would be indirection \
               with no second caller to justify it"
 )]
@@ -2926,7 +2926,7 @@ mod tests {
         assert_eq!(bytes[1], VIEW_FLAG_RECORDING | VIEW_FLAG_DESYNC);
     }
 
-    /// ADR 0066: the negotiated codec rides the last header byte of every
+    /// ADR 0067: the negotiated codec rides the last header byte of every
     /// answer, including an empty one, so the window sees a mid-session
     /// change (or the lack of one) on every poll rather than fetching it once.
     #[test]

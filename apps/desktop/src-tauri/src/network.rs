@@ -341,7 +341,7 @@ struct ViewFeed {
     /// Encoded frames for a window that decodes them itself (ADR 0058).
     bitstream: Arc<BitstreamFeed>,
     /// The negotiated video codec, as a [`lumepeer_core::protocol::MediaCodec`]
-    /// wire byte (§11; ADR 0066). Starts at 0 (H.264) and is written only when
+    /// wire byte (§11; ADR 0067). Starts at 0 (H.264) and is written only when
     /// a `MessageKind::MediaCodec` arrives, which an older host never sends —
     /// so a guest that never hears otherwise stays on the baseline every host
     /// can produce.
@@ -2314,7 +2314,7 @@ struct DisplayModeFeature {
 }
 
 /// Host side: which optional codecs (beyond the mandatory H.264 baseline) a
-/// guest's `Hello` advertised understanding of (§11; ADR 0066).
+/// guest's `Hello` advertised understanding of (§11; ADR 0067).
 ///
 /// Unlike [`ReceiverReports`]/[`StreamScaleFeature`] this has no `to_peer`
 /// half: only a host ever chooses and announces a codec
@@ -2350,7 +2350,7 @@ impl GuestCodecSupport {
 
 /// Host side: what this host could show as `MediaCodec.codec` to a guest with
 /// `support`, given what this host can actually encode right now (§11; ADR
-/// 0066).
+/// 0067).
 ///
 /// AV1 is only chosen with mutual hardware support, asked through
 /// [`probe_hardware`] — the exact question `select_encoder` asks again later
@@ -2377,7 +2377,7 @@ fn choose_media_codec(support: GuestCodecSupport) -> VideoCodec {
 }
 
 /// The wire-level [`MediaCodec`] naming the same codec as `codec`, for the
-/// `MessageKind::MediaCodec` this host is about to send (§11; ADR 0066).
+/// `MessageKind::MediaCodec` this host is about to send (§11; ADR 0067).
 ///
 /// Infallible because [`choose_media_codec`] never returns a
 /// `lumepeer_media` codec this cannot name — the day it can, this match grows
@@ -2514,7 +2514,7 @@ struct ViewState {
     /// cursor into the picture sends none, and this stays `None`.
     cursor: Arc<std::sync::RwLock<Option<CursorFeed>>>,
     /// The negotiated video codec, as the frame poll reads it (§11; ADR
-    /// 0066). Written when a `MessageKind::MediaCodec` arrives; starts at 0
+    /// 0067). Written when a `MessageKind::MediaCodec` arrives; starts at 0
     /// (H.264), the only codec a host that never sends one can mean.
     codec: Arc<AtomicU8>,
     /// The host's monitors, as it announced them when it granted the session
@@ -2606,7 +2606,7 @@ enum ActorEvent {
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
         /// Which optional codecs the guest's `Hello` advertised understanding
-        /// of (§11; ADR 0066).
+        /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
     },
     /// A live connection delivered a control message.
@@ -2703,7 +2703,7 @@ enum Accepted {
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
         /// Which optional codecs the guest's `Hello` advertised understanding
-        /// of (§11; ADR 0066).
+        /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
     },
     /// Media ALPN: authenticated only, nothing decided.
@@ -2801,7 +2801,7 @@ struct Actor {
     /// peer can speak (§9.1; docs/bugs/16-host-display-mode.md; ADR 0048).
     display_mode: std::collections::HashMap<NodeId, DisplayModeFeature>,
     /// Host side: which optional codecs each guest's `Hello` advertised
-    /// understanding of (§11; ADR 0066).
+    /// understanding of (§11; ADR 0067).
     guest_codec_support: std::collections::HashMap<NodeId, GuestCodecSupport>,
     /// Host side: the host's own monitor's original mode, and who is
     /// responsible for restoring it, while a switch this session made has
@@ -3886,7 +3886,7 @@ impl Actor {
                 self.receiver_reports.entry(peer).or_default().from_peer = speaks_receiver_report;
                 // Which optional codecs this guest can actually decode, for
                 // the choice `on_media_accepted` makes before its encode loop
-                // starts (§11; ADR 0066).
+                // starts (§11; ADR 0067).
                 self.guest_codec_support.insert(peer, guest_codec_support);
                 // Same shape, for the manual scale ceiling (D7,
                 // docs/bugs/13-stream-resolution.md).
@@ -4010,7 +4010,7 @@ impl Actor {
                 .grants(&peer)
                 .is_some_and(|grants| grants.secure_desktop),
         );
-        // §11, ADR 0066: the intersection of what this guest can decode with
+        // §11, ADR 0067: the intersection of what this guest can decode with
         // what this host can encode right now, falling back to H.264 — sent
         // before the first frame and only to a guest that proved it
         // understands the message by advertising at least one codec string.
@@ -4252,7 +4252,7 @@ impl Actor {
         let cursor: Arc<std::sync::RwLock<Option<CursorFeed>>> =
             Arc::new(std::sync::RwLock::new(None));
         // Starts at H.264 (0): a host that never sends `MediaCodec` at all —
-        // every host built before ADR 0066, and any newer one this guest gave
+        // every host built before ADR 0067, and any newer one this guest gave
         // no codec feature string to negotiate with — can only ever mean the
         // mandatory baseline.
         let codec = Arc::new(AtomicU8::new(0));
@@ -4920,7 +4920,7 @@ impl Actor {
             // Guest side: the host announced it has no picture to send.
             MessageKind::MediaUnavailable(reason) => self.on_media_unavailable(peer, reason),
             // Guest side: the host announced which codec the media stream is
-            // about to carry (§11; ADR 0066). The byte already passed
+            // about to carry (§11; ADR 0067). The byte already passed
             // `MessageEnvelope::decode`'s `check_limits`, so it is one of the
             // assigned `MediaCodec` values; a view for this peer may not exist
             // yet if the message somehow raced the window closing, in which
@@ -8347,13 +8347,13 @@ async fn connect_once(
     // the message behind it.
     //
     // No `FEATURE_CODEC_AV1`/`FEATURE_CODEC_H265`/`FEATURE_CODEC_VP9` here
-    // (§11; ADR 0066). The real answer — `VideoDecoder.isConfigSupported`,
+    // (§11; ADR 0067). The real answer — `VideoDecoder.isConfigSupported`,
     // asked by `view-decoder.ts`'s `supportedOptionalCodecs()` — can only run
     // inside the view window, and the view window does not exist yet at this
     // point: it opens only after `HelloAck` and consent, both of which come
     // after the `Hello` this call is about to send. Advertising a codec this
     // process has not actually asked its `WebView` about would be relying on
-    // an unverified assumption exactly like the one ADR 0066 rejects (the
+    // an unverified assumption exactly like the one ADR 0067 rejects (the
     // v0.0.14 blank screen, `.github/workflows/release.yml`'s build matrix
     // comment). Nothing is lost by staying quiet: no build
     // of this workspace can encode anything but H.264 either yet (batches
@@ -8948,7 +8948,7 @@ mod tests {
         assert_eq!(tracker.smoothed(), after_the_real_one);
     }
 
-    /// §9.1, ADR 0066: a guest that advertised none of the three codec
+    /// §9.1, ADR 0067: a guest that advertised none of the three codec
     /// feature strings must be indistinguishable, at the negotiation layer,
     /// from one that predates this message entirely — the whole point being
     /// that `on_media_accepted` never sends it such a guest `MediaCodec` at
@@ -8961,7 +8961,7 @@ mod tests {
     }
 
     /// `GuestCodecSupport::from_features` reads exactly the three strings
-    /// ADR 0066 defines and nothing else, and any one of them alone is
+    /// ADR 0067 defines and nothing else, and any one of them alone is
     /// enough to prove this guest understands the message.
     #[test]
     fn from_features_reads_each_codec_string_independently() {
