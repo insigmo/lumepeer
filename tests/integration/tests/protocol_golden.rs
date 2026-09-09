@@ -11,8 +11,10 @@
 //! 14-clipboard-files.md; ADR 0047), minor 9 appended `DisplayModesList` and
 //! `DisplaySetMode` (docs/bugs/16-host-display-mode.md; ADR 0048), minor 11
 //! appended `MediaCodec` (ADR 0067), minor 12 appended `DirListRequest` and
-//! `DirListResponse` (ADR 0075) — and every earlier vector is still in the
-//! file unchanged, which is the compatibility claim this test checks.
+//! `DirListResponse` (ADR 0075), minor 13 appended `FileFetchRequest`,
+//! `FileFetchRefused` and `FilePutOffer` (ADR 0076) — and every earlier
+//! vector is still in the file unchanged, which is the compatibility claim
+//! this test checks.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,
 //! so a stable toolchain still exercises them on every CI run; the nightly
@@ -79,7 +81,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 12,
+        PROTOCOL_MINOR, 13,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 
