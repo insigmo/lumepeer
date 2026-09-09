@@ -166,6 +166,7 @@ export const ja: Dictionary = {
   'files.heading': 'ファイル',
   'files.sendHint': 'ファイルを送るには Ctrl+C でコピーしてください — 自動的にここに表示されます。',
   'files.fromClipboard': 'クリップボードから',
+  'files.directory': 'フォルダー',
   'files.accept': '受け入れる',
   'files.decline': '拒否',
   'files.cancel': 'キャンセル',

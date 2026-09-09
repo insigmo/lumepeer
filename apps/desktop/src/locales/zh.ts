@@ -159,6 +159,7 @@ export const zh: Dictionary = {
   'files.heading': '文件',
   'files.sendHint': '要发送文件，请使用 Ctrl+C 复制它——它会自动出现在此处。',
   'files.fromClipboard': '来自剪贴板',
+  'files.directory': '文件夹',
   'files.accept': '接受',
   'files.decline': '拒绝',
   'files.cancel': '取消',

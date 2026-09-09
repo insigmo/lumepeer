@@ -168,6 +168,7 @@ export const pt: Dictionary = {
   'files.sendHint':
     'Para enviar um arquivo, copie-o com Ctrl+C — ele será oferecido aqui automaticamente.',
   'files.fromClipboard': 'Da área de transferência',
+  'files.directory': 'Pasta',
   'files.accept': 'Aceitar',
   'files.decline': 'Recusar',
   'files.cancel': 'Cancelar',
