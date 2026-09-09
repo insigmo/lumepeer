@@ -241,19 +241,28 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
 }
 
 /**
- * Fixed `VideoDecoder` config string for each optional codec (ADR 0067).
+ * Fixed `VideoDecoder` config string for each optional codec (ADR 0067,
+ * ADR 0069).
  *
- * Unlike H.264 (see {@link avcCodecString}), nothing here yet reads a real
- * profile out of the stream itself: no encoder for any of these three exists
- * in this workspace (batches 07/08/09 add them), so there is no bitstream to
- * read one from. These name the baseline profile/level each of those batches
- * is expected to actually produce — AV1 Main profile level 4.0 main tier
- * 8-bit, H.265 Main profile main tier level 3.1, VP9 profile 0 level 1.0
- * 8-bit — and are exercised here purely as the config each codec probes and
- * configures with until a real encoder gives a real stream to read instead.
+ * Unlike H.264 (see {@link avcCodecString}), nothing here reads a profile out
+ * of the stream itself. For AV1 that is now a decision rather than a gap: an
+ * AV1 temporal unit is a sequence of OBUs, not Annex-B NAL units, so its
+ * profile and level sit inside a sequence header OBU behind variable-length
+ * bit fields — and the host's Media Foundation encoder produces Main profile
+ * 8-bit and nothing else, which is the whole of what this string has to say.
+ * For H.265 and VP9 there is still no encoder anywhere in this workspace to
+ * read a stream from (batches 08/09).
+ *
+ * AV1 is Main profile, level 4.1, main tier, 8-bit. Level 4.1 rather than 4.0
+ * because it is the first level whose sample rate covers 1080p at 60 Hz, and
+ * `MAX_PICTURE_PIXELS` is 1080p while nothing pins the host to 30. This is a
+ * ceiling the decoder is asked to clear, not a description of any particular
+ * stream, so naming one level above what a default session needs costs
+ * nothing — and a machine that cannot clear it says so, and the session stays
+ * on H.264.
  */
 const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.H265 | WireCodec.Vp9, string>> = {
-  [WireCodec.Av1]: 'av01.0.04M.08',
+  [WireCodec.Av1]: 'av01.0.05M.08',
   [WireCodec.H265]: 'hev1.1.6.L93.B0',
   [WireCodec.Vp9]: 'vp09.00.10.08',
 };
@@ -300,9 +309,10 @@ export async function supportedOptionalCodecs(): Promise<WireCodec[]> {
  * H.264 alone reads its profile out of the stream (see {@link avcCodecString}):
  * its encoder can pick High, Main or Baseline depending on what the host's
  * hardware gives, so nothing else can name the right string. The other three
- * have exactly one fixed {@link OPTIONAL_CODEC_CONFIGS} entry each, because
- * nothing in this workspace encodes them yet with a profile of its own
- * choosing to read back.
+ * have exactly one fixed {@link OPTIONAL_CODEC_CONFIGS} entry each, and
+ * `keyframe.data` is deliberately not looked at for them — an AV1 stream is
+ * OBUs rather than Annex-B NAL units, so the H.264 walk would find start
+ * codes wherever the byte pattern happened to produce them (ADR 0069).
  */
 export function configStringFor(codec: WireCodec, keyframe: ChunkFrame): string | null {
   if (codec === WireCodec.H264) {

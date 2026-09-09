@@ -282,6 +282,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::history_forget_password,
         commands::connect_status,
         commands::connect_cancel,
+        commands::report_decoder_codecs,
         commands::network_status,
         commands::connection_stats,
         commands::license_status,

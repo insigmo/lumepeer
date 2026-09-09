@@ -160,6 +160,15 @@ pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
             return Some(EncoderKind::Hardware);
         }
     }
+    // Says which codec found nothing, which is the whole answer to "why did
+    // this session negotiate H.264" on a machine whose hardware does not
+    // encode the codec the guest asked for (§18). It also keeps `config` used
+    // in a build with no encoder backend compiled in at all, which every
+    // branch above is behind a `cfg` for.
+    tracing::debug!(
+        codec = ?config.codec,
+        "no hardware encoder backend on this machine reports support"
+    );
     None
 }
 
