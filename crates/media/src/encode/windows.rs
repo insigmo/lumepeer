@@ -63,6 +63,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
     eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_High,
 };
+#[cfg(feature = "encode-h265")]
+use windows::Win32::Media::MediaFoundation::{MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, Interface as _};
@@ -82,6 +84,31 @@ const BITS_PER_KBIT: u32 = 1_000;
 const PROBE_WIDTH: u32 = 64;
 /// See [`PROBE_WIDTH`].
 const PROBE_HEIGHT: u32 = 64;
+
+/// Probe/initial negotiation size for the optional codecs.
+///
+/// Larger than [`PROBE_WIDTH`], and not for tidiness: HEVC and AV1 encoder
+/// MFTs refuse pictures the H.264 MFT sitting next to them on the same GPU
+/// accepts. NVENC's HEVC minimum is 128 pixels on each axis and Intel's AV1
+/// encoder has a floor of its own, so a 64x64 rehearsal answers "there is no
+/// encoder" on a machine whose answer is "not at that size" — measured here
+/// on a machine with both an "NVIDIA HEVC Encoder MFT" and an "Intel Hardware
+/// H265 Encoder MFT" registered, both of which decline 64x64 and accept this
+/// (ADR 0071).
+///
+/// Still small enough to cost nothing: it is negotiated once and the first
+/// real frame reconfigures to the screen's own size.
+const OPTIONAL_PROBE_WIDTH: u32 = 256;
+/// See [`OPTIONAL_PROBE_WIDTH`].
+const OPTIONAL_PROBE_HEIGHT: u32 = 256;
+
+/// The geometry a probe and a fresh encoder negotiate at for `codec`.
+const fn probe_dims(codec: VideoCodec) -> (u32, u32) {
+    match codec {
+        VideoCodec::H264 => (PROBE_WIDTH, PROBE_HEIGHT),
+        VideoCodec::Av1 | VideoCodec::H265 => (OPTIONAL_PROBE_WIDTH, OPTIONAL_PROBE_HEIGHT),
+    }
+}
 /// Busy-poll granularity while waiting for an async MFT event. Small enough
 /// to keep p50 latency negligible; the overall wait is still bounded by
 /// `ENCODE_HW_EVENT_TIMEOUT_MS`.
@@ -126,39 +153,101 @@ const QUALITY_VS_SPEED: u32 = 33;
 /// ever comes.
 const GOP_SECONDS: u32 = 10;
 
-/// The Media Foundation output subtype for one codec.
+/// The Media Foundation output subtype for one codec, or `None` when this
+/// build cannot ask for that codec at all.
 ///
 /// The one place a codec turns into a GUID, so enumeration
 /// ([`enum_hardware_encoders`]) and the negotiated output type
 /// ([`build_output_type`]) can never ask for different things — a transform
 /// enumerated for one subtype and configured for another is the mismatch that
 /// makes a driver hand back a bitstream the guest cannot decode (ADR 0069).
-const fn mf_subtype(codec: VideoCodec) -> GUID {
+///
+/// `MFVideoFormat_HEVC` rather than `MFVideoFormat_HEVC_ES`: the former is
+/// what Microsoft's hardware HEVC encoder MFTs advertise, and what they emit
+/// is an Annex-B byte stream with the VPS/SPS/PPS in band ahead of each IRAP
+/// picture. That is deliberately the same shape the H.264 path already
+/// produces, which is what lets the guest configure `VideoDecoder` from a
+/// `hvc1.…` string with no `description` — `WebCodecs` reads a missing
+/// `description` as "this bitstream is Annex-B" (ADR 0071).
+#[cfg_attr(
+    feature = "encode-h265",
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "`None` is a real answer in a build without `encode-h265`, and the signature must not change with the feature (ADR 0071)"
+    )
+)]
+const fn mf_subtype(codec: VideoCodec) -> Option<GUID> {
     match codec {
-        VideoCodec::H264 => MFVideoFormat_H264,
-        VideoCodec::Av1 => MFVideoFormat_AV1,
+        VideoCodec::H264 => Some(MFVideoFormat_H264),
+        VideoCodec::Av1 => Some(MFVideoFormat_AV1),
+        #[cfg(feature = "encode-h265")]
+        VideoCodec::H265 => Some(MFVideoFormat_HEVC),
+        // Not "this machine has no HEVC encoder" but "this build may not ask
+        // for one": without `encode-h265` there is no subtype to enumerate,
+        // and every H.265 question below therefore ends in `None`/`Err`
+        // before a single Media Foundation call is made (ADR 0071).
+        #[cfg(not(feature = "encode-h265"))]
+        VideoCodec::H265 => None,
     }
 }
 
+/// The `MF_MT_MPEG2_PROFILE` value for `codec`, or `None` for a codec whose
+/// profile this module leaves to the driver.
+///
+/// The attribute is shared but its meaning is not: it carries an
+/// `eAVEncH264VProfile` for an H.264 MFT and an `eAVEncH265VProfile` for an
+/// HEVC one, which is exactly why this is a per-codec answer rather than one
+/// constant. AV1 gets `None` — Main is the only profile any hardware AV1
+/// encoder produces for the 8-bit 4:2:0 input this feeds it, so the driver's
+/// default is already right (ADR 0069).
+fn mf_profile(codec: VideoCodec) -> Option<u32> {
+    match codec {
+        // High profile. It is the same decoder cost on anything built this
+        // decade and it buys CABAC and 8x8 transforms, which is real
+        // sharpness back on exactly the content a desktop is made of: text
+        // edges and flat fills.
+        VideoCodec::H264 => Some(platform_profile(eAVEncH264VProfile_High.0)),
+        VideoCodec::Av1 => None,
+        // Main, 4:2:0, 8-bit: the one HEVC profile every hardware encoder
+        // implements and the only one this pipeline's NV12 input can feed
+        // (ADR 0071).
+        #[cfg(feature = "encode-h265")]
+        VideoCodec::H265 => Some(platform_profile(eAVEncH265VProfile_Main_420_8.0)),
+        #[cfg(not(feature = "encode-h265"))]
+        VideoCodec::H265 => None,
+    }
+}
+
+/// One `eAVEnc*VProfile` constant as the `u32` `MF_MT_MPEG2_PROFILE` wants;
+/// they are fixed, non-negative platform enum values.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "the video profiles are fixed, non-negative platform enum constants"
+)]
+const fn platform_profile(profile: i32) -> u32 {
+    profile as u32
+}
+
 /// Whether a genuinely usable hardware encoder MFT for `config.codec` is
-/// available right now (§18; ADR 0011, ADR 0069).
+/// available right now (§18; ADR 0011, ADR 0069, ADR 0071).
 ///
 /// H.264 runs the exact same activation and type negotiation
 /// [`MediaFoundationEncoder::new`] would use, so this cannot claim
 /// availability that construction then fails to back up.
 ///
-/// AV1 goes one step further and encodes a frame, the way the
+/// The optional codecs go one step further and encode a frame, the way the
 /// `VideoToolbox` probe does (ADR 0066). The reason is the same one that
 /// applies there: on H.264 the interesting question is whether an encoder
-/// exists at all, and on AV1 — hardware that is at most a few years old,
-/// through driver paths that are much younger than the H.264 ones next to
-/// them — it is whether the transform that just enumerated actually produces
-/// a picture. §11 only allows AV1 with real hardware behind it on both sides,
-/// and "it enumerated" is not that evidence.
+/// exists at all, and plenty of machines have none. On a codec a session only
+/// reaches because a guest asked for it and this build was made to offer it,
+/// the question is whether the transform that just enumerated actually
+/// produces a picture — §11 allows either optional codec only with real
+/// hardware behind it on both sides, and "it enumerated" is not that
+/// evidence. It costs one 64x64 frame, once, at encoder selection.
 pub(super) fn hardware_available(config: EncoderConfig) -> bool {
     match config.codec {
         VideoCodec::H264 => activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config).is_ok(),
-        VideoCodec::Av1 => encodes_one_frame(config),
+        VideoCodec::Av1 | VideoCodec::H265 => encodes_one_frame(config),
     }
 }
 
@@ -168,7 +257,7 @@ fn encodes_one_frame(config: EncoderConfig) -> bool {
     let Ok(mut encoder) = MediaFoundationEncoder::new(config) else {
         return false;
     };
-    match encoder.encode(&probe_frame()) {
+    match encoder.encode(&probe_frame(config.codec)) {
         Ok(frame) => !frame.data.is_empty(),
         Err(error) => {
             tracing::info!(%error, codec = ?config.codec, "a hardware encoder MFT activated but produced no picture");
@@ -177,18 +266,19 @@ fn encodes_one_frame(config: EncoderConfig) -> bool {
     }
 }
 
-/// A flat grey [`PROBE_WIDTH`]x[`PROBE_HEIGHT`] picture for [`encodes_one_frame`]
-/// to push through a transform it just activated.
-fn probe_frame() -> Frame {
+/// A flat grey [`probe_dims`] picture for [`encodes_one_frame`] to push
+/// through a transform it just activated.
+fn probe_frame(codec: VideoCodec) -> Frame {
     /// Mid grey, so the picture is neither degenerate black nor saturated
     /// white; nothing depends on the value beyond it being a real image.
     const FILL: u8 = 0x80;
+    let (width, height) = probe_dims(codec);
     Frame {
-        width: PROBE_WIDTH,
-        height: PROBE_HEIGHT,
+        width,
+        height,
         format: PixelFormat::Bgra8,
         timestamp_us: 0,
-        data: vec![FILL; (PROBE_WIDTH as usize) * (PROBE_HEIGHT as usize) * 4],
+        data: vec![FILL; (width as usize) * (height as usize) * 4],
     }
 }
 
@@ -249,13 +339,13 @@ impl MediaFoundationEncoder {
     /// [`MediaError::EncoderUnavailable`] if no hardware encoder MFT for that
     /// codec is available and usable.
     pub fn new(config: EncoderConfig) -> Result<Self> {
-        let (mf, transform, events) =
-            activate_hardware_transform(PROBE_WIDTH, PROBE_HEIGHT, config)?;
+        let (width, height) = probe_dims(config.codec);
+        let (mf, transform, events) = activate_hardware_transform(width, height, config)?;
         Ok(Self {
             transform,
             events,
             config,
-            dims: (PROBE_WIDTH, PROBE_HEIGHT),
+            dims: (width, height),
             pump: EventPump::default(),
             needs_drain: false,
             mf,
@@ -600,6 +690,15 @@ fn activate_hardware_transform(
     height: u32,
     config: EncoderConfig,
 ) -> Result<(MfRuntime, IMFTransform, Option<IMFMediaEventGenerator>)> {
+    // Before `MFStartup`, deliberately: a build that cannot ask for this
+    // codec at all must not start Media Foundation to find that out
+    // (ADR 0071).
+    let Some(subtype) = mf_subtype(config.codec) else {
+        return Err(MediaError::EncoderUnavailable(format!(
+            "this build was not made with support for {:?}",
+            config.codec
+        )));
+    };
     let mf = MfRuntime::acquire()?;
     ensure_com_initialized()?;
 
@@ -609,7 +708,7 @@ fn activate_hardware_transform(
     };
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: mf_subtype(config.codec),
+        guidSubtype: subtype,
     };
 
     for activate in enum_hardware_encoders(&input_info, &output_info)? {
@@ -774,8 +873,14 @@ fn build_output_type(width: u32, height: u32, config: EncoderConfig) -> Result<I
         media_type
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
+        let subtype = mf_subtype(config.codec).ok_or_else(|| {
+            MediaError::EncoderUnavailable(format!(
+                "this build was not made with support for {:?}",
+                config.codec
+            ))
+        })?;
         media_type
-            .SetGUID(&MF_MT_SUBTYPE, &mf_subtype(config.codec))
+            .SetGUID(&MF_MT_SUBTYPE, &raw const subtype)
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
         media_type
             .SetUINT32(
@@ -786,37 +891,17 @@ fn build_output_type(width: u32, height: u32, config: EncoderConfig) -> Result<I
         media_type
             .SetUINT32(&MF_MT_INTERLACE_MODE, interlace_progressive())
             .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))?;
-        // High profile, best-effort. It is the same decoder cost on anything
-        // built this decade and it buys CABAC and 8x8 transforms, which is
-        // real sharpness back on exactly the content a desktop is made of:
-        // text edges and flat fills. A driver that refuses it keeps whatever
-        // profile it defaults to, so this is set rather than negotiated.
-        //
-        // H.264 only, and deliberately: `MF_MT_MPEG2_PROFILE` carries an
-        // `eAVEncH264VProfile` value, so setting it on an AV1 output type
-        // would be naming an H.264 profile number to an AV1 encoder. AV1 gets
-        // no profile attribute at all — Main is the only profile any hardware
-        // AV1 encoder produces for the 8-bit 4:2:0 input this feeds it, so the
-        // driver's own default is already the right answer and there is
-        // nothing here worth guessing at (ADR 0069).
-        if config.codec == VideoCodec::H264 {
-            let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, h264_high_profile());
+        // Best-effort, and per codec — see [`mf_profile`]. A driver that
+        // refuses the value keeps whatever profile it defaults to, so this is
+        // set rather than negotiated.
+        if let Some(profile) = mf_profile(config.codec) {
+            let _ = media_type.SetUINT32(&MF_MT_MPEG2_PROFILE, profile);
         }
     }
     set_frame_size(&media_type, width, height)?;
     set_frame_rate(&media_type, config.fps)?;
     set_pixel_aspect_ratio(&media_type)?;
     Ok(media_type)
-}
-
-/// `eAVEncH264VProfile_High` as the `u32` `MF_MT_MPEG2_PROFILE` wants; the
-/// constant is a fixed, non-negative platform enum value.
-#[allow(
-    clippy::cast_sign_loss,
-    reason = "eAVEncH264VProfile_High is a fixed, non-negative platform enum constant"
-)]
-fn h264_high_profile() -> u32 {
-    eAVEncH264VProfile_High.0 as u32
 }
 
 /// Asks the transform's own attribute store for low-latency processing.
@@ -1230,39 +1315,79 @@ fn bitstream_is_random_access(codec: VideoCodec, data: &[u8]) -> bool {
     match codec {
         VideoCodec::H264 => bitstream_has_idr(data),
         VideoCodec::Av1 => av1_has_sequence_header(data),
+        VideoCodec::H265 => bitstream_has_irap(data),
     }
+}
+
+/// `nal_unit_type` occupies the low five bits of an H.264 NAL header byte.
+const H264_NAL_TYPE_MASK: u8 = 0b0001_1111;
+/// H.264 `nal_unit_type` 5: a slice of an IDR picture.
+const H264_NAL_IDR: u8 = 5;
+/// `nal_unit_type` occupies bits 6..1 of the first byte of an H.265 NAL
+/// header, which is two bytes rather than H.264's one.
+const HEVC_NAL_TYPE_SHIFT: u32 = 1;
+/// See [`HEVC_NAL_TYPE_SHIFT`].
+const HEVC_NAL_TYPE_MASK: u8 = 0b0011_1111;
+/// First `nal_unit_type` of H.265's IRAP set (`BLA_W_LP`).
+const HEVC_NAL_IRAP_FIRST: u8 = 16;
+/// Last `nal_unit_type` of H.265's IRAP set (`RSV_IRAP_VCL23`). The whole
+/// range is reserved for pictures a decoder may start from, so the two
+/// reserved values at the top belong in it too.
+const HEVC_NAL_IRAP_LAST: u8 = 23;
+
+/// Offsets of every NAL unit header byte in an Annex-B buffer.
+///
+/// Shared by the two scans below: H.264 and H.265 frame their NAL units with
+/// the same three- or four-byte start codes and differ only in what the
+/// header byte means, so the walk is written once rather than twice.
+fn annex_b_nal_headers(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        while i + 3 <= data.len() {
+            let start_code_len = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                3usize
+            } else if i + 4 <= data.len()
+                && data[i] == 0
+                && data[i + 1] == 0
+                && data[i + 2] == 0
+                && data[i + 3] == 1
+            {
+                4usize
+            } else {
+                i += 1;
+                continue;
+            };
+            let nal_start = i + start_code_len;
+            // Never stands still: `nal_start` is at least `i + 3`.
+            i = nal_start;
+            return Some(nal_start);
+        }
+        None
+    })
 }
 
 /// Scans an Annex-B H.264 bitstream for an IDR slice NAL unit (type 5).
 fn bitstream_has_idr(data: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 3 <= data.len() {
-        let start_code_len = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            Some(3usize)
-        } else if i + 4 <= data.len()
-            && data[i] == 0
-            && data[i + 1] == 0
-            && data[i + 2] == 0
-            && data[i + 3] == 1
-        {
-            Some(4usize)
-        } else {
-            None
-        };
-        match start_code_len {
-            Some(len) => {
-                let nal_start = i + len;
-                if let Some(&header) = data.get(nal_start)
-                    && header & 0x1F == 5
-                {
-                    return true;
-                }
-                i = nal_start.max(i + 1);
-            }
-            None => i += 1,
-        }
-    }
-    false
+    annex_b_nal_headers(data).any(|at| {
+        data.get(at)
+            .is_some_and(|header| header & H264_NAL_TYPE_MASK == H264_NAL_IDR)
+    })
+}
+
+/// Scans an Annex-B H.265 bitstream for an IRAP picture — the H.265 answer to
+/// "can a decoder start here" (ADR 0071).
+///
+/// A range rather than one type, unlike H.264's single IDR: H.265 splits
+/// random access into IDR, CRA and BLA pictures, and every one of them is a
+/// point a decoder can join at. `IDR_W_RADL` alone would miss the CRA
+/// pictures an encoder emits for periodic refresh.
+fn bitstream_has_irap(data: &[u8]) -> bool {
+    annex_b_nal_headers(data).any(|at| {
+        data.get(at).is_some_and(|header| {
+            let nal_type = (header >> HEVC_NAL_TYPE_SHIFT) & HEVC_NAL_TYPE_MASK;
+            (HEVC_NAL_IRAP_FIRST..=HEVC_NAL_IRAP_LAST).contains(&nal_type)
+        })
+    })
 }
 
 /// `obu_forbidden_bit` of an AV1 OBU header; always 0 in a well-formed
@@ -1514,7 +1639,7 @@ mod tests {
         }
         // The probe above already built one of these and encoded through it.
         let mut encoder = MediaFoundationEncoder::new(config).unwrap();
-        let first = encoder.encode(&probe_frame()).unwrap();
+        let first = encoder.encode(&probe_frame(config.codec)).unwrap();
         assert!(!first.data.is_empty());
         assert!(first.keyframe, "the first frame must be decodable alone");
         assert_eq!(encoder.kind(), EncoderKind::Hardware);
@@ -1528,9 +1653,30 @@ mod tests {
     /// individual step apparently succeeding.
     #[test]
     fn each_codec_has_its_own_media_foundation_subtype() {
-        assert_eq!(mf_subtype(VideoCodec::H264), MFVideoFormat_H264);
-        assert_eq!(mf_subtype(VideoCodec::Av1), MFVideoFormat_AV1);
+        assert_eq!(mf_subtype(VideoCodec::H264), Some(MFVideoFormat_H264));
+        assert_eq!(mf_subtype(VideoCodec::Av1), Some(MFVideoFormat_AV1));
         assert_ne!(mf_subtype(VideoCodec::H264), mf_subtype(VideoCodec::Av1));
+    }
+
+    /// The licensing switch of ADR 0071, checked at the one place it takes
+    /// effect: without `encode-h265` there is no subtype to enumerate, so no
+    /// Media Foundation call is ever made for H.265 and no probe can answer
+    /// anything but `false`.
+    #[test]
+    fn h265_exists_as_a_subtype_only_in_a_build_that_asked_for_it() {
+        #[cfg(feature = "encode-h265")]
+        {
+            assert_eq!(mf_subtype(VideoCodec::H265), Some(MFVideoFormat_HEVC));
+            assert_ne!(mf_subtype(VideoCodec::H265), mf_subtype(VideoCodec::H264));
+        }
+        #[cfg(not(feature = "encode-h265"))]
+        {
+            assert_eq!(mf_subtype(VideoCodec::H265), None);
+            assert!(!hardware_available(EncoderConfig {
+                codec: VideoCodec::H265,
+                ..EncoderConfig::default()
+            }));
+        }
     }
 
     #[test]
@@ -1644,16 +1790,96 @@ mod tests {
         assert!(!av1_has_sequence_header(&[obu_header(6), 0x40, 0x00]));
     }
 
-    /// The two scanners must never be applied to each other's bitstream: an
-    /// H.264 IDR is a byte pattern an OBU walk can wander into, and vice
-    /// versa.
+    /// H.265 `nal_unit_type` 32/33/34: the video, sequence and picture
+    /// parameter sets a decoder needs before it can read anything else. Only
+    /// the tests name them; the encoder never inspects them.
+    const HEVC_NAL_VPS: u8 = 32;
+    /// See [`HEVC_NAL_VPS`].
+    const HEVC_NAL_SPS: u8 = 33;
+    /// See [`HEVC_NAL_VPS`].
+    const HEVC_NAL_PPS: u8 = 34;
+
+    /// The first byte of an H.265 NAL header carrying `nal_type`.
+    const fn hevc_nal_header(nal_type: u8) -> u8 {
+        nal_type << HEVC_NAL_TYPE_SHIFT
+    }
+
+    /// Every `nal_unit_type` H.265 reserves for random access counts, not
+    /// just IDR: an encoder doing periodic refresh emits CRA pictures, and a
+    /// scan that only knew about IDR would report a guest's own entry point
+    /// as a delta frame.
+    #[test]
+    fn hevc_finds_every_irap_type_and_nothing_else() {
+        for nal_type in HEVC_NAL_IRAP_FIRST..=HEVC_NAL_IRAP_LAST {
+            let data = [0x00, 0x00, 0x00, 0x01, hevc_nal_header(nal_type), 0x01];
+            assert!(bitstream_has_irap(&data), "type {nal_type} is an IRAP");
+        }
+        // TRAIL_R (1), a plain inter picture, and VPS (32), which is above
+        // the IRAP range.
+        for nal_type in [1u8, HEVC_NAL_VPS] {
+            let data = [0x00, 0x00, 0x01, hevc_nal_header(nal_type), 0x01];
+            assert!(!bitstream_has_irap(&data), "type {nal_type} is not an IRAP");
+        }
+        assert!(!bitstream_has_irap(&[]));
+    }
+
+    /// The three scanners must never be applied to each other's bitstream: an
+    /// H.264 IDR is a byte pattern an OBU walk can wander into, an H.265 NAL
+    /// header is one an H.264 walk reads as a different type entirely, and
+    /// vice versa.
     #[test]
     fn random_access_detection_does_not_cross_codecs() {
         let h264_idr = [0x00, 0x00, 0x00, 0x01, 0x65, 0xAA];
         let av1_keyframe = [obu_header(2), 0x00, obu_header(1), 0x01, 0x00];
+        // IDR_W_RADL (19). As an H.264 header byte this reads as type 6, SEI.
+        let hevc_idr = [0x00, 0x00, 0x00, 0x01, hevc_nal_header(19), 0x01, 0xAA];
         assert!(bitstream_is_random_access(VideoCodec::H264, &h264_idr));
         assert!(!bitstream_is_random_access(VideoCodec::Av1, &h264_idr));
+        assert!(!bitstream_is_random_access(VideoCodec::H265, &h264_idr));
         assert!(bitstream_is_random_access(VideoCodec::Av1, &av1_keyframe));
         assert!(!bitstream_is_random_access(VideoCodec::H264, &av1_keyframe));
+        assert!(!bitstream_is_random_access(VideoCodec::H265, &av1_keyframe));
+        assert!(bitstream_is_random_access(VideoCodec::H265, &hevc_idr));
+        assert!(!bitstream_is_random_access(VideoCodec::H264, &hevc_idr));
+    }
+
+    /// The H.265 twin of `an_av1_probe_that_says_yes_is_backed_by_a_real
+    /// _picture`, and the one claim the guest's decoder configuration rests
+    /// on: this backend hands back an **Annex-B** byte stream with the
+    /// parameter sets in band, not a length-prefixed `hvcC` one. `WebCodecs`
+    /// reads a `VideoDecoder` config with no `description` as Annex-B, which
+    /// is what `view-decoder.ts` sends for H.265 (ADR 0071).
+    #[cfg(feature = "encode-h265")]
+    #[test]
+    fn an_h265_probe_that_says_yes_produces_annex_b_with_its_parameter_sets() {
+        let config = EncoderConfig {
+            codec: VideoCodec::H265,
+            ..EncoderConfig::default()
+        };
+        if !hardware_available(config) {
+            eprintln!("skipping: no hardware HEVC encoder MFT on this machine");
+            return;
+        }
+        // The probe above already built one of these and encoded through it.
+        let mut encoder = MediaFoundationEncoder::new(config).unwrap();
+        let first = encoder.encode(&probe_frame(config.codec)).unwrap();
+        assert!(!first.data.is_empty());
+        assert!(first.keyframe, "the first frame must be decodable alone");
+        assert!(
+            first.data.starts_with(&[0x00, 0x00, 0x00, 0x01])
+                || first.data.starts_with(&[0x00, 0x00, 0x01]),
+            "the first frame does not begin with an Annex-B start code"
+        );
+        let nal_types: Vec<u8> = annex_b_nal_headers(&first.data)
+            .filter_map(|at| first.data.get(at))
+            .map(|header| (header >> HEVC_NAL_TYPE_SHIFT) & HEVC_NAL_TYPE_MASK)
+            .collect();
+        for parameter_set in [HEVC_NAL_VPS, HEVC_NAL_SPS, HEVC_NAL_PPS] {
+            assert!(
+                nal_types.contains(&parameter_set),
+                "no NAL of type {parameter_set} in band; a guest that joined here has nothing describing the stream (found {nal_types:?})"
+            );
+        }
+        assert_eq!(encoder.kind(), EncoderKind::Hardware);
     }
 }
