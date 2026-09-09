@@ -215,7 +215,21 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `rd/file/1` connection of ADR 0032 is not opened for it, because a listing
 /// is not a transfer. See
 /// `docs/adr/0075-listing-a-directory-is-its-own-grant.md`.
-pub const PROTOCOL_MINOR: u16 = 12;
+///
+/// 13: appended [`MessageKind::FileFetchRequest`],
+/// [`MessageKind::FileFetchRefused`] and [`MessageKind::FilePutOffer`] after
+/// `DirListResponse`. Minor 12 let a guest see what was on the host and
+/// nothing more: naming a file it could now see was still not a thing the
+/// protocol could say, so the file manager of backlog item 19 could browse
+/// and not move anything. These three say it. A fetch is answered with the
+/// ordinary [`MessageKind::FileOffer`] of §9.2 — the same engine, the same
+/// `rd/file/1` connection, the same BLAKE3 check — or with an out-loud
+/// refusal; a put is an offer that also names the directory it is for, and is
+/// answered with the ordinary [`MessageKind::FileAccept`]. All three are
+/// guest to host and gated on [`FEATURE_FILE_MANAGE`], and the host requires
+/// `file_browse` *and* `file_transfer` before it acts on any of them. See
+/// `docs/adr/0076-naming-a-file-on-the-host-is-browse-plus-transfer.md`.
+pub const PROTOCOL_MINOR: u16 = 13;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -347,6 +361,22 @@ pub const FEATURE_STREAM_SIZE: &str = "stream-size";
 /// without holding the grant is refused with
 /// [`DirListRefusal::NotGranted`].
 pub const FEATURE_FILE_BROWSE: &str = "file-browse";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::FileFetchRequest`], [`MessageKind::FileFetchRefused`] and
+/// [`MessageKind::FilePutOffer`] (ADR 0076).
+///
+/// Same compatibility shape and same direction as [`FEATURE_FILE_BROWSE`]:
+/// all three are guest-to-host messages, so the guest advertises the string
+/// in its own `Hello` and the host reads it off that. A host must never send
+/// `FileFetchRefused` to a peer that did not advertise it — that peer decodes
+/// the discriminant as unknown and closes the connection (§9.1).
+///
+/// Deliberately separate from `FEATURE_FILE_BROWSE` even though the grant
+/// behind them starts at the same place: a peer that can list a directory and
+/// a peer that can name a file inside it are two different builds, and a
+/// guest that only browses must not have to claim it can do more.
+pub const FEATURE_FILE_MANAGE: &str = "file-manage";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -859,6 +889,67 @@ pub enum MessageKind {
         /// Why the list is empty, when it is empty for a reason.
         refused: Option<DirListRefusal>,
     },
+    /// Guest to host: offer me the file at this path (§9.2; ADR 0076). New in
+    /// minor 13.
+    ///
+    /// Sent only by a guest whose `Hello` advertised [`FEATURE_FILE_MANAGE`],
+    /// and acted on only for a guest holding both `file_browse` and
+    /// `file_transfer`: naming a file is the browse half, moving its bytes is
+    /// the transfer half, and neither on its own is enough (ADR 0076).
+    ///
+    /// The answer is not a new message on the happy path. A host that agrees
+    /// sends the ordinary [`Self::FileOffer`] of §9.2 and the transfer runs
+    /// exactly as any other does — same `rd/file/1` connection, same chunk
+    /// format, same BLAKE3 check before anything leaves staging. Only a
+    /// refusal needs a message of its own ([`Self::FileFetchRefused`]),
+    /// because there is no offer to carry it.
+    ///
+    /// `path` is untrusted input, bounded here by
+    /// [`crate::constants::DIR_PATH_MAX_BYTES`] before anything parses it and
+    /// checked by `lumepeer_core::remote_path::safe_browse_path` before
+    /// anything opens it — one file, named in full, never a pattern and never
+    /// a directory to walk.
+    FileFetchRequest {
+        /// Absolute path of the file to send.
+        path: String,
+    },
+    /// Host to guest: that fetch is not happening, and why (§18; ADR 0076).
+    /// New in minor 13.
+    ///
+    /// A fetch that succeeds is answered by an ordinary [`Self::FileOffer`],
+    /// so this message exists for the one case that has no offer to travel
+    /// on. A guest that asked and heard nothing would otherwise sit watching
+    /// for a file that is never coming.
+    FileFetchRefused {
+        /// Why the host will not send the file.
+        reason: FileFetchRefusal,
+    },
+    /// Guest to host: an offer that also names the directory it is for
+    /// (§9.2; ADR 0076). New in minor 13.
+    ///
+    /// [`Self::FileOffer`] with a destination, and nothing else: the host
+    /// answers it with the ordinary [`Self::FileAccept`], and an acceptance
+    /// runs the same engine an ordinary offer runs. The destination is what a
+    /// file manager's upload means — the ordinary offer lands wherever the
+    /// *receiving* user picks in a dialog, which is the right answer for a
+    /// file that arrives unasked and the wrong one for a file dropped into a
+    /// directory the guest is looking at.
+    ///
+    /// Both halves of the destination are untrusted: `dir` is checked by
+    /// `safe_browse_path` and `name` by `remote_path::is_safe_component`, so
+    /// nothing here can name a path outside the directory the guest chose,
+    /// and the host still re-reads `file_browse` and `file_transfer` when it
+    /// arrives.
+    FilePutOffer {
+        /// Absolute path of the directory the file is for.
+        dir: String,
+        /// Basename after normalization, no path separators.
+        name: String,
+        /// File size, at most `FILE_OFFER_MAX_BYTES`.
+        size: u64,
+        /// BLAKE3 of the whole file, verified before export from staging.
+        hash: [u8; 32],
+    },
 }
 
 /// Video codec identifier carried in [`MessageKind::MediaCodec`]'s `codec`
@@ -1099,6 +1190,41 @@ pub enum DirListRefusal {
     Unreadable,
 }
 
+/// Why a host will not send the file a guest named (§18; ADR 0076).
+///
+/// A closed set, and deliberately its own type rather than a reuse of
+/// [`DirListRefusal`]. The first three answers are the same three a listing
+/// gives, for the same reasons — including "no such file" folded into
+/// `Unreadable`, so a fetch is no more of an oracle for what exists than a
+/// listing is — but a fetch has a fourth answer a listing cannot have, and
+/// growing the frozen listing enum to carry it would put a variant on the
+/// wire that every peer built before minor 13 reads as malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileFetchRefusal {
+    /// This guest does not hold both `file_browse` and `file_transfer`
+    /// (ADR 0076).
+    ///
+    /// One answer for both halves on purpose: which of the two the host is
+    /// missing is a fact about the host's consent screen, and the guest's
+    /// next move — ask the operator — is the same either way.
+    NotGranted,
+    /// The path was refused before it reached the filesystem: not absolute, a
+    /// traversal, a UNC or device path, or over the length bound
+    /// (`lumepeer_core::remote_path::safe_browse_path`).
+    BadPath,
+    /// The operating system refused the file, it is not a regular file, or it
+    /// is over [`crate::constants::FILE_OFFER_MAX_BYTES`].
+    Unreadable,
+    /// This guest already has [`crate::constants::MAX_PENDING_FILE_OFFERS`]
+    /// fetches outstanding on this session.
+    ///
+    /// Not a refusal of the file and not a refusal of the guest: a host that
+    /// hashed every path a peer asked for would be doing a full disk pass per
+    /// request, which is the shape of failure the pending-offer bound already
+    /// exists to stop on the way in.
+    TooMany,
+}
+
 /// Input event payload: logical key plus physical scancode, never raw OS
 /// handles (§11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1156,6 +1282,55 @@ fn check_dir_listing(entries: &[DirEntry], refused: Option<DirListRefusal>) -> R
         .iter()
         .any(|entry| entry.name.is_empty() || entry.name.len() > FILE_NAME_MAX_BYTES)
     {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
+/// Checks a display-mode list the same three ways `check_dir_listing` checks
+/// a directory listing (docs/bugs/16-host-display-mode.md #2).
+///
+/// `modes` and `reason` must never disagree about which state the list is in:
+/// a populated list next to an explanation for why it is empty, or an empty
+/// list with no explanation at all, is not a state a well-behaved host can
+/// produce, so a peer claiming one is malformed rather than merely unusual.
+/// The count is bounded the same way `MonitorsList` bounds its own entries,
+/// before anything downstream allocates per mode.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for any of the three.
+fn check_display_modes(
+    modes: &[DisplayModeInfo],
+    reason: Option<DisplayModeUnavailableReason>,
+) -> Result<()> {
+    if modes.is_empty() == reason.is_none() {
+        return Err(CoreError::Malformed);
+    }
+    if modes.len() > MAX_DISPLAY_MODES_PER_HOST {
+        return Err(CoreError::Malformed);
+    }
+    if modes
+        .iter()
+        .any(|mode| mode.width == 0 || mode.height == 0 || mode.refresh_hz == 0)
+    {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
+/// Bounds both halves of a put offer's destination (§9.1; ADR 0076).
+///
+/// The directory as a string like every other path on this wire, before
+/// anything parses it; the name and the size exactly as `FileOffer` bounds
+/// its own, since this *is* an offer with a directory attached.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for any of the four.
+fn check_put_offer(dir: &str, name: &str, size: u64) -> Result<()> {
+    if dir.is_empty() || dir.len() > DIR_PATH_MAX_BYTES {
+        return Err(CoreError::Malformed);
+    }
+    if name.is_empty() || name.len() > FILE_NAME_MAX_BYTES || size > FILE_OFFER_MAX_BYTES {
         return Err(CoreError::Malformed);
     }
     Ok(())
@@ -1304,31 +1479,15 @@ impl MessageEnvelope {
             {
                 return Err(CoreError::Malformed);
             }
-            // `modes` and `reason` must never disagree about which state the
-            // list is in (docs/bugs/16-host-display-mode.md #2): a populated
-            // list next to an explanation for why it is empty, or an empty
-            // list with no explanation at all, is not a state a well-behaved
-            // host can produce, so a peer claiming one is malformed rather
-            // than merely unusual. The count is bounded the same way
-            // `MonitorsList` bounds its own entries, before anything
-            // downstream allocates per mode.
             MessageKind::DisplayModesList { modes, reason } => {
-                if modes.is_empty() == reason.is_none() {
-                    return Err(CoreError::Malformed);
-                }
-                if modes.len() > MAX_DISPLAY_MODES_PER_HOST {
-                    return Err(CoreError::Malformed);
-                }
-                for mode in modes {
-                    if mode.width == 0 || mode.height == 0 || mode.refresh_hz == 0 {
-                        return Err(CoreError::Malformed);
-                    }
-                }
+                check_display_modes(modes, *reason)?;
             }
             // A path is untrusted input, bounded as a *string* before it is
-            // parsed (§9.1; ADR 0075), so a peer cannot make the host walk
-            // four kilobytes of separators to find out the path is bad.
-            MessageKind::DirListRequest { path }
+            // parsed (§9.1; ADR 0075, ADR 0076), so a peer cannot make the
+            // host walk four kilobytes of separators to find out the path is
+            // bad. A fetch names one file and a listing names one directory;
+            // the bound is the same, and a name of no length names neither.
+            MessageKind::DirListRequest { path } | MessageKind::FileFetchRequest { path }
                 if path.is_empty() || path.len() > DIR_PATH_MAX_BYTES =>
             {
                 return Err(CoreError::Malformed);
@@ -1336,6 +1495,9 @@ impl MessageEnvelope {
             MessageKind::DirListResponse {
                 entries, refused, ..
             } => check_dir_listing(entries, *refused)?,
+            MessageKind::FilePutOffer {
+                dir, name, size, ..
+            } => check_put_offer(dir, name, *size)?,
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide
@@ -1513,6 +1675,72 @@ mod tests {
             assert!(
                 matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
                 "a malformed listing was accepted"
+            );
+        }
+    }
+
+    /// ADR 0076: a fetch names one file, bounded as a string exactly as a
+    /// listing request is, and a refusal for it travels rather than being
+    /// mimed as silence.
+    #[test]
+    fn a_fetch_request_is_bounded_like_a_listing_and_its_refusal_travels() {
+        for path in ["/home/beta/notes.txt", r"C:\Users\beta\notes.txt"] {
+            let original = envelope(MessageKind::FileFetchRequest {
+                path: path.to_owned(),
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for path in [String::new(), "a".repeat(DIR_PATH_MAX_BYTES + 1)] {
+            let bytes = envelope(MessageKind::FileFetchRequest { path })
+                .encode()
+                .unwrap();
+            assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            ));
+        }
+
+        for reason in [
+            FileFetchRefusal::NotGranted,
+            FileFetchRefusal::BadPath,
+            FileFetchRefusal::Unreadable,
+            FileFetchRefusal::TooMany,
+        ] {
+            let original = envelope(MessageKind::FileFetchRefused { reason });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+    }
+
+    /// ADR 0076: a put is an offer with a destination, so it is bounded on
+    /// both — the directory as a path, the name and the size exactly as
+    /// `FileOffer` is bounded.
+    #[test]
+    fn a_put_offer_is_bounded_on_its_directory_and_on_its_file() {
+        let put = |dir: &str, name: &str, size: u64| MessageKind::FilePutOffer {
+            dir: dir.to_owned(),
+            name: name.to_owned(),
+            size,
+            hash: [3u8; 32],
+        };
+
+        let original = envelope(put("/home/beta/inbox", "notes.txt", 4096));
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+
+        for kind in [
+            put("", "notes.txt", 1),
+            put(&"a".repeat(DIR_PATH_MAX_BYTES + 1), "notes.txt", 1),
+            put("/home/beta", "", 1),
+            put("/home/beta", &"a".repeat(FILE_NAME_MAX_BYTES + 1), 1),
+            put("/home/beta", "notes.txt", FILE_OFFER_MAX_BYTES + 1),
+        ] {
+            let bytes = envelope(kind).encode().unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "a malformed put offer was accepted"
             );
         }
     }

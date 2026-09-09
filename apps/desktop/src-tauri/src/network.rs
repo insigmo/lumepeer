@@ -34,10 +34,11 @@ use lumepeer_core::constants::{
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
-    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE, FEATURE_FILE_TRANSFER,
-    FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
-    FEATURE_UNATTENDED, InputDetail, InputEventPayload, MediaCodec, MediaUnavailableReason,
-    MessageKind, MonitorInfo, UnattendedRejection,
+    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE, FEATURE_FILE_MANAGE,
+    FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
+    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED, FileFetchRefusal, InputDetail,
+    InputEventPayload, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
+    UnattendedRejection,
 };
 use lumepeer_core::remote_path::{is_safe_component, safe_browse_path};
 use lumepeer_core::session::{SessionManager, SessionState};
@@ -129,6 +130,15 @@ const DISPLAY_MODE_MINOR: u16 = 9;
 /// guest's `FEATURE_FILE_BROWSE` string instead, and `HelloAck` carries no
 /// feature list for the guest to read the other way.
 const FILE_BROWSE_MINOR: u16 = 12;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::FileFetchRequest`,
+/// `MessageKind::FileFetchRefused` and `MessageKind::FilePutOffer`
+/// (ADR 0076).
+///
+/// Guest side only, exactly like [`FILE_BROWSE_MINOR`]: a host reads the
+/// guest's `FEATURE_FILE_MANAGE` string instead, and `HelloAck` carries no
+/// feature list for the guest to read the other way.
+const FILE_MANAGE_MINOR: u16 = 13;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -713,6 +723,19 @@ pub struct DirListing {
     pub refused: Option<DirListRefusal>,
 }
 
+/// Everything the guest's file manager polls for in one call (ADR 0076).
+///
+/// The last listing and the last refused fetch travel together because they
+/// are one screen: a panel that has just been told "you may not" has to stop
+/// showing the directory it was looking at as though it were still readable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteFileStatus {
+    /// The directory this host last answered for, if it has answered one.
+    pub listing: Option<DirListing>,
+    /// Why the last download was refused, if one was.
+    pub fetch_refused: Option<FileFetchRefusal>,
+}
+
 /// Reply type of [`ActorCommand::DisplayModesList`] (docs/bugs/
 /// 16-host-display-mode.md #2; ADR 0048): the modes, empty exactly when the
 /// reason is `Some`, mirroring the wire message's own shape.
@@ -917,11 +940,27 @@ enum ActorCommand {
         path: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Guest side: the listing the watched host last answered with
-    /// (ADR 0075).
+    /// Guest side: the listing the watched host last answered with, plus the
+    /// last refused download (ADR 0075, ADR 0076).
     DirListing {
         label: String,
-        reply: oneshot::Sender<Result<Option<DirListing>, ActorError>>,
+        reply: oneshot::Sender<Result<RemoteFileStatus, ActorError>>,
+    },
+    /// Guest side: ask the watched host to send the file at `path`, into
+    /// `into` on this machine (ADR 0076).
+    RemoteDownload {
+        label: String,
+        path: String,
+        into: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: offer `local_path` to the watched host, for `remote_dir`
+    /// on its own disk (ADR 0076).
+    RemoteUpload {
+        label: String,
+        local_path: String,
+        remote_dir: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Guest side: the modes the watched host announced for its own physical
     /// monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
@@ -1739,10 +1778,71 @@ impl ActorHandle {
     /// # Errors
     /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
     /// [`ActorError::ChannelClosed`] if the actor is gone.
-    pub async fn dir_listing(&self, label: String) -> Result<Option<DirListing>, ActorError> {
+    pub async fn dir_listing(&self, label: String) -> Result<RemoteFileStatus, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::DirListing { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: asks the watched host to send one file, to be written into
+    /// `into` on this machine (ADR 0076).
+    ///
+    /// Fire and forget like [`Self::request_dir_list`]: what comes back is
+    /// either the ordinary `FileOffer` of §9.2, accepted automatically
+    /// because this call *is* the acceptance, or a refusal read back with
+    /// [`Self::dir_listing`].
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old to understand the
+    /// message; [`ActorError::Core`] with `Malformed` when the path is not
+    /// one this host would accept or `into` is not a directory on this
+    /// machine; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn remote_download(
+        &self,
+        label: String,
+        path: String,
+        into: String,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RemoteDownload {
+                label,
+                path,
+                into,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: offers one local file to the watched host, for a directory
+    /// the host itself will check (ADR 0076).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old to understand the
+    /// message; [`ActorError::Core`] with `Malformed` when the destination is
+    /// not a path this host would accept; [`ActorError::ChannelClosed`] if
+    /// the actor is gone.
+    pub async fn remote_upload(
+        &self,
+        label: String,
+        local_path: String,
+        remote_dir: String,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RemoteUpload {
+                label,
+                local_path,
+                remote_dir,
+                reply,
+            })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -2115,6 +2215,18 @@ struct OutgoingOffer {
     name: String,
     size: u64,
     hash: [u8; 32],
+}
+
+/// One download this node asked a host for and has not been answered
+/// (ADR 0076).
+///
+/// The name is the basename the host is expected to offer back, which is what
+/// matches the arriving `FileOffer` to this request; the directory is the one
+/// the guest's own file manager was showing when it asked, and is where the
+/// accepted file lands.
+struct PendingFetch {
+    name: String,
+    into: std::path::PathBuf,
 }
 
 /// One offer this node accepted, waiting for the sender's
@@ -2681,6 +2793,10 @@ struct ViewState {
     dir_list_asked: Option<String>,
     /// The last listing this host answered with (ADR 0075).
     dir_listing: Option<DirListing>,
+    /// Why this host refused the last file this view asked it to send
+    /// (ADR 0076). Cleared when the next download is asked for, so the panel
+    /// never shows a refusal from two directories ago.
+    fetch_refused: Option<FileFetchRefusal>,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -2752,6 +2868,10 @@ enum ActorEvent {
         /// (ADR 0075), so this host may answer a `DirListRequest` from it at
         /// all.
         speaks_file_browse: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_MANAGE`
+        /// (ADR 0076), so this host may refuse a `FileFetchRequest` from it
+        /// out loud rather than in silence.
+        speaks_file_manage: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2810,6 +2930,29 @@ enum ActorEvent {
         /// the file it named.
         paths: Vec<std::path::PathBuf>,
     },
+    /// Host side: a file a guest asked for was measured and hashed off the
+    /// actor loop, and can now be offered back to it (ADR 0076).
+    FetchPrepared {
+        peer: NodeId,
+        /// The real local path, never sent on the wire (§15).
+        path: std::path::PathBuf,
+        /// Name, size and BLAKE3, or the refusal to send instead.
+        prepared: Result<(String, u64, [u8; 32]), FileFetchRefusal>,
+    },
+    /// Guest side: a local file was measured and hashed off the actor loop,
+    /// and can now be offered to a host for one of its directories
+    /// (ADR 0076).
+    PutPrepared {
+        peer: NodeId,
+        /// The host directory this offer is for, already through
+        /// `safe_browse_path` on this side.
+        dir: String,
+        /// The real local path, never sent on the wire (§15).
+        path: std::path::PathBuf,
+        /// Name, size and BLAKE3 of the local file, or why it cannot be
+        /// offered at all.
+        prepared: Result<(String, u64, [u8; 32]), NetError>,
+    },
     /// A display-mode switch's confirmation window elapsed off the actor
     /// loop (docs/bugs/16-host-display-mode.md #3; ADR 0048). `generation`
     /// ties this to the switch that armed it; the actor checks both that its
@@ -2853,6 +2996,10 @@ enum Accepted {
         /// (ADR 0075), so this host may answer a `DirListRequest` from it at
         /// all.
         speaks_file_browse: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_FILE_MANAGE`
+        /// (ADR 0076), so this host may refuse a `FileFetchRequest` from it
+        /// out loud rather than in silence.
+        speaks_file_manage: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -2981,6 +3128,29 @@ struct Actor {
     /// Host side: peers whose `Hello` advertised `FEATURE_CURSOR_SHAPE`, and
     /// which may therefore be sent one (§11).
     speaks_cursor_shape: std::collections::HashSet<NodeId>,
+    /// Host side: peers whose `Hello` advertised `FEATURE_FILE_MANAGE`, and
+    /// which may therefore be answered with a `FileFetchRefused` (ADR 0076).
+    speaks_file_manage: std::collections::HashSet<NodeId>,
+    /// Guest side: per watched host, whether its `HelloAck` minor is at least
+    /// `FILE_MANAGE_MINOR`, so this node may send it a `FileFetchRequest` or
+    /// a `FilePutOffer` (ADR 0076).
+    file_manage_to_host: std::collections::HashMap<NodeId, bool>,
+    /// Guest side: the downloads this node has asked for and not yet been
+    /// answered, oldest first, with the directory each is destined for.
+    ///
+    /// A fetch is answered by an ordinary `FileOffer`, which carries a
+    /// basename and nothing else (§15), so this is what tells an arriving
+    /// offer apart from one the host started on its own — and what says
+    /// where the accepted one goes without asking the user a second time for
+    /// a directory they already navigated to (ADR 0076).
+    fetches_out: std::collections::HashMap<NodeId, VecDeque<PendingFetch>>,
+    /// Host side: how many fetches from each peer are being hashed right now.
+    ///
+    /// Counted separately from `file_offers_out` because a hash pass is where
+    /// the cost is: without this, a guest could ask for the same large file
+    /// three times before the first offer exists and put three full disk
+    /// passes on the host (ADR 0076).
+    fetch_preparing: std::collections::HashMap<NodeId, usize>,
     /// Host side: peers whose `Hello` advertised `FEATURE_FILE_BROWSE`, and
     /// which may therefore be answered with a `DirListResponse` (ADR 0075).
     speaks_file_browse: std::collections::HashSet<NodeId>,
@@ -3735,50 +3905,11 @@ impl Actor {
             self.refuse_dir_list(peer, DirListRefusal::Unreadable);
             return;
         }
-        let Ok(reader) = std::fs::read_dir(path) else {
+        let Ok((entries, truncated)) = read_directory(std::path::Path::new(path)) else {
             tracing::info!(peer = %tag, "the host could not read the directory a guest asked for");
             self.refuse_dir_list(peer, DirListRefusal::Unreadable);
             return;
         };
-
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        for entry in reader.flatten() {
-            if entries.len() == MAX_DIR_ENTRIES_PER_RESPONSE {
-                truncated = true;
-                break;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                // A name that is not UTF-8 has no representation on this wire
-                // and is skipped rather than lossily transliterated into a
-                // name that would not open.
-                continue;
-            };
-            if !is_safe_component(&name) {
-                continue;
-            }
-            // `file_type` does not follow links, so a link to a directory is
-            // reported as the ordinary entry it is; `metadata` here would
-            // stat through it and describe somewhere else.
-            let file_type = entry.file_type().ok();
-            let is_dir = file_type.is_some_and(|kind| kind.is_dir());
-            let meta = entry.metadata().ok();
-            let size = if is_dir {
-                0
-            } else {
-                meta.as_ref().map_or(0, std::fs::Metadata::len)
-            };
-            let modified_unix = meta
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |since| since.as_secs());
-            entries.push(DirEntry {
-                name,
-                size,
-                is_dir,
-                modified_unix,
-            });
-        }
 
         self.send_to(
             &peer,
@@ -3801,6 +3932,282 @@ impl Actor {
                 refused: Some(refused),
             },
         );
+    }
+
+    /// Host side: answers a guest's `FileFetchRequest` (§9.2, §18; ADR 0076).
+    ///
+    /// The same three refusals [`Self::on_dir_list_request`] makes, plus a
+    /// fourth for a guest that has asked faster than this host can hash — and
+    /// one difference in the first: a fetch needs `file_browse` *and*
+    /// `file_transfer`, because naming a file on someone else's disk is the
+    /// browse half and moving its bytes is the transfer half. Both are
+    /// re-read here rather than trusted from whenever the session started
+    /// (§2.3).
+    ///
+    /// Nothing is read or hashed on this thread. `prepare_offer` is a full
+    /// pass over the file, so it runs on its own task and lands back as
+    /// [`ActorEvent::FetchPrepared`], where the grants are read once more
+    /// because a pass over a large file is long enough for a revoke to
+    /// arrive in the middle of it (ADR 0027).
+    fn on_file_fetch_request(&mut self, peer: NodeId, path: &str) {
+        let tag = self.label_of(&peer);
+        if !self.speaks_file_manage.contains(&peer) {
+            // Refusing would put a discriminant this peer's minor does not
+            // know on the wire, which closes the connection it was trying to
+            // use (§9.1).
+            tracing::debug!(peer = %tag, "a file fetch from a peer that never advertised the feature");
+            return;
+        }
+        // Audited before the grants are read, exactly as a listing is: what
+        // §15 wants recorded is that this peer asked this machine for a file,
+        // and a refused request is as much of that as a served one.
+        tracing::info!(peer = %tag, "a guest asked the host to send a file");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::FileAction {
+                action: "file_fetch",
+            },
+        );
+
+        if !self.may_fetch_or_put(&peer) {
+            tracing::warn!(peer = %tag, "a file fetch without live browse and transfer grants; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::NotGranted);
+            return;
+        }
+        let Some(path) = safe_browse_path(path) else {
+            tracing::warn!(peer = %tag, "a file fetch for a path that is not one; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::BadPath);
+            return;
+        };
+        // A symbolic link is not followed, exactly as it is not for a listing
+        // (ADR 0075): the file it leads to is not the file the guest named.
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+            tracing::warn!(peer = %tag, "a file fetch for a symbolic link; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
+            return;
+        }
+        let outstanding = self.file_offers_out.get(&peer).map_or(0, VecDeque::len)
+            + self.fetch_preparing.get(&peer).copied().unwrap_or(0);
+        if outstanding >= MAX_PENDING_FILE_OFFERS {
+            tracing::warn!(peer = %tag, "a file fetch past the outstanding-offer bound; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::TooMany);
+            return;
+        }
+
+        *self.fetch_preparing.entry(peer).or_default() += 1;
+        let path = std::path::PathBuf::from(path);
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let prepared = prepare_offer(&path)
+                .await
+                .map_err(|_| FileFetchRefusal::Unreadable);
+            let _ = events
+                .send(ActorEvent::FetchPrepared {
+                    peer,
+                    path,
+                    prepared,
+                })
+                .await;
+        });
+    }
+
+    /// Whether `peer` may name a file on this machine right now (ADR 0076).
+    ///
+    /// Both grants, and a live session behind them. `file_browse` alone is
+    /// the right to see what is there and `file_transfer` alone is the right
+    /// to move files both sides already named; a fetch and a put are the
+    /// intersection, and neither half implies the other.
+    fn may_fetch_or_put(&self, peer: &NodeId) -> bool {
+        self.connections.contains_key(peer)
+            && self.sessions.state(peer) == SessionState::Active
+            && self
+                .sessions
+                .grants(peer)
+                .is_some_and(|grants| grants.file_browse && grants.file_transfer)
+    }
+
+    /// Sends the one answer a refused fetch gets (§18; ADR 0076).
+    fn refuse_fetch(&mut self, peer: NodeId, reason: FileFetchRefusal) {
+        self.send_to(&peer, MessageKind::FileFetchRefused { reason });
+    }
+
+    /// Host side: a fetched file finished being measured and hashed, and can
+    /// now be offered to the guest that asked for it (ADR 0076).
+    fn on_fetch_prepared(
+        &mut self,
+        peer: NodeId,
+        path: std::path::PathBuf,
+        prepared: Result<(String, u64, [u8; 32]), FileFetchRefusal>,
+    ) {
+        if let Some(count) = self.fetch_preparing.get_mut(&peer) {
+            *count = count.saturating_sub(1);
+        }
+        let tag = self.label_of(&peer);
+        // Re-read rather than assumed: hashing a large file takes long enough
+        // for a revoke to land in the middle of it (§2.3).
+        if !self.may_fetch_or_put(&peer) {
+            tracing::warn!(peer = %tag, "the grants for a fetch were gone by the time it was hashed");
+            self.refuse_fetch(peer, FileFetchRefusal::NotGranted);
+            return;
+        }
+        let (name, size, hash) = match prepared {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                tracing::info!(peer = %tag, "the host could not read a file a guest asked for");
+                self.refuse_fetch(peer, reason);
+                return;
+            }
+        };
+        self.file_offers_out
+            .entry(peer)
+            .or_default()
+            .push_back(OutgoingOffer {
+                path,
+                name: name.clone(),
+                size,
+                hash,
+            });
+        self.send_to(&peer, MessageKind::FileOffer { name, size, hash });
+        self.audit_file(&peer, "fetch-offered");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Host side: a guest offered a file for one of this machine's
+    /// directories (§9.2; ADR 0076).
+    ///
+    /// Accepted without a second question when both grants are live and the
+    /// destination parses, and refused with the ordinary `FileAccept(false)`
+    /// otherwise. There is no dialog on this side on purpose: a host that
+    /// granted `FullControl` has already granted a guest that can type into
+    /// an elevated window on this machine (ADR 0061), and asking it to
+    /// confirm each file of a copy it is watching happen is a prompt that
+    /// gets clicked through rather than read. Every put is audited instead,
+    /// and either grant can be withdrawn mid-copy — the next file is refused.
+    fn on_file_put_offer(
+        &mut self,
+        peer: NodeId,
+        dir: &str,
+        name: &str,
+        size: u64,
+        hash: [u8; 32],
+    ) {
+        let tag = self.label_of(&peer);
+        tracing::info!(peer = %tag, "a guest offered the host a file for one of its directories");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action: "file_put" },
+        );
+
+        if !self.may_fetch_or_put(&peer) {
+            tracing::warn!(peer = %tag, "a file put without live browse and transfer grants; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        // Both halves of the destination are the guest's strings, which is to
+        // say an attacker's: the directory through the same parser a listing
+        // request goes through, the name through the same normalization every
+        // other offer's name goes through. Nothing here is repaired — a
+        // rewritten destination is a file written somewhere neither side
+        // named (§18).
+        let (Some(dir), Some(name)) = (safe_browse_path(dir), safe_file_name(name)) else {
+            tracing::warn!(peer = %tag, "a file put whose destination is not one; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        };
+        if size > FILE_OFFER_MAX_BYTES {
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        let directory = std::path::Path::new(dir);
+        if !directory.is_dir() {
+            tracing::warn!(peer = %tag, "a file put for a directory this host does not have; declined");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        let accepted = self.file_accepted.entry(peer).or_default();
+        if accepted.len() >= MAX_PENDING_FILE_OFFERS {
+            tracing::warn!(peer = %tag, "declining a put past the pending limit");
+            self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        // Never overwrites: a put lands beside a file of the same name, the
+        // same way every other received file does. Writing over one would
+        // make an upload a delete as well, and deleting on the host is not
+        // something any grant here covers.
+        let destination = unique_destination(directory, &name);
+        accepted.push_back(AcceptedOffer {
+            name,
+            size,
+            hash: Some(hash),
+            destination,
+            from_clipboard: false,
+        });
+        self.send_to(&peer, MessageKind::FileAccept(true));
+        self.audit_file(&peer, "put-accepted");
+        self.ensure_file_connection(peer);
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Guest side: the host will not send the file this node asked for
+    /// (§18; ADR 0076).
+    fn on_file_fetch_refused(&mut self, peer: NodeId, reason: FileFetchRefusal) {
+        if let Some(queue) = self.fetches_out.get_mut(&peer) {
+            queue.pop_front();
+        }
+        if let Some(view) = self.views.get_mut(&peer) {
+            view.fetch_refused = Some(reason);
+        }
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
+    /// Guest side: a local file finished being hashed and can now be offered
+    /// to the host for one of its directories (ADR 0076).
+    fn on_put_prepared(
+        &mut self,
+        peer: NodeId,
+        dir: String,
+        path: std::path::PathBuf,
+        prepared: Result<(String, u64, [u8; 32]), NetError>,
+    ) {
+        let tag = self.label_of(&peer);
+        // Re-checked rather than assumed, exactly as a clipboard offer is:
+        // the hash pass takes long enough for the view to have closed.
+        if !self.may_transfer_files(&peer)
+            || !self
+                .file_manage_to_host
+                .get(&peer)
+                .copied()
+                .unwrap_or(false)
+        {
+            tracing::warn!(peer = %tag, "dropping a prepared upload");
+            return;
+        }
+        let Ok((name, size, hash)) = prepared else {
+            // The path is this machine's own and stays out of the log, like
+            // every other file name (§15).
+            tracing::warn!(peer = %tag, "a local file could not be offered for upload");
+            return;
+        };
+        self.file_offers_out
+            .entry(peer)
+            .or_default()
+            .push_back(OutgoingOffer {
+                path,
+                name: name.clone(),
+                size,
+                hash,
+            });
+        self.send_to(
+            &peer,
+            MessageKind::FilePutOffer {
+                dir,
+                name,
+                size,
+                hash,
+            },
+        );
+        self.audit_file(&peer, "put-offered");
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
 
     /// Host side: switches this host's own physical monitor to `mode_id`
@@ -4045,6 +4452,7 @@ impl Actor {
                     speaks_stream_scale,
                     speaks_stream_size,
                     speaks_file_browse,
+                    speaks_file_manage,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -4060,6 +4468,7 @@ impl Actor {
                     speaks_stream_scale,
                     speaks_stream_size,
                     speaks_file_browse,
+                    speaks_file_manage,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -4188,6 +4597,7 @@ impl Actor {
                 speaks_stream_scale,
                 speaks_stream_size,
                 speaks_file_browse,
+                speaks_file_manage,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -4216,6 +4626,14 @@ impl Actor {
                     self.speaks_file_browse.insert(peer);
                 } else {
                     self.speaks_file_browse.remove(&peer);
+                }
+                // Same shape again, for a fetch or a put from this peer
+                // (ADR 0076). Also not a grant: it only says the peer
+                // understands what a refusal would look like.
+                if speaks_file_manage {
+                    self.speaks_file_manage.insert(peer);
+                } else {
+                    self.speaks_file_manage.remove(&peer);
                 }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
@@ -4266,6 +4684,17 @@ impl Actor {
             ActorEvent::ClipboardFilesRead { peer, files, paths } => {
                 self.on_clipboard_files_read(peer, files, paths);
             }
+            ActorEvent::FetchPrepared {
+                peer,
+                path,
+                prepared,
+            } => self.on_fetch_prepared(peer, path, prepared),
+            ActorEvent::PutPrepared {
+                peer,
+                dir,
+                path,
+                prepared,
+            } => self.on_put_prepared(peer, dir, path, prepared),
             ActorEvent::DisplayModeConfirmTimeout { generation } => {
                 self.on_display_mode_confirm_timeout(generation);
             }
@@ -4609,6 +5038,7 @@ impl Actor {
                 display_modes: Vec::new(),
                 display_modes_reason: None,
                 dir_list_asked: None,
+                fetch_refused: None,
                 dir_listing: None,
                 slot: slot_rx,
                 slot_tx,
@@ -5230,8 +5660,7 @@ impl Actor {
             }
             // Guest side: the host answered a listing request (ADR 0075).
             // Kept on the view, exactly as `DisplayModesList` is, and read
-            // back through `dir_listing`; the window that will draw it is
-            // gap-tasks `14`.
+            // back through `dir_listing`.
             MessageKind::DirListResponse {
                 ref entries,
                 truncated,
@@ -5245,6 +5674,28 @@ impl Actor {
                         refused,
                     });
                 }
+            }
+            // Host side: the guest named a file on this machine and asked
+            // for it (ADR 0076).
+            MessageKind::FileFetchRequest { ref path } => {
+                let path = path.clone();
+                self.on_file_fetch_request(peer, &path);
+            }
+            // Guest side: the host will not send the file this node asked
+            // for, and says why (§18; ADR 0076).
+            MessageKind::FileFetchRefused { reason } => {
+                self.on_file_fetch_refused(peer, reason);
+            }
+            // Host side: the guest offered a file for one of this machine's
+            // directories (ADR 0076).
+            MessageKind::FilePutOffer {
+                ref dir,
+                ref name,
+                size,
+                hash,
+            } => {
+                let (dir, name) = (dir.clone(), name.clone());
+                self.on_file_put_offer(peer, &dir, &name, size, hash);
             }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
@@ -5503,6 +5954,10 @@ impl Actor {
         self.speaks_cursor_shape.remove(&peer);
         self.speaks_file_browse.remove(&peer);
         self.file_browse_to_host.remove(&peer);
+        self.speaks_file_manage.remove(&peer);
+        self.file_manage_to_host.remove(&peer);
+        self.fetches_out.remove(&peer);
+        self.fetch_preparing.remove(&peer);
         // Link measurements belong to the connection that produced them: a
         // later connection to the same device measures its own path, and must
         // not inherit a round trip taken over one that no longer exists.
@@ -5755,6 +6210,22 @@ impl Actor {
             }
             ActorCommand::DirListing { label, reply } => {
                 let _ = reply.send(self.on_last_dir_listing(&label));
+            }
+            ActorCommand::RemoteDownload {
+                label,
+                path,
+                into,
+                reply,
+            } => {
+                let _ = reply.send(self.on_remote_download(&label, &path, &into));
+            }
+            ActorCommand::RemoteUpload {
+                label,
+                local_path,
+                remote_dir,
+                reply,
+            } => {
+                let _ = reply.send(self.on_remote_upload(&label, &local_path, &remote_dir));
             }
             ActorCommand::DisplaySetMode {
                 label,
@@ -6264,11 +6735,117 @@ impl Actor {
         Ok(())
     }
 
-    /// Guest side: the listing this view last received (ADR 0075).
-    fn on_last_dir_listing(&self, label: &str) -> Result<Option<DirListing>, ActorError> {
+    /// Guest side: the listing this view last received, and the last refused
+    /// download (ADR 0075, ADR 0076).
+    fn on_last_dir_listing(&self, label: &str) -> Result<RemoteFileStatus, ActorError> {
         let peer = self.resolve(label)?;
         let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
-        Ok(view.dir_listing.clone())
+        Ok(RemoteFileStatus {
+            listing: view.dir_listing.clone(),
+            fetch_refused: view.fetch_refused,
+        })
+    }
+
+    /// Guest side: asks the watched host to send one file, into a directory
+    /// on this machine (ADR 0076).
+    ///
+    /// Everything here is refused locally rather than sent and refused on the
+    /// far side, for the same reason [`Self::on_request_dir_list`] checks the
+    /// path twice: a request the host is certain to refuse costs a round trip
+    /// and an audit entry, and the person who typed it gets a worse answer
+    /// later. None of it is a *substitute* for the host's own checks — the
+    /// host re-reads both grants and re-parses the path when the request
+    /// lands.
+    fn on_remote_download(
+        &mut self,
+        label: &str,
+        path: &str,
+        into: &str,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self
+            .file_manage_to_host
+            .get(&peer)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(ActorError::Unsupported);
+        }
+        if safe_browse_path(path).is_none() {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        // The basename the host is expected to offer back. A path whose last
+        // component is not a name this node would accept is one whose offer
+        // it would decline anyway, so it never leaves.
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| is_safe_component(name))
+            .ok_or(ActorError::Core(CoreError::Malformed))?
+            .to_owned();
+        // The destination is this machine's own directory, named by this
+        // machine's own window — but it still has to exist before a transfer
+        // is started that would have nowhere to land (§18).
+        let into = std::path::PathBuf::from(into);
+        if !into.is_dir() {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        let queue = self.fetches_out.entry(peer).or_default();
+        if queue.len() >= MAX_PENDING_FILE_OFFERS {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        queue.push_back(PendingFetch { name, into });
+        if let Some(view) = self.views.get_mut(&peer) {
+            view.fetch_refused = None;
+        }
+        self.send_to(
+            &peer,
+            MessageKind::FileFetchRequest {
+                path: path.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Guest side: offers one local file to the watched host, for a directory
+    /// on the host's own disk (ADR 0076).
+    ///
+    /// The hash is a full pass over the file, so it runs on its own task and
+    /// lands back as [`ActorEvent::PutPrepared`] — the same shape a clipboard
+    /// offer uses, and for the same reason (ADR 0027).
+    fn on_remote_upload(
+        &mut self,
+        label: &str,
+        local_path: &str,
+        remote_dir: &str,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self
+            .file_manage_to_host
+            .get(&peer)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(ActorError::Unsupported);
+        }
+        if safe_browse_path(remote_dir).is_none() {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        let dir = remote_dir.to_owned();
+        let path = std::path::PathBuf::from(local_path);
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let prepared = prepare_offer(&path).await;
+            let _ = events
+                .send(ActorEvent::PutPrepared {
+                    peer,
+                    dir,
+                    path,
+                    prepared,
+                })
+                .await;
+        });
+        Ok(())
     }
 
     fn on_announced_display_modes(&self, label: &str) -> DisplayModesReply {
@@ -7194,6 +7771,34 @@ impl Actor {
         };
         if size > FILE_OFFER_MAX_BYTES {
             self.send_to(&peer, MessageKind::FileAccept(false));
+            return;
+        }
+        // An offer that answers a download this window asked for is not a
+        // decision waiting to be made: the click that asked for it *was* the
+        // decision, and the directory it lands in is the one that window was
+        // already showing. Matched on the front of the queue only — a fetch
+        // is answered by exactly one offer or one refusal, so the front is
+        // always the request being answered (ADR 0076).
+        if self
+            .fetches_out
+            .get(&peer)
+            .and_then(VecDeque::front)
+            .is_some_and(|fetch| fetch.name == name)
+        {
+            let fetch = self
+                .fetches_out
+                .get_mut(&peer)
+                .and_then(VecDeque::pop_front);
+            if let Some(fetch) = fetch {
+                let directory = fetch.into.to_string_lossy().into_owned();
+                let offer = PendingOffer { name, size, hash };
+                if self
+                    .on_direct_offer_accept(peer, offer, true, Some(directory))
+                    .is_err()
+                {
+                    tracing::warn!(peer = %tag, "a fetched file could not be accepted");
+                }
+            }
             return;
         }
         let queue = self.file_offers_in.entry(peer).or_default();
@@ -8269,6 +8874,10 @@ impl Actor {
         // (ADR 0075).
         self.file_browse_to_host
             .insert(peer, control.peer_minor() >= FILE_BROWSE_MINOR);
+        // Same reasoning for a download or an upload this node might ask for
+        // (ADR 0076).
+        self.file_manage_to_host
+            .insert(peer, control.peer_minor() >= FILE_MANAGE_MINOR);
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -8332,6 +8941,61 @@ async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
 /// A transfer must never quietly replace a file the user already had. The
 /// suffix goes before the extension so the result still opens in the same
 /// application.
+/// Reads one directory into the entries a `DirListResponse` carries, bounded
+/// by `MAX_DIR_ENTRIES_PER_RESPONSE` (ADR 0075).
+///
+/// Shared by the host answering a guest's listing request and by the local
+/// half of the guest's own file manager (`commands::local_dir_list`), so the
+/// two panes of that window cannot come to disagree about what an entry is —
+/// what counts as a name, what a symbolic link is reported as, and where the
+/// list stops.
+///
+/// # Errors
+/// Whatever `read_dir` returns: a path that is not a directory, or one the
+/// operating system will not open.
+pub fn read_directory(path: &std::path::Path) -> std::io::Result<(Vec<DirEntry>, bool)> {
+    let reader = std::fs::read_dir(path)?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for entry in reader.flatten() {
+        if entries.len() == MAX_DIR_ENTRIES_PER_RESPONSE {
+            truncated = true;
+            break;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            // A name that is not UTF-8 has no representation on this wire
+            // and is skipped rather than lossily transliterated into a
+            // name that would not open.
+            continue;
+        };
+        if !is_safe_component(&name) {
+            continue;
+        }
+        // `file_type` does not follow links, so a link to a directory is
+        // reported as the ordinary entry it is; `metadata` here would
+        // stat through it and describe somewhere else.
+        let file_type = entry.file_type().ok();
+        let is_dir = file_type.is_some_and(|kind| kind.is_dir());
+        let meta = entry.metadata().ok();
+        let size = if is_dir {
+            0
+        } else {
+            meta.as_ref().map_or(0, std::fs::Metadata::len)
+        };
+        let modified_unix = meta
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_secs());
+        entries.push(DirEntry {
+            name,
+            size,
+            is_dir,
+            modified_unix,
+        });
+    }
+    Ok((entries, truncated))
+}
+
 fn unique_destination(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
     let candidate = directory.join(name);
     if !candidate.exists() {
@@ -8640,6 +9304,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_FILE_BROWSE),
+        speaks_file_manage: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_FILE_MANAGE),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -8777,6 +9445,7 @@ async fn connect_once(
         FEATURE_STREAM_SIZE.to_owned(),
         FEATURE_DISPLAY_MODE.to_owned(),
         FEATURE_FILE_BROWSE.to_owned(),
+        FEATURE_FILE_MANAGE.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -9240,6 +9909,10 @@ pub fn spawn_actor_with(
         speaks_cursor_shape: std::collections::HashSet::new(),
         speaks_file_browse: std::collections::HashSet::new(),
         file_browse_to_host: std::collections::HashMap::new(),
+        speaks_file_manage: std::collections::HashSet::new(),
+        file_manage_to_host: std::collections::HashMap::new(),
+        fetches_out: std::collections::HashMap::new(),
+        fetch_preparing: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
@@ -10053,7 +10726,10 @@ mod tests {
                 .dir_listing(pair.host_label.clone())
                 .await
                 .unwrap();
-            if listing.is_some_and(|listing| listing.refused == Some(DirListRefusal::NotGranted)) {
+            if listing
+                .listing
+                .is_some_and(|listing| listing.refused == Some(DirListRefusal::NotGranted))
+            {
                 break;
             }
             assert!(
@@ -10085,12 +10761,194 @@ mod tests {
     async fn wait_for_listing(guest: &ActorHandle, host_label: &str) -> DirListing {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
-            if let Ok(Some(listing)) = guest.dir_listing(host_label.to_owned()).await {
+            if let Ok(status) = guest.dir_listing(host_label.to_owned()).await
+                && let Some(listing) = status.listing
+            {
                 return listing;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the host never answered the listing request"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0076: a download needs `file_browse` *and* `file_transfer`, and a
+    /// guest holding neither is told so out loud rather than left waiting for
+    /// an offer that is never coming (§18).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_without_both_grants_is_refused_out_loud() {
+        let scratch = Scratch::new("fetch-ungranted");
+        let source = scratch.join("secret.txt");
+        std::fs::write(&source, b"not for this guest").unwrap();
+        let into = Scratch::new("fetch-ungranted-into");
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+
+        // One grant is not the other: with `file_transfer` alone the guest can
+        // still not name a file on the host's disk.
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        guest
+            .remote_download(
+                host_label.clone(),
+                source.to_string_lossy().into_owned(),
+                into.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        let refusal = wait_for_fetch_refusal(&guest, &host_label).await;
+        assert_eq!(refusal, FileFetchRefusal::NotGranted);
+        assert!(
+            !into.join("secret.txt").exists(),
+            "a refused download still wrote a file"
+        );
+    }
+
+    /// ADR 0076: with both grants the download runs on the ordinary transfer
+    /// engine — the host offers, the guest's own request is the acceptance,
+    /// and the bytes land in the directory that asked for them, verified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_lands_in_the_directory_that_asked_for_it() {
+        let scratch = Scratch::new("fetch-granted");
+        let source = scratch.join("report.pdf");
+        let bytes: Vec<u8> = (0..40_000u32)
+            .map(|i| u8::try_from(i % 251).unwrap_or(0))
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let into = Scratch::new("fetch-granted-into");
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+
+        host.set_grant(guest_label.clone(), IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        guest
+            .remote_download(
+                host_label,
+                source.to_string_lossy().into_owned(),
+                into.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_files(&guest, "the download never completed", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.name == "report.pdf" && row.state == TransferState::Completed)
+        })
+        .await;
+        // Never queued as a question: the click that asked for it was the
+        // answer, so the offer must not have landed in the offer list.
+        assert!(
+            guest.file_transfers().await.unwrap().offers.is_empty(),
+            "a download was queued as an offer to answer"
+        );
+        assert_eq!(std::fs::read(into.join("report.pdf")).unwrap(), bytes);
+    }
+
+    /// ADR 0076: an upload is an offer with a destination, accepted by the
+    /// host without a second question when both grants are live — and refused
+    /// when they are not, which is the same check read at the other end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_lands_in_the_named_directory_and_needs_both_grants() {
+        let scratch = Scratch::new("put-source");
+        let source = scratch.join("notes.txt");
+        std::fs::write(&source, b"twelve bytes").unwrap();
+        let target = Scratch::new("put-target");
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        let local = source.to_string_lossy().into_owned();
+        let remote = target.0.to_string_lossy().into_owned();
+
+        // `file_transfer` alone is not enough: the guest named a directory on
+        // the host, which is the browse half of ADR 0076.
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        guest
+            .remote_upload(host_label.clone(), local.clone(), remote.clone())
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the refused upload was never answered", |files| {
+            files.transfers.is_empty() && files.offers.is_empty()
+        })
+        .await;
+        assert!(
+            !target.join("notes.txt").exists(),
+            "an upload without the browse grant still wrote a file"
+        );
+
+        host.set_grant(guest_label, IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        guest
+            .remote_upload(host_label, local, remote)
+            .await
+            .unwrap();
+        wait_for_files(&guest, "the upload never completed", |files| {
+            files
+                .transfers
+                .iter()
+                .any(|row| row.name == "notes.txt" && row.state == TransferState::Completed)
+        })
+        .await;
+        assert_eq!(
+            std::fs::read(target.join("notes.txt")).unwrap(),
+            b"twelve bytes"
+        );
+    }
+
+    /// ADR 0076: the same parser guards a download's path as guards a
+    /// listing's, and it refuses on this side before the host is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_download_of_a_traversal_never_leaves_the_guest() {
+        let into = Scratch::new("fetch-traversal");
+        let pair = clipboard_pair().await;
+        let directory = into.0.to_string_lossy().into_owned();
+        for path in ["/home/../etc/shadow", "relative/file", r"\\server\share\f"] {
+            let refused = pair
+                .guest
+                .remote_download(pair.host_label.clone(), path.to_owned(), directory.clone())
+                .await;
+            assert!(
+                matches!(refused, Err(ActorError::Core(CoreError::Malformed))),
+                "{path} was sent to the host"
+            );
+        }
+        // And a destination that is not a directory on this machine is
+        // refused here too: a transfer with nowhere to land is worse than one
+        // that never started (§18).
+        let refused = pair
+            .guest
+            .remote_download(
+                pair.host_label.clone(),
+                "/etc/hosts".to_owned(),
+                into.join("nowhere").to_string_lossy().into_owned(),
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(ActorError::Core(CoreError::Malformed))
+        ));
+    }
+
+    /// Polls for the refusal a download is about to produce.
+    async fn wait_for_fetch_refusal(guest: &ActorHandle, host_label: &str) -> FileFetchRefusal {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if let Ok(status) = guest.dir_listing(host_label.to_owned()).await
+                && let Some(reason) = status.fetch_refused
+            {
+                return reason;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host never refused the download"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

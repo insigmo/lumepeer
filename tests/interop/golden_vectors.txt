@@ -165,3 +165,16 @@ invalid minor12_dir_list_request_empty_path abababababababababababababababab0100
 valid minor12_dir_list_response_two_entries abababababababababababababababab00002e02096e6f7465732e74787480080080e2cfaa060870726f6a65637473000181e2cfaa06000000
 valid minor12_dir_list_response_not_granted abababababababababababababababab00002e0000010000
 invalid minor12_dir_list_response_contradiction abababababababababababababababab00002e01096e6f7465732e74787480080080e2cfaa0600010200
+
+# --- Frozen for PROTOCOL_MINOR 13: naming a file on the host (ADR 0076). All
+# --- three are guest to host except the refusal, and all three are sent only
+# --- between peers that advertised the "file-manage" feature string. A fetch
+# --- carries one absolute path and an empty one is malformed, exactly as it is
+# --- for a listing request. A put offer is FileOffer with a destination, so it
+# --- is bounded on the directory as well as on the name and the size; an empty
+# --- directory is malformed rather than "wherever you like".
+valid minor13_file_fetch_request abababababababababababababababab01002f142f686f6d652f626574612f6e6f7465732e74787400
+invalid minor13_file_fetch_request_empty_path abababababababababababababababab01002f0000
+valid minor13_file_fetch_refused_not_granted abababababababababababababababab0000300000
+valid minor13_file_put_offer abababababababababababababababab010031102f686f6d652f626574612f696e626f78096e6f7465732e7478748020030303030303030303030303030303030303030303030303030303030303030300
+invalid minor13_file_put_offer_empty_dir abababababababababababababababab01003100096e6f7465732e7478748020030303030303030303030303030303030303030303030303030303030303030300

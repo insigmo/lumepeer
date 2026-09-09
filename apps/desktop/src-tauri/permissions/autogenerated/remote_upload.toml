@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-remote-upload"
+description = "Enables the remote_upload command without any pre-configured scope."
+commands.allow = ["remote_upload"]
+
+[[permission]]
+identifier = "deny-remote-upload"
+description = "Denies the remote_upload command without any pre-configured scope."
+commands.deny = ["remote_upload"]
