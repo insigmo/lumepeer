@@ -93,7 +93,7 @@ describe('decodeViewChunk', () => {
   });
 
   it('reads every assigned codec byte (ADR 0067)', () => {
-    for (const codec of [WireCodec.H264, WireCodec.Av1, WireCodec.H265, WireCodec.Vp9]) {
+    for (const codec of [WireCodec.H264, WireCodec.Av1, WireCodec.Vp9]) {
       expect(decodeViewChunk(chunkResponse(1, 0, [], codec)).codec).toBe(codec);
     }
   });
@@ -218,7 +218,6 @@ describe('configStringFor', () => {
     // 08/09). The frame's own bytes are irrelevant to the answer.
     const frame = keyframe([0xff]);
     expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.05M.08');
-    expect(configStringFor(WireCodec.H265, frame)).toBe('hev1.1.6.L120.B0');
     expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
   });
 
@@ -262,7 +261,7 @@ describe('supportedOptionalCodecs', () => {
     };
     try {
       await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
-      expect(asked).toEqual(['av01.0.05M.08', 'hev1.1.6.L120.B0', 'vp09.00.10.08']);
+      expect(asked).toEqual(['av01.0.05M.08', 'vp09.00.10.08']);
     } finally {
       delete scope.VideoDecoder;
     }
@@ -312,19 +311,19 @@ describe('NativeDecoder configuration', () => {
 
   const keyframe = (data: number[]) => ({ keyframe: true, timestampUs: 0, data: new Uint8Array(data) });
 
-  it('pairs the hev1 string with an Annex-B stream by sending no description (ADR 0071)', () => {
-    // The one claim the H.265 path rests on: `hev1` says the parameter sets
-    // travel in the bitstream, and WebCodecs reads a configuration with no
-    // `description` as Annex-B. A `description` here would mean hvcC, which
-    // is not what the host sends, and the decoder would fail on every
-    // picture rather than refuse the configuration.
+  it('pairs the av01 string with an OBU stream by sending no description (ADR 0069)', () => {
+    // The one claim the AV1 path rests on: a temporal unit carries its own
+    // sequence header, and WebCodecs reads a configuration with no
+    // `description` as exactly that. A `description` here would promise an
+    // out-of-band AV1CodecConfigurationRecord the host never sends, and the
+    // decoder would fail on every picture rather than refuse the config.
     const { configs, restore } = captureConfigs();
     try {
       const decoder = new NativeDecoder(document.createElement('canvas'), () => {});
-      // An HEVC IDR_W_RADL (nal_unit_type 19) behind a start code.
-      decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaa])], WireCodec.H265);
+      // A temporal delimiter OBU followed by a sequence header OBU.
+      decoder.push([keyframe([0x12, 0x00, 0x0a, 0x01, 0x00])], WireCodec.Av1);
       expect(configs).toHaveLength(1);
-      expect(configs[0]?.codec).toBe('hev1.1.6.L120.B0');
+      expect(configs[0]?.codec).toBe('av01.0.05M.08');
       expect(configs[0]).not.toHaveProperty('description');
     } finally {
       restore();
@@ -335,9 +334,9 @@ describe('NativeDecoder configuration', () => {
     const { configs, restore } = captureConfigs();
     try {
       const decoder = new NativeDecoder(document.createElement('canvas'), () => {});
-      decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x26, 0x01])], WireCodec.H265);
+      decoder.push([keyframe([0x12, 0x00, 0x0a, 0x01, 0x00])], WireCodec.Av1);
       decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, 0x00])], WireCodec.H264);
-      expect(configs.map((config) => config.codec)).toEqual(['hev1.1.6.L120.B0', 'avc1.640028']);
+      expect(configs.map((config) => config.codec)).toEqual(['av01.0.05M.08', 'avc1.640028']);
     } finally {
       restore();
     }

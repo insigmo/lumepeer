@@ -33,8 +33,8 @@ use lumepeer_core::constants::{
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DisplayModeInfo, DisplayModeUnavailableReason,
-    FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_H265, FEATURE_CODEC_VP9,
-    FEATURE_CURSOR_SHAPE, FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
+    FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9, FEATURE_CURSOR_SHAPE,
+    FEATURE_DISPLAY_MODE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
     FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED,
     InputDetail, InputEventPayload, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
     UnattendedRejection,
@@ -2343,7 +2343,7 @@ struct DisplayModeFeature {
 /// Which optional codecs (beyond the mandatory H.264 baseline) a guest can
 /// decode (§11; ADR 0067, ADR 0070).
 ///
-/// One three-bit set read in two directions rather than a pair of types.
+/// One small set read in two directions rather than a pair of types.
 /// On a **host** it is what a peer's `Hello` advertised, and it decides what
 /// `MessageKind::MediaCodec` may name. On a **guest** it is what this
 /// process's own `WebView` answered and it decides what this node's `Hello`
@@ -2356,8 +2356,6 @@ struct DisplayModeFeature {
 struct GuestCodecSupport {
     /// AV1: [`FEATURE_CODEC_AV1`].
     av1: bool,
-    /// H.265/HEVC: [`FEATURE_CODEC_H265`].
-    h265: bool,
     /// VP9: [`FEATURE_CODEC_VP9`].
     vp9: bool,
 }
@@ -2366,7 +2364,6 @@ impl GuestCodecSupport {
     fn from_features(features: &[String]) -> Self {
         Self {
             av1: features.iter().any(|f| f == FEATURE_CODEC_AV1),
-            h265: features.iter().any(|f| f == FEATURE_CODEC_H265),
             vp9: features.iter().any(|f| f == FEATURE_CODEC_VP9),
         }
     }
@@ -2384,7 +2381,6 @@ impl GuestCodecSupport {
         let advertised = |codec: MediaCodec| codecs.contains(&codec.to_wire());
         Self {
             av1: advertised(MediaCodec::Av1),
-            h265: advertised(MediaCodec::H265),
             vp9: advertised(MediaCodec::Vp9),
         }
     }
@@ -2395,9 +2391,6 @@ impl GuestCodecSupport {
         let mut features = Vec::new();
         if self.av1 {
             features.push(FEATURE_CODEC_AV1.to_owned());
-        }
-        if self.h265 {
-            features.push(FEATURE_CODEC_H265.to_owned());
         }
         if self.vp9 {
             features.push(FEATURE_CODEC_VP9.to_owned());
@@ -2410,7 +2403,7 @@ impl GuestCodecSupport {
     /// place (§9.1): a guest that advertised none of the three strings would
     /// decode the discriminant as unknown and close the connection.
     const fn understands_negotiation(self) -> bool {
-        self.av1 || self.h265 || self.vp9
+        self.av1 || self.vp9
     }
 }
 
@@ -2418,11 +2411,11 @@ impl GuestCodecSupport {
 /// `support`, given what this host can actually encode right now (§11; ADR
 /// 0067).
 ///
-/// An optional codec is only chosen with mutual hardware support, asked
-/// through [`probe_hardware`] — the exact question `select_encoder` asks again
-/// later when it actually builds the encoder, rather than a second opinion
-/// that could disagree with it (§11's mutual-hardware-support rule; ADR 0069,
-/// ADR 0071). VP9 has no encoder anywhere in this workspace yet (batch 09), so
+/// A codec above the baseline is only chosen with mutual hardware support,
+/// asked through [`probe_hardware`] — the exact question `select_encoder` asks
+/// again later when it actually builds the encoder, rather than a second
+/// opinion that could disagree with it (§11's mutual-hardware-support rule;
+/// ADR 0069). VP9 has no encoder anywhere in this workspace yet (batch 09), so
 /// it is never chosen no matter what a guest advertises: an honest "not yet",
 /// not an unverified assumption that a path works — the same shape of mistake
 /// the comment above the build matrix in `.github/workflows/release.yml`
@@ -2431,13 +2424,10 @@ impl GuestCodecSupport {
 /// permanently blank because nothing had confirmed a usable encoder actually
 /// existed before relying on one.
 ///
-/// AV1 is asked about before H.265, and that order is not arbitrary: AV1 is
-/// royalty-free where H.265 is not, so where a machine and a guest can do
-/// both, the one that costs nobody a licence wins. H.265 can only ever be
-/// reached at all in a build made with `lumepeer-media`'s `encode-h265`
-/// feature, which no release row enables — turning it on is a licensing
-/// decision (ADR 0071), and a build that has taken that decision is a build
-/// that means to use H.265 where it can.
+/// AV1 is asked about first and taken whenever the answer is yes: it is the
+/// codec this project prefers, and the only one above the baseline it will
+/// ever choose (ADR 0072). H.264 is what remains when the guest cannot decode
+/// AV1 or this machine cannot encode it — a baseline, not a preference.
 fn choose_media_codec(support: GuestCodecSupport) -> VideoCodec {
     let hardware = |codec| {
         probe_hardware(EncoderConfig {
@@ -2447,9 +2437,6 @@ fn choose_media_codec(support: GuestCodecSupport) -> VideoCodec {
     };
     if support.av1 && hardware(VideoCodec::Av1) {
         return VideoCodec::Av1;
-    }
-    if support.h265 && hardware(VideoCodec::H265) {
-        return VideoCodec::H265;
     }
     VideoCodec::H264
 }
@@ -2464,7 +2451,6 @@ const fn wire_media_codec(codec: VideoCodec) -> MediaCodec {
     match codec {
         VideoCodec::H264 => MediaCodec::H264,
         VideoCodec::Av1 => MediaCodec::Av1,
-        VideoCodec::H265 => MediaCodec::H265,
     }
 }
 
@@ -9043,7 +9029,7 @@ mod tests {
         assert_eq!(tracker.smoothed(), after_the_real_one);
     }
 
-    /// §9.1, ADR 0067: a guest that advertised none of the three codec
+    /// §9.1, ADR 0067: a guest that advertised none of the codec
     /// feature strings must be indistinguishable, at the negotiation layer,
     /// from one that predates this message entirely — the whole point being
     /// that `on_media_accepted` never sends it such a guest `MediaCodec` at
@@ -9055,13 +9041,12 @@ mod tests {
         assert_eq!(choose_media_codec(support), VideoCodec::H264);
     }
 
-    /// `GuestCodecSupport::from_features` reads exactly the three strings
-    /// ADR 0067 defines and nothing else, and any one of them alone is
-    /// enough to prove this guest understands the message.
+    /// `GuestCodecSupport::from_features` reads exactly the strings ADR 0067
+    /// defines and nothing else, and any one of them alone is enough to prove
+    /// this guest understands the message.
     #[test]
     fn from_features_reads_each_codec_string_independently() {
         assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_AV1.to_owned()]).av1);
-        assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_H265.to_owned()]).h265);
         assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_VP9.to_owned()]).vp9);
         assert!(
             !GuestCodecSupport::from_features(&["something-unrelated".to_owned()])
@@ -9069,7 +9054,6 @@ mod tests {
         );
         for features in [
             vec![FEATURE_CODEC_AV1.to_owned()],
-            vec![FEATURE_CODEC_H265.to_owned()],
             vec![FEATURE_CODEC_VP9.to_owned()],
         ] {
             assert!(GuestCodecSupport::from_features(&features).understands_negotiation());
@@ -9087,7 +9071,6 @@ mod tests {
     fn av1_is_chosen_exactly_when_the_hardware_probe_says_so() {
         let support = GuestCodecSupport {
             av1: true,
-            h265: false,
             vp9: false,
         };
         let hardware = probe_hardware(EncoderConfig {
@@ -9120,7 +9103,6 @@ mod tests {
         );
         let seen_by_the_host = GuestCodecSupport::from_features(&reported.features());
         assert!(seen_by_the_host.av1);
-        assert!(!seen_by_the_host.h265);
         assert!(seen_by_the_host.vp9);
     }
 
@@ -9140,73 +9122,37 @@ mod tests {
     fn vp9_is_never_chosen_without_an_encoder() {
         let support = GuestCodecSupport {
             av1: false,
-            h265: false,
             vp9: true,
         };
         assert_eq!(choose_media_codec(support), VideoCodec::H264);
     }
 
-    /// ADR 0071's licensing gate, checked where it actually decides something:
-    /// a build made **without** `encode-h265` must never negotiate H.265, no
-    /// matter what a guest advertises and no matter what hardware the machine
-    /// has. In a build that did ask for the feature the same test says the
-    /// opposite — H.265 is chosen exactly when the probe finds hardware for
-    /// it — so this runs on both sides of the switch rather than only the one
-    /// that ships.
+    /// ADR 0072: AV1 and the H.264 baseline are the whole set a host can
+    /// choose from, so no advertisement a guest can make — including one
+    /// naming the retired H.265 wire byte — reaches anything else.
     #[test]
-    fn h265_is_negotiated_only_in_a_build_that_asked_for_the_feature() {
-        let support = GuestCodecSupport {
-            av1: false,
-            h265: true,
-            vp9: false,
+    fn nothing_a_guest_advertises_negotiates_a_codec_beyond_av1_and_the_baseline() {
+        // 2 was H.265's wire byte before it was removed; a peer still
+        // sending it names a codec this build has no `MediaCodec` for.
+        let reported = GuestCodecSupport::from_wire_bytes(&[2, MediaCodec::Vp9.to_wire()]);
+        assert!(!reported.av1);
+        assert_eq!(reported.features(), vec![FEATURE_CODEC_VP9.to_owned()]);
+        assert_eq!(choose_media_codec(reported), VideoCodec::H264);
+
+        let everything = GuestCodecSupport {
+            av1: true,
+            vp9: true,
         };
-        let hardware = probe_hardware(EncoderConfig {
-            codec: VideoCodec::H265,
+        let av1_hardware = probe_hardware(EncoderConfig {
+            codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         }) == Some(EncoderKind::Hardware);
-        #[cfg(not(feature = "encode-h265"))]
-        {
-            assert!(
-                !hardware,
-                "a build without encode-h265 reported hardware H.265"
-            );
-            assert_eq!(choose_media_codec(support), VideoCodec::H264);
-        }
-        #[cfg(feature = "encode-h265")]
-        {
-            let expected = if hardware {
-                VideoCodec::H265
-            } else {
-                VideoCodec::H264
-            };
-            assert_eq!(choose_media_codec(support), expected);
-        }
-    }
-
-    /// AV1 is royalty-free where H.265 is not, so a machine and a guest that
-    /// can do both get AV1 (ADR 0071). Only checkable where both probes say
-    /// yes, which is why it asks them rather than assuming.
-    #[test]
-    fn av1_wins_over_h265_when_both_are_available() {
-        let support = GuestCodecSupport {
-            av1: true,
-            h265: true,
-            vp9: false,
-        };
-        let hardware = |codec| {
-            probe_hardware(EncoderConfig {
-                codec,
-                ..EncoderConfig::default()
-            }) == Some(EncoderKind::Hardware)
-        };
-        let expected = if hardware(VideoCodec::Av1) {
+        let expected = if av1_hardware {
             VideoCodec::Av1
-        } else if hardware(VideoCodec::H265) {
-            VideoCodec::H265
         } else {
             VideoCodec::H264
         };
-        assert_eq!(choose_media_codec(support), expected);
+        assert_eq!(choose_media_codec(everything), expected);
     }
 
     /// The wire byte `on_media_accepted` sends is exactly the one

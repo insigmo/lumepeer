@@ -185,7 +185,7 @@ TeamViewer и AnyDesk закрыты — проверить их нечем в �
 
 | Чего нет | У кого есть | Статус |
 |---|---|---|
-| H.265, AV1, VP9 | RustDesk (VP8/VP9/AV1/H264/H265), у TeamViewer и AnyDesk свои кодеки | **[не сделано]** — `VideoCodec::Av1` объявлен, но `encode/mod.rs` отдаёт `None`: реально только H.264 |
+| VP9 | RustDesk (VP8/VP9/AV1/H264/H265), у TeamViewer и AnyDesk свои кодеки | **[частично]** — AV1 согласуется и кодируется там, где есть аппаратный энкодер (ADR 0069); H.265 снят по лицензии (ADR 0072); VP9 не сделан |
 | Аппаратный энкодер на macOS (VideoToolbox) | все трое | **[не сделано]** — `docs/tasks/13-hardware-encoders.md`; на Mac только openh264 |
 | GPU zero-copy на пути захват → энкодер | AnyDesk (DeskRT), TeamViewer | **[не сделано]** — оставлено в ADR 0058/0059 |
 | Картинка выше 4K и кадры тяжелее 8 МиБ | TeamViewer, AnyDesk | **[решено]** — `MAX_STREAM_PIXELS = 3840×2160`, `MAX_MEDIA_FRAME_BYTES = 8 MiB` |

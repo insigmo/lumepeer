@@ -1,7 +1,13 @@
 # ADR 0071 — H.265 is a licensing switch, not a default
 
-Status: accepted
+Status: superseded by [ADR 0072](0072-h265-is-removed-and-av1-is-the-only-codec-above-the-baseline.md)
 Date: 2026-09-09
+
+> The flag this ADR built was never turned on, and ADR 0072 answers its open
+> question with a no: H.265 is removed from the workspace entirely and wire
+> byte 2 is retired. Everything below is the reasoning as it stood, kept for
+> the measurements in it — the AV1-versus-H.264 latency figures still stand
+> and still argue about a preference this project has not revisited.
 
 Follows [ADR 0069](0069-av1-asks-each-backend-and-va-api-cannot-answer.md),
 which made `probe_hardware` a per-backend question, and
