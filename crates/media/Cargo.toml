@@ -79,6 +79,21 @@ encode-openh264 = ["dep:openh264"]
 # shipped Linux feature set: a .deb must install and run on a machine with no
 # VA-API at all, falling back to openh264 (§18).
 encode-vaapi = ["dep:cros-libva"]
+# Hardware H.265/HEVC encoding (§11; ADR 0071). Off by default and off in
+# every row of the release matrix, and that is a **licensing** decision rather
+# than a technical one: H.265 is covered by the Access Advance and Via LA
+# patent pools, and this project ships an installer. Turning this on for a
+# distributed build is a decision for a human with the authority to take it —
+# see ADR 0071.
+#
+# A pure marker feature: it adds no dependency, because neither backend needs
+# one. On Windows it selects `MFVideoFormat_HEVC` inside the `encode-mf`
+# module, whose `windows` bindings already carry it; on Linux it enables the
+# HEVC parameter buffers inside the `encode-vaapi` module, whose `cros-libva`
+# already carries those too. Without a platform encoder feature next to it,
+# this feature is completely inert: every probe answers `None` and the
+# negotiation never offers H.265 at all.
+encode-h265 = []
 # VideoToolbox hardware H.264 encoder for macOS (§5.1, §11, §18/§19 phase 4;
 # ADR 0066). Same convention as encode-mf/encode-vaapi: `cargo build
 # --workspace` needs no platform SDK, and every binding it needs is declared

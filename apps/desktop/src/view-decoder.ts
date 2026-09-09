@@ -250,8 +250,9 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
  * profile and level sit inside a sequence header OBU behind variable-length
  * bit fields — and the host's Media Foundation encoder produces Main profile
  * 8-bit and nothing else, which is the whole of what this string has to say.
- * For H.265 and VP9 there is still no encoder anywhere in this workspace to
- * read a stream from (batches 08/09).
+ * For H.265 the host's encoders produce Main profile 8-bit and nothing else
+ * either, so the same reasoning applies; VP9 still has no encoder anywhere in
+ * this workspace to read a stream from (batch 09).
  *
  * AV1 is Main profile, level 4.1, main tier, 8-bit. Level 4.1 rather than 4.0
  * because it is the first level whose sample rate covers 1080p at 60 Hz, and
@@ -260,10 +261,29 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
  * stream, so naming one level above what a default session needs costs
  * nothing — and a machine that cannot clear it says so, and the session stays
  * on H.264.
+ *
+ * H.265 is `hev1`, Main profile, main tier, level 4.0 (ADR 0071), and both
+ * halves of that are a decision about matching the stream rather than a
+ * default:
+ *
+ * - `hev1` rather than `hvc1`. In ISOBMFF the two differ in where the
+ *   parameter sets live: `hvc1` promises they are out of band and never
+ *   change, `hev1` allows them in the bitstream. The host's encoders put the
+ *   VPS/SPS/PPS in band ahead of every IRAP picture — an Annex-B stream, the
+ *   same shape the H.264 path already produces — which is what `hev1`
+ *   describes. WebCodecs decides the container from whether `description` is
+ *   present, and this configuration deliberately has none, so the string and
+ *   the stream agree on both counts.
+ * - Level 4.0 (`L120`, H.265 counting levels in thirtieths) rather than 3.1.
+ *   3.1 stops at 720p, and this pipeline's default picture is 1080p; the
+ *   VA-API encoder writes exactly this level into its own sequence header
+ *   (`HEVC_LEVEL_IDC`). A decoder asked for less than the stream carries is
+ *   free to accept the configuration and then fail on the pictures, which is
+ *   a black window rather than an honest fallback to H.264.
  */
 const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.H265 | WireCodec.Vp9, string>> = {
   [WireCodec.Av1]: 'av01.0.05M.08',
-  [WireCodec.H265]: 'hev1.1.6.L93.B0',
+  [WireCodec.H265]: 'hev1.1.6.L120.B0',
   [WireCodec.Vp9]: 'vp09.00.10.08',
 };
 
