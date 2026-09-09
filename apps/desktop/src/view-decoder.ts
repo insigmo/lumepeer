@@ -56,7 +56,7 @@ const CHUNK_FLAG_DESYNC = 0b100;
  * Video codec identifier as [`MessageKind::MediaCodec`]'s wire byte and the
  * ninth byte of every `view_next_chunk` header encode it
  * (`crates/core/src/protocol.rs`, `apps/desktop/src-tauri/src/view.rs`; ADR
- * 0066). H.264 is the mandatory baseline and the value every session starts
+ * 0067). H.264 is the mandatory baseline and the value every session starts
  * on until a `MediaCodec` message says otherwise.
  */
 export enum WireCodec {
@@ -85,7 +85,7 @@ export interface ViewChunk {
   recording: boolean;
   /** Whether the decoder must be reset before these frames are used. */
   desync: boolean;
-  /** The codec this batch of frames is encoded with (ADR 0066). */
+  /** The codec this batch of frames is encoded with (ADR 0067). */
   codec: WireCodec;
   /** Encoded pictures, in the order the host produced them. */
   frames: ChunkFrame[];
@@ -102,7 +102,7 @@ export interface ViewChunk {
  * than half-read: it is the same untrusted-input rule the rest of the wire
  * follows (§21), and a truncated length here would otherwise be handed
  * straight to a decoder. An unrecognized codec byte is refused the same way
- * (ADR 0066) — this side never guesses at a codec it has no name for.
+ * (ADR 0067) — this side never guesses at a codec it has no name for.
  */
 export function decodeViewChunk(buffer: ArrayBuffer): ViewChunk {
   if (buffer.byteLength < CHUNK_RESPONSE_HEADER_BYTES) {
@@ -241,7 +241,7 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
 }
 
 /**
- * Fixed `VideoDecoder` config string for each optional codec (ADR 0066).
+ * Fixed `VideoDecoder` config string for each optional codec (ADR 0067).
  *
  * Unlike H.264 (see {@link avcCodecString}), nothing here yet reads a real
  * profile out of the stream itself: no encoder for any of these three exists
@@ -260,7 +260,7 @@ const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.H265 | W
 
 /**
  * Which optional codecs (beyond the mandatory H.264 baseline) this `WebView`
- * can actually decode right now (ADR 0066).
+ * can actually decode right now (ADR 0067).
  *
  * Asked one profile at a time from `VideoDecoder.isConfigSupported` itself,
  * never assumed from a table of "we think this platform can" — an unverified
@@ -295,7 +295,7 @@ export async function supportedOptionalCodecs(): Promise<WireCodec[]> {
 
 /**
  * The `VideoDecoder` config string for `codec`, given the keyframe that is
- * about to configure a decoder for it (ADR 0066).
+ * about to configure a decoder for it (ADR 0067).
  *
  * H.264 alone reads its profile out of the stream (see {@link avcCodecString}):
  * its encoder can pick High, Main or Baseline depending on what the host's
@@ -329,7 +329,7 @@ export class NativeDecoder {
   #broken = false;
   #painted = false;
   /**
-   * The codec the current decoder (if any) was configured for (ADR 0066).
+   * The codec the current decoder (if any) was configured for (ADR 0067).
    * `null` until the first successful {@link NativeDecoder.#configure} call,
    * so the very first keyframe of a session is never mistaken for a change.
    */
@@ -383,7 +383,7 @@ export class NativeDecoder {
    * anything is on screen. Painting from the callback rather than from here
    * is what keeps the decode off the critical path.
    *
-   * A mid-session codec change is not a supported transition (ADR 0066): the
+   * A mid-session codec change is not a supported transition (ADR 0067): the
    * decoder holds state for the codec it was configured with, so a `codec`
    * that differs from the last call's gets the same treatment as
    * `CHUNK_FLAG_DESYNC` — thrown away and rebuilt from the next intra frame.

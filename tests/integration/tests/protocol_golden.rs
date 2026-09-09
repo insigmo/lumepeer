@@ -10,7 +10,7 @@
 //! `ClipboardFileOffer` and `ClipboardFileAccept` (docs/bugs/
 //! 14-clipboard-files.md; ADR 0047), minor 9 appended `DisplayModesList` and
 //! `DisplaySetMode` (docs/bugs/16-host-display-mode.md; ADR 0048), minor 11
-//! appended `MediaCodec` (ADR 0066) — and every earlier vector is still in the
+//! appended `MediaCodec` (ADR 0067) — and every earlier vector is still in the
 //! file unchanged, which is the compatibility claim this test checks.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,

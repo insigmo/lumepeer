@@ -91,7 +91,7 @@ describe('decodeViewChunk', () => {
     expect(decodeViewChunk(chunkResponse(1, 0, [])).codec).toBe(WireCodec.H264);
   });
 
-  it('reads every assigned codec byte (ADR 0066)', () => {
+  it('reads every assigned codec byte (ADR 0067)', () => {
     for (const codec of [WireCodec.H264, WireCodec.Av1, WireCodec.H265, WireCodec.Vp9]) {
       expect(decodeViewChunk(chunkResponse(1, 0, [], codec)).codec).toBe(codec);
     }
@@ -185,7 +185,7 @@ describe('configStringFor', () => {
     expect(configStringFor(WireCodec.H264, keyframe(sps))).toBe(avcCodecString(new Uint8Array(sps)));
   });
 
-  it('answers a fixed config string for each optional codec (ADR 0066)', () => {
+  it('answers a fixed config string for each optional codec (ADR 0067)', () => {
     // Nothing has encoded any of these yet (batches 07/08/09), so unlike
     // H.264 there is no stream to read a profile out of — the frame's own
     // bytes are irrelevant to the answer.
