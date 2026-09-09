@@ -1814,9 +1814,12 @@ mod tests {
             let data = [0x00, 0x00, 0x00, 0x01, hevc_nal_header(nal_type), 0x01];
             assert!(bitstream_has_irap(&data), "type {nal_type} is an IRAP");
         }
-        // TRAIL_R (1), a plain inter picture, and VPS (32), which is above
-        // the IRAP range.
-        for nal_type in [1u8, HEVC_NAL_VPS] {
+        // TRAIL_R (1), a plain inter picture, and the three parameter sets,
+        // which sit above the IRAP range: they describe the stream rather
+        // than carrying a picture, and a scan that counted one of them as a
+        // random access point would mark every keyframe's *first* NAL as the
+        // keyframe and be right by accident until an encoder reordered them.
+        for nal_type in [1u8, HEVC_NAL_VPS, HEVC_NAL_SPS, HEVC_NAL_PPS] {
             let data = [0x00, 0x00, 0x01, hevc_nal_header(nal_type), 0x01];
             assert!(!bitstream_has_irap(&data), "type {nal_type} is not an IRAP");
         }
