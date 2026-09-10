@@ -13,6 +13,7 @@ import type { ConnectionStats } from './connection-quality';
 import { connectionQuality } from './connection-quality';
 import type { FileCommands, FileTransfers } from './file-transfers';
 import { fileTransferPanel, tauriFileCommands } from './file-transfers';
+import { tauriTunnelCommands, tunnelPanel, type TunnelCommands, type TunnelRow } from './tunnels';
 
 export type SessionState = 'pending' | 'active';
 
@@ -33,7 +34,8 @@ export type IndependentGrant =
   | 'recording'
   | 'display_mode'
   | 'secure_desktop'
-  | 'secure_desktop_input';
+  | 'secure_desktop_input'
+  | 'tunnel';
 
 export interface SessionStatus {
   peer_label: string;
@@ -74,6 +76,15 @@ export interface SessionStatus {
    * `recording_active` rather than `recording`.
    */
   secure_desktop_active: boolean;
+  /**
+   * Whether this guest may forward TCP connections into the host's own
+   * network (ADR 0078).
+   *
+   * Permission only, and half a decision: which addresses it may reach is a
+   * separate list the host writes one entry at a time, and this flag with an
+   * empty list reaches nothing.
+   */
+  tunnel: boolean;
 }
 
 /**
@@ -341,6 +352,18 @@ export function sessionStatus(
    * has measured it: a session with no row here simply shows no pill.
    */
   connectionStats: ReadonlyMap<string, ConnectionStats> = new Map(),
+  /**
+   * Which addresses each session's tunnel may reach, and what is going
+   * through them, as the last `tunnel_status` poll reported (ADR 0078).
+   *
+   * On the session's own row on purpose: a tunnel reaches past this machine
+   * into the network around it, and "something is being forwarded" belongs
+   * next to the switch that ends the session rather than on a panel somebody
+   * has to go and find (§2.2).
+   */
+  tunnels: readonly TunnelRow[] = [],
+  /** How the tunnel panel reaches the actor; injectable for tests. */
+  tunnelCommands: TunnelCommands = tauriTunnelCommands,
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -424,6 +447,9 @@ export function sessionStatus(
                   ${session.state === 'active' ? secureDesktopIndicator(session, locale) : ''}
                   ${session.state === 'active' && session.file_transfer
                     ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
+                    : ''}
+                  ${session.state === 'active' && session.tunnel
+                    ? tunnelPanel(session.peer_label, tunnels, locale, tunnelCommands, onRefresh)
                     : ''}
                 </li>
               `,

@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -30,22 +30,22 @@ use lumepeer_core::constants::{
     FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
     KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
-    STREAM_SIZE_MIN_PX,
+    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
     FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
-    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_UNATTENDED, FileFetchRefusal, InputDetail,
-    InputEventPayload, ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
-    UnattendedRejection,
+    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TUNNEL, FEATURE_UNATTENDED,
+    FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
+    MediaUnavailableReason, MessageKind, MonitorInfo, TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
 };
-use lumepeer_core::session::{SessionManager, SessionState};
+use lumepeer_core::session::{SessionManager, SessionState, TunnelTarget};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_media::capture::{
@@ -58,6 +58,7 @@ use lumepeer_net::file_transfer::{
 };
 use lumepeer_net::keystore::{Keystore, load_or_create};
 use lumepeer_net::ticket::TicketRegistry;
+use lumepeer_net::tunnel::{StreamId, read_frame, write_close, write_frame};
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use rand::Rng as _;
 use rand::RngExt as _;
@@ -153,6 +154,13 @@ const FILE_MANAGE_MINOR: u16 = 13;
 /// guest to read; a minor is announced by both sides, and the size ceiling is
 /// a thing each side has to know about the other before it offers anything.
 const DIR_TRANSFER_MINOR: u16 = 14;
+
+/// First `PROTOCOL_MINOR` that carries the three tunnel messages (ADR 0078).
+///
+/// Guest side only, like the file gates: a host reads the guest's
+/// `FEATURE_TUNNEL` string instead, and `HelloAck` carries no feature list
+/// for the guest to read the other way.
+const TUNNEL_MINOR: u16 = 15;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -688,6 +696,10 @@ pub enum ActorNotification {
     /// material and this bus reaches every listener; the UI polls
     /// `file_transfers` for the detail.
     FileTransferChanged,
+    /// A tunnel opened, closed, or gained or lost a forwarded connection
+    /// (ADR 0078). Host side, so the session line and the tunnel list are
+    /// never a poll behind what is actually carrying bytes.
+    TunnelChanged,
 }
 
 /// Failure returned by an actor call.
@@ -965,6 +977,34 @@ enum ActorCommand {
     DirListing {
         label: String,
         reply: oneshot::Sender<Result<RemoteFileStatus, ActorError>>,
+    },
+    /// Guest side: forward a local port to an address on the watched host
+    /// (ADR 0078).
+    TunnelOpen {
+        label: String,
+        local_port: u16,
+        host: String,
+        port: u16,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Either side: close every forwarded connection with this peer, and the
+    /// tunnel under them (ADR 0078).
+    TunnelCloseAll {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: add or remove one address this session's tunnel may reach
+    /// (§8.2; ADR 0078).
+    TunnelSetTarget {
+        label: String,
+        host: String,
+        port: u16,
+        allowed: bool,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: every tunnel this machine is carrying right now.
+    TunnelStatus {
+        reply: oneshot::Sender<Vec<TunnelRow>>,
     },
     /// Guest side: ask the watched host to send the file at `path`, into
     /// `into` on this machine (ADR 0076).
@@ -1807,6 +1847,104 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Guest side: forwards `local_port` on this machine to `host:port` on
+    /// the watched host (§4.1; ADR 0078).
+    ///
+    /// Nothing is authorized here. The host re-reads its own `tunnel` grant
+    /// and its own address list for **every** connection that goes through,
+    /// so what this can fail on is local: a port already taken, an address
+    /// this build will not parse, a host too old to understand the message.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old; [`ActorError::Core`]
+    /// with `Malformed` for an address that is not one, or `NotPermitted` when
+    /// that local port is already forwarded; [`ActorError::Net`] when the port
+    /// cannot be bound.
+    pub async fn tunnel_open(
+        &self,
+        label: String,
+        local_port: u16,
+        host: String,
+        port: u16,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TunnelOpen {
+                label,
+                local_port,
+                host,
+                port,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Either side: closes every forwarded connection with `label` at once
+    /// (§4, §8.1; ADR 0078).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when no session matches `label`;
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn tunnel_close_all(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TunnelCloseAll { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: names one address this session's tunnel may reach, or takes
+    /// it back (§8.2; ADR 0078).
+    ///
+    /// A deliberate act on one session, which is what separates it from a
+    /// policy file: the host is looking at a guest and saying "this address".
+    /// It grants nothing on its own — without the `tunnel` flag the list is
+    /// unreachable — and taking an address back closes the connections that
+    /// were using it.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when no session matches `label`;
+    /// [`ActorError::Core`] with `Malformed` for an address that is not one,
+    /// or `NotPermitted` when the list is full.
+    pub async fn tunnel_set_target(
+        &self,
+        label: String,
+        host: String,
+        port: u16,
+        allowed: bool,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TunnelSetTarget {
+                label,
+                host,
+                port,
+                allowed,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: every tunnel this machine is carrying right now (§15;
+    /// ADR 0078).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn tunnel_status(&self) -> Result<Vec<TunnelRow>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TunnelStatus { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     /// Guest side: asks the watched host to send one file, to be written into
     /// `into` on this machine (ADR 0076).
     ///
@@ -2487,6 +2625,83 @@ pub struct FileTransfersDto {
     pub transfers: Vec<TransferRow>,
 }
 
+/// One live tunnel: the writer it feeds and the local sockets it dispatches
+/// to (§4.1; ADR 0078).
+///
+/// Cloneable on purpose. The reader task, the per-connection pumps and the
+/// actor all hold one, and none of them owns the connection: a tunnel ends
+/// when the actor drops its entry and closes the QUIC connection, and every
+/// task then falls out of its own loop.
+#[derive(Clone)]
+struct TunnelChannel {
+    /// Frames on their way to the far side, drained by the writer task.
+    frames: mpsc::Sender<TunnelWrite>,
+    /// Where a frame that arrives goes: one sender per open stream, feeding
+    /// the local socket's own write half.
+    streams: Arc<tokio::sync::Mutex<std::collections::HashMap<StreamId, mpsc::Sender<Vec<u8>>>>>,
+    /// Bytes carried in both directions, for the line the host reads.
+    bytes: Arc<AtomicU64>,
+    /// The QUIC connection under it, kept so a revoke can close it outright
+    /// rather than waiting for the far side to notice (§4; ADR 0078).
+    connection: iroh::endpoint::Connection,
+}
+
+/// One thing to put on a tunnel connection.
+#[derive(Debug)]
+enum TunnelWrite {
+    /// Payload for one forwarded connection.
+    Data(StreamId, Vec<u8>),
+    /// That connection is over on this side.
+    Close(StreamId),
+}
+
+/// One forwarded connection, as the host's own screen lists it (§15;
+/// ADR 0078).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TunnelRow {
+    /// Pseudonymized peer label (§15).
+    pub peer_label: String,
+    /// Address this session may reach, as the host named it.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// How many connections are open to it right now.
+    pub streams: usize,
+    /// Bytes carried through this session's tunnel, both directions.
+    pub bytes: u64,
+}
+
+/// One thing that happened to a tunnel, off the actor loop.
+enum TunnelEvent {
+    /// `rd/tunnel/1` towards this peer is up — either this node dialed it, or
+    /// the peer's dial was accepted and authorized.
+    Connected {
+        peer: NodeId,
+        connection: Box<iroh::endpoint::Connection>,
+    },
+    /// The dial failed, so nothing can be forwarded to this peer.
+    ConnectFailed { peer: NodeId },
+    /// Guest side: something connected to a forwarded local port, and the
+    /// host has not been asked about it yet.
+    LocalConnection {
+        peer: NodeId,
+        stream_id: StreamId,
+        /// Which forwarded port it arrived on, which is what says where it
+        /// is going: one peer may have several, each to its own address.
+        local_port: u16,
+        /// The accepted socket, held until the host answers.
+        socket: Box<tokio::net::TcpStream>,
+    },
+    /// Host side: the connection to the target either exists or does not.
+    TargetConnected {
+        peer: NodeId,
+        stream_id: StreamId,
+        socket: Option<Box<tokio::net::TcpStream>>,
+    },
+    /// One forwarded connection ended on this side.
+    StreamEnded { peer: NodeId, stream_id: StreamId },
+}
+
 /// One thing that happened to a transfer, off the actor loop.
 enum FileEvent {
     /// `rd/file/1` towards this peer is up — either this node dialed it, or
@@ -3010,6 +3225,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_DIR_TRANSFER`
         /// (ADR 0077), so a whole directory may be offered to it.
         speaks_dir_transfer: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_TUNNEL`
+        /// (ADR 0078), so a tunnel request from it can be answered out loud.
+        speaks_tunnel: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3058,6 +3276,8 @@ enum ActorEvent {
     },
     /// Something happened to a file transfer, on one of its own tasks.
     File(FileEvent),
+    /// Something happened to a tunnel, on one of its own tasks (ADR 0078).
+    Tunnel(TunnelEvent),
     /// This node's own clipboard file list was read and measured, off the
     /// actor loop (docs/bugs/14-clipboard-files.md #2; ADR 0027).
     ClipboardFilesRead {
@@ -3141,6 +3361,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_DIR_TRANSFER`
         /// (ADR 0077), so a whole directory may be offered to it.
         speaks_dir_transfer: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_TUNNEL`
+        /// (ADR 0078), so a tunnel request from it can be answered out loud.
+        speaks_tunnel: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3153,6 +3376,12 @@ enum Accepted {
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
+        connection: Box<iroh::endpoint::Connection>,
+        peer: NodeId,
+    },
+    /// Tunnel ALPN: authenticated only, nothing decided — exactly like media
+    /// and files, and for the same reason (§4.1, §2.3; ADR 0078).
+    Tunnel {
         connection: Box<iroh::endpoint::Connection>,
         peer: NodeId,
     },
@@ -3308,6 +3537,33 @@ struct Actor {
     dir_offers_in: std::collections::HashMap<NodeId, IncomingDirOffer>,
     /// Directories in flight, keyed by the group id the window cancels by.
     dir_groups: std::collections::HashMap<(NodeId, u64), DirGroup>,
+    /// Peers whose `Hello` advertised `FEATURE_TUNNEL`, and which may
+    /// therefore be answered with a `TunnelOpenResponse` (ADR 0078).
+    speaks_tunnel: std::collections::HashSet<NodeId>,
+    /// Guest side: per watched host, whether its `HelloAck` minor is at least
+    /// `TUNNEL_MINOR`, so this node may ask it for a tunnel at all.
+    tunnel_to_host: std::collections::HashMap<NodeId, bool>,
+    /// The live `rd/tunnel/1` plumbing per peer, on both sides (ADR 0078).
+    tunnels: std::collections::HashMap<NodeId, TunnelChannel>,
+    /// Peers whose tunnel connection is being dialed right now.
+    tunnel_dialing: std::collections::HashSet<NodeId>,
+    /// Guest side: the local listeners this node opened, keyed by peer and
+    /// local port, so closing a tunnel actually gives the port back.
+    tunnel_listeners: std::collections::HashMap<(NodeId, u16), tokio::task::JoinHandle<()>>,
+    /// Guest side: sockets accepted on a forwarded port and waiting for the
+    /// host to say whether they may be connected.
+    tunnel_pending: std::collections::HashMap<(NodeId, StreamId), Box<tokio::net::TcpStream>>,
+    /// Which address each open stream is for, on both sides, for the line the
+    /// host reads and for the audit entry when it closes.
+    tunnel_streams: std::collections::HashMap<(NodeId, StreamId), TunnelTarget>,
+    /// Guest side: the next stream id this node will name.
+    next_tunnel_stream: StreamId,
+    /// Guest side: the address each forwarded local port is for.
+    tunnel_wanted: std::collections::HashMap<(NodeId, u16), TunnelTarget>,
+    /// Guest side: why the host last refused a forwarded connection, for the
+    /// window to say something true rather than leave a port that silently
+    /// accepts and drops (§18).
+    tunnel_refusals: std::collections::HashMap<NodeId, TunnelRefusal>,
     /// Host side: how many fetches from each peer are being hashed right now.
     ///
     /// Counted separately from `file_offers_out` because a hash pass is where
@@ -4848,6 +5104,615 @@ impl Actor {
             .map(|group| group.members.clone())
     }
 
+    // ---------------------------------------------------------------------
+    // Tunnel (§4.1; ADR 0078)
+    // ---------------------------------------------------------------------
+
+    fn on_tunnel_event(&mut self, event: TunnelEvent) {
+        match event {
+            TunnelEvent::Connected { peer, connection } => {
+                self.on_tunnel_connected(peer, *connection);
+            }
+            TunnelEvent::ConnectFailed { peer } => {
+                self.tunnel_dialing.remove(&peer);
+                tracing::warn!(peer = %self.label_of(&peer), "the tunnel connection could not be opened");
+                self.close_tunnel(peer, "dial failed");
+            }
+            TunnelEvent::LocalConnection {
+                peer,
+                stream_id,
+                local_port,
+                socket,
+            } => self.on_tunnel_local_connection(peer, stream_id, local_port, socket),
+            TunnelEvent::TargetConnected {
+                peer,
+                stream_id,
+                socket,
+            } => self.on_tunnel_target_connected(peer, stream_id, socket),
+            TunnelEvent::StreamEnded { peer, stream_id } => {
+                self.end_tunnel_stream(peer, stream_id, true);
+            }
+        }
+    }
+
+    /// `rd/tunnel/1` towards `peer` is up (§4.1; ADR 0078).
+    ///
+    /// Authorized here and nowhere else, exactly like the file connection:
+    /// this is the one thread that can read `SessionManager`, and a tunnel
+    /// connection from a peer with no live session carrying `tunnel` is
+    /// closed on the spot. Nothing about *which addresses* is decided here —
+    /// that is re-read per request, because a tunnel is many connections.
+    fn on_tunnel_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+        self.tunnel_dialing.remove(&peer);
+        let tag = self.label_of(&peer);
+        if !self.connections.contains_key(&peer) || !self.may_tunnel(&peer) {
+            tracing::warn!(peer = %tag, "refusing a tunnel connection without the grant");
+            connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+            return;
+        }
+        let dialed = self.views.contains_key(&peer);
+        let events = self.events_tx.clone();
+        let (frames_tx, frames_rx) = mpsc::channel::<TunnelWrite>(64);
+        let channel = TunnelChannel {
+            frames: frames_tx,
+            streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            bytes: Arc::new(AtomicU64::new(0)),
+            connection: connection.clone(),
+        };
+        self.tunnels.insert(peer, channel.clone());
+        // One bidirectional QUIC stream carries every forwarded connection,
+        // told apart by the stream id in each frame's own header. The side
+        // that dialed opens it; the other accepts it.
+        tokio::spawn(run_tunnel_connection(
+            connection, channel, frames_rx, peer, tag, dialed, events,
+        ));
+    }
+
+    /// Whether `peer` may hold a tunnel at all right now (ADR 0078).
+    ///
+    /// The grant, and a live session behind it. Which addresses it may reach
+    /// is a separate question, asked per connection by
+    /// `SessionManager::tunnel_allows`.
+    fn may_tunnel(&self, peer: &NodeId) -> bool {
+        // A guest holds no grants of its own: it has a view of the host, and
+        // the host is the side that decides (§2.3). The same asymmetry
+        // `may_transfer_files` carries.
+        if self.views.contains_key(peer) {
+            return true;
+        }
+        self.sessions.state(peer) == SessionState::Active
+            && self
+                .sessions
+                .grants(peer)
+                .is_some_and(|grants| grants.tunnel)
+    }
+
+    /// Opens `rd/tunnel/1` towards `peer`, if this side is the one that can.
+    ///
+    /// Only the node that dialed the control connection dials this one, the
+    /// same as media and files (§4.1; ADR 0026) — which makes the guest the
+    /// dialer, and the guest is also the side with the local port, so the
+    /// host never opens a tunnel nobody asked for.
+    fn ensure_tunnel_connection(&mut self, peer: NodeId) {
+        if self.tunnels.contains_key(&peer) || self.tunnel_dialing.contains(&peer) {
+            return;
+        }
+        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+            return;
+        };
+        self.tunnel_dialing.insert(peer);
+        let endpoint = self.endpoint.clone();
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        tokio::spawn(async move {
+            let event = match endpoint.connect(addr, lumepeer_net::ALPN_TUNNEL).await {
+                Ok(connection) => TunnelEvent::Connected {
+                    peer,
+                    connection: Box::new(connection),
+                },
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "could not open the tunnel connection");
+                    TunnelEvent::ConnectFailed { peer }
+                }
+            };
+            let _ = events.send(ActorEvent::Tunnel(event)).await;
+        });
+    }
+
+    /// Guest side: starts forwarding `local_port` on this machine to
+    /// `host:port` on the watched host (§4.1; ADR 0078).
+    ///
+    /// Binds the loopback and nothing else: a forwarded port that other
+    /// machines on this network could reach would make this node the tunnel's
+    /// second entrance, which nobody consented to.
+    fn on_tunnel_open(
+        &mut self,
+        label: &str,
+        local_port: u16,
+        host: &str,
+        port: u16,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.tunnel_to_host.get(&peer).copied().unwrap_or(false) {
+            return Err(ActorError::Unsupported);
+        }
+        if TunnelTarget::named(host, port).is_none() || local_port == 0 {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        if self.tunnel_listeners.contains_key(&(peer, local_port)) {
+            return Err(ActorError::Core(CoreError::NotPermitted));
+        }
+        self.ensure_tunnel_connection(peer);
+
+        // Bound here, on the actor loop, with the blocking API and then
+        // handed to tokio: `bind` is one syscall that does not wait on
+        // anything, and doing it here is what lets "that port is already
+        // taken" be this call's own error rather than a log line the person
+        // who typed it never sees (§18). Waiting on a spawned task for the
+        // answer would be the actor loop blocking on another task, which is
+        // the one thing it must never do (ADR 0027).
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, local_port))
+            .and_then(|listener| {
+                listener.set_nonblocking(true)?;
+                tokio::net::TcpListener::from_std(listener)
+            })
+            .map_err(|error| {
+                tracing::warn!(peer = %self.label_of(&peer), %error, "a local port could not be bound");
+                ActorError::Net(NetError::Io(error.to_string()))
+            })?;
+
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        // Ids are handed out by the actor, so two listeners on one peer
+        // cannot name the same stream.
+        let first_id = self.next_tunnel_stream;
+        self.next_tunnel_stream = self.next_tunnel_stream.wrapping_add(1_000_000).max(1);
+        let task = tokio::spawn(async move {
+            let mut next = first_id;
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    tracing::debug!(peer = %tag, "a forwarded port stopped accepting");
+                    return;
+                };
+                let stream_id = next;
+                next = next.wrapping_add(1);
+                if events
+                    .send(ActorEvent::Tunnel(TunnelEvent::LocalConnection {
+                        peer,
+                        stream_id,
+                        local_port,
+                        socket: Box::new(socket),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        self.tunnel_listeners.insert((peer, local_port), task);
+        self.tunnel_wanted.insert(
+            (peer, local_port),
+            TunnelTarget::named(host, port).unwrap_or(TunnelTarget {
+                host: host.to_ascii_lowercase(),
+                port,
+            }),
+        );
+        self.audit_tunnel(&peer, "tunnel-opened");
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+        Ok(())
+    }
+
+    /// Guest side: something connected to a forwarded port, so the host is
+    /// asked whether it may go through (ADR 0078).
+    fn on_tunnel_local_connection(
+        &mut self,
+        peer: NodeId,
+        stream_id: StreamId,
+        local_port: u16,
+        socket: Box<tokio::net::TcpStream>,
+    ) {
+        // The port it arrived on is what says where it goes: one session may
+        // forward several ports, each to its own address.
+        let Some(target) = self.tunnel_wanted.get(&(peer, local_port)).cloned() else {
+            return;
+        };
+        let open = self
+            .tunnel_streams
+            .keys()
+            .filter(|(p, _)| *p == peer)
+            .count();
+        if open >= MAX_TUNNEL_STREAMS_PER_SESSION {
+            tracing::warn!(peer = %self.label_of(&peer), "refusing a forwarded connection past the stream bound");
+            return;
+        }
+        // Remembered now rather than when the answer comes back: the answer
+        // names a stream id and nothing else, and this side is the one that
+        // knows what it asked for.
+        self.tunnel_streams
+            .insert((peer, stream_id), target.clone());
+        self.tunnel_pending.insert((peer, stream_id), socket);
+        self.send_to(
+            &peer,
+            MessageKind::TunnelOpenRequest {
+                host: target.host,
+                port: target.port,
+                stream_id,
+            },
+        );
+    }
+
+    /// Host side: a guest asked for a connection to an address (§4.1, §18;
+    /// ADR 0078).
+    ///
+    /// Every decision is re-read here, for **this** connection: the grant,
+    /// because a tunnel is many connections and a revoke has to land on the
+    /// next one; the address, because the host's list is the only thing that
+    /// says where a tunnel may go; and the stream bound, because a guest that
+    /// can open one socket on somebody's network can open a thousand.
+    fn on_tunnel_open_request(&mut self, peer: NodeId, host: &str, port: u16, stream_id: StreamId) {
+        let tag = self.label_of(&peer);
+        if !self.speaks_tunnel.contains(&peer) {
+            tracing::debug!(peer = %tag, "a tunnel request from a peer that never advertised it");
+            return;
+        }
+        tracing::info!(peer = %tag, "a guest asked the host to forward a connection");
+        self.audit_tunnel(&peer, "tunnel-connect");
+
+        let Some(target) = TunnelTarget::named(host, port) else {
+            self.refuse_tunnel(peer, stream_id, TunnelRefusal::BadTarget);
+            return;
+        };
+        if !self.sessions.tunnel_allows(&peer, host, port) {
+            tracing::warn!(peer = %tag, "a tunnel to an address this session may not reach; refused");
+            self.refuse_tunnel(peer, stream_id, TunnelRefusal::NotGranted);
+            return;
+        }
+        let open = self
+            .tunnel_streams
+            .keys()
+            .filter(|(p, _)| *p == peer)
+            .count();
+        if open >= MAX_TUNNEL_STREAMS_PER_SESSION {
+            self.refuse_tunnel(peer, stream_id, TunnelRefusal::TooMany);
+            return;
+        }
+        self.tunnel_streams
+            .insert((peer, stream_id), target.clone());
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let socket = tokio::time::timeout(
+                Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS),
+                tokio::net::TcpStream::connect((target.host.as_str(), target.port)),
+            )
+            .await
+            .ok()
+            .and_then(std::result::Result::ok);
+            let _ = events
+                .send(ActorEvent::Tunnel(TunnelEvent::TargetConnected {
+                    peer,
+                    stream_id,
+                    socket: socket.map(Box::new),
+                }))
+                .await;
+        });
+    }
+
+    /// Host side: the connection to the target either happened or did not.
+    fn on_tunnel_target_connected(
+        &mut self,
+        peer: NodeId,
+        stream_id: StreamId,
+        socket: Option<Box<tokio::net::TcpStream>>,
+    ) {
+        let tag = self.label_of(&peer);
+        let Some(socket) = socket else {
+            tracing::info!(peer = %tag, "the host could not reach a tunnel target");
+            self.tunnel_streams.remove(&(peer, stream_id));
+            self.refuse_tunnel(peer, stream_id, TunnelRefusal::Unreachable);
+            return;
+        };
+        // Re-read once more: connecting takes real time, and a grant
+        // withdrawn while it was happening must not be honoured by the socket
+        // it produced (§2.3).
+        if !self.may_tunnel(&peer)
+            || self
+                .tunnel_streams
+                .get(&(peer, stream_id))
+                .is_none_or(|target| {
+                    !self
+                        .sessions
+                        .tunnel_allows(&peer, &target.host, target.port)
+                })
+        {
+            tracing::warn!(peer = %tag, "the grant for a tunnel was gone by the time it connected");
+            self.tunnel_streams.remove(&(peer, stream_id));
+            self.refuse_tunnel(peer, stream_id, TunnelRefusal::NotGranted);
+            return;
+        }
+        self.start_tunnel_stream(peer, stream_id, *socket);
+        self.send_to(
+            &peer,
+            MessageKind::TunnelOpenResponse {
+                stream_id,
+                refused: None,
+            },
+        );
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+    }
+
+    /// Guest side: the host answered a forwarded connection (ADR 0078).
+    fn on_tunnel_open_response(
+        &mut self,
+        peer: NodeId,
+        stream_id: StreamId,
+        refused: Option<TunnelRefusal>,
+    ) {
+        let Some(socket) = self.tunnel_pending.remove(&(peer, stream_id)) else {
+            return;
+        };
+        if let Some(reason) = refused {
+            tracing::info!(peer = %self.label_of(&peer), ?reason, "a forwarded connection was refused");
+            // Dropping the socket is the local `FIN`: whatever connected to
+            // the forwarded port learns immediately rather than waiting on a
+            // connection that is never coming (§18).
+            drop(socket);
+            self.tunnel_streams.remove(&(peer, stream_id));
+            self.tunnel_refusals.insert(peer, reason);
+            let _ = self.notify.send(ActorNotification::TunnelChanged);
+            return;
+        }
+        self.start_tunnel_stream(peer, stream_id, *socket);
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+    }
+
+    /// Wires one TCP socket to one tunnel stream, both directions.
+    fn start_tunnel_stream(
+        &mut self,
+        peer: NodeId,
+        stream_id: StreamId,
+        socket: tokio::net::TcpStream,
+    ) {
+        let Some(channel) = self.tunnels.get(&peer).cloned() else {
+            return;
+        };
+        let events = self.events_tx.clone();
+        let (mut read_half, mut write_half) = socket.into_split();
+        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(16);
+        let streams = Arc::clone(&channel.streams);
+        let bytes = Arc::clone(&channel.bytes);
+        tokio::spawn(async move {
+            streams.lock().await.insert(stream_id, inbound_tx);
+        });
+
+        // Far side to local socket. An idle stream is closed rather than held
+        // open forever: a socket on somebody else's machine is not free.
+        let write_bytes = Arc::clone(&bytes);
+        tokio::spawn(async move {
+            loop {
+                let next = tokio::time::timeout(
+                    Duration::from_secs(TUNNEL_IDLE_TIMEOUT_SECS),
+                    inbound_rx.recv(),
+                )
+                .await;
+                let Ok(Some(payload)) = next else {
+                    break;
+                };
+                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &payload)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                write_bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+            }
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
+        });
+
+        // Local socket to far side, ending with the close marker whichever
+        // way the TCP side ended.
+        let frames = channel.frames.clone();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; lumepeer_core::constants::TUNNEL_BUFFER_BYTES];
+            loop {
+                let read = match tokio::io::AsyncReadExt::read(&mut read_half, &mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                bytes.fetch_add(read as u64, Ordering::Relaxed);
+                if frames
+                    .send(TunnelWrite::Data(stream_id, buffer[..read].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = frames.send(TunnelWrite::Close(stream_id)).await;
+            let _ = events
+                .send(ActorEvent::Tunnel(TunnelEvent::StreamEnded {
+                    peer,
+                    stream_id,
+                }))
+                .await;
+        });
+    }
+
+    /// Either side: closes every forwarded connection with `label` (§4;
+    /// ADR 0078).
+    fn on_tunnel_close_all(&mut self, label: &str) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        self.close_tunnel(peer, "closed by hand");
+        Ok(())
+    }
+
+    /// Host side: names one address this session's tunnel may reach, or takes
+    /// it back (§8.2; ADR 0078).
+    fn on_tunnel_set_target(
+        &mut self,
+        label: &str,
+        host: &str,
+        port: u16,
+        allowed: bool,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let target =
+            TunnelTarget::named(host, port).ok_or(ActorError::Core(CoreError::Malformed))?;
+        if allowed {
+            self.sessions
+                .allow_tunnel_target(peer, target)
+                .map_err(ActorError::Core)?;
+            self.audit_tunnel(&peer, "tunnel-target-allowed");
+        } else {
+            self.sessions.deny_tunnel_target(peer, &target);
+            // An address taken back takes its connections with it: leaving
+            // them open would make the list a description of the future and
+            // not of what is happening (§4).
+            let open: Vec<StreamId> = self
+                .tunnel_streams
+                .iter()
+                .filter(|((p, _), open)| *p == peer && **open == target)
+                .map(|((_, id), _)| *id)
+                .collect();
+            for stream_id in open {
+                self.end_tunnel_stream(peer, stream_id, true);
+            }
+            self.audit_tunnel(&peer, "tunnel-target-denied");
+        }
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+        Ok(())
+    }
+
+    /// Sends the one answer a refused tunnel connection gets (§18).
+    fn refuse_tunnel(&mut self, peer: NodeId, stream_id: StreamId, reason: TunnelRefusal) {
+        self.send_to(
+            &peer,
+            MessageKind::TunnelOpenResponse {
+                stream_id,
+                refused: Some(reason),
+            },
+        );
+    }
+
+    /// Ends one forwarded connection on this side, and tells the far side
+    /// when it does not already know.
+    fn end_tunnel_stream(&mut self, peer: NodeId, stream_id: StreamId, announce: bool) {
+        if self.tunnel_streams.remove(&(peer, stream_id)).is_none() {
+            return;
+        }
+        self.tunnel_pending.remove(&(peer, stream_id));
+        if let Some(channel) = self.tunnels.get(&peer).cloned() {
+            let streams = Arc::clone(&channel.streams);
+            tokio::spawn(async move {
+                streams.lock().await.remove(&stream_id);
+            });
+        }
+        if announce {
+            self.send_to(&peer, MessageKind::TunnelClose { stream_id });
+        }
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+    }
+
+    /// Closes a peer's whole tunnel: every stream, the local listeners and
+    /// the QUIC connection under them (§8.1; ADR 0078).
+    ///
+    /// What a revoke runs, and what the host's own "close everything" button
+    /// runs. Immediate on purpose: §4's rule is that a revoke must not wait
+    /// for a channel to drain, and a tunnel is the channel most able to be
+    /// busy.
+    fn close_tunnel(&mut self, peer: NodeId, why: &'static str) {
+        let closed = self.tunnels.remove(&peer);
+        let had = closed.is_some();
+        // Closed here and not left to the far side to notice: §4's rule is
+        // that ending a permission ends what it paid for, now.
+        if let Some(channel) = closed {
+            channel.connection.close(0u32.into(), b"tunnel closed");
+        }
+        let open: Vec<StreamId> = self
+            .tunnel_streams
+            .keys()
+            .filter(|(p, _)| *p == peer)
+            .map(|(_, id)| *id)
+            .collect();
+        for stream_id in open {
+            self.tunnel_streams.remove(&(peer, stream_id));
+            self.send_to(&peer, MessageKind::TunnelClose { stream_id });
+        }
+        self.tunnel_pending.retain(|(p, _), _| *p != peer);
+        self.tunnel_listeners.retain(|(p, _), task| {
+            if *p == peer {
+                task.abort();
+                false
+            } else {
+                true
+            }
+        });
+        self.tunnel_wanted.retain(|(p, _), _| *p != peer);
+        self.tunnel_dialing.remove(&peer);
+        if had {
+            tracing::info!(peer = %self.label_of(&peer), why, "the tunnel is closed");
+            self.audit_tunnel(&peer, "tunnel-closed");
+        }
+        let _ = self.notify.send(ActorNotification::TunnelChanged);
+    }
+
+    /// Records one tunnel action in the audit log (§15).
+    ///
+    /// The action and the pseudonymized peer, and nothing else: which address
+    /// a session may reach is on the host's own screen, and §15 keeps the
+    /// host's network layout out of a log that leaves the machine.
+    fn audit_tunnel(&mut self, peer: &NodeId, action: &'static str) {
+        self.audit(
+            peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action },
+        );
+    }
+
+    /// Host side: every tunnel this machine is carrying right now (§15).
+    fn tunnel_rows(&self) -> Vec<TunnelRow> {
+        let mut rows: Vec<TunnelRow> = Vec::new();
+        // Every active session's own list, not the tunnels that happen to be
+        // up: an address the host named is a decision it made, and it stays
+        // on screen whether or not anything is currently going through it.
+        let peers: Vec<NodeId> = self
+            .sessions
+            .active()
+            .into_iter()
+            .map(|(peer, _, _)| peer)
+            .collect();
+        for peer in peers {
+            let bytes = self
+                .tunnels
+                .get(&peer)
+                .map_or(0, |channel| channel.bytes.load(Ordering::Relaxed));
+            for target in self.sessions.tunnel_targets(&peer) {
+                let streams = self
+                    .tunnel_streams
+                    .iter()
+                    .filter(|((p, _), open)| *p == peer && **open == target)
+                    .count();
+                rows.push(TunnelRow {
+                    peer_label: self.label_of(&peer),
+                    host: target.host.clone(),
+                    port: target.port,
+                    streams,
+                    bytes,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            (a.peer_label.as_str(), a.host.as_str(), a.port).cmp(&(
+                b.peer_label.as_str(),
+                b.host.as_str(),
+                b.port,
+            ))
+        });
+        rows
+    }
+
     /// Host side: switches this host's own physical monitor to `mode_id`
     /// (docs/bugs/16-host-display-mode.md #2, #3; ADR 0048).
     ///
@@ -5092,6 +5957,7 @@ impl Actor {
                     speaks_file_browse,
                     speaks_file_manage,
                     speaks_dir_transfer,
+                    speaks_tunnel,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -5109,6 +5975,7 @@ impl Actor {
                     speaks_file_browse,
                     speaks_file_manage,
                     speaks_dir_transfer,
+                    speaks_tunnel,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -5119,6 +5986,9 @@ impl Actor {
                 }
                 Some(Accepted::File { connection, peer }) => {
                     ActorEvent::File(FileEvent::Connected { connection, peer })
+                }
+                Some(Accepted::Tunnel { connection, peer }) => {
+                    ActorEvent::Tunnel(TunnelEvent::Connected { connection, peer })
                 }
                 None => return,
             };
@@ -5245,6 +6115,7 @@ impl Actor {
                 speaks_file_browse,
                 speaks_file_manage,
                 speaks_dir_transfer,
+                speaks_tunnel,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -5287,6 +6158,14 @@ impl Actor {
                     self.speaks_dir_transfer.insert(peer);
                 } else {
                     self.speaks_dir_transfer.remove(&peer);
+                }
+                // And for a tunnel (ADR 0078). Emphatically not a grant: this
+                // says the peer understands a refusal, and the grant plus the
+                // address list say whether there is anything to refuse.
+                if speaks_tunnel {
+                    self.speaks_tunnel.insert(peer);
+                } else {
+                    self.speaks_tunnel.remove(&peer);
                 }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
@@ -5334,6 +6213,7 @@ impl Actor {
                 result,
             } => self.on_dialed(peer, code, *addr, result),
             ActorEvent::File(event) => self.on_file_event(event),
+            ActorEvent::Tunnel(event) => self.on_tunnel_event(event),
             ActorEvent::ClipboardFilesRead { peer, files, paths } => {
                 self.on_clipboard_files_read(peer, files, paths);
             }
@@ -6362,6 +7242,24 @@ impl Actor {
             }
             // Either side: the answer to a directory this node offered.
             MessageKind::DirAccept(accepted) => self.on_dir_accept_inbound(peer, accepted),
+            // Host side: the guest asked for a connection to an address
+            // (ADR 0078).
+            MessageKind::TunnelOpenRequest {
+                ref host,
+                port,
+                stream_id,
+            } => {
+                let host = host.clone();
+                self.on_tunnel_open_request(peer, &host, port, stream_id);
+            }
+            // Guest side: the host answered one of those.
+            MessageKind::TunnelOpenResponse { stream_id, refused } => {
+                self.on_tunnel_open_response(peer, stream_id, refused);
+            }
+            // Either side: one forwarded connection is over.
+            MessageKind::TunnelClose { stream_id } => {
+                self.end_tunnel_stream(peer, stream_id, false);
+            }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -6622,6 +7520,13 @@ impl Actor {
         self.speaks_file_manage.remove(&peer);
         self.file_manage_to_host.remove(&peer);
         self.speaks_dir_transfer.remove(&peer);
+        self.speaks_tunnel.remove(&peer);
+        self.tunnel_to_host.remove(&peer);
+        self.tunnel_refusals.remove(&peer);
+        // §4: a connection that is gone takes its tunnel with it, sockets and
+        // listeners and all, rather than leaving a forwarded port open onto
+        // nothing (ADR 0078).
+        self.close_tunnel(peer, "the connection ended");
         self.fetches_out.remove(&peer);
         self.fetch_preparing.remove(&peer);
         // Link measurements belong to the connection that produced them: a
@@ -6876,6 +7781,30 @@ impl Actor {
             }
             ActorCommand::DirListing { label, reply } => {
                 let _ = reply.send(self.on_last_dir_listing(&label));
+            }
+            ActorCommand::TunnelOpen {
+                label,
+                local_port,
+                host,
+                port,
+                reply,
+            } => {
+                let _ = reply.send(self.on_tunnel_open(&label, local_port, &host, port));
+            }
+            ActorCommand::TunnelCloseAll { label, reply } => {
+                let _ = reply.send(self.on_tunnel_close_all(&label));
+            }
+            ActorCommand::TunnelSetTarget {
+                label,
+                host,
+                port,
+                allowed,
+                reply,
+            } => {
+                let _ = reply.send(self.on_tunnel_set_target(&label, &host, port, allowed));
+            }
+            ActorCommand::TunnelStatus { reply } => {
+                let _ = reply.send(self.tunnel_rows());
             }
             ActorCommand::RemoteDownload {
                 label,
@@ -9405,7 +10334,7 @@ impl Actor {
         }
         if !allowed {
             // Exhaustive on purpose, with no `_` arm, for the reason
-            // `Grants::get` gives: an eighth independent grant must not be
+            // `Grants::get` gives: a tenth independent grant must not be
             // able to appear and quietly keep running after it is switched
             // off.
             match grant {
@@ -9447,6 +10376,13 @@ impl Actor {
                         self.restore_display_mode();
                     }
                 }
+                // Every open socket, on the spot. A tunnel is the one
+                // channel that can be carrying traffic at the moment it is
+                // withdrawn, and §4's whole point is that a revoke does not
+                // wait for a channel to drain (ADR 0078). The address list
+                // is left alone: the host withdrew the permission, not its
+                // own opinion of which addresses this guest could have.
+                IndependentGrant::Tunnel => self.close_tunnel(peer, "the grant was withdrawn"),
             }
         }
         Ok(())
@@ -9874,6 +10810,9 @@ impl Actor {
         } else {
             self.speaks_dir_transfer.remove(&peer);
         }
+        // Same reasoning for a tunnel (ADR 0078).
+        self.tunnel_to_host
+            .insert(peer, control.peer_minor() >= TUNNEL_MINOR);
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -9937,6 +10876,99 @@ async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
 /// A transfer must never quietly replace a file the user already had. The
 /// suffix goes before the extension so the result still opens in the same
 /// application.
+/// Drives one peer's `rd/tunnel/1` connection until it ends (§4.1;
+/// ADR 0078).
+///
+/// One bidirectional QUIC stream carries every forwarded connection, told
+/// apart by the stream id in each frame's own header. The side that dialed
+/// opens it and the other accepts it, which is the same asymmetry every other
+/// channel here has: only the node that dialed the control connection has an
+/// address for the other (ADR 0026).
+///
+/// Two halves, and neither can stall the other: a writer draining the frames
+/// the actor and the socket pumps produce, and a reader dispatching what
+/// arrives to the local socket it belongs to. A frame for a stream nobody is
+/// waiting on is dropped rather than an error — both ends may close at once,
+/// and neither is wrong.
+async fn run_tunnel_connection(
+    connection: iroh::endpoint::Connection,
+    channel: TunnelChannel,
+    mut frames_rx: mpsc::Receiver<TunnelWrite>,
+    peer: NodeId,
+    tag: String,
+    dialed: bool,
+    events: mpsc::Sender<ActorEvent>,
+) {
+    let opened = if dialed {
+        connection.open_bi().await
+    } else {
+        connection.accept_bi().await
+    };
+    let Ok((mut send, mut recv)) = opened else {
+        tracing::debug!(peer = %tag, "the tunnel connection carried no stream");
+        let _ = events
+            .send(ActorEvent::Tunnel(TunnelEvent::ConnectFailed { peer }))
+            .await;
+        return;
+    };
+
+    let writer_tag = tag.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(write) = frames_rx.recv().await {
+            let result = match write {
+                TunnelWrite::Data(stream, payload) => {
+                    write_frame(&mut send, stream, &payload).await
+                }
+                TunnelWrite::Close(stream) => write_close(&mut send, stream).await,
+            };
+            if let Err(error) = result {
+                tracing::debug!(peer = %writer_tag, %error, "a tunnel frame could not be written");
+                return;
+            }
+        }
+        let _ = send.finish();
+    });
+
+    loop {
+        let frame = match read_frame(&mut recv).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::debug!(peer = %tag, %error, "the tunnel stream ended");
+                break;
+            }
+        };
+        let stream_id = frame.stream;
+        if frame.is_close() {
+            // Dropping the sender closes the local socket's write half,
+            // which is what turns the far side's `FIN` into one here.
+            channel.streams.lock().await.remove(&stream_id);
+            let _ = events
+                .send(ActorEvent::Tunnel(TunnelEvent::StreamEnded {
+                    peer,
+                    stream_id,
+                }))
+                .await;
+            continue;
+        }
+        let sender = channel.streams.lock().await.get(&stream_id).cloned();
+        let Some(sender) = sender else {
+            // A payload for a connection this side has already closed. Not an
+            // error and not a reason to tear the tunnel down: both ends may
+            // close at once, and the far side is told by the close this side
+            // already sent.
+            continue;
+        };
+        if sender.send(frame.payload).await.is_err() {
+            channel.streams.lock().await.remove(&stream_id);
+        }
+    }
+
+    writer.abort();
+    let _ = events
+        .send(ActorEvent::Tunnel(TunnelEvent::ConnectFailed { peer }))
+        .await;
+}
+
 /// Turns one manifest entry into the path it lands at under `root`, or
 /// refuses it (§9.1, §18; ADR 0077).
 ///
@@ -10354,6 +11386,16 @@ async fn classify_incoming(
                 peer,
             });
         }
+        // Same again for the tunnel (ADR 0078), and here the asymmetry
+        // matters most: this task cannot see whether the peer holds
+        // `tunnel`, nor which addresses the host named for it, and both are
+        // re-read by the actor for every connection inside the tunnel.
+        Some(Channel::Tunnel) => {
+            return Some(Accepted::Tunnel {
+                connection: Box::new(connection),
+                peer,
+            });
+        }
         None => {
             tracing::warn!(peer = %tag, "closing a connection on an unknown ALPN");
             connection.close(
@@ -10425,6 +11467,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_DIR_TRANSFER),
+        speaks_tunnel: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_TUNNEL),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -10564,6 +11610,7 @@ async fn connect_once(
         FEATURE_FILE_BROWSE.to_owned(),
         FEATURE_FILE_MANAGE.to_owned(),
         FEATURE_DIR_TRANSFER.to_owned(),
+        FEATURE_TUNNEL.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -11036,6 +12083,16 @@ pub fn spawn_actor_with(
         dir_offers_out: std::collections::HashMap::new(),
         dir_offers_in: std::collections::HashMap::new(),
         dir_groups: std::collections::HashMap::new(),
+        speaks_tunnel: std::collections::HashSet::new(),
+        tunnel_to_host: std::collections::HashMap::new(),
+        tunnels: std::collections::HashMap::new(),
+        tunnel_dialing: std::collections::HashSet::new(),
+        tunnel_listeners: std::collections::HashMap::new(),
+        tunnel_pending: std::collections::HashMap::new(),
+        tunnel_streams: std::collections::HashMap::new(),
+        next_tunnel_stream: 1,
+        tunnel_wanted: std::collections::HashMap::new(),
+        tunnel_refusals: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
@@ -12222,6 +13279,214 @@ mod tests {
             manifest_destination(root, &entry),
             Some(root.join("docs").join("notes.txt"))
         );
+    }
+
+    /// ADR 0078: a tunnel is a grant **and** an address the host named, and
+    /// with only one of the two nothing goes through. Then, with both, bytes
+    /// actually reach a service on the host's own machine — and a withdrawn
+    /// grant takes every open connection with it on the spot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tunnel_needs_both_halves_and_a_revoke_closes_it_at_once() {
+        // A service on the "host's" machine, which in this test is this one.
+        let echo = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 64];
+                    while let Ok(read) =
+                        tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await
+                    {
+                        if read == 0
+                            || tokio::io::AsyncWriteExt::write_all(&mut socket, &buffer[..read])
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let forwarded = free_local_port().await;
+
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        // The forward itself is local and always allowed: what it reaches is
+        // the host's decision, not this one.
+        guest
+            .tunnel_open(
+                host_label.clone(),
+                forwarded,
+                "127.0.0.1".to_owned(),
+                echo_port,
+            )
+            .await
+            .unwrap();
+
+        // No grant: the connection is accepted locally and then closed,
+        // because the host refused it. Nothing echoes.
+        assert!(
+            !echoes_through(forwarded, b"first try").await,
+            "a tunnel without the grant carried bytes"
+        );
+
+        // The grant alone still reaches nothing: the address list is empty,
+        // and an empty list is the default policy of ADR 0078.
+        host.set_grant(guest_label.clone(), IndependentGrant::Tunnel, true)
+            .await
+            .unwrap();
+        assert!(
+            !echoes_through(forwarded, b"second try").await,
+            "a tunnel with no named address carried bytes"
+        );
+
+        // Both halves: the host names the address, and only then does
+        // anything go through.
+        host.tunnel_set_target(guest_label.clone(), "127.0.0.1".to_owned(), echo_port, true)
+            .await
+            .unwrap();
+        assert!(
+            echoes_through(forwarded, b"third try").await,
+            "a tunnel with both halves carried nothing"
+        );
+
+        // The host can see it, which is the other half of §2.2: a tunnel that
+        // is carrying traffic is never silent on the host's own screen.
+        let rows = host.tunnel_status().await.unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.host == "127.0.0.1" && row.port == echo_port),
+            "the host's own list does not show the address it named"
+        );
+
+        // And withdrawing it stops the next connection immediately, rather
+        // than when a socket happens to close (§4).
+        host.set_grant(guest_label, IndependentGrant::Tunnel, false)
+            .await
+            .unwrap();
+        assert!(
+            !echoes_through(forwarded, b"after the revoke").await,
+            "a withdrawn grant still carried bytes"
+        );
+    }
+
+    /// ADR 0078: an address the host did not name is refused even while
+    /// another one is allowed — the list is addresses, not a switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_address_the_host_never_named_is_refused() {
+        let echo = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let allowed_port = echo.local_addr().unwrap().port();
+        let other_port = free_local_port().await;
+        let forwarded = free_local_port().await;
+
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::Tunnel, true)
+            .await
+            .unwrap();
+        host.tunnel_set_target(guest_label, "127.0.0.1".to_owned(), allowed_port, true)
+            .await
+            .unwrap();
+
+        // The forward names a *different* port on the same host.
+        guest
+            .tunnel_open(host_label, forwarded, "127.0.0.1".to_owned(), other_port)
+            .await
+            .unwrap();
+        assert!(
+            !echoes_through(forwarded, b"not this port").await,
+            "an address the host never named carried bytes"
+        );
+    }
+
+    /// ADR 0078: an address that is not one never leaves this node, and one
+    /// local port cannot be forwarded twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bad_address_and_a_taken_port_are_refused_locally() {
+        let pair = clipboard_pair().await;
+        let forwarded = free_local_port().await;
+        for (host, port) in [("", 80u16), ("127.0.0.1", 0), ("with space", 80)] {
+            let refused = pair
+                .guest
+                .tunnel_open(pair.host_label.clone(), forwarded, host.to_owned(), port)
+                .await;
+            assert!(
+                matches!(refused, Err(ActorError::Core(CoreError::Malformed))),
+                "{host}:{port} was sent to the host"
+            );
+        }
+
+        pair.guest
+            .tunnel_open(
+                pair.host_label.clone(),
+                forwarded,
+                "127.0.0.1".to_owned(),
+                8080,
+            )
+            .await
+            .unwrap();
+        let again = pair
+            .guest
+            .tunnel_open(pair.host_label, forwarded, "127.0.0.1".to_owned(), 8081)
+            .await;
+        assert!(
+            matches!(again, Err(ActorError::Core(CoreError::NotPermitted))),
+            "the same local port was forwarded twice"
+        );
+    }
+
+    /// A port nothing is listening on, for a forward to take.
+    ///
+    /// Bound and released rather than guessed: a hard-coded port is a test
+    /// that fails on whichever machine happens to be using it.
+    async fn free_local_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    /// Whether `payload` comes back through the forwarded port.
+    ///
+    /// A refused connection looks like this from the outside: the local
+    /// listener accepts, the host says no, and the socket closes with nothing
+    /// on it — so "did anything echo" is exactly the question that tells a
+    /// carried tunnel from a refused one.
+    async fn echoes_through(port: u16, payload: &[u8]) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(mut socket) =
+                tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await
+            else {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            };
+            if tokio::io::AsyncWriteExt::write_all(&mut socket, payload)
+                .await
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            let mut back = vec![0u8; payload.len()];
+            let read = tokio::time::timeout(
+                Duration::from_millis(750),
+                tokio::io::AsyncReadExt::read_exact(&mut socket, &mut back),
+            )
+            .await;
+            if matches!(read, Ok(Ok(_))) && back == payload {
+                return true;
+            }
+            // One refusal is the answer; the retry above is only for the
+            // moment before the local listener is up.
+            return false;
+        }
+        false
     }
 
     /// Polls for the refusal a download is about to produce.

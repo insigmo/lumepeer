@@ -385,6 +385,13 @@ pub struct SessionStatusDto {
     /// from `recording`: the host's non-removable indicator hangs off this
     /// one (ADR 0049).
     pub secure_desktop_active: bool,
+    /// Whether this guest may forward TCP connections into the host's own
+    /// network (§8.2; ADR 0078).
+    ///
+    /// Permission only, and half a decision: the addresses it may reach are a
+    /// separate list the host writes one entry at a time, and this flag
+    /// without an entry on it reaches nothing.
+    pub tunnel: bool,
 }
 
 /// One remembered host this node has connected to (§21 punch-list item 5).
@@ -712,6 +719,7 @@ pub async fn session_status(
             secure_desktop: s.grants.secure_desktop,
             secure_desktop_input: s.grants.secure_desktop_input,
             secure_desktop_active: s.secure_desktop_active,
+            tunnel: s.grants.tunnel,
         })
         .collect())
 }
@@ -2015,6 +2023,129 @@ pub async fn remote_upload(
         .remote_upload(args.peer, args.local_path, args.remote_dir)
         .await?;
     Ok(())
+}
+
+// -------------------------------------------------------------------------
+// Tunnel (§4.1; ADR 0078)
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TunnelOpenArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Port on **this** machine to listen on. Bound to the loopback only.
+    pub local_port: u16,
+    /// Address on the host to forward to.
+    pub host: String,
+    /// TCP port on the host.
+    pub port: u16,
+}
+
+/// Guest side: forwards a local port to an address on the watched host
+/// (§4.1; ADR 0078).
+///
+/// Authorizes nothing. The host re-reads its own `tunnel` grant and its own
+/// address list for every connection that goes through this, and refuses each
+/// one on its own; what can fail here is local — a port already taken, an
+/// address this build will not parse, a host too old to understand the
+/// message.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old, the
+/// address is not one, or the local port cannot be bound.
+#[tauri::command]
+pub async fn tunnel_open(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TunnelOpenArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .tunnel_open(args.peer, args.local_port, args.host, args.port)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TunnelCloseArgs {
+    /// Pseudonymized label of the session whose tunnel is to be closed.
+    pub peer: String,
+}
+
+/// Closes every forwarded connection with `peer`, and the tunnel under them
+/// (§4, §8.1; ADR 0078).
+///
+/// Reachable from the host's own window and from a guest's view window: on
+/// the host it is the "close everything" the operator needs while a tunnel is
+/// live, and on the guest it is giving back a port it asked for. Neither is a
+/// permission — closing is always allowed.
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed or no session matches.
+#[tauri::command]
+pub async fn tunnel_close_all(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TunnelCloseArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    state.network.tunnel_close_all(args.peer).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TunnelTargetArgs {
+    /// Pseudonymized label of the guest session.
+    pub peer: String,
+    /// Address the tunnel may reach.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+    /// `true` adds it to this session's list, `false` takes it back — which
+    /// also closes the connections that were using it.
+    pub allowed: bool,
+}
+
+/// Host side: names one address this session's tunnel may reach, or takes it
+/// back (§8.2; ADR 0078).
+///
+/// The second half of the decision the `tunnel` grant starts. Main window
+/// only: this is the host deciding about its own network, and a guest's view
+/// window has no business in it.
+///
+/// # Errors
+/// [`IpcError`] when called from another window, no session matches, the
+/// address is not one, or the list is full.
+#[tauri::command]
+pub async fn tunnel_set_target(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TunnelTargetArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state
+        .network
+        .tunnel_set_target(args.peer, args.host, args.port, args.allowed)
+        .await?;
+    Ok(())
+}
+
+/// Host side: every tunnel this machine is carrying right now (§15;
+/// ADR 0078).
+///
+/// Main window only, where the session list is: a tunnel shows up on the row
+/// of the session carrying it, next to the switch that ends it.
+///
+/// # Errors
+/// [`IpcError`] when the window is not allowed or the actor is gone.
+#[tauri::command]
+pub async fn tunnel_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::network::TunnelRow>, IpcError> {
+    check_window(&window)?;
+    Ok(state.network.tunnel_status().await?)
 }
 
 /// Runs the OS directory picker, for where a received file should land.

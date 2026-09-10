@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tunnel-close-all"
+description = "Enables the tunnel_close_all command without any pre-configured scope."
+commands.allow = ["tunnel_close_all"]
+
+[[permission]]
+identifier = "deny-tunnel-close-all"
+description = "Denies the tunnel_close_all command without any pre-configured scope."
+commands.deny = ["tunnel_close_all"]
