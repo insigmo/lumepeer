@@ -121,6 +121,19 @@ function draw(): void {
               <span class="bar-dot" aria-hidden="true"></span>
               <span class="bar-peer">${session.peer_label}</span>
               <span class="bar-role">${t(locale, ROLE_KEY[session.role])}</span>
+              <!-- A shell running on this machine, said on the surface that
+                   stays visible while the operator works in something else
+                   (ADR 0079 decision 3, ADR 0055). Nothing switches it off
+                   while it is true. -->
+              ${session.terminal_active
+                ? html`<span
+                    class="bar-terminal"
+                    role="status"
+                    data-testid="hostbar-terminal"
+                    title=${t(locale, 'status.terminal.active')}
+                    >${t(locale, 'status.terminal.active')}</span
+                  >`
+                : ''}
               <button
                 type="button"
                 class="bar-revoke"

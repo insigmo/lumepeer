@@ -35,7 +35,8 @@ export type IndependentGrant =
   | 'display_mode'
   | 'secure_desktop'
   | 'secure_desktop_input'
-  | 'tunnel';
+  | 'tunnel'
+  | 'terminal';
 
 export interface SessionStatus {
   peer_label: string;
@@ -85,6 +86,21 @@ export interface SessionStatus {
    * empty list reaches nothing.
    */
   tunnel: boolean;
+  /**
+   * Whether this guest may start a shell on this host (ADR 0079).
+   *
+   * Permission only. `input` does not imply it and it does not imply `input`:
+   * a host that handed over the keyboard can watch what happens on its own
+   * screen, and a shell is not on the screen.
+   */
+  terminal: boolean;
+  /**
+   * Whether this guest has a shell running right now. Not the same as
+   * `terminal`, which is only permission — the host's non-removable indicator
+   * hangs off this one, the same way the recording dot hangs off
+   * `recording_active`.
+   */
+  terminal_active: boolean;
 }
 
 /**
@@ -274,6 +290,25 @@ function secureDesktopIndicator(session: SessionStatus, locale: Locale): Templat
     : '';
 }
 
+/**
+ * The terminal indicator (ADR 0079 decision 3).
+ *
+ * A terminal is the one capability with no picture attached to it: an
+ * operator watching the screen can see a guest type, and cannot see a shell.
+ * So while one is running the host is told, on the session's own row and on
+ * the always-on-top bar, and no setting switches either off — exactly as the
+ * recording dot and the secure-desktop dot cannot be switched off while what
+ * they are about is happening. It hangs off `terminal_active` rather than the
+ * grant, because permission is not what is worth interrupting somebody for.
+ */
+function terminalIndicator(session: SessionStatus, locale: Locale): TemplateResult | '' {
+  return session.terminal_active
+    ? html`<span class="terminal-indicator" role="status" data-testid="terminal-indicator">
+        <span class="terminal-dot" aria-hidden="true"></span>${t(locale, 'status.terminal.active')}
+      </span>`
+    : '';
+}
+
 const MINUTE_SECS = 60;
 const HOUR_SECS = 60 * MINUTE_SECS;
 const DAY_SECS = 24 * HOUR_SECS;
@@ -445,6 +480,7 @@ export function sessionStatus(
                       )
                     : ''}
                   ${session.state === 'active' ? secureDesktopIndicator(session, locale) : ''}
+                  ${session.state === 'active' ? terminalIndicator(session, locale) : ''}
                   ${session.state === 'active' && session.file_transfer
                     ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
                     : ''}
