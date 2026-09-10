@@ -12,11 +12,11 @@ use lumepeer_core::protocol::{
 };
 use lumepeer_core::{CoreError, session::SessionManager};
 
-use crate::endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA};
+use crate::endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, ALPN_TUNNEL};
 use crate::error::{NetError, Result, close_code};
 use crate::framing::{FrameReader, FrameWriter};
 
-/// Which of the three ALPNs a connection belongs to (§4.1).
+/// Which of the four ALPNs a connection belongs to (§4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
     /// `rd/control/1`, opened first and kept responsive for revoke.
@@ -25,6 +25,9 @@ pub enum Channel {
     Media,
     /// `rd/file/1`, opened lazily after `FileAccept(true)`.
     File,
+    /// `rd/tunnel/1`, opened lazily after the host allowed an address
+    /// (ADR 0078).
+    Tunnel,
 }
 
 impl Channel {
@@ -36,6 +39,7 @@ impl Channel {
             ALPN_CONTROL => Some(Self::Control),
             ALPN_MEDIA => Some(Self::Media),
             ALPN_FILE => Some(Self::File),
+            ALPN_TUNNEL => Some(Self::Tunnel),
             _ => None,
         }
     }
@@ -447,6 +451,7 @@ mod tests {
     fn every_supported_alpn_maps_to_a_channel() {
         assert_eq!(Channel::from_alpn(ALPN_CONTROL), Some(Channel::Control));
         assert_eq!(Channel::from_alpn(ALPN_MEDIA), Some(Channel::Media));
+        assert_eq!(Channel::from_alpn(ALPN_TUNNEL), Some(Channel::Tunnel));
         assert_eq!(Channel::from_alpn(ALPN_FILE), Some(Channel::File));
         assert_eq!(Channel::from_alpn(b"rd/control/2"), None);
     }

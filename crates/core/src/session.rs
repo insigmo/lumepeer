@@ -12,7 +12,11 @@ use rand::Rng as _;
 
 use crate::NodeId;
 use crate::audit::AuditEvent;
-pub use crate::consent::{
+pub use serde::{Deserialize, Serialize};
+
+use crate::constants::MAX_TUNNEL_TARGETS_PER_SESSION;
+
+use crate::consent::{
     ConsentQueue, ConsentRateLimiter, ConsentTicket, ControlAction, ControlPolicy, Grants,
     IndependentGrant, Role,
 };
@@ -94,6 +98,77 @@ struct ActiveSession {
     /// Monotonic instant the session entered `Reconnecting` (§12.3: never
     /// wall-clock).
     disconnected_at: Option<Instant>,
+    /// Addresses this session's tunnel may reach, snapshotted at the moment
+    /// of the grant and added to only by a deliberate act on this session
+    /// (§8.2; ADR 0078).
+    ///
+    /// Empty by default and empty for every role but [`Role::FullControl`],
+    /// which is the whole of the default policy: the `tunnel` grant says a
+    /// tunnel may exist, and this says where it may go. Neither implies the
+    /// other.
+    allowed_targets: Vec<TunnelTarget>,
+}
+
+/// One address a session's tunnel is allowed to reach (§4.1; ADR 0078).
+///
+/// A host and a port, both as the host named them: the guest's request is
+/// compared against this and never the other way round.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TunnelTarget {
+    /// Host as a literal address or a name, lowercased on construction so
+    /// two spellings of one host are one entry.
+    pub host: String,
+    /// TCP port.
+    pub port: u16,
+}
+
+impl TunnelTarget {
+    /// A target the host has named, or `None` for one this build will not
+    /// forward to (§18; ADR 0078).
+    ///
+    /// The default policy, and it is a policy rather than a check on a peer:
+    /// only the loopback addresses, because "the service on the host's own
+    /// machine" is what a port forward is for, and anything else is the
+    /// host's own subnet — which it may still allow, one address at a time,
+    /// by naming it through [`Self::named`].
+    #[must_use]
+    pub fn loopback(host: &str, port: u16) -> Option<Self> {
+        let target = Self::named(host, port)?;
+        if target.is_loopback() {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    /// A target the host has named explicitly, loopback or not.
+    ///
+    /// # Errors
+    /// `None` for an empty host, one over
+    /// [`crate::constants::TUNNEL_HOST_MAX_BYTES`], one carrying a control
+    /// character or whitespace, or port zero — none of which is an address.
+    #[must_use]
+    pub fn named(host: &str, port: u16) -> Option<Self> {
+        if host.is_empty()
+            || host.len() > crate::constants::TUNNEL_HOST_MAX_BYTES
+            || port == 0
+            || host
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '\\')
+        {
+            return None;
+        }
+        Some(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    /// Whether this address is the machine the host is already running on.
+    #[must_use]
+    pub fn is_loopback(&self) -> bool {
+        matches!(self.host.as_str(), "127.0.0.1" | "::1" | "localhost")
+    }
 }
 
 /// Owner of all session state on the host. The only component allowed to move
@@ -213,6 +288,17 @@ impl SessionManager {
         } else {
             Vec::new()
         };
+        // Snapshotted the same way the control allowlist is, and starting
+        // empty: a session that may tunnel still reaches nowhere until the
+        // host names an address for it (§8.2; ADR 0078). A re-grant of a
+        // session that is already active keeps what it was already allowed —
+        // the host said those addresses about this guest, and the role
+        // decision is not a retraction of them.
+        let allowed_targets = self
+            .sessions
+            .get(&peer)
+            .map(|session| session.allowed_targets.clone())
+            .unwrap_or_default();
         self.sessions.insert(
             peer,
             ActiveSession {
@@ -222,6 +308,7 @@ impl SessionManager {
                 allowed_actions,
                 state: SessionState::Active,
                 disconnected_at: None,
+                allowed_targets,
             },
         );
         Ok(())
@@ -322,6 +409,77 @@ impl SessionManager {
     #[must_use]
     pub fn grants(&self, peer: &NodeId) -> Option<Grants> {
         self.sessions.get(peer).map(|s| s.grants)
+    }
+
+    /// Adds one address this session's tunnel may reach (§8.2; ADR 0078).
+    ///
+    /// A deliberate act on one session, which is what makes it different
+    /// from editing a policy file: [`Self::set_control_policy`] must not
+    /// widen a running session, and this is the host saying "this guest, this
+    /// address" about a session it is looking at. It does **not** grant
+    /// `tunnel`; a target on the list of a session without that flag is
+    /// reachable by nobody.
+    ///
+    /// # Errors
+    /// [`CoreError::NotPermitted`] when there is no active session for
+    /// `peer`, or when its list already holds
+    /// [`MAX_TUNNEL_TARGETS_PER_SESSION`] addresses.
+    pub fn allow_tunnel_target(&mut self, peer: NodeId, target: TunnelTarget) -> Result<()> {
+        let session = self
+            .sessions
+            .get_mut(&peer)
+            .filter(|session| session.state == SessionState::Active)
+            .ok_or(CoreError::NotPermitted)?;
+        if session.allowed_targets.contains(&target) {
+            return Ok(());
+        }
+        if session.allowed_targets.len() >= MAX_TUNNEL_TARGETS_PER_SESSION {
+            return Err(CoreError::NotPermitted);
+        }
+        session.allowed_targets.push(target);
+        Ok(())
+    }
+
+    /// Takes one address off a session's tunnel allowlist (§8.2; ADR 0078).
+    ///
+    /// Streams already open through it are not closed by this — the caller
+    /// closes those, because what a socket already carrying bytes should do
+    /// is a decision about the tunnel and not about the list.
+    pub fn deny_tunnel_target(&mut self, peer: NodeId, target: &TunnelTarget) {
+        if let Some(session) = self.sessions.get_mut(&peer) {
+            session.allowed_targets.retain(|allowed| allowed != target);
+        }
+    }
+
+    /// Addresses `peer`'s tunnel may currently reach.
+    #[must_use]
+    pub fn tunnel_targets(&self, peer: &NodeId) -> Vec<TunnelTarget> {
+        self.sessions
+            .get(peer)
+            .map(|session| session.allowed_targets.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `peer` may open a tunnel stream to `host:port` **right now**
+    /// (§2.3, §8.2; ADR 0078).
+    ///
+    /// Both halves, read at the moment the connection is asked for rather
+    /// than when the tunnel opened: the session must be active and hold
+    /// `tunnel`, and the address must be one the host named for it. Either
+    /// withdrawn stops the next connection, which is the difference between
+    /// a revoke that lands and one that waits for a socket to close.
+    #[must_use]
+    pub fn tunnel_allows(&self, peer: &NodeId, host: &str, port: u16) -> bool {
+        let Some(session) = self.sessions.get(peer) else {
+            return false;
+        };
+        if session.state != SessionState::Active || !session.grants.tunnel {
+            return false;
+        }
+        let Some(asked) = TunnelTarget::named(host, port) else {
+            return false;
+        };
+        session.allowed_targets.contains(&asked)
     }
 
     /// State of `peer`'s session; `Idle` if it has none.
@@ -783,7 +941,7 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 7] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 8] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
@@ -791,7 +949,91 @@ mod tests {
         IndependentGrant::DisplayMode,
         IndependentGrant::SecureDesktop,
         IndependentGrant::SecureDesktopInput,
+        IndependentGrant::Tunnel,
     ];
+
+    /// ADR 0078: the grant and the address are two decisions, and a tunnel
+    /// needs both. Neither one alone reaches anything.
+    #[test]
+    fn a_tunnel_needs_the_grant_and_an_address_the_host_named() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+
+        // Full control carries the flag, and the list starts empty: a session
+        // that may tunnel reaches nowhere until the host says where.
+        assert!(manager.grants(&peer(1)).is_some_and(|g| g.tunnel));
+        assert!(manager.tunnel_targets(&peer(1)).is_empty());
+        assert!(!manager.tunnel_allows(&peer(1), "127.0.0.1", 8080));
+
+        let target = TunnelTarget::loopback("127.0.0.1", 8080).unwrap();
+        manager
+            .allow_tunnel_target(peer(1), target.clone())
+            .unwrap();
+        assert!(manager.tunnel_allows(&peer(1), "127.0.0.1", 8080));
+        // One address is one address: not the port next to it, not another
+        // host, and not a spelling nobody named.
+        assert!(!manager.tunnel_allows(&peer(1), "127.0.0.1", 8081));
+        assert!(!manager.tunnel_allows(&peer(1), "10.0.0.5", 8080));
+
+        // The flag off closes it, with the address still on the list — and
+        // back on reopens it, because the host never withdrew the address.
+        manager
+            .set_grant(peer(1), IndependentGrant::Tunnel, false)
+            .unwrap();
+        assert!(!manager.tunnel_allows(&peer(1), "127.0.0.1", 8080));
+        assert_eq!(manager.tunnel_targets(&peer(1)), vec![target.clone()]);
+        manager
+            .set_grant(peer(1), IndependentGrant::Tunnel, true)
+            .unwrap();
+        assert!(manager.tunnel_allows(&peer(1), "127.0.0.1", 8080));
+
+        // The address off closes it with the flag still on.
+        manager.deny_tunnel_target(peer(1), &target);
+        assert!(!manager.tunnel_allows(&peer(1), "127.0.0.1", 8080));
+
+        // A session that never held the grant is refused whatever its list
+        // says, and a peer with no session at all is refused outright.
+        let mut lesser = SessionManager::new();
+        lesser.grant(peer(2), Role::ViewOnly).unwrap();
+        lesser
+            .allow_tunnel_target(peer(2), TunnelTarget::loopback("127.0.0.1", 22).unwrap())
+            .unwrap();
+        assert!(!lesser.tunnel_allows(&peer(2), "127.0.0.1", 22));
+        assert!(!lesser.tunnel_allows(&peer(3), "127.0.0.1", 22));
+    }
+
+    /// ADR 0078: the default policy is the loopback and nothing else, and an
+    /// address that is not one is refused before it can be named.
+    #[test]
+    fn only_the_loopback_is_a_default_target_and_a_non_address_is_none() {
+        assert!(TunnelTarget::loopback("127.0.0.1", 80).is_some());
+        assert!(TunnelTarget::loopback("::1", 80).is_some());
+        assert!(TunnelTarget::loopback("LocalHost", 80).is_some());
+        for host in ["10.0.0.5", "example.com", "192.168.1.1"] {
+            assert!(
+                TunnelTarget::loopback(host, 80).is_none(),
+                "{host} was treated as the host's own machine"
+            );
+            // Still nameable by hand: the host may decide, one at a time.
+            assert!(TunnelTarget::named(host, 80).is_some());
+        }
+        for (host, port) in [
+            ("", 80u16),
+            ("127.0.0.1", 0),
+            ("127.0.0.1/../x", 80),
+            ("with space", 80),
+            ("with\ttab", 80),
+        ] {
+            assert!(
+                TunnelTarget::named(host, port).is_none(),
+                "{host}:{port} was accepted as an address"
+            );
+        }
+        assert!(
+            TunnelTarget::named(&"a".repeat(crate::constants::TUNNEL_HOST_MAX_BYTES + 1), 80)
+                .is_none()
+        );
+    }
 
     #[test]
     fn every_independent_grant_can_be_turned_on_and_off() {

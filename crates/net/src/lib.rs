@@ -18,12 +18,13 @@ pub mod obfuscated_endpoint;
 pub mod reconnect;
 pub mod stun;
 pub mod ticket;
+pub mod tunnel;
 
 pub use connection::{
     Channel, ControlConnection, ControlReader, ControlWriter, HelloInfo, guest_handshake,
     host_handshake,
 };
-pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, PeerEndpoint};
+pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, ALPN_TUNNEL, PeerEndpoint};
 pub use error::{NetError, Result};
 pub use media::{
     MediaFrameReader, MediaFrameWriter, STREAM_AUDIO, STREAM_MIC, STREAM_VIDEO,

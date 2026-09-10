@@ -541,6 +541,41 @@ const _: () = assert!(
     "a full DirOffer cannot fit MAX_CONTROL_FRAME_BYTES"
 );
 
+/// Most TCP streams one session may have open inside its tunnel at once
+/// (§4.1; ADR 0078).
+///
+/// A tunnel is a guest opening sockets on the host's network, so this is the
+/// bound on how many it may hold at a time. Generous enough for a web
+/// interface with its images and its API calls, small enough that a
+/// forgotten tunnel is not a port scanner.
+pub const MAX_TUNNEL_STREAMS_PER_SESSION: usize = 32;
+/// Read buffer of one tunnel stream, in bytes (§4.1; ADR 0078).
+///
+/// One per direction per stream, so the memory a tunnel can hold is this
+/// times two times [`MAX_TUNNEL_STREAMS_PER_SESSION`] — 4 MiB at these
+/// values, inside the §15 budget for an active session.
+pub const TUNNEL_BUFFER_BYTES: usize = 64 * 1024;
+/// How long a tunnel stream may carry nothing before it is closed (§4.1;
+/// ADR 0078).
+///
+/// Not a keepalive interval: an idle TCP connection through a tunnel is a
+/// socket held open on somebody else's machine, and the guest that opened it
+/// can open another. Long enough that a paused download or an editor's idle
+/// database connection survives.
+pub const TUNNEL_IDLE_TIMEOUT_SECS: u64 = 300;
+/// Longest host string a `TunnelOpenRequest` may carry (§9.1; ADR 0078).
+///
+/// A DNS name's own limit is 253 bytes and an IPv6 literal is shorter than
+/// that; the bound exists because this is untrusted input that becomes a
+/// resolver call.
+pub const TUNNEL_HOST_MAX_BYTES: usize = 253;
+/// Most targets a host may put on one session's tunnel allowlist (§8.2;
+/// ADR 0078).
+///
+/// The list is the host naming addresses one at a time, so it is short by
+/// construction; the bound is what keeps a UI bug from making it unbounded.
+pub const MAX_TUNNEL_TARGETS_PER_SESSION: usize = 16;
+
 /// Maximum number of monitors one host may report in `MonitorsList` (§11).
 pub const MAX_MONITORS_PER_HOST: usize = 8;
 

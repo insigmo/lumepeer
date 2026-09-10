@@ -35,6 +35,7 @@ import { logoMark } from './logo';
 import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
 import { onSettingsStateChange, openSettings, settingsView } from './settings-view';
 import type { FileTransfers } from './file-transfers';
+import type { TunnelRow } from './tunnels';
 import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
@@ -76,6 +77,7 @@ const recordingPaths = new Map<string, string>();
 let recordings: RecordingEntry[] = [];
 // Offers waiting for an answer and transfers in flight, from the last poll.
 let files: FileTransfers = { offers: [], transfers: [] };
+let tunnels: TunnelRow[] = [];
 /**
  * What each live connection's link looks like, by peer label (§18; ADR 0026).
  *
@@ -233,6 +235,7 @@ function renderNow(): void {
                 },
                 (peer) => saveDeviceButton(peer, locale, () => void refresh()),
                 connectionStats,
+                tunnels,
               )}
             </main>
           </div>
@@ -319,6 +322,13 @@ async function refresh(): Promise<void> {
       files = await invoke<FileTransfers>('file_transfers');
     } catch (error) {
       console.error('file_transfers failed:', error);
+    }
+    // Same isolation again: a tunnel list that cannot be read must not cost
+    // the session list its refresh (ADR 0078).
+    try {
+      tunnels = await invoke<TunnelRow[]>('tunnel_status');
+    } catch (error) {
+      console.error('tunnel_status failed:', error);
     }
     // Same reasoning, and the same isolation: a directory that cannot be read
     // must not cost the session list its refresh.
