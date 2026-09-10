@@ -5,9 +5,10 @@
 //! CA. Both build on increment 1's `ObfuscatedSocket`/`Obfuscator`
 //! (`crate::obfuscate`) unchanged.
 //!
-//! Neither side is wired into the live app yet — that is increment 3
-//! (ADR 0052 roadmap item 3). This module is exercised today by
-//! `examples/obfuscated_wan_probe.rs`.
+//! Increment 3 (gap-tasks/21; ADR 0079) gives the host endpoint the explicit
+//! shutdown it lacked, so its lifetime can be tied to the invite it was bound
+//! for rather than to the process. It is exercised by
+//! `examples/obfuscated_wan_probe.rs` and by this module's own tests.
 
 use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::Arc;
@@ -52,6 +53,10 @@ pub struct HostObfuscatedEndpoint {
     /// caller only alongside a `Some(public_addr)` — a fingerprint for an
     /// endpoint nobody can dial is not worth carrying into a ticket.
     pub cert_fingerprint: [u8; 32],
+    /// The NAT-mapping keep-alive of [`spawn_keepalive`], when STUN found a
+    /// server to keep hitting. Owned here so the task dies with the endpoint
+    /// instead of with the process (gap-tasks/21 task 1; ADR 0079).
+    keepalive: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for HostObfuscatedEndpoint {
@@ -59,6 +64,59 @@ impl std::fmt::Debug for HostObfuscatedEndpoint {
         f.debug_struct("HostObfuscatedEndpoint")
             .field("public_addr", &self.public_addr)
             .finish_non_exhaustive()
+    }
+}
+
+impl HostObfuscatedEndpoint {
+    /// Address this endpoint's socket is actually bound to, which is what a
+    /// peer on the same machine dials — unlike [`Self::public_addr`], which is
+    /// the reflexive address a peer on the far side of the NAT needs.
+    ///
+    /// # Errors
+    /// [`NetError::Endpoint`] if the socket has no local address, which means
+    /// it is already closed.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .local_addr()
+            .map_err(|e| NetError::Endpoint(e.to_string()))
+    }
+
+    /// Closes the endpoint: the keep-alive stops and the socket is released.
+    ///
+    /// Explicit rather than left to the process, because the endpoint's
+    /// lifetime is the invite's (ADR 0062, ADR 0079): a replaced invite's
+    /// endpoint has to stop holding a NAT mapping open — and stop sending a
+    /// STUN request every [`NAT_MAPPING_KEEPALIVE_SECS`] — the moment its
+    /// invite is retired, or a host that renews its code a few times is left
+    /// with a fan of live sockets nobody can dial.
+    pub async fn close(mut self) {
+        self.stop_keepalive();
+        self.endpoint.close(noq::VarInt::from_u32(0), b"");
+        self.endpoint.wait_idle().await;
+    }
+
+    /// Aborts the keep-alive task, if one is running. Idempotent.
+    fn stop_keepalive(&mut self) {
+        if let Some(task) = self.keepalive.take() {
+            task.abort();
+        }
+    }
+
+    /// Abort handle for the keep-alive task, so a test can watch it stop.
+    #[cfg(test)]
+    fn keepalive_probe(&self) -> Option<tokio::task::AbortHandle> {
+        self.keepalive
+            .as_ref()
+            .map(tokio::task::JoinHandle::abort_handle)
+    }
+}
+
+impl Drop for HostObfuscatedEndpoint {
+    /// A dropped endpoint must not leave its keep-alive behind. [`Self::close`]
+    /// is the orderly path — this is the backstop for every other way the
+    /// value can go away, including a panic between bind and close.
+    fn drop(&mut self) {
+        self.stop_keepalive();
     }
 }
 
@@ -70,14 +128,25 @@ impl std::fmt::Debug for HostObfuscatedEndpoint {
 /// request to the same server every `NAT_MAPPING_KEEPALIVE_SECS` to keep the
 /// discovered NAT mapping open (ADR 0053 — this substitutes for a
 /// synchronized simultaneous punch, which this app's one-way invite has no
-/// channel to coordinate). The task runs for the process's lifetime; there is
-/// no shutdown handle yet (increment 3 wires that into the app's invite
-/// lifecycle).
+/// channel to coordinate). That task now stops with the endpoint rather than
+/// with the process — see [`HostObfuscatedEndpoint::close`].
 ///
 /// # Errors
 /// [`NetError::Endpoint`] if the socket cannot be bound, cloned, or the `noq`
 /// endpoint cannot be constructed.
 pub async fn bind_host(invite_id: &[u8; INVITE_ID_BYTES]) -> Result<HostObfuscatedEndpoint> {
+    bind_host_via(invite_id, STUN_SERVERS).await
+}
+
+/// [`bind_host`], with the reflector list named by the caller.
+///
+/// Split out so a test can point the discovery and its keep-alive at a local
+/// reflector instead of the public fleet, which is the only way to prove the
+/// keep-alive both runs and stops without depending on the internet.
+async fn bind_host_via(
+    invite_id: &[u8; INVITE_ID_BYTES],
+    servers: &[&str],
+) -> Result<HostObfuscatedEndpoint> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| NetError::Endpoint(e.to_string()))?;
     let probe_socket = socket
         .try_clone()
@@ -86,14 +155,16 @@ pub async fn bind_host(invite_id: &[u8; INVITE_ID_BYTES]) -> Result<HostObfuscat
         .try_clone()
         .map_err(|e| NetError::Endpoint(e.to_string()))?;
 
+    let resolved: Vec<SocketAddr> = servers
+        .iter()
+        .filter_map(|server| server.to_socket_addrs().ok().and_then(|mut a| a.next()))
+        .collect();
     let (public_addr, stun_server) =
-        tokio::task::spawn_blocking(move || discover_public_addr(&probe_socket))
+        tokio::task::spawn_blocking(move || discover_public_addr(&probe_socket, &resolved))
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
 
-    if let Some(server) = stun_server {
-        spawn_keepalive(keepalive_socket, server);
-    }
+    let keepalive = stun_server.map(|server| spawn_keepalive(keepalive_socket, server));
 
     let runtime: Arc<dyn noq::Runtime> = Arc::new(TokioRuntime);
     let wrapped = runtime
@@ -126,20 +197,20 @@ pub async fn bind_host(invite_id: &[u8; INVITE_ID_BYTES]) -> Result<HostObfuscat
         endpoint,
         public_addr,
         cert_fingerprint,
+        keepalive,
     })
 }
 
-/// Tries each of `STUN_SERVERS` in turn on `socket`, returning the first
-/// reflexive address found and the server that answered (so the caller can
-/// keep hitting the same one to hold the mapping open). `None` if no server
-/// answered.
-fn discover_public_addr(socket: &UdpSocket) -> (Option<SocketAddr>, Option<SocketAddr>) {
-    for server in STUN_SERVERS {
-        let Some(resolved) = server.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
-            continue;
-        };
-        if let Ok(reflexive) = stun::reflexive_addr(socket, resolved) {
-            return (Some(reflexive), Some(resolved));
+/// Tries each of `servers` in turn on `socket`, returning the first reflexive
+/// address found and the server that answered (so the caller can keep hitting
+/// the same one to hold the mapping open). `None` if no server answered.
+fn discover_public_addr(
+    socket: &UdpSocket,
+    servers: &[SocketAddr],
+) -> (Option<SocketAddr>, Option<SocketAddr>) {
+    for server in servers {
+        if let Ok(reflexive) = stun::reflexive_addr(socket, *server) {
+            return (Some(reflexive), Some(*server));
         }
     }
     (None, None)
@@ -150,7 +221,11 @@ fn discover_public_addr(socket: &UdpSocket) -> (Option<SocketAddr>, Option<Socke
 /// outbound packet, which is what a NAT counts to keep a mapping alive; a
 /// failed/timed-out reply just means one keepalive tick, not the mapping,
 /// was lost.
-fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) {
+///
+/// The handle is returned rather than dropped: the endpoint owns it and aborts
+/// it on close, so a retired invite stops holding its mapping open
+/// (gap-tasks/21 task 1; ADR 0079).
+fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(NAT_MAPPING_KEEPALIVE_SECS));
         // The STUN probe during bind already sent one packet; skip the
@@ -171,7 +246,7 @@ fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) {
                 Err(_) => return,
             }
         }
-    });
+    })
 }
 
 /// Dials a host's obfuscated endpoint at `target`, pinning TLS verification
@@ -305,5 +380,141 @@ impl ServerCertVerifier for PinnedCertVerifier {
         noq::rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::*;
+
+    const INVITE: [u8; INVITE_ID_BYTES] = [0x3c; INVITE_ID_BYTES];
+
+    /// STUN magic cookie (RFC 5389 §6), mirrored from `crate::stun` so this
+    /// reflector speaks the format that module parses.
+    const MAGIC_COOKIE: u32 = 0x2112_A442;
+    /// STUN message type for a Binding success response.
+    const BINDING_SUCCESS: u16 = 0x0101;
+    /// Attribute type carrying the XOR-obfuscated reflexive address.
+    const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    /// Bytes of the fixed STUN header.
+    const HEADER_BYTES: usize = 20;
+    /// Bytes of the `XOR-MAPPED-ADDRESS` attribute value for IPv4.
+    const XOR_MAPPED_VALUE_BYTES: u16 = 8;
+
+    /// A local stand-in for a public STUN reflector: answers every Binding
+    /// request with the source address it saw.
+    ///
+    /// The point is not to test `crate::stun` — that has its own RFC 5769
+    /// vectors — but to give `bind_host_via` a reflector that answers on
+    /// loopback, so the keep-alive it spawns exists and can be watched.
+    async fn spawn_reflector() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Some(request) = buf.get(..n) else { return };
+                let Some(reply) = binding_success(request, from) else {
+                    continue;
+                };
+                let _ = socket.send_to(&reply, from).await;
+            }
+        });
+        (addr, task)
+    }
+
+    /// Builds the Binding success answer to `request`, echoing `from` as the
+    /// XOR-mapped address. `None` for anything too short to be a request or
+    /// for an IPv6 peer, which this reflector does not answer.
+    fn binding_success(request: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+        let txid = request.get(8..HEADER_BYTES)?;
+        let SocketAddr::V4(from) = from else {
+            return None;
+        };
+        let mut reply = Vec::with_capacity(HEADER_BYTES + 12);
+        reply.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        reply.extend_from_slice(&(XOR_MAPPED_VALUE_BYTES + 4).to_be_bytes());
+        reply.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        reply.extend_from_slice(txid);
+        reply.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        reply.extend_from_slice(&XOR_MAPPED_VALUE_BYTES.to_be_bytes());
+        reply.push(0);
+        reply.push(1);
+        let cookie_hi = u16::try_from(MAGIC_COOKIE >> 16).ok()?;
+        reply.extend_from_slice(&(from.port() ^ cookie_hi).to_be_bytes());
+        reply.extend_from_slice(&(u32::from(*from.ip()) ^ MAGIC_COOKIE).to_be_bytes());
+        Some(reply)
+    }
+
+    /// gap-tasks/21 task 1, and one half of its definition of done: closing
+    /// the endpoint stops the keep-alive task.
+    ///
+    /// Without this the task outlived every invite it was bound for, so a host
+    /// that renewed its code kept sending a STUN request every
+    /// `NAT_MAPPING_KEEPALIVE_SECS` from every socket it had ever bound.
+    #[tokio::test]
+    async fn closing_the_endpoint_stops_the_keepalive_task() {
+        let (reflector, reflector_task) = spawn_reflector().await;
+        let host = bind_host_via(&INVITE, &[&reflector.to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            host.public_addr.is_some(),
+            "the local reflector answered, so discovery must have an address"
+        );
+        let keepalive = host
+            .keepalive_probe()
+            .expect("a reflector answered, so a keep-alive holds its mapping open");
+        assert!(!keepalive.is_finished(), "the keep-alive must be running");
+
+        host.close().await;
+
+        // `abort` is delivered by the runtime, not synchronously by the
+        // caller, so the task is finished on one of the next few polls rather
+        // than the instant `close` returns.
+        for _ in 0..1_000 {
+            if keepalive.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            keepalive.is_finished(),
+            "closing the endpoint must stop its keep-alive task"
+        );
+
+        reflector_task.abort();
+    }
+
+    /// gap-tasks/21 task 1 item 3: no reflector answering is an ordinary
+    /// outcome, not an error — the endpoint still binds, with nothing to put
+    /// in a ticket and no mapping to hold open.
+    #[tokio::test]
+    async fn no_reflector_leaves_the_public_address_unknown() {
+        // A reflector that is bound and then immediately dropped: the address
+        // is real and nothing is listening on it, which is what "no reflector
+        // answered" looks like from here.
+        let (reflector, reflector_task) = spawn_reflector().await;
+        reflector_task.abort();
+
+        let host = bind_host_via(&INVITE, &[&reflector.to_string()])
+            .await
+            .unwrap();
+        assert!(host.public_addr.is_none());
+        assert!(
+            host.keepalive_probe().is_none(),
+            "there is no mapping worth holding open without an address"
+        );
+        host.close().await;
     }
 }
