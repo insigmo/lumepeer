@@ -4211,6 +4211,7 @@ dependencies = [
  "lumepeer-media",
  "lumepeer-net",
  "lumepeer-service",
+ "lumepeer-terminal",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

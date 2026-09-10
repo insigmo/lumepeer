@@ -591,13 +591,20 @@ pub const MAX_TERMINALS_PER_SESSION: usize = 4;
 /// at the same size, because a shell that dumps a file is exactly as capable
 /// of naming a large number as a forwarded socket is.
 pub const TERMINAL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
-/// How many lines of history the guest's terminal emulator keeps (ADR 0079).
+/// How much output one shell may hold for a guest window that has not read it
+/// yet, in bytes (ADR 0079).
 ///
-/// Only the guest's own window, and deliberately not on the host: scrollback
-/// is what the person reading the terminal can scroll back to, and the host
-/// keeps no transcript of anything (§15, ADR 0041). A thousand lines is what
-/// fits a build log without holding a session's whole output in a webview.
-pub const TERMINAL_SCROLLBACK_LINES: u16 = 1000;
+/// The scrollback bound, and it behaves like one: past this the **oldest**
+/// bytes go, which is exactly what a terminal that scrolled off the top does.
+/// Dropping the newest instead would leave a window showing a prompt that is
+/// no longer there.
+///
+/// Guest-side only, and deliberately so: the host keeps no transcript of
+/// anything (§15, ADR 0041), so there is nothing on that side for this to
+/// bound. Sixteen times [`TERMINAL_OUTPUT_MAX_BYTES`], which is a build log's
+/// worth of scroll for a window that stopped polling, and a bounded cost per
+/// shell either way.
+pub const TERMINAL_SCROLLBACK_BYTES: usize = 16 * TERMINAL_OUTPUT_MAX_BYTES;
 /// Widest terminal a guest may ask a host to allocate, in columns (§9.1;
 /// ADR 0079).
 ///

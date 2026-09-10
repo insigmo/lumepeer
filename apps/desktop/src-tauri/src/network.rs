@@ -30,17 +30,19 @@ use lumepeer_core::constants::{
     FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
     KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS,
-    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TUNNEL_IDLE_TIMEOUT_SECS,
+    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
+    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
+    TERMINAL_SCROLLBACK_BYTES, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
     FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
-    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TUNNEL, FEATURE_UNATTENDED,
-    FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
-    MediaUnavailableReason, MessageKind, MonitorInfo, TunnelRefusal, UnattendedRejection,
+    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TERMINAL, FEATURE_TUNNEL,
+    FEATURE_UNATTENDED, FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry,
+    MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, TerminalRefusal, TunnelRefusal,
+    UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
@@ -57,9 +59,14 @@ use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
 use lumepeer_net::keystore::{Keystore, load_or_create};
+use lumepeer_net::terminal::{
+    ShellId, read_frame as read_terminal_frame, write_close as write_terminal_close,
+    write_frame as write_terminal_frame,
+};
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::tunnel::{StreamId, read_frame, write_close, write_frame};
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
+use lumepeer_terminal::{Shell, ShellControl, ShellError, ShellSize};
 use rand::Rng as _;
 use rand::RngExt as _;
 use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
@@ -161,6 +168,23 @@ const DIR_TRANSFER_MINOR: u16 = 14;
 /// `FEATURE_TUNNEL` string instead, and `HelloAck` carries no feature list
 /// for the guest to read the other way.
 const TUNNEL_MINOR: u16 = 15;
+
+/// First `PROTOCOL_MINOR` that carries the four terminal messages (ADR 0079).
+///
+/// Guest side only, exactly like [`TUNNEL_MINOR`]: a host reads the guest's
+/// `FEATURE_TERMINAL` string instead, and `HelloAck` carries no feature list
+/// for the guest to read the other way.
+const TERMINAL_MINOR: u16 = 16;
+
+/// How many frames one terminal connection queues before its producer waits.
+///
+/// The tunnel's writer queue in named form. Deep enough that a shell dumping a
+/// file never blocks on a connection that is merely busy, shallow enough that
+/// one nobody is draining stops growing — and the producer here is a thread
+/// blocked in `read`, so waiting is exactly the right thing for it to do: the
+/// pseudo-terminal then stops the process behind it, which is the backpressure
+/// a real terminal has anyway (ADR 0079).
+const TERMINAL_QUEUE_FRAMES: usize = 16;
 
 /// Capacity of the notification broadcast. Listeners that fall behind lag;
 /// nothing in the actor's own progress depends on them.
@@ -442,7 +466,7 @@ pub struct ConnectionStats {
 /// One row of the status list the webview polls.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "mirrors Grants plus two independent activity flags (recording_active, secure_desktop_active); §2.2 requires the grants to stay independent fields rather than folded together"
+    reason = "mirrors Grants plus three independent activity flags (recording_active, secure_desktop_active, terminal_active); §2.2 requires the grants to stay independent fields rather than folded together"
 )]
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
@@ -480,6 +504,14 @@ pub struct SessionSnapshot {
     /// this says it *is* happening. The host's non-removable indicator hangs
     /// off this one.
     pub secure_desktop_active: bool,
+    /// Whether this guest has a shell running on this machine right now
+    /// (ADR 0079).
+    ///
+    /// Separate from `grants.terminal` the same way the two flags above are
+    /// separate from their grants, and for the sharper reason: permission is
+    /// not what is worth interrupting somebody for, a running shell is. The
+    /// indicator the host cannot switch off hangs off this one.
+    pub terminal_active: bool,
 }
 
 /// Translates one authorized guest event into the helper's secure-desktop
@@ -700,6 +732,10 @@ pub enum ActorNotification {
     /// (ADR 0078). Host side, so the session line and the tunnel list are
     /// never a poll behind what is actually carrying bytes.
     TunnelChanged,
+    /// A shell started or ended on this machine (ADR 0079). Host side, and
+    /// the reason it exists at all: the indicator the host cannot switch off
+    /// must not be a poll behind a running shell.
+    TerminalChanged,
 }
 
 /// Failure returned by an actor call.
@@ -1005,6 +1041,39 @@ enum ActorCommand {
     /// Host side: every tunnel this machine is carrying right now.
     TunnelStatus {
         reply: oneshot::Sender<Vec<TunnelRow>>,
+    },
+    /// Guest side: ask the watched host to start a shell (ADR 0079).
+    TerminalOpen {
+        label: String,
+        cols: u16,
+        rows: u16,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: what was typed, on its way to one shell.
+    TerminalInput {
+        label: String,
+        shell: ShellId,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: that shell's window changed size.
+    TerminalResize {
+        label: String,
+        shell: ShellId,
+        cols: u16,
+        rows: u16,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: this window is finished with one shell.
+    TerminalClose {
+        label: String,
+        shell: ShellId,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Guest side: everything this peer's terminal window has not seen yet.
+    TerminalPoll {
+        label: String,
+        reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
     },
     /// Guest side: ask the watched host to send the file at `path`, into
     /// `into` on this machine (ADR 0076).
@@ -1945,6 +2014,121 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
+    /// Guest side: asks the watched host to start a shell (§4.1; ADR 0079).
+    ///
+    /// Nothing is authorized here. The host re-reads its own `terminal` grant
+    /// for **every** shell and answers with an id or a refusal, which arrives
+    /// through [`Self::terminal_poll`] rather than here: an open is a request
+    /// on the wire, not a call that can succeed locally.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old for the terminal
+    /// messages; [`ActorError::Core`] with `Malformed` for a geometry that is
+    /// not a window.
+    pub async fn terminal_open(
+        &self,
+        label: String,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalOpen {
+                label,
+                cols,
+                rows,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: what was typed, on its way to one shell (ADR 0079).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core`] with `Malformed` past
+    /// `TERMINAL_OUTPUT_MAX_BYTES`; [`ActorError::Net`] when the channel is
+    /// full, which is a shell that has stopped reading.
+    pub async fn terminal_input(
+        &self,
+        label: String,
+        shell: ShellId,
+        payload: Vec<u8>,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalInput {
+                label,
+                shell,
+                payload,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: tells the host one shell's window changed size (ADR 0079).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Core`] with `Malformed` for a geometry that is not a
+    /// window.
+    pub async fn terminal_resize(
+        &self,
+        label: String,
+        shell: ShellId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalResize {
+                label,
+                shell,
+                cols,
+                rows,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: this window is finished with one shell (ADR 0079).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
+    pub async fn terminal_close(&self, label: String, shell: ShellId) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalClose {
+                label,
+                shell,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: everything this peer's terminal window has not seen yet,
+    /// in the order it happened (ADR 0079).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
+    pub async fn terminal_poll(&self, label: String) -> Result<Vec<u8>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalPoll { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
     /// Guest side: asks the watched host to send one file, to be written into
     /// `into` on this machine (ADR 0076).
     ///
@@ -2702,6 +2886,117 @@ enum TunnelEvent {
     StreamEnded { peer: NodeId, stream_id: StreamId },
 }
 
+/// One peer's `rd/term/1` plumbing (§4.1; ADR 0079).
+///
+/// Made the moment either side first needs it and **before** the QUIC
+/// connection exists, which is what separates it from [`TunnelChannel`]: a
+/// host spawns the shell and answers on the control channel, and the guest
+/// only dials this connection once it has read that answer (ADR 0032). The
+/// prompt the shell prints in between has somewhere to wait because `frames`
+/// already exists; the receiving half sits in `Actor::terminal_backlog` until
+/// the connection arrives to drain it.
+#[derive(Clone)]
+struct TerminalChannel {
+    /// Frames on their way to the far side, drained by the writer task.
+    frames: mpsc::Sender<TerminalWrite>,
+    /// The QUIC connection under it once there is one, kept so a revoke can
+    /// close it outright rather than waiting for the far side to notice (§4).
+    connection: Option<iroh::endpoint::Connection>,
+}
+
+/// One shell this host is running for a guest (ADR 0079).
+///
+/// Two halves for the reason [`lumepeer_terminal::Shell`] has them: the thread
+/// writing keystrokes and the thread reading output are both blocked in the
+/// kernel most of the time, and a revoke has to reach the shell anyway.
+struct RunningShell {
+    /// Resize and kill, safe to call while either thread is blocked.
+    control: ShellControl,
+    /// Keystrokes on their way in, drained by this shell's writer thread.
+    input: mpsc::Sender<Vec<u8>>,
+}
+
+/// One thing to put on a terminal connection.
+#[derive(Debug)]
+enum TerminalWrite {
+    /// Keystrokes towards a shell, or a shell's output towards a window.
+    Data(ShellId, Vec<u8>),
+    /// That shell's stream is over on this side.
+    Close(ShellId),
+}
+
+/// One thing that happened to a shell or its channel, off the actor loop.
+enum TerminalEvent {
+    /// `rd/term/1` towards this peer is up — either this node dialed it, or
+    /// the peer's dial was accepted and authorized.
+    Connected {
+        peer: NodeId,
+        connection: Box<iroh::endpoint::Connection>,
+    },
+    /// The dial failed, so no shell with this peer has anywhere to send.
+    ConnectFailed { peer: NodeId },
+    /// A payload frame arrived on `rd/term/1`: keystrokes towards a shell on
+    /// the host side, a shell's output towards a window on the guest side.
+    ///
+    /// Routed through the actor rather than straight to its destination,
+    /// unlike a tunnel's frames: on the guest side the destination *is* the
+    /// actor's own queue, and a terminal moves a keystroke at a time rather
+    /// than a file at a time, so there is nothing here to keep off the loop.
+    Frame {
+        peer: NodeId,
+        shell: ShellId,
+        payload: Vec<u8>,
+    },
+    /// A shell's stream ended: the process exited, it was killed, or the far
+    /// side sent the zero-length marker.
+    ShellEnded { peer: NodeId, shell: ShellId },
+}
+
+/// One thing the guest's terminal window has not been told yet (ADR 0079).
+///
+/// Queued in arrival order rather than pushed, the same way frames and the
+/// chat transcript are: the window asks, and what it gets back is everything
+/// since it last asked, in the order it happened.
+#[derive(Debug)]
+struct TerminalRecord {
+    /// The shell this is about; `0` for a refusal, which names none.
+    shell: ShellId,
+    /// What happened, as the byte the poll's own framing carries.
+    event: u8,
+    /// The shell's output, and empty for everything else.
+    payload: Vec<u8>,
+}
+
+/// A shell started (ADR 0079). `shell` is the id the host chose.
+const TERMINAL_EVENT_OPENED: u8 = 1;
+/// A shell ended, whichever side ended it.
+const TERMINAL_EVENT_CLOSED: u8 = 2;
+/// Output from a shell, in the order it was produced.
+const TERMINAL_EVENT_OUTPUT: u8 = 0;
+/// The host holds no `terminal` grant for this session (§18; ADR 0079).
+const TERMINAL_EVENT_REFUSED_NOT_GRANTED: u8 = 3;
+/// The session already holds [`MAX_TERMINALS_PER_SESSION`] shells.
+const TERMINAL_EVENT_REFUSED_TOO_MANY: u8 = 4;
+/// The host could not run the shell as its own interactive user, and refused
+/// to run it as anything else (ADR 0079 decision 2).
+const TERMINAL_EVENT_REFUSED_CANNOT_DROP: u8 = 5;
+/// The host has no shell to run, or no pseudo-terminal to run it behind.
+const TERMINAL_EVENT_REFUSED_UNAVAILABLE: u8 = 6;
+
+/// The poll byte one wire refusal travels as (§18; ADR 0079).
+///
+/// A `match` without a `_` arm: a refusal this side could not name would
+/// otherwise reach the window as silence, which is the one thing §18 says a
+/// refusal may never be.
+const fn terminal_refusal_event(refusal: TerminalRefusal) -> u8 {
+    match refusal {
+        TerminalRefusal::NotGranted => TERMINAL_EVENT_REFUSED_NOT_GRANTED,
+        TerminalRefusal::TooMany => TERMINAL_EVENT_REFUSED_TOO_MANY,
+        TerminalRefusal::CannotDropPrivileges => TERMINAL_EVENT_REFUSED_CANNOT_DROP,
+        TerminalRefusal::Unavailable => TERMINAL_EVENT_REFUSED_UNAVAILABLE,
+    }
+}
+
 /// One thing that happened to a transfer, off the actor loop.
 enum FileEvent {
     /// `rd/file/1` towards this peer is up — either this node dialed it, or
@@ -3228,6 +3523,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_TUNNEL`
         /// (ADR 0078), so a tunnel request from it can be answered out loud.
         speaks_tunnel: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_TERMINAL`
+        /// (ADR 0079), so a shell request from it can be answered out loud.
+        speaks_terminal: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3278,6 +3576,9 @@ enum ActorEvent {
     File(FileEvent),
     /// Something happened to a tunnel, on one of its own tasks (ADR 0078).
     Tunnel(TunnelEvent),
+    /// Something happened to a shell or its channel, on one of its own
+    /// threads (ADR 0079).
+    Terminal(TerminalEvent),
     /// This node's own clipboard file list was read and measured, off the
     /// actor loop (docs/bugs/14-clipboard-files.md #2; ADR 0027).
     ClipboardFilesRead {
@@ -3364,6 +3665,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_TUNNEL`
         /// (ADR 0078), so a tunnel request from it can be answered out loud.
         speaks_tunnel: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_TERMINAL`
+        /// (ADR 0079), so a shell request from it can be answered out loud.
+        speaks_terminal: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3382,6 +3686,12 @@ enum Accepted {
     /// Tunnel ALPN: authenticated only, nothing decided — exactly like media
     /// and files, and for the same reason (§4.1, §2.3; ADR 0078).
     Tunnel {
+        connection: Box<iroh::endpoint::Connection>,
+        peer: NodeId,
+    },
+    /// Terminal ALPN: authenticated only, nothing decided — same again
+    /// (§4.1, §2.3; ADR 0079).
+    Terminal {
         connection: Box<iroh::endpoint::Connection>,
         peer: NodeId,
     },
@@ -3564,6 +3874,33 @@ struct Actor {
     /// window to say something true rather than leave a port that silently
     /// accepts and drops (§18).
     tunnel_refusals: std::collections::HashMap<NodeId, TunnelRefusal>,
+    /// Peers whose `Hello` advertised `FEATURE_TERMINAL`, and which may
+    /// therefore be answered with a `TerminalOpenResponse` (ADR 0079).
+    speaks_terminal: std::collections::HashSet<NodeId>,
+    /// Guest side: per watched host, whether its `HelloAck` minor is at least
+    /// [`TERMINAL_MINOR`], so this node may ask it for a shell at all.
+    terminal_to_host: std::collections::HashMap<NodeId, bool>,
+    /// The live `rd/term/1` plumbing per peer, on both sides (ADR 0079).
+    terminals: std::collections::HashMap<NodeId, TerminalChannel>,
+    /// The receiving half of each channel's writer queue, held until the QUIC
+    /// connection that drains it exists — see [`TerminalChannel`].
+    terminal_backlog: std::collections::HashMap<NodeId, mpsc::Receiver<TerminalWrite>>,
+    /// Peers whose terminal connection is being dialed right now.
+    terminal_dialing: std::collections::HashSet<NodeId>,
+    /// Host side: the shells this machine is running, by peer and shell id.
+    ///
+    /// The only thing that says a terminal is live: the host's non-removable
+    /// indicator, the per-session bound and the teardown a revoke runs all
+    /// read this map and nothing else (ADR 0079).
+    shells: std::collections::HashMap<(NodeId, ShellId), RunningShell>,
+    /// Host side: the next shell id this machine will name.
+    ///
+    /// Host-chosen, unlike a tunnel's stream id: a shell is the host's own
+    /// process, so the guest never names one (ADR 0079).
+    next_shell: ShellId,
+    /// Guest side: what each terminal window has not been told yet, in the
+    /// order it happened (ADR 0079).
+    terminal_pending: std::collections::HashMap<NodeId, std::collections::VecDeque<TerminalRecord>>,
     /// Host side: how many fetches from each peer are being hashed right now.
     ///
     /// Counted separately from `file_offers_out` because a hash pass is where
@@ -3867,6 +4204,7 @@ impl Actor {
                 recording_active: false,
                 record_request: false,
                 secure_desktop_active: false,
+                terminal_active: false,
             });
         }
         for (peer, role, grants) in self.sessions.active() {
@@ -3887,6 +4225,7 @@ impl Actor {
                     .media
                     .get(&peer)
                     .is_some_and(|s| s.control.secure_desktop_active()),
+                terminal_active: self.shells.keys().any(|(p, _)| *p == peer),
             });
         }
         // Host side: every saved device gets a label too, whether or not it is
@@ -5713,6 +6052,509 @@ impl Actor {
         rows
     }
 
+    // ---------------------------------------------------------------------
+    // Terminal (§4.1; ADR 0079)
+    // ---------------------------------------------------------------------
+
+    fn on_terminal_event(&mut self, event: TerminalEvent) {
+        match event {
+            TerminalEvent::Connected { peer, connection } => {
+                self.on_terminal_connected(peer, *connection);
+            }
+            TerminalEvent::ConnectFailed { peer } => {
+                self.terminal_dialing.remove(&peer);
+                self.close_terminal(peer, "terminal-closed-channel-lost");
+            }
+            TerminalEvent::Frame {
+                peer,
+                shell,
+                payload,
+            } => self.on_terminal_frame(peer, shell, payload),
+            TerminalEvent::ShellEnded { peer, shell } => {
+                self.end_shell(peer, shell, "terminal-closed-by-shell", true);
+            }
+        }
+    }
+
+    /// `rd/term/1` towards `peer` is up (§4.1; ADR 0079).
+    ///
+    /// Authorized here and nowhere else, exactly like the tunnel connection:
+    /// this is the one thread that can read `SessionManager`. A connection
+    /// from a peer with no live session carrying `terminal` is closed on the
+    /// spot — which is a coarser check than the per-open one below and does
+    /// not replace it, because a session opens many shells over its life.
+    fn on_terminal_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+        self.terminal_dialing.remove(&peer);
+        let tag = self.label_of(&peer);
+        if !self.connections.contains_key(&peer) || !self.may_terminal(&peer) {
+            tracing::warn!(peer = %tag, "refusing a terminal connection without the grant");
+            connection.close(
+                lumepeer_net::connection::CLOSE_MALFORMED.into(),
+                lumepeer_net::error::close_code::MALFORMED.as_bytes(),
+            );
+            return;
+        }
+        let dialed = self.views.contains_key(&peer);
+        self.ensure_terminal_channel(peer);
+        // The queue was made before the connection existed, so a prompt the
+        // shell printed while this was being dialed is still in it.
+        let Some(frames_rx) = self.terminal_backlog.remove(&peer) else {
+            // Already draining: a second connection for the same peer is one
+            // this side has no use for.
+            connection.close(0u32.into(), b"terminal already open");
+            return;
+        };
+        if let Some(channel) = self.terminals.get_mut(&peer) {
+            channel.connection = Some(connection.clone());
+        }
+        let events = self.events_tx.clone();
+        tokio::spawn(run_terminal_connection(
+            connection, frames_rx, peer, tag, dialed, events,
+        ));
+    }
+
+    /// Whether `peer` may hold a terminal channel at all right now
+    /// (ADR 0079).
+    ///
+    /// The grant and a live session behind it, and nothing about privileges:
+    /// what the shell is allowed to *be* is decided where it is spawned.
+    fn may_terminal(&self, peer: &NodeId) -> bool {
+        // A guest holds no grants of its own: it has a view of the host, and
+        // the host is the side that decides (§2.3). The same asymmetry
+        // `may_tunnel` carries.
+        if self.views.contains_key(peer) {
+            return true;
+        }
+        self.sessions.terminal_allows(peer)
+    }
+
+    /// The peer's terminal channel, making the queue if it does not exist.
+    ///
+    /// Deliberately independent of the QUIC connection: the host makes this
+    /// the moment it has a shell, the guest the moment it has keystrokes, and
+    /// the connection arrives when it arrives (ADR 0032).
+    fn ensure_terminal_channel(&mut self, peer: NodeId) -> TerminalChannel {
+        if let Some(channel) = self.terminals.get(&peer) {
+            return channel.clone();
+        }
+        let (frames, frames_rx) = mpsc::channel::<TerminalWrite>(TERMINAL_QUEUE_FRAMES);
+        let channel = TerminalChannel {
+            frames,
+            connection: None,
+        };
+        self.terminals.insert(peer, channel.clone());
+        self.terminal_backlog.insert(peer, frames_rx);
+        channel
+    }
+
+    /// Guest side: opens `rd/term/1` towards `peer`.
+    ///
+    /// Only the node that dialed the control connection dials this one, the
+    /// same as media, files and the tunnel (§4.1; ADR 0026) — which makes the
+    /// guest the dialer, and the guest is also the side that wanted a shell,
+    /// so the host never opens a terminal nobody asked for.
+    fn ensure_terminal_connection(&mut self, peer: NodeId) {
+        if self
+            .terminals
+            .get(&peer)
+            .is_some_and(|c| c.connection.is_some())
+            || self.terminal_dialing.contains(&peer)
+        {
+            return;
+        }
+        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+            return;
+        };
+        self.terminal_dialing.insert(peer);
+        let endpoint = self.endpoint.clone();
+        let events = self.events_tx.clone();
+        let tag = self.label_of(&peer);
+        tokio::spawn(async move {
+            let event = match endpoint.connect(addr, lumepeer_net::ALPN_TERMINAL).await {
+                Ok(connection) => TerminalEvent::Connected {
+                    peer,
+                    connection: Box::new(connection),
+                },
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "could not open the terminal connection");
+                    TerminalEvent::ConnectFailed { peer }
+                }
+            };
+            let _ = events.send(ActorEvent::Terminal(event)).await;
+        });
+    }
+
+    /// Host side: a guest asked for a shell (§4.1, §18; ADR 0079).
+    ///
+    /// Every decision is re-read here, for **this** shell: the grant, because
+    /// a session opens many over its life and a revoke that landed only on
+    /// the first would be a revoke waiting for somebody to type `exit`; and
+    /// the per-session bound, because a guest that can start one process on
+    /// somebody's machine can start a hundred.
+    ///
+    /// The spawn itself runs on this loop rather than off it, which is the
+    /// one place this file does that with a syscall that is not instant. Two
+    /// reasons, and they point the same way. The wire rule of ADR 0079 is
+    /// that a guest pairs answers with asks *in the order it sent them*, and
+    /// an open moved onto a task could come back out of order. And a shell is
+    /// started by a person pressing a button, at most
+    /// [`MAX_TERMINALS_PER_SESSION`] times a session — the same reasoning
+    /// that puts `TcpListener::bind` on this loop in `on_tunnel_open`.
+    fn on_terminal_open_request(&mut self, peer: NodeId, cols: u16, rows: u16) {
+        let tag = self.label_of(&peer);
+        if !self.speaks_terminal.contains(&peer) {
+            tracing::debug!(peer = %tag, "a shell request from a peer that never advertised it");
+            return;
+        }
+        if !self.sessions.terminal_allows(&peer) {
+            tracing::warn!(peer = %tag, "a shell without the terminal grant; refused");
+            self.refuse_terminal(peer, TerminalRefusal::NotGranted);
+            return;
+        }
+        let open = self.shells.keys().filter(|(p, _)| *p == peer).count();
+        if open >= MAX_TERMINALS_PER_SESSION {
+            self.refuse_terminal(peer, TerminalRefusal::TooMany);
+            return;
+        }
+        let shell = match Shell::spawn(ShellSize { cols, rows }) {
+            Ok(shell) => shell,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "no shell was started");
+                self.refuse_terminal(
+                    peer,
+                    match error {
+                        ShellError::CannotDropPrivileges => TerminalRefusal::CannotDropPrivileges,
+                        ShellError::Unavailable => TerminalRefusal::Unavailable,
+                    },
+                );
+                return;
+            }
+        };
+        let id = self.next_shell;
+        self.next_shell = self.next_shell.wrapping_add(1).max(1);
+        self.start_shell(peer, id, shell);
+        self.send_to(
+            &peer,
+            MessageKind::TerminalOpenResponse {
+                session_id: id,
+                refused: None,
+            },
+        );
+        tracing::info!(peer = %tag, "a shell started for a guest");
+        self.audit_terminal(&peer, "terminal-opened");
+        let _ = self.notify.send(ActorNotification::TerminalChanged);
+    }
+
+    /// Host side: wires one running shell to the terminal channel, both ways.
+    ///
+    /// Two threads rather than two tasks: both ends of a pseudo-terminal are
+    /// blocking, and a blocking read parked on a tokio worker is a worker that
+    /// is gone (ADR 0027). Nothing that crosses either of them is logged,
+    /// kept or written anywhere (§15; ADR 0041).
+    fn start_shell(&mut self, peer: NodeId, id: ShellId, shell: Shell) {
+        let control = shell.control();
+        let (reader, mut writer, _) = shell.into_parts();
+        let channel = self.ensure_terminal_channel(peer);
+        let (input, mut input_rx) = mpsc::channel::<Vec<u8>>(TERMINAL_QUEUE_FRAMES);
+        self.shells
+            .insert((peer, id), RunningShell { control, input });
+
+        // Keystrokes in. Ends when the shell is killed and the write fails,
+        // or when the actor drops the sender.
+        std::thread::spawn(move || {
+            while let Some(payload) = input_rx.blocking_recv() {
+                if std::io::Write::write_all(&mut writer, &payload).is_err()
+                    || std::io::Write::flush(&mut writer).is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        // Output back. `blocking_send` is the backpressure: a shell that
+        // outruns the connection waits, and the pseudo-terminal then makes
+        // the process behind it wait, which is what a terminal does anyway.
+        let events = self.events_tx.clone();
+        let frames = channel.frames.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buffer = vec![0u8; TERMINAL_OUTPUT_MAX_BYTES];
+            loop {
+                let read = match std::io::Read::read(&mut reader, &mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                if frames
+                    .blocking_send(TerminalWrite::Data(id, buffer[..read].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = frames.blocking_send(TerminalWrite::Close(id));
+            let _ = events.blocking_send(ActorEvent::Terminal(TerminalEvent::ShellEnded {
+                peer,
+                shell: id,
+            }));
+        });
+    }
+
+    /// A payload frame arrived on `rd/term/1` (ADR 0079).
+    ///
+    /// Host side it is what somebody typed, and it goes to that shell's
+    /// writer thread. Guest side it is what a shell said, and it goes into
+    /// the queue the window polls. A frame for a shell this side no longer
+    /// has is dropped rather than an error: both ends may close at once, and
+    /// neither is wrong.
+    fn on_terminal_frame(&mut self, peer: NodeId, shell: ShellId, payload: Vec<u8>) {
+        if let Some(running) = self.shells.get(&(peer, shell)) {
+            if running.input.try_send(payload).is_err() {
+                tracing::debug!(peer = %self.label_of(&peer), "a shell is not keeping up with its input");
+            }
+            return;
+        }
+        if self.views.contains_key(&peer) {
+            self.queue_terminal(peer, shell, TERMINAL_EVENT_OUTPUT, payload);
+        }
+    }
+
+    /// Guest side: the host answered an open (§18; ADR 0079).
+    fn on_terminal_open_response(
+        &mut self,
+        peer: NodeId,
+        session_id: ShellId,
+        refused: Option<TerminalRefusal>,
+    ) {
+        if !self.views.contains_key(&peer) {
+            return;
+        }
+        if let Some(reason) = refused {
+            tracing::info!(peer = %self.label_of(&peer), ?reason, "a shell was refused");
+            self.queue_terminal(peer, 0, terminal_refusal_event(reason), Vec::new());
+            let _ = self.notify.send(ActorNotification::TerminalChanged);
+            return;
+        }
+        // Dialled only now, which is the lazy half of ADR 0032: a channel
+        // exists once there is something to carry, never before.
+        self.ensure_terminal_connection(peer);
+        self.queue_terminal(peer, session_id, TERMINAL_EVENT_OPENED, Vec::new());
+        let _ = self.notify.send(ActorNotification::TerminalChanged);
+    }
+
+    /// Guest side: remembers one thing the terminal window has not been told.
+    ///
+    /// Bounded on output and nothing else: an `opened` or a `closed` is a fact
+    /// the window must eventually see, and there are at most
+    /// [`MAX_TERMINALS_PER_SESSION`] of each. Output past
+    /// [`TERMINAL_SCROLLBACK_BYTES`] drops the **oldest** bytes of that shell,
+    /// which is what a terminal scrolling off the top does (ADR 0079).
+    fn queue_terminal(&mut self, peer: NodeId, shell: ShellId, event: u8, payload: Vec<u8>) {
+        let queue = self.terminal_pending.entry(peer).or_default();
+        queue.push_back(TerminalRecord {
+            shell,
+            event,
+            payload,
+        });
+        let mut held: usize = queue
+            .iter()
+            .filter(|record| record.shell == shell && record.event == TERMINAL_EVENT_OUTPUT)
+            .map(|record| record.payload.len())
+            .sum();
+        while held > TERMINAL_SCROLLBACK_BYTES {
+            let Some(index) = queue
+                .iter()
+                .position(|record| record.shell == shell && record.event == TERMINAL_EVENT_OUTPUT)
+            else {
+                break;
+            };
+            held -= queue.remove(index).map_or(0, |record| record.payload.len());
+        }
+    }
+
+    /// Guest side: everything this peer's terminal window has not seen yet.
+    ///
+    /// Little endian, and the same self-describing shape `view_cursor` uses:
+    /// `count:u16`, then `count` records of `shell:u32 | event:u8 |
+    /// length:u32 | payload`. The queue is emptied by the call, so nothing is
+    /// delivered twice and nothing is held once it has been read (§15).
+    fn terminal_drain(&mut self, label: &str) -> Result<Vec<u8>, ActorError> {
+        let peer = self.resolve(label)?;
+        let queue = self.terminal_pending.remove(&peer).unwrap_or_default();
+        let count = u16::try_from(queue.len()).unwrap_or(u16::MAX);
+        let mut out = Vec::new();
+        out.extend_from_slice(&count.to_le_bytes());
+        for record in queue.into_iter().take(count as usize) {
+            let length = u32::try_from(record.payload.len()).unwrap_or(0);
+            out.extend_from_slice(&record.shell.to_le_bytes());
+            out.push(record.event);
+            out.extend_from_slice(&length.to_le_bytes());
+            out.extend_from_slice(&record.payload);
+        }
+        Ok(out)
+    }
+
+    /// Sends the one answer a refused shell gets (§18; ADR 0079).
+    fn refuse_terminal(&mut self, peer: NodeId, reason: TerminalRefusal) {
+        self.send_to(
+            &peer,
+            MessageKind::TerminalOpenResponse {
+                session_id: 0,
+                refused: Some(reason),
+            },
+        );
+    }
+
+    /// Host side: kills one shell and gives its pseudo-terminal back
+    /// (ADR 0079).
+    ///
+    /// The only place a shell ends, whichever way it ended: a guest closing
+    /// its window, the process exiting, a grant going, a session ending.
+    /// `why` is the short machine-readable tag §15 allows and is the whole of
+    /// what is recorded besides the pseudonymized peer.
+    fn end_shell(&mut self, peer: NodeId, shell: ShellId, why: &'static str, announce: bool) {
+        let Some(running) = self.shells.remove(&(peer, shell)) else {
+            return;
+        };
+        running.control.kill();
+        if let Some(channel) = self.terminals.get(&peer)
+            && channel
+                .frames
+                .try_send(TerminalWrite::Close(shell))
+                .is_err()
+        {
+            tracing::debug!(peer = %self.label_of(&peer), "a shell's close marker could not be queued");
+        }
+        if announce {
+            self.send_to(&peer, MessageKind::TerminalClose { session_id: shell });
+        }
+        tracing::info!(peer = %self.label_of(&peer), why, "a shell is gone");
+        self.audit_terminal(&peer, why);
+        let _ = self.notify.send(ActorNotification::TerminalChanged);
+    }
+
+    /// Ends every shell with `peer` and closes the channel under them (§8.1;
+    /// ADR 0079).
+    ///
+    /// What a revoke runs, and what the end of a session runs. Immediate on
+    /// purpose: §4's rule is that a revoke must not wait for a channel to
+    /// drain, and a shell producing output is a channel that is busy.
+    fn close_terminal(&mut self, peer: NodeId, why: &'static str) {
+        let open: Vec<ShellId> = self
+            .shells
+            .keys()
+            .filter(|(p, _)| *p == peer)
+            .map(|(_, id)| *id)
+            .collect();
+        for shell in open {
+            self.end_shell(peer, shell, why, true);
+        }
+        if let Some(channel) = self.terminals.remove(&peer)
+            && let Some(connection) = channel.connection
+        {
+            connection.close(0u32.into(), b"terminal closed");
+        }
+        self.terminal_backlog.remove(&peer);
+        self.terminal_dialing.remove(&peer);
+    }
+
+    /// Records one terminal action in the audit log (§15; ADR 0041).
+    ///
+    /// The action and the pseudonymized peer, and nothing else. What was
+    /// typed and what came back are never written anywhere — not here, not to
+    /// `tracing`, not to any file: §15's log is deliberately pseudonymous and
+    /// deliberately exportable, and a transcript of somebody's session is the
+    /// one payload that would make it neither (ADR 0079 decision 6).
+    fn audit_terminal(&mut self, peer: &NodeId, action: &'static str) {
+        self.audit(
+            peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action },
+        );
+    }
+
+    /// Guest side: asks the watched host to start a shell (§4.1; ADR 0079).
+    fn on_terminal_open(&mut self, label: &str, cols: u16, rows: u16) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.terminal_to_host.get(&peer).copied().unwrap_or(false) {
+            return Err(ActorError::Unsupported);
+        }
+        // Bounded here as well as at the parse boundary, so a window with a
+        // bug gets a local error rather than a connection closed for a §9.1
+        // violation it caused itself.
+        if cols == 0
+            || rows == 0
+            || cols > lumepeer_core::constants::TERMINAL_COLS_MAX
+            || rows > lumepeer_core::constants::TERMINAL_ROWS_MAX
+        {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        self.send_to(&peer, MessageKind::TerminalOpenRequest { cols, rows });
+        Ok(())
+    }
+
+    /// Guest side: what was typed, on its way to one shell (ADR 0079).
+    fn on_terminal_input(
+        &mut self,
+        label: &str,
+        shell: ShellId,
+        payload: Vec<u8>,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if payload.len() > TERMINAL_OUTPUT_MAX_BYTES {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        let channel = self.ensure_terminal_channel(peer);
+        channel
+            .frames
+            .try_send(TerminalWrite::Data(shell, payload))
+            .map_err(|_| ActorError::Net(NetError::Io("the terminal channel is full".to_owned())))
+    }
+
+    /// Host side: the window around one shell changed size (ADR 0079).
+    ///
+    /// A resize of a shell that is not open is ignored rather than an error:
+    /// the guest may have sent it while this side was killing the shell.
+    fn on_terminal_resize(&mut self, peer: NodeId, shell: ShellId, cols: u16, rows: u16) {
+        if let Some(running) = self.shells.get(&(peer, shell)) {
+            running.control.resize(ShellSize { cols, rows });
+        }
+    }
+
+    /// Guest side: tells the host this shell's window changed size
+    /// (ADR 0079).
+    fn on_terminal_resize_command(
+        &mut self,
+        label: &str,
+        shell: ShellId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if cols == 0
+            || rows == 0
+            || cols > lumepeer_core::constants::TERMINAL_COLS_MAX
+            || rows > lumepeer_core::constants::TERMINAL_ROWS_MAX
+        {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        self.send_to(
+            &peer,
+            MessageKind::TerminalResize {
+                session_id: shell,
+                cols,
+                rows,
+            },
+        );
+        Ok(())
+    }
+
+    /// Guest side: this window is finished with one shell (ADR 0079).
+    fn on_terminal_close(&mut self, label: &str, shell: ShellId) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        self.send_to(&peer, MessageKind::TerminalClose { session_id: shell });
+        self.queue_terminal(peer, shell, TERMINAL_EVENT_CLOSED, Vec::new());
+        Ok(())
+    }
+
     /// Host side: switches this host's own physical monitor to `mode_id`
     /// (docs/bugs/16-host-display-mode.md #2, #3; ADR 0048).
     ///
@@ -5958,6 +6800,7 @@ impl Actor {
                     speaks_file_manage,
                     speaks_dir_transfer,
                     speaks_tunnel,
+                    speaks_terminal,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -5976,6 +6819,7 @@ impl Actor {
                     speaks_file_manage,
                     speaks_dir_transfer,
                     speaks_tunnel,
+                    speaks_terminal,
                     speaks_clipboard_files,
                     speaks_display_mode,
                     guest_codec_support,
@@ -5989,6 +6833,9 @@ impl Actor {
                 }
                 Some(Accepted::Tunnel { connection, peer }) => {
                     ActorEvent::Tunnel(TunnelEvent::Connected { connection, peer })
+                }
+                Some(Accepted::Terminal { connection, peer }) => {
+                    ActorEvent::Terminal(TerminalEvent::Connected { connection, peer })
                 }
                 None => return,
             };
@@ -6116,6 +6963,7 @@ impl Actor {
                 speaks_file_manage,
                 speaks_dir_transfer,
                 speaks_tunnel,
+                speaks_terminal,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -6167,6 +7015,14 @@ impl Actor {
                 } else {
                     self.speaks_tunnel.remove(&peer);
                 }
+                // And for a shell (ADR 0079). Also not a grant: `terminal` is
+                // the host's decision and is re-read for every shell asked
+                // for; this only says the peer can decode the answer.
+                if speaks_terminal {
+                    self.speaks_terminal.insert(peer);
+                } else {
+                    self.speaks_terminal.remove(&peer);
+                }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
                 } else {
@@ -6214,6 +7070,7 @@ impl Actor {
             } => self.on_dialed(peer, code, *addr, result),
             ActorEvent::File(event) => self.on_file_event(event),
             ActorEvent::Tunnel(event) => self.on_tunnel_event(event),
+            ActorEvent::Terminal(event) => self.on_terminal_event(event),
             ActorEvent::ClipboardFilesRead { peer, files, paths } => {
                 self.on_clipboard_files_read(peer, files, paths);
             }
@@ -7260,6 +8117,30 @@ impl Actor {
             MessageKind::TunnelClose { stream_id } => {
                 self.end_tunnel_stream(peer, stream_id, false);
             }
+            // Host side: the guest asked for a shell (ADR 0079).
+            MessageKind::TerminalOpenRequest { cols, rows } => {
+                self.on_terminal_open_request(peer, cols, rows);
+            }
+            // Guest side: the host answered one of those.
+            MessageKind::TerminalOpenResponse {
+                session_id,
+                refused,
+            } => self.on_terminal_open_response(peer, session_id, refused),
+            // Host side: that shell's window changed size.
+            MessageKind::TerminalResize {
+                session_id,
+                cols,
+                rows,
+            } => self.on_terminal_resize(peer, session_id, cols, rows),
+            // Either side: one shell is over. Announcing it back would be an
+            // answer to an answer; the far side already knows.
+            MessageKind::TerminalClose { session_id } => {
+                self.end_shell(peer, session_id, "terminal-closed-by-guest", false);
+                if self.views.contains_key(&peer) {
+                    self.queue_terminal(peer, session_id, TERMINAL_EVENT_CLOSED, Vec::new());
+                    let _ = self.notify.send(ActorNotification::TerminalChanged);
+                }
+            }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -7527,6 +8408,13 @@ impl Actor {
         // listeners and all, rather than leaving a forwarded port open onto
         // nothing (ADR 0078).
         self.close_tunnel(peer, "the connection ended");
+        self.speaks_terminal.remove(&peer);
+        self.terminal_to_host.remove(&peer);
+        self.terminal_pending.remove(&peer);
+        // And its shells, for the sharper version of the same reason: a
+        // process left running on somebody's machine after the session that
+        // asked for it is gone is the failure ADR 0079 exists to prevent.
+        self.close_terminal(peer, "terminal-closed-session-ended");
         self.fetches_out.remove(&peer);
         self.fetch_preparing.remove(&peer);
         // Link measurements belong to the connection that produced them: a
@@ -7805,6 +8693,41 @@ impl Actor {
             }
             ActorCommand::TunnelStatus { reply } => {
                 let _ = reply.send(self.tunnel_rows());
+            }
+            ActorCommand::TerminalOpen {
+                label,
+                cols,
+                rows,
+                reply,
+            } => {
+                let _ = reply.send(self.on_terminal_open(&label, cols, rows));
+            }
+            ActorCommand::TerminalInput {
+                label,
+                shell,
+                payload,
+                reply,
+            } => {
+                let _ = reply.send(self.on_terminal_input(&label, shell, payload));
+            }
+            ActorCommand::TerminalResize {
+                label,
+                shell,
+                cols,
+                rows,
+                reply,
+            } => {
+                let _ = reply.send(self.on_terminal_resize_command(&label, shell, cols, rows));
+            }
+            ActorCommand::TerminalClose {
+                label,
+                shell,
+                reply,
+            } => {
+                let _ = reply.send(self.on_terminal_close(&label, shell));
+            }
+            ActorCommand::TerminalPoll { label, reply } => {
+                let _ = reply.send(self.terminal_drain(&label));
             }
             ActorCommand::RemoteDownload {
                 label,
@@ -10383,6 +11306,13 @@ impl Actor {
                 // is left alone: the host withdrew the permission, not its
                 // own opinion of which addresses this guest could have.
                 IndependentGrant::Tunnel => self.close_tunnel(peer, "the grant was withdrawn"),
+                // Every running shell, on the spot, and the channel under
+                // them. A terminal is the one capability that leaves a
+                // *process* behind, so "the permission ended" and "the thing
+                // it paid for ended" have to be the same moment (ADR 0079).
+                IndependentGrant::Terminal => {
+                    self.close_terminal(peer, "terminal-closed-revoked");
+                }
             }
         }
         Ok(())
@@ -10813,6 +11743,9 @@ impl Actor {
         // Same reasoning for a tunnel (ADR 0078).
         self.tunnel_to_host
             .insert(peer, control.peer_minor() >= TUNNEL_MINOR);
+        // Same reasoning for a shell (ADR 0079).
+        self.terminal_to_host
+            .insert(peer, control.peer_minor() >= TERMINAL_MINOR);
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -10966,6 +11899,85 @@ async fn run_tunnel_connection(
     writer.abort();
     let _ = events
         .send(ActorEvent::Tunnel(TunnelEvent::ConnectFailed { peer }))
+        .await;
+}
+
+/// Drives one peer's `rd/term/1` connection until it ends (§4.1; ADR 0079).
+///
+/// The tunnel's shape with one difference: every frame that arrives goes to
+/// the actor rather than straight to its destination. On the guest side that
+/// destination *is* the actor's queue, and on the host side a keystroke is
+/// small enough that routing it through the loop costs nothing — which leaves
+/// one place that knows which shells exist, instead of two that can disagree.
+///
+/// Nothing that crosses here is logged: the frames are somebody typing and a
+/// machine answering, and §15's log is deliberately pseudonymous (ADR 0041).
+async fn run_terminal_connection(
+    connection: iroh::endpoint::Connection,
+    mut frames_rx: mpsc::Receiver<TerminalWrite>,
+    peer: NodeId,
+    tag: String,
+    dialed: bool,
+    events: mpsc::Sender<ActorEvent>,
+) {
+    let opened = if dialed {
+        connection.open_bi().await
+    } else {
+        connection.accept_bi().await
+    };
+    let Ok((mut send, mut recv)) = opened else {
+        tracing::debug!(peer = %tag, "the terminal connection carried no stream");
+        let _ = events
+            .send(ActorEvent::Terminal(TerminalEvent::ConnectFailed { peer }))
+            .await;
+        return;
+    };
+
+    let writer_tag = tag.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(write) = frames_rx.recv().await {
+            let result = match write {
+                TerminalWrite::Data(shell, payload) => {
+                    write_terminal_frame(&mut send, shell, &payload).await
+                }
+                TerminalWrite::Close(shell) => write_terminal_close(&mut send, shell).await,
+            };
+            if let Err(error) = result {
+                tracing::debug!(peer = %writer_tag, %error, "a terminal frame could not be written");
+                return;
+            }
+        }
+        let _ = send.finish();
+    });
+
+    loop {
+        let frame = match read_terminal_frame(&mut recv).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::debug!(peer = %tag, %error, "the terminal stream ended");
+                break;
+            }
+        };
+        let event = if frame.is_close() {
+            TerminalEvent::ShellEnded {
+                peer,
+                shell: frame.shell,
+            }
+        } else {
+            TerminalEvent::Frame {
+                peer,
+                shell: frame.shell,
+                payload: frame.payload,
+            }
+        };
+        if events.send(ActorEvent::Terminal(event)).await.is_err() {
+            break;
+        }
+    }
+
+    writer.abort();
+    let _ = events
+        .send(ActorEvent::Terminal(TerminalEvent::ConnectFailed { peer }))
         .await;
 }
 
@@ -11396,6 +12408,15 @@ async fn classify_incoming(
                 peer,
             });
         }
+        // And once more for a shell (ADR 0079): this task cannot see whether
+        // the peer holds `terminal`, and the actor re-reads it both when this
+        // connection lands and for every shell asked for over it.
+        Some(Channel::Terminal) => {
+            return Some(Accepted::Terminal {
+                connection: Box::new(connection),
+                peer,
+            });
+        }
         None => {
             tracing::warn!(peer = %tag, "closing a connection on an unknown ALPN");
             connection.close(
@@ -11471,6 +12492,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_TUNNEL),
+        speaks_terminal: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_TERMINAL),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -11611,6 +12636,7 @@ async fn connect_once(
         FEATURE_FILE_MANAGE.to_owned(),
         FEATURE_DIR_TRANSFER.to_owned(),
         FEATURE_TUNNEL.to_owned(),
+        FEATURE_TERMINAL.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -12093,6 +13119,14 @@ pub fn spawn_actor_with(
         next_tunnel_stream: 1,
         tunnel_wanted: std::collections::HashMap::new(),
         tunnel_refusals: std::collections::HashMap::new(),
+        speaks_terminal: std::collections::HashSet::new(),
+        terminal_to_host: std::collections::HashMap::new(),
+        terminals: std::collections::HashMap::new(),
+        terminal_backlog: std::collections::HashMap::new(),
+        terminal_dialing: std::collections::HashSet::new(),
+        shells: std::collections::HashMap::new(),
+        next_shell: 1,
+        terminal_pending: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
