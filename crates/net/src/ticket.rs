@@ -128,7 +128,7 @@ impl InviteTicket {
     /// The obfuscated transport's datagram keys are derived from the invite id
     /// (`crate::obfuscate`), so a host that wants `obfuscated_addr` in the
     /// ticket has to bind the endpoint *before* the ticket exists — which
-    /// means choosing the id first (gap-tasks/21 task 1; ADR 0079). Every
+    /// means choosing the id first (gap-tasks/21 task 1; ADR 0080). Every
     /// other caller wants [`Self::issue`], which mints a fresh random one.
     ///
     /// # Errors

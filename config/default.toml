@@ -22,7 +22,7 @@ prefer_direct = true
 # datagram is sealed, discovered through a stateless STUN reflector, with no
 # server ever in the data path. Off by default — it is added beside the iroh
 # path, not in place of it, and turning it on costs a host one STUN round trip
-# per invite. With it off nothing about this node changes (ADR 0079).
+# per invite. With it off nothing about this node changes (ADR 0080).
 # Choosing between the two paths automatically, and falling back when the
 # obfuscated one cannot be reached, is separate work and is not this flag.
 obfuscated = false
