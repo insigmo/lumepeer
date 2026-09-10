@@ -108,7 +108,14 @@ async fn bind() -> Result<(PeerEndpoint, SigningKey), String> {
 
 /// Describes how the traffic of `connection` is actually reaching the peer:
 /// every open path, which kind it is, and which one is carrying the data.
-fn report_path(connection: &iroh::endpoint::Connection, side: &str) {
+///
+/// Paths are iroh's own notion, so this probe — which only ever dials the iroh
+/// endpoint — says so and prints nothing for any other transport.
+fn report_path(connection: &lumepeer_net::PeerConnection, side: &str) {
+    let Some(connection) = connection.iroh() else {
+        println!("{side} paths=not an iroh connection");
+        return;
+    };
     let paths = connection.paths();
     if paths.is_empty() {
         println!("{side} paths=none");

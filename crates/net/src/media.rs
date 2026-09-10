@@ -20,12 +20,13 @@
 //! reordering across frames is [`lumepeer_media::jitter`]'s job upstream of
 //! decode, not this layer's.
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{RecvStream, SendStream};
 use lumepeer_core::CoreError;
 use lumepeer_core::constants::MAX_MEDIA_FRAME_BYTES;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{NetError, Result};
+use crate::peer_connection::PeerConnection;
 
 /// Bytes of the length prefix, matching the control channel's.
 pub const MEDIA_LENGTH_PREFIX_BYTES: usize = 4;
@@ -129,7 +130,9 @@ impl<R: AsyncRead + Unpin + Send> MediaFrameReader<R> {
 ///
 /// # Errors
 /// [`NetError::Io`] if the stream cannot be opened.
-pub async fn open_media_stream(connection: &Connection) -> Result<MediaFrameWriter<SendStream>> {
+pub async fn open_media_stream(
+    connection: &PeerConnection,
+) -> Result<MediaFrameWriter<SendStream>> {
     let send = connection
         .open_uni()
         .await
@@ -141,7 +144,9 @@ pub async fn open_media_stream(connection: &Connection) -> Result<MediaFrameWrit
 ///
 /// # Errors
 /// [`NetError::Io`] if the connection closes before a stream arrives.
-pub async fn accept_media_stream(connection: &Connection) -> Result<MediaFrameReader<RecvStream>> {
+pub async fn accept_media_stream(
+    connection: &PeerConnection,
+) -> Result<MediaFrameReader<RecvStream>> {
     let recv = connection
         .accept_uni()
         .await
@@ -175,7 +180,7 @@ pub const STREAM_MIC: u8 = b'M';
 /// # Errors
 /// [`NetError::Io`] if the stream cannot be opened or the tag written.
 pub async fn open_tagged_media_stream(
-    connection: &Connection,
+    connection: &PeerConnection,
     kind: u8,
 ) -> Result<MediaFrameWriter<SendStream>> {
     let mut writer = open_media_stream(connection).await?;
@@ -198,7 +203,7 @@ pub async fn open_tagged_media_stream(
 /// [`NetError::Io`] propagates when a skipped stream's tag frame cannot be
 /// read; the caller may simply call again.
 pub async fn accept_tagged_media_stream(
-    connection: &Connection,
+    connection: &PeerConnection,
     wanted: u8,
 ) -> Result<Option<MediaFrameReader<RecvStream>>> {
     loop {
@@ -227,7 +232,7 @@ pub async fn accept_tagged_media_stream(
 /// [`NetError::Io`] propagates when a skipped stream's tag frame cannot be
 /// read; the caller may simply call again.
 pub async fn accept_audio_media_stream(
-    connection: &Connection,
+    connection: &PeerConnection,
 ) -> Result<Option<MediaFrameReader<RecvStream>>> {
     loop {
         let mut reader = accept_media_stream(connection).await?;
