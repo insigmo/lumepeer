@@ -110,9 +110,40 @@ impl InviteTicket {
         obfuscated_addr: Option<SocketAddr>,
         host_cert_fingerprint: Option<[u8; 32]>,
     ) -> Result<Self> {
-        let node_addr = postcard::to_allocvec(addr).map_err(|_| NetError::MalformedTicket)?;
         let mut invite_id = [0u8; INVITE_ID_BYTES];
         rand::rng().fill_bytes(&mut invite_id);
+        Self::issue_with_id(
+            signing_key,
+            addr,
+            allowed_request,
+            now,
+            invite_id,
+            obfuscated_addr,
+            host_cert_fingerprint,
+        )
+    }
+
+    /// [`Self::issue`] over an invite id the caller already has.
+    ///
+    /// The obfuscated transport's datagram keys are derived from the invite id
+    /// (`crate::obfuscate`), so a host that wants `obfuscated_addr` in the
+    /// ticket has to bind the endpoint *before* the ticket exists — which
+    /// means choosing the id first (gap-tasks/21 task 1; ADR 0079). Every
+    /// other caller wants [`Self::issue`], which mints a fresh random one.
+    ///
+    /// # Errors
+    /// [`NetError::MalformedTicket`] if the address or the signed prefix cannot
+    /// be serialized.
+    pub fn issue_with_id(
+        signing_key: &SigningKey,
+        addr: &iroh::EndpointAddr,
+        allowed_request: Role,
+        now: u64,
+        invite_id: [u8; INVITE_ID_BYTES],
+        obfuscated_addr: Option<SocketAddr>,
+        host_cert_fingerprint: Option<[u8; 32]>,
+    ) -> Result<Self> {
+        let node_addr = postcard::to_allocvec(addr).map_err(|_| NetError::MalformedTicket)?;
         let expires_at = now.saturating_add(INVITE_TICKET_TTL_SECS);
 
         let signed = postcard::to_allocvec(&SignedFields {

@@ -46,6 +46,15 @@ pub struct Network {
     /// Whether direct paths may be used at all. `false` is the relay-only
     /// mode of ADR 0020 — a deliberate WAN test, never a shipping default.
     pub prefer_direct: bool,
+    /// Whether this node may use the obfuscated serverless transport beside
+    /// the iroh path (ADR 0052, ADR 0079).
+    ///
+    /// **Off by default**, and deliberately so: the transport is new, it is
+    /// added beside iroh rather than in place of it, and turning it on costs
+    /// a host a STUN round trip to a public reflector every time it issues an
+    /// invite. Automatic selection between the two and the fallback when the
+    /// obfuscated path fails are gap-tasks/23, not this flag.
+    pub obfuscated: bool,
 }
 
 impl Default for Network {
@@ -53,6 +62,7 @@ impl Default for Network {
         Self {
             relay_url: None,
             prefer_direct: true,
+            obfuscated: false,
         }
     }
 }
@@ -161,6 +171,7 @@ impl Settings {
             self.network.relay_url = other.network.relay_url;
         }
         self.network.prefer_direct = other.network.prefer_direct;
+        self.network.obfuscated = other.network.obfuscated;
         if other.logging.directory.is_some() {
             self.logging.directory = other.logging.directory;
         }
@@ -218,6 +229,16 @@ impl Settings {
     #[must_use]
     pub fn relay_only(&self) -> bool {
         !self.network.prefer_direct || lumepeer_net::endpoint::relay_only_enabled()
+    }
+
+    /// Whether this run may use the obfuscated transport at all (ADR 0079).
+    ///
+    /// Off unless `[network] obfuscated` says otherwise, which is what makes
+    /// "with the flag off nothing changed" a property of the build rather
+    /// than of a code path nobody took.
+    #[must_use]
+    pub const fn obfuscated(&self) -> bool {
+        self.network.obfuscated
     }
 
     /// Directory the rotating log file lives in (§16.1), or `None` when no
@@ -331,6 +352,10 @@ mod tests {
             settings.network.prefer_direct,
             "direct paths are the shipping default (ADR 0026)"
         );
+        assert!(
+            !settings.obfuscated(),
+            "the obfuscated transport is opt-in, never a shipping default (ADR 0079)"
+        );
     }
 
     #[test]
@@ -341,6 +366,10 @@ mod tests {
         let text = include_str!("../../../../config/default.toml");
         let parsed = toml::from_str::<Settings>(text).expect("config/default.toml must parse");
         assert!(parsed.network.prefer_direct);
+        assert!(
+            !parsed.obfuscated(),
+            "config/default.toml must ship with the obfuscated transport off (ADR 0079)"
+        );
         assert_eq!(parsed.logging.directory.as_deref(), Some("logs"));
     }
 

@@ -57,6 +57,7 @@ use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
 use lumepeer_net::keystore::{Keystore, load_or_create};
+use lumepeer_net::obfuscated_endpoint::HostObfuscatedEndpoint;
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::tunnel::{StreamId, read_frame, write_close, write_frame};
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
@@ -3311,6 +3312,28 @@ enum ActorEvent {
         /// offered at all.
         prepared: Result<(String, u64, [u8; 32]), NetError>,
     },
+    /// Host side: the obfuscated endpoint for a new invite finished binding,
+    /// or failed to, off the actor loop (gap-tasks/21 task 1; ADR 0079).
+    ///
+    /// Binding is a STUN round trip to a public reflector, so it cannot run on
+    /// the actor's own thread — but the ticket cannot be issued before it
+    /// finishes either, because the address and fingerprint it discovers are
+    /// signed *into* that ticket (ADR 0053). So the invite request waits here
+    /// with its reply channel and is answered when this lands.
+    ObfuscatedBound {
+        /// The invite id the endpoint's datagram keys were derived from. The
+        /// ticket has to be issued under this exact id or the two sides
+        /// derive different keys (`lumepeer_net::obfuscate`).
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        /// The role the invite request asked for.
+        role: Role,
+        /// The bound endpoint, or `None` when it could not be bound at all.
+        /// Either way an invite is issued: without this transport the ticket
+        /// simply says nothing about it and every guest uses the iroh path.
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+        /// The waiting `invite_create` call.
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    },
     /// A display-mode switch's confirmation window elapsed off the actor
     /// loop (docs/bugs/16-host-display-mode.md #3; ADR 0048). `generation`
     /// ties this to the switch that armed it; the actor checks both that its
@@ -3784,6 +3807,34 @@ struct Actor {
     /// submitting the form. The connect form uses this to keep the modal from
     /// flashing open for a host it already knows the password to.
     connect_credentials_auto: bool,
+    /// The obfuscated transport, and whether this run may use it at all
+    /// (gap-tasks/21; ADR 0079).
+    obfuscated: ObfuscatedHost,
+}
+
+/// Everything the obfuscated transport needs across invites on the host side
+/// (gap-tasks/21; ADR 0079).
+///
+/// One struct rather than three fields on the actor because the three move
+/// together: `enabled` decides whether the other two are ever anything but
+/// their defaults.
+#[derive(Debug, Default)]
+struct ObfuscatedHost {
+    /// Whether this run may use the transport at all (`[network] obfuscated`,
+    /// off by default). With it off nothing here is ever bound or dialed and
+    /// the node behaves exactly as it did before this transport existed.
+    enabled: bool,
+    /// Whether a bind is in flight, so a second invite request cannot start a
+    /// second one racing it.
+    binding: bool,
+    /// The endpoint bound for the live invite, when one could be bound at all.
+    ///
+    /// Its life is the invite's: issued means bound, replaced means the old
+    /// one is closed. `None` is the ordinary state — the flag is off, no
+    /// invite has been issued this run, or STUN found no usable address
+    /// (double NAT), in which case the ticket carries nothing about this
+    /// transport and every guest falls back to the iroh path.
+    endpoint: Option<HostObfuscatedEndpoint>,
 }
 
 impl Actor {
@@ -6228,6 +6279,12 @@ impl Actor {
                 path,
                 prepared,
             } => self.on_put_prepared(peer, dir, path, prepared),
+            ActorEvent::ObfuscatedBound {
+                invite_id,
+                role,
+                endpoint,
+                reply,
+            } => self.on_obfuscated_bound(invite_id, role, endpoint, reply),
             ActorEvent::DisplayModeConfirmTimeout { generation } => {
                 self.on_display_mode_confirm_timeout(generation);
             }
@@ -7670,11 +7727,10 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::InviteCreate { role, renew, reply } => {
-                let result = self.on_invite_create(role, renew);
-                if let Err(ActorError::Net(ref error)) = result {
-                    tracing::warn!(%error, "could not issue an invite");
-                }
-                let _ = reply.send(result);
+                // The reply travels into the call: with the obfuscated
+                // transport on, issuing waits for a STUN round trip that
+                // cannot run on this thread (ADR 0079).
+                self.on_invite_create(role, renew, reply);
             }
             ActorCommand::InviteCurrent { reply } => {
                 let now = unix_now();
@@ -8590,7 +8646,12 @@ impl Actor {
 
     /// Issues an invite for `role`, refusing while the endpoint has no
     /// dialable address (§7).
-    fn on_invite_create(&mut self, role: Role, renew: bool) -> Result<InviteDto, ActorError> {
+    fn on_invite_create(
+        &mut self,
+        role: Role,
+        renew: bool,
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    ) {
         let now = unix_now();
         // "Show me my code" and "give me a new code" are different wishes and
         // used to be the same call (ADR 0062). Answering the first by issuing
@@ -8605,7 +8666,17 @@ impl Actor {
             && ticket.allowed_request == role
             && !ticket.is_expired_at(now)
         {
-            return Ok(live);
+            let _ = reply.send(Ok(live));
+            return;
+        }
+        // A bind for another invite is already in flight and owns the endpoint
+        // this one would replace. Refusing is what keeps two issues from
+        // racing to retire each other's ticket — the same answer a second
+        // dial gets while one is in flight.
+        if self.obfuscated.binding {
+            tracing::info!("an invite is already being issued");
+            let _ = reply.send(Err(ActorError::Net(NetError::AlreadyConnected)));
+            return;
         }
         let addr = self.endpoint.addr();
         // An invite is only worth anything if it carries somewhere to
@@ -8617,7 +8688,8 @@ impl Actor {
         // wrong machine.
         if addr.addrs.is_empty() {
             tracing::warn!("refusing to issue an invite: the endpoint has no dialable address yet");
-            return Err(ActorError::Net(NetError::Offline));
+            let _ = reply.send(Err(ActorError::Net(NetError::Offline)));
+            return;
         }
         // With direct paths on (ADR 0026) the address set fills up from the
         // local interfaces long before a relay is reached, so an invite issued
@@ -8632,11 +8704,83 @@ impl Actor {
             );
         }
         tracing::info!(addrs = ?addr.addrs, "issuing an invite");
-        // The obfuscated-transport address/fingerprint are not produced by
-        // anything in this actor yet (task 17 increment 3, ADR 0053) — every
-        // ticket issued here still carries only the existing iroh address
-        // until that wiring lands.
-        let issued = InviteTicket::issue(&self.identity, &addr, role, now, None, None);
+        // The invite id is chosen here rather than inside `InviteTicket::issue`
+        // because the obfuscated transport derives its datagram keys from it
+        // (`lumepeer_net::obfuscate`), so the endpoint has to be bound under
+        // this id before the ticket that advertises it can be signed
+        // (ADR 0079).
+        let mut invite_id = [0u8; lumepeer_net::ticket::INVITE_ID_BYTES];
+        rand::rng().fill_bytes(&mut invite_id);
+
+        if !self.obfuscated.enabled {
+            // The shipping default: no obfuscated endpoint is bound, the
+            // ticket says nothing about that transport, and this whole call
+            // stays as synchronous as it was before the transport existed.
+            let issued = self.finish_invite(role, invite_id, None);
+            if let Err(ActorError::Net(ref error)) = issued {
+                tracing::warn!(%error, "could not issue an invite");
+            }
+            let _ = reply.send(issued);
+            return;
+        }
+
+        // Binding is a STUN round trip to a public reflector — seconds, on a
+        // thread that must not be the actor's (ADR 0027). The reply travels
+        // with it and is answered when `ObfuscatedBound` comes back.
+        self.obfuscated.binding = true;
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let endpoint = match lumepeer_net::obfuscated_endpoint::bind_host(&invite_id).await {
+                Ok(endpoint) => Some(Box::new(endpoint)),
+                Err(error) => {
+                    // Not fatal, and not a refusal to issue: the invite is
+                    // still worth handing out over the iroh path this
+                    // transport was only ever added beside (ADR 0052).
+                    tracing::warn!(
+                        %error,
+                        "could not bind the obfuscated endpoint for this invite"
+                    );
+                    None
+                }
+            };
+            let _ = events
+                .send(ActorEvent::ObfuscatedBound {
+                    invite_id,
+                    role,
+                    endpoint,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Host side: signs, registers and stores the invite for `invite_id`.
+    ///
+    /// `obfuscated` is the address and pinned cert fingerprint of the endpoint
+    /// bound for this invite, when there is one worth advertising — `None`
+    /// leaves both ticket fields empty, which is what every guest built before
+    /// this transport, and every guest with the flag off, already expects
+    /// (ADR 0053; ADR 0079).
+    fn finish_invite(
+        &mut self,
+        role: Role,
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        obfuscated: Option<(std::net::SocketAddr, [u8; 32])>,
+    ) -> Result<InviteDto, ActorError> {
+        let addr = self.endpoint.addr();
+        let (obfuscated_addr, fingerprint) = match obfuscated {
+            Some((addr, fingerprint)) => (Some(addr), Some(fingerprint)),
+            None => (None, None),
+        };
+        let issued = InviteTicket::issue_with_id(
+            &self.identity,
+            &addr,
+            role,
+            unix_now(),
+            invite_id,
+            obfuscated_addr,
+            fingerprint,
+        );
         match issued {
             Ok(ticket) => match ticket.to_code() {
                 Ok(code) => {
@@ -8660,6 +8804,60 @@ impl Actor {
             },
             Err(e) => Err(ActorError::Net(e)),
         }
+    }
+
+    /// Host side: an obfuscated endpoint finished binding for a new invite.
+    ///
+    /// This is where the endpoint's life is tied to the invite's (gap-tasks/21
+    /// task 1): the one bound for the invite being replaced is closed, so its
+    /// keep-alive stops holding a NAT mapping open for a code nobody can claim
+    /// any more, and the new one takes its place. A `public_addr` of `None` —
+    /// no reflector answered, or the mapping is unusable behind a double NAT —
+    /// is an ordinary outcome and not an error: the ticket then says nothing
+    /// about this transport, and an endpoint nobody can dial is not kept.
+    fn on_obfuscated_bound(
+        &mut self,
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        role: Role,
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    ) {
+        self.obfuscated.binding = false;
+        let usable = endpoint.and_then(|endpoint| {
+            let addr = endpoint.public_addr?;
+            Some((endpoint, addr))
+        });
+        let advertised = usable
+            .as_ref()
+            .map(|(endpoint, addr)| (*addr, endpoint.cert_fingerprint));
+        let issued = self.finish_invite(role, invite_id, advertised);
+        if let Err(ActorError::Net(ref error)) = issued {
+            tracing::warn!(%error, "could not issue an invite");
+        }
+        // Swapped in only once the ticket exists: an endpoint put in place for
+        // an invite that then failed to sign would leave the host listening
+        // for a code it never handed out.
+        if issued.is_ok() {
+            self.replace_obfuscated_host(usable.map(|(endpoint, _)| *endpoint));
+        }
+        let _ = reply.send(issued);
+    }
+
+    /// Puts `next` in place of the endpoint bound for the previous invite,
+    /// closing that one (ADR 0079).
+    ///
+    /// The close is spawned because it awaits the QUIC shutdown, and the actor
+    /// loop is not a place to await anything (ADR 0027). Its keep-alive is
+    /// aborted the moment `close` starts, which is the half that matters.
+    fn replace_obfuscated_host(&mut self, next: Option<HostObfuscatedEndpoint>) {
+        if let Some(previous) = self.obfuscated.endpoint.take() {
+            tracing::info!("closing the obfuscated endpoint of the replaced invite");
+            tokio::spawn(async move { previous.close().await });
+        }
+        if let Some(next) = next.as_ref() {
+            tracing::info!(addr = ?next.public_addr, "the invite carries an obfuscated address");
+        }
+        self.obfuscated.endpoint = next;
     }
 
     /// Transcript of `label`; empty for an unknown label rather than an
@@ -11724,6 +11922,7 @@ pub async fn spawn_actor(
         default_capture(),
         crate::clipboard_os::platform_clipboard(),
         stores,
+        settings.obfuscated(),
     );
 
     tokio::spawn({
@@ -11961,6 +12160,7 @@ pub fn spawn_actor_with(
     media: HostMedia,
     clipboard: crate::clipboard_os::ClipboardFactory,
     stores: ActorStores,
+    obfuscated: bool,
 ) -> ActorHandle {
     let ActorStores {
         history_path,
@@ -12110,6 +12310,10 @@ pub fn spawn_actor_with(
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
         host_addrs: std::collections::HashMap::new(),
+        obfuscated: ObfuscatedHost {
+            enabled: obfuscated,
+            ..ObfuscatedHost::default()
+        },
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
         speaks_file_transfer: std::collections::HashSet::new(),
@@ -12710,6 +12914,7 @@ mod tests {
             media,
             factory,
             ActorStores::in_memory(),
+            false,
         );
         (handle, clipboard)
     }
@@ -12730,6 +12935,7 @@ mod tests {
             media,
             crate::clipboard_os::no_clipboard(),
             ActorStores::in_memory(),
+            false,
         );
         (handle, endpoint)
     }

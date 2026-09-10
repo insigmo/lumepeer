@@ -18,6 +18,14 @@ prefer_direct = true
 # fleet. Point it at your own relay (docs/relay-deployment.md) when the public
 # one is not reachable from where your clients are:
 # relay_url = "https://relay.example.com"
+# The obfuscated serverless transport of ADR 0052: direct QUIC whose every
+# datagram is sealed, discovered through a stateless STUN reflector, with no
+# server ever in the data path. Off by default — it is added beside the iroh
+# path, not in place of it, and turning it on costs a host one STUN round trip
+# per invite. With it off nothing about this node changes (ADR 0079).
+# Choosing between the two paths automatically, and falling back when the
+# obfuscated one cannot be reached, is separate work and is not this flag.
+obfuscated = false
 
 [logging]
 # Human-readable on stdout in development, structured JSON to file in
