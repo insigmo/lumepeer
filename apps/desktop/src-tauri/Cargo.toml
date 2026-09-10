@@ -58,6 +58,11 @@ lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] 
 # The privileged helper service and its two-byte protocol (ADR 0043). The
 # library half carries no privileges and no Win32; the service binary does.
 lumepeer-service.workspace = true
+# The host's pseudo-terminal (ADR 0079). A crate of its own for the reason the
+# helper is one: this crate carries no `unsafe`, and neither ConPTY nor the
+# token drop that keeps a shell out of this process's privileges has a safe
+# binding.
+lumepeer-terminal.workspace = true
 ed25519-dalek.workspace = true
 iroh.workspace = true
 postcard.workspace = true

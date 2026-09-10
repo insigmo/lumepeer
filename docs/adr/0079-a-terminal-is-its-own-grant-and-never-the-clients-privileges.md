@@ -129,8 +129,11 @@ refused }`, `TerminalResize { session_id, cols, rows }` and `TerminalClose
 
 `MAX_TERMINALS_PER_SESSION` (4) is how many shells one session may hold at
 once; `TERMINAL_OUTPUT_MAX_BYTES` (64 KiB) bounds one output frame;
-`TERMINAL_SCROLLBACK_LINES` (1000) is how much history the guest's emulator
-keeps; `TERMINAL_COLS_MAX` (500) and `TERMINAL_ROWS_MAX` (300) bound a geometry
+`TERMINAL_SCROLLBACK_BYTES` (16 frames' worth) is how much a shell's output may
+pile up on the **guest** side for a window that has stopped polling, oldest
+first out, which is what a terminal scrolling off the top does anyway — and it
+is guest-side because the host keeps no transcript to bound;
+`TERMINAL_COLS_MAX` (500) and `TERMINAL_ROWS_MAX` (300) bound a geometry
 that arrives from the network and becomes a PTY size — zero or past the bound
 is malformed at the parse boundary, not a refusal further down (§9.1).
 

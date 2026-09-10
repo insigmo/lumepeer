@@ -392,6 +392,18 @@ pub struct SessionStatusDto {
     /// separate list the host writes one entry at a time, and this flag
     /// without an entry on it reaches nothing.
     pub tunnel: bool,
+    /// Whether this guest may start a shell on this host (§8.2; ADR 0079).
+    ///
+    /// Carried by full control alone and separately revocable, like every
+    /// other flag here. `input` does not imply it: a host that handed over
+    /// the keyboard can watch what happens on its own screen, and a shell is
+    /// not on the screen.
+    pub terminal: bool,
+    /// Whether this guest has a shell running right now. Distinct from
+    /// `terminal` above the same way `recording_active` is distinct from
+    /// `recording`: the indicator the host cannot switch off hangs off this
+    /// one (ADR 0079).
+    pub terminal_active: bool,
 }
 
 /// One remembered host this node has connected to (§21 punch-list item 5).
@@ -720,6 +732,8 @@ pub async fn session_status(
             secure_desktop_input: s.grants.secure_desktop_input,
             secure_desktop_active: s.secure_desktop_active,
             tunnel: s.grants.tunnel,
+            terminal: s.grants.terminal,
+            terminal_active: s.terminal_active,
         })
         .collect())
 }
@@ -2146,6 +2160,169 @@ pub async fn tunnel_status(
 ) -> Result<Vec<crate::network::TunnelRow>, IpcError> {
     check_window(&window)?;
     Ok(state.network.tunnel_status().await?)
+}
+
+// -------------------------------------------------------------------------
+// Terminal (§4.1; ADR 0079)
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalOpenArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Width of the window asking, in character cells.
+    pub cols: u16,
+    /// Its height, in character cells.
+    pub rows: u16,
+}
+
+/// Guest side: asks the watched host to start a shell (§4.1; ADR 0079).
+///
+/// Authorizes nothing, and names nothing. There is no program in these
+/// arguments and no arguments for one: the shell is the host's own, and a
+/// guest that could name the executable would hold arbitrary process
+/// execution under another name. The host re-reads its `terminal` grant for
+/// every one of these and answers with an id or a refusal, which arrives
+/// through [`terminal_poll`].
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old for
+/// the terminal messages, or the geometry is not a window.
+#[tauri::command]
+pub async fn terminal_open(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TerminalOpenArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .terminal_open(args.peer, args.cols, args.rows)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalInputArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Which shell, as the host named it.
+    pub shell: u32,
+    /// What was typed, as bytes: a terminal's input is not text, and a key
+    /// that produces an escape sequence produces bytes that are not one.
+    pub data: Vec<u8>,
+}
+
+/// Guest side: what was typed, on its way to one shell (ADR 0079).
+///
+/// Never logged, never kept and never written anywhere on the way through —
+/// not here, not in the actor, not on the host (§15; ADR 0041).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the payload is over
+/// `TERMINAL_OUTPUT_MAX_BYTES`, or the channel to that shell is full.
+#[tauri::command]
+pub async fn terminal_input(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TerminalInputArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .terminal_input(args.peer, args.shell, args.data)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalResizeArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Which shell, as the host named it.
+    pub shell: u32,
+    /// New width in character cells.
+    pub cols: u16,
+    /// New height in character cells.
+    pub rows: u16,
+}
+
+/// Guest side: tells the host one shell's window changed size (ADR 0079).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's or the geometry is not a
+/// window.
+#[tauri::command]
+pub async fn terminal_resize(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TerminalResizeArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .terminal_resize(args.peer, args.shell, args.cols, args.rows)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalCloseArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Which shell, as the host named it.
+    pub shell: u32,
+}
+
+/// Guest side: this window is finished with one shell (ADR 0079).
+///
+/// The host kills the process and gives the pseudo-terminal back; closing is
+/// never a permission, so this only fails when the peer is not one.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's.
+#[tauri::command]
+pub async fn terminal_close(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TerminalCloseArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state.network.terminal_close(args.peer, args.shell).await?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TerminalPollArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+}
+
+/// Guest side: everything this window's shells have said since it last asked
+/// (ADR 0079).
+///
+/// Binary for the same reason `view_cursor` is, and polled for the same one:
+/// a terminal produces bytes rather than text, and a `Vec<u8>` through the
+/// JSON side of the IPC boundary is one number per byte. Layout, little
+/// endian: `count:u16`, then `count` records of `shell:u32 | event:u8 |
+/// length:u32 | payload`. `event` is 0 for output, 1 for a shell that opened
+/// under that id, 2 for one that closed, and 3 to 6 for the four refusals of
+/// §18 — which name no shell.
+///
+/// The queue is emptied by the call: nothing arrives twice, and nothing is
+/// held once it has been read (§15).
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's.
+#[tauri::command]
+pub async fn terminal_poll(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: TerminalPollArgs,
+) -> Result<tauri::ipc::Response, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    let bytes = state.network.terminal_poll(args.peer).await?;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Runs the OS directory picker, for where a received file should land.

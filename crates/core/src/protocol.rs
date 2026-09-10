@@ -1763,7 +1763,7 @@ impl MessageEnvelope {
     /// naming a file over `FILE_NAME_MAX_BYTES`.
     #[allow(
         clippy::too_many_lines,
-        reason = "a flat dispatcher of one bound per message: its length is                   the number of messages that carry an untrusted number, and                   it grows by one arm per protocol minor. Splitting it would                   hide which messages are checked and which fall through to                   the `_` arm, which is the one thing a reader has to be able                   to see here (§9.1)"
+        reason = "a flat dispatcher of one bound per message: its length is the number of messages that carry an untrusted number, and it grows by one arm per protocol minor. Splitting it would hide which messages are checked and which fall through to the `_` arm, which is the one thing a reader has to be able to see here (§9.1)"
     )]
     fn check_limits(&self) -> Result<()> {
         match &self.kind {
