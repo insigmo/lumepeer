@@ -11,7 +11,7 @@ use crate::constants::{
     DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
     MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
-    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, UNATTENDED_CODE_MAX_BYTES,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES,
     UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
@@ -247,7 +247,19 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// same "check what the far side speaks before sending" rule every feature
 /// string here exists for, read off the minor because both sides announce
 /// one. See `docs/adr/0077-a-directory-is-a-manifest-and-the-ceiling-is-free-space.md`.
-pub const PROTOCOL_MINOR: u16 = 14;
+///
+/// 15: appended [`MessageKind::TunnelOpenRequest`],
+/// [`MessageKind::TunnelOpenResponse`] and [`MessageKind::TunnelClose`] after
+/// `DirAccept`, behind [`FEATURE_TUNNEL`] and the new `tunnel` grant. These
+/// three carry no bytes: a tunnel's payload rides `rd/tunnel/1`, a fourth
+/// ALPN opened lazily only after the host has allowed a specific address, so
+/// that no amount of traffic through it can delay a revoke arriving on the
+/// control channel — the same reason `rd/file/1` is its own connection
+/// (ADR 0032). The address is the guest's ask and the host's decision: what
+/// crosses here is a name and a port, and the host answers from a list only
+/// it can write. See
+/// `docs/adr/0078-a-tunnel-is-a-grant-plus-an-address-the-host-named.md`.
+pub const PROTOCOL_MINOR: u16 = 15;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -405,6 +417,21 @@ pub const FEATURE_FILE_MANAGE: &str = "file-manage";
 /// send the offer, and both sides advertise and check it. Without it on the
 /// far side a directory is simply never offered.
 pub const FEATURE_DIR_TRANSFER: &str = "dir-transfer";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::TunnelOpenRequest`], [`MessageKind::TunnelOpenResponse`]
+/// and [`MessageKind::TunnelClose`] (ADR 0078).
+///
+/// Same compatibility shape and direction as [`FEATURE_FILE_BROWSE`]: the
+/// request and the close are guest-to-host, so the guest advertises the
+/// string in its own `Hello` and the host reads it off that. A host must
+/// never send a response to a peer that did not advertise it.
+///
+/// Advertising it asks for nothing. The `tunnel` grant is a separate decision,
+/// the address list is a third, and a guest that advertises the string
+/// without either is refused with
+/// [`TunnelRefusal::NotGranted`].
+pub const FEATURE_TUNNEL: &str = "tunnel";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -1017,6 +1044,74 @@ pub enum MessageKind {
     /// Answer to [`Self::DirOffer`]; `true` starts the files in manifest
     /// order (§9.2; ADR 0077). New in minor 14.
     DirAccept(bool),
+    /// Guest to host: open a TCP connection to this address and give me a
+    /// stream to it (§4.1; ADR 0078). New in minor 15.
+    ///
+    /// The most far-reaching request on this wire, and the one whose answer
+    /// depends least on the request: the guest names an address, and the
+    /// host answers from a list only the host writes. `tunnel` alone reaches
+    /// nothing, an address on the list without `tunnel` reaches nothing, and
+    /// both are re-read for **every** request rather than when the tunnel
+    /// opened — a tunnel is many connections, and a revoke has to land on
+    /// the next one rather than waiting for a socket to close.
+    ///
+    /// `host` is untrusted input that becomes a resolver call, bounded here
+    /// by [`crate::constants::TUNNEL_HOST_MAX_BYTES`] before anything looks
+    /// at it. Port zero is not an address.
+    TunnelOpenRequest {
+        /// Address as the guest names it, matched against the host's list.
+        host: String,
+        /// TCP port.
+        port: u16,
+        /// Identifier the guest chose for this stream, unique among the ones
+        /// it has open. The guest names it because the guest is the side
+        /// that has a local socket waiting on the answer, and both
+        /// directions of `rd/tunnel/1` are framed by it.
+        stream_id: u32,
+    },
+    /// Host to guest: whether that stream exists, and why not when it does
+    /// not (§18; ADR 0078). New in minor 15.
+    TunnelOpenResponse {
+        /// The `stream_id` of the request being answered.
+        stream_id: u32,
+        /// Why the host will not open it, or `None` when it did.
+        refused: Option<TunnelRefusal>,
+    },
+    /// Either side: this stream is finished (§4.1; ADR 0078). New in minor
+    /// 15.
+    ///
+    /// Sent by whichever end saw its TCP connection end, and by the host for
+    /// every open stream the moment the grant behind them goes. A close for
+    /// a stream that is not open is ignored rather than an error: both ends
+    /// may decide at once, and neither is wrong.
+    TunnelClose {
+        /// The stream that is over.
+        stream_id: u32,
+    },
+}
+
+/// Why a host will not open a tunnel stream (§18; ADR 0078).
+///
+/// A closed set, and deliberately coarse in the same way
+/// [`DirListRefusal`] is: which of the two decisions is missing — the grant
+/// or the address — is a fact about the host's own consent screen, and the
+/// guest's next move is the same either way. `TooMany` is the exception,
+/// because the guest can act on it: close a stream and try again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TunnelRefusal {
+    /// This session does not hold `tunnel`, or this address is not on the
+    /// list the host wrote for it (ADR 0078).
+    NotGranted,
+    /// The address is not one this build will parse: empty, over the length
+    /// bound, port zero, or carrying something that is not part of a host
+    /// name.
+    BadTarget,
+    /// The host could not reach it: nothing is listening, the connection was
+    /// refused, the name did not resolve.
+    Unreachable,
+    /// This session already holds
+    /// [`crate::constants::MAX_TUNNEL_STREAMS_PER_SESSION`] streams.
+    TooMany,
 }
 
 /// One file or empty directory inside a [`MessageKind::DirOffer`] manifest
@@ -1436,6 +1531,22 @@ fn check_manifest(name: &str, dir: Option<&str>, entries: &[ManifestEntry]) -> R
     Ok(())
 }
 
+/// Bounds the address a tunnel request names (§9.1; ADR 0078).
+///
+/// A host name is untrusted input that becomes a resolver call on the far
+/// side, so it is bounded as a *string* before anything looks at it — and
+/// port zero is not an address, it is the operating system being asked to
+/// pick one, which is not a thing a peer may ask of this host.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for an empty or overlong host, or port zero.
+fn check_tunnel_target(host: &str, port: u16) -> Result<()> {
+    if host.is_empty() || host.len() > TUNNEL_HOST_MAX_BYTES || port == 0 {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
 /// Bounds both halves of a put offer's destination (§9.1; ADR 0076).
 ///
 /// The directory as a string like every other path on this wire, before
@@ -1619,6 +1730,9 @@ impl MessageEnvelope {
             MessageKind::DirOffer { name, dir, entries } => {
                 check_manifest(name, dir.as_deref(), entries)?;
             }
+            MessageKind::TunnelOpenRequest { host, port, .. } => {
+                check_tunnel_target(host, *port)?;
+            }
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide
@@ -1657,7 +1771,7 @@ mod tests {
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
         FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
         MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
-        UNATTENDED_LOCKOUT_DURATION_SECS,
+        TUNNEL_HOST_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     /// docs/bugs/17-remote-hotkeys.md: Shift selects a character, the other
@@ -1948,6 +2062,58 @@ mod tests {
             .encode()
             .unwrap();
         assert!(MessageEnvelope::decode(&bytes).is_ok());
+    }
+
+    /// ADR 0078: the address is bounded as a string before anything resolves
+    /// it, and every refusal travels rather than being mimed as silence.
+    #[test]
+    fn a_tunnel_request_is_bounded_and_every_refusal_travels() {
+        for (host, port) in [("127.0.0.1", 8080u16), ("::1", 443), ("localhost", 1)] {
+            let original = envelope(MessageKind::TunnelOpenRequest {
+                host: host.to_owned(),
+                port,
+                stream_id: 7,
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for (host, port) in [
+            (String::new(), 80u16),
+            ("a".repeat(TUNNEL_HOST_MAX_BYTES + 1), 80),
+            ("127.0.0.1".to_owned(), 0),
+        ] {
+            let bytes = envelope(MessageKind::TunnelOpenRequest {
+                host,
+                port,
+                stream_id: 1,
+            })
+            .encode()
+            .unwrap();
+            assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            ));
+        }
+
+        for refused in [
+            None,
+            Some(TunnelRefusal::NotGranted),
+            Some(TunnelRefusal::BadTarget),
+            Some(TunnelRefusal::Unreachable),
+            Some(TunnelRefusal::TooMany),
+        ] {
+            let original = envelope(MessageKind::TunnelOpenResponse {
+                stream_id: 3,
+                refused,
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        let original = envelope(MessageKind::TunnelClose { stream_id: 3 });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
     }
 
     #[test]

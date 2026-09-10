@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-tunnel-set-target"
+description = "Enables the tunnel_set_target command without any pre-configured scope."
+commands.allow = ["tunnel_set_target"]
+
+[[permission]]
+identifier = "deny-tunnel-set-target"
+description = "Denies the tunnel_set_target command without any pre-configured scope."
+commands.deny = ["tunnel_set_target"]

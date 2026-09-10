@@ -26,6 +26,7 @@ const noGrants = {
   secure_desktop: false,
   secure_desktop_input: false,
   secure_desktop_active: false,
+  tunnel: false,
 } as const;
 
 vi.mock('@tauri-apps/api/core', () => ({
