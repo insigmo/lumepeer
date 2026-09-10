@@ -12,6 +12,14 @@
 //! connection here carries the same `NodeId` the iroh path would have. It is
 //! exercised by `examples/obfuscated_wan_probe.rs` and by this module's own
 //! tests.
+//!
+//! gap-tasks/22 (ADR 0081) settles what a hole punch can be here. The host's
+//! half stays the keep-alive: a one-way invite has no channel on which to
+//! coordinate a simultaneous send, and the one it could borrow — a live iroh
+//! connection — is exactly what is missing on the networks that would need
+//! the punch. The guest's half is [`punch`]: the dial itself, on a bounded
+//! cadence, so its packets are ordinary sealed datagrams and a punch that
+//! cannot land fails in seconds instead of minutes.
 
 use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::Arc;
@@ -21,6 +29,7 @@ use ed25519_dalek::SigningKey;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     NAT_MAPPING_KEEPALIVE_SECS, OBFUSCATED_CONNECT_ATTEMPTS, OBFUSCATED_CONNECT_RETRY_BACKOFF_MS,
+    OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS,
 };
 use noq::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -632,15 +641,15 @@ impl GuestObfuscatedEndpoint {
         })
     }
 
-    /// Opens one channel to the host, on `alpn`.
+    /// Opens one channel to the host, on `alpn`, punching towards it as it
+    /// goes.
     ///
     /// TLS is pinned to the fingerprint the ticket carried rather than
     /// validated against a CA (ADR 0053: there is no CA for an ad-hoc host
     /// certificate, and the real authentication is the `invite_id`-derived
-    /// AEAD layer beneath this handshake). Retries up to
-    /// [`OBFUSCATED_CONNECT_ATTEMPTS`] times,
-    /// [`OBFUSCATED_CONNECT_RETRY_BACKOFF_MS`] apart, since the host's NAT
-    /// mapping may not accept the very first packet.
+    /// AEAD layer beneath this handshake). The dial itself is the punch — see
+    /// [`punch`] for the cadence and why the packets are the dial's own rather
+    /// than a shape of their own (gap-tasks/22 task 3; ADR 0081).
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if the client configuration cannot be built;
@@ -669,31 +678,21 @@ impl GuestObfuscatedEndpoint {
         let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(obfuscated_transport_config()));
 
-        let mut last = NetError::Dial("no attempt was made".to_owned());
-        for attempt in 1..=OBFUSCATED_CONNECT_ATTEMPTS {
-            let result = async {
-                self.endpoint
-                    .connect_with(client_config.clone(), self.target, CERT_SUBJECT)
-                    .map_err(|e| NetError::Dial(e.to_string()))?
-                    .await
-                    .map_err(|e| NetError::Dial(e.to_string()))
-            }
-            .await;
-            match result {
-                Ok(connection) => {
-                    let (peer, negotiated) = peer_and_alpn(&connection)?;
-                    return Ok(PeerConnection::from_obfuscated(
-                        connection, peer, negotiated,
-                    ));
-                }
-                Err(error) => last = error,
-            }
-            if attempt < OBFUSCATED_CONNECT_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(OBFUSCATED_CONNECT_RETRY_BACKOFF_MS))
-                    .await;
-            }
-        }
-        Err(last)
+        let connection = punch(|| async {
+            self.endpoint
+                .connect_with(client_config.clone(), self.target, CERT_SUBJECT)
+                .map_err(|e| NetError::Dial(e.to_string()))?
+                .await
+                .map_err(|e| NetError::Dial(e.to_string()))
+        })
+        .await?;
+        // Outside the punch on purpose: a host that answered but named itself
+        // with a certificate this cannot read will answer the same way every
+        // time, so it is a failed connection rather than a failed attempt.
+        let (peer, negotiated) = peer_and_alpn(&connection)?;
+        Ok(PeerConnection::from_obfuscated(
+            connection, peer, negotiated,
+        ))
     }
 
     /// Closes the endpoint and every channel it carries.
@@ -701,6 +700,53 @@ impl GuestObfuscatedEndpoint {
         self.endpoint.close(noq::VarInt::from_u32(0), b"");
         self.endpoint.wait_idle().await;
     }
+}
+
+/// The guest's half of the hole punch: `dial` up to
+/// [`OBFUSCATED_CONNECT_ATTEMPTS`] times, each attempt bounded by
+/// [`OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS`] and the next one
+/// [`OBFUSCATED_CONNECT_RETRY_BACKOFF_MS`] behind it, stopping at the first
+/// attempt that connects (gap-tasks/22 task 3; ADR 0081).
+///
+/// **The punch packets are the dial's own.** Each attempt's QUIC Initial goes
+/// out through the same `ObfuscatedSocket` as every other datagram, sealed
+/// with the same invite-derived key, so a punch and a session are the same
+/// thing on the wire — a bespoke punch packet would be a second shape for an
+/// observer to learn, which is the opposite of what this transport is for.
+/// Success is therefore an established connection and nothing weaker: a sent
+/// packet proves nothing about a mapping it never reached.
+///
+/// The bound on each attempt is what makes this a cadence rather than a wait.
+/// An unbounded QUIC dial to a mapping that is not open sits there until the
+/// idle timeout, so the attempts stop being punches and the caller stops being
+/// able to give up in time to try anything else. The host's half of the punch
+/// is the NAT-mapping keep-alive of ADR 0053, which is unchanged and stays the
+/// only thing a one-way invite can coordinate: nothing here tells the host
+/// when to send, because there is no channel on which to tell it (ADR 0081).
+///
+/// # Errors
+/// Whatever the last attempt failed with, or [`NetError::Dial`] if it went
+/// unanswered for its whole budget.
+async fn punch<T, F, Fut>(mut dial: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let attempt_timeout = Duration::from_millis(OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS);
+    let mut last = NetError::Dial("no attempt was made".to_owned());
+    for attempt in 1..=OBFUSCATED_CONNECT_ATTEMPTS {
+        match tokio::time::timeout(attempt_timeout, dial()).await {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(error)) => last = error,
+            Err(_) => {
+                last = NetError::Dial("the punch went unanswered for its attempt".to_owned());
+            }
+        }
+        if attempt < OBFUSCATED_CONNECT_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(OBFUSCATED_CONNECT_RETRY_BACKOFF_MS)).await;
+        }
+    }
+    Err(last)
 }
 
 /// Accepts any certificate that carries a usable ed25519 identity, and nothing
@@ -950,6 +996,103 @@ mod tests {
         );
 
         reflector_task.abort();
+    }
+
+    /// Records when each punch attempt was made, relative to the first, so a
+    /// test can assert the cadence rather than the wall clock.
+    ///
+    /// Every timing test below runs on tokio's paused clock: no socket is
+    /// bound, no packet is sent, and time only moves when the runtime has
+    /// nothing left to poll — so the instants are the schedule itself and not
+    /// a machine's load (gap-tasks/22 definition of done).
+    async fn punch_attempts<T>(outcome: impl Fn(usize) -> Result<T>) -> (Result<T>, Vec<Duration>) {
+        let started = tokio::time::Instant::now();
+        let made = std::cell::RefCell::new(Vec::new());
+        let result = punch(|| async {
+            let attempt = {
+                let mut made = made.borrow_mut();
+                made.push(started.elapsed());
+                made.len()
+            };
+            outcome(attempt)
+        })
+        .await;
+        (result, made.into_inner())
+    }
+
+    /// gap-tasks/22 task 3: the punch keeps to its attempt count and its
+    /// backoff when every attempt is refused outright.
+    ///
+    /// A refusal costs no time, so the packets are exactly
+    /// `OBFUSCATED_CONNECT_RETRY_BACKOFF_MS` apart and there are exactly
+    /// `OBFUSCATED_CONNECT_ATTEMPTS` of them — no more, so a failed punch
+    /// cannot become an unbounded retry loop, and no fewer, so a lost first
+    /// packet is not the end of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_punch_keeps_to_its_count_and_backoff() {
+        let (result, made): (Result<()>, _) =
+            punch_attempts(|_| Err(NetError::Dial("refused".to_owned()))).await;
+
+        assert!(result.is_err(), "every attempt was refused");
+        assert_eq!(
+            u32::try_from(made.len()).unwrap(),
+            OBFUSCATED_CONNECT_ATTEMPTS
+        );
+        for (index, at) in made.iter().enumerate() {
+            let expected = Duration::from_millis(
+                OBFUSCATED_CONNECT_RETRY_BACKOFF_MS * u64::try_from(index).unwrap(),
+            );
+            assert_eq!(*at, expected, "attempt {index} landed off its cadence");
+        }
+    }
+
+    /// gap-tasks/22 task 3: an attempt that goes unanswered is abandoned after
+    /// `OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS` so the next packet can go out.
+    ///
+    /// This is the case that matters — a punch into a mapping that is not open
+    /// answers nothing at all — and without the bound the dial would sit
+    /// there until QUIC's idle timeout, turning a train of packets into
+    /// minutes of silence and a caller that cannot give up in time to try
+    /// anything else.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_punch_is_abandoned_on_its_own_cadence() {
+        let started = tokio::time::Instant::now();
+        let made = std::cell::RefCell::new(Vec::new());
+        let result: Result<()> = punch(|| async {
+            made.borrow_mut().push(started.elapsed());
+            std::future::pending().await
+        })
+        .await;
+        let made = made.into_inner();
+
+        assert!(result.is_err(), "nothing answered");
+        assert_eq!(
+            u32::try_from(made.len()).unwrap(),
+            OBFUSCATED_CONNECT_ATTEMPTS
+        );
+        let step = OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS + OBFUSCATED_CONNECT_RETRY_BACKOFF_MS;
+        for (index, at) in made.iter().enumerate() {
+            let expected = Duration::from_millis(step * u64::try_from(index).unwrap());
+            assert_eq!(*at, expected, "attempt {index} landed off its cadence");
+        }
+    }
+
+    /// gap-tasks/22 task 3: the punch stops at the first attempt that
+    /// connects, because success is an established connection and not a sent
+    /// packet.
+    #[tokio::test(start_paused = true)]
+    async fn the_punch_stops_at_the_attempt_that_connects() {
+        let (result, made) = punch_attempts(|attempt| {
+            if attempt == 3 {
+                Ok(())
+            } else {
+                Err(NetError::Dial("refused".to_owned()))
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(made.len(), 3, "the punch must not outlive its own success");
     }
 
     /// gap-tasks/21 task 1 item 3: no reflector answering is an ordinary
