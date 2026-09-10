@@ -11,8 +11,8 @@ use crate::constants::{
     DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
     MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
-    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES,
-    UNATTENDED_PASSWORD_MAX_BYTES,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX,
+    TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -259,7 +259,24 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// crosses here is a name and a port, and the host answers from a list only
 /// it can write. See
 /// `docs/adr/0078-a-tunnel-is-a-grant-plus-an-address-the-host-named.md`.
-pub const PROTOCOL_MINOR: u16 = 15;
+///
+/// 16: appended [`MessageKind::TerminalOpenRequest`],
+/// [`MessageKind::TerminalOpenResponse`], [`MessageKind::TerminalResize`] and
+/// [`MessageKind::TerminalClose`] after `TunnelClose`, behind
+/// [`FEATURE_TERMINAL`] and the new `terminal` grant. Like the three tunnel
+/// messages before them these carry no payload: keystrokes and output ride
+/// `rd/term/1`, a fifth ALPN opened lazily only after a shell has been agreed,
+/// so that a `cat` of a large file cannot delay a revoke on the control
+/// channel — the reason every channel here is its own connection (ADR 0032).
+/// What crosses the control channel is the geometry, the host's answer and the
+/// two ways a shell ends.
+///
+/// The request carries no identifier of its own, unlike
+/// [`MessageKind::TunnelOpenRequest`]: the shell is the host's to name, and a
+/// guest with two opens in flight pairs the answers with its asks in order,
+/// which this channel's strict `seq` makes well defined. See
+/// `docs/adr/0079-a-terminal-is-its-own-grant-and-never-the-clients-privileges.md`.
+pub const PROTOCOL_MINOR: u16 = 16;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -432,6 +449,23 @@ pub const FEATURE_DIR_TRANSFER: &str = "dir-transfer";
 /// without either is refused with
 /// [`TunnelRefusal::NotGranted`].
 pub const FEATURE_TUNNEL: &str = "tunnel";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::TerminalOpenRequest`],
+/// [`MessageKind::TerminalOpenResponse`], [`MessageKind::TerminalResize`] and
+/// [`MessageKind::TerminalClose`] (ADR 0079).
+///
+/// Same compatibility shape and direction as [`FEATURE_TUNNEL`]: the request,
+/// the resize and the guest's own close are guest-to-host, so the guest
+/// advertises the string in its own `Hello` and the host reads it off that. A
+/// host must never send a response to a peer that did not advertise it — that
+/// peer decodes the unknown discriminant as malformed and closes the
+/// connection (§9.1).
+///
+/// Advertising it asks for nothing: the `terminal` grant is the host's
+/// decision, and a guest that advertises the string without holding it is
+/// refused with [`TerminalRefusal::NotGranted`].
+pub const FEATURE_TERMINAL: &str = "terminal";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -1088,6 +1122,98 @@ pub enum MessageKind {
         /// The stream that is over.
         stream_id: u32,
     },
+    /// Guest to host: start a shell for me and give me a stream to it (§4.1;
+    /// ADR 0079). New in minor 16.
+    ///
+    /// The whole ask. There is no program name in it and no arguments,
+    /// deliberately: the shell is `$SHELL` or `%COMSPEC%` on the host's own
+    /// terms, and a guest that could name the executable would hold arbitrary
+    /// process execution under another name — which is not the permission the
+    /// host's consent screen could state (ADR 0079).
+    ///
+    /// It carries no identifier either. The shell is the host's to name and it
+    /// answers with one in [`Self::TerminalOpenResponse`]; a guest with two
+    /// opens in flight pairs the answers with its asks in the order it sent
+    /// them, which the strict `seq` of this channel makes well defined (§9.1).
+    ///
+    /// `cols` and `rows` are untrusted numbers that become a PTY allocation,
+    /// bounded by [`crate::constants::TERMINAL_COLS_MAX`] and
+    /// [`crate::constants::TERMINAL_ROWS_MAX`] before anything looks at them.
+    /// A terminal of no width is not a terminal.
+    TerminalOpenRequest {
+        /// Width in character cells.
+        cols: u16,
+        /// Height in character cells.
+        rows: u16,
+    },
+    /// Host to guest: whether that shell exists, and why not when it does not
+    /// (§18; ADR 0079). New in minor 16.
+    ///
+    /// `session_id` names the **shell**, not the Lumepeer session — that one
+    /// is [`MessageEnvelope::session_id`] and is sixteen bytes wide. It is
+    /// unique among the shells this session has open, and it is the id both
+    /// directions of `rd/term/1` are framed by.
+    TerminalOpenResponse {
+        /// Identifier the host gave this shell; meaningless when refused.
+        session_id: u32,
+        /// Why the host will not start it, or `None` when it did.
+        refused: Option<TerminalRefusal>,
+    },
+    /// Guest to host: the window around this shell changed size (§4.1;
+    /// ADR 0079). New in minor 16.
+    ///
+    /// Advisory in the sense that a resize of a shell that is not open is
+    /// ignored rather than an error — the guest may have sent it while the
+    /// host was killing the shell — and bounded exactly as the open request
+    /// is, for the same reason.
+    TerminalResize {
+        /// The shell being resized.
+        session_id: u32,
+        /// New width in character cells.
+        cols: u16,
+        /// New height in character cells.
+        rows: u16,
+    },
+    /// Either side: this shell is finished (§4.1; ADR 0079). New in minor 16.
+    ///
+    /// Sent by the guest that closed its terminal window, and by the host for
+    /// every running shell the moment the grant behind them goes. A close for
+    /// a shell that is not open is ignored rather than an error: both ends may
+    /// decide at once, and neither is wrong — the same rule
+    /// [`Self::TunnelClose`] follows.
+    TerminalClose {
+        /// The shell that is over.
+        session_id: u32,
+    },
+}
+
+/// Why a host will not start a shell (§18; ADR 0079).
+///
+/// A closed set, and coarse in the same way [`TunnelRefusal`] is — except for
+/// the one distinction a guest can act on and an operator needs to hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalRefusal {
+    /// This session does not hold `terminal`, or it is no longer active
+    /// (ADR 0079).
+    NotGranted,
+    /// This session already holds
+    /// [`crate::constants::MAX_TERMINALS_PER_SESSION`] shells. The guest can
+    /// act on this one: close a terminal and ask again.
+    TooMany,
+    /// The host could not run the shell as its own interactive user, and
+    /// refused to run it as anything else (ADR 0079 decision 2).
+    ///
+    /// Its own variant rather than part of `Unavailable` because it is the
+    /// one refusal that is not a malfunction: the host is working exactly as
+    /// intended, and an operator told "unavailable" would go looking for a
+    /// bug instead of reading it as the boundary it is. On Windows it means
+    /// the elevated client found no unelevated desktop session to borrow a
+    /// token from; on Unix it means the client is running as `root`, and
+    /// "drop to whom" is a decision nobody made.
+    CannotDropPrivileges,
+    /// The host has no shell to run, or the pseudo-terminal could not be
+    /// created.
+    Unavailable,
 }
 
 /// Why a host will not open a tunnel stream (§18; ADR 0078).
@@ -1547,6 +1673,25 @@ fn check_tunnel_target(host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Bounds a terminal's geometry before it becomes a PTY size (§9.1;
+/// ADR 0079).
+///
+/// A terminal of no width or no height is not a terminal, and one past the
+/// bound is a peer's number rather than a window anybody has. Checked here
+/// rather than at the point of use because the range is static — unlike
+/// `MonitorSelect`, which can only be checked against a host's own runtime
+/// monitor count — and a resize is checked exactly as an open is, because it
+/// reaches the same allocation.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for a zero or over-bound `cols` or `rows`.
+const fn check_terminal_size(cols: u16, rows: u16) -> Result<()> {
+    if cols == 0 || rows == 0 || cols > TERMINAL_COLS_MAX || rows > TERMINAL_ROWS_MAX {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
 /// Bounds both halves of a put offer's destination (§9.1; ADR 0076).
 ///
 /// The directory as a string like every other path on this wire, before
@@ -1616,6 +1761,10 @@ impl MessageEnvelope {
     /// `MAX_CURSOR_SHAPE_PIXELS`, more than `MAX_MONITORS_PER_HOST` monitors,
     /// a `FileOffer` or `FileTransferStart` over `FILE_OFFER_MAX_BYTES` or
     /// naming a file over `FILE_NAME_MAX_BYTES`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "a flat dispatcher of one bound per message: its length is                   the number of messages that carry an untrusted number, and                   it grows by one arm per protocol minor. Splitting it would                   hide which messages are checked and which fall through to                   the `_` arm, which is the one thing a reader has to be able                   to see here (§9.1)"
+    )]
     fn check_limits(&self) -> Result<()> {
         match &self.kind {
             MessageKind::Chat { text } => {
@@ -1733,6 +1882,8 @@ impl MessageEnvelope {
             MessageKind::TunnelOpenRequest { host, port, .. } => {
                 check_tunnel_target(host, *port)?;
             }
+            MessageKind::TerminalOpenRequest { cols, rows }
+            | MessageKind::TerminalResize { cols, rows, .. } => check_terminal_size(*cols, *rows)?,
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide
@@ -1771,7 +1922,8 @@ mod tests {
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
         FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
         MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
-        TUNNEL_HOST_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
+        TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
+        UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     /// docs/bugs/17-remote-hotkeys.md: Shift selects a character, the other
@@ -2112,6 +2264,75 @@ mod tests {
         }
 
         let original = envelope(MessageKind::TunnelClose { stream_id: 3 });
+        let bytes = original.encode().unwrap();
+        assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+    }
+
+    /// ADR 0079: the geometry is bounded at the parse boundary because it
+    /// becomes a PTY allocation, and every refusal travels rather than being
+    /// mimed as a shell that never answers.
+    #[test]
+    fn a_terminal_request_is_bounded_on_its_geometry_and_every_refusal_travels() {
+        for (cols, rows) in [
+            (80u16, 24u16),
+            (1, 1),
+            (TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX),
+        ] {
+            for kind in [
+                MessageKind::TerminalOpenRequest { cols, rows },
+                MessageKind::TerminalResize {
+                    session_id: 9,
+                    cols,
+                    rows,
+                },
+            ] {
+                let original = envelope(kind);
+                let bytes = original.encode().unwrap();
+                assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+            }
+        }
+
+        // A terminal of no width is not a terminal, and one past the bound is
+        // a peer's number rather than a window. A resize is checked exactly
+        // as an open is: it reaches the same allocation.
+        for (cols, rows) in [
+            (0u16, 24u16),
+            (80, 0),
+            (TERMINAL_COLS_MAX + 1, 24),
+            (80, TERMINAL_ROWS_MAX + 1),
+        ] {
+            for kind in [
+                MessageKind::TerminalOpenRequest { cols, rows },
+                MessageKind::TerminalResize {
+                    session_id: 1,
+                    cols,
+                    rows,
+                },
+            ] {
+                let bytes = envelope(kind).encode().unwrap();
+                assert!(
+                    matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                    "a terminal of {cols}x{rows} was accepted"
+                );
+            }
+        }
+
+        for refused in [
+            None,
+            Some(TerminalRefusal::NotGranted),
+            Some(TerminalRefusal::TooMany),
+            Some(TerminalRefusal::CannotDropPrivileges),
+            Some(TerminalRefusal::Unavailable),
+        ] {
+            let original = envelope(MessageKind::TerminalOpenResponse {
+                session_id: 2,
+                refused,
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        let original = envelope(MessageKind::TerminalClose { session_id: 2 });
         let bytes = original.encode().unwrap();
         assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
     }

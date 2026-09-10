@@ -576,6 +576,40 @@ pub const TUNNEL_HOST_MAX_BYTES: usize = 253;
 /// construction; the bound is what keeps a UI bug from making it unbounded.
 pub const MAX_TUNNEL_TARGETS_PER_SESSION: usize = 16;
 
+/// Most shells one session may have running at once (§4.1; ADR 0079).
+///
+/// A terminal is a process on somebody else's machine, so this is the bound
+/// on how many of them one guest can leave behind. Small on purpose and much
+/// smaller than [`MAX_TUNNEL_STREAMS_PER_SESSION`]: a tunnel's streams are
+/// short-lived connections a browser opens by itself, and every one of these
+/// is a shell a person deliberately started.
+pub const MAX_TERMINALS_PER_SESSION: usize = 4;
+/// Largest single output frame on `rd/term/1`, in bytes (§9.1; ADR 0079).
+///
+/// The allocation bound of a length a peer announces, checked before anything
+/// reserves it — the same job [`TUNNEL_BUFFER_BYTES`] does one channel over,
+/// at the same size, because a shell that dumps a file is exactly as capable
+/// of naming a large number as a forwarded socket is.
+pub const TERMINAL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+/// How many lines of history the guest's terminal emulator keeps (ADR 0079).
+///
+/// Only the guest's own window, and deliberately not on the host: scrollback
+/// is what the person reading the terminal can scroll back to, and the host
+/// keeps no transcript of anything (§15, ADR 0041). A thousand lines is what
+/// fits a build log without holding a session's whole output in a webview.
+pub const TERMINAL_SCROLLBACK_LINES: u16 = 1000;
+/// Widest terminal a guest may ask a host to allocate, in columns (§9.1;
+/// ADR 0079).
+///
+/// Geometry arrives from the network and becomes a PTY size, so it is bounded
+/// at the parse boundary like every other untrusted number. Comfortably past
+/// any real window on any real display, and far below the point where a
+/// terminal buffer becomes an allocation worth refusing.
+pub const TERMINAL_COLS_MAX: u16 = 500;
+/// Tallest terminal a guest may ask a host to allocate, in rows (§9.1;
+/// ADR 0079). Same reasoning as [`TERMINAL_COLS_MAX`].
+pub const TERMINAL_ROWS_MAX: u16 = 300;
+
 /// Maximum number of monitors one host may report in `MonitorsList` (§11).
 pub const MAX_MONITORS_PER_HOST: usize = 8;
 
