@@ -1444,6 +1444,29 @@ button {
   background: var(--red);
 }
 
+/* A shell is running on this machine right now (ADR 0079 decision 3). Drawn
+   exactly like the two indicators above, and for the same reason: no setting
+   hides it, because a terminal is the one capability with no picture attached
+   to it. */
+.connections-list .terminal-indicator {
+  flex-basis: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--red);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+}
+
+.terminal-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--red);
+}
+
 /* Unattended access (§8; ADR 0033) and the host address book (ADR 0034). */
 
 /* The compact sidebar line that says an unattended login is possible

@@ -31,6 +31,8 @@ function toolbarHooks(): ToolbarHooks {
     toggleFiles: () => true,
     filesVisible: () => false,
     filesAvailable: () => true,
+    toggleTerminal: () => false,
+    terminalVisible: () => false,
     displayMode: () => 'fit',
     setDisplayMode: () => {},
     zoomPercent: () => 100,
@@ -66,6 +68,8 @@ const activeSession: SessionStatus = {
   secure_desktop_input: false,
   secure_desktop_active: false,
   tunnel: false,
+  terminal: false,
+  terminal_active: false,
 };
 
 let container: HTMLElement;

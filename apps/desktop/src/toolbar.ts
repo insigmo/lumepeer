@@ -408,6 +408,10 @@ export interface ToolbarHooks {
    * (§18).
    */
   filesAvailable(): boolean;
+  /** Show or hide the terminal; returns the new visible state. */
+  toggleTerminal(): boolean;
+  /** Whether the terminal panel is visible right now. */
+  terminalVisible(): boolean;
   /**
    * Whether a message arrived while the panel was closed.
    *
@@ -459,6 +463,9 @@ const ICONS = {
   settings: SETTINGS_ICON,
   monitor: (n: string) => html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><text x="8" y="10" text-anchor="middle" font-size="7" fill="currentColor" stroke="none" font-family="system-ui">${n}</text></svg>`,
   files: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.4l1.2 1.5h5.4A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
+  // A prompt and a caret: the one drawing of a terminal nobody has to be told
+  // the meaning of.
+  terminal: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M5 6.5 7 8l-2 1.5M8.5 10h2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   chat: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
   chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="2.5" fill="#9fd0ff" stroke="none"/></svg>`,
   mic: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
@@ -507,6 +514,7 @@ export function renderToolbar(
   const chatOn = hooks.chatVisible();
   const filesOn = hooks.filesVisible();
   const filesAvailable = hooks.filesAvailable();
+  const terminalOn = hooks.terminalVisible();
   // Only worth showing while the panel is closed: with it open the message is
   // already on screen, and a mark next to it would be a second claim about the
   // same thing.
@@ -748,6 +756,17 @@ export function renderToolbar(
               ${ICONS.files}
             </button>`
           : ''}
+        <button
+          type="button"
+          class="toolbar-btn ${terminalOn ? 'is-active' : ''}"
+          data-testid="toolbar-terminal"
+          aria-label=${t(locale, 'toolbar.terminal')}
+          title=${t(locale, 'toolbar.terminal')}
+          aria-pressed=${terminalOn ? 'true' : 'false'}
+          @click=${() => hooks.toggleTerminal()}
+        >
+          ${ICONS.terminal}
+        </button>
         <button
           type="button"
           class="toolbar-btn ${state.micOn ? 'is-active' : ''}"

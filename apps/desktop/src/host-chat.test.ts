@@ -23,6 +23,8 @@ const noGrants = {
   secure_desktop_input: false,
   secure_desktop_active: false,
   tunnel: false,
+  terminal: false,
+  terminal_active: false,
 } as const;
 
 const active: SessionStatus[] = [

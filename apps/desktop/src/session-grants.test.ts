@@ -36,6 +36,8 @@ const fullControl: SessionStatus = {
   secure_desktop_input: false,
   secure_desktop_active: false,
   tunnel: false,
+  terminal: false,
+  terminal_active: false,
 };
 
 /**
@@ -88,6 +90,21 @@ describe('independent grants on the host panel', () => {
 
     const button = container.querySelector<HTMLButtonElement>('[data-testid="record-toggle"]');
     expect(button?.disabled).toBe(true);
+  });
+
+  // ADR 0079 decision 3: the indicator hangs off a running shell, not off the
+  // permission — permission is not what is worth interrupting somebody for —
+  // and nothing on the row takes it away while the shell is there.
+  it('marks a session that has a shell running, and only while it is running', () => {
+    render(sessionStatus([{ ...fullControl, terminal: true }], 'en'), container);
+    expect(container.querySelector('[data-testid="terminal-indicator"]')).toBeNull();
+
+    render(
+      sessionStatus([{ ...fullControl, terminal: true, terminal_active: true }], 'en'),
+      container,
+    );
+    expect(container.querySelector('[data-testid="terminal-indicator"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="terminal-indicator"] button')).toHaveLength(0);
   });
 
   it('answering a record request still asks the core for the grant', async () => {
