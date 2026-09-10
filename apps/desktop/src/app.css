@@ -699,6 +699,88 @@ button {
   height: 6px;
 }
 
+/* Port forwarding (ADR 0078). On the session's own row, under the file panel,
+   because it is the same kind of thing said about the same guest — and
+   because a tunnel that is carrying traffic must be visible next to the
+   switch that ends the session, not on a panel somebody has to find. */
+.connections-list .tunnel-panel {
+  flex-basis: 100%;
+  margin-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+}
+
+.connections-list .tunnel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.connections-list .tunnel-panel h4 {
+  margin: 0;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Said in the accent colour on purpose: this is the line that means bytes are
+   moving through this machine into the network around it. */
+.connections-list .tunnel-active {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  color: var(--blue-solid);
+}
+
+.connections-list .tunnel-panel p {
+  margin: 6px 0 0;
+  font-size: var(--fs-micro);
+  color: var(--text-secondary);
+}
+
+.connections-list .tunnel-targets {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.connections-list .tunnel-targets li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-micro);
+}
+
+.connections-list .tunnel-address {
+  font-weight: 600;
+  color: var(--text-heading);
+  overflow-wrap: anywhere;
+}
+
+.connections-list .tunnel-streams {
+  color: var(--text-secondary);
+}
+
+.connections-list .tunnel-add {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: var(--fs-micro);
+}
+
+.connections-list .tunnel-add label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text-secondary);
+}
+
 .connections-list .chat-open-btn {
   margin-inline-start: auto;
   appearance: none;

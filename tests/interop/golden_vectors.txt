@@ -198,3 +198,16 @@ valid minor14_dir_offer_with_destination abababababababababababababababab0100320
 invalid minor14_dir_offer_directory_with_a_size abababababababababababababababab0100320770726f6a656374000105656d707479010100
 valid minor14_dir_accept abababababababababababababababab0000330100
 invalid minor14_file_offer_over_the_size_limit abababababababababababababababab01000d086469736b2e696d67818080808002010101010101010101010101010101010101010101010101010101010101010100
+
+# --- Frozen for PROTOCOL_MINOR 15: the TCP tunnel (ADR 0078). Three control
+# --- messages and no payload: the bytes ride rd/tunnel/1, a fourth ALPN, so
+# --- that no amount of traffic can delay a revoke on the control channel. The
+# --- request is guest to host and gated on the "tunnel" feature string; port
+# --- zero is not an address and is malformed rather than "any port". The
+# --- response carries no reason when it accepts, and one of a closed set when
+# --- it does not.
+valid minor15_tunnel_open_request abababababababababababababababab010034093132372e302e302e31903f0700
+invalid minor15_tunnel_open_request_port_zero abababababababababababababababab010034093132372e302e302e31000700
+valid minor15_tunnel_open_response_accepted abababababababababababababababab000035070000
+valid minor15_tunnel_open_response_not_granted abababababababababababababababab00003507010000
+valid minor15_tunnel_close abababababababababababababababab0100360700

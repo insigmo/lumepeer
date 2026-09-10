@@ -37,9 +37,14 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "io-util",
-    # File-transfer staging (§9.2, ADR 0032): a 500 MiB transfer must not be
-    # written with blocking `std::fs` calls from inside an async task.
+    # File-transfer staging (§9.2, ADR 0032): a transfer of up to
+    # FILE_OFFER_MAX_BYTES must not be written with blocking `std::fs` calls
+    # from inside an async task.
     "fs",
+    # The TCP half of the port forward of §4.1 (ADR 0078): the tunnel listens
+    # on a local port on the guest and connects to the host's own service on
+    # the other side.
+    "net",
 ] }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

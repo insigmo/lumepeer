@@ -65,6 +65,7 @@ const session: SessionStatus = {
   secure_desktop: false,
   secure_desktop_input: false,
   secure_desktop_active: false,
+  tunnel: false,
 };
 
 let container: HTMLElement;

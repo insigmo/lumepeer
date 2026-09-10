@@ -42,6 +42,8 @@
     "allow-remote-dir-status",
     "allow-remote-download",
     "allow-remote-upload",
+    "allow-tunnel-open",
+    "allow-tunnel-close-all",
     "allow-mic-toggle",
     "allow-sas-request",
     "allow-record-request",

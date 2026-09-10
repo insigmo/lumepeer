@@ -456,6 +456,7 @@ const fn grant_tag(grant: IndependentGrant) -> &'static str {
         IndependentGrant::DisplayMode => "display_mode",
         IndependentGrant::SecureDesktop => "secure_desktop",
         IndependentGrant::SecureDesktopInput => "secure_desktop_input",
+        IndependentGrant::Tunnel => "tunnel",
     }
 }
 

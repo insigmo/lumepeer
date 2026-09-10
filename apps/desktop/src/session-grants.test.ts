@@ -35,6 +35,7 @@ const fullControl: SessionStatus = {
   record_request: false,
   secure_desktop_input: false,
   secure_desktop_active: false,
+  tunnel: false,
 };
 
 /**

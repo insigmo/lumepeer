@@ -85,6 +85,17 @@ pub struct Grants {
     /// picture. Still an [`IndependentGrant`], so a host can withdraw it from
     /// a running session and the actor re-reads it before every capture.
     pub secure_desktop: bool,
+    /// Forward TCP connections into the host's own network (ADR 0078).
+    ///
+    /// The most far-reaching grant on this list in what it *reaches*: every
+    /// other one acts on the host machine, and this one turns the guest into
+    /// a node inside the network the host sits in. Which addresses it may
+    /// reach is not part of the grant — the host names those one at a time
+    /// (`allowed_targets`), and the default is nothing at all — but without
+    /// this flag no address is reachable however the list reads. Carried by
+    /// [`Role::FullControl`] alone, separately revocable, and re-read for
+    /// every connection inside the tunnel rather than only when it opened.
+    pub tunnel: bool,
     /// Inject input into the host's secure desktop — click the UAC prompt,
     /// type into the lock screen (`docs/bugs/15-secure-desktop-capture.md`,
     /// ADR 0057).
@@ -102,7 +113,7 @@ pub struct Grants {
     pub secure_desktop_input: bool,
 }
 
-/// One of the eight grants a host may toggle on a session that is already
+/// One of the nine grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -128,6 +139,8 @@ pub enum IndependentGrant {
     SecureDesktop,
     /// Inject input into the host's secure desktop (ADR 0057).
     SecureDesktopInput,
+    /// Forward TCP connections into the host's own network (ADR 0078).
+    Tunnel,
 }
 
 impl Grants {
@@ -166,6 +179,11 @@ impl Grants {
             file_browse: full,
             recording: full,
             display_mode: full,
+            // Full control and nothing below it, like every other grant that
+            // reaches past the picture. It opens no address by itself: the
+            // host still names each target, and names none by default
+            // (ADR 0078).
+            tunnel: full,
             // On for every role, like `view` (ADR 0056), not just full
             // control — a view-only guest is the case that needs to see the
             // prompt instead of a frozen picture.
@@ -182,7 +200,7 @@ impl Grants {
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: a ninth permission must
+        // Exhaustive on purpose, with no `_` arm: a tenth permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
@@ -193,6 +211,7 @@ impl Grants {
             IndependentGrant::DisplayMode => self.display_mode,
             IndependentGrant::SecureDesktop => self.secure_desktop,
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input,
+            IndependentGrant::Tunnel => self.tunnel,
         }
     }
 
@@ -207,6 +226,7 @@ impl Grants {
             IndependentGrant::DisplayMode => self.display_mode = allowed,
             IndependentGrant::SecureDesktop => self.secure_desktop = allowed,
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input = allowed,
+            IndependentGrant::Tunnel => self.tunnel = allowed,
         }
     }
 }
@@ -527,7 +547,29 @@ mod tests {
             assert!(!lesser.display_mode);
             assert!(lesser.secure_desktop);
             assert!(!lesser.secure_desktop_input);
+            assert!(!lesser.tunnel);
         }
+    }
+
+    /// ADR 0078: a tunnel is not implied by anything already granted, and it
+    /// is not the same decision as the address it may reach — this half is
+    /// the flag; `SessionManager` holds the other.
+    #[test]
+    fn tunnelling_follows_full_control_and_toggles_on_its_own() {
+        for role in [Role::ViewOnly, Role::ControlLimited] {
+            assert!(!Grants::from_role(role).get(IndependentGrant::Tunnel));
+        }
+        assert!(Grants::from_role(Role::FullControl).get(IndependentGrant::Tunnel));
+
+        let mut grants = Grants::from_role(Role::FullControl);
+        grants.set(IndependentGrant::Tunnel, false);
+        assert!(!grants.get(IndependentGrant::Tunnel));
+        // Nothing else moved with it.
+        assert!(grants.get(IndependentGrant::FileTransfer));
+        assert!(grants.get(IndependentGrant::SecureDesktopInput));
+        assert!(grants.input);
+        grants.set(IndependentGrant::Tunnel, true);
+        assert!(grants.get(IndependentGrant::Tunnel));
     }
 
     #[test]

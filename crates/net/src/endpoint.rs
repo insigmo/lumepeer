@@ -17,9 +17,18 @@ pub const ALPN_MEDIA: &[u8] = b"rd/media/1";
 /// File channel ALPN. Opened lazily only after `FileAccept(true)` and closed
 /// when the transfer finishes or is cancelled (§4, §4.1).
 pub const ALPN_FILE: &[u8] = b"rd/file/1";
+/// Tunnel channel ALPN: forwarded TCP payload (§4.1; ADR 0078). Opened
+/// lazily, only after the host has allowed a specific address, and torn down
+/// with the `tunnel` grant.
+///
+/// Its own connection rather than a second use of `rd/file/1`, for the reason
+/// every ALPN here is separate: a channel that is busy must not be able to
+/// delay a revoke on another one, and a tunnel is the busiest thing a guest
+/// can hold open.
+pub const ALPN_TUNNEL: &[u8] = b"rd/tunnel/1";
 
 /// Every ALPN this build speaks, in the order they may be opened.
-pub const SUPPORTED_ALPNS: [&[u8]; 3] = [ALPN_CONTROL, ALPN_MEDIA, ALPN_FILE];
+pub const SUPPORTED_ALPNS: [&[u8]; 4] = [ALPN_CONTROL, ALPN_MEDIA, ALPN_FILE, ALPN_TUNNEL];
 
 fn alpn_list() -> Vec<Vec<u8>> {
     SUPPORTED_ALPNS.iter().map(|a| (*a).to_vec()).collect()
