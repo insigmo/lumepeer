@@ -47,7 +47,7 @@ pub struct Network {
     /// mode of ADR 0020 — a deliberate WAN test, never a shipping default.
     pub prefer_direct: bool,
     /// Whether this node may use the obfuscated serverless transport beside
-    /// the iroh path (ADR 0052, ADR 0079).
+    /// the iroh path (ADR 0052, ADR 0080).
     ///
     /// **Off by default**, and deliberately so: the transport is new, it is
     /// added beside iroh rather than in place of it, and turning it on costs
@@ -231,7 +231,7 @@ impl Settings {
         !self.network.prefer_direct || lumepeer_net::endpoint::relay_only_enabled()
     }
 
-    /// Whether this run may use the obfuscated transport at all (ADR 0079).
+    /// Whether this run may use the obfuscated transport at all (ADR 0080).
     ///
     /// Off unless `[network] obfuscated` says otherwise, which is what makes
     /// "with the flag off nothing changed" a property of the build rather
@@ -354,7 +354,7 @@ mod tests {
         );
         assert!(
             !settings.obfuscated(),
-            "the obfuscated transport is opt-in, never a shipping default (ADR 0079)"
+            "the obfuscated transport is opt-in, never a shipping default (ADR 0080)"
         );
     }
 
@@ -368,7 +368,7 @@ mod tests {
         assert!(parsed.network.prefer_direct);
         assert!(
             !parsed.obfuscated(),
-            "config/default.toml must ship with the obfuscated transport off (ADR 0079)"
+            "config/default.toml must ship with the obfuscated transport off (ADR 0080)"
         );
         assert_eq!(parsed.logging.directory.as_deref(), Some("logs"));
     }
