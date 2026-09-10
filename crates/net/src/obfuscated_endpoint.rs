@@ -43,7 +43,12 @@ use crate::ticket::INVITE_ID_BYTES;
 
 /// Public STUN reflectors tried in order, same list `examples/stun_probe.rs`
 /// uses (task 17, ADR 0052/0053).
-const STUN_SERVERS: &[&str] = &[
+///
+/// Public so a probe can measure this machine's NAT through the very
+/// reflectors the transport discovers with: an answer from a different list
+/// would say nothing about the address this endpoint advertises
+/// (gap-tasks/22 task 2).
+pub const STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
