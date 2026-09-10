@@ -9,6 +9,7 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
 
 use crate::error::{NetError, Result};
+use crate::peer_connection::PeerConnection;
 
 /// Control channel ALPN: `Hello`/consent/input/clipboard. Opened first (§4.1).
 pub const ALPN_CONTROL: &[u8] = b"rd/control/1";
@@ -260,10 +261,7 @@ impl PeerEndpoint {
     ///
     /// # Errors
     /// [`NetError::Dial`] if no connection can be established.
-    pub async fn connect_control(
-        &self,
-        addr: impl Into<EndpointAddr>,
-    ) -> Result<iroh::endpoint::Connection> {
+    pub async fn connect_control(&self, addr: impl Into<EndpointAddr>) -> Result<PeerConnection> {
         self.connect(addr, ALPN_CONTROL).await
     }
 
@@ -275,10 +273,11 @@ impl PeerEndpoint {
         &self,
         addr: impl Into<EndpointAddr>,
         alpn: &[u8],
-    ) -> Result<iroh::endpoint::Connection> {
+    ) -> Result<PeerConnection> {
         self.inner
             .connect(addr, alpn)
             .await
+            .map(PeerConnection::from_iroh)
             .map_err(|e| NetError::Dial(e.to_string()))
     }
 
@@ -289,7 +288,7 @@ impl PeerEndpoint {
     /// # Errors
     /// [`NetError::Io`] if the handshake of an incoming connection fails; the
     /// caller keeps accepting afterwards.
-    pub async fn accept(&self) -> Option<Result<iroh::endpoint::Connection>> {
+    pub async fn accept(&self) -> Option<Result<PeerConnection>> {
         let incoming = self.accept_incoming().await?;
         Some(Self::finish_accept(incoming).await)
     }
@@ -310,10 +309,11 @@ impl PeerEndpoint {
     ///
     /// # Errors
     /// [`NetError::Io`] if the handshake fails.
-    pub async fn finish_accept(
-        incoming: iroh::endpoint::Incoming,
-    ) -> Result<iroh::endpoint::Connection> {
-        incoming.await.map_err(|e| NetError::Io(e.to_string()))
+    pub async fn finish_accept(incoming: iroh::endpoint::Incoming) -> Result<PeerConnection> {
+        incoming
+            .await
+            .map(PeerConnection::from_iroh)
+            .map_err(|e| NetError::Io(e.to_string()))
     }
 
     /// Borrows the underlying endpoint.

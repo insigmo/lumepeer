@@ -110,7 +110,7 @@ async fn guest_control(guest: &PeerEndpoint, addr: iroh::EndpointAddr) -> Contro
 /// the running hash is fed the same bytes, and nothing leaves staging until
 /// `finish` says the file is the file that was offered.
 async fn receive_one(
-    file_connection: &iroh::endpoint::Connection,
+    file_connection: &lumepeer_net::PeerConnection,
     tracker: &mut ReceiveTracker,
     staged: &mut StagedReceive,
     expected: [u8; 32],

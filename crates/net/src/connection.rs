@@ -4,7 +4,7 @@
 //! and versions the connection. Consent is a separate exchange that only the
 //! host's `SessionManager` may resolve (§2.3, §8.1).
 
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{RecvStream, SendStream};
 use lumepeer_core::NodeId;
 use lumepeer_core::consent::Role;
 use lumepeer_core::protocol::{
@@ -15,6 +15,7 @@ use lumepeer_core::{CoreError, session::SessionManager};
 use crate::endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, ALPN_TUNNEL};
 use crate::error::{NetError, Result, close_code};
 use crate::framing::{FrameReader, FrameWriter};
+use crate::peer_connection::PeerConnection;
 
 /// Which of the four ALPNs a connection belongs to (§4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub struct HelloInfo {
 /// open as long as either half is alive.
 #[derive(Debug)]
 pub struct ControlReader {
-    connection: Connection,
+    connection: PeerConnection,
     session_id: [u8; 16],
     reader: FrameReader<RecvStream>,
 }
@@ -74,13 +75,13 @@ pub struct ControlReader {
 impl ControlReader {
     /// Authenticated peer identity.
     #[must_use]
-    pub fn peer(&self) -> NodeId {
-        self.connection.remote_id()
+    pub const fn peer(&self) -> NodeId {
+        self.connection.peer()
     }
 
     /// Underlying QUIC connection, for the close codes of §18.
     #[must_use]
-    pub const fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &PeerConnection {
         &self.connection
     }
 
@@ -128,7 +129,7 @@ impl ControlReader {
 /// Write half of a [`ControlConnection`].
 #[derive(Debug)]
 pub struct ControlWriter {
-    connection: Connection,
+    connection: PeerConnection,
     session_id: [u8; 16],
     outbound: Direction,
     writer: FrameWriter<SendStream>,
@@ -137,13 +138,13 @@ pub struct ControlWriter {
 impl ControlWriter {
     /// Authenticated peer identity.
     #[must_use]
-    pub fn peer(&self) -> NodeId {
-        self.connection.remote_id()
+    pub const fn peer(&self) -> NodeId {
+        self.connection.peer()
     }
 
     /// Underlying QUIC connection, for the close codes of §18.
     #[must_use]
-    pub const fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &PeerConnection {
         &self.connection
     }
 
@@ -198,7 +199,7 @@ impl ControlConnection {
     /// connection it belongs to.
     #[must_use]
     pub fn new(
-        connection: Connection,
+        connection: PeerConnection,
         session_id: [u8; 16],
         recv: RecvStream,
         send: SendStream,
@@ -234,7 +235,7 @@ impl ControlConnection {
 
     /// Authenticated peer identity.
     #[must_use]
-    pub fn peer(&self) -> NodeId {
+    pub const fn peer(&self) -> NodeId {
         self.reader.peer()
     }
 
@@ -250,7 +251,7 @@ impl ControlConnection {
 
     /// Underlying QUIC connection, for the close codes of §18.
     #[must_use]
-    pub const fn connection(&self) -> &Connection {
+    pub const fn connection(&self) -> &PeerConnection {
         self.reader.connection()
     }
 
@@ -308,7 +309,7 @@ impl ControlConnection {
 ///   answers with anything other than `HelloAck`.
 /// - [`NetError::Io`] if the stream cannot be opened.
 pub async fn guest_handshake(
-    connection: Connection,
+    connection: PeerConnection,
     role_request: Role,
     invite_proof: Vec<u8>,
     features: Vec<String>,
@@ -358,7 +359,7 @@ pub async fn guest_handshake(
 /// - [`NetError::Framing`] wrapping [`CoreError::Malformed`] if the first
 ///   message is not a `Hello`.
 /// - [`NetError::Io`] if the stream cannot be accepted.
-pub async fn host_handshake(connection: Connection) -> Result<(ControlConnection, HelloInfo)> {
+pub async fn host_handshake(connection: PeerConnection) -> Result<(ControlConnection, HelloInfo)> {
     let (send, recv) = connection
         .accept_bi()
         .await
