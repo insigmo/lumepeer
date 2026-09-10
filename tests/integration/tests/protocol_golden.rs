@@ -14,9 +14,11 @@
 //! `DirListResponse` (ADR 0075), minor 13 appended `FileFetchRequest`,
 //! `FileFetchRefused` and `FilePutOffer` (ADR 0076), minor 14 appended
 //! `DirOffer` and `DirAccept` (ADR 0077), minor 15 appended
-//! `TunnelOpenRequest`, `TunnelOpenResponse` and `TunnelClose` (ADR 0078) —
-//! and every earlier vector is still in the file with the same bytes, which
-//! is the compatibility claim this test checks.
+//! `TunnelOpenRequest`, `TunnelOpenResponse` and `TunnelClose` (ADR 0078),
+//! minor 16 appended `TerminalOpenRequest`, `TerminalOpenResponse`,
+//! `TerminalResize` and `TerminalClose` (ADR 0079) — and every earlier vector
+//! is still in the file with the same bytes, which is the compatibility claim
+//! this test checks.
 //!
 //! One verdict has changed in the file's life, and it is written down where
 //! it happened: minor 14 raised the offer ceiling, so an offer of 500 MiB
@@ -89,7 +91,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 15,
+        PROTOCOL_MINOR, 16,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 

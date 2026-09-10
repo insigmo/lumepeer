@@ -211,3 +211,20 @@ invalid minor15_tunnel_open_request_port_zero abababababababababababababababab01
 valid minor15_tunnel_open_response_accepted abababababababababababababababab000035070000
 valid minor15_tunnel_open_response_not_granted abababababababababababababababab00003507010000
 valid minor15_tunnel_close abababababababababababababababab0100360700
+
+# --- Frozen for PROTOCOL_MINOR 16: the remote terminal (ADR 0079). Four
+# --- control messages and no payload: the keystrokes and the output ride
+# --- rd/term/1, a fifth ALPN, for the reason the tunnel has its own. The open
+# --- request carries no identifier - the shell is the host's to name, and a
+# --- guest pairs answers with asks in order - and its geometry is bounded
+# --- because it becomes a PTY allocation: zero rows is malformed, not
+# --- "whatever the host likes". The response carries no reason when it
+# --- accepts, and one of a closed set when it does not; CannotDropPrivileges
+# --- is the refusal a host gives when it will not lend the shell its own
+# --- administrator token.
+valid minor16_terminal_open_request abababababababababababababababab010137501800
+invalid minor16_terminal_open_request_zero_rows abababababababababababababababab010137500000
+valid minor16_terminal_open_response_accepted abababababababababababababababab000038070000
+valid minor16_terminal_open_response_cannot_drop_privileges abababababababababababababababab00003800010200
+valid minor16_terminal_resize abababababababababababababababab01023907782800
+valid minor16_terminal_close abababababababababababababababab01033a0700
