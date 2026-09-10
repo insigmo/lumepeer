@@ -1,0 +1,49 @@
+[package]
+name = "lumepeer-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Lumepeer host-side pseudo-terminal (ADR 0079)"
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+# The Unix pseudo-terminal: `openpty`, the controlling terminal, the resize
+# ioctl and `waitpid`, none of which has a safe binding in std. Confined to
+# `cfg(unix)` on purpose — its ConPTY backend calls `CreateProcessW`, which
+# takes no token, so decision 2 of ADR 0079 would be impossible through it, and
+# a Windows build must not pull its `winapi`/`winreg` tree in for a backend it
+# never uses.
+[target.'cfg(unix)'.dependencies]
+portable-pty = "0.9"
+# `geteuid` for the root refusal of ADR 0079 decision 2, so this crate needs no
+# `unsafe` of its own on Unix. The exact version `portable-pty` already
+# depends on, so no new dependency version enters `Cargo.lock`.
+nix = { version = "0.28", features = ["user"] }
+
+# `kill(pid, None)` — signal 0 — is how the orphan test of ADR 0079 asks
+# whether a shell's pid still names anything. A test-only need, so the two
+# extra features stay out of the shipped build.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.28", features = ["signal", "process"] }
+
+# ConPTY, and the token drop it exists to make possible (ADR 0079 decision 2).
+# `CreatePseudoConsole`, the process-thread attribute list,
+# `CreateProcessAsUserW` and `DuplicateTokenEx` have no safe bindings; same
+# major version `lumepeer-service` already resolves to, so no second `windows`
+# tree appears.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
