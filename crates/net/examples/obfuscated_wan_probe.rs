@@ -10,16 +10,20 @@
 //! at all on a given machine: what kind of NAT it is behind, and how long its
 //! UDP mappings live without traffic (gap-tasks/22 task 2).
 //!
+//! Both `host` and `guest` take an optional count, so one invite can carry a
+//! series of punches and the share that landed is one number at the end
+//! (gap-tasks/22 definition of done: ten attempts).
+//!
 //! ```text
 //! # on each machine, before anything else: what is this network?
 //! cargo run -p lumepeer-net --example obfuscated_wan_probe -- nat
 //!
-//! # on the host machine
-//! cargo run -p lumepeer-net --example obfuscated_wan_probe -- host
+//! # on the host machine (serve up to 10 guests on one invite)
+//! cargo run -p lumepeer-net --example obfuscated_wan_probe -- host 10
 //! # -> prints `INVITE lumepeer1:...`
 //!
-//! # on the other machine
-//! cargo run -p lumepeer-net --example obfuscated_wan_probe -- guest lumepeer1:...
+//! # on the other machine (10 independent punches)
+//! cargo run -p lumepeer-net --example obfuscated_wan_probe -- guest lumepeer1:... 10
 //! ```
 
 use std::collections::BTreeSet;
@@ -28,10 +32,10 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
-use lumepeer_net::InviteTicket;
 use lumepeer_net::obfuscated_endpoint::{GuestObfuscatedEndpoint, STUN_SERVERS, bind_host};
 use lumepeer_net::stun;
 use lumepeer_net::ticket::INVITE_ID_BYTES;
+use lumepeer_net::{InviteTicket, PeerConnection};
 use rand::Rng as _;
 
 /// How long the host waits for a guest to show up.
@@ -60,18 +64,23 @@ async fn main() {
 
     let mut args = std::env::args().skip(1);
     let role = args.next().unwrap_or_default();
-    let code = args.next();
 
     let outcome = match role.as_str() {
-        "host" => host().await,
-        "guest" => match code {
-            Some(code) => guest(&code).await,
-            None => Err("usage: obfuscated_wan_probe guest <invite-code>".to_owned()),
+        "host" => match count(args.next()) {
+            Ok(guests) => host(guests).await,
+            Err(reason) => Err(reason),
+        },
+        "guest" => match (args.next(), count(args.next())) {
+            (Some(code), Ok(attempts)) => guest(&code, attempts).await,
+            (None, _) => {
+                Err("usage: obfuscated_wan_probe guest <invite-code> [attempts]".to_owned())
+            }
+            (_, Err(reason)) => Err(reason),
         },
         "nat" => nat().await,
         _ => Err(
-            "usage: obfuscated_wan_probe nat | obfuscated_wan_probe host | \
-                  obfuscated_wan_probe guest <invite-code>"
+            "usage: obfuscated_wan_probe nat | obfuscated_wan_probe host [guests] | \
+                  obfuscated_wan_probe guest <invite-code> [attempts]"
                 .to_owned(),
         ),
     };
@@ -85,7 +94,19 @@ async fn main() {
     }
 }
 
-async fn host() -> Result<(), String> {
+/// The count argument of `host` and `guest`: one when absent, and never zero —
+/// a series of nothing would report a share of nothing.
+fn count(arg: Option<String>) -> Result<u32, String> {
+    match arg {
+        None => Ok(1),
+        Some(arg) => match arg.parse::<u32>() {
+            Ok(0) | Err(_) => Err(format!("expected a positive count, got {arg:?}")),
+            Ok(count) => Ok(count),
+        },
+    }
+}
+
+async fn host(guests: u32) -> Result<(), String> {
     // The invite id has to exist before the endpoint binds: it is the key
     // material for every datagram the obfuscated socket seals, and the
     // ticket signs it alongside the address the endpoint discovers.
@@ -129,18 +150,57 @@ async fn host() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     println!("INVITE {}", ticket.to_code().map_err(|e| e.to_string())?);
 
-    println!("WAITING for a guest (up to {}s)", ACCEPT_TIMEOUT.as_secs());
-    let connection = tokio::time::timeout(ACCEPT_TIMEOUT, bound.accept())
-        .await
-        .map_err(|_| format!("no guest connected within {}s", ACCEPT_TIMEOUT.as_secs()))?
-        .ok_or_else(|| "the endpoint closed while accepting".to_owned())?
-        .map_err(|e| format!("accept: {e}"))?;
+    // Each guest is waited for on its own clock: a guest whose punch never
+    // lands never arrives, so the series ends at the first quiet
+    // `ACCEPT_TIMEOUT` rather than at the count, and the count served is what
+    // is reported.
     println!(
-        "ACCEPTED peer={} alpn={:?}",
-        connection.peer(),
-        String::from_utf8_lossy(connection.alpn())
+        "WAITING for {guests} guest(s), each within {}s",
+        ACCEPT_TIMEOUT.as_secs()
     );
+    let mut serving = tokio::task::JoinSet::new();
+    let mut served = 0u32;
+    while served < guests {
+        let accepted = match tokio::time::timeout(ACCEPT_TIMEOUT, bound.accept()).await {
+            Ok(Some(accepted)) => accepted,
+            Ok(None) => return Err("the endpoint closed while accepting".to_owned()),
+            Err(_) => break,
+        };
+        // A refused handshake is one guest's failure, not the series'.
+        let connection = match accepted {
+            Ok(connection) => connection,
+            Err(e) => {
+                println!("REFUSED {e}");
+                continue;
+            }
+        };
+        served += 1;
+        println!(
+            "ACCEPTED {served}/{guests} peer={} alpn={:?}",
+            connection.peer(),
+            String::from_utf8_lossy(connection.alpn())
+        );
+        serving.spawn(serve(connection));
+    }
+    while let Some(outcome) = serving.join_next().await {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => println!("SERVE failed: {reason}"),
+            Err(e) => println!("SERVE failed: {e}"),
+        }
+    }
+    println!("SERVED {served}/{guests}");
+    if served == 0 {
+        return Err(format!(
+            "no guest connected within {}s",
+            ACCEPT_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(())
+}
 
+/// Answers one guest's ping and waits for it to hang up.
+async fn serve(connection: PeerConnection) -> Result<(), String> {
     let (mut send, mut recv) = connection
         .accept_bi()
         .await
@@ -158,7 +218,7 @@ async fn host() -> Result<(), String> {
     Ok(())
 }
 
-async fn guest(code: &str) -> Result<(), String> {
+async fn guest(code: &str, attempts: u32) -> Result<(), String> {
     let ticket = InviteTicket::from_code(code).map_err(|e| format!("ticket: {e}"))?;
     let (Some(target), Some(fingerprint)) = (ticket.obfuscated_addr, ticket.host_cert_fingerprint)
     else {
@@ -168,13 +228,56 @@ async fn guest(code: &str) -> Result<(), String> {
                 .to_owned(),
         );
     };
-    println!("DIALING target={target}");
+    println!("DIALING target={target}, {attempts} punch(es)");
 
     // The guest's own throwaway identity: its certificate names it to the
     // host exactly as the iroh path's endpoint key would (ADR 0080).
     let identity = SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
-    let endpoint = GuestObfuscatedEndpoint::bind(&ticket.invite_id, &identity, target, fingerprint)
+    let mut landed = 0u32;
+    for attempt in 1..=attempts {
+        let started = Instant::now();
+        match punch(&ticket.invite_id, &identity, target, fingerprint).await {
+            Ok(()) => {
+                landed += 1;
+                println!(
+                    "PUNCH {attempt}/{attempts} landed in {}ms",
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(reason) => println!(
+                "PUNCH {attempt}/{attempts} failed after {}ms: {reason}",
+                started.elapsed().as_millis()
+            ),
+        }
+    }
+    println!("PUNCH landed={landed}/{attempts}");
+    if landed == 0 {
+        return Err("no punch landed".to_owned());
+    }
+    Ok(())
+}
+
+/// One punch of a series, from a socket of its own.
+///
+/// A fresh socket is a fresh mapping on this side's NAT: reusing one would
+/// leave the first attempt's mapping open towards the host, and every later
+/// attempt would count a punch the first one had already made.
+async fn punch(
+    invite_id: &[u8; INVITE_ID_BYTES],
+    identity: &SigningKey,
+    target: SocketAddr,
+    fingerprint: [u8; 32],
+) -> Result<(), String> {
+    let endpoint = GuestObfuscatedEndpoint::bind(invite_id, identity, target, fingerprint)
         .map_err(|e| format!("bind: {e}"))?;
+    let outcome = ping(&endpoint).await;
+    endpoint.close().await;
+    outcome
+}
+
+/// Dials the host and exchanges one ping. Success is the reply, not the dial:
+/// a connection that carries nothing proves less than the session needs.
+async fn ping(endpoint: &GuestObfuscatedEndpoint) -> Result<(), String> {
     let connection = endpoint
         .connect(lumepeer_net::ALPN_CONTROL)
         .await
