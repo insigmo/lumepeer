@@ -350,6 +350,26 @@ pub const OBFUSCATED_CONNECT_ATTEMPTS: u32 = 5;
 /// Backoff between obfuscated-transport dial attempts, milliseconds (task 17
 /// increment 2, ADR 0053). See [`OBFUSCATED_CONNECT_ATTEMPTS`].
 pub const OBFUSCATED_CONNECT_RETRY_BACKOFF_MS: u64 = 500;
+/// How long one obfuscated dial attempt may wait for its handshake before the
+/// next one goes out, milliseconds (gap-tasks/22 task 3, ADR 0082).
+///
+/// A dial on this transport is also the punch: the attempt's own QUIC Initial
+/// is the packet that opens this side's mapping and probes the host's, sealed
+/// by the same codec as everything else, so there is nothing on the wire that
+/// a punch and a session do differently. What the punch needs from the clock
+/// is a *cadence*, and an unbounded attempt has none — it waits out
+/// [`QUIC_MAX_IDLE_TIMEOUT_SECS`] on a path that answers nothing, so
+/// [`OBFUSCATED_CONNECT_ATTEMPTS`] of them become minutes of silence rather
+/// than a train of packets.
+///
+/// Sized to a healthy handshake and not to hope: where the host's mapping is
+/// open this is one or two round trips, and where it is not, no length of
+/// waiting opens it — a lapsed mapping is a port the invite no longer names,
+/// and a filtering NAT drops the second packet exactly as it dropped the
+/// first. Attempts are what cover a lost packet or a slow first round trip,
+/// so the whole train bounds a failed punch at
+/// [`OBFUSCATED_CONNECT_ATTEMPTS`] × (this + [`OBFUSCATED_CONNECT_RETRY_BACKOFF_MS`]).
+pub const OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).
