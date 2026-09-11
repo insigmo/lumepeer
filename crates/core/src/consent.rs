@@ -96,6 +96,23 @@ pub struct Grants {
     /// [`Role::FullControl`] alone, separately revocable, and re-read for
     /// every connection inside the tunnel rather than only when it opened.
     pub tunnel: bool,
+    /// Start a shell on the host and drive it (§4.1; ADR 0079).
+    ///
+    /// Measured by what it lets a guest do this sits above `input` rather than
+    /// beside it: an operator watching the screen can see a guest type, and a
+    /// terminal is a channel with no picture attached to it. It is also the
+    /// only grant on this list that *creates a process*. Carried by
+    /// [`Role::FullControl`] alone, separately revocable, and re-read for
+    /// every shell rather than only when `rd/term/1` came up — a session opens
+    /// many shells over its life, and withdrawing this kills the running ones
+    /// on the spot.
+    ///
+    /// It says nothing about privileges. The shell runs as the host's
+    /// interactive user whatever this process is running as, or it does not
+    /// run at all: on Windows the client is elevated (ADR 0057), so the drop
+    /// is explicit and a host that cannot make it gets no terminal rather than
+    /// an administrator one (ADR 0079).
+    pub terminal: bool,
     /// Inject input into the host's secure desktop — click the UAC prompt,
     /// type into the lock screen (`docs/bugs/15-secure-desktop-capture.md`,
     /// ADR 0057).
@@ -113,7 +130,7 @@ pub struct Grants {
     pub secure_desktop_input: bool,
 }
 
-/// One of the nine grants a host may toggle on a session that is already
+/// One of the ten grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -141,6 +158,8 @@ pub enum IndependentGrant {
     SecureDesktopInput,
     /// Forward TCP connections into the host's own network (ADR 0078).
     Tunnel,
+    /// Start a shell on the host and drive it (ADR 0079).
+    Terminal,
 }
 
 impl Grants {
@@ -184,6 +203,10 @@ impl Grants {
             // host still names each target, and names none by default
             // (ADR 0078).
             tunnel: full,
+            // Full control and nothing below it (ADR 0079). It carries no
+            // privileges with it either way: the shell is the interactive
+            // user's, or there is no shell.
+            terminal: full,
             // On for every role, like `view` (ADR 0056), not just full
             // control — a view-only guest is the case that needs to see the
             // prompt instead of a frozen picture.
@@ -200,7 +223,7 @@ impl Grants {
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: a tenth permission must
+        // Exhaustive on purpose, with no `_` arm: an eleventh permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
@@ -212,6 +235,7 @@ impl Grants {
             IndependentGrant::SecureDesktop => self.secure_desktop,
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input,
             IndependentGrant::Tunnel => self.tunnel,
+            IndependentGrant::Terminal => self.terminal,
         }
     }
 
@@ -227,6 +251,7 @@ impl Grants {
             IndependentGrant::SecureDesktop => self.secure_desktop = allowed,
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input = allowed,
             IndependentGrant::Tunnel => self.tunnel = allowed,
+            IndependentGrant::Terminal => self.terminal = allowed,
         }
     }
 }
@@ -527,6 +552,8 @@ mod tests {
         assert!(grants.recording);
         assert!(grants.display_mode);
         assert!(grants.secure_desktop);
+        assert!(grants.tunnel);
+        assert!(grants.terminal);
         // Full control means full control: the click on the UAC prompt rides
         // along with the keyboard that can already type into the elevated
         // window it opens (ADR 0061, amending ADR 0057).
@@ -548,7 +575,33 @@ mod tests {
             assert!(lesser.secure_desktop);
             assert!(!lesser.secure_desktop_input);
             assert!(!lesser.tunnel);
+            assert!(!lesser.terminal);
         }
+    }
+
+    /// ADR 0079: a shell is not something the keyboard implies, and taking it
+    /// back leaves everything else where it was.
+    #[test]
+    fn a_terminal_follows_full_control_and_is_not_implied_by_input() {
+        for role in [Role::ViewOnly, Role::ControlLimited] {
+            assert!(!Grants::from_role(role).get(IndependentGrant::Terminal));
+        }
+        assert!(Grants::from_role(Role::FullControl).get(IndependentGrant::Terminal));
+
+        // The implication this grant exists to refuse: a session may hold the
+        // host's keyboard without being able to start a shell behind the
+        // picture. `input` follows the role, so build the case by hand.
+        let mut narrowed = Grants::from_role(Role::FullControl);
+        narrowed.set(IndependentGrant::Terminal, false);
+        assert!(narrowed.input);
+        assert!(!narrowed.get(IndependentGrant::Terminal));
+        // Nothing else moved with it, in particular not the other grant that
+        // reaches past this machine.
+        assert!(narrowed.get(IndependentGrant::Tunnel));
+        assert!(narrowed.get(IndependentGrant::FileTransfer));
+        assert!(narrowed.get(IndependentGrant::SecureDesktopInput));
+        narrowed.set(IndependentGrant::Terminal, true);
+        assert!(narrowed.get(IndependentGrant::Terminal));
     }
 
     /// ADR 0078: a tunnel is not implied by anything already granted, and it
@@ -566,6 +619,7 @@ mod tests {
         assert!(!grants.get(IndependentGrant::Tunnel));
         // Nothing else moved with it.
         assert!(grants.get(IndependentGrant::FileTransfer));
+        assert!(grants.get(IndependentGrant::Terminal));
         assert!(grants.get(IndependentGrant::SecureDesktopInput));
         assert!(grants.input);
         grants.set(IndependentGrant::Tunnel, true);

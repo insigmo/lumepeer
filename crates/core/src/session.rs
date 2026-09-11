@@ -482,6 +482,24 @@ impl SessionManager {
         session.allowed_targets.contains(&asked)
     }
 
+    /// Whether `peer` may start a shell on this host **right now** (§2.3,
+    /// §8.2; ADR 0079).
+    ///
+    /// Read at the moment a shell is asked for rather than when `rd/term/1`
+    /// came up, the same rule [`Self::tunnel_allows`] follows: a session opens
+    /// many shells over its life, and a revoke that landed only on the first
+    /// would be a revoke waiting for somebody to type `exit`.
+    ///
+    /// It says nothing about privileges. What the shell is allowed to *be* is
+    /// decided where it is spawned (`lumepeer-terminal`), which refuses
+    /// outright rather than inheriting this process's own token.
+    #[must_use]
+    pub fn terminal_allows(&self, peer: &NodeId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|session| session.state == SessionState::Active && session.grants.terminal)
+    }
+
     /// State of `peer`'s session; `Idle` if it has none.
     #[must_use]
     pub fn state(&self, peer: &NodeId) -> SessionState {
@@ -941,7 +959,7 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 8] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 9] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
@@ -950,7 +968,39 @@ mod tests {
         IndependentGrant::SecureDesktop,
         IndependentGrant::SecureDesktopInput,
         IndependentGrant::Tunnel,
+        IndependentGrant::Terminal,
     ];
+
+    /// ADR 0079: a shell needs the grant and a live session, and both are read
+    /// at the moment it is asked for rather than when the channel came up.
+    #[test]
+    fn a_terminal_needs_the_grant_and_an_active_session() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        assert!(manager.terminal_allows(&peer(1)));
+
+        // Withdrawn on its own, with the role untouched.
+        manager
+            .set_grant(peer(1), IndependentGrant::Terminal, false)
+            .unwrap();
+        assert!(!manager.terminal_allows(&peer(1)));
+        assert!(manager.grants(&peer(1)).is_some_and(|g| g.input));
+        manager
+            .set_grant(peer(1), IndependentGrant::Terminal, true)
+            .unwrap();
+        assert!(manager.terminal_allows(&peer(1)));
+
+        // A session that is no longer running cannot start one, grant or not
+        // (§8.2), and neither can a peer that has no session at all.
+        manager.on_disconnect(peer(1)).unwrap();
+        assert!(!manager.terminal_allows(&peer(1)));
+        assert!(!manager.terminal_allows(&peer(2)));
+
+        // And nothing below full control brings it.
+        let mut lesser = SessionManager::new();
+        lesser.grant(peer(3), Role::ControlLimited).unwrap();
+        assert!(!lesser.terminal_allows(&peer(3)));
+    }
 
     /// ADR 0078: the grant and the address are two decisions, and a tunnel
     /// needs both. Neither one alone reaches anything.

@@ -9,6 +9,11 @@
 
 import { render } from 'lit-html';
 
+// The emulator's own stylesheet, imported statically so the bundler emits it
+// as a file this page links: a dynamic CSS import would arrive as an inline
+// `<style>`, which §13's `style-src 'self'` refuses (ADR 0079, ADR 0081).
+import '@xterm/xterm/css/xterm.css';
+
 import {
   browseDenied,
   emptyState,
@@ -27,6 +32,7 @@ import {
   type ChatRow,
 } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
+import { mountTerminal, type TerminalControls } from './terminal';
 import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
 import {
   decodeViewChunk,
@@ -87,6 +93,9 @@ const overlay = document.querySelector<HTMLElement>('#overlay');
 const recordingIndicator = document.querySelector<HTMLElement>('#recording-indicator');
 const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
 const filePanel = document.querySelector<HTMLElement>('#file-panel');
+const terminalPanel = document.querySelector<HTMLElement>('#terminal-panel');
+const terminalChrome = document.querySelector<HTMLElement>('#terminal-chrome');
+const terminalScreen = document.querySelector<HTMLElement>('#terminal-screen');
 const locale: Locale = detectLocale(navigator);
 
 document.documentElement.lang = locale;
@@ -126,6 +135,10 @@ let layout: ViewLayout = defaultLayout();
 let frameSize = { width: 0, height: 0 };
 let fullscreen = false;
 let toolbar: ToolbarControls | null = null;
+// The terminal, once somebody has opened it. Mounted on first use rather than
+// with the window: this window's job is the picture, and a session that never
+// asks for a shell should not pay for an emulator (ADR 0079).
+let terminal: TerminalControls | null = null;
 // The host's cursor, once it has announced one. A host that still draws the
 // cursor into the picture announces none, and this stays null — which is what
 // keeps the overlay off rather than putting a second cursor on screen (§11).
@@ -223,6 +236,25 @@ function renderFileManager(): void {
     ),
     filePanel,
   );
+}
+
+/**
+ * Mounts the terminal the first time the panel is opened, and asks the host
+ * for a shell (ADR 0079).
+ *
+ * Nothing is granted by asking. The answer — an id or one of the four
+ * refusals of §18 — arrives on the panel's own poll and is drawn there.
+ */
+async function openTerminal(): Promise<void> {
+  if (!terminalScreen || !terminalChrome) {
+    return;
+  }
+  try {
+    terminal ??= await mountTerminal(terminalScreen, terminalChrome, locale, peer);
+    await terminal.start();
+  } catch (error) {
+    console.error('the terminal could not be opened:', error);
+  }
 }
 
 /** Re-reads both panes and the transfer list, then draws them. */
@@ -675,6 +707,20 @@ async function main(): Promise<void> {
       filesAvailable(): boolean {
         return !browseDenied(fileState);
       },
+      toggleTerminal(): boolean {
+        if (!terminalPanel) {
+          return false;
+        }
+        terminalPanel.hidden = !terminalPanel.hidden;
+        if (!terminalPanel.hidden) {
+          void openTerminal();
+        }
+        toolbar?.redraw();
+        return !terminalPanel.hidden;
+      },
+      terminalVisible(): boolean {
+        return terminalPanel !== null && !terminalPanel.hidden;
+      },
       displayMode: () => layout.mode,
       setDisplayMode,
       zoomPercent: () =>
@@ -781,6 +827,11 @@ async function main(): Promise<void> {
     stopped = true;
     input?.setEnabled(false);
     nativeDecoder?.close();
+    // The shell goes with the window that asked for it. The host kills it at
+    // its own end of the session too, so this is belt and braces on purpose:
+    // a process left running on somebody else's machine is the one outcome
+    // ADR 0079 may not produce.
+    terminal?.stop();
     void endSession();
   });
   // Which side decodes. The window is the only one that knows whether its own
