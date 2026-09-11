@@ -124,6 +124,41 @@
       #file-panel[hidden] {
         display: none;
       }
+      /* The terminal takes the bottom of the picture across its whole width:
+         a shell wrapped into a narrow column is a shell whose output is wrong
+         (ADR 0079). */
+      #terminal-panel {
+        position: absolute;
+        inset-block-end: 0;
+        inset-inline: 0;
+        height: min(22rem, 50%);
+        display: flex;
+        flex-direction: column;
+        background: rgb(0 0 0 / 88%);
+        font-size: 0.85rem;
+      }
+      /* Same specificity problem `#chat-panel[hidden]` has, same answer. */
+      #terminal-panel[hidden] {
+        display: none;
+      }
+      #terminal-screen {
+        flex: 1;
+        min-height: 0;
+      }
+      .term-head {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 0.5rem;
+      }
+      .term-head h3 {
+        margin: 0;
+        font-size: 0.9rem;
+      }
+      .term-state {
+        flex: 1;
+        opacity: 0.8;
+      }
       .fm-panes {
         display: flex;
         gap: 0.5rem;
@@ -439,6 +474,13 @@
       <div id="recording-indicator"></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>
       <aside id="file-panel" hidden></aside>
+      <!-- The terminal (ADR 0079). Two elements rather than one: `xterm.js`
+           owns `#terminal-screen` outright and a re-render would destroy it,
+           so the chrome around it is drawn into its own sibling. -->
+      <aside id="terminal-panel" aria-labelledby="term-heading" hidden>
+        <div id="terminal-chrome"></div>
+        <div id="terminal-screen"></div>
+      </aside>
       <div id="toolbar-root"></div>
     </main>
     <script type="module" src="/src/view.ts"></script>

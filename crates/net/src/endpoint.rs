@@ -1,8 +1,8 @@
 //! Wrapper over `iroh::Endpoint` (design doc §4, §4.1).
 //!
-//! One endpoint serves three ALPNs, each on its own QUIC connection, so that
-//! media load or a file transfer can never delay a revoke on the control
-//! channel.
+//! One endpoint serves five ALPNs, each on its own QUIC connection, so that
+//! media load, a file transfer, a tunnel or a shell's output can never delay a
+//! revoke on the control channel.
 
 use iroh::endpoint::Builder as EndpointBuilder;
 use iroh::endpoint::presets;
@@ -26,9 +26,24 @@ pub const ALPN_FILE: &[u8] = b"rd/file/1";
 /// delay a revoke on another one, and a tunnel is the busiest thing a guest
 /// can hold open.
 pub const ALPN_TUNNEL: &[u8] = b"rd/tunnel/1";
+/// Terminal channel ALPN: shell keystrokes and output (§4.1; ADR 0079).
+/// Opened lazily, only after the host has agreed to start a shell, and torn
+/// down with the `terminal` grant.
+///
+/// Its own connection rather than a second use of `rd/tunnel/1`, for the
+/// reason every ALPN here is separate — and for one more: sharing would put a
+/// terminal behind the tunnel grant, and a `cat` of a large file would then
+/// compete with a forwarded database session for the same stream.
+pub const ALPN_TERMINAL: &[u8] = b"rd/term/1";
 
 /// Every ALPN this build speaks, in the order they may be opened.
-pub const SUPPORTED_ALPNS: [&[u8]; 4] = [ALPN_CONTROL, ALPN_MEDIA, ALPN_FILE, ALPN_TUNNEL];
+pub const SUPPORTED_ALPNS: [&[u8]; 5] = [
+    ALPN_CONTROL,
+    ALPN_MEDIA,
+    ALPN_FILE,
+    ALPN_TUNNEL,
+    ALPN_TERMINAL,
+];
 
 fn alpn_list() -> Vec<Vec<u8>> {
     SUPPORTED_ALPNS.iter().map(|a| (*a).to_vec()).collect()

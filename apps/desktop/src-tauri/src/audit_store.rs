@@ -457,6 +457,7 @@ const fn grant_tag(grant: IndependentGrant) -> &'static str {
         IndependentGrant::SecureDesktop => "secure_desktop",
         IndependentGrant::SecureDesktopInput => "secure_desktop_input",
         IndependentGrant::Tunnel => "tunnel",
+        IndependentGrant::Terminal => "terminal",
     }
 }
 

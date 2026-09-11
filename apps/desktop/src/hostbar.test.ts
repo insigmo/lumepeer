@@ -79,6 +79,28 @@ describe('the host session bar', () => {
     expect(rows[0]?.querySelector('.bar-peer')?.textContent).toBe('guest-ab12');
   });
 
+  // ADR 0079 decision 3: a terminal is the one capability with no picture
+  // attached to it, so while a shell is running the host is told on the
+  // surface that stays visible while they work in something else — and there
+  // is no control that takes it away.
+  it('says when a guest has a shell running, and offers no way to hide it', async () => {
+    statusRows = [{ ...ACTIVE_GUEST, terminal_active: true }];
+    await boot();
+
+    const mark = bar().querySelector('[data-testid="hostbar-terminal"]');
+    expect(mark).not.toBeNull();
+    expect(bar().querySelectorAll('button')).toHaveLength(3);
+    for (const button of bar().querySelectorAll('button')) {
+      expect(button.getAttribute('data-testid')).not.toBe('hostbar-terminal-hide');
+    }
+  });
+
+  it('says nothing about a terminal while no shell is running', async () => {
+    await boot();
+
+    expect(bar().querySelector('[data-testid="hostbar-terminal"]')).toBeNull();
+  });
+
   it('shows only live sessions: one still waiting for consent is not connected', async () => {
     statusRows = [{ ...ACTIVE_GUEST, state: 'pending' }];
     await boot();
