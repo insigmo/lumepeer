@@ -351,7 +351,7 @@ pub const OBFUSCATED_CONNECT_ATTEMPTS: u32 = 5;
 /// increment 2, ADR 0053). See [`OBFUSCATED_CONNECT_ATTEMPTS`].
 pub const OBFUSCATED_CONNECT_RETRY_BACKOFF_MS: u64 = 500;
 /// How long one obfuscated dial attempt may wait for its handshake before the
-/// next one goes out, milliseconds (gap-tasks/22 task 3, ADR 0081).
+/// next one goes out, milliseconds (gap-tasks/22 task 3, ADR 0082).
 ///
 /// A dial on this transport is also the punch: the attempt's own QUIC Initial
 /// is the packet that opens this side's mapping and probes the host's, sealed
