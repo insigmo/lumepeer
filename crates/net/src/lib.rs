@@ -15,6 +15,7 @@ pub mod keystore;
 pub mod media;
 pub mod obfuscate;
 pub mod obfuscated_endpoint;
+pub mod peer_connection;
 pub mod reconnect;
 pub mod stun;
 pub mod terminal;
@@ -33,4 +34,5 @@ pub use media::{
     check_media_frame_length, decode_audio_payload, encode_audio_payload, open_media_stream,
     open_tagged_media_stream,
 };
+pub use peer_connection::PeerConnection;
 pub use ticket::InviteTicket;

@@ -59,12 +59,16 @@ use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
 use lumepeer_net::keystore::{Keystore, load_or_create};
+use lumepeer_net::obfuscated_endpoint::{HostObfuscatedEndpoint, ObfuscatedAcceptor};
 use lumepeer_net::terminal::{
     ShellId, read_frame as read_terminal_frame, write_close as write_terminal_close,
     write_frame as write_terminal_frame,
 };
 use lumepeer_net::ticket::TicketRegistry;
 use lumepeer_net::tunnel::{StreamId, read_frame, write_close, write_frame};
+use lumepeer_net::{
+    Channel, ControlConnection, InviteTicket, NetError, PeerConnection, PeerEndpoint,
+};
 use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use lumepeer_terminal::{Shell, ShellControl, ShellError, ShellSize};
 use rand::Rng as _;
@@ -334,7 +338,14 @@ impl PathKind {
 /// is "through a relay, roughly there", not an address they could look up. An
 /// IP-literal relay has no region at all and gets `None` rather than an
 /// invented one.
-fn path_of(connection: &iroh::endpoint::Connection) -> (PathKind, Option<String>) {
+fn path_of(connection: &PeerConnection) -> (PathKind, Option<String>) {
+    // Paths are iroh's own notion of how a connection is reaching the peer.
+    // The obfuscated transport has none to report because it has nothing to
+    // choose between: one direct UDP path, never a relay (ADR 0052), which is
+    // exactly what `PathKind::Direct` says.
+    let Some(connection) = connection.iroh() else {
+        return (PathKind::Direct, None);
+    };
     let mut direct = false;
     let mut relay = false;
     let mut region = None;
@@ -2827,7 +2838,7 @@ struct TunnelChannel {
     bytes: Arc<AtomicU64>,
     /// The QUIC connection under it, kept so a revoke can close it outright
     /// rather than waiting for the far side to notice (§4; ADR 0078).
-    connection: iroh::endpoint::Connection,
+    connection: PeerConnection,
 }
 
 /// One thing to put on a tunnel connection.
@@ -2861,7 +2872,7 @@ enum TunnelEvent {
     /// the peer's dial was accepted and authorized.
     Connected {
         peer: NodeId,
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
     },
     /// The dial failed, so nothing can be forwarded to this peer.
     ConnectFailed { peer: NodeId },
@@ -3003,7 +3014,7 @@ enum FileEvent {
     /// the peer's dial was accepted and authorized.
     Connected {
         peer: NodeId,
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
     },
     /// The dial failed; anything queued for this peer has nowhere to go.
     ConnectFailed { peer: NodeId },
@@ -3092,7 +3103,7 @@ struct ConnectionHandle {
     /// Kept so this side can close the QUIC connection outright. Dropping the
     /// outbound sender alone only ends the writer task; the reader would sit
     /// in `recv` until the far end noticed.
-    connection: iroh::endpoint::Connection,
+    connection: PeerConnection,
     /// Whether this peer's `Hello` advertised `FEATURE_MEDIA_UNAVAILABLE`.
     ///
     /// A peer that did not must never be sent `MessageKind::MediaUnavailable`:
@@ -3322,7 +3333,7 @@ struct DisplayModeState {
 /// lives as long as the media session itself.
 struct MediaSession {
     task: tokio::task::JoinHandle<()>,
-    connection: iroh::endpoint::Connection,
+    connection: PeerConnection,
     #[allow(
         dead_code,
         reason = "kept for the actor to swap recorders into mid-session"
@@ -3456,7 +3467,7 @@ struct ViewState {
     /// The media connection the picture rides. Written by the media task
     /// once dialed, read by the mic toggle; `None` until the first dial
     /// lands and after the media task ends.
-    media_connection: Arc<std::sync::Mutex<Option<iroh::endpoint::Connection>>>,
+    media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>>,
 }
 
 impl ViewState {
@@ -3469,7 +3480,7 @@ impl ViewState {
     /// (§4.1). `None` means the media task has not landed a dial yet — the
     /// toolbar's mic press is refused and can be pressed again once a
     /// picture is showing.
-    fn media_connection(&self) -> Option<iroh::endpoint::Connection> {
+    fn media_connection(&self) -> Option<PeerConnection> {
         self.media_connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3554,7 +3565,7 @@ enum ActorEvent {
     /// question only the actor can answer, since only the actor knows which
     /// peers hold a live, granted control session (§4.1).
     MediaAccepted {
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
         peer: NodeId,
     },
     /// Guest side: an outgoing dial started by [`Actor::spawn_dial`] finished,
@@ -3569,7 +3580,10 @@ enum ActorEvent {
         /// The invite code the dial used, kept so a successful connection can
         /// still be recorded in the remembered-hosts list (ADR 0016).
         code: String,
-        addr: Box<iroh::EndpointAddr>,
+        /// How this host was reached, kept so `rd/media/1`, `rd/file/1` and
+        /// `rd/tunnel/1` are opened over the same transport the control
+        /// channel took (gap-tasks/21 task 2; ADR 0080).
+        dialer: Box<HostDialer>,
         result: Result<Box<ControlConnection>, NetError>,
     },
     /// Something happened to a file transfer, on one of its own tasks.
@@ -3612,6 +3626,37 @@ enum ActorEvent {
         /// offered at all.
         prepared: Result<(String, u64, [u8; 32]), NetError>,
     },
+    /// Host side: the obfuscated endpoint for a new invite finished binding,
+    /// or failed to, off the actor loop (gap-tasks/21 task 1; ADR 0080).
+    ///
+    /// Binding is a STUN round trip to a public reflector, so it cannot run on
+    /// the actor's own thread — but the ticket cannot be issued before it
+    /// finishes either, because the address and fingerprint it discovers are
+    /// signed *into* that ticket (ADR 0053). So the invite request waits here
+    /// with its reply channel and is answered when this lands.
+    ObfuscatedBound {
+        /// The invite id the endpoint's datagram keys were derived from. The
+        /// ticket has to be issued under this exact id or the two sides
+        /// derive different keys (`lumepeer_net::obfuscate`).
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        /// The role the invite request asked for.
+        role: Role,
+        /// The bound endpoint, or `None` when it could not be bound at all.
+        /// Either way an invite is issued: without this transport the ticket
+        /// simply says nothing about it and every guest uses the iroh path.
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+        /// The waiting `invite_create` call.
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    },
+    /// Host side: a guest arrived on the obfuscated endpoint bound for the
+    /// live invite (gap-tasks/21 task 2; ADR 0080).
+    ///
+    /// The QUIC handshake is already finished — the acceptor had to await it
+    /// to read the peer's identity and ALPN out of the TLS session — so this
+    /// carries a connection that is authenticated but nothing more. It joins
+    /// the same classify-and-handshake path as an iroh one, which is where the
+    /// invite it claims to hold is actually checked (§7, §9.1).
+    ObfuscatedIncoming { connection: Box<PeerConnection> },
     /// A display-mode switch's confirmation window elapsed off the actor
     /// loop (docs/bugs/16-host-display-mode.md #3; ADR 0048). `generation`
     /// ties this to the switch that armed it; the actor checks both that its
@@ -3680,13 +3725,13 @@ enum Accepted {
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
         peer: NodeId,
     },
     /// Tunnel ALPN: authenticated only, nothing decided — exactly like media
     /// and files, and for the same reason (§4.1, §2.3; ADR 0078).
     Tunnel {
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
         peer: NodeId,
     },
     /// Terminal ALPN: authenticated only, nothing decided — same again
@@ -3698,7 +3743,7 @@ enum Accepted {
     /// File ALPN: authenticated only, nothing decided — exactly like media,
     /// and for the same reason (§4.1, §2.3).
     File {
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
         peer: NodeId,
     },
 }
@@ -3719,6 +3764,82 @@ struct AuditContext {
 impl std::fmt::Debug for AuditContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuditContext").finish_non_exhaustive()
+    }
+}
+
+/// Guest side: how to reach one host on any of the four ALPNs, whichever
+/// transport its session was established over (gap-tasks/21 task 2; ADR 0080).
+///
+/// A session is more than its control channel: `rd/media/1` follows a grant,
+/// `rd/file/1` and `rd/tunnel/1` are opened lazily much later (§4.1). All three
+/// have to be opened the same way the control channel was, or a guest that
+/// reached a host through the obfuscated transport would drop back onto iroh
+/// the moment a picture was granted — which is the one thing that transport
+/// exists to avoid (ADR 0052). So the choice is made once, when the invite is
+/// read, and this is what the actor remembers instead of a bare address.
+#[derive(Clone)]
+pub enum HostDialer {
+    /// The iroh endpoint: what every session used before this transport
+    /// existed, and still the default.
+    Iroh {
+        endpoint: PeerEndpoint,
+        /// The address set the invite carried (§7).
+        addr: iroh::EndpointAddr,
+    },
+    /// The obfuscated transport, bound once for this host and shared by every
+    /// channel of the session with it (ADR 0052, ADR 0053).
+    Obfuscated(Arc<lumepeer_net::obfuscated_endpoint::GuestObfuscatedEndpoint>),
+}
+
+impl std::fmt::Debug for HostDialer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Iroh { addr, .. } => f.debug_struct("Iroh").field("addr", &addr.id).finish(),
+            Self::Obfuscated(_) => f.write_str("Obfuscated"),
+        }
+    }
+}
+
+impl HostDialer {
+    /// Opens one channel to this host on `alpn`.
+    ///
+    /// # Errors
+    /// [`NetError::Dial`] if the channel cannot be opened.
+    pub async fn connect(&self, alpn: &[u8]) -> Result<PeerConnection, NetError> {
+        match self {
+            Self::Iroh { endpoint, addr } => endpoint.connect(addr.clone(), alpn).await,
+            Self::Obfuscated(endpoint) => endpoint.connect(alpn).await,
+        }
+    }
+
+    /// One control-channel dial attempt.
+    ///
+    /// `by_lookup` strips the ticket's addresses so iroh reaches the host by
+    /// its endpoint key alone, which is what finds a host that rebooted onto a
+    /// new address (ADR 0062). The obfuscated transport has no lookup service
+    /// and exactly one address — the one the ticket pinned — so it ignores the
+    /// hint and dials the same target every time.
+    ///
+    /// # Errors
+    /// [`NetError::Dial`] if the channel cannot be opened.
+    async fn connect_control(&self, by_lookup: bool) -> Result<PeerConnection, NetError> {
+        match self {
+            Self::Iroh { endpoint, addr } if by_lookup => {
+                endpoint
+                    .connect(
+                        iroh::EndpointAddr::from(addr.id),
+                        lumepeer_net::ALPN_CONTROL,
+                    )
+                    .await
+            }
+            _ => self.connect(lumepeer_net::ALPN_CONTROL).await,
+        }
+    }
+
+    /// Whether this host is being reached over the obfuscated transport, for
+    /// the log line that says so and nothing else.
+    const fn is_obfuscated(&self) -> bool {
+        matches!(*self, Self::Obfuscated(_))
     }
 }
 
@@ -3975,9 +4096,10 @@ struct Actor {
     /// Kept in step by `start_view` and `stop_view`, which are the only two
     /// places a view begins or ends.
     view_feeds: ViewFeeds,
-    /// Guest side: dialable address per host, remembered from its invite so the
-    /// media dial does not have to wait for discovery.
-    host_addrs: std::collections::HashMap<NodeId, iroh::EndpointAddr>,
+    /// Guest side: how to reach each host, remembered from its invite so the
+    /// media dial does not have to wait for discovery — and so every later
+    /// channel takes the transport the control channel took (ADR 0080).
+    host_dialers: std::collections::HashMap<NodeId, HostDialer>,
     /// Guest side: the invite code used to reach each host, kept so the history
     /// row written when the session ends can dial it again (ADR 0016).
     host_invites: std::collections::HashMap<NodeId, String>,
@@ -4002,7 +4124,7 @@ struct Actor {
         std::collections::HashMap<NodeId, std::collections::VecDeque<std::path::PathBuf>>,
     /// The `rd/file/1` connection per peer, opened lazily and only after an
     /// accepted offer (§4).
-    file_conns: std::collections::HashMap<NodeId, iroh::endpoint::Connection>,
+    file_conns: std::collections::HashMap<NodeId, PeerConnection>,
     /// Peers whose file connection is being dialed right now, so a second
     /// accepted offer does not start a second dial.
     file_dialing: std::collections::HashSet<NodeId>,
@@ -4121,6 +4243,34 @@ struct Actor {
     /// submitting the form. The connect form uses this to keep the modal from
     /// flashing open for a host it already knows the password to.
     connect_credentials_auto: bool,
+    /// The obfuscated transport, and whether this run may use it at all
+    /// (gap-tasks/21; ADR 0080).
+    obfuscated: ObfuscatedHost,
+}
+
+/// Everything the obfuscated transport needs across invites on the host side
+/// (gap-tasks/21; ADR 0080).
+///
+/// One struct rather than three fields on the actor because the three move
+/// together: `enabled` decides whether the other two are ever anything but
+/// their defaults.
+#[derive(Debug, Default)]
+struct ObfuscatedHost {
+    /// Whether this run may use the transport at all (`[network] obfuscated`,
+    /// off by default). With it off nothing here is ever bound or dialed and
+    /// the node behaves exactly as it did before this transport existed.
+    enabled: bool,
+    /// Whether a bind is in flight, so a second invite request cannot start a
+    /// second one racing it.
+    binding: bool,
+    /// The endpoint bound for the live invite, when one could be bound at all.
+    ///
+    /// Its life is the invite's: issued means bound, replaced means the old
+    /// one is closed. `None` is the ordinary state — the flag is off, no
+    /// invite has been issued this run, or STUN found no usable address
+    /// (double NAT), in which case the ticket carries nothing about this
+    /// transport and every guest falls back to the iroh path.
+    endpoint: Option<HostObfuscatedEndpoint>,
 }
 
 impl Actor {
@@ -5481,7 +5631,7 @@ impl Actor {
     /// connection from a peer with no live session carrying `tunnel` is
     /// closed on the spot. Nothing about *which addresses* is decided here —
     /// that is re-read per request, because a tunnel is many connections.
-    fn on_tunnel_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+    fn on_tunnel_connected(&mut self, peer: NodeId, connection: PeerConnection) {
         self.tunnel_dialing.remove(&peer);
         let tag = self.label_of(&peer);
         if !self.connections.contains_key(&peer) || !self.may_tunnel(&peer) {
@@ -5539,15 +5689,14 @@ impl Actor {
         if self.tunnels.contains_key(&peer) || self.tunnel_dialing.contains(&peer) {
             return;
         }
-        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+        let Some(dialer) = self.host_dialers.get(&peer).cloned() else {
             return;
         };
         self.tunnel_dialing.insert(peer);
-        let endpoint = self.endpoint.clone();
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
         tokio::spawn(async move {
-            let event = match endpoint.connect(addr, lumepeer_net::ALPN_TUNNEL).await {
+            let event = match dialer.connect(lumepeer_net::ALPN_TUNNEL).await {
                 Ok(connection) => TunnelEvent::Connected {
                     peer,
                     connection: Box::new(connection),
@@ -6739,11 +6888,7 @@ impl Actor {
     /// Finishes the QUIC handshake, checks the ALPN and runs the control
     /// handshake, all on its own task and under one deadline (§9.1, §18).
     fn spawn_handshake(&self, incoming: iroh::endpoint::Incoming) {
-        let Ok(permit) = Arc::clone(&self.handshake_slots).try_acquire_owned() else {
-            tracing::warn!(
-                limit = MAX_INFLIGHT_HANDSHAKES,
-                "refusing an incoming connection: handshake slots exhausted"
-            );
+        let Some(permit) = self.handshake_permit() else {
             drop(incoming);
             return;
         };
@@ -6759,7 +6904,6 @@ impl Actor {
             // the host just before it would have arrived, and both sides then
             // reported a failure neither had caused (ADR 0027).
             let accept_deadline = std::time::Duration::from_secs(INCOMING_ACCEPT_TIMEOUT_SECS);
-            let handshake_deadline = std::time::Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS);
             let Ok(connection) = tokio::time::timeout(accept_deadline, async move {
                 PeerEndpoint::finish_accept(incoming).await.ok()
             })
@@ -6771,15 +6915,45 @@ impl Actor {
                 );
                 return;
             };
-            let Ok(outcome) = tokio::time::timeout(
-                handshake_deadline,
-                classify_incoming(connection, &verifying_key, &salt),
-            )
-            .await
-            else {
+            handshake_and_dispatch(connection, &verifying_key, &salt, &tx).await;
+        });
+    }
+
+    /// The same, for a connection accepted on the obfuscated transport
+    /// (gap-tasks/21 task 2; ADR 0080).
+    ///
+    /// Its QUIC handshake is already finished — `ObfuscatedAcceptor` awaits it
+    /// in order to read the peer identity and ALPN out of the TLS session — so
+    /// only the control-handshake deadline is left to apply. Everything after
+    /// that is the same code, on purpose: a second copy of the classify-and-
+    /// dispatch path under a second transport would be a second place for an
+    /// authorization decision to drift (§2.3).
+    fn spawn_obfuscated_incoming(&self, connection: PeerConnection) {
+        let Some(permit) = self.handshake_permit() else {
+            return;
+        };
+        let tx = self.events_tx.clone();
+        let verifying_key = self.identity.verifying_key();
+        let salt = self.install_salt;
+        tokio::spawn(async move {
+            let _permit = permit;
+            handshake_and_dispatch(Some(connection), &verifying_key, &salt, &tx).await;
+        });
+    }
+
+    /// One of the [`MAX_INFLIGHT_HANDSHAKES`] slots an incoming connection has
+    /// to hold to be worked on at all, or `None` when they are all taken.
+    ///
+    /// One budget across both transports, because it bounds what this host
+    /// will do for peers it has not authenticated yet, and that is a property
+    /// of the host rather than of a wire.
+    fn handshake_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.handshake_slots)
+            .try_acquire_owned()
+            .inspect_err(|_| {
                 tracing::warn!(
-                    timeout_secs = CONTROL_HANDSHAKE_TIMEOUT_SECS,
-                    "dropping an incoming connection that did not finish its control handshake in time"
+                    limit = MAX_INFLIGHT_HANDSHAKES,
+                    "refusing an incoming connection: handshake slots exhausted"
                 );
                 return;
             };
@@ -7065,9 +7239,9 @@ impl Actor {
             ActorEvent::Dialed {
                 peer,
                 code,
-                addr,
+                dialer,
                 result,
-            } => self.on_dialed(peer, code, *addr, result),
+            } => self.on_dialed(peer, code, *dialer, result),
             ActorEvent::File(event) => self.on_file_event(event),
             ActorEvent::Tunnel(event) => self.on_tunnel_event(event),
             ActorEvent::Terminal(event) => self.on_terminal_event(event),
@@ -7085,6 +7259,15 @@ impl Actor {
                 path,
                 prepared,
             } => self.on_put_prepared(peer, dir, path, prepared),
+            ActorEvent::ObfuscatedBound {
+                invite_id,
+                role,
+                endpoint,
+                reply,
+            } => self.on_obfuscated_bound(invite_id, role, endpoint, reply),
+            ActorEvent::ObfuscatedIncoming { connection } => {
+                self.spawn_obfuscated_incoming(*connection);
+            }
             ActorEvent::DisplayModeConfirmTimeout { generation } => {
                 self.on_display_mode_confirm_timeout(generation);
             }
@@ -7099,7 +7282,7 @@ impl Actor {
     /// here, on the actor's own thread, because this is the only place that can
     /// read `SessionManager` — a media connection must never be able to
     /// authorize itself.
-    fn on_media_accepted(&mut self, connection: iroh::endpoint::Connection, peer: NodeId) {
+    fn on_media_accepted(&mut self, connection: PeerConnection, peer: NodeId) {
         let tag = self.label_of(&peer);
         let granted = self.connections.contains_key(&peer)
             && self.sessions.state(&peer) == SessionState::Active
@@ -7350,7 +7533,7 @@ impl Actor {
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
             return;
         }
-        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+        let Some(dialer) = self.host_dialers.get(&peer).cloned() else {
             tracing::warn!(peer = %tag, "no remembered address for this host: cannot open media");
             return;
         };
@@ -7364,13 +7547,12 @@ impl Actor {
         // The media connection lands here once the media task dials, so the
         // mic toggle can open its tagged stream on the *same* `rd/media/1`
         // the picture uses (§4.1; ADR 0028).
-        let media_connection: Arc<std::sync::Mutex<Option<iroh::endpoint::Connection>>> =
+        let media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>> =
             Arc::new(std::sync::Mutex::new(None));
         let bitstream = Arc::new(BitstreamFeed::default());
         let task = spawn_media_receiver(
             MediaTarget {
-                endpoint: self.endpoint.clone(),
-                addr,
+                dialer,
                 peer,
                 reports: self.reports_tx.clone(),
                 tag: tag.clone(),
@@ -7877,7 +8059,7 @@ impl Actor {
                 // A revoke while the request is still pending is the host
                 // pressing Deny; after a grant it is an ordinary end of
                 // session, and the connect form should just go quiet.
-                let dialed = self.host_addrs.contains_key(&peer);
+                let dialed = self.host_dialers.contains_key(&peer);
                 self.settle_connect(peer, ConnectPhase::Denied);
                 self.stop_view(peer);
                 if dialed {
@@ -8558,11 +8740,10 @@ impl Actor {
                 let _ = reply.send(result);
             }
             ActorCommand::InviteCreate { role, renew, reply } => {
-                let result = self.on_invite_create(role, renew);
-                if let Err(ActorError::Net(ref error)) = result {
-                    tracing::warn!(%error, "could not issue an invite");
-                }
-                let _ = reply.send(result);
+                // The reply travels into the call: with the obfuscated
+                // transport on, issuing waits for a STUN round trip that
+                // cannot run on this thread (ADR 0080).
+                self.on_invite_create(role, renew, reply);
             }
             ActorCommand::InviteCurrent { reply } => {
                 let now = unix_now();
@@ -9513,7 +9694,12 @@ impl Actor {
 
     /// Issues an invite for `role`, refusing while the endpoint has no
     /// dialable address (§7).
-    fn on_invite_create(&mut self, role: Role, renew: bool) -> Result<InviteDto, ActorError> {
+    fn on_invite_create(
+        &mut self,
+        role: Role,
+        renew: bool,
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    ) {
         let now = unix_now();
         // "Show me my code" and "give me a new code" are different wishes and
         // used to be the same call (ADR 0062). Answering the first by issuing
@@ -9528,7 +9714,17 @@ impl Actor {
             && ticket.allowed_request == role
             && !ticket.is_expired_at(now)
         {
-            return Ok(live);
+            let _ = reply.send(Ok(live));
+            return;
+        }
+        // A bind for another invite is already in flight and owns the endpoint
+        // this one would replace. Refusing is what keeps two issues from
+        // racing to retire each other's ticket — the same answer a second
+        // dial gets while one is in flight.
+        if self.obfuscated.binding {
+            tracing::info!("an invite is already being issued");
+            let _ = reply.send(Err(ActorError::Net(NetError::AlreadyConnected)));
+            return;
         }
         let addr = self.endpoint.addr();
         // An invite is only worth anything if it carries somewhere to
@@ -9540,7 +9736,8 @@ impl Actor {
         // wrong machine.
         if addr.addrs.is_empty() {
             tracing::warn!("refusing to issue an invite: the endpoint has no dialable address yet");
-            return Err(ActorError::Net(NetError::Offline));
+            let _ = reply.send(Err(ActorError::Net(NetError::Offline)));
+            return;
         }
         // With direct paths on (ADR 0026) the address set fills up from the
         // local interfaces long before a relay is reached, so an invite issued
@@ -9555,11 +9752,88 @@ impl Actor {
             );
         }
         tracing::info!(addrs = ?addr.addrs, "issuing an invite");
-        // The obfuscated-transport address/fingerprint are not produced by
-        // anything in this actor yet (task 17 increment 3, ADR 0053) — every
-        // ticket issued here still carries only the existing iroh address
-        // until that wiring lands.
-        let issued = InviteTicket::issue(&self.identity, &addr, role, now, None, None);
+        // The invite id is chosen here rather than inside `InviteTicket::issue`
+        // because the obfuscated transport derives its datagram keys from it
+        // (`lumepeer_net::obfuscate`), so the endpoint has to be bound under
+        // this id before the ticket that advertises it can be signed
+        // (ADR 0080).
+        let mut invite_id = [0u8; lumepeer_net::ticket::INVITE_ID_BYTES];
+        rand::rng().fill_bytes(&mut invite_id);
+
+        if !self.obfuscated.enabled {
+            // The shipping default: no obfuscated endpoint is bound, the
+            // ticket says nothing about that transport, and this whole call
+            // stays as synchronous as it was before the transport existed.
+            let issued = self.finish_invite(role, invite_id, None);
+            if let Err(ActorError::Net(ref error)) = issued {
+                tracing::warn!(%error, "could not issue an invite");
+            }
+            let _ = reply.send(issued);
+            return;
+        }
+
+        // Binding is a STUN round trip to a public reflector — seconds, on a
+        // thread that must not be the actor's (ADR 0027). The reply travels
+        // with it and is answered when `ObfuscatedBound` comes back.
+        self.obfuscated.binding = true;
+        let events = self.events_tx.clone();
+        // The endpoint's certificate is generated from this node's own
+        // endpoint key, so a guest that dials it authenticates the same
+        // `NodeId` the iroh path would have given it (ADR 0080).
+        let identity = self.identity.clone();
+        tokio::spawn(async move {
+            let endpoint =
+                match lumepeer_net::obfuscated_endpoint::bind_host(&invite_id, &identity).await {
+                    Ok(endpoint) => Some(Box::new(endpoint)),
+                    Err(error) => {
+                        // Not fatal, and not a refusal to issue: the invite is
+                        // still worth handing out over the iroh path this
+                        // transport was only ever added beside (ADR 0052).
+                        tracing::warn!(
+                            %error,
+                            "could not bind the obfuscated endpoint for this invite"
+                        );
+                        None
+                    }
+                };
+            let _ = events
+                .send(ActorEvent::ObfuscatedBound {
+                    invite_id,
+                    role,
+                    endpoint,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Host side: signs, registers and stores the invite for `invite_id`.
+    ///
+    /// `obfuscated` is the address and pinned cert fingerprint of the endpoint
+    /// bound for this invite, when there is one worth advertising — `None`
+    /// leaves both ticket fields empty, which is what every guest built before
+    /// this transport, and every guest with the flag off, already expects
+    /// (ADR 0053; ADR 0080).
+    fn finish_invite(
+        &mut self,
+        role: Role,
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        obfuscated: Option<(std::net::SocketAddr, [u8; 32])>,
+    ) -> Result<InviteDto, ActorError> {
+        let addr = self.endpoint.addr();
+        let (obfuscated_addr, fingerprint) = match obfuscated {
+            Some((addr, fingerprint)) => (Some(addr), Some(fingerprint)),
+            None => (None, None),
+        };
+        let issued = InviteTicket::issue_with_id(
+            &self.identity,
+            &addr,
+            role,
+            unix_now(),
+            invite_id,
+            obfuscated_addr,
+            fingerprint,
+        );
         match issued {
             Ok(ticket) => match ticket.to_code() {
                 Ok(code) => {
@@ -9583,6 +9857,94 @@ impl Actor {
             },
             Err(e) => Err(ActorError::Net(e)),
         }
+    }
+
+    /// Host side: an obfuscated endpoint finished binding for a new invite.
+    ///
+    /// This is where the endpoint's life is tied to the invite's (gap-tasks/21
+    /// task 1): the one bound for the invite being replaced is closed, so its
+    /// keep-alive stops holding a NAT mapping open for a code nobody can claim
+    /// any more, and the new one takes its place. A `public_addr` of `None` —
+    /// no reflector answered, or the mapping is unusable behind a double NAT —
+    /// is an ordinary outcome and not an error: the ticket then says nothing
+    /// about this transport, and an endpoint nobody can dial is not kept.
+    fn on_obfuscated_bound(
+        &mut self,
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        role: Role,
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+        reply: oneshot::Sender<Result<InviteDto, ActorError>>,
+    ) {
+        self.obfuscated.binding = false;
+        let usable = endpoint.and_then(|endpoint| {
+            let addr = endpoint.public_addr?;
+            Some((endpoint, addr))
+        });
+        let advertised = usable
+            .as_ref()
+            .map(|(endpoint, addr)| (*addr, endpoint.cert_fingerprint));
+        let issued = self.finish_invite(role, invite_id, advertised);
+        if let Err(ActorError::Net(ref error)) = issued {
+            tracing::warn!(%error, "could not issue an invite");
+        }
+        // Swapped in only once the ticket exists: an endpoint put in place for
+        // an invite that then failed to sign would leave the host listening
+        // for a code it never handed out.
+        if issued.is_ok() {
+            self.replace_obfuscated_host(usable.map(|(endpoint, _)| *endpoint));
+        }
+        let _ = reply.send(issued);
+    }
+
+    /// Puts `next` in place of the endpoint bound for the previous invite,
+    /// closing that one (ADR 0080).
+    ///
+    /// The close is spawned because it awaits the QUIC shutdown, and the actor
+    /// loop is not a place to await anything (ADR 0027). Its keep-alive is
+    /// aborted the moment `close` starts, which is the half that matters.
+    fn replace_obfuscated_host(&mut self, next: Option<HostObfuscatedEndpoint>) {
+        if let Some(previous) = self.obfuscated.endpoint.take() {
+            tracing::info!("closing the obfuscated endpoint of the replaced invite");
+            tokio::spawn(async move { previous.close().await });
+        }
+        if let Some(next) = next.as_ref() {
+            tracing::info!(addr = ?next.public_addr, "the invite carries an obfuscated address");
+            self.spawn_obfuscated_accept_loop(next.acceptor());
+        }
+        self.obfuscated.endpoint = next;
+    }
+
+    /// Serves the endpoint bound for the live invite until it is closed
+    /// (gap-tasks/21 task 2; ADR 0080).
+    ///
+    /// The loop is not owned or tracked: closing the endpoint is what ends it,
+    /// which is the same thing that retires the invite it was bound for, so
+    /// there is nothing left for a second handle to stop. A connection that
+    /// fails its own handshake is logged and the loop goes on — one guest that
+    /// could not arrive is not a reason to stop serving the invite.
+    fn spawn_obfuscated_accept_loop(&self, acceptor: ObfuscatedAcceptor) {
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = acceptor.accept().await {
+                match incoming {
+                    Ok(connection) => {
+                        if events
+                            .send(ActorEvent::ObfuscatedIncoming {
+                                connection: Box::new(connection),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "an obfuscated connection did not come up");
+                    }
+                }
+            }
+            tracing::debug!("the obfuscated endpoint stopped accepting");
+        });
     }
 
     /// Transcript of `label`; empty for an unknown label rather than an
@@ -10175,7 +10537,7 @@ impl Actor {
     /// permanent: `ensure_file_connection` would keep finding an entry, never
     /// dial again, and every later transfer would wait on a connection that
     /// accepts nothing.
-    fn live_file_connection(&mut self, peer: NodeId) -> Option<iroh::endpoint::Connection> {
+    fn live_file_connection(&mut self, peer: NodeId) -> Option<PeerConnection> {
         let connection = self.file_conns.get(&peer)?;
         if connection.close_reason().is_some() {
             tracing::debug!(peer = %self.label_of(&peer), "dropping a closed file connection");
@@ -10199,15 +10561,14 @@ impl Actor {
         if self.file_dialing.contains(&peer) {
             return;
         }
-        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+        let Some(dialer) = self.host_dialers.get(&peer).cloned() else {
             return;
         };
         self.file_dialing.insert(peer);
-        let endpoint = self.endpoint.clone();
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
         tokio::spawn(async move {
-            let event = match endpoint.connect(addr, lumepeer_net::ALPN_FILE).await {
+            let event = match dialer.connect(lumepeer_net::ALPN_FILE).await {
                 Ok(connection) => FileEvent::Connected {
                     peer,
                     connection: Box::new(connection),
@@ -10287,7 +10648,7 @@ impl Actor {
     /// the speed of all three. Progress goes back through `try_send`: a
     /// dropped progress update costs a UI frame, and blocking a transfer on
     /// the actor's mailbox would cost the transfer.
-    fn spawn_send(&mut self, peer: NodeId, connection: iroh::endpoint::Connection, job: SendJob) {
+    fn spawn_send(&mut self, peer: NodeId, connection: PeerConnection, job: SendJob) {
         let events = self.events_tx.clone();
         let progress = self.events_tx.clone();
         let tag = self.label_of(&peer);
@@ -10339,7 +10700,7 @@ impl Actor {
     }
 
     /// Reads every chunk stream a peer opens on its file connection.
-    fn spawn_file_reader(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+    fn spawn_file_reader(&mut self, peer: NodeId, connection: PeerConnection) {
         let channel = self.file_channel(peer);
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
@@ -10405,7 +10766,7 @@ impl Actor {
     /// session carrying `file_transfer` is closed on the spot, which is what
     /// keeps the accept path safe now that it no longer refuses every file
     /// connection unconditionally.
-    fn on_file_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+    fn on_file_connected(&mut self, peer: NodeId, connection: PeerConnection) {
         self.file_dialing.remove(&peer);
         let tag = self.label_of(&peer);
         if !self.connections.contains_key(&peer) || !self.may_transfer_files(&peer) {
@@ -11168,7 +11529,7 @@ impl Actor {
             self.drop_file_state(peer);
             // Records the host into the remembered list on its way out.
             self.stop_view(peer);
-            self.host_addrs.remove(&peer);
+            self.host_dialers.remove(&peer);
             // The user closing the window on purpose, not a protocol fault —
             // the malformed code close_connection sends would otherwise make
             // an ordinary exit look like an error in the host's own log
@@ -11576,6 +11937,53 @@ impl Actor {
         Ok(())
     }
 
+    /// Guest side: which transport this invite is going to be dialed over
+    /// (gap-tasks/21 task 3; ADR 0080).
+    ///
+    /// Two conditions, both required, neither guessed at: this run must have
+    /// `[network] obfuscated` on — off in every shipping build — and the
+    /// ticket must carry both an address for that transport and the
+    /// fingerprint to pin its certificate by (ADR 0053). A ticket from a host
+    /// whose STUN discovery found nothing carries neither, and is dialed over
+    /// iroh exactly as every ticket was before this transport existed.
+    ///
+    /// Choosing between the two by *trying* one and falling back to the other,
+    /// with the diagnostics that needs, is gap-tasks/23 and deliberately not
+    /// here: this is one decision, taken once, before a single packet is sent.
+    ///
+    /// # Errors
+    /// [`ActorError::Net`] if the obfuscated endpoint cannot be bound at all,
+    /// which is a local failure — no socket — rather than anything about the
+    /// host.
+    fn dialer_for(
+        &self,
+        ticket: &InviteTicket,
+        addr: &iroh::EndpointAddr,
+    ) -> Result<HostDialer, ActorError> {
+        let iroh = || HostDialer::Iroh {
+            endpoint: self.endpoint.clone(),
+            addr: addr.clone(),
+        };
+        if !self.obfuscated.enabled {
+            return Ok(iroh());
+        }
+        let (Some(target), Some(fingerprint)) =
+            (ticket.obfuscated_addr, ticket.host_cert_fingerprint)
+        else {
+            tracing::info!("this invite carries no obfuscated address: dialing the host over iroh");
+            return Ok(iroh());
+        };
+        let endpoint = lumepeer_net::obfuscated_endpoint::GuestObfuscatedEndpoint::bind(
+            &ticket.invite_id,
+            &self.identity,
+            target,
+            fingerprint,
+        )
+        .map_err(ActorError::Net)?;
+        tracing::info!("dialing the host over the obfuscated transport");
+        Ok(HostDialer::Obfuscated(Arc::new(endpoint)))
+    }
+
     /// Guest side: validate the invite here, then run the dial and the
     /// handshake **off** the actor loop (ADR 0027).
     ///
@@ -11609,6 +12017,7 @@ impl Actor {
         }
         let proof = postcard::to_allocvec(&ticket)
             .map_err(|_| ActorError::Net(NetError::MalformedTicket))?;
+        let dialer = self.dialer_for(&ticket, &addr)?;
 
         self.connect_phase = ConnectPhase::Dialing;
         self.connect_peer = Some(addr.id);
@@ -11621,24 +12030,23 @@ impl Actor {
         self.pending_remember = None;
         self.connect_credentials_auto = false;
 
-        let endpoint = self.endpoint.clone();
         let tx = self.events_tx.clone();
         let tag = self.label_of(&addr.id);
         let code = raw.to_owned();
         let role = ticket.allowed_request;
-        let target = addr.clone();
+        let peer = addr.id;
         // Copied out here, on the actor's own thread, rather than read from
         // the dial task: the dial outlives this call and the actor keeps
         // running, so reading it later would be reading a field two threads
         // own. What a `Hello` advertises is settled when the dial starts.
         let codecs = self.own_codec_support;
         tokio::spawn(async move {
-            let result = dial_with_retries(&endpoint, &target, role, proof, &tag, codecs).await;
+            let result = dial_with_retries(&dialer, role, proof, &tag, codecs).await;
             let _ = tx
                 .send(ActorEvent::Dialed {
-                    peer: target.id,
+                    peer,
                     code,
-                    addr: Box::new(target),
+                    dialer: Box::new(dialer),
                     result: result.map(Box::new),
                 })
                 .await;
@@ -11652,7 +12060,7 @@ impl Actor {
         &mut self,
         peer: NodeId,
         code: String,
-        addr: iroh::EndpointAddr,
+        dialer: HostDialer,
         result: Result<Box<ControlConnection>, NetError>,
     ) {
         let tag = self.label_of(&peer);
@@ -11678,8 +12086,13 @@ impl Actor {
         let peer = control.peer();
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
-        // ticket is the only place this address is known without discovery.
-        self.host_addrs.insert(peer, addr);
+        // ticket is the only place this address is known without discovery,
+        // and every later channel has to take the transport this one took
+        // (ADR 0080).
+        if dialer.is_obfuscated() {
+            tracing::info!(peer = %self.label_of(&peer), "this session is on the obfuscated transport");
+        }
+        self.host_dialers.insert(peer, dialer);
         // Remembered so the history row written when this session ends can dial
         // the same host again (ADR 0016).
         self.host_invites.insert(peer, code);
@@ -11824,7 +12237,7 @@ async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
 /// waiting on is dropped rather than an error — both ends may close at once,
 /// and neither is wrong.
 async fn run_tunnel_connection(
-    connection: iroh::endpoint::Connection,
+    connection: PeerConnection,
     channel: TunnelChannel,
     mut frames_rx: mpsc::Receiver<TunnelWrite>,
     peer: NodeId,
@@ -12353,6 +12766,85 @@ const fn rejection_of(error: &UnattendedError) -> UnattendedRejection {
     }
 }
 
+/// Runs the control handshake on one accepted connection, under the §9.1
+/// deadline, and sends the actor the event its ALPN earned.
+///
+/// Shared by both transports (gap-tasks/21 task 2; ADR 0080): by the time a
+/// connection reaches here nothing about it says which one carried it, and
+/// nothing here asks.
+async fn handshake_and_dispatch(
+    connection: Option<PeerConnection>,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    salt: &[u8; 32],
+    tx: &mpsc::Sender<ActorEvent>,
+) {
+    let handshake_deadline = std::time::Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS);
+    let Ok(outcome) = tokio::time::timeout(
+        handshake_deadline,
+        classify_incoming(connection, verifying_key, salt),
+    )
+    .await
+    else {
+        tracing::warn!(
+            timeout_secs = CONTROL_HANDSHAKE_TIMEOUT_SECS,
+            "dropping an incoming connection that did not finish its control handshake in time"
+        );
+        return;
+    };
+    let event = match outcome {
+        Some(Accepted::Control {
+            connection,
+            peer,
+            ticket,
+            announces_media_faults,
+            speaks_remote_sas,
+            speaks_file_transfer,
+            speaks_unattended,
+            speaks_receiver_report,
+            speaks_cursor_shape,
+            speaks_stream_scale,
+            speaks_stream_size,
+            speaks_file_browse,
+            speaks_file_manage,
+            speaks_dir_transfer,
+            speaks_tunnel,
+            speaks_clipboard_files,
+            speaks_display_mode,
+            guest_codec_support,
+        }) => ActorEvent::Handshaked {
+            connection,
+            peer,
+            announces_media_faults,
+            speaks_remote_sas,
+            speaks_file_transfer,
+            speaks_unattended,
+            speaks_receiver_report,
+            speaks_cursor_shape,
+            speaks_stream_scale,
+            speaks_stream_size,
+            speaks_file_browse,
+            speaks_file_manage,
+            speaks_dir_transfer,
+            speaks_tunnel,
+            speaks_clipboard_files,
+            speaks_display_mode,
+            guest_codec_support,
+            ticket: *ticket,
+        },
+        Some(Accepted::Media { connection, peer }) => {
+            ActorEvent::MediaAccepted { connection, peer }
+        }
+        Some(Accepted::File { connection, peer }) => {
+            ActorEvent::File(FileEvent::Connected { connection, peer })
+        }
+        Some(Accepted::Tunnel { connection, peer }) => {
+            ActorEvent::Tunnel(TunnelEvent::Connected { connection, peer })
+        }
+        None => return,
+    };
+    let _ = tx.send(event).await;
+}
+
 /// Sorts one accepted connection by ALPN and, if it is control, runs the host
 /// handshake and verifies the invite it carries (§4.1, §9.1, §18).
 ///
@@ -12364,12 +12856,12 @@ const fn rejection_of(error: &UnattendedError) -> UnattendedRejection {
     reason = "one field per feature string the handshake reads; splitting it               would separate a string from the flag it sets"
 )]
 async fn classify_incoming(
-    connection: Option<iroh::endpoint::Connection>,
+    connection: Option<PeerConnection>,
     verifying_key: &ed25519_dalek::VerifyingKey,
     salt: &[u8; 32],
 ) -> Option<Accepted> {
     let connection = connection?;
-    let peer = connection.remote_id();
+    let peer = connection.peer();
     let tag = peer_tag(salt, &peer);
     match Channel::from_alpn(connection.alpn()) {
         Some(Channel::Control) => {}
@@ -12541,36 +13033,25 @@ async fn classify_incoming(
 /// been punched. What is *not* retried is an answer: a bad ticket, a version
 /// mismatch or a refusal is a verdict, and asking again only collects it twice.
 async fn dial_with_retries(
-    endpoint: &PeerEndpoint,
-    addr: &iroh::EndpointAddr,
+    dialer: &HostDialer,
     role: Role,
     proof: Vec<u8>,
     tag: &str,
     codecs: GuestCodecSupport,
 ) -> Result<ControlConnection, NetError> {
     let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
-    // The same host, named by its endpoint key alone. iroh only falls back to
-    // address lookup when the addresses it was handed fail *and* no relay URL
-    // came with them (`Endpoint::connect`), and an invite ticket always
-    // carries one — so a host that rebooted onto a new public IP was retried,
-    // five times, against the addresses it no longer has, and the user was
-    // told to ask for a fresh code (ADR 0062). Stripping the addresses is what
-    // makes the lookup run.
-    let by_id = iroh::EndpointAddr::from(addr.id);
     let mut last = NetError::Dial("no attempt was made".to_owned());
     for attempt in 1..=DIAL_ATTEMPTS {
         // Alternated rather than "addresses first, then lookup": the ticket's
         // addresses are the fast path while they are still true, and ADR 0050
         // widened this loop precisely because one attempt each is not enough
         // to ride out a flapping link. This way both routes get several tries.
-        let target = if attempt.is_multiple_of(2) {
-            &by_id
-        } else {
-            addr
-        };
+        // Only iroh has a lookup to fall back to; the obfuscated transport has
+        // one address and ignores the hint (`HostDialer::connect_control`).
+        let by_lookup = attempt.is_multiple_of(2);
         let outcome = tokio::time::timeout(
             attempt_budget,
-            connect_once(endpoint, target, role, proof.clone(), codecs),
+            connect_once(dialer, by_lookup, role, proof.clone(), codecs),
         )
         .await
         .unwrap_or_else(|_| {
@@ -12612,13 +13093,13 @@ async fn dial_with_retries(
 
 /// One attempt: dial the control ALPN and run the guest half of the handshake.
 async fn connect_once(
-    endpoint: &PeerEndpoint,
-    addr: &iroh::EndpointAddr,
+    dialer: &HostDialer,
+    by_lookup: bool,
     role: Role,
     proof: Vec<u8>,
     codecs: GuestCodecSupport,
 ) -> Result<ControlConnection, NetError> {
-    let connection = endpoint.connect_control(addr.clone()).await?;
+    let connection = dialer.connect_control(by_lookup).await?;
     // What this build understands, for a host to decide what it may send.
     // An older host ignores an unknown string (§9.1) and simply never sends
     // the message behind it.
@@ -12750,6 +13231,7 @@ pub async fn spawn_actor(
         default_capture(),
         crate::clipboard_os::platform_clipboard(),
         stores,
+        settings.obfuscated(),
     );
 
     tokio::spawn({
@@ -12987,6 +13469,7 @@ pub fn spawn_actor_with(
     media: HostMedia,
     clipboard: crate::clipboard_os::ClipboardFactory,
     stores: ActorStores,
+    obfuscated: bool,
 ) -> ActorHandle {
     let ActorStores {
         history_path,
@@ -13143,7 +13626,11 @@ pub fn spawn_actor_with(
         secure_desktop_pointer: None,
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
-        host_addrs: std::collections::HashMap::new(),
+        host_dialers: std::collections::HashMap::new(),
+        obfuscated: ObfuscatedHost {
+            enabled: obfuscated,
+            ..ObfuscatedHost::default()
+        },
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
         speaks_file_transfer: std::collections::HashSet::new(),
@@ -13744,6 +14231,7 @@ mod tests {
             media,
             factory,
             ActorStores::in_memory(),
+            false,
         );
         (handle, clipboard)
     }
@@ -13764,6 +14252,7 @@ mod tests {
             media,
             crate::clipboard_os::no_clipboard(),
             ActorStores::in_memory(),
+            false,
         );
         (handle, endpoint)
     }

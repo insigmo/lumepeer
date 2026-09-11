@@ -20,7 +20,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
 use lumepeer_net::InviteTicket;
-use lumepeer_net::obfuscated_endpoint::{bind_host, connect_guest};
+use lumepeer_net::obfuscated_endpoint::{GuestObfuscatedEndpoint, bind_host};
 use lumepeer_net::ticket::INVITE_ID_BYTES;
 use rand::Rng as _;
 
@@ -68,7 +68,16 @@ async fn host() -> Result<(), String> {
     let mut invite_id = [0u8; INVITE_ID_BYTES];
     rand::rng().fill_bytes(&mut invite_id);
 
-    let bound = bind_host(&invite_id).await.map_err(|e| e.to_string())?;
+    // A throwaway identity, same as `wan_probe.rs`: this probe never touches
+    // the OS keystore or the app's real identity (§11.2). The endpoint's
+    // certificate is generated from it, so the `NodeId` a guest sees here is
+    // this key (ADR 0080).
+    let secret = iroh::SecretKey::generate();
+    let identity = SigningKey::from_bytes(&secret.to_bytes());
+
+    let bound = bind_host(&invite_id, &identity)
+        .await
+        .map_err(|e| e.to_string())?;
     let Some(public_addr) = bound.public_addr else {
         return Err(
             "no STUN server answered (or the mapping looked unusable): this host cannot be \
@@ -78,12 +87,9 @@ async fn host() -> Result<(), String> {
     };
     println!("STUN public_addr={public_addr}");
 
-    // A throwaway identity, same as `wan_probe.rs`: this probe never touches
-    // the OS keystore or the app's real identity (§11.2). `addr`/`node_addr`
-    // still needs *some* iroh address to satisfy `InviteTicket::issue`, even
-    // though this probe never dials it — a bare local endpoint gives one.
-    let secret = iroh::SecretKey::generate();
-    let identity = SigningKey::from_bytes(&secret.to_bytes());
+    // `addr`/`node_addr` still needs *some* iroh address to satisfy
+    // `InviteTicket::issue`, even though this probe never dials it — a bare
+    // local endpoint gives one.
     let iroh_stub = lumepeer_net::PeerEndpoint::bind_local(secret)
         .await
         .map_err(|e| format!("stub iroh bind: {e}"))?;
@@ -100,12 +106,16 @@ async fn host() -> Result<(), String> {
     println!("INVITE {}", ticket.to_code().map_err(|e| e.to_string())?);
 
     println!("WAITING for a guest (up to {}s)", ACCEPT_TIMEOUT.as_secs());
-    let incoming = tokio::time::timeout(ACCEPT_TIMEOUT, bound.endpoint.accept())
+    let connection = tokio::time::timeout(ACCEPT_TIMEOUT, bound.accept())
         .await
         .map_err(|_| format!("no guest connected within {}s", ACCEPT_TIMEOUT.as_secs()))?
-        .ok_or_else(|| "the endpoint closed while accepting".to_owned())?;
-    let connection = incoming.await.map_err(|e| format!("accept: {e}"))?;
-    println!("ACCEPTED remote={:?}", remote_address(&connection));
+        .ok_or_else(|| "the endpoint closed while accepting".to_owned())?
+        .map_err(|e| format!("accept: {e}"))?;
+    println!(
+        "ACCEPTED peer={} alpn={:?}",
+        connection.peer(),
+        String::from_utf8_lossy(connection.alpn())
+    );
 
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -136,10 +146,16 @@ async fn guest(code: &str) -> Result<(), String> {
     };
     println!("DIALING target={target}");
 
-    let connection = connect_guest(&ticket.invite_id, target, fingerprint)
+    // The guest's own throwaway identity: its certificate names it to the
+    // host exactly as the iroh path's endpoint key would (ADR 0080).
+    let identity = SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
+    let endpoint = GuestObfuscatedEndpoint::bind(&ticket.invite_id, &identity, target, fingerprint)
+        .map_err(|e| format!("bind: {e}"))?;
+    let connection = endpoint
+        .connect(lumepeer_net::ALPN_CONTROL)
         .await
         .map_err(|e| format!("dial: {e}"))?;
-    println!("CONNECTED remote={:?}", remote_address(&connection));
+    println!("CONNECTED peer={}", connection.peer());
 
     let (mut send, mut recv) = connection
         .open_bi()
@@ -156,13 +172,6 @@ async fn guest(code: &str) -> Result<(), String> {
     println!("REPLY {:?}", String::from_utf8_lossy(&reply));
     connection.close(0u32.into(), b"done");
     Ok(())
-}
-
-/// The peer address of `connection`'s one path, for a status line.
-fn remote_address(connection: &noq::Connection) -> Option<std::net::SocketAddr> {
-    connection
-        .path(noq::PathId::ZERO)
-        .and_then(|path| path.remote_address().ok())
 }
 
 fn unix_now() -> u64 {

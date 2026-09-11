@@ -26,8 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use iroh::EndpointAddr;
-use iroh::endpoint::Connection;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
@@ -41,7 +39,7 @@ use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, VideoCodec, select_encoder};
 use lumepeer_media::error::MediaError;
 use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
-use lumepeer_net::{PeerEndpoint, STREAM_MIC, accept_media_stream, open_media_stream};
+use lumepeer_net::{PeerConnection, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -1204,7 +1202,7 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
               with no second caller to justify it"
 )]
 pub fn spawn_encode_loop(
-    connection: Connection,
+    connection: PeerConnection,
     capture: SharedCapture,
     recorder: SharedRecorder,
     tag: String,
@@ -1868,11 +1866,11 @@ impl SendRate {
 /// Everything the guest's media loop needs to reach one host.
 #[derive(Debug, Clone)]
 pub struct MediaTarget {
-    /// This node's endpoint, reused for the media dial.
-    pub endpoint: PeerEndpoint,
-    /// Host address, remembered from the invite ticket so the media dial does
-    /// not depend on discovery having caught up.
-    pub addr: EndpointAddr,
+    /// How to reach the host, decided when its invite was read and kept so
+    /// this dial takes the same transport the control channel took
+    /// (ADR 0080). It carries the address the ticket named, so the media dial
+    /// does not depend on discovery having caught up.
+    pub dialer: crate::network::HostDialer,
     /// The host being watched. Only ever used to name this loop's own reports
     /// back to the actor; nothing here can act on it.
     pub peer: NodeId,
@@ -1898,7 +1896,7 @@ pub struct MediaTarget {
         dead_code,
         reason = "read by the actor through ViewState::media_connection; the cell is shared"
     )]
-    pub connection_cell: Arc<std::sync::Mutex<Option<Connection>>>,
+    pub connection_cell: Arc<std::sync::Mutex<Option<PeerConnection>>>,
 }
 
 /// Guest side: dial media, decode, and keep the newest picture in `slot`.
@@ -1996,14 +1994,10 @@ fn set_status(slot: &watch::Sender<ViewSlot>, status: ViewStatus) {
 async fn dial_media(
     target: &MediaTarget,
 ) -> Option<(
-    Connection,
+    PeerConnection,
     lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
 )> {
-    let connection = match target
-        .endpoint
-        .connect(target.addr.clone(), lumepeer_net::ALPN_MEDIA)
-        .await
-    {
+    let connection = match target.dialer.connect(lumepeer_net::ALPN_MEDIA).await {
         Ok(connection) => connection,
         Err(error) => {
             tracing::debug!(peer = %target.tag, %error, "media dial failed");
@@ -2290,7 +2284,7 @@ async fn spawn_decoder(worker: Option<PathBuf>) -> Result<DecoderHandle, String>
 /// feature; without a backend the loop refuses loudly in the log and the
 /// session stays video-only (§18).
 pub fn spawn_audio_loop(
-    connection: Connection,
+    connection: PeerConnection,
     stop: Arc<AtomicBool>,
     recorder: crate::view::SharedRecorder,
     tag: String,
@@ -2418,7 +2412,7 @@ pub fn spawn_audio_loop(
 /// main process only ever sees decoded PCM. Returns when the stream ends —
 /// the caller treats that the same way the video path treats a lost stream.
 async fn stream_audio_once(
-    connection: &Connection,
+    connection: &PeerConnection,
     tag: &str,
     sink: &watch::Sender<Option<Vec<i16>>>,
 ) -> bool {
@@ -2495,7 +2489,7 @@ impl Drop for AbortOnDrop {
 /// turned on mid-session, which opens a fresh stream for exactly this
 /// purpose (§11).
 fn spawn_audio_pass(
-    connection: Connection,
+    connection: PeerConnection,
     tag: String,
     pcm: watch::Sender<Option<Vec<i16>>>,
 ) -> AbortOnDrop {
@@ -2527,7 +2521,7 @@ fn spawn_audio_pass(
 /// itself. Capture runs behind the `audio-capture` feature; without a
 /// backend, or when the OS refuses microphone access, the loop refuses
 /// loudly in the log and the toolbar button reports the refusal (§18).
-pub fn spawn_mic_loop(connection: Connection, tag: String) -> JoinHandle<()> {
+pub fn spawn_mic_loop(connection: PeerConnection, tag: String) -> JoinHandle<()> {
     use lumepeer_media::audio::OpusEncoder;
     use lumepeer_media::capture_audio::{MicCapturer, platform_mic_capturer};
 
@@ -2626,7 +2620,7 @@ pub fn spawn_mic_loop(connection: Connection, tag: String) -> JoinHandle<()> {
 /// that pass lasts. One per media session, started when the media connection
 /// is accepted; the loop inside parks while no mic stream exists and ends
 /// with the session.
-pub fn spawn_guest_mic_pass(connection: Connection, tag: String) -> JoinHandle<()> {
+pub fn spawn_guest_mic_pass(connection: PeerConnection, tag: String) -> JoinHandle<()> {
     tokio::spawn(async move {
         // The mic stream is opt-in on the guest: most sessions never carry
         // one, and the accept call parks until it shows up or the connection
@@ -2752,10 +2746,10 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let host = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
             .await
             .unwrap();
-        let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
             .await
             .unwrap();
         let addr = host.addr();
@@ -2786,8 +2780,10 @@ mod tests {
         let (reports, _reports_rx) = mpsc::channel(4);
         let receiver = spawn_media_receiver(
             MediaTarget {
-                endpoint: guest.clone(),
-                addr,
+                dialer: crate::network::HostDialer::Iroh {
+                    endpoint: guest.clone(),
+                    addr,
+                },
                 peer: guest.node_id(),
                 reports,
                 tag: "test-peer".to_owned(),
