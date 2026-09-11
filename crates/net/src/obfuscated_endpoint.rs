@@ -13,7 +13,7 @@
 //! exercised by `examples/obfuscated_wan_probe.rs` and by this module's own
 //! tests.
 //!
-//! gap-tasks/22 (ADR 0081) settles what a hole punch can be here. The host's
+//! gap-tasks/22 (ADR 0082) settles what a hole punch can be here. The host's
 //! half stays the keep-alive: a one-way invite has no channel on which to
 //! coordinate a simultaneous send, and the one it could borrow — a live iroh
 //! connection — is exactly what is missing on the networks that would need
@@ -649,7 +649,7 @@ impl GuestObfuscatedEndpoint {
     /// certificate, and the real authentication is the `invite_id`-derived
     /// AEAD layer beneath this handshake). The dial itself is the punch — see
     /// [`punch`] for the cadence and why the packets are the dial's own rather
-    /// than a shape of their own (gap-tasks/22 task 3; ADR 0081).
+    /// than a shape of their own (gap-tasks/22 task 3; ADR 0082).
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if the client configuration cannot be built;
@@ -706,7 +706,7 @@ impl GuestObfuscatedEndpoint {
 /// [`OBFUSCATED_CONNECT_ATTEMPTS`] times, each attempt bounded by
 /// [`OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS`] and the next one
 /// [`OBFUSCATED_CONNECT_RETRY_BACKOFF_MS`] behind it, stopping at the first
-/// attempt that connects (gap-tasks/22 task 3; ADR 0081).
+/// attempt that connects (gap-tasks/22 task 3; ADR 0082).
 ///
 /// **The punch packets are the dial's own.** Each attempt's QUIC Initial goes
 /// out through the same `ObfuscatedSocket` as every other datagram, sealed
@@ -722,7 +722,7 @@ impl GuestObfuscatedEndpoint {
 /// able to give up in time to try anything else. The host's half of the punch
 /// is the NAT-mapping keep-alive of ADR 0053, which is unchanged and stays the
 /// only thing a one-way invite can coordinate: nothing here tells the host
-/// when to send, because there is no channel on which to tell it (ADR 0081).
+/// when to send, because there is no channel on which to tell it (ADR 0082).
 ///
 /// # Errors
 /// Whatever the last attempt failed with, or [`NetError::Dial`] if it went
