@@ -69,7 +69,6 @@ use lumepeer_net::tunnel::{StreamId, read_frame, write_close, write_frame};
 use lumepeer_net::{
     Channel, ControlConnection, InviteTicket, NetError, PeerConnection, PeerEndpoint,
 };
-use lumepeer_net::{Channel, ControlConnection, InviteTicket, NetError, PeerEndpoint};
 use lumepeer_terminal::{Shell, ShellControl, ShellError, ShellSize};
 use rand::Rng as _;
 use rand::RngExt as _;
@@ -2912,7 +2911,7 @@ struct TerminalChannel {
     frames: mpsc::Sender<TerminalWrite>,
     /// The QUIC connection under it once there is one, kept so a revoke can
     /// close it outright rather than waiting for the far side to notice (§4).
-    connection: Option<iroh::endpoint::Connection>,
+    connection: Option<PeerConnection>,
 }
 
 /// One shell this host is running for a guest (ADR 0079).
@@ -2942,7 +2941,7 @@ enum TerminalEvent {
     /// the peer's dial was accepted and authorized.
     Connected {
         peer: NodeId,
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
     },
     /// The dial failed, so no shell with this peer has anywhere to send.
     ConnectFailed { peer: NodeId },
@@ -3737,7 +3736,7 @@ enum Accepted {
     /// Terminal ALPN: authenticated only, nothing decided — same again
     /// (§4.1, §2.3; ADR 0079).
     Terminal {
-        connection: Box<iroh::endpoint::Connection>,
+        connection: Box<PeerConnection>,
         peer: NodeId,
     },
     /// File ALPN: authenticated only, nothing decided — exactly like media,
@@ -3767,16 +3766,17 @@ impl std::fmt::Debug for AuditContext {
     }
 }
 
-/// Guest side: how to reach one host on any of the four ALPNs, whichever
+/// Guest side: how to reach one host on any of the five ALPNs, whichever
 /// transport its session was established over (gap-tasks/21 task 2; ADR 0080).
 ///
 /// A session is more than its control channel: `rd/media/1` follows a grant,
-/// `rd/file/1` and `rd/tunnel/1` are opened lazily much later (§4.1). All three
-/// have to be opened the same way the control channel was, or a guest that
-/// reached a host through the obfuscated transport would drop back onto iroh
-/// the moment a picture was granted — which is the one thing that transport
-/// exists to avoid (ADR 0052). So the choice is made once, when the invite is
-/// read, and this is what the actor remembers instead of a bare address.
+/// `rd/file/1`, `rd/tunnel/1` and `rd/term/1` are opened lazily much later
+/// (§4.1). All four have to be opened the same way the control channel was, or
+/// a guest that reached a host through the obfuscated transport would drop
+/// back onto iroh the moment a picture was granted — which is the one thing
+/// that transport exists to avoid (ADR 0052). So the choice is made once, when
+/// the invite is read, and this is what the actor remembers instead of a bare
+/// address.
 #[derive(Clone)]
 pub enum HostDialer {
     /// The iroh endpoint: what every session used before this transport
@@ -6232,7 +6232,7 @@ impl Actor {
     /// from a peer with no live session carrying `terminal` is closed on the
     /// spot — which is a coarser check than the per-open one below and does
     /// not replace it, because a session opens many shells over its life.
-    fn on_terminal_connected(&mut self, peer: NodeId, connection: iroh::endpoint::Connection) {
+    fn on_terminal_connected(&mut self, peer: NodeId, connection: PeerConnection) {
         self.terminal_dialing.remove(&peer);
         let tag = self.label_of(&peer);
         if !self.connections.contains_key(&peer) || !self.may_terminal(&peer) {
@@ -6311,15 +6311,14 @@ impl Actor {
         {
             return;
         }
-        let Some(addr) = self.host_addrs.get(&peer).cloned() else {
+        let Some(dialer) = self.host_dialers.get(&peer).cloned() else {
             return;
         };
         self.terminal_dialing.insert(peer);
-        let endpoint = self.endpoint.clone();
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
         tokio::spawn(async move {
-            let event = match endpoint.connect(addr, lumepeer_net::ALPN_TERMINAL).await {
+            let event = match dialer.connect(lumepeer_net::ALPN_TERMINAL).await {
                 Ok(connection) => TerminalEvent::Connected {
                     peer,
                     connection: Box::new(connection),
@@ -6955,66 +6954,8 @@ impl Actor {
                     limit = MAX_INFLIGHT_HANDSHAKES,
                     "refusing an incoming connection: handshake slots exhausted"
                 );
-                return;
-            };
-            let event = match outcome {
-                Some(Accepted::Control {
-                    connection,
-                    peer,
-                    ticket,
-                    announces_media_faults,
-                    speaks_remote_sas,
-                    speaks_file_transfer,
-                    speaks_unattended,
-                    speaks_receiver_report,
-                    speaks_cursor_shape,
-                    speaks_stream_scale,
-                    speaks_stream_size,
-                    speaks_file_browse,
-                    speaks_file_manage,
-                    speaks_dir_transfer,
-                    speaks_tunnel,
-                    speaks_terminal,
-                    speaks_clipboard_files,
-                    speaks_display_mode,
-                    guest_codec_support,
-                }) => ActorEvent::Handshaked {
-                    connection,
-                    peer,
-                    announces_media_faults,
-                    speaks_remote_sas,
-                    speaks_file_transfer,
-                    speaks_unattended,
-                    speaks_receiver_report,
-                    speaks_cursor_shape,
-                    speaks_stream_scale,
-                    speaks_stream_size,
-                    speaks_file_browse,
-                    speaks_file_manage,
-                    speaks_dir_transfer,
-                    speaks_tunnel,
-                    speaks_terminal,
-                    speaks_clipboard_files,
-                    speaks_display_mode,
-                    guest_codec_support,
-                    ticket: *ticket,
-                },
-                Some(Accepted::Media { connection, peer }) => {
-                    ActorEvent::MediaAccepted { connection, peer }
-                }
-                Some(Accepted::File { connection, peer }) => {
-                    ActorEvent::File(FileEvent::Connected { connection, peer })
-                }
-                Some(Accepted::Tunnel { connection, peer }) => {
-                    ActorEvent::Tunnel(TunnelEvent::Connected { connection, peer })
-                }
-                Some(Accepted::Terminal { connection, peer }) => {
-                    ActorEvent::Terminal(TerminalEvent::Connected { connection, peer })
-                }
-                None => return,
-            };
-            let _ = tx.send(event).await;
-        });
+            })
+            .ok()
     }
 
     /// Takes ownership of an authenticated connection: the reader half runs as
@@ -12326,7 +12267,7 @@ async fn run_tunnel_connection(
 /// Nothing that crosses here is logged: the frames are somebody typing and a
 /// machine answering, and §15's log is deliberately pseudonymous (ADR 0041).
 async fn run_terminal_connection(
-    connection: iroh::endpoint::Connection,
+    connection: PeerConnection,
     mut frames_rx: mpsc::Receiver<TerminalWrite>,
     peer: NodeId,
     tag: String,
@@ -12808,6 +12749,7 @@ async fn handshake_and_dispatch(
             speaks_file_manage,
             speaks_dir_transfer,
             speaks_tunnel,
+            speaks_terminal,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -12826,6 +12768,7 @@ async fn handshake_and_dispatch(
             speaks_file_manage,
             speaks_dir_transfer,
             speaks_tunnel,
+            speaks_terminal,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -12839,6 +12782,9 @@ async fn handshake_and_dispatch(
         }
         Some(Accepted::Tunnel { connection, peer }) => {
             ActorEvent::Tunnel(TunnelEvent::Connected { connection, peer })
+        }
+        Some(Accepted::Terminal { connection, peer }) => {
+            ActorEvent::Terminal(TerminalEvent::Connected { connection, peer })
         }
         None => return,
     };
