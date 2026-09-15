@@ -13,6 +13,8 @@
 //! is a capability — one reads bytes the privileged side published, the other
 //! asks the kernel a question about who is hosting.
 
+#[cfg(target_os = "windows")]
+pub mod agent_launch;
 pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
@@ -36,6 +38,18 @@ pub const SERVICE_NAME: &str = "LumepeerHelper";
 /// the launcher and `main.rs`'s argument check read this one constant so they
 /// cannot drift.
 pub const SECURE_DESKTOP_WORKER_ARG: &str = "--secure-desktop-worker";
+
+/// The single argument that starts the desktop application as this machine's
+/// session agent (ADR 0085).
+///
+/// Lives here, in the crate both sides link, for the same reason
+/// [`SECURE_DESKTOP_WORKER_ARG`] does: the privileged side that builds the
+/// command line and the process that checks its own arguments read one
+/// constant, so they cannot drift. The agent is the desktop binary rather
+/// than this one — it needs capture, encode and a window for the session
+/// indicator, none of which belong anywhere near a `LocalSystem` process
+/// (ADR 0085 §1).
+pub const SESSION_AGENT_ARG: &str = "--session-agent";
 
 /// The argument that re-executes this binary as the secure-desktop *input*
 /// worker (ADR 0057), followed by four bounded integers `kind logical x y`.
