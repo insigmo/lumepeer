@@ -427,6 +427,14 @@ pub struct HistoryEntryDto {
     /// A boolean, never the password: the webview may know that reconnecting
     /// will log itself in, so it can offer to stop that, and nothing more.
     pub has_password: bool,
+    /// Whether this node may dial that host again by itself after the link
+    /// goes away (ADR 0084).
+    ///
+    /// Shown so the row can offer the switch, and so the person can see which
+    /// of their remembered hosts hold it. Together with `has_password` it is
+    /// also the honest answer to "will this one come back on its own": both
+    /// halves or neither.
+    pub trusted: bool,
 }
 
 /// Argument of [`history_connect`].
@@ -795,6 +803,7 @@ pub async fn connection_history(
             role: e.role.into(),
             last_seen_at: e.last_seen_at,
             has_password: e.has_password,
+            trusted: e.trusted,
         })
         .collect())
 }

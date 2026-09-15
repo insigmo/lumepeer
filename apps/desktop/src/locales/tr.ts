@@ -351,4 +351,6 @@ export const tr: Dictionary = {
   'reboot.waiting.title': 'Cihaz yeniden başlatılıyor',
   'reboot.waiting.body': 'Geri gelmesini bekliyoruz. Yeniden girmek için bu oturumun yetkileri değil, cihaz parolası gerekir.',
   'reboot.waiting.cancel': 'Beklemeyi bırak',
+  'history.autoReconnect': 'Kendiliğinden yeniden bağlan',
+  'history.autoReconnect.hint': 'Bu cihaz kaybolursa, sormadan ona geri dön. Burada kayıtlı cihaz parolası gerekir ve yine de yeni bir oturum açmayla biter.',
 };

@@ -351,4 +351,6 @@ export const fr: Dictionary = {
   'reboot.waiting.title': 'L’appareil redémarre',
   'reboot.waiting.body': 'Nous attendons son retour. La reconnexion exigera son mot de passe d’appareil, pas les droits de cette session.',
   'reboot.waiting.cancel': 'Arrêter d’attendre',
+  'history.autoReconnect': 'Se reconnecter tout seul',
+  'history.autoReconnect.hint': 'Si cet appareil disparaît, y revenir sans rien demander. Nécessite son mot de passe d’appareil enregistré ici, et se termine quand même par une nouvelle connexion.',
 };

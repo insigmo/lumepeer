@@ -61,7 +61,10 @@ pub fn go_down(_mode: RebootMode) -> Result<(), String> {
 // Under `cargo test` `go_down` above short-circuits before it reaches
 // here, so this module is compiled and type-checked but never called. That
 // is the intent, not an oversight: see the guard for why.
-#[cfg_attr(test, allow(dead_code, reason = "the test build never takes a machine down"))]
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "the test build never takes a machine down")
+)]
 mod platform {
     use std::os::windows::process::CommandExt as _;
     use std::process::Command;
@@ -113,7 +116,10 @@ mod platform {
 // Under `cargo test` `go_down` above short-circuits before it reaches
 // here, so this module is compiled and type-checked but never called. That
 // is the intent, not an oversight: see the guard for why.
-#[cfg_attr(test, allow(dead_code, reason = "the test build never takes a machine down"))]
+#[cfg_attr(
+    test,
+    allow(dead_code, reason = "the test build never takes a machine down")
+)]
 mod platform {
     use std::process::Command;
 

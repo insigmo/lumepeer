@@ -351,4 +351,6 @@ export const es: Dictionary = {
   'reboot.waiting.title': 'El dispositivo se está reiniciando',
   'reboot.waiting.body': 'Esperamos a que vuelva. Volver a entrar requiere su contraseña de dispositivo, no los permisos de esta sesión.',
   'reboot.waiting.cancel': 'Dejar de esperar',
+  'history.autoReconnect': 'Reconectar por su cuenta',
+  'history.autoReconnect.hint': 'Si este dispositivo desaparece, volver a él sin preguntar. Necesita su contraseña de dispositivo guardada aquí, y aún así termina en un inicio de sesión nuevo.',
 };

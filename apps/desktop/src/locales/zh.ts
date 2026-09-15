@@ -335,4 +335,6 @@ export const zh: Dictionary = {
   'reboot.waiting.title': '设备正在重启',
   'reboot.waiting.body': '正在等待它恢复。重新登录需要它的设备密码，而不是本次会话的权限。',
   'reboot.waiting.cancel': '停止等待',
+  'history.autoReconnect': '自动重新连接',
+  'history.autoReconnect.hint': '这台设备消失后，无需询问即可重新连接。需要在此保存它的设备密码，而且仍然会重新登录。',
 };

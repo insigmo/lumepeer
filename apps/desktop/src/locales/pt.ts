@@ -351,4 +351,6 @@ export const pt: Dictionary = {
   'reboot.waiting.title': 'O dispositivo está reiniciando',
   'reboot.waiting.body': 'Aguardando o retorno. Entrar de novo exige a senha do dispositivo, não os direitos desta sessão.',
   'reboot.waiting.cancel': 'Parar de esperar',
+  'history.autoReconnect': 'Reconectar sozinho',
+  'history.autoReconnect.hint': 'Se este dispositivo sumir, voltar a ele sem perguntar. Precisa da senha do dispositivo salva aqui, e ainda assim termina num novo login.',
 };
