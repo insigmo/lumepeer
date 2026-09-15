@@ -500,6 +500,23 @@ impl SessionManager {
             .is_some_and(|session| session.state == SessionState::Active && session.grants.terminal)
     }
 
+    /// Whether `peer` may take this machine down **right now** (§2.3, §8.2;
+    /// ADR 0084).
+    ///
+    /// Asked twice on purpose, and the second time is the one that decides:
+    /// once when the request arrives, so a guest without the grant never puts
+    /// a warning on somebody's screen, and again when the warning window
+    /// closes, so a host that revoked while the countdown ran keeps its
+    /// machine. The same read-at-the-moment-of-use rule
+    /// [`Self::terminal_allows`] follows, on the one action that cannot be
+    /// undone afterwards.
+    #[must_use]
+    pub fn reboot_allows(&self, peer: &NodeId) -> bool {
+        self.sessions
+            .get(peer)
+            .is_some_and(|session| session.state == SessionState::Active && session.grants.reboot)
+    }
+
     /// State of `peer`'s session; `Idle` if it has none.
     #[must_use]
     pub fn state(&self, peer: &NodeId) -> SessionState {
@@ -959,7 +976,7 @@ mod tests {
         assert_eq!(manager.state(&peer(1)), SessionState::Active);
     }
 
-    const ALL_INDEPENDENT: [IndependentGrant; 9] = [
+    const ALL_INDEPENDENT: [IndependentGrant; 10] = [
         IndependentGrant::ClipboardRead,
         IndependentGrant::ClipboardWrite,
         IndependentGrant::FileTransfer,
@@ -969,7 +986,86 @@ mod tests {
         IndependentGrant::SecureDesktopInput,
         IndependentGrant::Tunnel,
         IndependentGrant::Terminal,
+        IndependentGrant::Reboot,
     ];
+
+    /// ADR 0084: the machine may be taken down only by a live session that
+    /// holds the grant, read at the moment it would happen.
+    #[test]
+    fn a_reboot_needs_the_grant_and_an_active_session() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        assert!(manager.reboot_allows(&peer(1)));
+
+        // Withdrawn on its own, with the role and the keyboard untouched —
+        // which is the whole reason it is an independent grant.
+        manager
+            .set_grant(peer(1), IndependentGrant::Reboot, false)
+            .unwrap();
+        assert!(!manager.reboot_allows(&peer(1)));
+        assert!(manager.grants(&peer(1)).is_some_and(|g| g.input));
+        manager
+            .set_grant(peer(1), IndependentGrant::Reboot, true)
+            .unwrap();
+        assert!(manager.reboot_allows(&peer(1)));
+
+        // A lesser role never carries it, however long the session runs. One
+        // manager each: the default plan allows a single concurrent guest.
+        for (index, role) in [Role::ViewOnly, Role::ControlLimited].into_iter().enumerate() {
+            let mut lesser = SessionManager::new();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "two iterations; the index is 0 or 1"
+            )]
+            let guest = peer(index as u8 + 2);
+            lesser.grant(guest, role).unwrap();
+            assert!(!lesser.reboot_allows(&guest));
+        }
+
+        // And a session inside its reconnect window is not one that may take
+        // the machine down: the link is gone, so nobody is watching the
+        // warning that would have been shown.
+        manager.on_disconnect(peer(1)).unwrap();
+        assert!(!manager.reboot_allows(&peer(1)));
+    }
+
+    /// ADR 0084, and the rule the whole reboot story rests on: a machine that
+    /// was away longer than the resume window comes back to *no* session, so
+    /// the grants it held are gone and the guest needs a fresh consent or a
+    /// fresh device password. Nothing here stretches
+    /// `RECONNECT_WINDOW_SECS` to cover a restart.
+    #[test]
+    fn grants_do_not_come_back_after_the_resume_window_elapsed() {
+        let mut manager = SessionManager::new();
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        assert!(manager.reboot_allows(&peer(1)));
+        manager.on_disconnect(peer(1)).unwrap();
+
+        // The window measured from the disconnect, pushed past its end. The
+        // manager keeps its own `Instant`, so the only honest way to age it is
+        // to age the recorded instant itself.
+        let elapsed = Duration::from_secs(RECONNECT_WINDOW_SECS + 1);
+        let session = manager.sessions.get_mut(&peer(1)).unwrap();
+        session.disconnected_at = Some(Instant::now() - elapsed);
+
+        assert!(matches!(
+            manager.on_reconnect(peer(1)),
+            ReconnectDecision::Reject {
+                reason: RejectReason::WindowElapsed
+            }
+        ));
+        // Not merely refused: the session is gone, so nothing is left for a
+        // later connection from the same device to inherit.
+        assert_eq!(manager.state(&peer(1)), SessionState::Idle);
+        assert_eq!(manager.grants(&peer(1)), None);
+        assert!(!manager.reboot_allows(&peer(1)));
+        assert!(!manager.terminal_allows(&peer(1)));
+
+        // The only way back is a new grant, and it starts from the role rather
+        // than from whatever the old session had been narrowed to.
+        manager.grant(peer(1), Role::ViewOnly).unwrap();
+        assert_eq!(manager.grants(&peer(1)), Some(Grants::from_role(Role::ViewOnly)));
+    }
 
     /// ADR 0079: a shell needs the grant and a live session, and both are read
     /// at the moment it is asked for rather than when the channel came up.
