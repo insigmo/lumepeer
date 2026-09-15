@@ -228,3 +228,15 @@ valid minor16_terminal_open_response_accepted abababababababababababababababab00
 valid minor16_terminal_open_response_cannot_drop_privileges abababababababababababababababab00003800010200
 valid minor16_terminal_resize abababababababababababababababab01023907782800
 valid minor16_terminal_close abababababababababababababababab01033a0700
+
+# --- Frozen for PROTOCOL_MINOR 17: the remote reboot (ADR 0084). One message
+# --- and no answer: a host that accepts it stops being reachable, so there is
+# --- nothing left for it to acknowledge. The only field is whether the machine
+# --- is meant to come back, and the set is closed at two - a third mode byte is
+# --- a peer claiming something this build has never heard of and is refused at
+# --- the parse boundary rather than guessed at. No delay field: how long the
+# --- person at the host has to cancel is the host's own constant, and a guest
+# --- that could name it could name zero.
+valid minor17_reboot_request_reboot abababababababababababababababab01043b0000
+valid minor17_reboot_request_shutdown abababababababababababababababab01053b0100
+invalid minor17_reboot_request_unknown_mode abababababababababababababababab01063b0200

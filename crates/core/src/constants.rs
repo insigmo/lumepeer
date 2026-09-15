@@ -773,3 +773,61 @@ pub const MAX_DISPLAY_MODES_PER_HOST: usize = 128;
 /// resync to a new signal (typically 1-3 s) and short enough that a genuinely
 /// broken mode does not strand the desktop for long.
 pub const DISPLAY_MODE_CONFIRM_TIMEOUT_SECS: u64 = 10;
+
+/// How long the host warns the person in front of it before a guest's
+/// accepted `RebootRequest` actually takes the machine down (§4.1; ADR 0084).
+///
+/// Not a formality. Dropping somebody's machine without a word is the one
+/// thing this grant must not be able to do, so the warning is unconditional —
+/// it is shown even for a guest the host trusts completely, and the restart
+/// is a separate act that happens when this window closes rather than when
+/// the request arrived. The grant is re-read at that moment, so a revoke
+/// landing inside the window stops the restart.
+///
+/// Ten seconds is the trade: long enough that somebody looking at the screen
+/// can read the banner and reach the button, short enough that an operator
+/// who is *not* there does not turn a remote restart into a minute of
+/// waiting. It deliberately matches
+/// [`DISPLAY_MODE_CONFIRM_TIMEOUT_SECS`] rather than inventing a second
+/// number for "how long a host has to notice something drastic".
+pub const REBOOT_WARNING_SECS: u64 = 10;
+
+/// How long the guest waits between attempts to raise a **new** session with
+/// a host that went away (§10; ADR 0084).
+///
+/// The wait that follows [`RECONNECT_WINDOW_SECS`], and a different thing
+/// from it: that window is resume — same session, same grants — and it is
+/// deliberately far shorter than a reboot, because grants must not survive
+/// one. What happens after it elapses is an ordinary dial that ends in an
+/// ordinary consent or an ordinary device password, and this is how often it
+/// is tried.
+///
+/// A flat interval rather than a backoff. A machine coming back from a
+/// restart is not a congested server: it is unreachable for a while and then
+/// abruptly reachable, so what matters is how soon after that moment the next
+/// attempt lands, and a doubling interval is at its worst exactly then. The
+/// cost of a flat interval is bounded by [`REBOOT_WAIT_CEILING_SECS`], and
+/// each attempt is one dial to one host the user asked for.
+pub const REBOOT_WAIT_RETRY_SECS: u64 = 15;
+
+/// How long the guest keeps waiting for a host to come back before giving up
+/// and leaving the reconnect to the person (§10, §18; ADR 0084).
+///
+/// A machine that has not answered in ten minutes is not rebooting: it is off,
+/// or its network is gone, or somebody cancelled the restart and walked away.
+/// Trying forever would leave a dial loop running against a host nobody is
+/// waiting for, so the wait ends and the ordinary "connect again" button is
+/// what is left.
+pub const REBOOT_WAIT_CEILING_SECS: u64 = 600;
+
+/// The wait for a rebooting host has to outlast the resume window, or it would
+/// only ever be tried inside it (§10; ADR 0084).
+///
+/// Stated as an assertion rather than left to the reader because the two
+/// numbers mean opposite things: [`RECONNECT_WINDOW_SECS`] is how long a
+/// session may be resumed *with its grants*, and stretching it to cover a
+/// reboot is exactly what ADR 0084 refuses to do.
+const _: () = assert!(
+    REBOOT_WAIT_CEILING_SECS > RECONNECT_WINDOW_SECS,
+    "the wait for a rebooting host must outlast the resume window"
+);
