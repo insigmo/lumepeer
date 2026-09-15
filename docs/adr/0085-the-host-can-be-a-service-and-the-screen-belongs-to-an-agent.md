@@ -292,6 +292,36 @@ in here is exactly what would make this change too large to review:
   the authorization is made in `lumepeer-core` before the channel is touched,
   exactly as ADR 0049 §4 and ADR 0057 §4 already require of the worker.
 
+## What is built against this decision, and what is not
+
+Stated the way ADR 0043 stated its own shortfall, because an ADR that
+describes a service nobody can start yet would otherwise read as a
+description of something that exists.
+
+Built, and covered by tests that run anywhere:
+
+- The agent channel — its message set, its access list, its process check and
+  its frame mapping (`crates/service/src/agent_protocol.rs`,
+  `agent_channel.rs`, `frame.rs`).
+- Starting and watching an agent as the signed-in user
+  (`crates/service/src/agent_launch.rs`).
+- The host role and its handover (`crates/service/src/host_role.rs`), enforced
+  in the desktop client, which now refuses to become a second host.
+- The machine store and its access list
+  (`crates/service/src/machine_store.rs`).
+- The admission rule of decision 2 (`lumepeer_core::consent::Admission`) and
+  the screen lifecycle of decision 3
+  (`lumepeer_runtime::session_agent::SessionScreen`).
+- The extraction of decision 1: `crates/runtime`.
+
+**Not built: `LumepeerHost` itself.** There is no binary yet that takes the
+host role, builds `ActorStores` from the machine store, binds the endpoint and
+drives an agent — nor the agent mode of the desktop application that would
+attach to it. Every piece one would be assembled from is above; assembling
+them is the work this decision authorizes and does not itself perform. Until
+that exists, the only host on a machine is the desktop client, exactly as
+before, and the host role it now takes is a token nothing else contends for.
+
 ## Verification
 
 What is provable without a second machine, and is:
