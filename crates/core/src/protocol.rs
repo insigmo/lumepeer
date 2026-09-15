@@ -276,7 +276,26 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// guest with two opens in flight pairs the answers with its asks in order,
 /// which this channel's strict `seq` makes well defined. See
 /// `docs/adr/0079-a-terminal-is-its-own-grant-and-never-the-clients-privileges.md`.
-pub const PROTOCOL_MINOR: u16 = 16;
+///
+/// 17: appended [`MessageKind::RebootRequest`] after `TerminalClose`, behind
+/// [`FEATURE_REBOOT`] and the new `reboot` grant. One message and no answer:
+/// a host that accepts it is a host that is about to stop being reachable, so
+/// there is nothing it could usefully promise afterwards, and a refusal is
+/// something the guest reads off the machine still being there. What crosses
+/// is the one thing the host cannot infer — whether the guest asked for a
+/// restart or for a shutdown, which are the same act right up to the moment
+/// the machine would have come back.
+///
+/// The host does **not** act on it when it arrives. It warns the person in
+/// front of it, gives them [`crate::constants::REBOOT_WARNING_SECS`] to
+/// cancel, and re-reads the grant when that window closes rather than when
+/// the request landed: a revoke arriving in between has to stop the restart.
+/// A guest sends it only to a host whose `HelloAck` minor is at least this
+/// one, and a host acts on it only from a guest whose `Hello` advertised
+/// [`FEATURE_REBOOT`] — the same shape [`FEATURE_TERMINAL`] uses, for the same
+/// reason. See
+/// `docs/adr/0084-restarting-the-host-is-its-own-grant-and-a-warned-act.md`.
+pub const PROTOCOL_MINOR: u16 = 17;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -466,6 +485,20 @@ pub const FEATURE_TUNNEL: &str = "tunnel";
 /// decision, and a guest that advertises the string without holding it is
 /// refused with [`TerminalRefusal::NotGranted`].
 pub const FEATURE_TERMINAL: &str = "terminal";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::RebootRequest`] (ADR 0084).
+///
+/// Same compatibility shape and direction as [`FEATURE_TERMINAL`]: the request
+/// is guest-to-host, so the guest advertises the string in its own `Hello` and
+/// the host reads it off that. A host that never saw the string ignores the
+/// message rather than acting on it, which is the deny-by-default direction.
+///
+/// Advertising it asks for nothing: the `reboot` grant is the host's decision,
+/// and a guest that advertises the string without holding the grant is refused
+/// — silently on the wire, out loud in the host's own log and audit trail,
+/// since this message has no answer of its own.
+pub const FEATURE_REBOOT: &str = "reboot";
 
 /// `Hello.features` string a guest sends to say it can actually decode AV1,
 /// the codec a host prefers whenever both ends can manage it (ADR 0072).
@@ -1185,6 +1218,41 @@ pub enum MessageKind {
         /// The shell that is over.
         session_id: u32,
     },
+    /// Guest to host: take this machine down (§4.1; ADR 0084). New in minor
+    /// 17.
+    ///
+    /// The whole ask, and the last message of a session that is granted: the
+    /// host stops being reachable shortly afterwards, so there is nothing to
+    /// acknowledge and no answer variant beside this one. A host that never
+    /// saw [`FEATURE_REBOOT`] in the guest's `Hello`, or whose session does
+    /// not hold `reboot`, ignores it — deny-by-default, and the guest learns
+    /// it by the machine still being there.
+    ///
+    /// It carries no delay and no "force" flag. How long the person at the
+    /// host has to stop this is the host's own
+    /// [`crate::constants::REBOOT_WARNING_SECS`], not a number a guest may
+    /// name, and a guest that could ask for zero would be able to take the
+    /// warning away.
+    RebootRequest {
+        /// Whether the machine is meant to come back.
+        mode: RebootMode,
+    },
+}
+
+/// What a [`MessageKind::RebootRequest`] asks for (§4.1; ADR 0084).
+///
+/// Two variants and no third, because there is no third answer to "does this
+/// machine come back": [`Self::Shutdown`] is the one that also ends every
+/// future session, since nothing in this protocol can press a power button.
+/// The guest's interface warns about that separately, and the host's warning
+/// says which of the two it is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebootMode {
+    /// Restart, and come back.
+    Reboot,
+    /// Power off, and stay off until somebody is physically there.
+    Shutdown,
 }
 
 /// Why a host will not start a shell (§18; ADR 0079).

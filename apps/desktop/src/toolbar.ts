@@ -85,6 +85,16 @@ export interface ToolbarCommands {
    * is a refusal and an ordinary outcome rather than an error.
    */
   recordRequest(peer: string): Promise<void>;
+  /**
+   * Asks the host to restart or shut down (§4.1; ADR 0084).
+   *
+   * Nothing here decides it either, and unlike every other ask on this
+   * interface there is no answer to wait for: the host re-reads its own
+   * `reboot` grant, warns the person in front of it, and a refusal at either
+   * point arrives as the machine still being there. What follows a success is
+   * the view going away.
+   */
+  rebootRequest(peer: string, mode: 'reboot' | 'shutdown'): Promise<void>;
   monitorsList(peer: string): Promise<MonitorDto[]>;
   monitorSelect(peer: string, monitorId: number): Promise<void>;
   /**
@@ -142,6 +152,10 @@ export const tauriToolbarCommands: ToolbarCommands = {
   async recordRequest(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
     return invoke('record_request', { args: { peer } });
+  },
+  async rebootRequest(peer, mode) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('reboot_request', { args: { peer, mode } });
   },
   async monitorsList(peer) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -503,6 +517,7 @@ export function renderToolbar(
     toggleMic(): void;
     sendCad(): void;
     askToRecord(): void;
+    askToPower(mode: 'reboot' | 'shutdown'): void;
     pickMonitor(id: number): void;
     pickQuality(preset: QualityPreset): void;
     pickHostResolution(key: string): void;
@@ -647,6 +662,29 @@ export function renderToolbar(
                   ${t(locale, 'toolbar.settings.cursorEmbedded')}
                 </p>`}
             <p class="toolbar-pop-note">${t(locale, 'toolbar.settings.placeholder')}</p>
+            <!-- ADR 0084. Two buttons rather than a mode picker and one
+                 button: they are different decisions, and only one of them
+                 ends remote access until somebody walks to the machine. The
+                 warning under them says which. -->
+            <div class="toolbar-pop-row toolbar-power" data-testid="toolbar-power">
+              <button
+                type="button"
+                data-testid="toolbar-reboot"
+                @click=${() => actions.askToPower('reboot')}
+              >
+                ${t(locale, 'reboot.ask.reboot')}
+              </button>
+              <button
+                type="button"
+                data-testid="toolbar-shutdown"
+                @click=${() => actions.askToPower('shutdown')}
+              >
+                ${t(locale, 'reboot.ask.shutdown')}
+              </button>
+            </div>
+            <p class="toolbar-pop-note" data-testid="toolbar-shutdown-warning">
+              ${t(locale, 'reboot.ask.shutdownWarning')}
+            </p>
             <!-- A hotkey nobody can see is indistinguishable from a bug, so
                  the chords this window keeps for itself are listed here (§11). -->
             <h3 class="toolbar-pop-heading">${t(locale, 'toolbar.hotkeys')}</h3>
@@ -1093,6 +1131,28 @@ export function mountToolbar(
         // considering a question nobody was asked.
         state.recordAsked = false;
         draw();
+      });
+    },
+    /**
+     * Asks the host to go down (ADR 0084).
+     *
+     * The popover closes on the way out: this is the one control in it whose
+     * result is the window disappearing, and leaving a menu open over a
+     * picture that is about to stop updating reads as a hang.
+     *
+     * No local confirmation dialog, deliberately. The confirmation that
+     * matters is the host's, it lasts `REBOOT_WARNING_SECS`, and a second one
+     * here would train the person to click through the one that counts. What
+     * this side owes is the sentence next to the button saying a shutdown is
+     * one-way, and that is rendered whether or not anybody clicks.
+     */
+    askToPower(mode: 'reboot' | 'shutdown'): void {
+      state.openPopover = null;
+      draw();
+      void commands.rebootRequest(peer, mode).catch(() => {
+        // The host is too old to understand the message, or the session
+        // ended. Either way nothing is going down, and there is no state here
+        // to roll back.
       });
     },
     pickMonitor(id: number): void {

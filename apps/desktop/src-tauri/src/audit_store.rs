@@ -30,9 +30,10 @@
 
 use std::path::{Path, PathBuf};
 
-use lumepeer_core::audit::{AuditEvent, AuditRecord, AuditSink};
+use lumepeer_core::audit::{AuditEvent, AuditRecord, AuditSink, RebootOutcome};
 use lumepeer_core::consent::{IndependentGrant, Role};
 use lumepeer_core::constants::AUDIT_RETENTION_DAYS;
+use lumepeer_core::protocol::RebootMode;
 use lumepeer_net::keystore::{AUDIT_SALT_ENTRY, Keystore};
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -419,11 +420,15 @@ fn event_columns(event: &AuditEvent) -> (&'static str, String) {
             "device_trust_changed",
             if trusted { "trusted" } else { "untrusted" }.to_owned(),
         ),
+        AuditEvent::Reboot { mode, outcome } => (
+            "reboot",
+            format!("{}:{}", reboot_mode_tag(mode), reboot_outcome_tag(outcome)),
+        ),
     }
 }
 
 /// Every `kind` [`event_columns`] can produce, for the UI's filter.
-pub const EVENT_KINDS: [&str; 12] = [
+pub const EVENT_KINDS: [&str; 13] = [
     "consent_requested",
     "consent_granted",
     "consent_revoked",
@@ -436,7 +441,27 @@ pub const EVENT_KINDS: [&str; 12] = [
     "grant_changed",
     "unattended_login",
     "device_trust_changed",
+    "reboot",
 ];
+
+/// Which of the two things a `RebootRequest` asked for (ADR 0084).
+const fn reboot_mode_tag(mode: RebootMode) -> &'static str {
+    match mode {
+        RebootMode::Reboot => "reboot",
+        RebootMode::Shutdown => "shutdown",
+    }
+}
+
+/// What this host did about it (ADR 0084).
+const fn reboot_outcome_tag(outcome: RebootOutcome) -> &'static str {
+    match outcome {
+        RebootOutcome::Refused => "refused",
+        RebootOutcome::Warned => "warned",
+        RebootOutcome::Cancelled => "cancelled",
+        RebootOutcome::Started => "started",
+        RebootOutcome::Failed => "failed",
+    }
+}
 
 const fn role_tag(role: Role) -> &'static str {
     match role {
@@ -458,6 +483,7 @@ const fn grant_tag(grant: IndependentGrant) -> &'static str {
         IndependentGrant::SecureDesktopInput => "secure_desktop_input",
         IndependentGrant::Tunnel => "tunnel",
         IndependentGrant::Terminal => "terminal",
+        IndependentGrant::Reboot => "reboot",
     }
 }
 
@@ -689,6 +715,10 @@ mod tests {
             },
             AuditEvent::UnattendedLogin { accepted: true },
             AuditEvent::DeviceTrustChanged { trusted: true },
+            AuditEvent::Reboot {
+                mode: RebootMode::Reboot,
+                outcome: RebootOutcome::Warned,
+            },
         ];
         for event in &all {
             let (kind, _) = event_columns(event);
