@@ -34,7 +34,9 @@
               this crate's Win32 surface (ADR 0043, ADR 0049)"
 )]
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -44,7 +46,7 @@ use windows::Win32::System::Threading::{
     CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, ReleaseMutex, ResetEvent, SetEvent,
     WaitForSingleObject,
 };
-use windows::core::PCWSTR;
+use windows::core::{HRESULT, PCWSTR};
 
 /// Name of the token that says who is hosting this machine.
 ///
@@ -126,12 +128,151 @@ pub struct HostRole {
 // role is released when the process ends", never to a false release.
 unsafe impl Send for HostRole {}
 
+// SAFETY: nothing reachable through a shared reference touches the handle.
+// `Drop` is the only code that uses it and takes `&mut self`, so `&HostRole`
+// exposes no operation at all — which is exactly what `Sync` promises. This
+// matters because the guard is parked in the desktop app's shared state, whose
+// whole purpose is to hold it until the process exits.
+unsafe impl Sync for HostRole {}
+
+/// What came of asking for the host role.
+///
+/// Three outcomes rather than two, because "I could not take it" and "I could
+/// not even ask" lead to opposite behaviour, and collapsing them would get one
+/// of the two wrong:
+///
+/// - [`Taken`](Self::Taken) means something else on this machine is hosting,
+///   and the caller must not. That includes the case where the token exists
+///   and this process is refused access to it, which is precisely what a host
+///   service holding it looks like to a process the access list does not
+///   admit.
+/// - [`Unavailable`](Self::Unavailable) means the question could not be put at
+///   all — creating an object in the `Global` namespace needs a privilege an
+///   unelevated process does not hold. A **shipped** client is elevated
+///   (ADR 0057) and never lands here; a development build run unelevated does,
+///   and refusing to host on a machine where nothing else is hosting would
+///   turn this token into a new reason for the app not to work.
+#[derive(Debug)]
+pub enum HostRoleClaim {
+    /// The role is this process's, for as long as the guard lives.
+    Held(HostRole),
+    /// Something else on this machine holds it.
+    Taken,
+    /// This process cannot ask. See the type's own documentation.
+    Unavailable,
+}
+
+impl HostRoleClaim {
+    /// Whether the caller may host.
+    ///
+    /// [`Unavailable`](Self::Unavailable) reads as yes, deliberately: it is
+    /// the state of a development build on a machine with no host service on
+    /// it, and the other reading turns an unanswerable question into a refusal
+    /// to run.
+    #[must_use]
+    pub const fn may_host(&self) -> bool {
+        !matches!(self, Self::Taken)
+    }
+}
+
+/// Asks for the host role.
+///
+/// The three-way [`HostRoleClaim`], rather than [`HostRole::acquire`] and its
+/// `Option`, for callers that have to behave differently when the question
+/// itself could not be put.
+#[must_use]
+pub fn claim() -> HostRoleClaim {
+    claim_named(HOST_ROLE_TOKEN)
+}
+
+/// [`claim`], against an arbitrary token name.
+#[must_use]
+pub fn claim_named(name: &str) -> HostRoleClaim {
+    match open_token(name) {
+        Opened::Token(token) => {
+            // SAFETY: `token` is a live mutex handle from `open_token`.
+            let waited = unsafe { WaitForSingleObject(token, 0) };
+            // `WAIT_ABANDONED` is the kernel saying the previous holder's
+            // process ended without releasing. That is a host that crashed,
+            // and the role is genuinely free — treating it as held would leave
+            // the machine unhostable until a reboot.
+            if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+                return HostRoleClaim::Held(HostRole { token });
+            }
+            // SAFETY: `token` is live and owned here, and is not used again.
+            unsafe {
+                let _ = CloseHandle(token);
+            }
+            HostRoleClaim::Taken
+        }
+        Opened::Refused => HostRoleClaim::Taken,
+        Opened::Impossible => HostRoleClaim::Unavailable,
+    }
+}
+
+/// What opening the token object produced.
+enum Opened {
+    /// A handle to it.
+    Token(HANDLE),
+    /// It exists and this process is not admitted, which from the outside is
+    /// indistinguishable from — and means the same as — somebody holding it.
+    Refused,
+    /// The call failed for a reason that is not about this object's access
+    /// list, which in practice means the privilege to create an object in the
+    /// `Global` namespace was not held.
+    Impossible,
+}
+
+/// Creates or opens the named token object.
+fn open_token(name: &str) -> Opened {
+    let Some((attributes, _encoded)) = security_attributes() else {
+        return Opened::Impossible;
+    };
+    let wide_name = wide(name);
+    // Created unowned: ownership is taken by the wait in the caller, so that
+    // "the token exists" and "somebody holds it" stay two different facts. A
+    // mutex created owned would make the second caller's `CreateMutexW` look
+    // like a failure rather than a busy token.
+    //
+    // SAFETY: `attributes` and `wide_name` are locals that outlive the call.
+    let token = unsafe {
+        CreateMutexW(
+            Some(&raw const attributes),
+            false,
+            PCWSTR(wide_name.as_ptr()),
+        )
+    };
+    // SAFETY: the descriptor came from `security_attributes` above and is not
+    // read again; the object holds its own copy by now.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(attributes.lpSecurityDescriptor)));
+    }
+    match token {
+        Ok(token) => Opened::Token(token),
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) => {
+            // The object is there and this process is not on its access list.
+            // A host service holding the role looks exactly like this to
+            // anything the list does not admit, so it reads as taken rather
+            // than as a failure to ask.
+            tracing::info!("the host role is held, and this process cannot open the token");
+            Opened::Refused
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot open the host role token");
+            Opened::Impossible
+        }
+    }
+}
+
 impl HostRole {
     /// Takes the host role, or `None` if something else on this machine
-    /// already holds it.
+    /// already holds it — or if this process cannot ask at all.
     ///
     /// Never blocks: a caller that cannot have the role needs to know now, so
     /// it can run as something other than a host, not in a minute.
+    ///
+    /// [`claim`] is the same question with the two failures kept apart, which
+    /// is what a caller that must still run without the role needs.
     #[must_use]
     pub fn acquire() -> Option<Self> {
         Self::acquire_named(HOST_ROLE_TOKEN)
@@ -145,44 +286,10 @@ impl HostRole {
     /// and an unelevated test run cannot create a `Global\` object at all.
     #[must_use]
     pub fn acquire_named(name: &str) -> Option<Self> {
-        let (attributes, _encoded) = security_attributes()?;
-        let wide_name = wide(name);
-        // Created unowned: ownership is taken by the wait below, so that
-        // "the token exists" and "somebody holds it" stay two different
-        // facts. A mutex created owned would make the second caller's
-        // `CreateMutexW` look like a failure rather than a busy token.
-        //
-        // SAFETY: `attributes` and `wide_name` are locals that outlive the
-        // call.
-        let token = unsafe {
-            CreateMutexW(
-                Some(&raw const attributes),
-                false,
-                PCWSTR(wide_name.as_ptr()),
-            )
-        };
-        // SAFETY: the descriptor came from `security_attributes` above and is
-        // not read again; the object holds its own copy by now.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(attributes.lpSecurityDescriptor)));
+        match claim_named(name) {
+            HostRoleClaim::Held(role) => Some(role),
+            HostRoleClaim::Taken | HostRoleClaim::Unavailable => None,
         }
-        let token = token
-            .inspect_err(|error| tracing::warn!(%error, "cannot open the host role token"))
-            .ok()?;
-        // SAFETY: `token` is a live mutex handle from the call above.
-        let waited = unsafe { WaitForSingleObject(token, 0) };
-        // `WAIT_ABANDONED` is the kernel saying the previous holder's process
-        // ended without releasing. That is a host that crashed, and the role
-        // is genuinely free — treating it as "held" would leave the machine
-        // unhostable until a reboot.
-        if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
-            return Some(Self { token });
-        }
-        // SAFETY: `token` is live and owned here, and is not used again.
-        unsafe {
-            let _ = CloseHandle(token);
-        }
-        None
     }
 
     /// Whether anything on this machine currently holds the host role.
@@ -465,6 +572,39 @@ mod tests {
     #[test]
     fn asking_with_no_host_listening_says_so() {
         assert!(!request_release_named(&test_name("nobody-home")));
+    }
+
+    /// The three-way claim keeps apart the two answers that lead to opposite
+    /// behaviour: a role somebody else holds, and a question this process
+    /// could not put at all.
+    #[test]
+    fn a_claim_distinguishes_taken_from_unaskable() {
+        let name = test_name("claim");
+        let first = claim_named(&name);
+        match first {
+            HostRoleClaim::Held(_) => {
+                assert!(first.may_host());
+                let second = claim_named(&name);
+                assert!(
+                    matches!(second, HostRoleClaim::Taken),
+                    "a role somebody holds must read as taken, never as unaskable"
+                );
+                assert!(
+                    !second.may_host(),
+                    "a second host is exactly what the token exists to prevent"
+                );
+            }
+            HostRoleClaim::Unavailable => {
+                // No named objects in this environment. Still an answer, and
+                // it must be the permissive one: a development build on a
+                // machine with no host service must not be stopped by a
+                // question it cannot ask.
+                assert!(first.may_host());
+            }
+            HostRoleClaim::Taken => {
+                panic!("a token this test just named cannot already be held")
+            }
+        }
     }
 
     /// The access list admits `LocalSystem` and administrators, and — unlike

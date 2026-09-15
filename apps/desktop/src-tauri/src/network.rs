@@ -878,6 +878,15 @@ pub enum ActorError {
     /// distinct from every other refusal because it is the one the person at
     /// this end can actually do something about.
     NoSpace,
+    /// Something else on this machine is hosting, so this process is not
+    /// (ADR 0085 §4).
+    ///
+    /// Distinct from every other refusal because nothing is wrong: the app is
+    /// running, the endpoint is bound, and everything on the guest side works.
+    /// What it cannot do is become a second host, and saying so plainly is the
+    /// difference between a person understanding their machine and hunting for
+    /// a fault that is not there.
+    NotTheHost,
 }
 
 /// Whether a host that went away may be dialed again without anybody pressing
@@ -4208,6 +4217,10 @@ impl DialPlan {
 }
 
 /// Runtime state the actor owns and loops over.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four unrelated facts about one run - is the host bar up, does               the host being dialed want a code, was a remembered password               used, and does this process hold the machine's host role.               Folding them into an enum would couple states that change               independently of each other"
+)]
 struct Actor {
     rx: mpsc::Receiver<ActorCommand>,
     sessions: SessionManager,
@@ -4649,6 +4662,13 @@ struct Actor {
     /// submitting the form. The connect form uses this to keep the modal from
     /// flashing open for a host it already knows the password to.
     connect_credentials_auto: bool,
+    /// Whether this process holds the machine's host role and may admit
+    /// guests at all (ADR 0085 §4).
+    ///
+    /// Read at the two places a node becomes a host — admitting a handshaked
+    /// peer, and handing out an invite for one to arrive with — and nowhere
+    /// else, because nothing about the guest side depends on it.
+    hosting: bool,
     /// The obfuscated transport, and whether this run may use it at all
     /// (gap-tasks/21; ADR 0080).
     obfuscated: ObfuscatedHost,
@@ -8238,6 +8258,17 @@ impl Actor {
         // `speaks_remote_sas` is already recorded by `handle_event` before
         // this runs; the parameter list stays untouched here.
         let tag = self.label_of(&peer);
+        // One host per machine (ADR 0085 §4). Checked before the ticket is
+        // claimed, so a process that is not the host does not burn a
+        // single-use invite the real host is still waiting to see used.
+        if !self.hosting {
+            tracing::warn!(
+                peer = %tag,
+                "refusing a guest: something else on this machine holds the host role"
+            );
+            connection.close_with(&NetError::ConsentUnavailable);
+            return;
+        }
         // Single-use enforcement runs here, on the actor's own thread, so two
         // connections racing the same ticket cannot both win it.
         if let Err(error) = self.tickets.claim(ticket, unix_now()) {
@@ -10202,6 +10233,14 @@ impl Actor {
         renew: bool,
         reply: oneshot::Sender<Result<InviteDto, ActorError>>,
     ) {
+        // A process that may not admit a guest may not hand out the code one
+        // would arrive with either (ADR 0085 §4). Refused rather than issued
+        // and left unusable: an invite nobody can act on is worse than no
+        // invite, because somebody would send it to a guest and wait.
+        if !self.hosting {
+            let _ = reply.send(Err(ActorError::NotTheHost));
+            return;
+        }
         let now = unix_now();
         // "Show me my code" and "give me a new code" are different wishes and
         // used to be the same call (ADR 0062). Answering the first by issuing
@@ -14218,6 +14257,7 @@ fn machine_id() -> String {
 pub async fn spawn_actor(
     app: tauri::AppHandle,
     settings: &crate::config::Settings,
+    policy: ActorPolicy,
 ) -> Result<ActorHandle, NetError> {
     let store = open_keystore()?;
     let secret_key = load_or_create(store.as_ref())?;
@@ -14262,7 +14302,7 @@ pub async fn spawn_actor(
         default_capture(),
         crate::clipboard_os::platform_clipboard(),
         stores,
-        settings.obfuscated(),
+        policy,
     );
 
     tokio::spawn({
@@ -14464,6 +14504,51 @@ impl ActorStores {
     }
 }
 
+/// What this process is allowed to be on this machine (ADR 0085 §4).
+///
+/// Two flags rather than two parameters, because they are one question —
+/// "what kind of node is this run" — and because a seventh and eighth
+/// positional `bool` on [`spawn_actor_with`] is a call nobody can read.
+///
+/// There is no `Default`, deliberately. Hosting is the consequential half,
+/// and a default would decide it for a caller that did not think about it;
+/// the two constructors make the choice a word at every call site instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorPolicy {
+    /// Whether this process holds the machine's host role and may therefore
+    /// admit guests and hand out invites (ADR 0085 §4).
+    ///
+    /// `false` does not make this actor useless: it still dials out, still
+    /// views a host that admitted it, and still owns every guest-side feature.
+    /// What it does not do is become a *second* host on a machine that already
+    /// has one, which would mean two processes owning `SessionManager` for the
+    /// same screen and §8.2's `ControlLimited` snapshot being taken twice
+    /// against two different policies.
+    pub hosting: bool,
+    /// Whether the obfuscated transport is offered (ADR 0051, ADR 0083).
+    pub obfuscated: bool,
+}
+
+impl ActorPolicy {
+    /// This process holds the host role.
+    #[must_use]
+    pub const fn hosting(obfuscated: bool) -> Self {
+        Self {
+            hosting: true,
+            obfuscated,
+        }
+    }
+
+    /// Something else on this machine is hosting, so this process must not.
+    #[must_use]
+    pub const fn not_hosting(obfuscated: bool) -> Self {
+        Self {
+            hosting: false,
+            obfuscated,
+        }
+    }
+}
+
 /// Removes what a *past* run received through the clipboard path and never
 /// got to clean up (a crash, a kill) — docs/bugs/14-clipboard-files.md #3.
 ///
@@ -14500,7 +14585,7 @@ pub fn spawn_actor_with(
     media: HostMedia,
     clipboard: crate::clipboard_os::ClipboardFactory,
     stores: ActorStores,
-    obfuscated: bool,
+    policy: ActorPolicy,
 ) -> ActorHandle {
     let ActorStores {
         history_path,
@@ -14666,9 +14751,10 @@ pub fn spawn_actor_with(
         host_dialers: std::collections::HashMap::new(),
         transport_fallbacks: std::collections::HashMap::new(),
         obfuscated: ObfuscatedHost {
-            enabled: obfuscated,
+            enabled: policy.obfuscated,
             ..ObfuscatedHost::default()
         },
+        hosting: policy.hosting,
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
         speaks_file_transfer: std::collections::HashSet::new(),
@@ -15463,7 +15549,7 @@ mod tests {
             media,
             factory,
             ActorStores::in_memory(),
-            false,
+            ActorPolicy::hosting(false),
         );
         (handle, clipboard)
     }
@@ -15484,7 +15570,7 @@ mod tests {
             media,
             crate::clipboard_os::no_clipboard(),
             ActorStores::in_memory(),
-            false,
+            ActorPolicy::hosting(false),
         );
         (handle, endpoint)
     }
@@ -18207,6 +18293,88 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// An actor built without the machine's host role (ADR 0085 §4).
+    ///
+    /// Used by the one test below rather than by a helper every other test
+    /// goes through, because *not* hosting is the exceptional state: every
+    /// other actor in this suite is the host of its own throwaway endpoint.
+    async fn actor_not_hosting() -> (ActorHandle, PeerEndpoint) {
+        let capture = test_capture();
+        let media = test_media(&capture);
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
+        let handle = spawn_actor_with(
+            endpoint.clone(),
+            identity,
+            Arc::new(DetachedViewWindows),
+            media,
+            crate::clipboard_os::no_clipboard(),
+            ActorStores::in_memory(),
+            ActorPolicy::not_hosting(false),
+        );
+        (handle, endpoint)
+    }
+
+    /// ADR 0085 §4: a process that does not hold the machine's host role does
+    /// not hand out the code a guest would arrive with.
+    ///
+    /// Refused rather than issued and left unusable — an invite nobody can act
+    /// on is worse than no invite, because somebody would send it to a guest
+    /// and then both of them would wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_without_the_host_role_issues_no_invite() {
+        let (host, _endpoint) = actor_not_hosting().await;
+        assert!(
+            matches!(
+                host.invite_create(Role::ViewOnly, false).await,
+                Err(ActorError::NotTheHost)
+            ),
+            "a second host must not be able to invite anybody"
+        );
+    }
+
+    /// ADR 0085 §4, the half that matters: even with a valid invite in hand, a
+    /// guest is not admitted by a process that does not hold the host role.
+    ///
+    /// The invite is issued by a *hosting* actor and the dial is aimed at the
+    /// non-hosting one, so what refuses the guest is the role check and not
+    /// the absence of a ticket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_without_the_host_role_admits_nobody() {
+        // Long enough for a local dial and handshake to complete several times
+        // over, and short enough not to add `TIMEOUT` to the suite for an
+        // assertion that is about something never appearing. The guest
+        // reaching `Failed` ends the wait early; not reaching it does not
+        // weaken the check, because the check is that no session was ever
+        // queued.
+        const SETTLE: Duration = Duration::from_secs(3);
+
+        let (issuer, _issuer_endpoint, _issuer_capture) = actor().await;
+        let (not_host, not_host_endpoint) = actor_not_hosting().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        // A real, live invite — signed by the issuer, which is a different
+        // node, so the dial reaches the handshake and is refused there rather
+        // than failing to parse.
+        let invite = issuer.invite_create(Role::ViewOnly, false).await.unwrap();
+        let _ = guest.invite_connect(invite.code).await;
+        let _ = not_host_endpoint;
+
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                not_host.status().await.unwrap().is_empty(),
+                "a process without the host role queued a session anyway"
+            );
+            if guest.connect_state().await.unwrap().phase == ConnectPhase::Failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(not_host.status().await.unwrap().is_empty());
     }
 
     /// ADR 0085 §2 at the actor: a host with no interactive session of its own

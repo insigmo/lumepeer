@@ -68,6 +68,18 @@ impl IpcError {
         }
     }
 
+    /// Something else on this machine holds the host role (ADR 0085 §4).
+    ///
+    /// Says which process, in the only terms the person at the machine can
+    /// act on: the service is serving this screen, and this window is not.
+    fn not_the_host() -> Self {
+        Self {
+            code: "NOT_THE_HOST",
+            message: "the Lumepeer service is hosting this machine, so this window cannot"
+                .to_owned(),
+        }
+    }
+
     fn poisoned() -> Self {
         Self {
             code: "STATE_POISONED",
@@ -180,6 +192,7 @@ impl From<ActorError> for IpcError {
             ActorError::ChannelClosed => Self::poisoned(),
             ActorError::Unsupported => Self::unsupported(),
             ActorError::NoSpace => Self::no_space(),
+            ActorError::NotTheHost => Self::not_the_host(),
         }
     }
 }
