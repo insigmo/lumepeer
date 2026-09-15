@@ -11,23 +11,17 @@
     reason = "binary crate: `pub` marks the IPC surface of §13, not a library API"
 )]
 
-mod address_book_store;
-mod audit_store;
 mod autostart;
-mod clipboard_os;
+mod bootstrap;
 mod commands;
-mod config;
-mod connection_history;
-mod disk;
-mod invite_store;
 mod logging;
-mod network;
-mod recorder;
-mod remembered_password;
 mod service_control;
-mod system_power;
-mod unattended_store;
-mod view;
+mod view_windows;
+
+// The session runtime itself lives in `crates/runtime` (ADR 0085 §1): the
+// actor, the stores, capture, encode and every decision, with no idea what a
+// window is. What is left here is the Tauri application around it.
+use lumepeer_runtime::{config, network};
 
 /// State shared by every IPC command: a handle into the network actor.
 #[derive(Debug)]
@@ -219,7 +213,11 @@ fn setup_app(
         network::ActorPolicy::not_hosting(settings.obfuscated())
     };
     let network = runtime
-        .block_on(network::spawn_actor(app.handle().clone(), settings, policy))
+        .block_on(bootstrap::spawn_actor(
+            app.handle().clone(),
+            settings,
+            policy,
+        ))
         .unwrap_or_else(|error| {
             eprintln!("fatal: failed to bind the network endpoint: {error}");
             std::process::exit(1);
@@ -539,7 +537,7 @@ fn main() {
                 // (ADR 0055). Hiding it on an Alt+F4 would leave a live but
                 // invisible window and no indicator at all, which is the gap
                 // it exists to close.
-                if window.label() != crate::view::HOST_BAR_LABEL {
+                if window.label() != crate::view_windows::HOST_BAR_LABEL {
                     let _ = window.hide();
                 }
             }

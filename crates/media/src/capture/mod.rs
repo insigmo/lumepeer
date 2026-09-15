@@ -449,7 +449,7 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// (Wayland, macOS) has nothing here to switch to either. Windows and
     /// X11 override it. Reversibility — remembering the original mode,
     /// restoring it when the session ends, and the auto-revert timeout — is
-    /// the caller's responsibility (`apps/desktop/src-tauri/src/network.rs`),
+    /// the caller's responsibility (`crates/runtime/src/network.rs`),
     /// not this trait's: a capture backend only knows how to apply one mode,
     /// never which one came before it.
     ///

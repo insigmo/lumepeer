@@ -237,7 +237,7 @@ mod platform {
     /// afterwards cannot happen any earlier — `clipboard-win`'s `FileList`
     /// getter has no lower-level entry point that yields one path at a time —
     /// so it is the second, narrower gate rather than the only one.
-    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+    pub(super) fn read_file_paths() -> Option<Vec<PathBuf>> {
         let byte_len = clipboard_win::raw::size(CF_HDROP).map_or(0, NonZeroUsize::get);
         if byte_len == 0 {
             // No `CF_HDROP` format on the clipboard at all: not files, and
@@ -266,7 +266,7 @@ mod platform {
         if paths.is_empty() { None } else { Some(paths) }
     }
 
-    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+    pub(super) fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
         let strings: Vec<String> = paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())

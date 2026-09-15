@@ -84,7 +84,7 @@ mod platform {
     /// unsaved work belonging to the person at this machine, who did not ask
     /// for any of this — a shutdown an open document can veto is the correct
     /// failure here, and it is a failure this side reports.
-    pub fn go_down(mode: RebootMode) -> Result<(), String> {
+    pub(super) fn go_down(mode: RebootMode) -> Result<(), String> {
         let flag = match mode {
             RebootMode::Reboot => "/r",
             RebootMode::Shutdown => "/s",

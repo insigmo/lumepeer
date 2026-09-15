@@ -60,7 +60,7 @@ use lumepeer_media::encode::{EncoderConfig, EncoderKind, VideoCodec, probe_hardw
 use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
-use lumepeer_net::keystore::{Keystore, load_or_create};
+use lumepeer_net::keystore::Keystore;
 use lumepeer_net::obfuscated_endpoint::{HostObfuscatedEndpoint, ObfuscatedAcceptor};
 use lumepeer_net::terminal::{
     ShellId, read_frame as read_terminal_frame, write_close as write_terminal_close,
@@ -1394,6 +1394,20 @@ impl ActorHandle {
         self.online.load(Ordering::Relaxed)
     }
 
+    /// The flag itself, for the front end that watches the endpoint reach a
+    /// relay and sets it (`apps/desktop/src-tauri/src/bootstrap.rs`).
+    ///
+    /// Reaching a relay is a fact about the endpoint, and which endpoint this
+    /// node got is the front end's decision — relay-only, LAN-preferred, or
+    /// whatever a session-0 host configures — so the watcher lives with the
+    /// bind rather than with the actor. This hands it the one flag it sets and
+    /// nothing else: the value is a `bool` that only ever moves from false to
+    /// true, so there is no state here a caller could corrupt.
+    #[must_use]
+    pub fn online_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.online)
+    }
+
     /// What this host can do about producing a picture, for the status the UI
     /// shows its own operator (§18). Carries no authorization of its own.
     #[must_use]
@@ -1983,6 +1997,13 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Host side: one input event from a guest, on its way to
+    /// `SessionManager::authorize_input` (§8.1).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] for a label that names no session;
+    /// [`ActorError::Core`] when the session refuses the event;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
     pub async fn input(&self, label: String, event: InputEventPayload) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -12147,7 +12168,7 @@ impl Actor {
         // `secure_desktop` moves both on and off here, unlike the others
         // below: the encode loop's own `EncodeControl` copy is the "one
         // value in one place" it checks before every attempt
-        // (`apps/desktop/src-tauri/src/view.rs`), so a grant switched on
+        // (`crates/runtime/src/view.rs`), so a grant switched on
         // mid-stall must reach it just as promptly as a revoke does
         // (ADR 0049). Nothing to update if no media session exists yet —
         // `on_media_accepted` seeds the flag from the live grant when the
@@ -13026,7 +13047,7 @@ impl Actor {
                     return;
                 }
                 tracing::warn!(peer = %tag, %error, "invite connect failed");
-                self.connect_failure = Some(crate::commands::net_error_code(&error));
+                self.connect_failure = Some(crate::net_errors::net_error_code(&error));
                 self.connect_phase = ConnectPhase::Failed;
                 self.connect_peer = None;
                 return;
@@ -14042,7 +14063,7 @@ async fn dial_over_plan(
         );
         fallbacks.push(TransportFallback {
             transport: stage.dialer.kind(),
-            failure: crate::commands::net_error_code(&error),
+            failure: crate::net_errors::net_error_code(&error),
         });
         stage = next;
     }
@@ -14198,128 +14219,6 @@ async fn connect_once(
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
 
-/// Binds the endpoint from the OS keystore identity and spawns the actor.
-///
-/// Reaching a relay is **not** awaited here: on a LAN-only machine that wait
-/// never finishes, and `main` blocks on this call before Tauri creates a
-/// window, so blocking it would leave the app with no window and no error at
-/// all. Ticket pairing does not need a relay (§7), so the wait runs in the
-/// background and only logs.
-///
-/// # Errors
-/// [`NetError`] if the keystore or the endpoint bind fails — surfaced as a
-/// startup failure rather than silently degrading (§11.2, §24.5).
-/// Opens the keystore, honouring the `LUMEPEER_KEYSTORE=file` override.
-///
-/// Default is the OS-native backend (`crates/net::keystore::open`). The
-/// override selects the encrypted-file store — the documented fallback for
-/// headless environments (CI, SSH-run E2E) where no secret-service prompter
-/// exists to unlock the keyring. `LUMEPEER_KEYSTORE_PATH` chooses the file
-/// location; it defaults to the app data directory.
-///
-/// # Errors
-/// [`NetError`] as [`keystore::open`], or when `LUMEPEER_KEYSTORE=file` is
-/// set but no usable path can be derived.
-fn open_keystore() -> Result<Box<dyn lumepeer_net::keystore::Keystore>, NetError> {
-    const KEYSTORE_ENV: &str = "LUMEPEER_KEYSTORE";
-    if std::env::var(KEYSTORE_ENV).as_deref() != Ok("file") {
-        return lumepeer_net::keystore::open();
-    }
-    let path = std::env::var("LUMEPEER_KEYSTORE_PATH").map_err(|_| {
-        NetError::Keystore("LUMEPEER_KEYSTORE=file also needs LUMEPEER_KEYSTORE_PATH".to_owned())
-    })?;
-    let path = std::path::PathBuf::from(path);
-    tracing::info!(path = %path.display(), "using the encrypted-file keystore (LUMEPEER_KEYSTORE=file)");
-    // The user secret mixes the machine id with the user name: stable for
-    // this user on this machine, never written anywhere (§11.2).
-    let machine = machine_id();
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default();
-    Ok(Box::new(lumepeer_net::keystore::FileKeystore::new(
-        path,
-        format!("{machine}:{user}").as_bytes(),
-    )))
-}
-
-/// Reads `/etc/machine-id` (or the fallback `DBUS` path) for the file-keystore
-/// user secret. A missing file is not fatal: an empty id only weakens the
-/// secret to the user name, matching the fallback's documented threat model.
-fn machine_id() -> String {
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(id) = std::fs::read_to_string(path) {
-            return id.trim().to_owned();
-        }
-    }
-    String::new()
-}
-
-pub async fn spawn_actor(
-    app: tauri::AppHandle,
-    settings: &crate::config::Settings,
-    policy: ActorPolicy,
-) -> Result<ActorHandle, NetError> {
-    let store = open_keystore()?;
-    let secret_key = load_or_create(store.as_ref())?;
-    let identity = SigningKey::from_bytes(&secret_key.to_bytes());
-    let relay = settings.relay_url();
-    // Relay-only is a WAN test, never the default: with the IP transports
-    // cleared every session lives or dies with one relay link, and a client
-    // whose relay flaps cannot connect at all (ADR 0026).
-    let endpoint = if settings.relay_only() {
-        tracing::info!(
-            "transport: relay only — direct IP paths are off, so every session goes over the internet"
-        );
-        PeerEndpoint::bind_relay_only(secret_key, relay).await?
-    } else {
-        tracing::info!("transport: direct IP paths preferred, relay as the fallback");
-        PeerEndpoint::bind_with_lan(secret_key, relay).await?
-    };
-    let audit = open_audit_log(&app, store.as_ref()).await;
-    // A second, independent handle on the same keystore: every native backend
-    // opens its own connection per operation rather than holding one open
-    // (see e.g. `SecretServiceKeystore`'s own doc comment), so this costs
-    // nothing beyond what `UnattendedStore` below already pays, and it is
-    // what lets the two stores own their `Box<dyn Keystore>` outright instead
-    // of sharing one behind an `Arc` (docs/bugs/02-connect-form.md, task 6).
-    let remembered_password_keystore = open_keystore()?;
-    let stores = ActorStores {
-        history_path: connection_history_path(&app),
-        address_book_path: address_book_path(),
-        invite_path: invite_path(),
-        // The same keystore the identity came from: the unattended password
-        // hash and TOTP secret are secret material and `CLAUDE.md` keeps
-        // secrets out of `config/*.toml` (§11.2; ADR 0033).
-        keystore: store,
-        remembered_password_keystore,
-        audit,
-    };
-
-    let handle = spawn_actor_with(
-        endpoint.clone(),
-        identity,
-        Arc::new(crate::view::TauriViewWindows::new(app)),
-        default_capture(),
-        crate::clipboard_os::platform_clipboard(),
-        stores,
-        policy,
-    );
-
-    tokio::spawn({
-        let online = Arc::clone(&handle.online);
-        async move {
-            endpoint.online().await;
-            online.store(true, Ordering::Relaxed);
-            tracing::info!("endpoint reached a relay; invites are dialable from outside the LAN");
-        }
-    });
-
-    Ok(handle)
-}
-
-/// Where the connection history file lives, if the app data directory can be
-/// resolved at all. `None` degrades the feature to in-memory-only for this
-/// run rather than failing startup over a convenience list (§18).
 /// Where the host's address book lives, if the config directory resolves at
 /// all. `None` degrades the book to in-memory-only for this run, which trusts
 /// nobody — the safe direction (§18; ADR 0034).
@@ -14327,7 +14226,7 @@ pub async fn spawn_actor(
 /// Alongside the other configuration rather than in the app data directory:
 /// it is host-owned policy, in the same place `config/control_policy.toml`
 /// lives, and it holds no secrets (a `NodeId` is a public key).
-fn address_book_path() -> Option<std::path::PathBuf> {
+pub fn address_book_path() -> Option<std::path::PathBuf> {
     let Some(dir) = crate::config::config_dir() else {
         tracing::warn!("cannot resolve the config directory; the address book will not persist");
         return None;
@@ -14339,7 +14238,7 @@ fn address_book_path() -> Option<std::path::PathBuf> {
 ///
 /// Next to the address book rather than to the connection history: both belong
 /// to the host's own configuration, and neither is per-machine-install state.
-fn invite_path() -> Option<std::path::PathBuf> {
+pub fn invite_path() -> Option<std::path::PathBuf> {
     let Some(dir) = crate::config::config_dir() else {
         tracing::warn!(
             "cannot resolve the config directory; the invite code will not survive a restart"
@@ -14347,66 +14246,6 @@ fn invite_path() -> Option<std::path::PathBuf> {
         return None;
     };
     Some(dir.join("invite.json"))
-}
-
-/// Opens the audit log and starts its daily retention sweep (§15; ADR 0041).
-///
-/// Every failure here is a warning and a `None`, never a refusal to start: §18
-/// says a storage fault degrades the feature that needs the storage. A host
-/// that cannot write an audit trail is still a host, and refusing to run would
-/// hand anyone who can break the database a way to take the machine offline.
-///
-/// The one failure worth its own message is a lost install salt over a
-/// non-empty log: minting a new one would silently split every peer's history
-/// in two, so the log is left untouched and unwritten instead.
-async fn open_audit_log(
-    app: &tauri::AppHandle,
-    keystore: &dyn Keystore,
-) -> Option<crate::audit_store::AuditStore> {
-    use tauri::Manager as _;
-
-    let path = match app.path().app_local_data_dir() {
-        Ok(dir) => dir.join("audit.db"),
-        Err(error) => {
-            tracing::warn!(%error, "cannot resolve the app data directory; no audit log this run");
-            return None;
-        }
-    };
-    let store = match crate::audit_store::AuditStore::open(path, keystore).await {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::warn!(%error, "audit log unavailable; the host runs without an audit trail");
-            return None;
-        }
-    };
-
-    // Once a day, not once per record: the sweep is a table scan and the
-    // cutoff moves by seconds. `AuditStore::open` already swept once.
-    let daily = store.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            lumepeer_core::constants::AUDIT_RETENTION_SWEEP_SECS,
-        ));
-        ticker.tick().await; // fires immediately; the open already pruned
-        loop {
-            ticker.tick().await;
-            if let Err(error) = daily.prune().await {
-                tracing::warn!(%error, "audit log: retention sweep failed");
-            }
-        }
-    });
-    Some(store)
-}
-
-fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager as _;
-    match app.path().app_local_data_dir() {
-        Ok(dir) => Some(dir.join("connection_history.json")),
-        Err(error) => {
-            tracing::warn!(%error, "cannot resolve the app data directory; connection history will not persist");
-            None
-        }
-    }
 }
 
 /// Builds the host's media side: the capture controller, whether this platform
