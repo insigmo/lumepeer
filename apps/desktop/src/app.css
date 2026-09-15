@@ -875,6 +875,26 @@ button {
 
 /* Same chrome as Remove, minus the destructive red: forgetting a saved
    password leaves the host in the list, it only stops the silent sign-in. */
+/* Unprompted reconnection, per remembered host (ADR 0084). A switch rather
+   than a button because it is a standing decision, not an action, and it sits
+   in the row it is about so "which machines come back on their own" is
+   answered by looking rather than by opening something. */
+.connections-list .history-autoreconnect {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.connections-list .history-autoreconnect input {
+  margin: 0;
+  cursor: pointer;
+}
+
 .connections-list .history-forget-password {
   flex-shrink: 0;
   appearance: none;

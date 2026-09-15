@@ -351,4 +351,6 @@ export const pl: Dictionary = {
   'reboot.waiting.title': 'Urządzenie uruchamia się ponownie',
   'reboot.waiting.body': 'Czekamy na jego powrót. Ponowne wejście wymaga hasła urządzenia, a nie uprawnień tej sesji.',
   'reboot.waiting.cancel': 'Przestań czekać',
+  'history.autoReconnect': 'Łącz ponownie samodzielnie',
+  'history.autoReconnect.hint': 'Gdy to urządzenie zniknie, wróć do niego bez pytania. Wymaga zapisanego hasła urządzenia i i tak kończy się nowym logowaniem.',
 };

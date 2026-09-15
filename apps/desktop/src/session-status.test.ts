@@ -63,6 +63,61 @@ describe('remembered-host row', () => {
     });
   });
 
+  // ADR 0084 §6. The flag nothing else sets: a row that has merely been
+  // connected to, granted a role, or had its password saved is still off.
+  it('starts off for a remembered host and reads the flag rather than assuming it', () => {
+    render_();
+    const box = container.querySelector<HTMLInputElement>(
+      '[data-testid="history-auto-reconnect"] input',
+    );
+    expect(box).not.toBeNull();
+    expect(box?.checked).toBe(false);
+
+    render(
+      sessionStatus([], 'en', () => {}, [{ ...ENTRY, trusted: true }], () => {}),
+      container,
+    );
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="history-auto-reconnect"] input')
+        ?.checked,
+    ).toBe(true);
+  });
+
+  it('switching it sends the host label and the new state, and refreshes', async () => {
+    const onRefresh = vi.fn();
+    render_(onRefresh);
+    const box = container.querySelector<HTMLInputElement>(
+      '[data-testid="history-auto-reconnect"] input',
+    );
+    box!.checked = true;
+    box?.dispatchEvent(new Event('change'));
+
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_set_trusted', {
+        args: { peer: 'host-ab12', trusted: true },
+      });
+      expect(onRefresh).toHaveBeenCalled();
+    });
+    // Turning it back off is the same call with the other answer, and never
+    // a removal: this is a standing decision, not the row.
+    invoke.mockClear();
+    render(
+      sessionStatus([], 'en', onRefresh, [{ ...ENTRY, trusted: true }], () => {}),
+      container,
+    );
+    const on = container.querySelector<HTMLInputElement>(
+      '[data-testid="history-auto-reconnect"] input',
+    );
+    on!.checked = false;
+    on?.dispatchEvent(new Event('change'));
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_set_trusted', {
+        args: { peer: 'host-ab12', trusted: false },
+      });
+    });
+    expect(invoke).not.toHaveBeenCalledWith('history_remove', expect.anything());
+  });
+
   it('offers no forget-password control for a host with no saved password', () => {
     render_();
     expect(container.querySelector('.history-forget-password')).toBeNull();

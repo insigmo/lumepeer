@@ -815,6 +815,19 @@ pub enum ActorError {
     NoSpace,
 }
 
+/// Whether a host that went away may be dialed again without anybody pressing
+/// anything (§10; ADR 0084).
+///
+/// A free function rather than a line inside `may_auto_reconnect` so the rule
+/// it encodes can be checked on its own: both halves, and neither enough
+/// alone. `trusted` is a decision somebody made about this host and nothing
+/// else sets it; `remembered` is whether an attempt could actually finish,
+/// because one that ends at a prompt nobody is there to answer is a dial loop
+/// rather than a reconnection (ADR 0044).
+const fn auto_reconnect_allowed(trusted: bool, remembered: bool) -> bool {
+    trusted && remembered
+}
+
 /// Host side: a guest's accepted reboot request, while the person at this
 /// machine still has time to stop it (§4.1; ADR 0084).
 ///
@@ -12386,7 +12399,10 @@ impl Actor {
     /// attempt that ends at a prompt nobody is there to answer is a dial loop
     /// rather than a reconnection (ADR 0044).
     fn may_auto_reconnect(&self, host_tag: &str) -> bool {
-        self.history.is_trusted(host_tag) && self.remembered_password_tags.contains(host_tag)
+        auto_reconnect_allowed(
+            self.history.is_trusted(host_tag),
+            self.remembered_password_tags.contains(host_tag),
+        )
     }
 
     /// Guest side: starts waiting for a host that went away to come back
@@ -16680,6 +16696,30 @@ mod tests {
         );
     }
 
+    /// ADR 0084 §6, and the half of the reboot story that is about *not*
+    /// acting: a machine this node happens to know the password for is not
+    /// thereby a machine it may dial unprompted, and a machine somebody
+    /// trusted but whose password is not remembered would only ever reach a
+    /// prompt nobody is there to answer.
+    ///
+    /// Stated as a truth table because that is what the rule is. The costly
+    /// half — that a disconnect from such a host leaves the ordinary
+    /// "connect again" button rather than a wait — is what `on_closed`
+    /// consults this for.
+    #[test]
+    fn dialing_a_host_unprompted_needs_both_halves() {
+        assert!(auto_reconnect_allowed(true, true));
+        assert!(
+            !auto_reconnect_allowed(false, true),
+            "a remembered password was treated as permission to dial unasked"
+        );
+        assert!(
+            !auto_reconnect_allowed(true, false),
+            "a trusted host with no remembered password would be dialed into a prompt"
+        );
+        assert!(!auto_reconnect_allowed(false, false));
+    }
+
     /// Polls the host's own banner state until `predicate` holds, or fails.
     ///
     /// The request crosses a real link and the warning is raised on the far
@@ -16760,7 +16800,10 @@ mod tests {
             .find(|row| row.label == guest_label2)
             .unwrap();
         assert_eq!(session.role, Role::FullControl);
-        assert!(session.grants.input, "revoking reboot took the keyboard too");
+        assert!(
+            session.grants.input,
+            "revoking reboot took the keyboard too"
+        );
         assert!(session.grants.get(IndependentGrant::Terminal));
     }
 
@@ -16842,10 +16885,14 @@ mod tests {
             host.reboot_pending().await.unwrap().is_none(),
             "the warning outlived the grant that raised it"
         );
-        tokio::time::sleep(Duration::from_secs(REBOOT_WARNING_SECS + 1)).await;
+        // That it also stays down when the armed timer finally fires is the
+        // same generation check `the_person_at_the_host_can_stop_the_restart`
+        // sits through a full window to prove; repeating the wait here would
+        // buy nothing and cost every run another REBOOT_WARNING_SECS.
+        a_few_poll_rounds().await;
         assert!(
             host.reboot_pending().await.unwrap().is_none(),
-            "the countdown fired after its grant was withdrawn"
+            "the warning came back after its grant was withdrawn"
         );
     }
 

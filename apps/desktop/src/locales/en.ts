@@ -376,4 +376,6 @@ export const en: Dictionary = {
   'reboot.waiting.title': 'The device is restarting',
   'reboot.waiting.body': 'Waiting for it to come back. Signing in again needs its device password, not the rights this session had.',
   'reboot.waiting.cancel': 'Stop waiting',
+  'history.autoReconnect': 'Reconnect on its own',
+  'history.autoReconnect.hint': 'After this device goes away, come back to it without being asked. Needs its device password saved here, and still ends in a fresh sign-in.',
 };

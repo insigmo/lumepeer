@@ -351,4 +351,6 @@ export const de: Dictionary = {
   'reboot.waiting.title': 'Das Gerät startet neu',
   'reboot.waiting.body': 'Wir warten, bis es zurück ist. Die erneute Anmeldung braucht sein Gerätepasswort, nicht die Rechte dieser Sitzung.',
   'reboot.waiting.cancel': 'Nicht mehr warten',
+  'history.autoReconnect': 'Von selbst neu verbinden',
+  'history.autoReconnect.hint': 'Wenn dieses Gerät verschwindet, ohne Nachfrage zurückkehren. Braucht sein hier gespeichertes Gerätepasswort und endet trotzdem in einer neuen Anmeldung.',
 };

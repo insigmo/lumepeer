@@ -342,4 +342,6 @@ export const ja: Dictionary = {
   'reboot.waiting.title': 'デバイスを再起動しています',
   'reboot.waiting.body': '復帰を待っています。再ログインにはこのセッションの権限ではなく、デバイスのパスワードが必要です。',
   'reboot.waiting.cancel': '待機をやめる',
+  'history.autoReconnect': '自動で再接続',
+  'history.autoReconnect.hint': 'このデバイスがいなくなったら、確認なしで戻ります。デバイスのパスワードの保存が必要で、それでもログインはやり直しになります。',
 };

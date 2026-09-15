@@ -341,4 +341,6 @@ export const ar: Dictionary = {
   'reboot.waiting.title': 'الجهاز يُعاد تشغيله',
   'reboot.waiting.body': 'ننتظر عودته. تسجيل الدخول من جديد يحتاج كلمة مرور الجهاز، لا صلاحيات هذه الجلسة.',
   'reboot.waiting.cancel': 'إيقاف الانتظار',
+  'history.autoReconnect': 'إعادة الاتصال تلقائياً',
+  'history.autoReconnect.hint': 'إذا اختفى هذا الجهاز، عد إليه دون سؤال. يتطلب حفظ كلمة مرور الجهاز هنا، وينتهي مع ذلك بتسجيل دخول جديد.',
 };

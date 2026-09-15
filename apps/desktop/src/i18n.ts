@@ -387,7 +387,9 @@ export type TranslationKey =
   | 'reboot.ask.shutdownWarning'
   | 'reboot.waiting.title'
   | 'reboot.waiting.body'
-  | 'reboot.waiting.cancel';
+  | 'reboot.waiting.cancel'
+  | 'history.autoReconnect'
+  | 'history.autoReconnect.hint';
 
 export type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 
