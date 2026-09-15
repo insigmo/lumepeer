@@ -21,6 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lumepeer_core::consent::Role;
 use serde::{Deserialize, Serialize};
 
+use crate::network::TransportKind;
+
 /// How many remembered hosts the list keeps. Older entries fall off as new
 /// ones arrive; this is a convenience list, not the audit trail, so a bound
 /// this small is fine.
@@ -49,6 +51,14 @@ pub struct HistoryEntry {
     /// and never receives the code back (§13).
     #[serde(default)]
     pub code: String,
+    /// Transport the last session with this host was carried over, when one is
+    /// known (gap-tasks/23 task 1; ADR 0083).
+    ///
+    /// The next dial to this host tries it first. `#[serde(default)]` because
+    /// a file written before this field existed has no answer, which is the
+    /// same "nothing to go on" a host nobody has dialed yet presents.
+    #[serde(default)]
+    pub transport: Option<TransportKind>,
     /// Whether a device password is remembered for this host (§8; ADR 0033).
     ///
     /// `#[serde(skip)]` on purpose: the OS keystore is the only thing that
@@ -110,16 +120,40 @@ impl ConnectionHistory {
             .map(|entry| entry.code.as_str())
     }
 
+    /// Transport remembered for `peer_label`, if that host is still listed and
+    /// a session with it ever said which one carried it (gap-tasks/23 task 1).
+    #[must_use]
+    pub fn transport_of(&self, peer_label: &str) -> Option<TransportKind> {
+        self.entries
+            .iter()
+            .find(|entry| entry.peer_label == peer_label)
+            .and_then(|entry| entry.transport)
+    }
+
     /// Records one host visit — at connect time or at disconnect, both call
     /// this — and persists the list.
     ///
     /// One row per host, not per session: this is a list of places to go back
     /// to, so connecting to the same host ten times leaves one row that moves
     /// to the front, carrying the code and role of the most recent visit.
-    pub fn record(&mut self, peer_label: String, role: Role, code: String) {
+    ///
+    /// `transport` is `None` when the caller cannot say which one carried the
+    /// session — a visit recorded after the dialer has already been dropped,
+    /// say. That leaves the remembered transport alone rather than forgetting
+    /// it: the next dial would otherwise lose what worked last time to a
+    /// bookkeeping detail of when the row happened to be written
+    /// (gap-tasks/23 task 1).
+    pub fn record(
+        &mut self,
+        peer_label: String,
+        role: Role,
+        code: String,
+        transport: Option<TransportKind>,
+    ) {
         let last_seen_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let transport = transport.or_else(|| self.transport_of(&peer_label));
         self.entries.retain(|entry| entry.peer_label != peer_label);
         self.entries.insert(
             0,
@@ -128,6 +162,7 @@ impl ConnectionHistory {
                 role,
                 last_seen_at,
                 code,
+                transport,
                 // Answered by the keystore when the actor reads the list, not
                 // by whatever wrote this row.
                 has_password: false,
@@ -183,7 +218,12 @@ mod tests {
     #[test]
     fn a_history_with_no_path_stays_in_memory_only() {
         let mut history = ConnectionHistory::open(None);
-        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
         assert_eq!(history.entries().len(), 1);
     }
 
@@ -191,7 +231,12 @@ mod tests {
     fn newest_entries_come_first_and_old_ones_fall_off_the_cap() {
         let mut history = ConnectionHistory::open(None);
         for n in 0..MAX_ENTRIES + 5 {
-            history.record(format!("host-{n}"), Role::ViewOnly, format!("code-{n}"));
+            history.record(
+                format!("host-{n}"),
+                Role::ViewOnly,
+                format!("code-{n}"),
+                None,
+            );
         }
         assert_eq!(history.entries().len(), MAX_ENTRIES);
         assert_eq!(
@@ -207,12 +252,23 @@ mod tests {
     #[test]
     fn connecting_to_the_same_host_twice_keeps_one_row_with_the_newer_code() {
         let mut history = ConnectionHistory::open(None);
-        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
-        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
+        history.record(
+            "host-cd34".to_owned(),
+            Role::ViewOnly,
+            "code-2".to_owned(),
+            None,
+        );
         history.record(
             "host-ab12".to_owned(),
             Role::FullControl,
             "code-3".to_owned(),
+            None,
         );
 
         assert_eq!(history.entries().len(), 2);
@@ -226,8 +282,18 @@ mod tests {
     #[test]
     fn removing_a_row_drops_it_and_leaves_the_rest_alone() {
         let mut history = ConnectionHistory::open(None);
-        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
-        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
+        history.record(
+            "host-cd34".to_owned(),
+            Role::ViewOnly,
+            "code-2".to_owned(),
+            None,
+        );
 
         assert!(history.remove("host-ab12"));
         assert_eq!(history.entries().len(), 1);
@@ -238,7 +304,12 @@ mod tests {
     #[test]
     fn removing_a_label_that_was_never_there_changes_nothing() {
         let mut history = ConnectionHistory::open(None);
-        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
 
         assert!(!history.remove("host-never-connected"));
         assert_eq!(history.entries().len(), 1);
@@ -251,8 +322,18 @@ mod tests {
         let path = dir.join("connection_history.json");
 
         let mut history = ConnectionHistory::open(Some(path.clone()));
-        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
-        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
+        history.record(
+            "host-cd34".to_owned(),
+            Role::ViewOnly,
+            "code-2".to_owned(),
+            None,
+        );
         assert!(history.remove("host-ab12"));
 
         let reloaded = ConnectionHistory::open(Some(path));
@@ -273,8 +354,14 @@ mod tests {
             "host-ab12".to_owned(),
             Role::FullControl,
             "code-1".to_owned(),
+            None,
         );
-        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        history.record(
+            "host-cd34".to_owned(),
+            Role::ViewOnly,
+            "code-2".to_owned(),
+            None,
+        );
 
         let reloaded = ConnectionHistory::open(Some(path));
         assert_eq!(reloaded.entries().len(), 2);
@@ -285,6 +372,69 @@ mod tests {
         assert_eq!(reloaded.code_of("host-ab12"), Some("code-1"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// gap-tasks/23 task 1: the transport that actually worked is what the next
+    /// dial to this host tries first, so it has to survive a restart.
+    #[test]
+    fn the_transport_of_the_last_visit_is_remembered_across_a_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-transport-{}", std::process::id()));
+        let path = dir.join("connection_history.json");
+
+        let mut history = ConnectionHistory::open(Some(path.clone()));
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            Some(TransportKind::Obfuscated),
+        );
+
+        let reloaded = ConnectionHistory::open(Some(path));
+        assert_eq!(
+            reloaded.transport_of("host-ab12"),
+            Some(TransportKind::Obfuscated)
+        );
+        // A host nobody has dialed has nothing to remember, which is what puts
+        // the next dial on the default order rather than on a guess.
+        assert_eq!(reloaded.transport_of("host-never-connected"), None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// gap-tasks/23 task 1: a row is written twice per session — once when the
+    /// grant lands and once when it ends — and the second write can happen
+    /// after the dialer has already gone. That must not erase what worked.
+    #[test]
+    fn a_visit_that_cannot_name_its_transport_keeps_the_remembered_one() {
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            Some(TransportKind::Obfuscated),
+        );
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+        );
+
+        assert_eq!(history.entries().len(), 1);
+        assert_eq!(
+            history.transport_of("host-ab12"),
+            Some(TransportKind::Obfuscated)
+        );
+        // A later visit that *can* name one still replaces it: the memory is
+        // of the most recent session that said anything, not the first.
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            Some(TransportKind::Iroh),
+        );
+        assert_eq!(history.transport_of("host-ab12"), Some(TransportKind::Iroh));
     }
 
     #[test]

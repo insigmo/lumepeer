@@ -32,7 +32,7 @@ use lumepeer_core::constants::{
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
     RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
-    TERMINAL_SCROLLBACK_BYTES, TUNNEL_IDLE_TIMEOUT_SECS,
+    TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
@@ -385,6 +385,62 @@ fn relay_region(url: &iroh::RelayUrl) -> Option<String> {
     Some(label.to_owned())
 }
 
+/// Which of the two transports of ADR 0080 carries a session (gap-tasks/23
+/// task 1; ADR 0083).
+///
+/// Not the same question as [`PathKind`], and the panel shows both: a path is
+/// how iroh is reaching a peer *inside* the iroh transport, and it has no
+/// answer at all on the obfuscated one, which is a single direct UDP path by
+/// construction (ADR 0052).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransportKind {
+    /// The iroh endpoint: relay-capable and address-lookup-capable, and what
+    /// every session used before the obfuscated transport existed.
+    Iroh,
+    /// Direct obfuscated QUIC, never relayed (ADR 0052).
+    Obfuscated,
+}
+
+impl TransportKind {
+    /// Stable identifier for the webview, which turns it into localized text.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Iroh => "iroh",
+            Self::Obfuscated => "obfuscated",
+        }
+    }
+}
+
+/// Which transport a live connection is carried by (gap-tasks/23 task 3).
+///
+/// Read off the connection rather than remembered beside it, so it is the
+/// same answer on the side that dialed and on the side that accepted: only
+/// the iroh transport has an `iroh::Connection` underneath.
+const fn transport_of(connection: &PeerConnection) -> TransportKind {
+    if connection.iroh().is_some() {
+        TransportKind::Iroh
+    } else {
+        TransportKind::Obfuscated
+    }
+}
+
+/// One transport a dial gave up on before the session was established
+/// (gap-tasks/23 task 3; ADR 0083).
+///
+/// Kept for the life of the session so the diagnostics panel can say what the
+/// connection it is showing had to go through to exist. The reason is the §18
+/// code of the error the attempts actually returned — the same vocabulary a
+/// failed connect already reports — and never an interpretation of it: this
+/// app cannot tell a blocked network from a bad one, so it does not say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportFallback {
+    /// The transport that did not connect.
+    pub transport: TransportKind,
+    /// §18 code of the last error it returned.
+    pub failure: &'static str,
+}
+
 /// What a view window needs to paint one frame, readable without the actor.
 ///
 /// The picture already lives in a `watch` channel the media task writes and
@@ -464,6 +520,14 @@ pub struct ConnectionStats {
     pub goodput_kbps: Option<u32>,
     /// Whether this peer is reached directly, through a relay, or both.
     pub path: PathKind,
+    /// Which of the two transports of ADR 0080 is carrying this connection
+    /// (gap-tasks/23 task 3).
+    pub transport: TransportKind,
+    /// Transports the dial gave up on before this connection was made, oldest
+    /// first. Empty when the first transport tried worked, and empty on the
+    /// side that accepted rather than dialed — a host learns nothing about
+    /// what a guest tried before it arrived (gap-tasks/23 task 3).
+    pub fallbacks: Vec<TransportFallback>,
     /// Region of the relay in use, when one is; never its address (§15).
     pub relay_region: Option<String>,
     /// Encoder bitrate this host is sending at; `None` on the guest side,
@@ -3583,6 +3647,10 @@ enum ActorEvent {
         /// `rd/tunnel/1` are opened over the same transport the control
         /// channel took (gap-tasks/21 task 2; ADR 0080).
         dialer: Box<HostDialer>,
+        /// Transports the dial plan gave up on before this one, in the order
+        /// they were tried; empty when the first transport worked
+        /// (gap-tasks/23 task 3; ADR 0083).
+        fallbacks: Vec<TransportFallback>,
         result: Result<Box<ControlConnection>, NetError>,
     },
     /// Something happened to a file transfer, on one of its own tasks.
@@ -3836,10 +3904,122 @@ impl HostDialer {
         }
     }
 
-    /// Whether this host is being reached over the obfuscated transport, for
-    /// the log line that says so and nothing else.
-    const fn is_obfuscated(&self) -> bool {
-        matches!(*self, Self::Obfuscated(_))
+    /// Which transport this dialer speaks (gap-tasks/23 task 1).
+    ///
+    /// The one place a dialer's transport is named: the dial plan orders
+    /// dialers by it, the history remembers it, and the log line for a
+    /// session says which one won.
+    const fn kind(&self) -> TransportKind {
+        match *self {
+            Self::Iroh { .. } => TransportKind::Iroh,
+            Self::Obfuscated(_) => TransportKind::Obfuscated,
+        }
+    }
+}
+
+/// The order one dial tries transports in (gap-tasks/23 task 1; ADR 0083).
+///
+/// Pure, and deliberately so: the order is a decision this function *is*,
+/// rather than something that falls out of where the branches ended up in
+/// [`Actor::dial_plan`]. Three inputs and nothing else — whether the
+/// obfuscated transport is usable for this invite at all, and what worked
+/// for this host last time.
+///
+/// A remembered transport only reorders what is already available. It can
+/// never put back a transport this invite has no address for, and it is never
+/// the only thing tried: a host that has moved onto a network where last
+/// time's answer no longer works still gets the other one, in the same dial,
+/// without the user doing anything.
+fn dial_order(obfuscated_available: bool, remembered: Option<TransportKind>) -> Vec<TransportKind> {
+    if !obfuscated_available {
+        return vec![TransportKind::Iroh];
+    }
+    if remembered == Some(TransportKind::Iroh) {
+        return vec![TransportKind::Iroh, TransportKind::Obfuscated];
+    }
+    vec![TransportKind::Obfuscated, TransportKind::Iroh]
+}
+
+/// How the [`DIAL_ATTEMPTS`] of one dial are shared out over the transports of
+/// a plan (gap-tasks/23 task 1; ADR 0083).
+///
+/// Every transport but the last gets [`TRANSPORT_PROBE_ATTEMPTS`] of them; the
+/// last gets what is left, and never fewer than one. The shares add up to
+/// `DIAL_ATTEMPTS` for any plan, which is the whole point: the attempts are
+/// *divided* between the transports, never multiplied by them, so a dial that
+/// tries two transports cannot cost the user more wall clock than the
+/// single-transport dial it replaced (ADR 0050's budget, unchanged).
+fn attempt_shares(stages: usize) -> Vec<u32> {
+    let mut shares = Vec::with_capacity(stages);
+    let mut left = DIAL_ATTEMPTS;
+    for position in 0..stages {
+        let behind = u32::try_from(stages.saturating_sub(position + 1)).unwrap_or(u32::MAX);
+        let take = if behind == 0 {
+            // The last transport takes whatever the earlier ones left it.
+            left
+        } else {
+            // Every transport behind this one still needs an attempt of its
+            // own, or a long plan would leave the fallback nothing to fall
+            // back with.
+            TRANSPORT_PROBE_ATTEMPTS.min(left.saturating_sub(behind))
+        };
+        let take = take.max(1);
+        shares.push(take);
+        left = left.saturating_sub(take);
+    }
+    shares
+}
+
+/// One transport of a [`DialPlan`]: the dialer that speaks it and the share of
+/// [`DIAL_ATTEMPTS`] it may spend before the next one is tried.
+#[derive(Debug)]
+struct DialStage {
+    dialer: HostDialer,
+    attempts: u32,
+}
+
+/// The transports one dial will try, in order, with their attempt budgets
+/// (gap-tasks/23 task 1; ADR 0083).
+///
+/// Non-empty by construction rather than by convention: a dial with no
+/// transport in it is not a dial, and having the first stage be a field
+/// instead of `stages[0]` is what keeps [`dial_over_plan`] free of an index
+/// that could be out of range.
+#[derive(Debug)]
+struct DialPlan {
+    first: DialStage,
+    /// Transports tried after [`Self::first`] fails, in order. Empty when the
+    /// plan names only one.
+    rest: Vec<DialStage>,
+}
+
+impl DialPlan {
+    /// Builds a plan from the dialers of [`dial_order`], in that order.
+    ///
+    /// `None` when handed nothing at all — which [`Actor::dial_plan`] cannot
+    /// do, since the iroh transport is built from an endpoint this process
+    /// already holds and is in every order this returns.
+    fn new(dialers: impl IntoIterator<Item = HostDialer>) -> Option<Self> {
+        let dialers: Vec<HostDialer> = dialers.into_iter().collect();
+        let shares = attempt_shares(dialers.len());
+        let mut stages = dialers
+            .into_iter()
+            .zip(shares)
+            .map(|(dialer, attempts)| DialStage { dialer, attempts });
+        let first = stages.next()?;
+        Some(Self {
+            first,
+            rest: stages.collect(),
+        })
+    }
+
+    /// The transports of this plan, in order — for the log line that records
+    /// which plan a dial ran, and for the tests that assert the order.
+    fn kinds(&self) -> Vec<TransportKind> {
+        std::iter::once(&self.first)
+            .chain(&self.rest)
+            .map(|stage| stage.dialer.kind())
+            .collect()
     }
 }
 
@@ -4100,6 +4280,15 @@ struct Actor {
     /// media dial does not have to wait for discovery — and so every later
     /// channel takes the transport the control channel took (ADR 0080).
     host_dialers: std::collections::HashMap<NodeId, HostDialer>,
+    /// Guest side: the transports the dial gave up on before the live session
+    /// with each host was established, for the diagnostics panel to report
+    /// (gap-tasks/23 task 3; ADR 0083).
+    ///
+    /// A fact about one connection, so it goes out with that connection: this
+    /// is cleared in the same teardown that drops the round trip and the loss
+    /// figures, and a later session to the same host starts with no fallback
+    /// to show.
+    transport_fallbacks: std::collections::HashMap<NodeId, Vec<TransportFallback>>,
     /// Guest side: the invite code used to reach each host, kept so the history
     /// row written when the session ends can dial it again (ADR 0016).
     host_invites: std::collections::HashMap<NodeId, String>,
@@ -6876,6 +7065,12 @@ impl Actor {
                     loss_permille: reception.map(|(loss, _)| loss),
                     goodput_kbps: reception.map(|(_, goodput)| goodput),
                     path,
+                    transport: transport_of(&handle.connection),
+                    fallbacks: self
+                        .transport_fallbacks
+                        .get(peer)
+                        .cloned()
+                        .unwrap_or_default(),
                     relay_region,
                     bitrate_kbps: target.map(|t| t.bitrate_kbps),
                     fps: target.map(|t| t.fps),
@@ -7181,8 +7376,9 @@ impl Actor {
                 peer,
                 code,
                 dialer,
+                fallbacks,
                 result,
-            } => self.on_dialed(peer, code, *dialer, result),
+            } => self.on_dialed(peer, code, *dialer, fallbacks, result),
             ActorEvent::File(event) => self.on_file_event(event),
             ActorEvent::Tunnel(event) => self.on_tunnel_event(event),
             ActorEvent::Terminal(event) => self.on_terminal_event(event),
@@ -7594,7 +7790,12 @@ impl Actor {
         drop(state.slot);
         self.windows.close(&state.label);
         if let Some(code) = self.host_invites.get(&peer).cloned() {
-            self.history.record(host_tag(&peer), state.role, code);
+            self.history.record(
+                host_tag(&peer),
+                state.role,
+                code,
+                self.host_dialers.get(&peer).map(HostDialer::kind),
+            );
         }
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
         // The last view closing may be the only reason the watcher was on
@@ -7982,7 +8183,12 @@ impl Actor {
                 // `stop_view` still makes when this session ends only
                 // refreshes this same row rather than duplicating it.
                 if let Some(code) = self.host_invites.get(&peer).cloned() {
-                    self.history.record(host_tag(&peer), role, code);
+                    self.history.record(
+                        host_tag(&peer),
+                        role,
+                        code,
+                        self.host_dialers.get(&peer).map(HostDialer::kind),
+                    );
                 }
                 // Only set when this grant followed a credential submission
                 // with "remember" checked (§8; ADR 0033; docs/bugs/02-connect-
@@ -8545,6 +8751,10 @@ impl Actor {
         // not inherit a round trip taken over one that no longer exists.
         self.rtt.remove(&peer);
         self.reception.remove(&peer);
+        // Same reasoning: how *this* connection was established says nothing
+        // about the next one, which runs its own dial plan (gap-tasks/23
+        // task 2; ADR 0083).
+        self.transport_fallbacks.remove(&peer);
         self.last_keyframe.remove(&peer);
         self.receiver_reports.remove(&peer);
         self.stream_scale.remove(&peer);
@@ -11878,8 +12088,8 @@ impl Actor {
         Ok(())
     }
 
-    /// Guest side: which transport this invite is going to be dialed over
-    /// (gap-tasks/21 task 3; ADR 0080).
+    /// Guest side: the obfuscated transport for this invite, when this run may
+    /// use it at all (gap-tasks/21 task 3; ADR 0080).
     ///
     /// Two conditions, both required, neither guessed at: this run must have
     /// `[network] obfuscated` on — off in every shipping build — and the
@@ -11888,41 +12098,81 @@ impl Actor {
     /// whose STUN discovery found nothing carries neither, and is dialed over
     /// iroh exactly as every ticket was before this transport existed.
     ///
-    /// Choosing between the two by *trying* one and falling back to the other,
-    /// with the diagnostics that needs, is gap-tasks/23 and deliberately not
-    /// here: this is one decision, taken once, before a single packet is sent.
-    ///
-    /// # Errors
-    /// [`ActorError::Net`] if the obfuscated endpoint cannot be bound at all,
-    /// which is a local failure — no socket — rather than anything about the
-    /// host.
-    fn dialer_for(
-        &self,
-        ticket: &InviteTicket,
-        addr: &iroh::EndpointAddr,
-    ) -> Result<HostDialer, ActorError> {
-        let iroh = || HostDialer::Iroh {
-            endpoint: self.endpoint.clone(),
-            addr: addr.clone(),
-        };
+    /// A bind that fails leaves this transport out of the plan instead of
+    /// failing the connect: it is a local failure — no socket — and the iroh
+    /// transport needs no socket of its own, so there is still a way to reach
+    /// the host (gap-tasks/23 task 1; ADR 0083).
+    fn obfuscated_dialer(&self, ticket: &InviteTicket) -> Option<HostDialer> {
         if !self.obfuscated.enabled {
-            return Ok(iroh());
+            return None;
         }
         let (Some(target), Some(fingerprint)) =
             (ticket.obfuscated_addr, ticket.host_cert_fingerprint)
         else {
             tracing::info!("this invite carries no obfuscated address: dialing the host over iroh");
-            return Ok(iroh());
+            return None;
         };
-        let endpoint = lumepeer_net::obfuscated_endpoint::GuestObfuscatedEndpoint::bind(
+        match lumepeer_net::obfuscated_endpoint::GuestObfuscatedEndpoint::bind(
             &ticket.invite_id,
             &self.identity,
             target,
             fingerprint,
-        )
-        .map_err(ActorError::Net)?;
-        tracing::info!("dialing the host over the obfuscated transport");
-        Ok(HostDialer::Obfuscated(Arc::new(endpoint)))
+        ) {
+            Ok(endpoint) => Some(HostDialer::Obfuscated(Arc::new(endpoint))),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "cannot bind the obfuscated endpoint: leaving it out of the dial plan"
+                );
+                None
+            }
+        }
+    }
+
+    /// Guest side: the transport this host connected over last time, if this
+    /// node has been there before (gap-tasks/23 task 1; ADR 0083).
+    ///
+    /// Read from the remembered-hosts list under the same stable label the
+    /// list is keyed by, which is why this is answerable before a single
+    /// packet has been sent: the ticket names the host's `NodeId`, and
+    /// [`host_tag`] hashes it the same way every run.
+    fn remembered_transport(&self, peer: &NodeId) -> Option<TransportKind> {
+        self.history.transport_of(&host_tag(peer))
+    }
+
+    /// Guest side: the transports this invite will be dialed over, in the
+    /// order they will be tried (gap-tasks/23 task 1; ADR 0083).
+    ///
+    /// **This is the one place the order is decided.** It is a decision, not
+    /// the shape the branches happened to take: the obfuscated transport goes
+    /// first when it is available at all, because it is the one a user turned
+    /// on deliberately and the one that fails fast when it cannot work (ADR
+    /// 0082 bounds its whole punch train at twelve seconds), and iroh goes
+    /// last because it is the transport that reaches a host no other way can —
+    /// it has a relay behind it and an address lookup behind that. A host this
+    /// node has reached before overrides the default with what actually
+    /// worked, which is the only evidence about this pair of machines that
+    /// exists (see [`dial_order`]).
+    ///
+    /// Choosing direct-then-relay *inside* the iroh transport is not
+    /// something this can express and not something it tries to: which of its
+    /// open paths carries a packet is iroh's own decision, taken per packet,
+    /// and it already prefers a direct path (§5).
+    ///
+    /// `None` is not reachable from here — [`dial_order`] always names the
+    /// iroh transport and that dialer always builds — and is handled by the
+    /// caller rather than asserted away.
+    fn dial_plan(&self, ticket: &InviteTicket, addr: &iroh::EndpointAddr) -> Option<DialPlan> {
+        let mut obfuscated = self.obfuscated_dialer(ticket);
+        let order = dial_order(obfuscated.is_some(), self.remembered_transport(&addr.id));
+        let dialers = order.into_iter().filter_map(|transport| match transport {
+            TransportKind::Iroh => Some(HostDialer::Iroh {
+                endpoint: self.endpoint.clone(),
+                addr: addr.clone(),
+            }),
+            TransportKind::Obfuscated => obfuscated.take(),
+        });
+        DialPlan::new(dialers)
     }
 
     /// Guest side: validate the invite here, then run the dial and the
@@ -11958,7 +12208,14 @@ impl Actor {
         }
         let proof = postcard::to_allocvec(&ticket)
             .map_err(|_| ActorError::Net(NetError::MalformedTicket))?;
-        let dialer = self.dialer_for(&ticket, &addr)?;
+        // Which transports this dial will try, and in which order, is settled
+        // here — on the actor's own thread, before the task that talks to the
+        // network starts (gap-tasks/23 task 1; ADR 0083).
+        let Some(plan) = self.dial_plan(&ticket, &addr) else {
+            return Err(ActorError::Net(NetError::Dial(
+                "no transport to dial this host over".to_owned(),
+            )));
+        };
 
         self.connect_phase = ConnectPhase::Dialing;
         self.connect_peer = Some(addr.id);
@@ -11981,14 +12238,16 @@ impl Actor {
         // running, so reading it later would be reading a field two threads
         // own. What a `Hello` advertises is settled when the dial starts.
         let codecs = self.own_codec_support;
+        tracing::info!(peer = %tag, plan = ?plan.kinds(), "dialing the host");
         tokio::spawn(async move {
-            let result = dial_with_retries(&dialer, role, proof, &tag, codecs).await;
+            let outcome = dial_over_plan(plan, role, proof, &tag, codecs).await;
             let _ = tx
                 .send(ActorEvent::Dialed {
                     peer,
                     code,
-                    dialer: Box::new(dialer),
-                    result: result.map(Box::new),
+                    dialer: Box::new(outcome.dialer),
+                    fallbacks: outcome.fallbacks,
+                    result: outcome.result.map(Box::new),
                 })
                 .await;
         });
@@ -12002,6 +12261,7 @@ impl Actor {
         peer: NodeId,
         code: String,
         dialer: HostDialer,
+        fallbacks: Vec<TransportFallback>,
         result: Result<Box<ControlConnection>, NetError>,
     ) {
         let tag = self.label_of(&peer);
@@ -12029,10 +12289,16 @@ impl Actor {
         // Remembered for the media dial that follows a `ConsentGrant`: the
         // ticket is the only place this address is known without discovery,
         // and every later channel has to take the transport this one took
-        // (ADR 0080).
-        if dialer.is_obfuscated() {
-            tracing::info!(peer = %self.label_of(&peer), "this session is on the obfuscated transport");
-        }
+        // (ADR 0080). This is also where the transport stops being a choice:
+        // nothing replaces this entry for the life of the session, so a
+        // session never changes transport under a guest (gap-tasks/23 task 2).
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            transport = dialer.kind().code(),
+            fell_back_from = ?fallbacks,
+            "this session's transport"
+        );
+        self.transport_fallbacks.insert(peer, fallbacks);
         self.host_dialers.insert(peer, dialer);
         // Remembered so the history row written when this session ends can dial
         // the same host again (ADR 0016).
@@ -12949,8 +13215,101 @@ async fn classify_incoming(
     })
 }
 
+/// Runs one dial plan: each transport in turn until one carries a finished
+/// handshake (gap-tasks/23 task 1; ADR 0083).
+///
+/// **The fallback happens before consent, and cannot happen after it.** What
+/// a stage returns is either a `ControlConnection` — the handshake of §9.1 is
+/// over, the host has queued its consent request and this dial is finished —
+/// or an error, in which case no `Hello` of this stage was ever answered.
+/// There is no third outcome and therefore no way for a guest to be looking
+/// at a consent dialog that a later transport switch takes away.
+///
+/// **An answer is never re-asked on another transport**, for the same reason
+/// ADR 0050 never retries one: a bad ticket, a version mismatch or a refusal
+/// is a verdict about this guest, and the far side will give the same verdict
+/// however it is reached. Only [`is_retryable`] failures — nothing answered,
+/// or a stream that stopped — move on to the next transport.
+///
+/// The transports are tried in the order [`Actor::dial_plan`] fixed before
+/// the first packet, and they share one attempt budget rather than each
+/// having their own ([`attempt_shares`]).
+async fn dial_over_plan(
+    plan: DialPlan,
+    role: Role,
+    proof: Vec<u8>,
+    tag: &str,
+    codecs: GuestCodecSupport,
+) -> DialOutcome {
+    let mut stage = plan.first;
+    let mut rest = plan.rest.into_iter();
+    let mut fallbacks = Vec::new();
+    loop {
+        let error = match dial_with_retries(
+            &stage.dialer,
+            stage.attempts,
+            role,
+            proof.clone(),
+            tag,
+            codecs,
+        )
+        .await
+        {
+            Ok(control) => {
+                return DialOutcome {
+                    dialer: stage.dialer,
+                    fallbacks,
+                    result: Ok(control),
+                };
+            }
+            Err(error) => error,
+        };
+        let Some(next) = rest.next().filter(|_| is_retryable(&error)) else {
+            return DialOutcome {
+                dialer: stage.dialer,
+                fallbacks,
+                result: Err(error),
+            };
+        };
+        tracing::info!(
+            peer = %tag,
+            transport = stage.dialer.kind().code(),
+            next = next.dialer.kind().code(),
+            %error,
+            "this transport did not connect: falling back to the next one"
+        );
+        fallbacks.push(TransportFallback {
+            transport: stage.dialer.kind(),
+            failure: crate::commands::net_error_code(&error),
+        });
+        stage = next;
+    }
+}
+
+/// What running a [`DialPlan`] produced.
+struct DialOutcome {
+    /// The transport that carried the handshake, or the last one tried when
+    /// none did. Kept whole rather than as a [`TransportKind`] because every
+    /// later channel of this session is opened through it (ADR 0080).
+    dialer: HostDialer,
+    /// Transports given up on before that one, oldest first.
+    fallbacks: Vec<TransportFallback>,
+    result: Result<ControlConnection, NetError>,
+}
+
+/// Whether a failed attempt is worth another one (ADR 0050).
+///
+/// This side's own observation that nothing answered, or that a stream
+/// stopped — never an answer from the host. Both the retry within one
+/// transport and the fallback to the next one read this single rule, so the
+/// two cannot drift apart into "retried here but not there".
+const fn is_retryable(error: &NetError) -> bool {
+    matches!(*error, NetError::Dial(_) | NetError::Io(_))
+}
+
 /// One outgoing control connection — dial and handshake — retried up to
-/// [`DIAL_ATTEMPTS`] times.
+/// `attempts` times, which is this transport's share of [`DIAL_ATTEMPTS`]
+/// ([`attempt_shares`]).
 ///
 /// The retry is not decoration. A ticket carries the address set the host had
 /// when it read the code out, and by the time a human has pasted it the host
@@ -12980,6 +13339,7 @@ async fn classify_incoming(
 /// mismatch or a refusal is a verdict, and asking again only collects it twice.
 async fn dial_with_retries(
     dialer: &HostDialer,
+    attempts: u32,
     role: Role,
     proof: Vec<u8>,
     tag: &str,
@@ -12987,7 +13347,7 @@ async fn dial_with_retries(
 ) -> Result<ControlConnection, NetError> {
     let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
     let mut last = NetError::Dial("no attempt was made".to_owned());
-    for attempt in 1..=DIAL_ATTEMPTS {
+    for attempt in 1..=attempts {
         // Alternated rather than "addresses first, then lookup": the ticket's
         // addresses are the fast path while they are still true, and ADR 0050
         // widened this loop precisely because one attempt each is not enough
@@ -13009,12 +13369,13 @@ async fn dial_with_retries(
             Ok(control) => return Ok(control),
             Err(error) => error,
         };
-        let retryable = matches!(error, NetError::Dial(_) | NetError::Io(_));
+        let retryable = is_retryable(&error);
         tracing::warn!(
             peer = %tag,
+            transport = dialer.kind().code(),
             %error,
             attempt,
-            of = DIAL_ATTEMPTS,
+            of = attempts,
             retryable,
             by_lookup = attempt.is_multiple_of(2),
             "connect attempt failed"
@@ -13023,7 +13384,7 @@ async fn dial_with_retries(
             return Err(error);
         }
         last = error;
-        if attempt < DIAL_ATTEMPTS {
+        if attempt < attempts {
             // Jittered so a run of attempts sweeps across a periodically
             // flapping relay link instead of staying locked in step with it
             // (ADR 0050).
@@ -13573,6 +13934,7 @@ pub fn spawn_actor_with(
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
         host_dialers: std::collections::HashMap::new(),
+        transport_fallbacks: std::collections::HashMap::new(),
         obfuscated: ObfuscatedHost {
             enabled: obfuscated,
             ..ObfuscatedHost::default()
@@ -13638,6 +14000,7 @@ mod tests {
 
     use std::time::Duration;
 
+    use lumepeer_core::constants::DIAL_TOTAL_BUDGET_SECS;
     use lumepeer_media::capture::{Frame, InputCapability, ScreenCapturer};
     use lumepeer_media::error::{MediaError, Result as MediaResult};
 
@@ -13683,6 +14046,175 @@ mod tests {
         // And a second echo of an already-answered nonce changes nothing.
         assert_eq!(tracker.pong(7), None);
         assert_eq!(tracker.smoothed(), after_the_real_one);
+    }
+
+    /// gap-tasks/23 task 1: the order is a decision, written in one place, and
+    /// the obfuscated transport leads it whenever this invite can use it — it
+    /// is the one a user turned on deliberately, and the one that gives up
+    /// quickly when it cannot work (ADR 0082 bounds its punch train).
+    #[test]
+    fn the_obfuscated_transport_leads_a_plan_that_can_use_it_at_all() {
+        assert_eq!(
+            dial_order(true, None),
+            vec![TransportKind::Obfuscated, TransportKind::Iroh]
+        );
+        // And iroh is always behind it, never instead of it: a plan with one
+        // transport in it is a plan with no fallback.
+        assert_eq!(dial_order(false, None), vec![TransportKind::Iroh]);
+    }
+
+    /// gap-tasks/23 task 1: what actually worked for this host last time beats
+    /// the default order, because it is the only evidence about this pair of
+    /// machines that exists.
+    #[test]
+    fn a_host_last_reached_over_iroh_is_tried_over_iroh_first() {
+        assert_eq!(
+            dial_order(true, Some(TransportKind::Iroh)),
+            vec![TransportKind::Iroh, TransportKind::Obfuscated]
+        );
+        // Remembering the transport that already leads changes nothing.
+        assert_eq!(
+            dial_order(true, Some(TransportKind::Obfuscated)),
+            vec![TransportKind::Obfuscated, TransportKind::Iroh]
+        );
+    }
+
+    /// gap-tasks/23 task 1: a memory reorders what is available and can never
+    /// add a transport this invite has no address for — nor leave the dial
+    /// with only the remembered one, which is what would strand a host that
+    /// moved onto a network where last time's answer no longer works.
+    #[test]
+    fn a_remembered_transport_never_adds_one_this_invite_cannot_use() {
+        assert_eq!(
+            dial_order(false, Some(TransportKind::Obfuscated)),
+            vec![TransportKind::Iroh]
+        );
+        for remembered in [
+            None,
+            Some(TransportKind::Iroh),
+            Some(TransportKind::Obfuscated),
+        ] {
+            let order = dial_order(true, remembered);
+            assert_eq!(order.len(), 2, "a fallback must always be left: {order:?}");
+            assert!(order.contains(&TransportKind::Iroh));
+            assert!(order.contains(&TransportKind::Obfuscated));
+        }
+    }
+
+    /// gap-tasks/23 task 1: the attempts of ADR 0050 are *divided* between the
+    /// transports of a plan, never multiplied by them.
+    #[test]
+    fn a_plan_divides_the_dial_attempts_instead_of_multiplying_them() {
+        assert_eq!(attempt_shares(1), vec![DIAL_ATTEMPTS]);
+        assert_eq!(
+            attempt_shares(2),
+            vec![
+                TRANSPORT_PROBE_ATTEMPTS,
+                DIAL_ATTEMPTS - TRANSPORT_PROBE_ATTEMPTS
+            ]
+        );
+        for stages in 1..=usize::try_from(DIAL_ATTEMPTS).unwrap() {
+            let shares = attempt_shares(stages);
+            assert_eq!(shares.len(), stages);
+            assert_eq!(
+                shares.iter().sum::<u32>(),
+                DIAL_ATTEMPTS,
+                "a plan of {stages} spent something other than the dial budget: {shares:?}"
+            );
+            assert!(
+                shares.iter().all(|attempts| *attempts >= 1),
+                "a transport with no attempt is a transport that is not tried: {shares:?}"
+            );
+        }
+    }
+
+    /// gap-tasks/23 task 1, the rule with teeth: a user waits no longer than
+    /// they already do. Worst case is every attempt burning its full bound
+    /// plus the longest jittered backoff between the attempts of one
+    /// transport — the plan itself waits for nothing between transports.
+    #[test]
+    fn no_dial_plan_costs_more_wall_clock_than_one_transport_already_did() {
+        fn worst_case_secs(shares: &[u32]) -> u64 {
+            let attempts: u64 = shares.iter().map(|share| u64::from(*share)).sum();
+            let backoffs: u64 = shares
+                .iter()
+                .map(|share| u64::from(share.saturating_sub(1)))
+                .sum();
+            attempts * CONNECT_ATTEMPT_TIMEOUT_SECS
+                + (backoffs * (DIAL_RETRY_BACKOFF_MS + DIAL_RETRY_BACKOFF_JITTER_MS)) / 1_000
+        }
+
+        // One transport is what the budget was measured for (ADR 0050), and is
+        // exactly the constant.
+        assert_eq!(worst_case_secs(&attempt_shares(1)), DIAL_TOTAL_BUDGET_SECS);
+        // Two transports cost no more — in fact slightly less, because the
+        // split removes one of the backoffs between attempts.
+        assert!(
+            worst_case_secs(&attempt_shares(2)) <= DIAL_TOTAL_BUDGET_SECS,
+            "a two-transport plan outgrew the budget of a one-transport dial"
+        );
+    }
+
+    /// gap-tasks/23 task 2: a transport is chosen per dial, and a reconnect is
+    /// a fresh dial — so the transport may differ between two connections to
+    /// the same host. What must not differ is the session: §10 resumes by
+    /// `NodeId` and `session_id` with the grants the host already gave, and
+    /// none of those three is a function of how the packets arrive.
+    #[test]
+    fn a_reconnect_over_a_different_transport_is_the_same_session_and_widens_nothing() {
+        let peer = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let mut sessions = SessionManager::new();
+        sessions.grant(peer, Role::ViewOnly).unwrap();
+        sessions
+            .set_grant(peer, IndependentGrant::ClipboardRead, true)
+            .unwrap();
+        let session_id = sessions.session_id(&peer).unwrap();
+        let granted = sessions.grants(&peer).unwrap();
+
+        // The transport drops, which opens the window of §10 and nothing else.
+        sessions.on_disconnect(peer).unwrap();
+        let window = lumepeer_net::reconnect::ReconnectWindow::open(peer, session_id);
+
+        // The guest dials again. Last time's transport is remembered and led
+        // the order; this time the other one is what answers — a different
+        // route to the same machine.
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            host_tag(&peer),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            Some(TransportKind::Obfuscated),
+        );
+        assert_eq!(
+            dial_order(true, history.transport_of(&host_tag(&peer))),
+            vec![TransportKind::Obfuscated, TransportKind::Iroh]
+        );
+        history.record(
+            host_tag(&peer),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            Some(TransportKind::Iroh),
+        );
+
+        // The resume is decided by peer and session, neither of which the
+        // change of transport touched.
+        assert!(
+            window.accepts(&peer, &session_id),
+            "the reconnect window is about the peer and the session, not the route"
+        );
+        let lumepeer_core::session::ReconnectDecision::Resume {
+            session_id: resumed,
+        } = sessions.on_reconnect(peer)
+        else {
+            panic!("a reconnect inside the window must resume");
+        };
+        assert_eq!(resumed, session_id, "a new transport is not a new session");
+        assert_eq!(
+            sessions.grants(&peer),
+            Some(granted),
+            "changing transport must not add or remove a single grant"
+        );
+        assert_eq!(sessions.state(&peer), SessionState::Active);
     }
 
     /// §9.1, ADR 0067: a guest that advertised none of the codec
