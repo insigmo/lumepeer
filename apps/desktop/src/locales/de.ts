@@ -360,4 +360,5 @@ export const de: Dictionary = {
   'reboot.waiting.cancel': 'Nicht mehr warten',
   'history.autoReconnect': 'Von selbst neu verbinden',
   'history.autoReconnect.hint': 'Wenn dieses Gerät verschwindet, ohne Nachfrage zurückkehren. Braucht sein hier gespeichertes Gerätepasswort und endet trotzdem in einer neuen Anmeldung.',
+  'agent.indicator': 'Fernzugriff ist auf diesem Computer aktiv',
 };

@@ -36,6 +36,7 @@ use lumepeer_runtime::session_agent::SessionScreen;
 use lumepeer_service::agent_channel::{AgentCommands, AgentLink};
 use lumepeer_service::agent_launch::{SessionAgent, console_session, user_sid};
 use lumepeer_service::agent_protocol::AgentCommand;
+use lumepeer_service::frame::Writer;
 
 use crate::view::AgentScreen;
 
@@ -117,6 +118,22 @@ fn serve_one_session(screen: &Arc<AgentScreen>, session: u32, stopping: &AtomicB
             "cannot read the signed-in user's SID; no agent this round"
         );
         screen.with_screen(SessionScreen::no_interactive_session);
+        return Served::CouldNotStart;
+    };
+
+    // The mapping before the process, and held by this side for the whole
+    // attachment. The agent *opens* it and never creates one: a mapping the
+    // agent created would be one whose access list the agent chose, and the
+    // whole point of `create_for_session_agent` is that the list names that
+    // one signed-in user and nobody else. Holding it here is also what keeps
+    // it alive — an agent that died would otherwise take the mapping with it,
+    // mid-read.
+    let Some(_mapping) = Writer::create_for_session_agent(&sid) else {
+        tracing::error!(
+            session,
+            "cannot publish a frame mapping for this session's agent"
+        );
+        screen.with_screen(SessionScreen::agent_gone);
         return Served::CouldNotStart;
     };
 

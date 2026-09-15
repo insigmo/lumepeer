@@ -360,4 +360,5 @@ export const fr: Dictionary = {
   'reboot.waiting.cancel': 'Arrêter d’attendre',
   'history.autoReconnect': 'Se reconnecter tout seul',
   'history.autoReconnect.hint': 'Si cet appareil disparaît, y revenir sans rien demander. Nécessite son mot de passe d’appareil enregistré ici, et se termine quand même par une nouvelle connexion.',
+  'agent.indicator': 'L’accès à distance est actif sur cet ordinateur',
 };

@@ -46,10 +46,12 @@ use windows::Win32::Security::{
     TokenPrimary, TokenUser,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+};
 use windows::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetExitCodeProcess,
-    PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcessId,
+    GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -111,6 +113,28 @@ pub fn console_session() -> Option<u32> {
     if session == u32::MAX || session == 0 {
         return None;
     }
+    Some(session)
+}
+
+/// The Windows session this process is running in.
+///
+/// The agent's own answer to "where am I", for the one event that carries it
+/// ([`crate::agent_protocol::AgentEvent::Attached`]). `None` when the kernel
+/// will not say, which no ordinary process should ever see.
+///
+/// Here, in the crate that already holds this crate's Win32 surface, rather
+/// than in the agent itself: the agent is the desktop binary and that crate is
+/// `#![forbid(unsafe_code)]`. One export is a smaller thing to justify than an
+/// exception to that rule (ADR 0043's standard, applied in the direction that
+/// keeps the unprivileged side free of it).
+#[must_use]
+pub fn current_session() -> Option<u32> {
+    let mut session = 0u32;
+    // SAFETY: `session` is a local the call only writes; `GetCurrentProcessId`
+    // takes no arguments and always succeeds.
+    let read = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &raw mut session) };
+    read.inspect_err(|error| tracing::warn!(%error, "cannot read this process's session"))
+        .ok()?;
     Some(session)
 }
 

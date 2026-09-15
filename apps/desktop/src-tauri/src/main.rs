@@ -16,6 +16,10 @@ mod bootstrap;
 mod commands;
 mod logging;
 mod service_control;
+// This same binary, run as a machine's session agent (ADR 0085 §1). Windows
+// only: there is no session-0 host on the other platforms to launch one.
+#[cfg(target_os = "windows")]
+mod session_agent;
 mod view_windows;
 
 // The session runtime itself lives in `crates/runtime` (ADR 0085 §1): the
@@ -455,6 +459,17 @@ fn main() {
     // mirroring the equivalent `--install`/`--uninstall` short-circuit at the
     // top of `crates/service`'s own `main.rs`.
     let args: Vec<String> = std::env::args().collect();
+    // Before everything: this process is a session agent, not a client
+    // (ADR 0085 §1). Checked first so it can never be confused with a normal
+    // run — an agent that got as far as the single-instance check, the tray or
+    // the actor would be a second host on a machine whose host launched it.
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::SESSION_AGENT_ARG)
+    {
+        session_agent::run();
+    }
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {
             Ok(()) => return,

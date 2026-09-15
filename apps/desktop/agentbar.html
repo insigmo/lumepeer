@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumepeer</title>
+    <style>
+      /* The session agent's indicator (ADR 0085 §3b). It is the only thing on
+         a machine a service is hosting that says so, so it is deliberately
+         plainer than the host bar: one line, no controls, nothing to click
+         and nothing to dismiss. A control somebody can press is a control
+         somebody can be talked into pressing. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        color: #fff;
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+        /* Nothing here is a document to select from. */
+        user-select: none;
+      }
+      #agentbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        box-sizing: border-box;
+        height: 100%;
+        padding: 0 14px;
+        /* Red, like every other "this is happening right now" mark in this
+           application, and at full opacity: an indicator that blends into a
+           desktop is one somebody stops seeing. */
+        background: #b3261e;
+        border: 1px solid rgb(255 255 255 / 28%);
+        border-radius: 10px;
+      }
+      .mark {
+        flex: none;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #fff;
+      }
+      .text {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="agentbar"></div>
+    <script type="module" src="/src/agentbar.ts"></script>
+  </body>
+</html>

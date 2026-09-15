@@ -350,4 +350,5 @@ export const ar: Dictionary = {
   'reboot.waiting.cancel': 'إيقاف الانتظار',
   'history.autoReconnect': 'إعادة الاتصال تلقائياً',
   'history.autoReconnect.hint': 'إذا اختفى هذا الجهاز، عد إليه دون سؤال. يتطلب حفظ كلمة مرور الجهاز هنا، وينتهي مع ذلك بتسجيل دخول جديد.',
+  'agent.indicator': 'الوصول عن بُعد مُفعَّل على هذا الحاسوب',
 };

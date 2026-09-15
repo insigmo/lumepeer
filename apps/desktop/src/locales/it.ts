@@ -360,4 +360,5 @@ export const it: Dictionary = {
   'reboot.waiting.cancel': 'Smetti di aspettare',
   'history.autoReconnect': 'Riconnettersi da solo',
   'history.autoReconnect.hint': 'Se questo dispositivo sparisce, tornarci senza chiedere. Serve la sua password del dispositivo salvata qui, e finisce comunque in un nuovo accesso.',
+  'agent.indicator': 'L’accesso remoto è attivo su questo computer',
 };

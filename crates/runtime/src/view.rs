@@ -535,7 +535,15 @@ const MEDIA_PAYLOAD_HEADER_BYTES: usize = 9;
 /// Deliberately not `postcard`: the bitstream is already the payload and
 /// copying it through a serializer once per picture would cost exactly what
 /// §15's latency budget does not have.
-fn encode_media_payload(frame: &EncodedFrame) -> Vec<u8> {
+///
+/// Public because a session agent writes exactly these bytes into the frame
+/// mapping (ADR 0085 §1). That is the whole point of it being one function:
+/// the agent produces the payload, the privileged host copies it onto the wire
+/// without opening it, and there is no second place where a keyframe flag and
+/// a timestamp are laid out. A host that parsed a bitstream would be a
+/// `LocalSystem` process decoding attacker-influenced bytes.
+#[must_use]
+pub fn encode_media_payload(frame: &EncodedFrame) -> Vec<u8> {
     let mut out = Vec::with_capacity(MEDIA_PAYLOAD_HEADER_BYTES + frame.data.len());
     out.push(u8::from(frame.keyframe));
     out.extend_from_slice(&frame.timestamp_us.to_le_bytes());

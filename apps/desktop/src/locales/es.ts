@@ -360,4 +360,5 @@ export const es: Dictionary = {
   'reboot.waiting.cancel': 'Dejar de esperar',
   'history.autoReconnect': 'Reconectar por su cuenta',
   'history.autoReconnect.hint': 'Si este dispositivo desaparece, volver a él sin preguntar. Necesita su contraseña de dispositivo guardada aquí, y aún así termina en un inicio de sesión nuevo.',
+  'agent.indicator': 'El acceso remoto está activo en este equipo',
 };

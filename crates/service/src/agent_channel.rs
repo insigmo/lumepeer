@@ -75,6 +75,25 @@ impl HostLink {
         self.pipe.write_all(&encode_event(event)).is_ok() && self.pipe.flush().is_ok()
     }
 
+    /// A half of this channel that can only write.
+    ///
+    /// The mirror of [`AgentLink::commands`], and needed for the mirror
+    /// reason: an agent is blocked in [`recv`](Self::recv) waiting for the
+    /// host while its capture loop has frames to announce, and one handle
+    /// cannot be both. `None` when the handle cannot be duplicated, which
+    /// leaves the agent able to hear and not answer — an attachment worth
+    /// ending rather than serving half of.
+    #[must_use]
+    pub fn events(&self) -> Option<HostEvents> {
+        self.pipe
+            .try_clone()
+            .inspect_err(
+                |error| tracing::warn!(%error, "cannot split the host channel for writing"),
+            )
+            .ok()
+            .map(|pipe| HostEvents { pipe })
+    }
+
     /// Waits for the next command from the host.
     ///
     /// `None` means the channel is gone or the host said something this agent
@@ -88,6 +107,26 @@ impl HostLink {
         // `read_exact`, not `read`: a short message is not a message.
         self.pipe.read_exact(&mut message).ok()?;
         parse_command(&message)
+    }
+}
+
+/// The writing half of a [`HostLink`].
+///
+/// Events only, the same way [`crate::agent_channel::AgentCommands`] is
+/// commands only: neither peer can reach the direction that is not its own.
+#[derive(Debug)]
+pub struct HostEvents {
+    pipe: std::fs::File,
+}
+
+impl HostEvents {
+    /// Tells the host something about this desktop.
+    ///
+    /// Returns whether it went out whole; a partial write is a failure for the
+    /// same reason it is everywhere else on this wire.
+    #[must_use]
+    pub fn send(&mut self, event: AgentEvent) -> bool {
+        self.pipe.write_all(&encode_event(event)).is_ok() && self.pipe.flush().is_ok()
     }
 }
 

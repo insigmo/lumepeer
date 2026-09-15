@@ -360,4 +360,5 @@ export const pl: Dictionary = {
   'reboot.waiting.cancel': 'Przestań czekać',
   'history.autoReconnect': 'Łącz ponownie samodzielnie',
   'history.autoReconnect.hint': 'Gdy to urządzenie zniknie, wróć do niego bez pytania. Wymaga zapisanego hasła urządzenia i i tak kończy się nowym logowaniem.',
+  'agent.indicator': 'Dostęp zdalny jest aktywny na tym komputerze',
 };

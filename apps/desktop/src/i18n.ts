@@ -56,6 +56,10 @@ export const LOCALE_NAMES: Record<Locale, string> = {
 };
 
 export type TranslationKey =
+  // The session agent's own indicator (ADR 0085 §3b). One string, because
+  // the window it is on says nothing else: a person walking up to a machine
+  // a service is hosting has to learn that fact and no more.
+  | 'agent.indicator'
   | 'consent.none.title'
   | 'consent.none.body'
   | 'consent.request.title'

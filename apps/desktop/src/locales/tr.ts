@@ -360,4 +360,5 @@ export const tr: Dictionary = {
   'reboot.waiting.cancel': 'Beklemeyi bırak',
   'history.autoReconnect': 'Kendiliğinden yeniden bağlan',
   'history.autoReconnect.hint': 'Bu cihaz kaybolursa, sormadan ona geri dön. Burada kayıtlı cihaz parolası gerekir ve yine de yeni bir oturum açmayla biter.',
+  'agent.indicator': 'Bu bilgisayarda uzaktan erişim etkin',
 };

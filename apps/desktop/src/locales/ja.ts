@@ -351,4 +351,5 @@ export const ja: Dictionary = {
   'reboot.waiting.cancel': '待機をやめる',
   'history.autoReconnect': '自動で再接続',
   'history.autoReconnect.hint': 'このデバイスがいなくなったら、確認なしで戻ります。デバイスのパスワードの保存が必要で、それでもログインはやり直しになります。',
+  'agent.indicator': 'このコンピューターはリモートアクセスが有効です',
 };
