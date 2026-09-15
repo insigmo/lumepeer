@@ -398,6 +398,31 @@
         justify-content: space-between;
         gap: 0.5rem;
       }
+      /* Asking the host to go down (ADR 0084). Side by side and equally
+         weighted: a restart and a shutdown are different decisions, and
+         making one of them the quiet secondary would be this side deciding
+         which the person meant. Red, because both end the session. */
+      .toolbar-power {
+        gap: 0.4rem;
+      }
+      .toolbar-power button {
+        flex: 1;
+        padding: 0.35rem 0.5rem;
+        background: rgb(255 90 90 / 16%);
+        color: #ffb3b3;
+        border: 1px solid rgb(255 90 90 / 45%);
+        border-radius: 0.25rem;
+        cursor: pointer;
+        font-size: 0.8rem;
+        line-height: 1.2;
+      }
+      .toolbar-power button:hover {
+        background: rgb(255 90 90 / 28%);
+      }
+      .toolbar-power button:focus-visible {
+        outline: 2px solid #9fd0ff;
+        outline-offset: 1px;
+      }
       /* The zoom stepper, shown only while the picture size is "Zoom". */
       .toolbar-zoom {
         display: inline-flex;

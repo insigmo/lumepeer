@@ -57,6 +57,7 @@ function fakeCommands(): ToolbarCommands & {
     clipboardPull: vi.fn().mockResolvedValue(null),
     sasRequest: vi.fn().mockResolvedValue(undefined),
     recordRequest: vi.fn().mockResolvedValue(undefined),
+    rebootRequest: vi.fn().mockResolvedValue(undefined),
     monitorsList: vi.fn().mockResolvedValue(MONITORS),
     monitorSelect: vi.fn().mockResolvedValue(undefined),
     viewSetScale: vi.fn().mockResolvedValue(undefined),
@@ -147,6 +148,7 @@ function draw(
     toggleMic: () => {},
     sendCad: () => {},
     askToRecord: () => {},
+    askToPower: () => {},
     pickMonitor: () => {},
     pickQuality: (preset) => {
       state.quality = preset;
@@ -178,6 +180,7 @@ function noopActions(): Parameters<typeof renderToolbar>[4] {
     toggleMic: () => {},
     sendCad: () => {},
     askToRecord: () => {},
+    askToPower: () => {},
     pickMonitor: () => {},
     pickQuality: () => {},
     pickHostResolution: () => {},
@@ -589,6 +592,45 @@ describe('the floating session toolbar', () => {
       // picker below.
       await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalled());
       expect(commands.hostDisplaySetMode).not.toHaveBeenCalled();
+    } finally {
+      stop();
+    }
+  });
+
+  // ADR 0084. The two asks live in the settings popover rather than on the
+  // toolbar proper: they are rare, and both of them end the session.
+  it('offers a restart and a shutdown as separate asks, and warns that one is one-way', () => {
+    const state = stateWith({ openPopover: 'settings' });
+    draw(state);
+    expect(container.querySelector('[data-testid="toolbar-reboot"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="toolbar-shutdown"]')).not.toBeNull();
+    // The sentence is unconditional, not something that appears only after
+    // the button is pressed: by then the message has gone.
+    const warning = container.querySelector('[data-testid="toolbar-shutdown-warning"]');
+    expect(warning?.textContent).toContain('switches it on in person');
+  });
+
+  it('neither ask is reachable while the toolbar is collapsed', () => {
+    draw(stateWith({ collapsed: true }));
+    expect(container.querySelector('[data-testid="toolbar-reboot"]')).toBeNull();
+    expect(container.querySelector('[data-testid="toolbar-shutdown"]')).toBeNull();
+  });
+
+  it('sends the mode the button stands for, and closes the menu behind it', () => {
+    const commands = fakeCommands();
+    const hooks = fakeHooks();
+    const stop = mountToolbar(container, 'en', 'host-ab12', commands, hooks);
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-shutdown"]')?.click();
+      expect(commands.rebootRequest).toHaveBeenCalledWith('host-ab12', 'shutdown');
+      // The picture is about to stop updating; a menu left open over it reads
+      // as a hang rather than as a machine going down.
+      expect(container.querySelector('[data-testid="toolbar-shutdown"]')).toBeNull();
+
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-reboot"]')?.click();
+      expect(commands.rebootRequest).toHaveBeenLastCalledWith('host-ab12', 'reboot');
     } finally {
       stop();
     }
