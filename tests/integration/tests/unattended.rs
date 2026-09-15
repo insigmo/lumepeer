@@ -10,7 +10,7 @@
 //! independent grants.
 //!
 //! The actor-level tests that decide *which* path a connection takes live with
-//! the actor, in `apps/desktop/src-tauri/src/network.rs`: only that crate owns
+//! the actor, in `crates/runtime/src/network.rs`: only that crate owns
 //! the address book and the session manager together.
 
 #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]

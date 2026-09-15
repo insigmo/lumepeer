@@ -22,7 +22,7 @@ use lumepeer_core::address_book::AddressEntry;
 use lumepeer_core::audit::{AuditEvent, RebootOutcome};
 use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
-use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
+use lumepeer_core::consent::{Admission, ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
@@ -60,7 +60,7 @@ use lumepeer_media::encode::{EncoderConfig, EncoderKind, VideoCodec, probe_hardw
 use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
 };
-use lumepeer_net::keystore::{Keystore, load_or_create};
+use lumepeer_net::keystore::Keystore;
 use lumepeer_net::obfuscated_endpoint::{HostObfuscatedEndpoint, ObfuscatedAcceptor};
 use lumepeer_net::terminal::{
     ShellId, read_frame as read_terminal_frame, write_close as write_terminal_close,
@@ -878,6 +878,15 @@ pub enum ActorError {
     /// distinct from every other refusal because it is the one the person at
     /// this end can actually do something about.
     NoSpace,
+    /// Something else on this machine is hosting, so this process is not
+    /// (ADR 0085 §4).
+    ///
+    /// Distinct from every other refusal because nothing is wrong: the app is
+    /// running, the endpoint is bound, and everything on the guest side works.
+    /// What it cannot do is become a second host, and saying so plainly is the
+    /// difference between a person understanding their machine and hunting for
+    /// a fault that is not there.
+    NotTheHost,
 }
 
 /// Whether a host that went away may be dialed again without anybody pressing
@@ -1383,6 +1392,20 @@ impl ActorHandle {
     #[must_use]
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
+    }
+
+    /// The flag itself, for the front end that watches the endpoint reach a
+    /// relay and sets it (`apps/desktop/src-tauri/src/bootstrap.rs`).
+    ///
+    /// Reaching a relay is a fact about the endpoint, and which endpoint this
+    /// node got is the front end's decision — relay-only, LAN-preferred, or
+    /// whatever a session-0 host configures — so the watcher lives with the
+    /// bind rather than with the actor. This hands it the one flag it sets and
+    /// nothing else: the value is a `bool` that only ever moves from false to
+    /// true, so there is no state here a caller could corrupt.
+    #[must_use]
+    pub fn online_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.online)
     }
 
     /// What this host can do about producing a picture, for the status the UI
@@ -1974,6 +1997,13 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Host side: one input event from a guest, on its way to
+    /// `SessionManager::authorize_input` (§8.1).
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] for a label that names no session;
+    /// [`ActorError::Core`] when the session refuses the event;
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
     pub async fn input(&self, label: String, event: InputEventPayload) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -4208,6 +4238,10 @@ impl DialPlan {
 }
 
 /// Runtime state the actor owns and loops over.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four unrelated facts about one run - is the host bar up, does               the host being dialed want a code, was a remembered password               used, and does this process hold the machine's host role.               Folding them into an enum would couple states that change               independently of each other"
+)]
 struct Actor {
     rx: mpsc::Receiver<ActorCommand>,
     sessions: SessionManager,
@@ -4649,6 +4683,13 @@ struct Actor {
     /// submitting the form. The connect form uses this to keep the modal from
     /// flashing open for a host it already knows the password to.
     connect_credentials_auto: bool,
+    /// Whether this process holds the machine's host role and may admit
+    /// guests at all (ADR 0085 §4).
+    ///
+    /// Read at the two places a node becomes a host — admitting a handshaked
+    /// peer, and handing out an invite for one to arrive with — and nowhere
+    /// else, because nothing about the guest side depends on it.
+    hosting: bool,
     /// The obfuscated transport, and whether this run may use it at all
     /// (gap-tasks/21; ADR 0080).
     obfuscated: ObfuscatedHost,
@@ -8238,6 +8279,17 @@ impl Actor {
         // `speaks_remote_sas` is already recorded by `handle_event` before
         // this runs; the parameter list stays untouched here.
         let tag = self.label_of(&peer);
+        // One host per machine (ADR 0085 §4). Checked before the ticket is
+        // claimed, so a process that is not the host does not burn a
+        // single-use invite the real host is still waiting to see used.
+        if !self.hosting {
+            tracing::warn!(
+                peer = %tag,
+                "refusing a guest: something else on this machine holds the host role"
+            );
+            connection.close_with(&NetError::ConsentUnavailable);
+            return;
+        }
         // Single-use enforcement runs here, on the actor's own thread, so two
         // connections racing the same ticket cannot both win it.
         if let Err(error) = self.tickets.claim(ticket, unix_now()) {
@@ -8260,43 +8312,68 @@ impl Actor {
         // person sat in front of a window that showed them nothing to answer.
         // Configuring a password says a device *may* let itself in; it does
         // not say the owner has stopped being able to decide.
-        let challenge = self.may_try_unattended(&peer);
+        //
+        // ADR 0085 adds the case ADR 0063's pair never had to cover: a host
+        // with no interactive session of its own, where the dialog half is not
+        // merely unlikely to be seen but impossible to show. `Admission` is
+        // where the two facts meet, in `lumepeer-core` rather than here, so
+        // there is one answer to "what may this host offer" and this function
+        // only carries it out (§2.1, §2.3).
+        let admission =
+            Admission::decide(self.windows.attendance(), self.may_try_unattended(&peer));
+        if admission.refuses() {
+            // Nobody to ask and nothing to verify. Not a fallback to asking,
+            // and not a fallback to the address book — trust narrows who may
+            // try a factor and never stands in for one (ADR 0034 §1). The
+            // ticket is already claimed above, so the connection must not be
+            // left open on a decision that will never come.
+            tracing::warn!(peer = %tag, "no way to admit this peer: nobody is here and no device password is set");
+            connection.close_with(&NetError::ConsentUnavailable);
+            return;
+        }
+        let challenge = admission.offer_credentials;
         // Every connection, first time or reconnect, gets a fresh decision.
-        let consent = match self
-            .sessions
-            .request_consent_as(peer, ticket.allowed_request)
-        {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
-                // Which refusal it was is worth a record: §15 separates "the
-                // host was too busy to ask" from "the plan does not allow
-                // another guest", and the two lead to different answers for
-                // the operator.
-                match error {
-                    CoreError::PendingConsentQueueFull => self.audit(
-                        &peer,
-                        lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
-                    ),
-                    CoreError::ConcurrentGuestLimit { limit } => self.audit(
-                        &peer,
-                        lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
-                    ),
-                    // Anything else is not one of the two §15 names a
-                    // rejection; the warning above is the whole record it gets.
-                    _ => {}
+        let consent = if admission.ask_the_person {
+            match self
+                .sessions
+                .request_consent_as(peer, ticket.allowed_request)
+            {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
+                    // Which refusal it was is worth a record: §15 separates "the
+                    // host was too busy to ask" from "the plan does not allow
+                    // another guest", and the two lead to different answers for
+                    // the operator.
+                    match error {
+                        CoreError::PendingConsentQueueFull => self.audit(
+                            &peer,
+                            lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
+                        ),
+                        CoreError::ConcurrentGuestLimit { limit } => self.audit(
+                            &peer,
+                            lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
+                        ),
+                        // Anything else is not one of the two §15 names a
+                        // rejection; the warning above is the whole record it gets.
+                        _ => {}
+                    }
+                    if !challenge {
+                        // The ticket is already burned and nobody will ever decide
+                        // on this peer, so the connection must not linger: close it
+                        // here, before it is ever stored.
+                        connection.close_with(&NetError::ConsentUnavailable);
+                        return;
+                    }
+                    // A queue this host cannot extend is not a reason to
+                    // refuse a device that can admit itself without the queue.
+                    false
                 }
-                if !challenge {
-                    // The ticket is already burned and nobody will ever decide
-                    // on this peer, so the connection must not linger: close it
-                    // here, before it is ever stored.
-                    connection.close_with(&NetError::ConsentUnavailable);
-                    return;
-                }
-                // A queue this host cannot extend is not a reason to refuse a
-                // device that can admit itself without the queue.
-                false
             }
+        } else {
+            // A host nobody is at queues nothing: a request that will never be
+            // rendered is a guest waiting forever on a host that looks alive.
+            false
         };
         self.adopt(
             connection,
@@ -10177,6 +10254,14 @@ impl Actor {
         renew: bool,
         reply: oneshot::Sender<Result<InviteDto, ActorError>>,
     ) {
+        // A process that may not admit a guest may not hand out the code one
+        // would arrive with either (ADR 0085 §4). Refused rather than issued
+        // and left unusable: an invite nobody can act on is worse than no
+        // invite, because somebody would send it to a guest and wait.
+        if !self.hosting {
+            let _ = reply.send(Err(ActorError::NotTheHost));
+            return;
+        }
         let now = unix_now();
         // "Show me my code" and "give me a new code" are different wishes and
         // used to be the same call (ADR 0062). Answering the first by issuing
@@ -12083,7 +12168,7 @@ impl Actor {
         // `secure_desktop` moves both on and off here, unlike the others
         // below: the encode loop's own `EncodeControl` copy is the "one
         // value in one place" it checks before every attempt
-        // (`apps/desktop/src-tauri/src/view.rs`), so a grant switched on
+        // (`crates/runtime/src/view.rs`), so a grant switched on
         // mid-stall must reach it just as promptly as a revoke does
         // (ADR 0049). Nothing to update if no media session exists yet —
         // `on_media_accepted` seeds the flag from the live grant when the
@@ -12962,7 +13047,7 @@ impl Actor {
                     return;
                 }
                 tracing::warn!(peer = %tag, %error, "invite connect failed");
-                self.connect_failure = Some(crate::commands::net_error_code(&error));
+                self.connect_failure = Some(crate::net_errors::net_error_code(&error));
                 self.connect_phase = ConnectPhase::Failed;
                 self.connect_peer = None;
                 return;
@@ -13978,7 +14063,7 @@ async fn dial_over_plan(
         );
         fallbacks.push(TransportFallback {
             transport: stage.dialer.kind(),
-            failure: crate::commands::net_error_code(&error),
+            failure: crate::net_errors::net_error_code(&error),
         });
         stage = next;
     }
@@ -14134,127 +14219,6 @@ async fn connect_once(
     lumepeer_net::guest_handshake(connection, role, proof, features).await
 }
 
-/// Binds the endpoint from the OS keystore identity and spawns the actor.
-///
-/// Reaching a relay is **not** awaited here: on a LAN-only machine that wait
-/// never finishes, and `main` blocks on this call before Tauri creates a
-/// window, so blocking it would leave the app with no window and no error at
-/// all. Ticket pairing does not need a relay (§7), so the wait runs in the
-/// background and only logs.
-///
-/// # Errors
-/// [`NetError`] if the keystore or the endpoint bind fails — surfaced as a
-/// startup failure rather than silently degrading (§11.2, §24.5).
-/// Opens the keystore, honouring the `LUMEPEER_KEYSTORE=file` override.
-///
-/// Default is the OS-native backend (`crates/net::keystore::open`). The
-/// override selects the encrypted-file store — the documented fallback for
-/// headless environments (CI, SSH-run E2E) where no secret-service prompter
-/// exists to unlock the keyring. `LUMEPEER_KEYSTORE_PATH` chooses the file
-/// location; it defaults to the app data directory.
-///
-/// # Errors
-/// [`NetError`] as [`keystore::open`], or when `LUMEPEER_KEYSTORE=file` is
-/// set but no usable path can be derived.
-fn open_keystore() -> Result<Box<dyn lumepeer_net::keystore::Keystore>, NetError> {
-    const KEYSTORE_ENV: &str = "LUMEPEER_KEYSTORE";
-    if std::env::var(KEYSTORE_ENV).as_deref() != Ok("file") {
-        return lumepeer_net::keystore::open();
-    }
-    let path = std::env::var("LUMEPEER_KEYSTORE_PATH").map_err(|_| {
-        NetError::Keystore("LUMEPEER_KEYSTORE=file also needs LUMEPEER_KEYSTORE_PATH".to_owned())
-    })?;
-    let path = std::path::PathBuf::from(path);
-    tracing::info!(path = %path.display(), "using the encrypted-file keystore (LUMEPEER_KEYSTORE=file)");
-    // The user secret mixes the machine id with the user name: stable for
-    // this user on this machine, never written anywhere (§11.2).
-    let machine = machine_id();
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_default();
-    Ok(Box::new(lumepeer_net::keystore::FileKeystore::new(
-        path,
-        format!("{machine}:{user}").as_bytes(),
-    )))
-}
-
-/// Reads `/etc/machine-id` (or the fallback `DBUS` path) for the file-keystore
-/// user secret. A missing file is not fatal: an empty id only weakens the
-/// secret to the user name, matching the fallback's documented threat model.
-fn machine_id() -> String {
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(id) = std::fs::read_to_string(path) {
-            return id.trim().to_owned();
-        }
-    }
-    String::new()
-}
-
-pub async fn spawn_actor(
-    app: tauri::AppHandle,
-    settings: &crate::config::Settings,
-) -> Result<ActorHandle, NetError> {
-    let store = open_keystore()?;
-    let secret_key = load_or_create(store.as_ref())?;
-    let identity = SigningKey::from_bytes(&secret_key.to_bytes());
-    let relay = settings.relay_url();
-    // Relay-only is a WAN test, never the default: with the IP transports
-    // cleared every session lives or dies with one relay link, and a client
-    // whose relay flaps cannot connect at all (ADR 0026).
-    let endpoint = if settings.relay_only() {
-        tracing::info!(
-            "transport: relay only — direct IP paths are off, so every session goes over the internet"
-        );
-        PeerEndpoint::bind_relay_only(secret_key, relay).await?
-    } else {
-        tracing::info!("transport: direct IP paths preferred, relay as the fallback");
-        PeerEndpoint::bind_with_lan(secret_key, relay).await?
-    };
-    let audit = open_audit_log(&app, store.as_ref()).await;
-    // A second, independent handle on the same keystore: every native backend
-    // opens its own connection per operation rather than holding one open
-    // (see e.g. `SecretServiceKeystore`'s own doc comment), so this costs
-    // nothing beyond what `UnattendedStore` below already pays, and it is
-    // what lets the two stores own their `Box<dyn Keystore>` outright instead
-    // of sharing one behind an `Arc` (docs/bugs/02-connect-form.md, task 6).
-    let remembered_password_keystore = open_keystore()?;
-    let stores = ActorStores {
-        history_path: connection_history_path(&app),
-        address_book_path: address_book_path(),
-        invite_path: invite_path(),
-        // The same keystore the identity came from: the unattended password
-        // hash and TOTP secret are secret material and `CLAUDE.md` keeps
-        // secrets out of `config/*.toml` (§11.2; ADR 0033).
-        keystore: store,
-        remembered_password_keystore,
-        audit,
-    };
-
-    let handle = spawn_actor_with(
-        endpoint.clone(),
-        identity,
-        Arc::new(crate::view::TauriViewWindows::new(app)),
-        default_capture(),
-        crate::clipboard_os::platform_clipboard(),
-        stores,
-        settings.obfuscated(),
-    );
-
-    tokio::spawn({
-        let online = Arc::clone(&handle.online);
-        async move {
-            endpoint.online().await;
-            online.store(true, Ordering::Relaxed);
-            tracing::info!("endpoint reached a relay; invites are dialable from outside the LAN");
-        }
-    });
-
-    Ok(handle)
-}
-
-/// Where the connection history file lives, if the app data directory can be
-/// resolved at all. `None` degrades the feature to in-memory-only for this
-/// run rather than failing startup over a convenience list (§18).
 /// Where the host's address book lives, if the config directory resolves at
 /// all. `None` degrades the book to in-memory-only for this run, which trusts
 /// nobody — the safe direction (§18; ADR 0034).
@@ -14262,7 +14226,7 @@ pub async fn spawn_actor(
 /// Alongside the other configuration rather than in the app data directory:
 /// it is host-owned policy, in the same place `config/control_policy.toml`
 /// lives, and it holds no secrets (a `NodeId` is a public key).
-fn address_book_path() -> Option<std::path::PathBuf> {
+pub fn address_book_path() -> Option<std::path::PathBuf> {
     let Some(dir) = crate::config::config_dir() else {
         tracing::warn!("cannot resolve the config directory; the address book will not persist");
         return None;
@@ -14274,7 +14238,7 @@ fn address_book_path() -> Option<std::path::PathBuf> {
 ///
 /// Next to the address book rather than to the connection history: both belong
 /// to the host's own configuration, and neither is per-machine-install state.
-fn invite_path() -> Option<std::path::PathBuf> {
+pub fn invite_path() -> Option<std::path::PathBuf> {
     let Some(dir) = crate::config::config_dir() else {
         tracing::warn!(
             "cannot resolve the config directory; the invite code will not survive a restart"
@@ -14282,66 +14246,6 @@ fn invite_path() -> Option<std::path::PathBuf> {
         return None;
     };
     Some(dir.join("invite.json"))
-}
-
-/// Opens the audit log and starts its daily retention sweep (§15; ADR 0041).
-///
-/// Every failure here is a warning and a `None`, never a refusal to start: §18
-/// says a storage fault degrades the feature that needs the storage. A host
-/// that cannot write an audit trail is still a host, and refusing to run would
-/// hand anyone who can break the database a way to take the machine offline.
-///
-/// The one failure worth its own message is a lost install salt over a
-/// non-empty log: minting a new one would silently split every peer's history
-/// in two, so the log is left untouched and unwritten instead.
-async fn open_audit_log(
-    app: &tauri::AppHandle,
-    keystore: &dyn Keystore,
-) -> Option<crate::audit_store::AuditStore> {
-    use tauri::Manager as _;
-
-    let path = match app.path().app_local_data_dir() {
-        Ok(dir) => dir.join("audit.db"),
-        Err(error) => {
-            tracing::warn!(%error, "cannot resolve the app data directory; no audit log this run");
-            return None;
-        }
-    };
-    let store = match crate::audit_store::AuditStore::open(path, keystore).await {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::warn!(%error, "audit log unavailable; the host runs without an audit trail");
-            return None;
-        }
-    };
-
-    // Once a day, not once per record: the sweep is a table scan and the
-    // cutoff moves by seconds. `AuditStore::open` already swept once.
-    let daily = store.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-            lumepeer_core::constants::AUDIT_RETENTION_SWEEP_SECS,
-        ));
-        ticker.tick().await; // fires immediately; the open already pruned
-        loop {
-            ticker.tick().await;
-            if let Err(error) = daily.prune().await {
-                tracing::warn!(%error, "audit log: retention sweep failed");
-            }
-        }
-    });
-    Some(store)
-}
-
-fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager as _;
-    match app.path().app_local_data_dir() {
-        Ok(dir) => Some(dir.join("connection_history.json")),
-        Err(error) => {
-            tracing::warn!(%error, "cannot resolve the app data directory; connection history will not persist");
-            None
-        }
-    }
 }
 
 /// Builds the host's media side: the capture controller, whether this platform
@@ -14439,6 +14343,51 @@ impl ActorStores {
     }
 }
 
+/// What this process is allowed to be on this machine (ADR 0085 §4).
+///
+/// Two flags rather than two parameters, because they are one question —
+/// "what kind of node is this run" — and because a seventh and eighth
+/// positional `bool` on [`spawn_actor_with`] is a call nobody can read.
+///
+/// There is no `Default`, deliberately. Hosting is the consequential half,
+/// and a default would decide it for a caller that did not think about it;
+/// the two constructors make the choice a word at every call site instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorPolicy {
+    /// Whether this process holds the machine's host role and may therefore
+    /// admit guests and hand out invites (ADR 0085 §4).
+    ///
+    /// `false` does not make this actor useless: it still dials out, still
+    /// views a host that admitted it, and still owns every guest-side feature.
+    /// What it does not do is become a *second* host on a machine that already
+    /// has one, which would mean two processes owning `SessionManager` for the
+    /// same screen and §8.2's `ControlLimited` snapshot being taken twice
+    /// against two different policies.
+    pub hosting: bool,
+    /// Whether the obfuscated transport is offered (ADR 0051, ADR 0083).
+    pub obfuscated: bool,
+}
+
+impl ActorPolicy {
+    /// This process holds the host role.
+    #[must_use]
+    pub const fn hosting(obfuscated: bool) -> Self {
+        Self {
+            hosting: true,
+            obfuscated,
+        }
+    }
+
+    /// Something else on this machine is hosting, so this process must not.
+    #[must_use]
+    pub const fn not_hosting(obfuscated: bool) -> Self {
+        Self {
+            hosting: false,
+            obfuscated,
+        }
+    }
+}
+
 /// Removes what a *past* run received through the clipboard path and never
 /// got to clean up (a crash, a kill) — docs/bugs/14-clipboard-files.md #3.
 ///
@@ -14475,7 +14424,7 @@ pub fn spawn_actor_with(
     media: HostMedia,
     clipboard: crate::clipboard_os::ClipboardFactory,
     stores: ActorStores,
-    obfuscated: bool,
+    policy: ActorPolicy,
 ) -> ActorHandle {
     let ActorStores {
         history_path,
@@ -14641,9 +14590,10 @@ pub fn spawn_actor_with(
         host_dialers: std::collections::HashMap::new(),
         transport_fallbacks: std::collections::HashMap::new(),
         obfuscated: ObfuscatedHost {
-            enabled: obfuscated,
+            enabled: policy.obfuscated,
             ..ObfuscatedHost::default()
         },
+        hosting: policy.hosting,
         host_invites: std::collections::HashMap::new(),
         chat: ChatLog::new(),
         speaks_file_transfer: std::collections::HashSet::new(),
@@ -15343,9 +15293,25 @@ mod tests {
         opened: std::sync::Mutex<Vec<(String, String, bool)>>,
         closed: std::sync::Mutex<Vec<String>>,
         host_bar: std::sync::atomic::AtomicBool,
+        /// Whether this stand-in claims somebody is in front of the host
+        /// (ADR 0085 §2). `false` is the default so the field has to be turned
+        /// on deliberately by the one test that is about a host with nobody at
+        /// it; `default()` stays a host somebody could answer a dialog at, so
+        /// every other test behaves exactly as it did before.
+        unattended: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingWindows {
+        /// A host with no interactive session of its own — what a session-0
+        /// host answers until its agent attaches.
+        fn unattended() -> Self {
+            let windows = Self::default();
+            windows
+                .unattended
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            windows
+        }
+
         fn opened(&self) -> Vec<(String, String, bool)> {
             self.opened.lock().unwrap().clone()
         }
@@ -15374,6 +15340,14 @@ mod tests {
         fn set_host_bar(&self, visible: bool) {
             self.host_bar
                 .store(visible, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn attendance(&self) -> lumepeer_core::consent::HostAttendance {
+            if self.unattended.load(std::sync::atomic::Ordering::Relaxed) {
+                lumepeer_core::consent::HostAttendance::Unattended
+            } else {
+                lumepeer_core::consent::HostAttendance::Attended
+            }
         }
     }
 
@@ -15414,7 +15388,7 @@ mod tests {
             media,
             factory,
             ActorStores::in_memory(),
-            false,
+            ActorPolicy::hosting(false),
         );
         (handle, clipboard)
     }
@@ -15435,7 +15409,7 @@ mod tests {
             media,
             crate::clipboard_os::no_clipboard(),
             ActorStores::in_memory(),
-            false,
+            ActorPolicy::hosting(false),
         );
         (handle, endpoint)
     }
@@ -18158,6 +18132,133 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// An actor built without the machine's host role (ADR 0085 §4).
+    ///
+    /// Used by the one test below rather than by a helper every other test
+    /// goes through, because *not* hosting is the exceptional state: every
+    /// other actor in this suite is the host of its own throwaway endpoint.
+    async fn actor_not_hosting() -> (ActorHandle, PeerEndpoint) {
+        let capture = test_capture();
+        let media = test_media(&capture);
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let endpoint = PeerEndpoint::bind_local(secret).await.unwrap();
+        let handle = spawn_actor_with(
+            endpoint.clone(),
+            identity,
+            Arc::new(DetachedViewWindows),
+            media,
+            crate::clipboard_os::no_clipboard(),
+            ActorStores::in_memory(),
+            ActorPolicy::not_hosting(false),
+        );
+        (handle, endpoint)
+    }
+
+    /// ADR 0085 §4: a process that does not hold the machine's host role does
+    /// not hand out the code a guest would arrive with.
+    ///
+    /// Refused rather than issued and left unusable — an invite nobody can act
+    /// on is worse than no invite, because somebody would send it to a guest
+    /// and then both of them would wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_without_the_host_role_issues_no_invite() {
+        let (host, _endpoint) = actor_not_hosting().await;
+        assert!(
+            matches!(
+                host.invite_create(Role::ViewOnly, false).await,
+                Err(ActorError::NotTheHost)
+            ),
+            "a second host must not be able to invite anybody"
+        );
+    }
+
+    /// ADR 0085 §4, the half that matters: even with a valid invite in hand, a
+    /// guest is not admitted by a process that does not hold the host role.
+    ///
+    /// The invite is issued by a *hosting* actor and the dial is aimed at the
+    /// non-hosting one, so what refuses the guest is the role check and not
+    /// the absence of a ticket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_process_without_the_host_role_admits_nobody() {
+        // Long enough for a local dial and handshake to complete several times
+        // over, and short enough not to add `TIMEOUT` to the suite for an
+        // assertion that is about something never appearing. The guest
+        // reaching `Failed` ends the wait early; not reaching it does not
+        // weaken the check, because the check is that no session was ever
+        // queued.
+        const SETTLE: Duration = Duration::from_secs(3);
+
+        let (issuer, _issuer_endpoint, _issuer_capture) = actor().await;
+        let (not_host, not_host_endpoint) = actor_not_hosting().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        // A real, live invite — signed by the issuer, which is a different
+        // node, so the dial reaches the handshake and is refused there rather
+        // than failing to parse.
+        let invite = issuer.invite_create(Role::ViewOnly, false).await.unwrap();
+        let _ = guest.invite_connect(invite.code).await;
+        let _ = not_host_endpoint;
+
+        let deadline = tokio::time::Instant::now() + SETTLE;
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                not_host.status().await.unwrap().is_empty(),
+                "a process without the host role queued a session anyway"
+            );
+            if guest.connect_state().await.unwrap().phase == ConnectPhase::Failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(not_host.status().await.unwrap().is_empty());
+    }
+
+    /// ADR 0085 §2 at the actor: a host with no interactive session of its own
+    /// and no device password configured admits nobody.
+    ///
+    /// The refusal this whole pack turns on. It is deliberately a worse
+    /// experience than guessing — the guest's attempt fails outright — and it
+    /// is the only behaviour that keeps "anything not explicitly permitted is
+    /// forbidden" true on a machine with an empty chair in front of it. Note
+    /// what is *not* tried here: no fallback to queueing a dialog nobody could
+    /// render, and no treating the invite or the address book as a stand-in
+    /// for a factor (ADR 0034 §1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_with_nobody_at_it_and_no_device_password_admits_nobody() {
+        let (host, _host_endpoint, capture, _windows) =
+            actor_with_windows(Arc::new(RecordingWindows::unattended())).await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        // The dial itself is fine — this is a real invite on a reachable host.
+        // What fails is the admission behind it, which is the distinction the
+        // test is about.
+        guest.invite_connect(invite.code).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let phase = guest.connect_state().await.unwrap().phase;
+            if phase == ConnectPhase::Failed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guest never learned it was refused; it was left in {phase:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            host.status().await.unwrap().is_empty(),
+            "a host nobody is at queued a consent request that nobody could ever answer"
+        );
+        assert!(
+            !lock_capture(&capture).is_capturing(),
+            "a refused peer must never start capture"
+        );
     }
 
     /// I7: a connection on a non-control ALPN must never reach the control

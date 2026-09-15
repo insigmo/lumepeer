@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Window;
 
 use crate::AppState;
-use crate::network::{ActorError, SessionStateDto};
+use lumepeer_runtime::net_errors::classify_net;
+use lumepeer_runtime::network::{ActorError, SessionStateDto};
 
 /// Label of the window allowed to call the session/invite/license commands.
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -65,6 +66,18 @@ impl IpcError {
         Self {
             code: "NO_SPACE",
             message: "there is not enough free space where that file was going".to_owned(),
+        }
+    }
+
+    /// Something else on this machine holds the host role (ADR 0085 §4).
+    ///
+    /// Says which process, in the only terms the person at the machine can
+    /// act on: the service is serving this screen, and this window is not.
+    fn not_the_host() -> Self {
+        Self {
+            code: "NOT_THE_HOST",
+            message: "the Lumepeer service is hosting this machine, so this window cannot"
+                .to_owned(),
         }
     }
 
@@ -120,56 +133,6 @@ impl IpcError {
     }
 }
 
-/// The §18 code of a transport failure, without its message.
-///
-/// The dial now runs off the actor loop, so a failure can no longer be the
-/// IPC call's own `Err`: the actor keeps this code instead and `connect_status`
-/// hands it to the webview, which owns the wording in the user's language
-/// (ADR 0027). Same classification as [`IpcError::net`], so nothing is
-/// disclosed here that the error channel would not have disclosed anyway.
-pub fn net_error_code(error: &lumepeer_net::NetError) -> &'static str {
-    classify_net(error).0
-}
-
-/// Maps a transport failure onto the (code, message) pair of §18.
-fn classify_net(error: &lumepeer_net::NetError) -> (&'static str, &'static str) {
-    use lumepeer_core::CoreError;
-    use lumepeer_net::NetError;
-
-    match *error {
-        NetError::MalformedTicket | NetError::InvalidTicket => {
-            ("BAD_TICKET", "the invite is not valid or has expired")
-        }
-        NetError::AlreadyConnected => (
-            "ALREADY_CONNECTED",
-            "you are already connected to this device",
-        ),
-        NetError::Dial(_) | NetError::Endpoint(_) => {
-            ("DIAL_FAILED", "the host could not be reached")
-        }
-        // This device, not the peer: nothing is wrong with the invite or
-        // the far side, so it must not read like a rejection.
-        NetError::Offline => (
-            "OFFLINE",
-            "this device is not reachable from the internet yet — wait for the status to turn ready, then try again",
-        ),
-        NetError::Framing(CoreError::IncompatibleVersion { .. }) => (
-            "INCOMPATIBLE_VERSION",
-            "the host speaks an incompatible protocol version",
-        ),
-        // Transport, not verdict. This is what *this* side observed — a
-        // stream that stopped — so saying so leaks nothing about why the
-        // far end did anything, and it keeps a flapping link from being
-        // reported as a rejection, which sends the user hunting on the
-        // wrong machine (ADR 0026).
-        NetError::Io(_) => (
-            "TRANSPORT_LOST",
-            "the connection dropped before the session was set up — check the network and try again",
-        ),
-        _ => ("REJECTED", "the host refused the connection"),
-    }
-}
-
 impl From<ActorError> for IpcError {
     fn from(error: ActorError) -> Self {
         match error {
@@ -180,6 +143,7 @@ impl From<ActorError> for IpcError {
             ActorError::ChannelClosed => Self::poisoned(),
             ActorError::Unsupported => Self::unsupported(),
             ActorError::NoSpace => Self::no_space(),
+            ActorError::NotTheHost => Self::not_the_host(),
         }
     }
 }
@@ -204,7 +168,7 @@ fn check_window(window: &Window) -> Result<(), IpcError> {
 fn check_host_surface(window: &Window) -> Result<(), IpcError> {
     if matches!(
         window.label(),
-        MAIN_WINDOW_LABEL | crate::view::HOST_BAR_LABEL
+        MAIN_WINDOW_LABEL | crate::view_windows::HOST_BAR_LABEL
     ) {
         Ok(())
     } else {
@@ -214,7 +178,7 @@ fn check_host_surface(window: &Window) -> Result<(), IpcError> {
 
 /// Rejects calls that do not come from the host's session bar.
 fn check_host_bar(window: &Window) -> Result<(), IpcError> {
-    if window.label() == crate::view::HOST_BAR_LABEL {
+    if window.label() == crate::view_windows::HOST_BAR_LABEL {
         Ok(())
     } else {
         Err(IpcError::denied())
@@ -1917,7 +1881,7 @@ pub async fn file_abort(
 pub async fn file_transfers(
     window: Window,
     state: tauri::State<'_, AppState>,
-) -> Result<crate::network::FileTransfersDto, IpcError> {
+) -> Result<lumepeer_runtime::network::FileTransfersDto, IpcError> {
     // Readable from either window: a guest watching its own transfer list is
     // reading its own side of the session, and every row it can see is one it
     // is already a party to.
@@ -2087,7 +2051,7 @@ pub async fn local_dir_list(
     check_view_window(&window, &args.peer)?;
     let path = match args.path {
         Some(path) => path,
-        None => crate::config::home()
+        None => lumepeer_runtime::config::home()
             .map(|home| home.to_string_lossy().into_owned())
             .ok_or(IpcError {
                 code: "NO_HOME_DIR",
@@ -2098,11 +2062,13 @@ pub async fn local_dir_list(
         code: "BAD_PATH",
         message: "that is not a directory this build will open".to_owned(),
     })?;
-    let (entries, truncated) = crate::network::read_directory(std::path::Path::new(resolved))
-        .map_err(|_| IpcError {
-            code: "UNREADABLE",
-            message: "that directory could not be read".to_owned(),
-        })?;
+    let (entries, truncated) = lumepeer_runtime::network::read_directory(std::path::Path::new(
+        resolved,
+    ))
+    .map_err(|_| IpcError {
+        code: "UNREADABLE",
+        message: "that directory could not be read".to_owned(),
+    })?;
     Ok(LocalDirDto {
         parent: parent_of(resolved),
         path: resolved.to_owned(),
@@ -2355,7 +2321,7 @@ pub async fn tunnel_set_target(
 pub async fn tunnel_status(
     window: Window,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<crate::network::TunnelRow>, IpcError> {
+) -> Result<Vec<lumepeer_runtime::network::TunnelRow>, IpcError> {
     check_window(&window)?;
     Ok(state.network.tunnel_status().await?)
 }
@@ -2975,7 +2941,7 @@ const RECORDING_EXTENSION: &str = "lmrc";
 /// The recordings directory, or the §18 error for a machine with no per-user
 /// data directory at all.
 fn recordings_dir() -> Result<std::path::PathBuf, IpcError> {
-    crate::config::recordings_dir().ok_or(IpcError {
+    lumepeer_runtime::config::recordings_dir().ok_or(IpcError {
         code: "NO_DATA_DIR",
         message: "this machine has no per-user data directory".to_owned(),
     })
@@ -3389,7 +3355,7 @@ pub async fn audit_list(
 /// drift away from what `audit_store::event_columns` actually writes.
 #[tauri::command]
 pub fn audit_kinds() -> Vec<&'static str> {
-    crate::audit_store::EVENT_KINDS.to_vec()
+    lumepeer_runtime::audit_store::EVENT_KINDS.to_vec()
 }
 
 /// Whether this host is keeping an audit log at all (§15).
@@ -3496,15 +3462,18 @@ pub async fn host_bar_expand(
     use tauri::{LogicalSize, Manager as _, PhysicalPosition};
 
     check_host_bar(&window)?;
-    let Some(bar) = app.get_webview_window(crate::view::HOST_BAR_LABEL) else {
+    let Some(bar) = app.get_webview_window(crate::view_windows::HOST_BAR_LABEL) else {
         return Ok(());
     };
     let (width, height) = if args.expanded {
-        (crate::view::HOST_BAR_WIDTH, crate::view::HOST_BAR_HEIGHT)
+        (
+            crate::view_windows::HOST_BAR_WIDTH,
+            crate::view_windows::HOST_BAR_HEIGHT,
+        )
     } else {
         (
-            crate::view::HOST_BAR_TAB_WIDTH,
-            crate::view::HOST_BAR_TAB_HEIGHT,
+            crate::view_windows::HOST_BAR_TAB_WIDTH,
+            crate::view_windows::HOST_BAR_TAB_HEIGHT,
         )
     };
 

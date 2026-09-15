@@ -83,7 +83,9 @@ fn wide(text: &str) -> Vec<u16> {
 /// finally has the right desktop to snapshot.
 #[must_use]
 pub fn run_worker() -> u32 {
-    let Some(writer) = lumepeer_service::frame::Writer::open() else {
+    let Some(writer) =
+        lumepeer_service::frame::Writer::open(lumepeer_service::frame::FrameChannel::SecureDesktop)
+    else {
         tracing::error!("secure-desktop worker: cannot open the frame mapping");
         return 1;
     };

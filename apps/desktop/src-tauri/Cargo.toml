@@ -22,23 +22,23 @@ default = []
 # X11 Linux, or automatically on Linux via the target-specific dependency table
 # below). Without any of them the app runs, pairs and consents normally and
 # reports "no capture backend" instead of showing a picture (§18).
-capture-x11 = ["lumepeer-media/capture-x11"]
-capture-portal = ["lumepeer-media/capture-portal"]
-audio-capture-pipewire = ["lumepeer-media/audio-capture-pipewire"]
-capture-scap = ["lumepeer-media/capture-scap"]
-capture-windows = ["lumepeer-media/capture-windows"]
-capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
-audio-capture-screencapturekit = ["lumepeer-media/audio-capture-screencapturekit"]
-audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio"]
-encode-openh264 = ["lumepeer-media/encode-openh264"]
-encode-mf = ["lumepeer-media/encode-mf"]
+capture-x11 = ["lumepeer-media/capture-x11", "lumepeer-runtime/capture-x11"]
+capture-portal = ["lumepeer-media/capture-portal", "lumepeer-runtime/capture-portal"]
+audio-capture-pipewire = ["lumepeer-media/audio-capture-pipewire", "lumepeer-runtime/audio-capture-pipewire"]
+capture-scap = ["lumepeer-media/capture-scap", "lumepeer-runtime/capture-scap"]
+capture-windows = ["lumepeer-media/capture-windows", "lumepeer-runtime/capture-windows"]
+capture-screencapturekit = ["lumepeer-media/capture-screencapturekit", "lumepeer-runtime/capture-screencapturekit"]
+audio-capture-screencapturekit = ["lumepeer-media/audio-capture-screencapturekit", "lumepeer-runtime/audio-capture-screencapturekit"]
+audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio", "lumepeer-runtime/audio-playout-coreaudio"]
+encode-openh264 = ["lumepeer-media/encode-openh264", "lumepeer-runtime/encode-openh264"]
+encode-mf = ["lumepeer-media/encode-mf", "lumepeer-runtime/encode-mf"]
 # Zero-copy capture-to-encoder frame path on Windows (ADR 0073). A
 # pass-through like the ones above, and deliberately not part of any
 # release build: the path is only worth turning on where it has been
 # measured on the machine in question.
-encode-mf-zero-copy = ["lumepeer-media/encode-mf-zero-copy"]
-encode-videotoolbox = ["lumepeer-media/encode-videotoolbox"]
-decode-openh264 = ["lumepeer-media/decode-openh264"]
+encode-mf-zero-copy = ["lumepeer-media/encode-mf-zero-copy", "lumepeer-runtime/encode-mf-zero-copy"]
+encode-videotoolbox = ["lumepeer-media/encode-videotoolbox", "lumepeer-runtime/encode-videotoolbox"]
+decode-openh264 = ["lumepeer-media/decode-openh264", "lumepeer-runtime/decode-openh264"]
 # Off by default: never part of `cargo build --workspace`, the Task client
 # builds, or the release CI matrix. Opt in locally with
 # `cargo build --features pilot` to get tauri-pilot wired in for
@@ -55,6 +55,10 @@ arboard.workspace = true
 lumepeer-core.workspace = true
 lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
 lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] }
+# The session runtime: the actor, the stores and the media pipeline, with no
+# window of its own (ADR 0085 §1). This crate is the Tauri application around
+# it and nothing more.
+lumepeer-runtime.workspace = true
 # The privileged helper service and its two-byte protocol (ADR 0043). The
 # library half carries no privileges and no Win32; the service binary does.
 lumepeer-service.workspace = true
