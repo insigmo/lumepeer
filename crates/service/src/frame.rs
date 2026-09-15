@@ -67,7 +67,7 @@ const MAX_SID_STRING_CHARS: usize = 90;
 /// carry anything unexpected. `S`, digits and `-` cannot close an ACE or open
 /// another one, so a string that passes this cannot change the list's
 /// structure whatever else is wrong with it.
-fn is_sid_string(text: &str) -> bool {
+pub(crate) fn is_sid_string(text: &str) -> bool {
     text.len() <= MAX_SID_STRING_CHARS
         && text.starts_with("S-")
         && text
