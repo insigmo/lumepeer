@@ -272,6 +272,16 @@ in here is exactly what would make this change too large to review:
 - The desktop client gains a state it did not have: *running, not hosting*.
   Every surface that assumed "this app is the host" has to mean "this app is
   the host **if it holds the token**".
+- **Most of `apps/desktop/src-tauri/src` has moved**, to `crates/runtime`: the
+  actor, the stores, the media loops and the §18 error table. What stays is the
+  Tauri application around them — `main.rs`, the IPC surface of §13,
+  `autostart`, the helper-service control, the window implementation of
+  `ViewWindows`, and the three `AppHandle`-taking functions that tell the
+  runtime where this installation's files are. Task files written against the
+  old paths (`docs/gap-tasks/06`, `10`, `12`, `13`, `15`, `16`, `21`, `23`,
+  `24`, `26`) name files that are now one directory over; the function and type
+  names in them are unchanged, which is what `docs/gap-tasks/README.md` already
+  says to trust over a path.
 - `crates/service` grows from three narrow capabilities to three narrow
   capabilities plus a long-lived child process and a channel to it. The child
   is the part that needed the most care, and the rule it is built around —

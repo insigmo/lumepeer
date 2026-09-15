@@ -1782,7 +1782,7 @@ mod dxgi {
         /// [`SECURE_DESKTOP_RECOVERY_BACKOFF_MS`]. Every poll while that is
         /// running returns `Err(MediaError::SecureDesktopActive)` — never
         /// `Ok` — so the caller
-        /// (`apps/desktop/src-tauri/src/view.rs::spawn_encode_loop`) knows to
+        /// (`crates/runtime/src/view.rs::spawn_encode_loop`) knows to
         /// keep the session up and say so rather than to revoke.
         ///
         /// The retry has no attempt budget, and that is the point. It used to

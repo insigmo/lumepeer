@@ -142,7 +142,7 @@ pub const SECURE_DESKTOP_MAPPING_NAME: &str = r"Global\lumepeer-secure-desktop-f
 /// Bytes of the fixed header at the start of the mapping: `width:u32 |
 /// height:u32 | payload_len:u32`, little-endian, read and written as plain
 /// byte slices rather than a `#[repr(C)]` cast — the same style
-/// `apps/desktop/src-tauri/src/view.rs::decode_media_payload` already uses
+/// `crates/runtime/src/view.rs::decode_media_payload` already uses
 /// for untrusted-shaped input, so there is no struct layout to get subtly
 /// wrong across the two sides of the mapping.
 pub const SECURE_DESKTOP_FRAME_HEADER_BYTES: usize = 12;

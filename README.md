@@ -54,6 +54,7 @@ instead of installing latest.
 | `crates/media`           | Capture, encode, jitter buffer, adaptive bitrate.                    |
 | `crates/decoder-worker`  | Decoder in its own sandboxed OS process (§11.3).                     |
 | `crates/service`         | Privileged helper: Ctrl+Alt+Del delivery, nothing else (ADR 0043).  |
+| `crates/runtime`         | The session runtime: the actor, the stores, the media loops. No window (ADR 0085). |
 | `apps/desktop`           | Tauri app: `src-tauri` Rust backend, `src` TypeScript webview.       |
 | `services/broker`        | Axum + SQLite license broker.                                        |
 | `docs/adr`               | Architecture decision records.                                       |
