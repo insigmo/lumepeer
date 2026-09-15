@@ -49,6 +49,7 @@
     "allow-terminal-resize",
     "allow-terminal-close",
     "allow-terminal-poll",
+    "allow-reboot-request",
     "allow-mic-toggle",
     "allow-sas-request",
     "allow-record-request",

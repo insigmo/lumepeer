@@ -366,4 +366,16 @@ export const en: Dictionary = {
   'quality.fpsValue': (value) => `${value} fps`,
   // Nothing has measured this yet, which is a different fact from zero.
   'quality.unknown': 'not measured yet',
+  'reboot.banner.reboot': (peer) => `${peer} asked this computer to restart`,
+  'reboot.banner.shutdown': (peer) => `${peer} asked this computer to shut down`,
+  'reboot.banner.countdown': (secs) => `It happens in ${secs} s unless you stop it.`,
+  'reboot.banner.cancel': 'Keep this computer on',
+  'reboot.ask.reboot': 'Restart host',
+  'reboot.ask.shutdown': 'Shut down host',
+  'reboot.ask.shutdownWarning': 'The host stays off until somebody switches it on in person, and you will not be able to connect to it again.',
+  'reboot.waiting.title': 'The device is restarting',
+  'reboot.waiting.body': 'Waiting for it to come back. Signing in again needs its device password, not the rights this session had.',
+  'reboot.waiting.cancel': 'Stop waiting',
+  'history.autoReconnect': 'Reconnect on its own',
+  'history.autoReconnect.hint': 'After this device goes away, come back to it without being asked. Needs its device password saved here, and still ends in a fresh sign-in.',
 };

@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::address_book::AddressEntry;
-use lumepeer_core::audit::AuditEvent;
+use lumepeer_core::audit::{AuditEvent, RebootOutcome};
 use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
 use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
@@ -30,19 +30,20 @@ use lumepeer_core::constants::{
     FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
     KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
-    TERMINAL_SCROLLBACK_BYTES, TUNNEL_IDLE_TIMEOUT_SECS,
+    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
+    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
     FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
-    FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_RECEIVER_REPORT,
-    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TERMINAL, FEATURE_TUNNEL,
-    FEATURE_UNATTENDED, FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry,
-    MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, TerminalRefusal, TunnelRefusal,
-    UnattendedRejection,
+    FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
+    FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TERMINAL,
+    FEATURE_TUNNEL, FEATURE_UNATTENDED, FileFetchRefusal, InputDetail, InputEventPayload,
+    ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, RebootMode,
+    TerminalRefusal, TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
@@ -178,6 +179,14 @@ const TUNNEL_MINOR: u16 = 15;
 /// `FEATURE_TERMINAL` string instead, and `HelloAck` carries no feature list
 /// for the guest to read the other way.
 const TERMINAL_MINOR: u16 = 16;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::RebootRequest`
+/// (ADR 0084).
+///
+/// Guest side only, exactly like [`TERMINAL_MINOR`]: a host reads the guest's
+/// `FEATURE_REBOOT` string instead, and `HelloAck` carries no feature list for
+/// the guest to read the other way.
+const REBOOT_MINOR: u16 = 17;
 
 /// How many frames one terminal connection queues before its producer waits.
 ///
@@ -666,6 +675,16 @@ pub enum ConnectPhase {
     AwaitingCredentials,
     /// The host granted and the view window is open.
     Connected,
+    /// The host went away and this node is waiting for it to come back, most
+    /// plausibly because it is restarting (ADR 0084).
+    ///
+    /// A wait like `Dialing` and `AwaitingConsent` rather than an outcome: the
+    /// form stays disabled and its Cancel button stays live, and that button is
+    /// the one click the wait can be called off with. It is only ever entered
+    /// for a host the user marked as one this node may dial again by itself and
+    /// that this node remembers a device password for — every other host gets
+    /// the ordinary "connect again" row and no attempt of its own.
+    WaitingForHost,
     /// The host refused, or ended the request without granting.
     Denied,
     /// The dial or the handshake failed, or the host dropped mid-request.
@@ -679,7 +698,10 @@ impl ConnectPhase {
     pub const fn is_pending(self) -> bool {
         matches!(
             self,
-            Self::Dialing | Self::AwaitingConsent | Self::AwaitingCredentials
+            Self::Dialing
+                | Self::AwaitingConsent
+                | Self::AwaitingCredentials
+                | Self::WaitingForHost
         )
     }
 
@@ -692,6 +714,7 @@ impl ConnectPhase {
             Self::AwaitingConsent => "awaiting_consent",
             Self::AwaitingCredentials => "awaiting_credentials",
             Self::Connected => "connected",
+            Self::WaitingForHost => "waiting_for_host",
             Self::Denied => "denied",
             Self::Failed => "failed",
         }
@@ -746,6 +769,14 @@ pub enum ActorNotification {
     /// the reason it exists at all: the indicator the host cannot switch off
     /// must not be a poll behind a running shell.
     TerminalChanged,
+    /// A guest asked this machine to restart or shut down, and the warning
+    /// window is running (ADR 0084). Host side.
+    ///
+    /// Raised like `ConsentRequested` rather than merely waking the poll: the
+    /// person at this machine has seconds to stop it, and a banner that waited
+    /// for the next tick behind a window they are not looking at would spend a
+    /// tenth of the window they get.
+    RebootPending,
 }
 
 /// Failure returned by an actor call.
@@ -782,6 +813,35 @@ pub enum ActorError {
     /// distinct from every other refusal because it is the one the person at
     /// this end can actually do something about.
     NoSpace,
+}
+
+/// Whether a host that went away may be dialed again without anybody pressing
+/// anything (§10; ADR 0084).
+///
+/// A free function rather than a line inside `may_auto_reconnect` so the rule
+/// it encodes can be checked on its own: both halves, and neither enough
+/// alone. `trusted` is a decision somebody made about this host and nothing
+/// else sets it; `remembered` is whether an attempt could actually finish,
+/// because one that ends at a prompt nobody is there to answer is a dial loop
+/// rather than a reconnection (ADR 0044).
+const fn auto_reconnect_allowed(trusted: bool, remembered: bool) -> bool {
+    trusted && remembered
+}
+
+/// Host side: a guest's accepted reboot request, while the person at this
+/// machine still has time to stop it (§4.1; ADR 0084).
+///
+/// Only ever `Some` between the request landing and the window closing, so a
+/// UI that renders it renders a banner exactly while one is worth showing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebootPending {
+    /// Pseudonymized label of the guest that asked (§15).
+    pub peer_label: String,
+    /// Whether the machine was asked to come back.
+    pub mode: RebootMode,
+    /// Whole seconds left, rounded up and floored at zero, so a banner counting
+    /// down never shows a negative number or skips the last second.
+    pub seconds_left: u64,
 }
 
 /// One directory of a watched host, as it last answered (ADR 0075).
@@ -847,6 +907,26 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<()>,
     },
+    /// Guest side: mark a remembered host as one this node may dial again by
+    /// itself after the link goes away, or take the mark away (ADR 0084).
+    HistorySetTrusted {
+        label: String,
+        trusted: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Guest side: ask the watched host to restart or shut down (ADR 0084).
+    RebootRequest {
+        label: String,
+        mode: RebootMode,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
+    /// Host side: the reboot warning running right now, if there is one
+    /// (ADR 0084).
+    RebootPending {
+        reply: oneshot::Sender<Option<RebootPending>>,
+    },
+    /// Host side: the person at this machine stopped it (ADR 0084).
+    RebootCancel { reply: oneshot::Sender<()> },
     /// Guest side: how this node's own outgoing connect attempt is going, and
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
@@ -1333,6 +1413,80 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ConnectionStats { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Guest side: marks a remembered host as one this node may dial again by
+    /// itself, or withdraws that (ADR 0084).
+    ///
+    /// Answers whether a row was there to change: a host that has since been
+    /// forgotten is not silently re-created.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn history_set_trusted(
+        &self,
+        label: String,
+        trusted: bool,
+    ) -> Result<bool, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistorySetTrusted {
+                label,
+                trusted,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Guest side: asks the watched host to restart or shut down (§4.1;
+    /// ADR 0084).
+    ///
+    /// Nothing here decides it and nothing here waits for it. The host
+    /// re-reads its own `reboot` grant, warns the person in front of it and
+    /// gives them `REBOOT_WARNING_SECS` to stop it; a refusal at either point
+    /// is an ordinary outcome that arrives as the machine still being there.
+    /// What this answers is only whether the request could be sent at all.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old to understand the
+    /// message; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn reboot_request(&self, label: String, mode: RebootMode) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RebootRequest { label, mode, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Host side: the reboot warning running right now, if there is one
+    /// (ADR 0084).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn reboot_pending(&self) -> Result<Option<RebootPending>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RebootPending { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Host side: the person at this machine stopped the restart (ADR 0084).
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn reboot_cancel(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RebootCancel { reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -3536,6 +3690,10 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_TERMINAL`
         /// (ADR 0079), so a shell request from it can be answered out loud.
         speaks_terminal: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_REBOOT`
+        /// (ADR 0084), so a request to take this machine down is one it
+        /// actually meant to send.
+        speaks_reboot: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3663,6 +3821,27 @@ enum ActorEvent {
     /// capture has answered successfully since the switch, before deciding
     /// whether there is anything left to revert.
     DisplayModeConfirmTimeout { generation: u64 },
+    /// Host side: a reboot warning window elapsed off the actor loop
+    /// (ADR 0084). `generation` ties it to the window that armed it; the
+    /// actor checks that its own `pending_reboot` still matches, and re-reads
+    /// the grant, before anything happens to the machine.
+    RebootCountdownElapsed { generation: u64 },
+    /// Host side: the operating system answered the shutdown command
+    /// (ADR 0084).
+    ///
+    /// On a machine that did as it was told this never arrives — the process
+    /// is gone with everything else — which is exactly why the failure has to
+    /// have somewhere to land: the alternative is a request that was accepted,
+    /// refused by the OS, and never recorded anywhere.
+    RebootAttempted {
+        peer: NodeId,
+        mode: RebootMode,
+        /// What the system said, or `None` when it accepted.
+        error: Option<String>,
+    },
+    /// Guest side: it is time to try a host that went away again (ADR 0084).
+    /// `generation` ties it to the wait that armed it.
+    ReconnectWaitTick { generation: u64 },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -3712,6 +3891,10 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_TERMINAL`
         /// (ADR 0079), so a shell request from it can be answered out loud.
         speaks_terminal: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_REBOOT`
+        /// (ADR 0084), so a request to take this machine down is one it
+        /// actually meant to send.
+        speaks_reboot: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -3998,6 +4181,39 @@ struct Actor {
     /// Peers whose `Hello` advertised `FEATURE_TERMINAL`, and which may
     /// therefore be answered with a `TerminalOpenResponse` (ADR 0079).
     speaks_terminal: std::collections::HashSet<NodeId>,
+    /// Peers whose `Hello` advertised `FEATURE_REBOOT`, and whose
+    /// `RebootRequest` this host will therefore look at at all (ADR 0084).
+    ///
+    /// Not a grant, and not a substitute for one: it only says the message was
+    /// sent by a build that meant to send it. `reboot_allows` decides.
+    speaks_reboot: std::collections::HashSet<NodeId>,
+    /// Guest side: per watched host, whether its `HelloAck` minor is at least
+    /// [`REBOOT_MINOR`], so this node may ask it to go down at all (ADR 0084).
+    reboot_to_host: std::collections::HashMap<NodeId, bool>,
+    /// Host side: the warning window a guest's accepted `RebootRequest`
+    /// started, while it is still running (ADR 0084).
+    ///
+    /// One slot, not a per-peer map: a machine goes down once. A second
+    /// request arriving while this is set is ignored rather than queued —
+    /// there is nothing a second countdown could add, and restarting the
+    /// first one would let a guest push the deadline back indefinitely and
+    /// keep the banner up forever.
+    pending_reboot: Option<PendingReboot>,
+    /// Monotonic counter naming the most recent warning window, so a timer
+    /// left over from a cancelled one cannot take the machine down
+    /// (ADR 0084). The same shape `display_mode_generation` uses, for the
+    /// same reason and with higher stakes.
+    reboot_generation: u64,
+    /// Guest side: the host this node is waiting to come back, if it is
+    /// waiting for one (ADR 0084).
+    ///
+    /// One slot, like `connect_peer`, and for the same reason: this node
+    /// makes one outgoing attempt at a time, and the wait is a sequence of
+    /// exactly those attempts.
+    reconnect_wait: Option<ReconnectWait>,
+    /// Monotonic counter naming the most recent wait, so a tick left over
+    /// from a cancelled one does not dial a host nobody is waiting for.
+    reconnect_wait_generation: u64,
     /// Guest side: per watched host, whether its `HelloAck` minor is at least
     /// [`TERMINAL_MINOR`], so this node may ask it for a shell at all.
     terminal_to_host: std::collections::HashMap<NodeId, bool>,
@@ -4246,6 +4462,47 @@ struct Actor {
     /// The obfuscated transport, and whether this run may use it at all
     /// (gap-tasks/21; ADR 0080).
     obfuscated: ObfuscatedHost,
+}
+
+/// Host side: the warning window a guest's accepted `RebootRequest` started
+/// (§4.1; ADR 0084).
+///
+/// The grant is deliberately **not** copied in here. It is re-read from
+/// `SessionManager` when `at` arrives, so a host that revoked while the
+/// countdown ran keeps its machine — the point of putting a window here at all
+/// is that the decision is still open for as long as it lasts.
+#[derive(Debug, Clone, Copy)]
+struct PendingReboot {
+    /// The guest that asked. Only ever used to name the session whose grant is
+    /// re-read, and to label the banner (§15).
+    peer: NodeId,
+    /// Whether the machine was asked to come back.
+    mode: RebootMode,
+    /// When it happens, unless somebody stops it first. Monotonic, so a
+    /// wall-clock change cannot move the deadline (§12.3).
+    at: std::time::Instant,
+    /// Which window this is; a timer whose generation no longer matches is a
+    /// leftover and does nothing.
+    generation: u64,
+}
+
+/// Guest side: a host this node is waiting to come back (§10; ADR 0084).
+///
+/// Holds no credentials and no code: the invite is read out of the history
+/// row at each attempt, so a row the user removes mid-wait takes the wait with
+/// it rather than leaving a copy dialing on.
+#[derive(Debug, Clone)]
+struct ReconnectWait {
+    /// The host being waited for, as the last connection proved it.
+    peer: NodeId,
+    /// The stable per-host label the history row and the remembered password
+    /// are both keyed on.
+    host_tag: String,
+    /// When the wait began, for [`REBOOT_WAIT_CEILING_SECS`]. Monotonic.
+    started_at: std::time::Instant,
+    /// Which wait this is; a tick whose generation no longer matches is a
+    /// leftover and dials nothing.
+    generation: u64,
 }
 
 /// Everything the obfuscated transport needs across invites on the host side
@@ -7079,6 +7336,7 @@ impl Actor {
                 speaks_dir_transfer,
                 speaks_tunnel,
                 speaks_terminal,
+                speaks_reboot,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -7137,6 +7395,15 @@ impl Actor {
                     self.speaks_terminal.insert(peer);
                 } else {
                     self.speaks_terminal.remove(&peer);
+                }
+                // And for taking this machine down (ADR 0084). Also not a
+                // grant: `reboot` is the host's decision and is re-read when
+                // the warning window closes; this only says the peer meant to
+                // send the message.
+                if speaks_reboot {
+                    self.speaks_reboot.insert(peer);
+                } else {
+                    self.speaks_reboot.remove(&peer);
                 }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
@@ -7211,6 +7478,15 @@ impl Actor {
             }
             ActorEvent::DisplayModeConfirmTimeout { generation } => {
                 self.on_display_mode_confirm_timeout(generation);
+            }
+            ActorEvent::RebootCountdownElapsed { generation } => {
+                self.on_reboot_countdown_elapsed(generation);
+            }
+            ActorEvent::RebootAttempted { peer, mode, error } => {
+                self.on_reboot_attempted(peer, mode, error.as_deref());
+            }
+            ActorEvent::ReconnectWaitTick { generation } => {
+                self.on_reconnect_wait_tick(generation);
             }
         }
     }
@@ -8264,6 +8540,10 @@ impl Actor {
                     let _ = self.notify.send(ActorNotification::TerminalChanged);
                 }
             }
+            // Host side: the guest asked this machine to go down (ADR 0084).
+            MessageKind::RebootRequest { mode } => {
+                self.on_reboot_request(peer, mode);
+            }
             // Host side: the guest asked to switch this host's own physical
             // monitor (docs/bugs/16-host-display-mode.md #2; ADR 0048).
             MessageKind::DisplaySetMode { mode_id } => {
@@ -8534,6 +8814,8 @@ impl Actor {
         self.speaks_terminal.remove(&peer);
         self.terminal_to_host.remove(&peer);
         self.terminal_pending.remove(&peer);
+        self.speaks_reboot.remove(&peer);
+        self.reboot_to_host.remove(&peer);
         // And its shells, for the sharper version of the same reason: a
         // process left running on somebody's machine after the session that
         // asked for it is gone is the failure ADR 0079 exists to prevent.
@@ -8573,8 +8855,21 @@ impl Actor {
         // host stops capturing for this viewer, the guest closes its window
         // (and, on the guest, records the host it was watching).
         self.stop_media(peer);
+        // Read before `stop_view` takes it away: a link that dropped while a
+        // session was actually running is the case a wait is for, and a host
+        // that revoked, or a window the user closed, is not — both of those
+        // close the view first and leave nothing here to arm on (ADR 0084).
+        let was_watching = self.views.contains_key(&peer);
         self.settle_connect(peer, ConnectPhase::Failed);
+        // `stop_view` is what writes the history row this wait reads its code
+        // out of, so the row exists by the time anything below looks for it.
         self.stop_view(peer);
+        if was_watching {
+            let host_tag = host_tag(&peer);
+            if self.may_auto_reconnect(&host_tag) {
+                self.start_reconnect_wait(peer, host_tag);
+            }
+        }
         let label = peer_tag(&self.install_salt, &peer);
         if self.sessions.on_disconnect(peer).is_err() {
             // No active session to move into the reconnect window, so this was
@@ -8850,6 +9145,36 @@ impl Actor {
             }
             ActorCommand::TerminalPoll { label, reply } => {
                 let _ = reply.send(self.terminal_drain(&label));
+            }
+            ActorCommand::HistorySetTrusted {
+                label,
+                trusted,
+                reply,
+            } => {
+                let changed = self.history.set_trusted(&label, trusted);
+                // Withdrawing trust stops a wait that is running on that very
+                // host right now, rather than letting the next tick dial a
+                // machine the user has just said not to dial by itself.
+                if changed
+                    && !trusted
+                    && self
+                        .reconnect_wait
+                        .as_ref()
+                        .is_some_and(|wait| wait.host_tag == label)
+                {
+                    self.stop_reconnect_wait();
+                }
+                let _ = reply.send(changed);
+            }
+            ActorCommand::RebootRequest { label, mode, reply } => {
+                let _ = reply.send(self.on_request_reboot(&label, mode));
+            }
+            ActorCommand::RebootPending { reply } => {
+                let _ = reply.send(self.reboot_pending_dto());
+            }
+            ActorCommand::RebootCancel { reply } => {
+                self.on_reboot_cancel();
+                let _ = reply.send(());
             }
             ActorCommand::RemoteDownload {
                 label,
@@ -11559,7 +11884,7 @@ impl Actor {
         }
         if !allowed {
             // Exhaustive on purpose, with no `_` arm, for the reason
-            // `Grants::get` gives: a tenth independent grant must not be
+            // `Grants::get` gives: a twelfth independent grant must not be
             // able to appear and quietly keep running after it is switched
             // off.
             match grant {
@@ -11614,6 +11939,21 @@ impl Actor {
                 // it paid for ended" have to be the same moment (ADR 0079).
                 IndependentGrant::Terminal => {
                     self.close_terminal(peer, "terminal-closed-revoked");
+                }
+                // A warning window this guest started, if it is still
+                // running. The grant is re-read when the countdown closes
+                // anyway (`on_reboot_countdown_elapsed`), so the machine was
+                // already safe; what this adds is taking the banner down at
+                // the moment the host decided, instead of leaving a
+                // countdown on screen that no longer means anything
+                // (ADR 0084).
+                IndependentGrant::Reboot => {
+                    if self
+                        .pending_reboot
+                        .is_some_and(|pending| pending.peer == peer)
+                    {
+                        self.on_reboot_cancel();
+                    }
                 }
             }
         }
@@ -11814,6 +12154,11 @@ impl Actor {
     /// walked away, which is not a protocol error and must not be reported as
     /// one (see `03`, task 3, for the sibling case on the view-window side).
     fn on_connect_cancel(&mut self) {
+        // The one click that calls off a wait for a host that went away
+        // (ADR 0084). It runs before the early return below, because a wait
+        // between attempts has no connection of its own to cancel and would
+        // otherwise be the one state this button could not reach.
+        self.stop_reconnect_wait();
         let Some(peer) = self.connect_peer.take() else {
             return;
         };
@@ -11859,6 +12204,331 @@ impl Actor {
             },
         );
         Ok(())
+    }
+
+    /// Guest side: asks the watched host to restart or shut down (§4.1;
+    /// ADR 0084).
+    ///
+    /// Sending is the whole of what happens here. The host decides — it
+    /// re-reads its own `reboot` grant and gives the person in front of it a
+    /// window to refuse — so there is nothing to wait for and nothing to
+    /// report but whether the message could go out at all.
+    ///
+    /// The wait for the machine to come back is **not** armed here. It is
+    /// armed where every other unexpected disconnect is handled
+    /// (`on_closed`), because that is the only place that knows the session
+    /// was actually running when the link went away, and because a host that
+    /// refuses the request never disconnects at all — arming on the send
+    /// would leave this node waiting for a machine that never left.
+    fn on_request_reboot(&mut self, label: &str, mode: RebootMode) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.reboot_to_host.get(&peer).copied().unwrap_or(false) {
+            return Err(ActorError::Unsupported);
+        }
+        self.send_to(&peer, MessageKind::RebootRequest { mode });
+        tracing::info!(peer = %label, ?mode, "asked a host to go down");
+        Ok(())
+    }
+
+    /// Host side: a guest asked this machine to go down (§4.1; ADR 0084).
+    ///
+    /// Nothing happens to the machine here. What happens is a warning, on this
+    /// host's own screen, with a button on it — the rule this grant is built
+    /// around is that a machine is never dropped silently, not even for a guest
+    /// the host handed full control to.
+    fn on_reboot_request(&mut self, peer: NodeId, mode: RebootMode) {
+        let tag = self.label_of(&peer);
+        if !self.speaks_reboot.contains(&peer) {
+            tracing::debug!(peer = %tag, "a reboot request from a peer that never advertised it");
+            return;
+        }
+        if !self.sessions.reboot_allows(&peer) {
+            tracing::warn!(peer = %tag, "a reboot without the reboot grant; refused");
+            self.audit_reboot(&peer, mode, RebootOutcome::Refused);
+            return;
+        }
+        if let Some(pending) = self.pending_reboot {
+            // Already counting down. A second request must not restart the
+            // window: a guest that could would be able to hold the banner up
+            // and push the deadline back for as long as it liked.
+            tracing::info!(
+                peer = %tag,
+                already = ?pending.mode,
+                "a reboot request while one is already counting down; ignored"
+            );
+            return;
+        }
+        self.reboot_generation = self.reboot_generation.wrapping_add(1);
+        let generation = self.reboot_generation;
+        self.pending_reboot = Some(PendingReboot {
+            peer,
+            mode,
+            at: std::time::Instant::now() + Duration::from_secs(REBOOT_WARNING_SECS),
+            generation,
+        });
+        tracing::warn!(peer = %tag, ?mode, secs = REBOOT_WARNING_SECS, "a guest asked this machine to go down");
+        self.audit_reboot(&peer, mode, RebootOutcome::Warned);
+        self.arm_reboot_countdown(generation);
+        // Raises this app's window in front of whoever is here (`main.rs`),
+        // exactly as a consent request does: a banner behind another window is
+        // not a warning.
+        let _ = self.notify.send(ActorNotification::RebootPending);
+    }
+
+    /// Wakes the actor when the warning window closes (ADR 0084).
+    ///
+    /// Off the actor loop for the same reason `arm_display_mode_confirm_timeout`
+    /// is: the loop must keep answering — above all `reboot_cancel`, which is
+    /// the whole point of the window.
+    fn arm_reboot_countdown(&self, generation: u64) {
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(REBOOT_WARNING_SECS)).await;
+            let _ = events
+                .send(ActorEvent::RebootCountdownElapsed { generation })
+                .await;
+        });
+    }
+
+    /// Host side: the warning window closed (ADR 0084).
+    ///
+    /// The grant is read **here**, not when the request arrived. A host that
+    /// revoked, or a session that ended, in between keeps its machine — which
+    /// is what makes the window a decision rather than a delay.
+    fn on_reboot_countdown_elapsed(&mut self, generation: u64) {
+        let Some(pending) = self.pending_reboot else {
+            return;
+        };
+        if pending.generation != generation {
+            // A leftover timer from a window that was already cancelled or
+            // superseded.
+            return;
+        }
+        self.pending_reboot = None;
+        let tag = self.label_of(&pending.peer);
+        if !self.sessions.reboot_allows(&pending.peer) {
+            tracing::info!(
+                peer = %tag,
+                "the reboot grant went away while the warning was up; the machine stays"
+            );
+            self.audit_reboot(&pending.peer, pending.mode, RebootOutcome::Cancelled);
+            let _ = self.notify.send(ActorNotification::RebootPending);
+            return;
+        }
+        tracing::warn!(peer = %tag, mode = ?pending.mode, "taking this machine down");
+        self.audit_reboot(&pending.peer, pending.mode, RebootOutcome::Started);
+        let events = self.events_tx.clone();
+        let peer = pending.peer;
+        let mode = pending.mode;
+        // Blocking, and off the actor loop: it shells out, and on success it
+        // never returns at all because the process goes down with the machine.
+        // The failure is what needs a way back (§18).
+        tokio::spawn(async move {
+            let error = tokio::task::spawn_blocking(move || crate::system_power::go_down(mode))
+                .await
+                .unwrap_or_else(|join| Err(format!("the shutdown command did not run: {join}")))
+                .err();
+            let _ = events
+                .send(ActorEvent::RebootAttempted { peer, mode, error })
+                .await;
+        });
+        let _ = self.notify.send(ActorNotification::RebootPending);
+    }
+
+    /// Host side: the operating system refused to take the machine down, or
+    /// took so long about it that this process was still alive to hear
+    /// (ADR 0084).
+    fn on_reboot_attempted(&mut self, peer: NodeId, mode: RebootMode, error: Option<&str>) {
+        let Some(error) = error else {
+            // It said yes. The machine is on its way down and there is nothing
+            // left to record that `Started` did not already say.
+            return;
+        };
+        tracing::error!(peer = %self.label_of(&peer), ?mode, error, "this machine refused to go down");
+        self.audit_reboot(&peer, mode, RebootOutcome::Failed);
+        let _ = self.notify.send(ActorNotification::RebootPending);
+    }
+
+    /// Host side: the person at this machine stopped the restart (ADR 0084).
+    ///
+    /// Bumping the generation is what makes it stick: the timer already armed
+    /// still fires, finds a generation that no longer matches, and does
+    /// nothing.
+    fn on_reboot_cancel(&mut self) {
+        let Some(pending) = self.pending_reboot.take() else {
+            return;
+        };
+        self.reboot_generation = self.reboot_generation.wrapping_add(1);
+        tracing::info!(
+            peer = %self.label_of(&pending.peer),
+            mode = ?pending.mode,
+            "the reboot was cancelled at this machine"
+        );
+        self.audit_reboot(&pending.peer, pending.mode, RebootOutcome::Cancelled);
+        let _ = self.notify.send(ActorNotification::RebootPending);
+    }
+
+    /// Host side: what the banner needs, or `None` when there is nothing to
+    /// warn about (ADR 0084).
+    fn reboot_pending_dto(&self) -> Option<RebootPending> {
+        let pending = self.pending_reboot?;
+        let left = pending
+            .at
+            .saturating_duration_since(std::time::Instant::now());
+        Some(RebootPending {
+            peer_label: self.label_of(&pending.peer),
+            mode: pending.mode,
+            // Rounded up, so a banner never shows 0 while the machine is still
+            // there and never skips the last second of the window.
+            seconds_left: left.as_secs() + u64::from(left.subsec_nanos() > 0),
+        })
+    }
+
+    /// One audit record about a reboot request (§15; ADR 0084).
+    fn audit_reboot(&mut self, peer: &NodeId, mode: RebootMode, outcome: RebootOutcome) {
+        self.audit(peer, AuditEvent::Reboot { mode, outcome });
+    }
+
+    /// Guest side: whether this node may raise a new session with `peer` by
+    /// itself after the link went away (§10; ADR 0084).
+    ///
+    /// Both halves, and neither is enough on its own. The user must have
+    /// marked the host as one this node may dial by itself — nothing about
+    /// connecting, being granted a role or saving a password sets that flag —
+    /// **and** this node must remember a device password for it, because an
+    /// attempt that ends at a prompt nobody is there to answer is a dial loop
+    /// rather than a reconnection (ADR 0044).
+    fn may_auto_reconnect(&self, host_tag: &str) -> bool {
+        auto_reconnect_allowed(
+            self.history.is_trusted(host_tag),
+            self.remembered_password_tags.contains(host_tag),
+        )
+    }
+
+    /// Guest side: starts waiting for a host that went away to come back
+    /// (§10; ADR 0084).
+    ///
+    /// The first attempt is deliberately not immediate. `RECONNECT_WINDOW_SECS`
+    /// is how long an ordinary network blip has to repair itself with the
+    /// session and its grants intact, and dialing inside it would race that
+    /// repair with a *new* session that carries none of them. Only once it has
+    /// elapsed without the link coming back is this a machine that went away
+    /// rather than a link that stuttered.
+    fn start_reconnect_wait(&mut self, peer: NodeId, host_tag: String) {
+        self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
+        let generation = self.reconnect_wait_generation;
+        self.reconnect_wait = Some(ReconnectWait {
+            peer,
+            host_tag,
+            started_at: std::time::Instant::now(),
+            generation,
+        });
+        self.connect_phase = ConnectPhase::WaitingForHost;
+        self.connect_peer = Some(peer);
+        self.connect_failure = None;
+        self.connect_code_required = false;
+        self.connect_retry_secs = None;
+        self.connect_credentials_auto = false;
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            first_attempt_secs = RECONNECT_WINDOW_SECS,
+            "waiting for a host to come back"
+        );
+        self.arm_reconnect_wait(generation, RECONNECT_WINDOW_SECS);
+    }
+
+    /// Wakes the actor when the next attempt is due (ADR 0084).
+    fn arm_reconnect_wait(&self, generation: u64, after_secs: u64) {
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(after_secs)).await;
+            let _ = events
+                .send(ActorEvent::ReconnectWaitTick { generation })
+                .await;
+        });
+    }
+
+    /// Guest side: ends the wait, whether it succeeded, was called off or ran
+    /// out of time (ADR 0084).
+    ///
+    /// Bumping the generation is what makes it stick: a tick already armed
+    /// still fires, finds a generation that no longer matches, and dials
+    /// nothing.
+    fn stop_reconnect_wait(&mut self) {
+        if self.reconnect_wait.take().is_some() {
+            self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
+        }
+    }
+
+    /// Guest side: one attempt at a host that went away (§10; ADR 0084).
+    ///
+    /// Every precondition is re-read rather than remembered from when the wait
+    /// started: the row may have been removed, the password forgotten or the
+    /// trust withdrawn in between, and each of those means this node no longer
+    /// has a reason to dial by itself.
+    fn on_reconnect_wait_tick(&mut self, generation: u64) {
+        let Some(wait) = self.reconnect_wait.clone() else {
+            return;
+        };
+        if wait.generation != generation {
+            return;
+        }
+        if wait.started_at.elapsed() >= Duration::from_secs(REBOOT_WAIT_CEILING_SECS) {
+            tracing::info!(
+                peer = %self.label_of(&wait.peer),
+                "a host did not come back inside the wait; leaving the reconnect to the user"
+            );
+            self.stop_reconnect_wait();
+            if self.connect_phase == ConnectPhase::WaitingForHost {
+                self.connect_phase = ConnectPhase::Failed;
+                self.connect_failure = Some("HOST_DID_NOT_RETURN");
+                self.connect_peer = None;
+            }
+            return;
+        }
+        if !self.may_auto_reconnect(&wait.host_tag) {
+            tracing::info!("this host is no longer one to dial unasked; the wait ends");
+            self.stop_reconnect_wait();
+            if self.connect_phase == ConnectPhase::WaitingForHost {
+                self.connect_phase = ConnectPhase::Idle;
+                self.connect_peer = None;
+            }
+            return;
+        }
+        // The connect form moved to another host. This node makes one outgoing
+        // attempt at a time, so dialing now would take the form away from
+        // whatever the user is doing with it; the wait ends instead.
+        if self.connect_peer.is_some_and(|peer| peer != wait.peer) {
+            tracing::info!("the connect form moved to another host; the wait ends");
+            self.stop_reconnect_wait();
+            return;
+        }
+        // An attempt is already in flight, or the host is already back and
+        // deciding: leave it alone and look again next tick. Two dials racing
+        // into one `connect_phase` is what `spawn_dial` refuses, and there is
+        // nothing here worth racing it for.
+        if self.connect_phase == ConnectPhase::Dialing || self.connections.contains_key(&wait.peer)
+        {
+            self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
+            return;
+        }
+        let Some(code) = self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) else {
+            // The row was removed while this was waiting; there is no code
+            // left to dial and nothing to wait for.
+            tracing::info!("the remembered host is gone; the wait ends");
+            self.stop_reconnect_wait();
+            if self.connect_phase == ConnectPhase::WaitingForHost {
+                self.connect_phase = ConnectPhase::Idle;
+                self.connect_peer = None;
+            }
+            return;
+        };
+        // A dial that fails here is the ordinary case, not an error: the host
+        // is mid-restart and not listening yet. The next tick tries again.
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial(&code) {
+            tracing::debug!(%error, "the host is still away");
+        }
+        self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
     }
 
     /// Guest side: forwards one input event, gated on this node's own copy of
@@ -12016,6 +12686,20 @@ impl Actor {
         let control = match result {
             Ok(control) => *control,
             Err(error) => {
+                // An attempt that failed while waiting for a host to come back
+                // is what waiting *looks like*, not an outcome to put on
+                // screen: the machine is still restarting, and the next tick
+                // will try again (ADR 0084).
+                if self
+                    .reconnect_wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.peer == peer)
+                {
+                    tracing::debug!(peer = %tag, %error, "the host is not back yet");
+                    self.connect_phase = ConnectPhase::WaitingForHost;
+                    self.connect_peer = Some(peer);
+                    return;
+                }
                 tracing::warn!(peer = %tag, %error, "invite connect failed");
                 self.connect_failure = Some(crate::commands::net_error_code(&error));
                 self.connect_phase = ConnectPhase::Failed;
@@ -12025,6 +12709,10 @@ impl Actor {
         };
         // The handshake proves who answered; the ticket only claimed it.
         let peer = control.peer();
+        // The host is back, so the wait is over — whatever it decides next is
+        // an ordinary consent or an ordinary device password, and this node has
+        // no business dialing it again unasked if the answer is no (ADR 0084).
+        self.stop_reconnect_wait();
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
         // ticket is the only place this address is known without discovery,
@@ -12100,6 +12788,9 @@ impl Actor {
         // Same reasoning for a shell (ADR 0079).
         self.terminal_to_host
             .insert(peer, control.peer_minor() >= TERMINAL_MINOR);
+        // Same reasoning for taking that machine down (ADR 0084).
+        self.reboot_to_host
+            .insert(peer, control.peer_minor() >= REBOOT_MINOR);
         self.adopt(control, peer, false, false, false);
     }
 }
@@ -12750,6 +13441,7 @@ async fn handshake_and_dispatch(
             speaks_dir_transfer,
             speaks_tunnel,
             speaks_terminal,
+            speaks_reboot,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -12769,6 +13461,7 @@ async fn handshake_and_dispatch(
             speaks_dir_transfer,
             speaks_tunnel,
             speaks_terminal,
+            speaks_reboot,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -12934,6 +13627,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_TERMINAL),
+        speaks_reboot: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_REBOOT),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -13064,6 +13761,7 @@ async fn connect_once(
         FEATURE_DIR_TRANSFER.to_owned(),
         FEATURE_TUNNEL.to_owned(),
         FEATURE_TERMINAL.to_owned(),
+        FEATURE_REBOOT.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -13549,6 +14247,12 @@ pub fn spawn_actor_with(
         tunnel_wanted: std::collections::HashMap::new(),
         tunnel_refusals: std::collections::HashMap::new(),
         speaks_terminal: std::collections::HashSet::new(),
+        speaks_reboot: std::collections::HashSet::new(),
+        reboot_to_host: std::collections::HashMap::new(),
+        pending_reboot: None,
+        reboot_generation: 0,
+        reconnect_wait: None,
+        reconnect_wait_generation: 0,
         terminal_to_host: std::collections::HashMap::new(),
         terminals: std::collections::HashMap::new(),
         terminal_backlog: std::collections::HashMap::new(),
@@ -15989,6 +16693,206 @@ mod tests {
         assert_eq!(
             before, after,
             "the guest's own clipboard was still being read after the view closed"
+        );
+    }
+
+    /// ADR 0084 §6, and the half of the reboot story that is about *not*
+    /// acting: a machine this node happens to know the password for is not
+    /// thereby a machine it may dial unprompted, and a machine somebody
+    /// trusted but whose password is not remembered would only ever reach a
+    /// prompt nobody is there to answer.
+    ///
+    /// Stated as a truth table because that is what the rule is. The costly
+    /// half — that a disconnect from such a host leaves the ordinary
+    /// "connect again" button rather than a wait — is what `on_closed`
+    /// consults this for.
+    #[test]
+    fn dialing_a_host_unprompted_needs_both_halves() {
+        assert!(auto_reconnect_allowed(true, true));
+        assert!(
+            !auto_reconnect_allowed(false, true),
+            "a remembered password was treated as permission to dial unasked"
+        );
+        assert!(
+            !auto_reconnect_allowed(true, false),
+            "a trusted host with no remembered password would be dialed into a prompt"
+        );
+        assert!(!auto_reconnect_allowed(false, false));
+    }
+
+    /// Polls the host's own banner state until `predicate` holds, or fails.
+    ///
+    /// The request crosses a real link and the warning is raised on the far
+    /// side of it, so "did the host put a banner up" is only ever answerable
+    /// by asking the host, repeatedly.
+    async fn wait_for_reboot_banner(
+        host: &ActorHandle,
+        what: &str,
+        mut predicate: impl FnMut(Option<&RebootPending>) -> bool,
+    ) -> Option<RebootPending> {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let pending = host.reboot_pending().await.unwrap();
+            if predicate(pending.as_ref()) {
+                return pending;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0084, the refusal this grant exists for: a session may hold the
+    /// host's screen and never be able to take the machine away. The guest
+    /// can send the message — nothing local stops it, and the host is the
+    /// authority — and the host does not so much as warn.
+    ///
+    /// Checked by the absence of a banner rather than by an answer on the
+    /// wire, because `RebootRequest` has none: the guest learns it was
+    /// refused by the machine still being there, and the host learns it from
+    /// its own log and audit trail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reboot_without_the_grant_never_warns_and_never_counts_down() {
+        let (host, guest, _guest_label, host_label, _clipboard) = file_pair().await;
+
+        // ViewOnly, from the pairing: no `reboot`, and no `input` either.
+        guest
+            .reboot_request(host_label.clone(), RebootMode::Reboot)
+            .await
+            .unwrap();
+
+        // Long enough for the message to have crossed and been acted on
+        // several times over, and far short of `REBOOT_WARNING_SECS`.
+        a_few_poll_rounds().await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "an ungranted reboot request raised a warning on the host"
+        );
+
+        // And the other half of "independent" (§2.2): a `FullControl` session
+        // carries `reboot` by default, the way it carries `terminal` and
+        // `tunnel`, but the host can take that one back without narrowing the
+        // role and without touching the keyboard. A guest left holding input
+        // and nothing else is refused exactly like the one above.
+        let (host2, guest2, guest_label2, host_label2, _clipboard2) = file_pair().await;
+        host2
+            .grant(guest_label2.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host2
+            .set_grant(guest_label2.clone(), IndependentGrant::Reboot, false)
+            .await
+            .unwrap();
+        guest2
+            .reboot_request(host_label2, RebootMode::Shutdown)
+            .await
+            .unwrap();
+        a_few_poll_rounds().await;
+        assert!(
+            host2.reboot_pending().await.unwrap().is_none(),
+            "a withdrawn reboot grant still took the machine down"
+        );
+        // The revoke was surgical: full control is otherwise intact.
+        let session = host2
+            .status()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.label == guest_label2)
+            .unwrap();
+        assert_eq!(session.role, Role::FullControl);
+        assert!(
+            session.grants.input,
+            "revoking reboot took the keyboard too"
+        );
+        assert!(session.grants.get(IndependentGrant::Terminal));
+    }
+
+    /// ADR 0084: the warning is a decision, not a delay. With the grant in
+    /// place the host raises a banner naming the guest and which of the two
+    /// acts was asked for — and the person in front of that machine can end
+    /// it, at which point there is nothing left counting down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_person_at_the_host_can_stop_the_restart() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.grant(guest_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host.set_grant(guest_label.clone(), IndependentGrant::Reboot, true)
+            .await
+            .unwrap();
+
+        guest
+            .reboot_request(host_label, RebootMode::Shutdown)
+            .await
+            .unwrap();
+        let banner = wait_for_reboot_banner(&host, "no warning was raised", |seen| seen.is_some())
+            .await
+            .unwrap();
+        // Which machine is going away, and whose asking — a banner that named
+        // neither would not be a warning.
+        assert_eq!(banner.peer_label, guest_label);
+        assert_eq!(
+            banner.mode,
+            RebootMode::Shutdown,
+            "the warning did not say which of the two was asked for"
+        );
+        assert!(
+            banner.seconds_left > 0 && banner.seconds_left <= REBOOT_WARNING_SECS,
+            "the countdown started outside its own window: {}",
+            banner.seconds_left
+        );
+
+        host.reboot_cancel().await.unwrap();
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the cancel left the countdown running"
+        );
+
+        // And it stays cancelled. The timer armed for the original window
+        // still fires somewhere around now; it must find a generation that no
+        // longer matches and do nothing at all.
+        tokio::time::sleep(Duration::from_secs(REBOOT_WARNING_SECS + 1)).await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "a cancelled countdown came back when its timer fired"
+        );
+    }
+
+    /// ADR 0084: withdrawing `reboot` while the warning is up takes the
+    /// warning down with it. The machine was already safe — the grant is read
+    /// again when the window closes, not when the request arrived — but a
+    /// countdown left on screen after the host changed its mind is a lie
+    /// about what is going to happen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn withdrawing_the_grant_mid_countdown_takes_the_warning_down() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.grant(guest_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host.set_grant(guest_label.clone(), IndependentGrant::Reboot, true)
+            .await
+            .unwrap();
+        guest
+            .reboot_request(host_label, RebootMode::Reboot)
+            .await
+            .unwrap();
+        wait_for_reboot_banner(&host, "no warning was raised", |seen| seen.is_some()).await;
+
+        host.set_grant(guest_label, IndependentGrant::Reboot, false)
+            .await
+            .unwrap();
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the warning outlived the grant that raised it"
+        );
+        // That it also stays down when the armed timer finally fires is the
+        // same generation check `the_person_at_the_host_can_stop_the_restart`
+        // sits through a full window to prove; repeating the wait here would
+        // buy nothing and cost every run another REBOOT_WARNING_SECS.
+        a_few_poll_rounds().await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the warning came back after its grant was withdrawn"
         );
     }
 

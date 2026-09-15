@@ -132,11 +132,32 @@ export interface HistoryEntry {
    * so the row can offer to forget it. Never the password itself.
    */
   has_password?: boolean;
+  /**
+   * Whether this node may dial that host again by itself after the link goes
+   * away (ADR 0084).
+   *
+   * Its own decision, and nothing else sets it: connecting to a host, being
+   * granted a role and saving its password all leave it alone. Optional so a
+   * row from an older answer reads as "no", which is the safe direction.
+   */
+  trusted?: boolean;
 }
 
 async function revoke(peer: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('session_revoke', { args: { peer } });
+}
+
+/**
+ * Switches unprompted reconnection to a remembered host on or off (ADR 0084).
+ *
+ * Widens nothing on the far side: what comes back is a new session that host
+ * decides from scratch. What it permits is the asking, from here, without a
+ * person pressing the button.
+ */
+async function setAutoReconnect(peer: string, trusted: boolean): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('history_set_trusted', { args: { peer, trusted } });
 }
 
 /** Forgets a remembered host (docs/bugs/03-connection-list.md, task 5). */
@@ -505,6 +526,25 @@ export function sessionStatus(
                     <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
                     <span class="history-action">${t(locale, 'status.reconnect')}</span>
                   </button>
+                  <label
+                    class="history-autoreconnect"
+                    title=${t(locale, 'history.autoReconnect.hint')}
+                    data-testid="history-auto-reconnect"
+                  >
+                    <input
+                      type="checkbox"
+                      .checked=${entry.trusted === true}
+                      aria-label=${`${t(locale, 'history.autoReconnect')}: ${entry.peer_label}`}
+                      @change=${(event: Event) => {
+                        const on = (event.target as HTMLInputElement).checked;
+                        void setAutoReconnect(entry.peer_label, on).then(onRefresh, (error: unknown) => {
+                          console.error('history_set_trusted failed:', error);
+                          onRefresh();
+                        });
+                      }}
+                    />
+                    <span>${t(locale, 'history.autoReconnect')}</span>
+                  </label>
                   ${entry.has_password
                     ? html`<button
                         type="button"

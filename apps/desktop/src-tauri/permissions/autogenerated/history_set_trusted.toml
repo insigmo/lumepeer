@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-history-set-trusted"
+description = "Enables the history_set_trusted command without any pre-configured scope."
+commands.allow = ["history_set_trusted"]
+
+[[permission]]
+identifier = "deny-history-set-trusted"
+description = "Denies the history_set_trusted command without any pre-configured scope."
+commands.deny = ["history_set_trusted"]

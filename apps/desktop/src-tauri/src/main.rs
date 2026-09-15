@@ -25,6 +25,7 @@ mod network;
 mod recorder;
 mod remembered_password;
 mod service_control;
+mod system_power;
 mod unattended_store;
 mod view;
 
@@ -198,9 +199,10 @@ fn setup_app(
 const WEBVIEW_WAKE_EVENT: &str = "lumepeer://actor-changed";
 
 /// Puts this app's window in front of the user when something needs their
-/// attention: a guest asking the host to decide (`ConsentRequested`), or a
+/// attention: a guest asking the host to decide (`ConsentRequested`), a
 /// host asking this node, as a guest, for device credentials
-/// (`UnattendedChallenge`; docs/bugs/02-connect-form.md, task 5).
+/// (`UnattendedChallenge`; docs/bugs/02-connect-form.md, task 5), or a guest
+/// asking this machine to go down (`RebootPending`; ADR 0084).
 ///
 /// Without this the relevant dialog renders into a window that is hidden in
 /// the tray or simply behind something else, and the far side waits until the
@@ -232,6 +234,11 @@ async fn watch_for_window_raising_notifications(
                     notification,
                     network::ActorNotification::ConsentRequested
                         | network::ActorNotification::UnattendedChallenge
+                        // The one of the three with a deadline attached: the
+                        // person here has REBOOT_WARNING_SECS to stop somebody
+                        // else's restart of their machine, and a banner behind
+                        // another window spends that window (ADR 0084).
+                        | network::ActorNotification::RebootPending
                 ) {
                     focus_main_window(&app);
                     // Raising the window can still lose to the foreground-lock
@@ -281,6 +288,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::history_connect,
         commands::history_remove,
         commands::history_forget_password,
+        commands::history_set_trusted,
         commands::connect_status,
         commands::connect_cancel,
         commands::report_decoder_codecs,
@@ -317,6 +325,9 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::terminal_resize,
         commands::terminal_close,
         commands::terminal_poll,
+        commands::reboot_request,
+        commands::reboot_pending,
+        commands::reboot_cancel,
         commands::audio_toggle,
         commands::recording_toggle,
         commands::record_request,

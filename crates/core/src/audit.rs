@@ -6,6 +6,30 @@
 
 use crate::NodeId;
 use crate::consent::{IndependentGrant, Role};
+use crate::protocol::RebootMode;
+
+/// What became of a guest's `RebootRequest` on this host (§15; ADR 0084).
+///
+/// A closed vocabulary, like every other detail this log carries. Every one of
+/// the five is worth a record: the refusal says somebody asked for something
+/// they did not hold, the warning and the cancel are the two halves of the
+/// window the host user gets, and the last two are the only places the machine
+/// was actually told to go down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebootOutcome {
+    /// The session did not hold `reboot`, or was not active. Nothing was shown
+    /// to the host user and nothing was done.
+    Refused,
+    /// The host user was warned and the countdown started.
+    Warned,
+    /// The host user stopped it, or the grant went away before the countdown
+    /// elapsed.
+    Cancelled,
+    /// The machine was handed to the operating system's own shutdown path.
+    Started,
+    /// That path refused — most plausibly for want of the rights to do it.
+    Failed,
+}
 
 /// Everything worth auditing on the host (§15).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +102,18 @@ pub enum AuditEvent {
     DeviceTrustChanged {
         /// Whether the device is trusted after the change.
         trusted: bool,
+    },
+    /// A guest asked this host to restart or shut down (§4.1; ADR 0084).
+    ///
+    /// The one audited action that can end the log's own machine, which is
+    /// exactly why it is here: afterwards there is nothing left running to ask
+    /// what happened, and this record is what the host reads when it comes
+    /// back up.
+    Reboot {
+        /// Whether the machine was asked to come back.
+        mode: RebootMode,
+        /// What the host did about it.
+        outcome: RebootOutcome,
     },
 }
 

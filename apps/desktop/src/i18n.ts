@@ -374,7 +374,22 @@ export type TranslationKey =
   | 'quality.percent'
   | 'quality.kbps'
   | 'quality.fpsValue'
-  | 'quality.unknown';
+  | 'quality.unknown'
+  // Restarting the host (ADR 0084). The host's own banner first, then what
+  // the guest sees: the ask, the warning that a shutdown is one-way, and the
+  // wait for a machine that is on its way back.
+  | 'reboot.banner.reboot'
+  | 'reboot.banner.shutdown'
+  | 'reboot.banner.countdown'
+  | 'reboot.banner.cancel'
+  | 'reboot.ask.reboot'
+  | 'reboot.ask.shutdown'
+  | 'reboot.ask.shutdownWarning'
+  | 'reboot.waiting.title'
+  | 'reboot.waiting.body'
+  | 'reboot.waiting.cancel'
+  | 'history.autoReconnect'
+  | 'history.autoReconnect.hint';
 
 export type Dictionary = Record<TranslationKey, string | ((arg: string) => string)>;
 

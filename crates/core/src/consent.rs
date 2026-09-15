@@ -128,9 +128,23 @@ pub struct Grants {
     /// at a picture you are not shown), and it stays a separate flag the actor
     /// re-reads before every event, so a revoke lands on the next one.
     pub secure_desktop_input: bool,
+    /// Restart or shut down the host machine (ADR 0084).
+    ///
+    /// The only grant on this list whose use ends the session holding it, and
+    /// — for a shutdown — every future one as well, until somebody walks over
+    /// to the machine and presses the power button. That is why it is its own
+    /// flag rather than something `input` implies: a guest holding the
+    /// keyboard can already type a reboot command, but it does so in front of
+    /// an operator watching the screen, while this message arrives with no
+    /// picture attached to it. Carried by [`Role::FullControl`] alone,
+    /// separately revocable, and re-read at the moment the machine is actually
+    /// told to go down rather than when the request arrived — the host's own
+    /// warning window sits in between, and a revoke landing inside it has to
+    /// stop the restart.
+    pub reboot: bool,
 }
 
-/// One of the ten grants a host may toggle on a session that is already
+/// One of the eleven grants a host may toggle on a session that is already
 /// running, without changing its role (§8.2).
 ///
 /// `view` and `input` are deliberately absent: they follow from [`Role`] and
@@ -160,6 +174,8 @@ pub enum IndependentGrant {
     Tunnel,
     /// Start a shell on the host and drive it (ADR 0079).
     Terminal,
+    /// Restart or shut down the host machine (ADR 0084).
+    Reboot,
 }
 
 impl Grants {
@@ -217,13 +233,19 @@ impl Grants {
             // the click on the prompt was a switch the host had to hunt for,
             // not a boundary. Still independent, so it is revocable on its own.
             secure_desktop_input: full,
+            // Full control and nothing below it (ADR 0084). A guest that holds
+            // the keyboard can reach the same result by typing, so withholding
+            // the message would not be a boundary — what the flag buys is a
+            // permission the host can withdraw without taking the keyboard
+            // back, and a name for the thing in the audit log.
+            reboot: full,
         }
     }
 
     /// Whether `which` is currently held.
     #[must_use]
     pub const fn get(self, which: IndependentGrant) -> bool {
-        // Exhaustive on purpose, with no `_` arm: an eleventh permission must
+        // Exhaustive on purpose, with no `_` arm: a twelfth permission must
         // not be able to appear and silently read as denied here (§2.2).
         match which {
             IndependentGrant::ClipboardRead => self.clipboard_read,
@@ -236,6 +258,7 @@ impl Grants {
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input,
             IndependentGrant::Tunnel => self.tunnel,
             IndependentGrant::Terminal => self.terminal,
+            IndependentGrant::Reboot => self.reboot,
         }
     }
 
@@ -252,6 +275,7 @@ impl Grants {
             IndependentGrant::SecureDesktopInput => self.secure_desktop_input = allowed,
             IndependentGrant::Tunnel => self.tunnel = allowed,
             IndependentGrant::Terminal => self.terminal = allowed,
+            IndependentGrant::Reboot => self.reboot = allowed,
         }
     }
 }
@@ -576,7 +600,31 @@ mod tests {
             assert!(!lesser.secure_desktop_input);
             assert!(!lesser.tunnel);
             assert!(!lesser.terminal);
+            assert!(!lesser.reboot);
         }
+    }
+
+    /// ADR 0084: restarting the machine is not something the keyboard implies,
+    /// and taking it back leaves every other grant where it was.
+    #[test]
+    fn rebooting_follows_full_control_and_toggles_on_its_own() {
+        for role in [Role::ViewOnly, Role::ControlLimited] {
+            assert!(!Grants::from_role(role).get(IndependentGrant::Reboot));
+        }
+        assert!(Grants::from_role(Role::FullControl).get(IndependentGrant::Reboot));
+
+        // The implication this grant exists to refuse: a session may hold the
+        // host's keyboard without being allowed to take the machine down with
+        // a message that has no picture attached to it.
+        let mut narrowed = Grants::from_role(Role::FullControl);
+        narrowed.set(IndependentGrant::Reboot, false);
+        assert!(narrowed.input);
+        assert!(!narrowed.get(IndependentGrant::Reboot));
+        assert!(narrowed.get(IndependentGrant::Terminal));
+        assert!(narrowed.get(IndependentGrant::Tunnel));
+        assert!(narrowed.get(IndependentGrant::SecureDesktopInput));
+        narrowed.set(IndependentGrant::Reboot, true);
+        assert!(narrowed.get(IndependentGrant::Reboot));
     }
 
     /// ADR 0079: a shell is not something the keyboard implies, and taking it
