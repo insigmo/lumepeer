@@ -31,10 +31,9 @@ use lumepeer_core::constants::{
     KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
-    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS,
-    RECONNECT_WINDOW_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
-    STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES,
-    TUNNEL_IDLE_TIMEOUT_SECS,
+    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
@@ -699,7 +698,10 @@ impl ConnectPhase {
     pub const fn is_pending(self) -> bool {
         matches!(
             self,
-            Self::Dialing | Self::AwaitingConsent | Self::AwaitingCredentials | Self::WaitingForHost
+            Self::Dialing
+                | Self::AwaitingConsent
+                | Self::AwaitingCredentials
+                | Self::WaitingForHost
         )
     }
 
@@ -12357,7 +12359,9 @@ impl Actor {
     /// warn about (ADR 0084).
     fn reboot_pending_dto(&self) -> Option<RebootPending> {
         let pending = self.pending_reboot?;
-        let left = pending.at.saturating_duration_since(std::time::Instant::now());
+        let left = pending
+            .at
+            .saturating_duration_since(std::time::Instant::now());
         Some(RebootPending {
             peer_label: self.label_of(&pending.peer),
             mode: pending.mode,
@@ -12492,23 +12496,21 @@ impl Actor {
             self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
             return;
         }
-        match self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) {
-            Some(code) => {
-                if let Err(ActorError::Net(ref error)) = self.spawn_dial(&code) {
-                    tracing::debug!(%error, "the host is still away");
-                }
+        let Some(code) = self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) else {
+            // The row was removed while this was waiting; there is no code
+            // left to dial and nothing to wait for.
+            tracing::info!("the remembered host is gone; the wait ends");
+            self.stop_reconnect_wait();
+            if self.connect_phase == ConnectPhase::WaitingForHost {
+                self.connect_phase = ConnectPhase::Idle;
+                self.connect_peer = None;
             }
-            None => {
-                // The row was removed while this was waiting; there is no code
-                // left to dial and nothing to wait for.
-                tracing::info!("the remembered host is gone; the wait ends");
-                self.stop_reconnect_wait();
-                if self.connect_phase == ConnectPhase::WaitingForHost {
-                    self.connect_phase = ConnectPhase::Idle;
-                    self.connect_peer = None;
-                }
-                return;
-            }
+            return;
+        };
+        // A dial that fails here is the ordinary case, not an error: the host
+        // is mid-restart and not listening yet. The next tick tries again.
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial(&code) {
+            tracing::debug!(%error, "the host is still away");
         }
         self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
     }
@@ -16675,6 +16677,175 @@ mod tests {
         assert_eq!(
             before, after,
             "the guest's own clipboard was still being read after the view closed"
+        );
+    }
+
+    /// Polls the host's own banner state until `predicate` holds, or fails.
+    ///
+    /// The request crosses a real link and the warning is raised on the far
+    /// side of it, so "did the host put a banner up" is only ever answerable
+    /// by asking the host, repeatedly.
+    async fn wait_for_reboot_banner(
+        host: &ActorHandle,
+        what: &str,
+        mut predicate: impl FnMut(Option<&RebootPending>) -> bool,
+    ) -> Option<RebootPending> {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let pending = host.reboot_pending().await.unwrap();
+            if predicate(pending.as_ref()) {
+                return pending;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0084, the refusal this grant exists for: a session may hold the
+    /// host's screen and never be able to take the machine away. The guest
+    /// can send the message — nothing local stops it, and the host is the
+    /// authority — and the host does not so much as warn.
+    ///
+    /// Checked by the absence of a banner rather than by an answer on the
+    /// wire, because `RebootRequest` has none: the guest learns it was
+    /// refused by the machine still being there, and the host learns it from
+    /// its own log and audit trail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reboot_without_the_grant_never_warns_and_never_counts_down() {
+        let (host, guest, _guest_label, host_label, _clipboard) = file_pair().await;
+
+        // ViewOnly, from the pairing: no `reboot`, and no `input` either.
+        guest
+            .reboot_request(host_label.clone(), RebootMode::Reboot)
+            .await
+            .unwrap();
+
+        // Long enough for the message to have crossed and been acted on
+        // several times over, and far short of `REBOOT_WARNING_SECS`.
+        a_few_poll_rounds().await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "an ungranted reboot request raised a warning on the host"
+        );
+
+        // And the other half of "independent" (§2.2): a `FullControl` session
+        // carries `reboot` by default, the way it carries `terminal` and
+        // `tunnel`, but the host can take that one back without narrowing the
+        // role and without touching the keyboard. A guest left holding input
+        // and nothing else is refused exactly like the one above.
+        let (host2, guest2, guest_label2, host_label2, _clipboard2) = file_pair().await;
+        host2
+            .grant(guest_label2.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host2
+            .set_grant(guest_label2.clone(), IndependentGrant::Reboot, false)
+            .await
+            .unwrap();
+        guest2
+            .reboot_request(host_label2, RebootMode::Shutdown)
+            .await
+            .unwrap();
+        a_few_poll_rounds().await;
+        assert!(
+            host2.reboot_pending().await.unwrap().is_none(),
+            "a withdrawn reboot grant still took the machine down"
+        );
+        // The revoke was surgical: full control is otherwise intact.
+        let session = host2
+            .status()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.label == guest_label2)
+            .unwrap();
+        assert_eq!(session.role, Role::FullControl);
+        assert!(session.grants.input, "revoking reboot took the keyboard too");
+        assert!(session.grants.get(IndependentGrant::Terminal));
+    }
+
+    /// ADR 0084: the warning is a decision, not a delay. With the grant in
+    /// place the host raises a banner naming the guest and which of the two
+    /// acts was asked for — and the person in front of that machine can end
+    /// it, at which point there is nothing left counting down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_person_at_the_host_can_stop_the_restart() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.grant(guest_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host.set_grant(guest_label.clone(), IndependentGrant::Reboot, true)
+            .await
+            .unwrap();
+
+        guest
+            .reboot_request(host_label, RebootMode::Shutdown)
+            .await
+            .unwrap();
+        let banner = wait_for_reboot_banner(&host, "no warning was raised", |seen| seen.is_some())
+            .await
+            .unwrap();
+        // Which machine is going away, and whose asking — a banner that named
+        // neither would not be a warning.
+        assert_eq!(banner.peer_label, guest_label);
+        assert_eq!(
+            banner.mode,
+            RebootMode::Shutdown,
+            "the warning did not say which of the two was asked for"
+        );
+        assert!(
+            banner.seconds_left > 0 && banner.seconds_left <= REBOOT_WARNING_SECS,
+            "the countdown started outside its own window: {}",
+            banner.seconds_left
+        );
+
+        host.reboot_cancel().await.unwrap();
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the cancel left the countdown running"
+        );
+
+        // And it stays cancelled. The timer armed for the original window
+        // still fires somewhere around now; it must find a generation that no
+        // longer matches and do nothing at all.
+        tokio::time::sleep(Duration::from_secs(REBOOT_WARNING_SECS + 1)).await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "a cancelled countdown came back when its timer fired"
+        );
+    }
+
+    /// ADR 0084: withdrawing `reboot` while the warning is up takes the
+    /// warning down with it. The machine was already safe — the grant is read
+    /// again when the window closes, not when the request arrived — but a
+    /// countdown left on screen after the host changed its mind is a lie
+    /// about what is going to happen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn withdrawing_the_grant_mid_countdown_takes_the_warning_down() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.grant(guest_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        host.set_grant(guest_label.clone(), IndependentGrant::Reboot, true)
+            .await
+            .unwrap();
+        guest
+            .reboot_request(host_label, RebootMode::Reboot)
+            .await
+            .unwrap();
+        wait_for_reboot_banner(&host, "no warning was raised", |seen| seen.is_some()).await;
+
+        host.set_grant(guest_label, IndependentGrant::Reboot, false)
+            .await
+            .unwrap();
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the warning outlived the grant that raised it"
+        );
+        tokio::time::sleep(Duration::from_secs(REBOOT_WARNING_SECS + 1)).await;
+        assert!(
+            host.reboot_pending().await.unwrap().is_none(),
+            "the countdown fired after its grant was withdrawn"
         );
     }
 

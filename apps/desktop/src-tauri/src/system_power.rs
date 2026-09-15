@@ -35,11 +35,33 @@ use lumepeer_core::protocol::RebootMode;
 /// A description of what the system refused — most plausibly for want of the
 /// rights to do it — never a panic. On success this usually does not return
 /// in any meaningful sense: the process is torn down with everything else.
+#[cfg(not(test))]
 pub fn go_down(mode: RebootMode) -> Result<(), String> {
     platform::go_down(mode)
 }
 
+/// The test build's answer, and deliberately a refusal.
+///
+/// `network.rs` drives the real host path against real actors — the grant
+/// check, the warning window, the cancel — and any one of those tests that
+/// lost a race would otherwise restart the developer's machine in the middle
+/// of the suite. Stopping here keeps the interesting half testable without
+/// ever handing a test the power to end the test run. Nothing special happens
+/// to the refusal either: it takes the same path
+/// `Reboot { outcome: Failed }` records for a machine whose OS said no.
+///
+/// # Errors
+/// Always.
+#[cfg(test)]
+pub fn go_down(_mode: RebootMode) -> Result<(), String> {
+    Err("this build is a test build and will not take the machine down".to_owned())
+}
+
 #[cfg(target_os = "windows")]
+// Under `cargo test` `go_down` above short-circuits before it reaches
+// here, so this module is compiled and type-checked but never called. That
+// is the intent, not an oversight: see the guard for why.
+#[cfg_attr(test, allow(dead_code, reason = "the test build never takes a machine down"))]
 mod platform {
     use std::os::windows::process::CommandExt as _;
     use std::process::Command;
@@ -88,6 +110,10 @@ mod platform {
 }
 
 #[cfg(not(target_os = "windows"))]
+// Under `cargo test` `go_down` above short-circuits before it reaches
+// here, so this module is compiled and type-checked but never called. That
+// is the intent, not an oversight: see the guard for why.
+#[cfg_attr(test, allow(dead_code, reason = "the test build never takes a machine down"))]
 mod platform {
     use std::process::Command;
 

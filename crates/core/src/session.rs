@@ -1011,7 +1011,10 @@ mod tests {
 
         // A lesser role never carries it, however long the session runs. One
         // manager each: the default plan allows a single concurrent guest.
-        for (index, role) in [Role::ViewOnly, Role::ControlLimited].into_iter().enumerate() {
+        for (index, role) in [Role::ViewOnly, Role::ControlLimited]
+            .into_iter()
+            .enumerate()
+        {
             let mut lesser = SessionManager::new();
             #[allow(
                 clippy::cast_possible_truncation,
@@ -1046,7 +1049,10 @@ mod tests {
         // to age the recorded instant itself.
         let elapsed = Duration::from_secs(RECONNECT_WINDOW_SECS + 1);
         let session = manager.sessions.get_mut(&peer(1)).unwrap();
-        session.disconnected_at = Some(Instant::now() - elapsed);
+        // `checked_sub` rather than `-`: the process has not been running
+        // since the epoch, but saying so is cheaper than explaining why a
+        // bare subtraction cannot underflow.
+        session.disconnected_at = Some(Instant::now().checked_sub(elapsed).unwrap());
 
         assert!(matches!(
             manager.on_reconnect(peer(1)),
@@ -1064,7 +1070,10 @@ mod tests {
         // The only way back is a new grant, and it starts from the role rather
         // than from whatever the old session had been narrowed to.
         manager.grant(peer(1), Role::ViewOnly).unwrap();
-        assert_eq!(manager.grants(&peer(1)), Some(Grants::from_role(Role::ViewOnly)));
+        assert_eq!(
+            manager.grants(&peer(1)),
+            Some(Grants::from_role(Role::ViewOnly))
+        );
     }
 
     /// ADR 0079: a shell needs the grant and a live session, and both are read
