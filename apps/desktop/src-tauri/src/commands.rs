@@ -644,6 +644,12 @@ pub struct ConnectionStatsDto {
     /// `direct`, `relay`, `mixed` or `unknown`, from iroh's own open paths —
     /// what is happening, not what the settings asked for.
     pub path: &'static str,
+    /// `iroh` or `obfuscated`: which of the two transports of ADR 0080 is
+    /// carrying this connection (gap-tasks/23 task 3).
+    pub transport: &'static str,
+    /// Transports the dial gave up on before this connection existed, oldest
+    /// first; empty when the first one tried worked (gap-tasks/23 task 3).
+    pub fallbacks: Vec<TransportFallbackDto>,
     /// Region of the relay in use, when one is.
     ///
     /// The leading label of its hostname and nothing more. A relay address is
@@ -656,6 +662,22 @@ pub struct ConnectionStatsDto {
     pub bitrate_kbps: Option<u32>,
     /// Frame rate this machine is sending at; `null` on the watching side.
     pub fps: Option<u8>,
+}
+
+/// One transport a connect tried and gave up on (gap-tasks/23 task 3;
+/// ADR 0083).
+///
+/// Both fields are stable identifiers the webview turns into localized text,
+/// never sentences assembled here. The failure is the same §18 vocabulary a
+/// failed connect already reports — what this side observed — and never an
+/// interpretation of it: this app cannot tell a blocked network from a bad
+/// one, so it does not offer a guess about which it was.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportFallbackDto {
+    /// `iroh` or `obfuscated`.
+    pub transport: &'static str,
+    /// §18 code of the last error that transport returned.
+    pub failure: &'static str,
 }
 
 /// License state for the UI.
@@ -1203,6 +1225,15 @@ pub async fn connection_stats(
             loss_permille: row.loss_permille,
             goodput_kbps: row.goodput_kbps,
             path: row.path.code(),
+            transport: row.transport.code(),
+            fallbacks: row
+                .fallbacks
+                .into_iter()
+                .map(|fallback| TransportFallbackDto {
+                    transport: fallback.transport.code(),
+                    failure: fallback.failure,
+                })
+                .collect(),
             relay_region: row.relay_region,
             bitrate_kbps: row.bitrate_kbps,
             fps: row.fps,

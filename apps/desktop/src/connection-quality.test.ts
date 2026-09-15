@@ -17,6 +17,8 @@ function stats(overrides: Partial<ConnectionStats> = {}): ConnectionStats {
     loss_permille: 25,
     goodput_kbps: 3_200,
     path: 'direct',
+    transport: 'iroh',
+    fallbacks: [],
     relay_region: null,
     bitrate_kbps: 4_000,
     fps: 30,
@@ -89,6 +91,61 @@ describe('connection quality pill', () => {
     expect(
       container.querySelector('[data-testid="quality-details"]')?.textContent,
     ).not.toContain(t('en', 'quality.relayLabel'));
+  });
+
+  // gap-tasks/23 task 3: the panel has to say which transport is carrying the
+  // session, in words, and the obfuscated one is always a single direct UDP
+  // path — so it is named as what it is rather than as "direct" twice over.
+  it('names the obfuscated transport in the pill instead of the iroh path', () => {
+    render(connectionQuality(stats({ transport: 'obfuscated' }), 'en'), container);
+    const pill = container.querySelector('[data-testid="quality-pill"]');
+    expect(pill?.textContent).toContain(t('en', 'quality.path.obfuscated'));
+    expect(pill?.textContent).not.toContain(t('en', 'quality.path.direct'));
+    expect(
+      container.querySelector('[data-testid="quality"]')?.getAttribute('data-transport'),
+    ).toBe('obfuscated');
+  });
+
+  // gap-tasks/23 task 3: which attempt was given up on, and what this machine
+  // observed when it was — never a guess at why the network did it.
+  it('says which transport was given up on and what happened to it', () => {
+    render(
+      connectionQuality(
+        stats({
+          transport: 'iroh',
+          fallbacks: [{ transport: 'obfuscated', failure: 'DIAL_FAILED' }],
+        }),
+        'en',
+      ),
+      container,
+    );
+    const details = container.querySelector('[data-testid="quality-details"]');
+    expect(details?.textContent).toContain(t('en', 'quality.fallbackLabel'));
+    expect(details?.textContent).toContain(
+      t('en', 'quality.fallback.noAnswer', t('en', 'quality.transport.obfuscated')),
+    );
+  });
+
+  it('falls back to a neutral phrase for a failure code it does not know', () => {
+    render(
+      connectionQuality(
+        stats({ fallbacks: [{ transport: 'obfuscated', failure: 'SOMETHING_NEW' }] }),
+        'en',
+      ),
+      container,
+    );
+    const details = container.querySelector('[data-testid="quality-details"]');
+    expect(details?.textContent).toContain(
+      t('en', 'quality.fallback.failed', t('en', 'quality.transport.obfuscated')),
+    );
+    expect(details?.textContent).not.toContain('SOMETHING_NEW');
+  });
+
+  it('shows no fallback row at all when the first transport worked', () => {
+    render(connectionQuality(stats(), 'en'), container);
+    expect(
+      container.querySelector('[data-testid="quality-details"]')?.textContent,
+    ).not.toContain(t('en', 'quality.fallbackLabel'));
   });
 
   it('is a native disclosure, so it is reachable without a pointer', () => {
