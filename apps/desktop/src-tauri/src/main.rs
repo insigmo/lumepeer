@@ -25,6 +25,7 @@ mod network;
 mod recorder;
 mod remembered_password;
 mod service_control;
+mod system_power;
 mod unattended_store;
 mod view;
 
@@ -281,6 +282,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::history_connect,
         commands::history_remove,
         commands::history_forget_password,
+        commands::history_set_trusted,
         commands::connect_status,
         commands::connect_cancel,
         commands::report_decoder_codecs,
@@ -317,6 +319,9 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::terminal_resize,
         commands::terminal_close,
         commands::terminal_poll,
+        commands::reboot_request,
+        commands::reboot_pending,
+        commands::reboot_cancel,
         commands::audio_toggle,
         commands::recording_toggle,
         commands::record_request,

@@ -12,6 +12,7 @@
 )]
 
 use lumepeer_core::consent::IndependentGrant;
+use lumepeer_core::protocol::RebootMode;
 use serde::{Deserialize, Serialize};
 use tauri::Window;
 
@@ -853,6 +854,163 @@ pub async fn history_forget_password(
 ) -> Result<(), IpcError> {
     check_window(&window)?;
     state.network.history_forget_password(args.peer).await?;
+    Ok(())
+}
+
+/// Argument of [`history_set_trusted`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistorySetTrustedArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+    /// Whether this node may dial that host again by itself after the link
+    /// goes away.
+    pub trusted: bool,
+}
+
+/// Marks a remembered host as one this node may dial again by itself after the
+/// link goes away, or withdraws that (ADR 0084).
+///
+/// The guest-side half of the reboot story, and deliberately a decision of its
+/// own: nothing about connecting, being granted a role or saving a password
+/// sets it, so a host only ever reconnects unasked because somebody said it
+/// may. It widens nothing — the session it eventually reaches is decided by
+/// that host from scratch (§2.3) — what it permits is the asking, on this
+/// side, without a human pressing the button.
+///
+/// Answers whether a row was there to change: a host that has since been
+/// forgotten is not silently re-created.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn history_set_trusted(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HistorySetTrustedArgs,
+) -> Result<bool, IpcError> {
+    check_window(&window)?;
+    Ok(state
+        .network
+        .history_set_trusted(args.peer, args.trusted)
+        .await?)
+}
+
+/// What a `RebootRequest` asks for, as the webview names it (ADR 0084).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebootModeDto {
+    /// Restart, and come back.
+    Reboot,
+    /// Power off, and stay off until somebody is physically there.
+    Shutdown,
+}
+
+impl From<RebootModeDto> for RebootMode {
+    fn from(value: RebootModeDto) -> Self {
+        match value {
+            RebootModeDto::Reboot => Self::Reboot,
+            RebootModeDto::Shutdown => Self::Shutdown,
+        }
+    }
+}
+
+impl From<RebootMode> for RebootModeDto {
+    fn from(value: RebootMode) -> Self {
+        match value {
+            RebootMode::Reboot => Self::Reboot,
+            RebootMode::Shutdown => Self::Shutdown,
+        }
+    }
+}
+
+/// Argument of [`reboot_request`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct RebootRequestArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// Whether that machine is meant to come back.
+    pub mode: RebootModeDto,
+}
+
+/// Asks the watched host to restart or shut down (§4.1; ADR 0084).
+///
+/// View window only, like every other thing a guest may ask a host for: this
+/// is the guest's side of a session, and the host still decides. It re-reads
+/// its own `reboot` grant, warns the person in front of it and gives them
+/// `REBOOT_WARNING_SECS` to refuse — a refusal at either point arrives as the
+/// machine still being there, because this message has no answer of its own.
+///
+/// # Errors
+/// Rejects calls from any window but that peer's own view; [`IpcError`]
+/// `unsupported` towards a host too old to understand the message.
+#[tauri::command]
+pub async fn reboot_request(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: RebootRequestArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .reboot_request(args.peer, args.mode.into())
+        .await?;
+    Ok(())
+}
+
+/// The reboot warning running on this machine right now, as the banner reads
+/// it (ADR 0084).
+#[derive(Debug, Clone, Serialize)]
+pub struct RebootPendingDto {
+    /// Pseudonymized label of the guest that asked (§15).
+    pub peer_label: String,
+    /// Whether this machine was asked to come back.
+    pub mode: RebootModeDto,
+    /// Whole seconds left before it happens.
+    pub seconds_left: u64,
+}
+
+/// What this machine has been asked to do to itself, if anything (ADR 0084).
+///
+/// Main window only. The actor raises that window the moment the warning
+/// starts (`ActorNotification::RebootPending`, `main.rs`), exactly as it does
+/// for a consent request, so the one surface that is guaranteed to be in front
+/// of the person is the one that carries the banner and its button.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn reboot_pending(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<RebootPendingDto>, IpcError> {
+    check_window(&window)?;
+    Ok(state
+        .network
+        .reboot_pending()
+        .await?
+        .map(|pending| RebootPendingDto {
+            peer_label: pending.peer_label,
+            mode: pending.mode.into(),
+            seconds_left: pending.seconds_left,
+        }))
+}
+
+/// Stops a restart a guest asked for, before it happens (ADR 0084).
+///
+/// The button on the warning, and the reason the warning exists: a machine is
+/// never dropped silently, not even for a guest the host handed full control
+/// to. Main window only, for the same reason [`reboot_pending`] is.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+/// Cancelling when nothing is pending is not an error.
+#[tauri::command]
+pub async fn reboot_cancel(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.reboot_cancel().await?;
     Ok(())
 }
 

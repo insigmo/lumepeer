@@ -58,6 +58,24 @@ pub struct HistoryEntry {
     /// starts `false`.
     #[serde(skip)]
     pub has_password: bool,
+    /// Whether this node may raise a **new** session with that host by itself
+    /// after the link goes away — a machine restarting, most of the time
+    /// (ADR 0084).
+    ///
+    /// Persisted, unlike `has_password`, because it is the only record of a
+    /// decision the user made: nothing about connecting, being granted a role
+    /// or saving a password sets it, exactly as `AddressBook`'s own trust flag
+    /// is never earned by connecting (ADR 0034). It is one half of the
+    /// precondition — the other half is a device password this node actually
+    /// remembers, which the keystore answers — because an automatic retry that
+    /// ends in a password prompt nobody is there to type is a retry loop, not
+    /// a reconnection.
+    ///
+    /// It widens nothing. The session it eventually reaches is an ordinary
+    /// one, decided by the host from scratch (§2.3): what this permits is the
+    /// *asking*, on this side, without a human pressing the button.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// In-memory list backed by a best-effort-persisted JSON file.
@@ -116,10 +134,18 @@ impl ConnectionHistory {
     /// One row per host, not per session: this is a list of places to go back
     /// to, so connecting to the same host ten times leaves one row that moves
     /// to the front, carrying the code and role of the most recent visit.
+    ///
+    /// `trusted` is the one field a visit does **not** rewrite. Rebuilding the
+    /// row on every connect and disconnect would otherwise clear a decision
+    /// the user made deliberately, which is the rule `AddressBook::upsert`
+    /// already follows for the flag on its own side (ADR 0034): saving a
+    /// device and trusting it are separate operations, and the ordinary one
+    /// must never be able to move the other.
     pub fn record(&mut self, peer_label: String, role: Role, code: String) {
         let last_seen_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
+        let trusted = self.is_trusted(&peer_label);
         self.entries.retain(|entry| entry.peer_label != peer_label);
         self.entries.insert(
             0,
@@ -131,10 +157,44 @@ impl ConnectionHistory {
                 // Answered by the keystore when the actor reads the list, not
                 // by whatever wrote this row.
                 has_password: false,
+                trusted,
             },
         );
         self.entries.truncate(MAX_ENTRIES);
         self.save();
+    }
+
+    /// Whether `peer_label` is a host this node may dial again on its own
+    /// (ADR 0084). A host that is not listed is not trusted, like every other
+    /// deny-by-default answer here.
+    #[must_use]
+    pub fn is_trusted(&self, peer_label: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.peer_label == peer_label && entry.trusted)
+    }
+
+    /// Marks `peer_label` as a host this node may dial again on its own, or
+    /// takes the mark away (ADR 0084).
+    ///
+    /// Returns whether a row was there to change, so the caller can tell a
+    /// real decision from one aimed at a host that has since been forgotten.
+    /// Nothing is created: trusting a host that is not in the list would be
+    /// trusting a machine this node has never reached.
+    pub fn set_trusted(&mut self, peer_label: &str, trusted: bool) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.peer_label == peer_label)
+        else {
+            return false;
+        };
+        if entry.trusted == trusted {
+            return true;
+        }
+        entry.trusted = trusted;
+        self.save();
+        true
     }
 
     /// Removes the row for `peer_label`, if there is one, and persists the
@@ -233,6 +293,81 @@ mod tests {
         assert_eq!(history.entries().len(), 1);
         assert_eq!(history.entries()[0].peer_label, "host-cd34");
         assert_eq!(history.code_of("host-ab12"), None);
+    }
+
+    /// ADR 0084: trusting a host is a decision, so an ordinary visit must not
+    /// clear it and a host nobody trusted must not acquire it by connecting.
+    #[test]
+    fn trust_is_a_separate_decision_that_survives_the_next_visit() {
+        let mut history = ConnectionHistory::open(None);
+        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        assert!(!history.is_trusted("host-ab12"));
+
+        assert!(history.set_trusted("host-ab12", true));
+        assert!(history.is_trusted("host-ab12"));
+
+        // A second visit rewrites the row; the decision stays.
+        history.record(
+            "host-ab12".to_owned(),
+            Role::FullControl,
+            "code-2".to_owned(),
+        );
+        assert!(history.is_trusted("host-ab12"));
+        assert_eq!(history.code_of("host-ab12"), Some("code-2"));
+
+        assert!(history.set_trusted("host-ab12", false));
+        assert!(!history.is_trusted("host-ab12"));
+    }
+
+    /// A host that was never dialed cannot be trusted: there would be nothing
+    /// to dial, and a row invented here would claim a visit that never was.
+    #[test]
+    fn trusting_a_host_that_is_not_listed_creates_nothing() {
+        let mut history = ConnectionHistory::open(None);
+        assert!(!history.set_trusted("host-never-connected", true));
+        assert!(history.entries().is_empty());
+        assert!(!history.is_trusted("host-never-connected"));
+    }
+
+    /// The flag has to outlive the process, or "reconnect by itself" would
+    /// only ever work until the next restart of *this* machine.
+    #[test]
+    fn trust_persists_across_a_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-trust-{}", std::process::id()));
+        let path = dir.join("connection_history.json");
+
+        let mut history = ConnectionHistory::open(Some(path.clone()));
+        history.record("host-ab12".to_owned(), Role::ViewOnly, "code-1".to_owned());
+        history.record("host-cd34".to_owned(), Role::ViewOnly, "code-2".to_owned());
+        assert!(history.set_trusted("host-ab12", true));
+
+        let reloaded = ConnectionHistory::open(Some(path));
+        assert!(reloaded.is_trusted("host-ab12"));
+        assert!(!reloaded.is_trusted("host-cd34"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A history file written before this flag existed loads with nobody
+    /// trusted, which is the safe reading of a file that cannot say.
+    #[test]
+    fn a_history_file_from_before_the_trust_flag_trusts_nobody() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-untrust-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection_history.json");
+        fs::write(
+            &path,
+            br#"[{"peer_label":"host-ab12","role":"ViewOnly","last_seen_at":1234,"code":"code-1"}]"#,
+        )
+        .unwrap();
+
+        let history = ConnectionHistory::open(Some(path));
+        assert_eq!(history.entries().len(), 1);
+        assert!(!history.is_trusted("host-ab12"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
