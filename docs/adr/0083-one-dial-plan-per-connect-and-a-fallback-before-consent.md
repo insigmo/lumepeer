@@ -220,10 +220,12 @@ log, where a technical answer belongs.
 
 - `cargo fmt --all -- --check` — clean.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
-- `cargo test --workspace` — 591 passed, 0 failed, 1 ignored, 28 test
-  binaries (585 before this pack; the six new ones are the dial order, the
-  attempt shares, the wall-clock budget, the reconnect, and the two history
-  ones).
+- `cargo test --workspace` — 593 passed, 0 failed, 1 ignored, 28 test
+  binaries (585 before this pack). The eight new ones are the three about the
+  order a plan comes out in, the one that divides the attempts, the one that
+  holds the wall clock to `DIAL_TOTAL_BUDGET_SECS`, the one that says a
+  reconnect over the other transport resumes the same session and widens no
+  grant, and the two about what the remembered transport survives.
 - `cd apps/desktop && npm run typecheck && npm test` — clean; 739 passed
   across 27 files (735 before; the four new ones are the panel's).
 - **Not verified, and needing two machines behind two different NATs:** that
