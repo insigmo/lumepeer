@@ -27,6 +27,11 @@ export type ConnectPhase =
   | 'dialing'
   | 'awaiting_consent'
   | 'awaiting_credentials'
+  // The host went away and this node is waiting for it to come back, rather
+  // than for it to answer (ADR 0084). Reached only for a device the user
+  // marked trusted and whose device password is remembered; for every other
+  // host the phase goes to `idle` and the button is what is left.
+  | 'waiting_for_host'
   | 'connected'
   | 'denied'
   | 'failed';
@@ -91,7 +96,10 @@ export function isConnecting(): boolean {
     dialing ||
     phase === 'dialing' ||
     phase === 'awaiting_consent' ||
-    phase === 'awaiting_credentials'
+    phase === 'awaiting_credentials' ||
+    // Also a wait, and the longest of them: the form must stay disabled while
+    // it runs, or a second dial would race the one the wait is about to make.
+    phase === 'waiting_for_host'
   );
 }
 
@@ -586,9 +594,35 @@ export function inviteRefreshPanel(locale: Locale): TemplateResult {
 }
 
 /** Main panel block: heading, subtext and the paste-a-code connect form. */
+/**
+ * The panel shown while this node waits for a host that went away (ADR 0084).
+ *
+ * Its own surface rather than a third string under the connect form, because
+ * it is the one wait that is not about the far side deciding: the machine is
+ * not there. It says so, says what coming back will cost — a device password,
+ * not the rights this session had — and offers the one click that ends it.
+ *
+ * `connect_cancel` is the same call the ordinary cancel button makes; it stops
+ * the wait as well as any dial in flight.
+ */
+function rebootWaitPanel(locale: Locale): TemplateResult {
+  return html`
+    <h1 class="panel-heading">${t(locale, 'reboot.waiting.title')}</h1>
+    <p class="panel-subtext" role="status" aria-live="polite" data-testid="reboot-waiting">
+      ${t(locale, 'reboot.waiting.body')}
+    </p>
+    <button type="button" class="connect-btn" @click=${() => void cancel()}>
+      ${t(locale, 'reboot.waiting.cancel')}
+    </button>
+  `;
+}
+
 export function connectPanel(locale: Locale): TemplateResult {
   const waiting = isConnecting();
   const message = errorText(locale);
+  if (phase === 'waiting_for_host') {
+    return rebootWaitPanel(locale);
+  }
   return html`
     <h1 class="panel-heading">${t(locale, 'panel.heading')}</h1>
     <p class="panel-subtext">${t(locale, 'panel.subtext')}</p>

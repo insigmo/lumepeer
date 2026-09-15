@@ -1329,6 +1329,48 @@ button {
   font-weight: 600;
 }
 
+/* The reboot warning (ADR 0084). Louder than the recording banner it sits
+   above: solid red rather than a tint, because this one has a deadline and
+   the person has to find the button on it without reading the sentence
+   twice. */
+.reboot-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  background: var(--red);
+  color: #fff;
+  font-size: var(--fs-micro);
+}
+
+.reboot-banner-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.reboot-banner-cancel {
+  flex: none;
+  padding: 6px 12px;
+  border: 1px solid #fff;
+  border-radius: 6px;
+  background: #fff;
+  color: var(--red);
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.reboot-banner-cancel:hover {
+  background: transparent;
+  color: #fff;
+}
+
 .recording-dot {
   width: 8px;
   height: 8px;

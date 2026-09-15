@@ -33,6 +33,7 @@ import { onAuditStateChange, tauriAuditCommands } from './audit-log';
 import { onSystemStateChange, tauriSystemCommands } from './system-settings';
 import { logoMark } from './logo';
 import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
+import { rebootBanner, type RebootPending } from './reboot-banner';
 import { onSettingsStateChange, openSettings, settingsView } from './settings-view';
 import type { FileTransfers } from './file-transfers';
 import type { TunnelRow } from './tunnels';
@@ -78,6 +79,16 @@ let recordings: RecordingEntry[] = [];
 // Offers waiting for an answer and transfers in flight, from the last poll.
 let files: FileTransfers = { offers: [], transfers: [] };
 let tunnels: TunnelRow[] = [];
+/**
+ * What a guest has asked this machine to do to itself, while there is still
+ * time to say no (ADR 0084).
+ *
+ * `null` almost always, and deliberately re-read on every poll rather than
+ * pushed once: the countdown is the thing being rendered, so a banner that
+ * was told about the request and then stopped asking would show a number that
+ * had stopped moving.
+ */
+let rebootPending: RebootPending | null = null;
 /**
  * What each live connection's link looks like, by peer label (§18; ADR 0026).
  *
@@ -211,6 +222,7 @@ function renderNow(): void {
               </div>
             </aside>
             <main class="main-panel">
+              ${rebootBanner(rebootPending, locale, () => void cancelReboot())}
               ${recordingBanner()} ${mediaWarning()}
               ${connectPanel(locale)}
               <div class="main-divider"></div>
@@ -288,6 +300,24 @@ async function noteClipboardArrivals(
   }
 }
 
+/**
+ * Stops a restart a guest asked for (ADR 0084).
+ *
+ * Refreshes straight after rather than waiting for the next tick: this is the
+ * one button in the app whose result the person needs to see immediately, and
+ * the banner staying up for another second would read as the cancel having
+ * missed.
+ */
+async function cancelReboot(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('reboot_cancel');
+  } catch (error) {
+    console.error('reboot_cancel failed:', error);
+  }
+  await refresh();
+}
+
 async function refresh(): Promise<void> {
   try {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -336,6 +366,15 @@ async function refresh(): Promise<void> {
       recordings = await invoke<RecordingEntry[]>('recordings_list');
     } catch (error) {
       console.error('recordings_list failed:', error);
+    }
+    // The warning window, re-read every tick so the countdown moves (ADR
+    // 0084). A failure here leaves the banner exactly as it was rather than
+    // clearing it: "the poll failed" is not "nobody is restarting this
+    // machine", and of the two readings only one is safe to show.
+    try {
+      rebootPending = (await invoke<RebootPending | null>('reboot_pending')) ?? null;
+    } catch (error) {
+      console.error('reboot_pending failed:', error);
     }
     sessions = sessionResult;
     history = historyResult;
