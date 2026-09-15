@@ -69,7 +69,8 @@ pub fn capture_secure_desktop_frame() -> Option<SecureDesktopFrame> {
         if !round_trip(OP_CAPTURE_SECURE_DESKTOP) {
             return None;
         }
-        let (width, height, data) = crate::frame::Reader::open()?.read()?;
+        let (width, height, data) =
+            crate::frame::Reader::open(crate::frame::FrameChannel::SecureDesktop)?.read()?;
         Some(SecureDesktopFrame {
             width,
             height,

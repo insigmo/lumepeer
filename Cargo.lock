@@ -4210,6 +4210,7 @@ dependencies = [
  "lumepeer-core",
  "lumepeer-media",
  "lumepeer-net",
+ "lumepeer-runtime",
  "lumepeer-service",
  "lumepeer-terminal",
  "objc2",
@@ -4315,6 +4316,37 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lumepeer-runtime"
+version = "0.0.66"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "clipboard-win",
+ "ed25519-dalek 2.2.0",
+ "fs4",
+ "iroh",
+ "lumepeer-core",
+ "lumepeer-media",
+ "lumepeer-net",
+ "lumepeer-service",
+ "lumepeer-terminal",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "percent-encoding",
+ "postcard",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.8.2",
+ "tracing",
+ "x11-clipboard",
 ]
 
 [[package]]

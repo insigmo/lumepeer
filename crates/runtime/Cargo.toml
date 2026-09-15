@@ -1,0 +1,94 @@
+[package]
+name = "lumepeer-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Lumepeer session runtime: the actor that owns the endpoint, the session and the media pipeline, with no window of its own"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Pass-throughs onto `lumepeer-media`'s platform backends, forwarded again by
+# whichever front end links this crate. Default is empty so
+# `cargo build --workspace` still needs no platform SDK, exactly as
+# `apps/desktop/src-tauri` arranged before these moved here.
+capture-x11 = ["lumepeer-media/capture-x11"]
+capture-portal = ["lumepeer-media/capture-portal"]
+audio-capture-pipewire = ["lumepeer-media/audio-capture-pipewire"]
+capture-scap = ["lumepeer-media/capture-scap"]
+capture-windows = ["lumepeer-media/capture-windows"]
+capture-screencapturekit = ["lumepeer-media/capture-screencapturekit"]
+audio-capture-screencapturekit = ["lumepeer-media/audio-capture-screencapturekit"]
+audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio"]
+encode-openh264 = ["lumepeer-media/encode-openh264"]
+encode-mf = ["lumepeer-media/encode-mf"]
+encode-mf-zero-copy = ["lumepeer-media/encode-mf-zero-copy"]
+encode-videotoolbox = ["lumepeer-media/encode-videotoolbox"]
+decode-openh264 = ["lumepeer-media/decode-openh264"]
+
+[dependencies]
+arboard.workspace = true
+lumepeer-core.workspace = true
+lumepeer-net = { workspace = true, features = ["secret-service", "keyring"] }
+lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] }
+# The privileged helper's client half (ADR 0043) and the session-agent
+# machinery (ADR 0085). Carries no privileges on this side.
+lumepeer-service.workspace = true
+lumepeer-terminal.workspace = true
+ed25519-dalek.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+rand.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+# Free space on a volume, for the check a transfer is accepted against
+# (ADR 0077). `statvfs` and `GetDiskFreeSpaceExW` are FFI and therefore
+# `unsafe`, which this crate forbids crate-wide; this carries that unsafe in
+# its own compiled crate, exactly as `keyring` does for the Windows keystore.
+fs4 = "0.13"
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# CF_HDROP clipboard file lists (docs/bugs/14-clipboard-files.md #1, #3;
+# ADR 0047) — the exact crate `arboard`'s own Windows text backend already
+# depends on, so this is a new direct edge, not a new dependency version.
+clipboard-win.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The Linux half of the capture and audio feature pairs whose Windows halves
+# are unconditional above, so a Linux build never has to remember to ask.
+lumepeer-media = { workspace = true, features = [
+    "capture-x11",
+    "audio-capture-pipewire",
+] }
+x11-clipboard.workspace = true
+percent-encoding.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+lumepeer-media = { workspace = true, features = [
+    "audio-capture-screencapturekit",
+    "audio-playout-coreaudio",
+] }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSArray",
+    "NSURL",
+    "NSObject",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+    "NSPasteboardItem",
+] }
+percent-encoding.workspace = true

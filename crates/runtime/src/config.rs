@@ -363,7 +363,7 @@ mod tests {
         // The file the design doc describes has to be readable by the code
         // that claims to read it; that agreement is exactly what ADR 0020
         // recorded as broken.
-        let text = include_str!("../../../../config/default.toml");
+        let text = include_str!("../../../config/default.toml");
         let parsed = toml::from_str::<Settings>(text).expect("config/default.toml must parse");
         assert!(parsed.network.prefer_direct);
         assert!(
