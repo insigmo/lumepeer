@@ -11,6 +11,7 @@
 //! becoming a Windows service or creating a DACL'd pipe does not on the
 //! service's own side.
 
+pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
 pub mod frame;
