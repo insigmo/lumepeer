@@ -135,7 +135,7 @@ mod platform {
     /// has always existed. "Not installed" is not a refusal, so the fallback
     /// is tried on any failure of the first, and what is reported is what the
     /// *last* one said.
-    pub fn commands(mode: RebootMode) -> Vec<(&'static str, Vec<&'static str>)> {
+    pub(super) fn commands(mode: RebootMode) -> Vec<(&'static str, Vec<&'static str>)> {
         let mut candidates = Vec::new();
         if cfg!(target_os = "linux") {
             candidates.push((
@@ -156,7 +156,7 @@ mod platform {
         candidates
     }
 
-    pub fn go_down(mode: RebootMode) -> Result<(), String> {
+    pub(super) fn go_down(mode: RebootMode) -> Result<(), String> {
         let mut last = "no shutdown command could be run at all".to_owned();
         for (program, args) in commands(mode) {
             match Command::new(program).args(&args).output() {
