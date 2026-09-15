@@ -1688,7 +1688,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.4",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4144,7 +4144,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "anyhow",
  "axum",
@@ -4164,7 +4164,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "argon2",
  "blake3",
@@ -4186,7 +4186,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "anyhow",
  "libc",
@@ -4199,7 +4199,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "ashpd",
  "blake3",
@@ -4291,7 +4291,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -4320,7 +4320,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-runtime"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4351,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-service"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-terminal"
-version = "0.0.66"
+version = "0.0.69"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
@@ -6652,9 +6652,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -7738,6 +7738,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
@@ -8254,7 +8255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
