@@ -96,6 +96,16 @@ const KIND_DETACHING: u8 = 0x84;
 /// is confusion-avoidance, not authorization.
 const EVENT_KIND_FLOOR: u8 = 0x80;
 
+/// Name of the pipe the privileged host and its session agent talk over.
+///
+/// A local pipe, and its own: the helper's request endpoint
+/// ([`crate::protocol::ENDPOINT`]) parses two-byte frames from interactive
+/// users, and putting twelve-byte agent messages in front of that parser would
+/// make one endpoint mean two things. `crates/service/src/agent_channel.rs`
+/// carries the access list and the process check that bound who may connect.
+#[cfg(target_os = "windows")]
+pub const AGENT_ENDPOINT: &str = r"\\.\pipe\lumepeer-session-agent";
+
 /// Name of the shared-memory mapping the session agent publishes encoded
 /// frames into (ADR 0085).
 ///

@@ -14,6 +14,8 @@
 //! asks the kernel a question about who is hosting.
 
 #[cfg(target_os = "windows")]
+pub mod agent_channel;
+#[cfg(target_os = "windows")]
 pub mod agent_launch;
 pub mod agent_protocol;
 pub mod client;
