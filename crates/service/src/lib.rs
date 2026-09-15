@@ -23,6 +23,8 @@ pub mod client;
 pub mod frame;
 #[cfg(target_os = "windows")]
 pub mod host_role;
+#[cfg(target_os = "windows")]
+pub mod machine_store;
 pub mod protocol;
 
 /// Name the service is registered under with the service control manager.
