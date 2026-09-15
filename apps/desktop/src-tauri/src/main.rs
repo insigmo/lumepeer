@@ -41,6 +41,68 @@ pub struct AppState {
     /// Whether this build starts with the user's session (ADR 0042), as the
     /// settings panel reads and writes it.
     pub autostart: autostart::Autostart,
+    /// This machine's host role, while this process holds it (ADR 0085 §4).
+    ///
+    /// Kept here for its lifetime, not for its contents: dropping the guard
+    /// hands the role back, so parking it in the state that lives as long as
+    /// the app is what makes "this process is the host until it exits" true.
+    /// `None` means something else on this machine is hosting, or — off
+    /// Windows, where there is no host service to contend with — that there is
+    /// no such token at all.
+    #[allow(
+        dead_code,
+        reason = "held for its Drop; reading it would be reading a fact the \
+                  actor was already told at spawn time"
+    )]
+    pub host_role: Option<HostRoleGuard>,
+}
+
+/// The platform's host-role guard, or a placeholder where there is none.
+///
+/// Only Windows has a host service to contend with (ADR 0085 does not extend
+/// to Linux or macOS, for ADR 0043 §7's reason), so everywhere else this is an
+/// uninhabited stand-in and [`claim_host_role`] always answers "host".
+#[cfg(target_os = "windows")]
+pub type HostRoleGuard = lumepeer_service::host_role::HostRole;
+/// See [`HostRoleGuard`].
+#[cfg(not(target_os = "windows"))]
+pub type HostRoleGuard = std::convert::Infallible;
+
+/// Takes this machine's host role, if there is one to take.
+///
+/// Returns the guard to hold and whether this process may host. The two are
+/// not the same question: on a platform or a build where the token cannot be
+/// created at all the answer is "host, with no guard", because a development
+/// build on a machine that has no host service must not be stopped by a
+/// question it cannot ask (`host_role::HostRoleClaim`).
+fn claim_host_role() -> (Option<HostRoleGuard>, bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use lumepeer_service::host_role::HostRoleClaim;
+
+        match lumepeer_service::host_role::claim() {
+            HostRoleClaim::Held(role) => (Some(role), true),
+            HostRoleClaim::Taken => {
+                tracing::warn!(
+                    "the Lumepeer service is hosting this machine; this window will not be a \
+                     second host. It still connects out and views other machines normally."
+                );
+                (None, false)
+            }
+            HostRoleClaim::Unavailable => {
+                tracing::info!(
+                    "cannot read this machine's host role; hosting as usual (a shipped client \
+                     runs elevated and does not land here)"
+                );
+                (None, true)
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No host service on this platform, so nothing to contend with.
+        (None, true)
+    }
 }
 
 /// Brings one window back to the user: out of the tray, out of a minimized
@@ -148,8 +210,16 @@ fn setup_app(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use tauri::Manager as _;
 
+    // Before anything binds: one host per machine, and which process it is
+    // decided here rather than by whichever one started first (ADR 0085 §4).
+    let (host_role, may_host) = claim_host_role();
+    let policy = if may_host {
+        network::ActorPolicy::hosting(settings.obfuscated())
+    } else {
+        network::ActorPolicy::not_hosting(settings.obfuscated())
+    };
     let network = runtime
-        .block_on(network::spawn_actor(app.handle().clone(), settings))
+        .block_on(network::spawn_actor(app.handle().clone(), settings, policy))
         .unwrap_or_else(|error| {
             eprintln!("fatal: failed to bind the network endpoint: {error}");
             std::process::exit(1);
@@ -178,6 +248,7 @@ fn setup_app(
         network,
         update_url,
         autostart,
+        host_role,
     });
     runtime.spawn(watch_for_window_raising_notifications(
         app.handle().clone(),
