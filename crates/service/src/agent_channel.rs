@@ -93,7 +93,7 @@ impl HostLink {
 
 /// The privileged host's end of the channel.
 #[cfg(target_os = "windows")]
-pub use windows_impl::AgentLink;
+pub use windows_impl::{AgentCommands, AgentLink};
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
@@ -183,12 +183,41 @@ mod windows_impl {
         /// connection.
         #[must_use]
         pub fn accept_from(expected_pid: u32, user_sid: &str) -> Option<Self> {
+            Self::accept_from_while(expected_pid, user_sid, &|| true)
+        }
+
+        /// [`accept_from`](Self::accept_from), for a caller that must be able
+        /// to stop waiting.
+        ///
+        /// `keep_waiting` is asked between rounds — after a stranger has been
+        /// turned away, never in the middle of one — and a `false` gives up
+        /// and answers `None`.
+        ///
+        /// It exists because the blocking half of this is genuinely
+        /// unbounded. `ConnectNamedPipe` waits for a connection and no flag
+        /// interrupts it, so a host whose agent died between being launched
+        /// and connecting would wait for it forever and never look at the
+        /// machine again — a screen lost permanently to one process that
+        /// failed to start. The caller breaks the wait the way
+        /// `windows_service.rs` already breaks its own: by connecting to the
+        /// pipe, which costs one turned-away stranger and one more round, and
+        /// this is the question asked on that round.
+        #[must_use]
+        pub fn accept_from_while(
+            expected_pid: u32,
+            user_sid: &str,
+            keep_waiting: &dyn Fn() -> bool,
+        ) -> Option<Self> {
             if !crate::frame::is_sid_string(user_sid) {
                 tracing::error!("refusing to build an agent channel access list from a non-SID");
                 return None;
             }
             let sddl = sddl_for(user_sid);
             loop {
+                if !keep_waiting() {
+                    tracing::info!("no longer waiting for a session agent to connect");
+                    return None;
+                }
                 let pipe = create_pipe(&sddl)?;
                 match accept_one(pipe, expected_pid) {
                     Accepted::Agent(link) => return Some(link),
@@ -208,6 +237,30 @@ mod windows_impl {
                     }
                 }
             }
+        }
+
+        /// A half of this channel that can only write.
+        ///
+        /// `None` when the handle cannot be duplicated, which leaves the
+        /// caller with a link it can read and not write — an attachment worth
+        /// abandoning rather than serving half of.
+        ///
+        /// A host needs this because the two directions are driven by
+        /// different things: events arrive when the agent has something to
+        /// say, and commands leave when a guest does something, and one
+        /// thread cannot be blocked in `recv` and ready to `send` at the same
+        /// time. Duplicating the handle is the whole mechanism — both halves
+        /// are the same pipe, so a write still cannot be read as a command by
+        /// this side and an event still cannot be written by it.
+        #[must_use]
+        pub fn commands(&self) -> Option<AgentCommands> {
+            self.pipe
+                .try_clone()
+                .inspect_err(
+                    |error| tracing::warn!(%error, "cannot split the agent channel for writing"),
+                )
+                .ok()
+                .map(|pipe| AgentCommands { pipe })
         }
 
         /// Tells the agent to do one already-authorized thing.
@@ -231,6 +284,28 @@ mod windows_impl {
             let mut message = [0u8; AGENT_MESSAGE_LEN];
             self.pipe.read_exact(&mut message).ok()?;
             parse_event(&message)
+        }
+    }
+
+    /// The writing half of an [`AgentLink`].
+    ///
+    /// Commands only. There is no `recv` here and no way to add one without
+    /// saying so in the type, which is the same property `HostLink` has in the
+    /// other direction: neither peer can reach the direction that is not its
+    /// own by getting the framing right.
+    #[derive(Debug)]
+    pub struct AgentCommands {
+        pipe: std::fs::File,
+    }
+
+    impl AgentCommands {
+        /// Tells the agent to do one already-authorized thing.
+        ///
+        /// Returns whether it went out whole; a partial write is a failure for
+        /// the same reason it is everywhere else on this wire.
+        #[must_use]
+        pub fn send(&mut self, command: AgentCommand) -> bool {
+            self.pipe.write_all(&encode_command(command)).is_ok() && self.pipe.flush().is_ok()
         }
     }
 

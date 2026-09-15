@@ -1,4 +1,4 @@
-//! Where the helper service's own diagnostics go.
+//! Where a Lumepeer service's own diagnostics go.
 //!
 //! Everything else in this crate is deliberately mute towards its caller: the
 //! pipe answers `ok` or `refused` and never says why, because a privileged
@@ -19,6 +19,12 @@
 //! under `%ProgramData%` that every one of them derives the same way rather
 //! than being told.
 //!
+//! The file name is the caller's, because this project now ships two services
+//! (ADR 0085) and one file carrying both would interleave a long-lived host's
+//! sessions with a helper's per-click workers. Everything else — the
+//! directory, the ceiling, the never-fail rule — is the same for both, which
+//! is why this module is shared rather than copied.
+//!
 //! Failing to log never fails the service. A directory that cannot be created
 //! or a file that cannot be opened leaves tracing on the stdout it had before,
 //! and the service goes on doing its job.
@@ -34,10 +40,15 @@ use tracing_subscriber::fmt::MakeWriter;
 /// Directory the log file lives in, under `%ProgramData%`.
 const DIRECTORY: &str = r"Lumepeer\logs";
 
-/// The one file this crate writes. Not dated and not rotated by day: the
-/// service is a background thing that logs a handful of lines per session, and
-/// a folder of mostly-empty files would be worse to read than one file.
-const FILE_NAME: &str = "lumepeer-service.log";
+/// The helper service's own file (`crates/service`'s binary).
+///
+/// Not dated and not rotated by day: a service is a background thing that
+/// logs a handful of lines per session, and a folder of mostly-empty files
+/// would be worse to read than one file.
+pub const HELPER_LOG_FILE: &str = "lumepeer-service.log";
+
+/// The session-0 host service's own file (ADR 0085).
+pub const HOST_LOG_FILE: &str = "lumepeer-host.log";
 
 /// Size at which the next process to open the file starts it over, in bytes.
 ///
@@ -46,12 +57,14 @@ const FILE_NAME: &str = "lumepeer-service.log";
 /// which is the one thing somebody debugging this actually needs.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Installs the subscriber. Returns the file being written, if any, so the
-/// caller can say where it went.
-pub fn init() -> Option<PathBuf> {
+/// Installs the subscriber, writing `file_name` under the machine-wide log
+/// directory. Returns the file being written, if any, so the caller can say
+/// where it went.
+#[must_use]
+pub fn init(file_name: &str) -> Option<PathBuf> {
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if let Some(file) = FileLog::open() {
+    if let Some(file) = FileLog::open(file_name) {
         let path = file.path.clone();
         tracing_subscriber::fmt()
             .with_env_filter(filter())
@@ -78,8 +91,8 @@ struct FileLog {
 impl FileLog {
     /// Creates the directory if needed and opens the file for appending,
     /// starting it over if what is already there is past [`MAX_BYTES`].
-    fn open() -> Option<Self> {
-        let path = directory().join(FILE_NAME);
+    fn open(file_name: &str) -> Option<Self> {
+        let path = directory().join(file_name);
         std::fs::create_dir_all(path.parent()?).ok()?;
         let oversized = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES);
         let file = OpenOptions::new()

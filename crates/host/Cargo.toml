@@ -1,0 +1,55 @@
+[package]
+name = "lumepeer-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Lumepeer's session-0 host service: the endpoint and the session, with the screen left to an agent (ADR 0085)"
+
+[[bin]]
+name = "lumepeer-host"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The session runtime, deliberately with **no** capture, encode or decode
+# feature turned on. That is not an omission to be fixed later: ADR 0085 §1
+# says the privileged process draws no pixels and presses no keys, and the
+# feature list is the mechanism rather than a comment asking people not to.
+# With none of them on, `default_capture` resolves to the stub capturer and
+# the honest `MediaUnavailable` of §18 — and pictures reach a guest only
+# through the agent, which is the one process that has a screen.
+lumepeer-runtime.workspace = true
+# The host role, the machine store, and the agent: channel, launcher and
+# frame mapping. Carries no lumepeer dependency of its own, which is part of
+# its security argument (ADR 0049 §2) and is why this crate exists rather
+# than the service binary growing a network.
+lumepeer-service.workspace = true
+lumepeer-net.workspace = true
+# For `InputInjector` alone — the trait the actor's own injector slot is typed
+# by. No capture, encode or decode feature is turned on here either: this crate
+# implements the trait, it does not use a backend behind it.
+lumepeer-media.workspace = true
+lumepeer-core.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Registering with the service control manager and reporting a lifecycle to it
+# have no safe bindings, the same way they do not in `crates/service`. Each
+# service binary carries its own copy on purpose: `crates/service`'s library
+# is the one the unprivileged desktop client links, and its header's claim
+# that nothing privileged lives there is worth more than sharing two hundred
+# lines of boilerplate.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }

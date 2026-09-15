@@ -78,8 +78,10 @@ const KIND_POINTER_MOVE: u8 = 0x04;
 const KIND_PRESS: u8 = 0x05;
 /// Kind byte of [`AgentCommand::Release`].
 const KIND_RELEASE: u8 = 0x06;
+/// Kind byte of [`AgentCommand::Wheel`].
+const KIND_WHEEL: u8 = 0x07;
 /// Kind byte of [`AgentCommand::Shutdown`].
-const KIND_SHUTDOWN: u8 = 0x07;
+const KIND_SHUTDOWN: u8 = 0x08;
 
 /// Kind byte of [`AgentEvent::Attached`].
 const KIND_ATTACHED: u8 = 0x81;
@@ -207,6 +209,24 @@ pub enum AgentCommand {
     Release {
         /// The guest's logical key/button code.
         logical: u32,
+    },
+    /// Scroll by a signed delta on the agent's session.
+    ///
+    /// Here rather than folded into [`Press`](Self::Press) because a wheel is
+    /// the one input event with no press and no release — a host that could
+    /// forward keys and buttons but not scrolling would leave a guest on a
+    /// service host silently unable to read a page, which is exactly the quiet
+    /// degradation §18 forbids.
+    ///
+    /// The deltas travel in the `x` and `y` slots, reinterpreted as signed:
+    /// the layout does not grow, because the slots are the right width and a
+    /// second pair would be two bytes every message carries and six of the
+    /// seven never use.
+    Wheel {
+        /// Horizontal delta, as the guest sent it.
+        dx: i16,
+        /// Vertical delta, as the guest sent it.
+        dy: i16,
     },
     /// Stop capturing, drop the indicator and exit.
     ///
@@ -363,6 +383,11 @@ pub fn encode_command(command: AgentCommand) -> [u8; AGENT_MESSAGE_LEN] {
             out = frame_of(KIND_RELEASE);
             out[WORD_AT..WORD_AT + 4].copy_from_slice(&logical.to_le_bytes());
         }
+        AgentCommand::Wheel { dx, dy } => {
+            out = frame_of(KIND_WHEEL);
+            out[X_AT..X_AT + 2].copy_from_slice(&dx.to_le_bytes());
+            out[Y_AT..Y_AT + 2].copy_from_slice(&dy.to_le_bytes());
+        }
         AgentCommand::Shutdown => out = frame_of(KIND_SHUTDOWN),
     }
     out
@@ -403,6 +428,12 @@ pub fn parse_command(message: &[u8; AGENT_MESSAGE_LEN]) -> Option<AgentCommand> 
         }),
         KIND_RELEASE => Some(AgentCommand::Release {
             logical: word_of(message),
+        }),
+        // Every bit pattern is a delta: unlike the indicator's flag there is
+        // no reserved value here, so there is nothing to refuse.
+        KIND_WHEEL => Some(AgentCommand::Wheel {
+            dx: x_of(message).cast_signed(),
+            dy: y_of(message).cast_signed(),
         }),
         KIND_SHUTDOWN => Some(AgentCommand::Shutdown),
         _ => None,
@@ -481,6 +512,15 @@ mod tests {
             },
             AgentCommand::Press { logical: 0x0d },
             AgentCommand::Release { logical: u32::MAX },
+            // Both signs and both extremes: a delta that came back unsigned
+            // would scroll a page the wrong way, which is the kind of bug the
+            // round trip is here to catch.
+            AgentCommand::Wheel { dx: 0, dy: 0 },
+            AgentCommand::Wheel { dx: -1, dy: 1 },
+            AgentCommand::Wheel {
+                dx: i16::MIN,
+                dy: i16::MAX,
+            },
             AgentCommand::Shutdown,
         ] {
             assert_eq!(parse_command(&encode_command(command)), Some(command));

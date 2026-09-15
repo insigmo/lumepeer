@@ -12,6 +12,11 @@
 //! creating a DACL'd pipe does not on the service's own side. Neither of them
 //! is a capability — one reads bytes the privileged side published, the other
 //! asks the kernel a question about who is hosting.
+//!
+//! [`log`] is here for a duller reason: this project ships two services now
+//! (ADR 0085), both of them started by the service control manager and
+//! therefore both of them with no stdout to write to. Where the file goes and
+//! what bounds it are the same question twice, so it is answered once.
 
 #[cfg(target_os = "windows")]
 pub mod agent_channel;
@@ -23,6 +28,7 @@ pub mod client;
 pub mod frame;
 #[cfg(target_os = "windows")]
 pub mod host_role;
+pub mod log;
 #[cfg(target_os = "windows")]
 pub mod machine_store;
 pub mod protocol;

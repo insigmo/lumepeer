@@ -33,8 +33,6 @@
 #[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
-mod log;
-#[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
 mod secure_desktop_input;
@@ -57,7 +55,7 @@ fn main() {
         // A file, not stdout: a process the service control manager starts has
         // no stdout, so until this existed every line this crate logged about
         // why an operation was refused went nowhere at all (`log.rs`).
-        let log_path = log::init();
+        let log_path = lumepeer_service::log::init(lumepeer_service::log::HELPER_LOG_FILE);
         // `--console` runs the same listener in the foreground, as an ordinary
         // process. It is how the endpoint and the protocol are exercised
         // without registering anything with the SCM; it is *not* a way to get
