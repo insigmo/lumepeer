@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use lumepeer_core::NodeId;
+use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
     KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
@@ -979,6 +980,20 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// happening" stops being true the moment the only surface that says so
     /// is behind a taskbar button.
     fn set_host_bar(&self, visible: bool);
+    /// Whether anybody is in front of this host to answer a consent dialog
+    /// (ADR 0085 §2).
+    ///
+    /// Asked of this trait rather than carried as a flag on the actor because
+    /// this is the seam that *is* the host's own screen: an implementation
+    /// that can put a window in front of somebody is the definition of a host
+    /// with a person at it. A session-0 host answers
+    /// [`HostAttendance::Unattended`] until its session agent attaches, which
+    /// is the same moment its indicator goes up.
+    ///
+    /// Re-read per handshake, never cached: somebody signing in while a
+    /// session is already running changes the answer, and the next guest to
+    /// arrive gets the dialog the one before it could not have been shown.
+    fn attendance(&self) -> HostAttendance;
 }
 
 /// [`ViewWindows`] that does nothing, for driving the actor without a webview.
@@ -1000,6 +1015,14 @@ impl ViewWindows for DetachedViewWindows {
 
     fn set_host_bar(&self, visible: bool) {
         tracing::debug!(visible, "no webview attached: not moving the host bar");
+    }
+
+    /// Attended: these tests drive the consent dialog, so the actor they
+    /// build has to behave as a host somebody could answer at. A detached
+    /// implementation that claimed otherwise would silently move every test
+    /// onto ADR 0085's credential-only path.
+    fn attendance(&self) -> HostAttendance {
+        HostAttendance::Attended
     }
 }
 
@@ -1124,6 +1147,15 @@ impl ViewWindows for TauriViewWindows {
         if let Err(error) = queued {
             tracing::warn!(%error, "cannot reach the main thread to move the host bar");
         }
+    }
+
+    /// Always attended: this implementation exists only inside somebody's own
+    /// desktop session, which is what an `AppHandle` is. Whether they are
+    /// looking at the screen is not something any process can know, and
+    /// [`HostAttendance`] does not claim to — it answers whether a dialog
+    /// this host renders could be seen and answered at all (ADR 0085 §2).
+    fn attendance(&self) -> HostAttendance {
+        HostAttendance::Attended
     }
 }
 

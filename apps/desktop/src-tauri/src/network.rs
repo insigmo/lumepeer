@@ -22,7 +22,7 @@ use lumepeer_core::address_book::AddressEntry;
 use lumepeer_core::audit::{AuditEvent, RebootOutcome};
 use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
-use lumepeer_core::consent::{ConsentRateLimiter, Grants, IndependentGrant, Role};
+use lumepeer_core::consent::{Admission, ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
@@ -8260,43 +8260,68 @@ impl Actor {
         // person sat in front of a window that showed them nothing to answer.
         // Configuring a password says a device *may* let itself in; it does
         // not say the owner has stopped being able to decide.
-        let challenge = self.may_try_unattended(&peer);
+        //
+        // ADR 0085 adds the case ADR 0063's pair never had to cover: a host
+        // with no interactive session of its own, where the dialog half is not
+        // merely unlikely to be seen but impossible to show. `Admission` is
+        // where the two facts meet, in `lumepeer-core` rather than here, so
+        // there is one answer to "what may this host offer" and this function
+        // only carries it out (§2.1, §2.3).
+        let admission =
+            Admission::decide(self.windows.attendance(), self.may_try_unattended(&peer));
+        if admission.refuses() {
+            // Nobody to ask and nothing to verify. Not a fallback to asking,
+            // and not a fallback to the address book — trust narrows who may
+            // try a factor and never stands in for one (ADR 0034 §1). The
+            // ticket is already claimed above, so the connection must not be
+            // left open on a decision that will never come.
+            tracing::warn!(peer = %tag, "no way to admit this peer: nobody is here and no device password is set");
+            connection.close_with(&NetError::ConsentUnavailable);
+            return;
+        }
+        let challenge = admission.offer_credentials;
         // Every connection, first time or reconnect, gets a fresh decision.
-        let consent = match self
-            .sessions
-            .request_consent_as(peer, ticket.allowed_request)
-        {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
-                // Which refusal it was is worth a record: §15 separates "the
-                // host was too busy to ask" from "the plan does not allow
-                // another guest", and the two lead to different answers for
-                // the operator.
-                match error {
-                    CoreError::PendingConsentQueueFull => self.audit(
-                        &peer,
-                        lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
-                    ),
-                    CoreError::ConcurrentGuestLimit { limit } => self.audit(
-                        &peer,
-                        lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
-                    ),
-                    // Anything else is not one of the two §15 names a
-                    // rejection; the warning above is the whole record it gets.
-                    _ => {}
+        let consent = if admission.ask_the_person {
+            match self
+                .sessions
+                .request_consent_as(peer, ticket.allowed_request)
+            {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
+                    // Which refusal it was is worth a record: §15 separates "the
+                    // host was too busy to ask" from "the plan does not allow
+                    // another guest", and the two lead to different answers for
+                    // the operator.
+                    match error {
+                        CoreError::PendingConsentQueueFull => self.audit(
+                            &peer,
+                            lumepeer_core::audit::AuditEvent::ConsentRejectedQueueFull,
+                        ),
+                        CoreError::ConcurrentGuestLimit { limit } => self.audit(
+                            &peer,
+                            lumepeer_core::audit::AuditEvent::ConsentRejectedGuestLimit { limit },
+                        ),
+                        // Anything else is not one of the two §15 names a
+                        // rejection; the warning above is the whole record it gets.
+                        _ => {}
+                    }
+                    if !challenge {
+                        // The ticket is already burned and nobody will ever decide
+                        // on this peer, so the connection must not linger: close it
+                        // here, before it is ever stored.
+                        connection.close_with(&NetError::ConsentUnavailable);
+                        return;
+                    }
+                    // A queue this host cannot extend is not a reason to
+                    // refuse a device that can admit itself without the queue.
+                    false
                 }
-                if !challenge {
-                    // The ticket is already burned and nobody will ever decide
-                    // on this peer, so the connection must not linger: close it
-                    // here, before it is ever stored.
-                    connection.close_with(&NetError::ConsentUnavailable);
-                    return;
-                }
-                // A queue this host cannot extend is not a reason to refuse a
-                // device that can admit itself without the queue.
-                false
             }
+        } else {
+            // A host nobody is at queues nothing: a request that will never be
+            // rendered is a guest waiting forever on a host that looks alive.
+            false
         };
         self.adopt(
             connection,
@@ -15343,9 +15368,25 @@ mod tests {
         opened: std::sync::Mutex<Vec<(String, String, bool)>>,
         closed: std::sync::Mutex<Vec<String>>,
         host_bar: std::sync::atomic::AtomicBool,
+        /// Whether this stand-in claims somebody is in front of the host
+        /// (ADR 0085 §2). `false` is the default so the field has to be turned
+        /// on deliberately by the one test that is about a host with nobody at
+        /// it; `default()` stays a host somebody could answer a dialog at, so
+        /// every other test behaves exactly as it did before.
+        unattended: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingWindows {
+        /// A host with no interactive session of its own — what a session-0
+        /// host answers until its agent attaches.
+        fn unattended() -> Self {
+            let windows = Self::default();
+            windows
+                .unattended
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            windows
+        }
+
         fn opened(&self) -> Vec<(String, String, bool)> {
             self.opened.lock().unwrap().clone()
         }
@@ -15374,6 +15415,14 @@ mod tests {
         fn set_host_bar(&self, visible: bool) {
             self.host_bar
                 .store(visible, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn attendance(&self) -> lumepeer_core::consent::HostAttendance {
+            if self.unattended.load(std::sync::atomic::Ordering::Relaxed) {
+                lumepeer_core::consent::HostAttendance::Unattended
+            } else {
+                lumepeer_core::consent::HostAttendance::Attended
+            }
         }
     }
 
@@ -18158,6 +18207,51 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// ADR 0085 §2 at the actor: a host with no interactive session of its own
+    /// and no device password configured admits nobody.
+    ///
+    /// The refusal this whole pack turns on. It is deliberately a worse
+    /// experience than guessing — the guest's attempt fails outright — and it
+    /// is the only behaviour that keeps "anything not explicitly permitted is
+    /// forbidden" true on a machine with an empty chair in front of it. Note
+    /// what is *not* tried here: no fallback to queueing a dialog nobody could
+    /// render, and no treating the invite or the address book as a stand-in
+    /// for a factor (ADR 0034 §1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_with_nobody_at_it_and_no_device_password_admits_nobody() {
+        let (host, _host_endpoint, capture, _windows) =
+            actor_with_windows(Arc::new(RecordingWindows::unattended())).await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        // The dial itself is fine — this is a real invite on a reachable host.
+        // What fails is the admission behind it, which is the distinction the
+        // test is about.
+        guest.invite_connect(invite.code).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let phase = guest.connect_state().await.unwrap().phase;
+            if phase == ConnectPhase::Failed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guest never learned it was refused; it was left in {phase:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            host.status().await.unwrap().is_empty(),
+            "a host nobody is at queued a consent request that nobody could ever answer"
+        );
+        assert!(
+            !lock_capture(&capture).is_capturing(),
+            "a refused peer must never start capture"
+        );
     }
 
     /// I7: a connection on a non-control ALPN must never reach the control

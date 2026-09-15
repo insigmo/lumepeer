@@ -529,6 +529,78 @@ impl ConsentRateLimiter {
     }
 }
 
+/// Whether anybody is in front of this host to answer a consent dialog
+/// (ADR 0085 §2).
+///
+/// A fact about the machine, never about the peer: it says whether a person
+/// *could* decide, not whether one would. A host running inside somebody's
+/// desktop session is [`Attended`](Self::Attended) whether or not they are
+/// looking; a host running as a service on a machine nobody has signed in to
+/// is [`Unattended`](Self::Unattended) no matter how trusted the guest is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAttendance {
+    /// There is an interactive session, so the consent dialog can be shown to
+    /// somebody and answered.
+    Attended,
+    /// There is none. Nothing this host renders would be seen by anyone.
+    Unattended,
+}
+
+/// The ways in a host is prepared to offer a peer that has just handshaked
+/// (§8.1; ADR 0033, ADR 0063, ADR 0085 §2).
+///
+/// One place, so there is one answer. ADR 0063 made a host offer both ways at
+/// once — the consent dialog for the person and the credential challenge for
+/// a trusted device — because guessing which one applied was wrong in the
+/// worst direction: the guest waited on a password only the owner knew while
+/// the owner sat in front of a window showing nothing. ADR 0085 adds the case
+/// that guess never had to cover, a host with no session of its own at all,
+/// and answers it the only way that keeps "anything not explicitly permitted
+/// is forbidden" true: the credential path, or nothing.
+///
+/// What this type deliberately cannot express is the tempting fourth state.
+/// There is no "nobody can be asked, so let the guest in": the absence of a
+/// person is not a permission, and [`refuses`](Self::refuses) is what a host
+/// with neither way in is left with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Admission {
+    /// Queue a consent request and show it to whoever is at the machine.
+    pub ask_the_person: bool,
+    /// Send the device-password challenge of §8.
+    pub offer_credentials: bool,
+}
+
+impl Admission {
+    /// Decides what a host offers a peer that has just handshaked.
+    ///
+    /// `device_may_try_credentials` is the caller's already-made answer to
+    /// "is unattended access configured, is this device in the address book
+    /// marked trusted, and does it speak the credential messages at all"
+    /// (ADR 0033, ADR 0034). This function does not re-derive it: trust is
+    /// re-read at the moment it is used, and the caller is the only one that
+    /// knows when that moment is.
+    #[must_use]
+    pub const fn decide(attendance: HostAttendance, device_may_try_credentials: bool) -> Self {
+        Self {
+            ask_the_person: matches!(attendance, HostAttendance::Attended),
+            offer_credentials: device_may_try_credentials,
+        }
+    }
+
+    /// Whether this host has no way to admit the peer at all.
+    ///
+    /// The case worth naming: a host with no interactive session and no
+    /// unattended credentials configured. It does not fall back to asking —
+    /// there is nobody to ask — and it does not fall back to the address book,
+    /// because trust narrows who may *try* a factor and never substitutes for
+    /// one (ADR 0034 §1). The connection is closed, which is a worse
+    /// experience than guessing and the only one that is honest.
+    #[must_use]
+    pub const fn refuses(self) -> bool {
+        !self.ask_the_person && !self.offer_credentials
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -793,5 +865,73 @@ mod tests {
         limiter
             .check_at(peer(1), start + Duration::from_secs(61))
             .unwrap();
+    }
+
+    /// ADR 0063, restated as a test: a host somebody is sitting at offers
+    /// both ways in at once to a device that could use either.
+    #[test]
+    fn an_attended_host_offers_both_ways_in() {
+        let admission = Admission::decide(HostAttendance::Attended, true);
+        assert!(admission.ask_the_person);
+        assert!(admission.offer_credentials);
+        assert!(!admission.refuses());
+    }
+
+    /// The ordinary case: nobody has configured unattended access, and a
+    /// person answers the dialog. No credential challenge is offered, because
+    /// there is no credential to answer it with.
+    #[test]
+    fn an_attended_host_without_credentials_only_asks_the_person() {
+        let admission = Admission::decide(HostAttendance::Attended, false);
+        assert!(admission.ask_the_person);
+        assert!(!admission.offer_credentials);
+        assert!(!admission.refuses());
+    }
+
+    /// ADR 0085 §2: with nobody at the machine the credential path is the
+    /// only one offered. The dialog is not queued, because queueing a
+    /// question nobody can see is how a guest ends up waiting forever on a
+    /// host that looks alive.
+    #[test]
+    fn an_unattended_host_offers_only_the_credential_path() {
+        let admission = Admission::decide(HostAttendance::Unattended, true);
+        assert!(!admission.ask_the_person);
+        assert!(admission.offer_credentials);
+        assert!(!admission.refuses());
+    }
+
+    /// The refusal this whole type exists for: no session to show a dialog in
+    /// and no device password configured is **no way in**, not a reason to
+    /// relax either half. A host that admitted a guest here would be deciding
+    /// that the absence of a person is a permission.
+    #[test]
+    fn an_unattended_host_without_credentials_admits_nobody() {
+        let admission = Admission::decide(HostAttendance::Unattended, false);
+        assert!(!admission.ask_the_person);
+        assert!(!admission.offer_credentials);
+        assert!(
+            admission.refuses(),
+            "with nobody to ask and nothing to verify, the only answer is no"
+        );
+    }
+
+    /// Exhaustive over both inputs: exactly one of the four combinations
+    /// refuses, and it is the one where neither way in exists. Stated as a
+    /// sweep so a future third way in cannot quietly make `refuses` mean
+    /// something narrower.
+    #[test]
+    fn exactly_one_combination_refuses() {
+        let mut refusals = 0;
+        for attendance in [HostAttendance::Attended, HostAttendance::Unattended] {
+            for credentials in [true, false] {
+                let admission = Admission::decide(attendance, credentials);
+                if admission.refuses() {
+                    refusals += 1;
+                    assert_eq!(attendance, HostAttendance::Unattended);
+                    assert!(!credentials);
+                }
+            }
+        }
+        assert_eq!(refusals, 1);
     }
 }
