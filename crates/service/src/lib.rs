@@ -5,16 +5,20 @@
 //! that cross it without either copying the other's constants.
 //!
 //! Nothing privileged lives here. [`client`] opens a pipe and writes two
-//! bytes; every capability is on the far side, in the service. [`frame`] is
-//! the one exception to "no unsafe on this side" (ADR 0049): reading a
-//! shared-memory mapping has no safe standard-library wrapper, the same way
-//! becoming a Windows service or creating a DACL'd pipe does not on the
-//! service's own side.
+//! bytes; every capability is on the far side, in the service. [`frame`] and
+//! [`host_role`] are the exceptions to "no unsafe on this side" (ADR 0049,
+//! ADR 0085): a shared-memory mapping and a named mutex have no safe
+//! standard-library wrapper, the same way becoming a Windows service or
+//! creating a DACL'd pipe does not on the service's own side. Neither of them
+//! is a capability — one reads bytes the privileged side published, the other
+//! asks the kernel a question about who is hosting.
 
 pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
 pub mod frame;
+#[cfg(target_os = "windows")]
+pub mod host_role;
 pub mod protocol;
 
 /// Name the service is registered under with the service control manager.
