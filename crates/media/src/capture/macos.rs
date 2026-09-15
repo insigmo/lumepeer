@@ -300,14 +300,14 @@ mod screen_capture_kit {
         #[cfg(feature = "audio-capture-screencapturekit")]
         fn accept_audio(&self, sample: &CMSampleBuffer) {
             match extract_audio(sample) {
-                Ok(Some(extracted)) => self.publish_audio(extracted),
+                Ok(Some(extracted)) => self.publish_audio(&extracted),
                 Ok(None) => {}
                 Err(e) => tracing::debug!("dropping a ScreenCaptureKit audio buffer: {e}"),
             }
         }
 
         #[cfg(feature = "audio-capture-screencapturekit")]
-        fn publish_audio(&self, extracted: ExtractedAudio) {
+        fn publish_audio(&self, extracted: &ExtractedAudio) {
             let Some(tx) = lock(&self.audio_tx).clone() else {
                 return;
             };
@@ -768,10 +768,8 @@ mod screen_capture_kit {
             // `CGMainDisplayID` matched nobody in the snapshot: the first
             // display carries `primary` instead, and only the first, rather
             // than leaving every entry false.
-            if !primary_found {
-                if let Some(first) = monitors.first_mut() {
-                    first.primary = true;
-                }
+            if !primary_found && let Some(first) = monitors.first_mut() {
+                first.primary = true;
             }
             Ok(monitors)
         }
@@ -947,7 +945,7 @@ mod screen_capture_kit {
 
     /// Decodes one raw PCM sample (`bytes.len() == bits / 8`) into a
     /// normalized `-1.0..=1.0` f32. Native-endian only: ScreenCaptureKit runs
-    /// exclusively on little-endian Apple Silicon and x86_64, and a
+    /// exclusively on little-endian Apple Silicon and `x86_64`, and a
     /// big-endian `AudioStreamBasicDescription` here would already be outside
     /// anything this backend or the §11 wire format supports.
     #[cfg(feature = "audio-capture-screencapturekit")]
@@ -1091,13 +1089,13 @@ mod screen_capture_kit {
         // `block_buffer_ptr` are locals the call fills.
         let status = unsafe {
             sample.audio_buffer_list_with_retained_block_buffer(
-                &mut needed_size,
+                &raw mut needed_size,
                 list_ptr,
                 std::mem::size_of::<AudioBufferListStorage>(),
                 None,
                 None,
                 0,
-                &mut block_buffer_ptr,
+                &raw mut block_buffer_ptr,
             )
         };
         if status != 0 {
@@ -1180,7 +1178,7 @@ mod screen_capture_kit {
     ///
     /// `SCStreamConfiguration.capturesAudio(true)` is what makes
     /// `ScreenCaptureKit` hand back the desktop output mix — no virtual
-    /// output device, no CoreAudio loopback (ScreenCaptureKit already does
+    /// output device, no `CoreAudio` loopback (ScreenCaptureKit already does
     /// the mixing, which is the whole reason this path was chosen over the
     /// classic one).
     #[cfg(feature = "audio-capture-screencapturekit")]
