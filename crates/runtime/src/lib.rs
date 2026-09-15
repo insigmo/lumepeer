@@ -43,6 +43,7 @@ pub mod net_errors;
 pub mod network;
 pub mod recorder;
 pub mod remembered_password;
+pub mod session_agent;
 pub mod system_power;
 pub mod unattended_store;
 pub mod view;
