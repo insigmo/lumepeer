@@ -187,6 +187,33 @@ pub const DIAL_RETRY_BACKOFF_JITTER_MS: u64 = 1_500;
 /// plus the handshake's own stall before it gives up, and the retry that would
 /// have worked never runs (ADR 0027).
 pub const CONNECT_ATTEMPT_TIMEOUT_SECS: u64 = 20;
+/// Attempts one transport of a dial plan may spend before the next transport
+/// in the plan is tried (gap-tasks/23 task 1, ADR 0083).
+///
+/// Taken *out of* [`DIAL_ATTEMPTS`], never added to it: a plan spends the same
+/// number of attempts a single-transport dial always spent, so trying two
+/// transports cannot make a user wait longer than trying one. The last
+/// transport of a plan gets whatever the earlier ones did not use, which is
+/// all five when there is only one.
+///
+/// Two rather than one because a single lost packet is not evidence about a
+/// transport: the first attempt on a freshly bound obfuscated endpoint races
+/// its own NAT mapping, and condemning the transport on it would fall back
+/// every time a handshake needed a second try. Two rather than three because
+/// the fallback is what actually connects a guest whose first choice does not
+/// work, and it should still have the larger half of the budget.
+pub const TRANSPORT_PROBE_ATTEMPTS: u32 = 2;
+/// Worst case a connect may cost the user, whichever transports its plan
+/// tries (gap-tasks/23 task 1, ADR 0083).
+///
+/// Derived, never chosen: it is exactly what [`DIAL_ATTEMPTS`] attempts at
+/// [`CONNECT_ATTEMPT_TIMEOUT_SECS`], spaced by [`DIAL_RETRY_BACKOFF_MS`] plus
+/// the full [`DIAL_RETRY_BACKOFF_JITTER_MS`], already cost before a dial could
+/// try more than one transport (ADR 0050). Splitting those attempts across a
+/// plan's transports moves where the time is spent and not how much of it
+/// there is, and this constant is what a test holds that property against.
+pub const DIAL_TOTAL_BUDGET_SECS: u64 = DIAL_ATTEMPTS as u64 * CONNECT_ATTEMPT_TIMEOUT_SECS
+    + ((DIAL_ATTEMPTS as u64 - 1) * (DIAL_RETRY_BACKOFF_MS + DIAL_RETRY_BACKOFF_JITTER_MS)) / 1_000;
 /// Handshakes the host will run concurrently. Beyond this, further incoming
 /// connections are closed immediately rather than queued (§3.2).
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;

@@ -21,6 +21,24 @@ import { t } from './i18n';
 /** How a peer is actually reached, as the Rust side classifies iroh's paths. */
 export type PathKind = 'direct' | 'relay' | 'mixed' | 'unknown';
 
+/**
+ * Which of the two transports of ADR 0080 carries the session (gap-tasks/23
+ * task 3).
+ *
+ * Not the same question as the path, and the panel answers both: a path is
+ * how iroh is reaching the peer *within* the iroh transport, and the
+ * obfuscated transport has none to report because it is one direct UDP path
+ * and never a relay.
+ */
+export type TransportKind = 'iroh' | 'obfuscated';
+
+/** One transport the connect tried and gave up on before this session. */
+export interface TransportFallback {
+  transport: TransportKind;
+  /** §18 code of the last error that transport returned. */
+  failure: string;
+}
+
 /** One row of the `connection_stats` IPC call. */
 export interface ConnectionStats {
   peer_label: string;
@@ -31,6 +49,13 @@ export interface ConnectionStats {
   /** Media throughput the receiver observed, kilobits per second. */
   goodput_kbps: number | null;
   path: PathKind;
+  /** Which transport carries this session (gap-tasks/23 task 3). */
+  transport: TransportKind;
+  /**
+   * Transports the connect gave up on before this session existed, oldest
+   * first; empty when the first one tried worked.
+   */
+  fallbacks: TransportFallback[];
   /** Region of the relay in use; never its address (§15). */
   relay_region: string | null;
   /** Encoder bitrate this machine is sending at, or null when watching. */
@@ -45,6 +70,40 @@ const PATH_KEY: Readonly<Record<PathKind, TranslationKey>> = {
   mixed: 'quality.path.mixed',
   unknown: 'quality.path.unknown',
 };
+
+/** What each transport is called, for the row that says one was given up on. */
+const TRANSPORT_KEY: Readonly<Record<TransportKind, TranslationKey>> = {
+  iroh: 'quality.transport.iroh',
+  obfuscated: 'quality.transport.obfuscated',
+};
+
+/**
+ * What a transport that did not connect is said to have done, by the §18 code
+ * the Rust side attached to it (the same vocabulary the connect form reads).
+ *
+ * Three phrases, all of them about what this machine observed: nothing
+ * answered, or a connection that had come up went away. Nothing here guesses
+ * at a *cause* — this app cannot tell a network that blocks a transport from
+ * one that is merely bad, and a panel that named the difference would be
+ * inventing it. An unrecognised code gets the neutral phrase rather than its
+ * raw text.
+ */
+const FALLBACK_KEY: Readonly<Record<string, TranslationKey>> = {
+  DIAL_FAILED: 'quality.fallback.noAnswer',
+  TRANSPORT_LOST: 'quality.fallback.lost',
+};
+
+/**
+ * The name under which the session's own transport and path are shown.
+ *
+ * One label rather than two: on the obfuscated transport the path is always
+ * one direct UDP path (ADR 0052), so "obfuscated, direct" would be saying the
+ * same thing twice, and iroh's own paths are the only ones there is a choice
+ * between.
+ */
+function pathLabel(stats: ConnectionStats): TranslationKey {
+  return stats.transport === 'obfuscated' ? 'quality.path.obfuscated' : PATH_KEY[stats.path];
+}
 
 /** Permille to whole percent, for a figure a person reads rather than sums. */
 const PERMILLE_PER_PERCENT = 10;
@@ -88,10 +147,15 @@ export function connectionQuality(
       ? t(locale, 'quality.unknown')
       : t(locale, 'quality.percent', (stats.loss_permille / PERMILLE_PER_PERCENT).toFixed(1));
   return html`
-    <details class="quality" data-testid="quality" data-path=${stats.path}>
+    <details
+      class="quality"
+      data-testid="quality"
+      data-path=${stats.path}
+      data-transport=${stats.transport}
+    >
       <summary class="quality-pill" data-testid="quality-pill">
         <span class="quality-dot" data-path=${stats.path} aria-hidden="true"></span>
-        <span class="quality-path">${t(locale, PATH_KEY[stats.path])}</span>
+        <span class="quality-path">${t(locale, pathLabel(stats))}</span>
         <span class="quality-sep" aria-hidden="true">·</span>
         <span class="quality-rtt">${rtt}</span>
       </summary>
@@ -112,6 +176,17 @@ export function connectionQuality(
         ${stats.relay_region
           ? detail(locale, 'quality.relayLabel', stats.relay_region)
           : html``}
+        ${stats.fallbacks.map((fallback) =>
+          detail(
+            locale,
+            'quality.fallbackLabel',
+            t(
+              locale,
+              FALLBACK_KEY[fallback.failure] ?? 'quality.fallback.failed',
+              t(locale, TRANSPORT_KEY[fallback.transport]),
+            ),
+          ),
+        )}
       </div>
     </details>
   `;
