@@ -96,6 +96,37 @@ const KIND_DETACHING: u8 = 0x84;
 /// is confusion-avoidance, not authorization.
 const EVENT_KIND_FLOOR: u8 = 0x80;
 
+/// Name of the shared-memory mapping the session agent publishes encoded
+/// frames into (ADR 0085).
+///
+/// `Global\` for the reason [`crate::protocol::SECURE_DESKTOP_MAPPING_NAME`]
+/// already records: the host runs in session 0 and the agent runs in an
+/// interactive session, and a name without the prefix would be created in the
+/// caller's own session-private namespace — invisible across exactly the
+/// boundary this mapping exists to cross.
+///
+/// Distinct from the secure-desktop mapping, and not reused: the two have
+/// different writers, different lifetimes and different access lists, and a
+/// single mapping serving both would have to carry the widest of each.
+pub const AGENT_FRAME_MAPPING_NAME: &str = r"Global\lumepeer-session-agent-frame";
+
+/// Capacity of the agent mapping's payload region: one **encoded** frame.
+///
+/// The agent captures *and encodes* (ADR 0085 §1), so what crosses this
+/// boundary is a bitstream, not a screen's worth of pixels. That is the
+/// reason the privileged process links no media pipeline at all, and it is
+/// also why this bound is eight mebibytes rather than a picture size: it is
+/// the same ceiling `lumepeer_core::constants::MAX_MEDIA_FRAME_BYTES` already
+/// puts on one encoded frame everywhere else in this codebase.
+///
+/// Kept as a literal here rather than imported, for the reason ADR 0049 §2
+/// recorded for this crate's other wire constants: `crates/service` does not
+/// depend on `lumepeer-core`, so raising one bound without the other is
+/// caught by review rather than by the compiler. A frame larger than this is
+/// refused by [`crate::frame`] rather than published truncated — a partial
+/// bitstream is a corrupt one, not a smaller one.
+pub const AGENT_FRAME_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Whether `kind` names a message only the privileged host may send.
 #[must_use]
 pub const fn is_command(kind: u8) -> bool {
