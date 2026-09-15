@@ -477,6 +477,37 @@ mod tests {
         )
     }
 
+    /// Puts a question about `name` to a thread that holds nothing.
+    ///
+    /// A Windows mutex belongs to the *thread* that waited on it, and a thread
+    /// that already owns one is handed it straight back rather than made to
+    /// wait: asking twice on the test's own thread measures reentrancy, not
+    /// exclusion. Every second host this token exists to stop is another
+    /// process, and another thread is the nearest a unit test gets to one —
+    /// the kernel refuses both for the same reason.
+    ///
+    /// Worth knowing when a failure here is hard to reproduce: on an
+    /// unelevated run the second `CreateMutexW` never reaches the wait at all.
+    /// Creating the object admits its creator whatever the descriptor says,
+    /// but *opening* it runs [`HOST_ROLE_SDDL`]'s access check, which admits
+    /// `SY` and `BA` only — so a developer machine answers `Taken` from the
+    /// access check and an elevated CI runner answers it from the wait. Both
+    /// are the right answer; only the second one is this test's subject.
+    fn asking_from_elsewhere<T, F>(name: &str, ask: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(&str) -> T + Send + 'static,
+    {
+        let name = name.to_owned();
+        match std::thread::spawn(move || ask(&name)).join() {
+            Ok(answer) => answer,
+            // Forwarded rather than rewritten: a panic over there is a failure
+            // of this test, and the original one says more than a summary of
+            // it would.
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
     /// The whole point of the token: the second acquirer does not get it.
     #[test]
     fn only_one_holder_at_a_time() {
@@ -486,10 +517,10 @@ mod tests {
             return;
         };
         assert!(
-            HostRole::acquire_named(&name).is_none(),
+            asking_from_elsewhere(&name, |name| HostRole::acquire_named(name).is_none()),
             "a second acquirer must not also become the host"
         );
-        assert!(HostRole::is_held_named(&name));
+        assert!(asking_from_elsewhere(&name, HostRole::is_held_named));
         drop(first);
     }
 
@@ -584,7 +615,7 @@ mod tests {
         match first {
             HostRoleClaim::Held(_) => {
                 assert!(first.may_host());
-                let second = claim_named(&name);
+                let second = asking_from_elsewhere(&name, claim_named);
                 assert!(
                     matches!(second, HostRoleClaim::Taken),
                     "a role somebody holds must read as taken, never as unaskable"

@@ -305,7 +305,7 @@ mod platform {
         NSString::from_str("public.file-url")
     }
 
-    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+    pub(super) fn read_file_paths() -> Option<Vec<PathBuf>> {
         let pasteboard = NSPasteboard::generalPasteboard();
         let items = pasteboard.pasteboardItems()?;
         // Checked before this side allocates a single `PathBuf`: the
@@ -346,7 +346,7 @@ mod platform {
         Some(PathBuf::from(decoded.into_owned()))
     }
 
-    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+    pub(super) fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
         let pasteboard = NSPasteboard::generalPasteboard();
         pasteboard.clearContents();
         let urls: Vec<objc2::rc::Retained<NSURL>> = paths
@@ -427,7 +427,7 @@ mod platform {
         }
     }
 
-    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+    pub(super) fn read_file_paths() -> Option<Vec<PathBuf>> {
         let clipboard = context()?;
         let uri_list = clipboard.getter.get_atom("text/uri-list").ok()?;
         let property = clipboard.getter.atoms.property;
@@ -482,7 +482,7 @@ mod platform {
         Some(PathBuf::from(decoded.into_owned()))
     }
 
-    pub fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
+    pub(super) fn write_file_paths(paths: &[PathBuf]) -> Result<(), ClipboardError> {
         let clipboard = context().ok_or(ClipboardError::Unavailable)?;
         let uri_list = clipboard
             .getter
@@ -517,11 +517,11 @@ mod platform {
 
     use super::ClipboardError;
 
-    pub fn read_file_paths() -> Option<Vec<PathBuf>> {
+    pub(super) fn read_file_paths() -> Option<Vec<PathBuf>> {
         None
     }
 
-    pub fn write_file_paths(_paths: &[PathBuf]) -> Result<(), ClipboardError> {
+    pub(super) fn write_file_paths(_paths: &[PathBuf]) -> Result<(), ClipboardError> {
         Err(ClipboardError::Unavailable)
     }
 }
