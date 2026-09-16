@@ -92,6 +92,19 @@ pub enum AuditEvent {
         /// Whether the credentials were accepted.
         accepted: bool,
     },
+    /// An unattended admission was decided on a machine **nobody is signed in
+    /// to** (§8; ADR 0088 §3).
+    ///
+    /// Its own kind rather than [`UnattendedLogin`](Self::UnattendedLogin)
+    /// with a flag, because it is the one admission nothing else discloses. A
+    /// guest admitted to a signed-in desktop is announced by the indicator on
+    /// that desktop; a guest admitted to a logon screen is watching a machine
+    /// with no desktop to put a banner on and nobody to read one, and this
+    /// record is what is left for the person who sits down afterwards to find.
+    EmptyMachineLogin {
+        /// Whether the credentials were accepted.
+        accepted: bool,
+    },
     /// The host marked a device trusted, or withdrew that mark (§8).
     ///
     /// Trust decides who is even allowed to try the unattended password, so

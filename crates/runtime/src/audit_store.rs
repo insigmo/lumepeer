@@ -416,6 +416,10 @@ fn event_columns(event: &AuditEvent) -> (&'static str, String) {
             "unattended_login",
             if accepted { "accepted" } else { "rejected" }.to_owned(),
         ),
+        AuditEvent::EmptyMachineLogin { accepted } => (
+            "empty_machine_login",
+            if accepted { "accepted" } else { "rejected" }.to_owned(),
+        ),
         AuditEvent::DeviceTrustChanged { trusted } => (
             "device_trust_changed",
             if trusted { "trusted" } else { "untrusted" }.to_owned(),
@@ -428,7 +432,7 @@ fn event_columns(event: &AuditEvent) -> (&'static str, String) {
 }
 
 /// Every `kind` [`event_columns`] can produce, for the UI's filter.
-pub const EVENT_KINDS: [&str; 13] = [
+pub const EVENT_KINDS: [&str; 14] = [
     "consent_requested",
     "consent_granted",
     "consent_revoked",
@@ -440,6 +444,7 @@ pub const EVENT_KINDS: [&str; 13] = [
     "protocol_violation",
     "grant_changed",
     "unattended_login",
+    "empty_machine_login",
     "device_trust_changed",
     "reboot",
 ];
@@ -714,6 +719,7 @@ mod tests {
                 enabled: true,
             },
             AuditEvent::UnattendedLogin { accepted: true },
+            AuditEvent::EmptyMachineLogin { accepted: true },
             AuditEvent::DeviceTrustChanged { trusted: true },
             AuditEvent::Reboot {
                 mode: RebootMode::Reboot,

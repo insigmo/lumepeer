@@ -199,6 +199,15 @@ mod windows_impl {
         format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;{user_sid})")
     }
 
+    /// The access list for the logon-screen worker (ADR 0088 §1).
+    ///
+    /// The same list with the user's half left out, because there is no user:
+    /// nobody is signed in, and the worker is `LocalSystem` on `Winlogon`. A
+    /// list that admitted an interactive user here would be admitting whoever
+    /// happens to sign in *next* to the channel that drives the screen they
+    /// are about to type a password on.
+    pub(super) const SYSTEM_ONLY_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+
     /// The privileged host's end of the channel.
     ///
     /// Writes commands, reads events, and can do neither of the opposite two.
@@ -251,13 +260,40 @@ mod windows_impl {
                 tracing::error!("refusing to build an agent channel access list from a non-SID");
                 return None;
             }
-            let sddl = sddl_for(user_sid);
+            Self::accept_with(&sddl_for(user_sid), expected_pid, keep_waiting)
+        }
+
+        /// [`accept_from_while`](Self::accept_from_while), for the
+        /// logon-screen worker (ADR 0088 §1).
+        ///
+        /// The same channel, the same process check, and an access list with
+        /// no user on it: the worker runs as `LocalSystem` because nobody is
+        /// signed in for it to run as. Its own entry point rather than a flag
+        /// on the one above, so that "this channel admitted a process with no
+        /// user behind it" is a call a reader can find rather than a parameter
+        /// they have to trace.
+        #[must_use]
+        pub fn accept_from_system_while(
+            expected_pid: u32,
+            keep_waiting: &dyn Fn() -> bool,
+        ) -> Option<Self> {
+            Self::accept_with(SYSTEM_ONLY_SDDL, expected_pid, keep_waiting)
+        }
+
+        /// The accept loop both entry points run, with whichever access list
+        /// they built.
+        #[must_use]
+        fn accept_with(
+            sddl: &str,
+            expected_pid: u32,
+            keep_waiting: &dyn Fn() -> bool,
+        ) -> Option<Self> {
             loop {
                 if !keep_waiting() {
                     tracing::info!("no longer waiting for a session agent to connect");
                     return None;
                 }
-                let pipe = create_pipe(&sddl)?;
+                let pipe = create_pipe(sddl)?;
                 match accept_one(pipe, expected_pid) {
                     Accepted::Agent(link) => return Some(link),
                     Accepted::Stranger => {
@@ -468,6 +504,19 @@ mod windows_impl {
                 "IU would admit every interactive user, not the one the host started an agent for"
             );
             assert!(!sddl.contains(";;;WD)") && !sddl.contains(";;;AU)"));
+        }
+
+        /// The logon-screen worker's list has no user on it at all — not the
+        /// `IU` alias, and no SID: nobody is signed in, and admitting whoever
+        /// signs in next would be admitting them to the channel that drives
+        /// the screen they are about to type a password on (ADR 0088 §1).
+        #[test]
+        fn the_logon_screen_channel_admits_no_user_at_all() {
+            assert!(SYSTEM_ONLY_SDDL.contains(";;;SY)"));
+            assert!(SYSTEM_ONLY_SDDL.contains(";;;BA)"));
+            assert!(!SYSTEM_ONLY_SDDL.contains(";;;IU)"));
+            assert!(!SYSTEM_ONLY_SDDL.contains("S-1-"));
+            assert!(!SYSTEM_ONLY_SDDL.contains(";;;WD)") && !SYSTEM_ONLY_SDDL.contains(";;;AU)"));
         }
 
         /// A SID that would not survive [`crate::frame::is_sid_string`] never

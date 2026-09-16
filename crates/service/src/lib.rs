@@ -30,8 +30,11 @@ pub mod frame;
 pub mod host_role;
 pub mod log;
 #[cfg(target_os = "windows")]
+pub mod logon_screen;
+#[cfg(target_os = "windows")]
 pub mod machine_store;
 pub mod protocol;
+pub mod session_change;
 
 /// Name the service is registered under with the service control manager.
 ///
@@ -60,6 +63,22 @@ pub const SECURE_DESKTOP_WORKER_ARG: &str = "--secure-desktop-worker";
 /// indicator, none of which belong anywhere near a `LocalSystem` process
 /// (ADR 0085 §1).
 pub const SESSION_AGENT_ARG: &str = "--session-agent";
+
+/// The single argument that re-executes this binary as the logon-screen
+/// worker (ADR 0088 §1).
+///
+/// The session-0 host launches a copy of this binary with exactly this
+/// argument into the console session's `Winsta0\Winlogon` desktop, where it
+/// lives for as long as that screen is being served: it attaches to the same
+/// channel a session agent uses, publishes frames of the logon screen on a
+/// tick, and performs the input the host forwards to it.
+///
+/// Distinct from [`SECURE_DESKTOP_WORKER_ARG`], which is the same desktop and
+/// a different job — one frame for a UAC prompt an ordinary client cannot see,
+/// and then gone (ADR 0056). Keeping them apart is what keeps that worker's
+/// "exists only for the one capture" property true while this one exists for a
+/// session.
+pub const LOGON_SCREEN_WORKER_ARG: &str = "--logon-screen-worker";
 
 /// The argument that re-executes this binary as the secure-desktop *input*
 /// worker (ADR 0057), followed by four bounded integers `kind logical x y`.

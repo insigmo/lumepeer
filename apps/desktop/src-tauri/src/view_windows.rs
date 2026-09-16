@@ -140,6 +140,19 @@ impl ViewWindows for TauriViewWindows {
     fn attendance(&self) -> HostAttendance {
         HostAttendance::Attended
     }
+
+    /// Never: a desktop client notices the secure desktop per media session,
+    /// from its own capture, and routes input by that (ADR 0057). This seam is
+    /// for a host that has no capture of its own (ADR 0088 §1).
+    fn on_secure_desktop(&self) -> bool {
+        false
+    }
+
+    /// Never: this process runs inside somebody's signed-in session, so there
+    /// is always somebody signed in (ADR 0088 §3).
+    fn nobody_signed_in(&self) -> bool {
+        false
+    }
 }
 
 /// Builds the session bar, docked to the right edge of the primary screen.
