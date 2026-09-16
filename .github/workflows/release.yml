@@ -130,8 +130,8 @@ jobs:
           sed -i "0,/\"version\":/{s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/}" apps/desktop/package.json
           sed -i "0,/\"version\":/{s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/}" apps/desktop/src-tauri/tauri.conf.json
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "beta"
+          git config user.email "qwantone@gmail.com"
           git add Cargo.toml apps/desktop/package.json apps/desktop/src-tauri/tauri.conf.json
           git commit -m "chore: release ${TAG}"
           git tag "${TAG}"
