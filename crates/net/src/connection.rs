@@ -318,6 +318,10 @@ impl ControlConnection {
 ///   host speaks a different protocol major (§9.1).
 /// - [`NetError::Framing`] wrapping [`CoreError::Malformed`] if the host
 ///   answers with anything other than `HelloAck`.
+/// - [`NetError::ReconnectRejected`] or [`NetError::ConsentUnavailable`] if
+///   the host closed the connection with that refusal before `HelloAck` was
+///   read. The close can discard a `HelloAck` already sent, so this is a
+///   refusal, not a lost link (§18).
 /// - [`NetError::Io`] if the stream cannot be opened.
 pub async fn guest_handshake(
     connection: PeerConnection,
@@ -359,7 +363,7 @@ pub async fn guest_resume_handshake(
         Direction::HostToGuest,
     );
 
-    control
+    let answer = match control
         .send(MessageKind::Hello {
             major: PROTOCOL_MAJOR,
             minor: PROTOCOL_MINOR,
@@ -367,9 +371,13 @@ pub async fn guest_resume_handshake(
             features,
             invite_proof,
         })
-        .await?;
-
-    let envelope = control.reader.reader.read_frame().await?;
+        .await
+    {
+        Ok(()) => control.reader.reader.read_frame().await,
+        Err(error) => Err(error),
+    };
+    let envelope =
+        answer.map_err(|error| refusal_in_close(control.connection()).unwrap_or(error))?;
     let MessageKind::HelloAck { major, minor } = envelope.kind else {
         let error = NetError::Framing(CoreError::Malformed);
         control.close_with(&error);
@@ -383,6 +391,27 @@ pub async fn guest_resume_handshake(
     control.peer_minor = minor;
     control.set_session_id(envelope.session_id);
     Ok(control)
+}
+
+/// The refusal the host closed `connection` with, if it closed it with one
+/// (§10, §18).
+///
+/// A host that refuses a guest after the handshake closes the connection right
+/// behind its `HelloAck`, and a QUIC close discards stream data still in
+/// flight. The guest may then read no `HelloAck` at all, only a stream that
+/// stopped, which on its own is a lost link and worth dialing again. The close
+/// code is what still says the host answered.
+///
+/// Only the codes a host refuses a guest with map here. Any other ending keeps
+/// the error the guest read.
+fn refusal_in_close(connection: &PeerConnection) -> Option<NetError> {
+    if connection.closed_by_peer_with(CLOSE_RESUME_REFUSED) {
+        Some(NetError::ReconnectRejected)
+    } else if connection.closed_by_peer_with(CLOSE_CONSENT_UNAVAILABLE) {
+        Some(NetError::ConsentUnavailable)
+    } else {
+        None
+    }
 }
 
 /// Host side of the handshake: accepts the control stream, reads `Hello`,
@@ -596,6 +625,56 @@ mod tests {
         let (claims, _held, _host) = host_side.await.unwrap();
         assert_eq!(claims, vec![None, Some(claimed)]);
         drop((first, second));
+    }
+
+    /// A host that refuses closes right behind its `HelloAck`, and the close
+    /// can discard the ack. The guest still reads a refusal, not a lost link it
+    /// would dial again for (§10, §18).
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
+    async fn a_refusal_that_overtakes_hello_ack_is_still_a_refusal() {
+        use crate::endpoint::PeerEndpoint;
+
+        let host = PeerEndpoint::bind_local(iroh::SecretKey::from_bytes(&[5u8; 32]))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::from_bytes(&[6u8; 32]))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let addr = host.addr();
+
+        for refusal in [NetError::ReconnectRejected, NetError::ConsentUnavailable] {
+            let (code, reason) = close_for(&refusal);
+            let host_side = async {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (send, recv) = connection.accept_bi().await.unwrap();
+                FrameReader::new(recv, Direction::GuestToHost)
+                    .read_frame()
+                    .await
+                    .unwrap();
+                connection.close(code.into(), reason.as_bytes());
+                // Held past the close: dropping it first ends the stream, and
+                // the guest could read that before the close.
+                drop(send);
+            };
+            let guest_side = async {
+                guest_resume_handshake(
+                    guest.connect_control(addr.clone()).await.unwrap(),
+                    Role::ViewOnly,
+                    Vec::new(),
+                    Vec::new(),
+                    Some([9u8; 16]),
+                )
+                .await
+            };
+            let ((), outcome) = tokio::join!(host_side, guest_side);
+            let error = outcome.err().unwrap();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&refusal),
+                "{error}"
+            );
+        }
     }
 
     #[test]

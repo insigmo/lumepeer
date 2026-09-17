@@ -52,11 +52,14 @@ pub enum NetError {
 
     /// Host cannot take another consent decision right now: the pending queue
     /// is full or the peer is rate limited (§8.1, §9.2). Raised on the host
-    /// side to close a connection it can no longer make progress on.
+    /// side to close a connection it can no longer make progress on, and on
+    /// the guest side when that close ends its handshake.
     #[error("host cannot accept another consent request")]
     ConsentUnavailable,
 
     /// Reconnect came from a different peer or for a different session (§10).
+    /// Raised on the host side to refuse a resume claim, and on the guest side
+    /// when that refusal ends its handshake.
     #[error("reconnect rejected")]
     ReconnectRejected,
 

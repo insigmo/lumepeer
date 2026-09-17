@@ -13549,6 +13549,12 @@ impl Actor {
             });
         let control = match result {
             Ok(control) => *control,
+            Err(NetError::ReconnectRejected) if resuming => {
+                // The same refusal `on_closed` reads, arriving here because
+                // the host's close overtook its `HelloAck` (ADR 0089).
+                self.on_resume_refused(peer);
+                return;
+            }
             Err(error) => {
                 // An attempt that failed while waiting for a host to come back
                 // is what waiting *looks like*, not an outcome to put on
@@ -19183,8 +19189,8 @@ mod tests {
             .unwrap();
         // Held apart from the handshake: the host refuses right after its
         // `HelloAck`, and a close that lands first discards the ack, so the
-        // handshake itself may be what fails. Either way the close is read
-        // off this handle.
+        // handshake itself may be what fails, with the refusal read off the
+        // close. Either way the close is read off this handle.
         let connection = stranger.connect_control(addr).await.unwrap();
         let handshake = tokio::time::timeout(
             TIMEOUT,
@@ -19198,12 +19204,18 @@ mod tests {
         )
         .await
         .expect("the host never answered the claim");
-        if let Ok(control) = handshake {
-            let (mut reader, _writer) = control.split();
-            let ended = tokio::time::timeout(TIMEOUT, reader.recv())
-                .await
-                .expect("the host kept a refused claim open");
-            assert!(ended.is_err(), "the host answered a claim it cannot honour");
+        match handshake {
+            Ok(control) => {
+                let (mut reader, _writer) = control.split();
+                let ended = tokio::time::timeout(TIMEOUT, reader.recv())
+                    .await
+                    .expect("the host kept a refused claim open");
+                assert!(ended.is_err(), "the host answered a claim it cannot honour");
+            }
+            Err(error) => assert!(
+                matches!(error, NetError::ReconnectRejected),
+                "a refusal that overtook HelloAck read as {error}"
+            ),
         }
         tokio::time::timeout(TIMEOUT, connection.closed())
             .await
@@ -19217,6 +19229,124 @@ mod tests {
                 .all(|row| row.state != SessionStateDto::Pending),
             "a refused claim must not queue a request"
         );
+    }
+
+    /// Which of the two orders a stand-in host refuses a claim in, for
+    /// [`a_refused_resume_stops_resuming`].
+    #[derive(Clone, Copy)]
+    enum ResumeRefusal {
+        /// The guest holds the connection by the time the close arrives, so
+        /// the refusal reaches it as a closed connection.
+        AfterHelloAck,
+        /// The close overtakes `HelloAck` and discards it, as a real host's
+        /// close sometimes does, so the refusal reaches the guest as a failed
+        /// handshake.
+        BeforeHelloAck,
+    }
+
+    /// ADR 0089: a refused claim ends the resume there and then, whichever of
+    /// the host's `HelloAck` and its close the guest reads first. A real host
+    /// sends both back to back and the network picks the order, so a stand-in
+    /// host picks it here instead.
+    async fn a_refused_resume_stops_resuming(refusal: ResumeRefusal) {
+        use lumepeer_core::protocol::{Direction, MessageKind};
+
+        /// The next control connection. Anything else the guest dials, such as
+        /// the media its view keeps asking for, is dropped: this host has no
+        /// picture to give.
+        async fn next_control(endpoint: &PeerEndpoint) -> PeerConnection {
+            loop {
+                if let Ok(connection) = endpoint.accept().await.unwrap()
+                    && connection.alpn() == lumepeer_net::ALPN_CONTROL
+                {
+                    return connection;
+                }
+            }
+        }
+
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::ViewOnly,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+        let (mut session, hello) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed");
+        assert_eq!(hello.resume_claim, None);
+        session
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+        let claim = tokio::time::timeout(TIMEOUT, next_control(&host))
+            .await
+            .expect("the guest never tried to resume");
+        let (code, reason) = lumepeer_net::connection::close_for(&NetError::ReconnectRejected);
+        match refusal {
+            ResumeRefusal::AfterHelloAck => {
+                let (control, hello) = lumepeer_net::host_handshake(claim).await.unwrap();
+                assert_eq!(hello.resume_claim, Some(session.session_id()));
+                let deadline = tokio::time::Instant::now() + TIMEOUT;
+                while guest.connection_stats().await.unwrap().is_empty() {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the guest never took the connection it resumed over"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                control.close_with(&NetError::ReconnectRejected);
+            }
+            ResumeRefusal::BeforeHelloAck => {
+                // The send half is held past the close: dropping it first
+                // would end the stream, and the guest would read that as a
+                // link that stopped before it ever saw the close.
+                let (send, recv) = claim.accept_bi().await.unwrap();
+                let hello = lumepeer_net::framing::FrameReader::new(recv, Direction::GuestToHost)
+                    .read_frame()
+                    .await
+                    .unwrap();
+                assert_eq!(hello.session_id, session.session_id());
+                claim.close(code.into(), reason.as_bytes());
+                drop(send);
+            }
+        }
+
+        wait_for_phase(&guest, ConnectPhase::Failed).await;
+        assert_eq!(
+            guest.connect_state().await.unwrap().code,
+            Some("SESSION_NOT_RESUMED"),
+            "a host this guest may not dial unasked leaves nothing to wait for"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_refused_after_its_hello_ack_stops_resuming() {
+        a_refused_resume_stops_resuming(ResumeRefusal::AfterHelloAck).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_refused_before_its_hello_ack_arrives_stops_resuming() {
+        a_refused_resume_stops_resuming(ResumeRefusal::BeforeHelloAck).await;
     }
 
     /// ADR 0089: the guest lost its link but the host has not noticed yet. A

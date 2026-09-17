@@ -107,6 +107,11 @@ nothing.
   on the host, so the guest stops trying. For a host it may dial unasked it
   falls back to ADR 0084's wait, still not dialing a new session inside the
   window. For any other host it shows `SESSION_NOT_RESUMED`: "connect again".
+- The refusal holds whether or not the guest read the host's `HelloAck`. The
+  host closes right behind the ack, and a QUIC close discards stream data
+  still in flight. A guest that lost the ack reads the refusal off the close
+  code, not as a lost link it would dial again for. `CONSENT_UNAVAILABLE` is
+  read the same way.
 - A resume connection that drops for any other reason is not a refusal, and
   the next tick tries again.
 - When the window ends without an answer, the guest falls back the same way.
@@ -131,8 +136,11 @@ promises a password prompt, and this one promises that nobody will be asked.
   `a_dropped_link_resumes_the_session_with_its_grants_and_asks_nobody`,
   `a_resume_claim_for_no_session_is_refused_and_raises_nothing`,
   `a_claim_replaces_a_connection_the_host_has_not_seen_drop`,
-  `connecting_again_instead_of_resuming_asks_for_consent`. In `crates/net`:
-  `a_resume_claim_reaches_the_host_and_a_first_hello_carries_none`. Golden
+  `connecting_again_instead_of_resuming_asks_for_consent`,
+  `a_resume_refused_after_its_hello_ack_stops_resuming`,
+  `a_resume_refused_before_its_hello_ack_arrives_stops_resuming`. In
+  `crates/net`: `a_resume_claim_reaches_the_host_and_a_first_hello_carries_none`,
+  `a_refusal_that_overtakes_hello_ack_is_still_a_refusal`. Golden
   vectors for minor 18 freeze a first `Hello` and a claiming one.
 
 ## Still open
