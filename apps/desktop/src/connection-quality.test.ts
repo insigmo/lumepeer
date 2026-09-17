@@ -22,6 +22,7 @@ function stats(overrides: Partial<ConnectionStats> = {}): ConnectionStats {
     relay_region: null,
     bitrate_kbps: 4_000,
     fps: 30,
+    codec: 'h264',
     ...overrides,
   };
 }
@@ -79,6 +80,28 @@ describe('connection quality pill', () => {
     expect(container.querySelector('[data-testid="quality-details"]')?.textContent).not.toContain(
       '0 ms',
     );
+  });
+
+  // gap-tasks/06: which codec was negotiated belongs here and nowhere else,
+  // under the codec's own name, and only while a picture travels in it.
+  it('names the codec the picture travels in', () => {
+    for (const [codec, name] of [
+      ['h264', 'H.264'],
+      ['av1', 'AV1'],
+      ['vp9', 'VP9'],
+    ] as const) {
+      render(connectionQuality(stats({ codec }), 'en'), container);
+      const details = container.querySelector('[data-testid="quality-details"]');
+      expect(details?.textContent).toContain(t('en', 'quality.codecLabel'));
+      expect(details?.textContent).toContain(name);
+    }
+  });
+
+  it('names no codec while no picture is travelling', () => {
+    render(connectionQuality(stats({ codec: null }), 'en'), container);
+    expect(
+      container.querySelector('[data-testid="quality-details"]')?.textContent,
+    ).not.toContain(t('en', 'quality.codecLabel'));
   });
 
   it('names the relay by region only, and only when one is in use', () => {

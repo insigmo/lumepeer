@@ -545,6 +545,12 @@ pub struct ConnectionStats {
     pub bitrate_kbps: Option<u32>,
     /// Frame rate this host is sending at; `None` on the guest side.
     pub fps: Option<u8>,
+    /// The video codec this connection's picture is travelling in (§11;
+    /// ADR 0067). `None` whenever no picture is: before one has arrived,
+    /// and after the host said it cannot send one — naming the negotiated
+    /// codec of a stream that carries nothing would describe a picture
+    /// nobody is seeing.
+    pub codec: Option<MediaCodec>,
 }
 
 /// One row of the status list the webview polls.
@@ -3586,6 +3592,36 @@ const fn wire_media_codec(codec: VideoCodec) -> MediaCodec {
     }
 }
 
+/// The codec the diagnostics panel names for one connection, if any picture
+/// is travelling on it (§11, §18; ADR 0067).
+///
+/// `encoding` is the host half: the codec of a live encode loop for this peer.
+/// `watching` is the guest half: the view's status and the `MediaCodec` byte
+/// the host announced (0, the baseline, when it announced none). A host's own
+/// loop is the stronger fact and wins. A guest names the codec only while a
+/// picture is actually arriving or is being recovered — waiting for the first
+/// frame, and every terminal state, name nothing, because a codec negotiated
+/// for a stream that carries nothing is not something to diagnose. A byte no
+/// [`MediaCodec`] assigns names nothing either rather than being guessed at.
+fn codec_in_use(
+    encoding: Option<VideoCodec>,
+    watching: Option<(ViewStatus, u8)>,
+) -> Option<MediaCodec> {
+    if let Some(codec) = encoding {
+        return Some(wire_media_codec(codec));
+    }
+    let (status, byte) = watching?;
+    match status {
+        ViewStatus::Live | ViewStatus::Reconnecting | ViewStatus::SecureDesktop => {
+            MediaCodec::try_from(byte).ok()
+        }
+        ViewStatus::Waiting
+        | ViewStatus::Failed
+        | ViewStatus::NoCapture
+        | ViewStatus::NoEncoder => None,
+    }
+}
+
 /// Host side: this host's own physical monitor has been switched at least
 /// once this "reversibility window", and has not been restored yet
 /// (docs/bugs/16-host-display-mode.md #3; ADR 0048).
@@ -3630,6 +3666,9 @@ struct MediaSession {
     /// quality target the loop settled on, in the one place both sides can
     /// reach (§11; ADR 0037).
     control: EncodeControl,
+    /// The codec the loop encodes this peer's picture in, as
+    /// [`choose_media_codec`] decided it for this session (§11; ADR 0067).
+    codec: VideoCodec,
 }
 
 impl MediaSession {
@@ -7431,6 +7470,15 @@ impl Actor {
                     relay_region,
                     bitrate_kbps: target.map(|t| t.bitrate_kbps),
                     fps: target.map(|t| t.fps),
+                    codec: codec_in_use(
+                        self.media.get(peer).map(|session| session.codec),
+                        self.views.get(peer).map(|view| {
+                            (
+                                view.slot_tx.borrow().status,
+                                view.codec.load(Ordering::Relaxed),
+                            )
+                        }),
+                    ),
                 }
             })
             .collect()
@@ -7881,6 +7929,7 @@ impl Actor {
                 connection: connection.clone(),
                 recorder,
                 control,
+                codec,
             },
         );
         // One capture backend feeds every viewer, so whether the cursor is
@@ -15063,6 +15112,51 @@ mod tests {
     #[test]
     fn wire_media_codec_round_trips_through_the_wire_enum() {
         assert_eq!(wire_media_codec(VideoCodec::H264).to_wire(), 0);
+    }
+
+    /// gap-tasks/06: the panel names the codec a picture is travelling in,
+    /// and nothing for a stream that carries no picture (ADR 0067).
+    #[test]
+    fn the_panel_names_a_codec_only_while_a_picture_travels_in_it() {
+        // Host side: the encode loop's own codec, whatever the view says.
+        assert_eq!(
+            codec_in_use(Some(VideoCodec::Av1), None),
+            Some(MediaCodec::Av1)
+        );
+        assert_eq!(
+            codec_in_use(Some(VideoCodec::H264), Some((ViewStatus::Waiting, 1))),
+            Some(MediaCodec::H264)
+        );
+        // Guest side: what the host announced, while frames arrive or are
+        // being recovered.
+        for streaming in [
+            ViewStatus::Live,
+            ViewStatus::Reconnecting,
+            ViewStatus::SecureDesktop,
+        ] {
+            assert_eq!(
+                codec_in_use(None, Some((streaming, MediaCodec::Av1.to_wire()))),
+                Some(MediaCodec::Av1),
+                "{streaming:?}"
+            );
+        }
+        // A host that never announced one means the baseline.
+        assert_eq!(
+            codec_in_use(None, Some((ViewStatus::Live, 0))),
+            Some(MediaCodec::H264)
+        );
+        // No picture yet, or none coming: no codec to name.
+        for silent in [
+            ViewStatus::Waiting,
+            ViewStatus::Failed,
+            ViewStatus::NoCapture,
+            ViewStatus::NoEncoder,
+        ] {
+            assert_eq!(codec_in_use(None, Some((silent, 0))), None, "{silent:?}");
+        }
+        // A byte no codec was assigned, and no media at all.
+        assert_eq!(codec_in_use(None, Some((ViewStatus::Live, 2))), None);
+        assert_eq!(codec_in_use(None, None), None);
     }
 
     /// A guest that asks on every frame must not be able to decide what the

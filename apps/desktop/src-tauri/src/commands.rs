@@ -12,7 +12,7 @@
 )]
 
 use lumepeer_core::consent::IndependentGrant;
-use lumepeer_core::protocol::RebootMode;
+use lumepeer_core::protocol::{MediaCodec, RebootMode};
 use serde::{Deserialize, Serialize};
 use tauri::Window;
 
@@ -632,6 +632,21 @@ pub struct ConnectionStatsDto {
     pub bitrate_kbps: Option<u32>,
     /// Frame rate this machine is sending at; `null` on the watching side.
     pub fps: Option<u8>,
+    /// `h264`, `av1` or `vp9`: the codec this connection's picture travels
+    /// in, on either side of it; `null` while no picture does (gap-tasks/06;
+    /// ADR 0067).
+    pub codec: Option<&'static str>,
+}
+
+/// Stable identifier of a video codec for the webview, which shows the
+/// codec's own name — H.264, AV1 and VP9 are names, not phrases, and are the
+/// same in every locale.
+const fn media_codec_code(codec: MediaCodec) -> &'static str {
+    match codec {
+        MediaCodec::H264 => "h264",
+        MediaCodec::Av1 => "av1",
+        MediaCodec::Vp9 => "vp9",
+    }
 }
 
 /// One transport a connect tried and gave up on (gap-tasks/23 task 3;
@@ -1209,6 +1224,7 @@ pub async fn connection_stats(
             relay_region: row.relay_region,
             bitrate_kbps: row.bitrate_kbps,
             fps: row.fps,
+            codec: row.codec.map(media_codec_code),
         })
         .collect())
 }

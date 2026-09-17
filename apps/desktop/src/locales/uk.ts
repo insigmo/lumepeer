@@ -344,6 +344,7 @@ export const uk: Dictionary = {
   'quality.bitrateLabel': 'Швидкість надсилання',
   'quality.fpsLabel': 'Частота кадрів',
   'quality.relayLabel': 'Регіон ретранслятора',
+  'quality.codecLabel': 'Відеокодек',
   'quality.ms': (value) => `${value} мс`,
   'quality.percent': (value) => `${value}%`,
   'quality.kbps': (value) => `${value} кбіт/с`,
