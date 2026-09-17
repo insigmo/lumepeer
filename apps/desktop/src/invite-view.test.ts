@@ -187,6 +187,34 @@ describe('connect form: one request at a time', () => {
     expect(message).not.toContain('DIAL_FAILED');
   });
 
+  // ADR 0089: a dropped session being got back is a wait of its own, and it
+  // must not read as the restart wait, which promises a password prompt.
+  it('shows the resume wait as its own panel, with a working cancel', async () => {
+    const view = await load();
+    view.setConnectPhase('resuming', null);
+    render(view.connectPanel('en'), container);
+    expect(view.isConnecting()).toBe(true);
+    expect(container.querySelector('[data-testid="resume-waiting"]')?.textContent).toContain(
+      'nobody is asked again',
+    );
+    expect(container.querySelector('[data-testid="reboot-waiting"]')).toBeNull();
+    expect(container.querySelector('#ticket-input')).toBeNull();
+
+    connectButton().click();
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('connect_cancel');
+  });
+
+  it('says a session that could not be resumed needs a new connection', async () => {
+    const view = await load();
+    view.setConnectPhase('resuming', null);
+    view.setConnectPhase('failed', 'SESSION_NOT_RESUMED');
+    render(view.connectPanel('en'), container);
+    expect(container.querySelector('.connect-error')?.textContent).toContain(
+      'could not be resumed',
+    );
+  });
+
   it('falls back to the generic wording for a code it does not know', async () => {
     const view = await load();
     render(view.connectPanel('en'), container);

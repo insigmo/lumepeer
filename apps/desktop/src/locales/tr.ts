@@ -23,6 +23,7 @@ export const tr: Dictionary = {
   'invite.cancel': 'İptal',
   'invite.denied': 'Diğer cihaz isteği reddetti.',
   'invite.failed': 'Bağlantı kabul edilmeden önce sona erdi.',
+  'invite.sessionNotResumed': 'Oturum sürdürülemedi. Yeni bir oturum istemek için yeniden bağlanın.',
   'invite.unreachable':
     'Bu cihaza ulaşılamadı. Çevrimdışı olabilir ya da davet kodu güncelliğini yitirmiş olabilir — yeni bir kod isteyin.',
   'invite.badTicket': 'Bu davet kodu geçersiz veya süresi dolmuş.',
@@ -85,6 +86,8 @@ export const tr: Dictionary = {
   'audit.kind.grant_changed': 'İzin değiştirildi',
   'audit.kind.unattended_login': 'Gözetimsiz oturum açma',
   'audit.kind.device_trust_changed': 'Cihaz güveni değiştirildi',
+  'audit.kind.reboot': 'Yeniden başlatma veya kapatma istendi',
+  'audit.kind.session_resumed': 'Kopan bağlantının ardından oturum sürdürüldü',
   'system.heading': 'Bu cihaz',
   'system.autostart': 'Oturum açtığımda Lumepeer\'i başlat',
   'system.autostartNote':
@@ -358,6 +361,9 @@ export const tr: Dictionary = {
   'reboot.waiting.title': 'Cihaz yeniden başlatılıyor',
   'reboot.waiting.body': 'Geri gelmesini bekliyoruz. Yeniden girmek için bu oturumun yetkileri değil, cihaz parolası gerekir.',
   'reboot.waiting.cancel': 'Beklemeyi bırak',
+  'resume.waiting.title': 'Bağlantı koptu',
+  'resume.waiting.body': 'Bu oturum geri getiriliyor. Sahip olduğu izinleri korur; kimseye yeniden sorulmaz.',
+  'resume.waiting.cancel': 'Yeniden bağlanmayı durdur',
   'history.autoReconnect': 'Kendiliğinden yeniden bağlan',
   'history.autoReconnect.hint': 'Bu cihaz kaybolursa, sormadan ona geri dön. Burada kayıtlı cihaz parolası gerekir ve yine de yeni bir oturum açmayla biter.',
   'agent.indicator': 'Bu bilgisayarda uzaktan erişim etkin',

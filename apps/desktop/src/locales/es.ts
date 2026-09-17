@@ -23,6 +23,7 @@ export const es: Dictionary = {
   'invite.cancel': 'Cancelar',
   'invite.denied': 'El otro dispositivo rechazó la solicitud.',
   'invite.failed': 'La conexión terminó antes de ser aceptada.',
+  'invite.sessionNotResumed': 'No se pudo reanudar la sesión. Conéctese de nuevo para pedir una nueva.',
   'invite.unreachable':
     'No se pudo contactar con ese dispositivo. Puede que esté fuera de línea, o que su código de invitación ya no sea válido — solicite uno nuevo.',
   'invite.badTicket': 'Ese código de invitación no es válido o ha caducado.',
@@ -85,6 +86,8 @@ export const es: Dictionary = {
   'audit.kind.grant_changed': 'Permiso modificado',
   'audit.kind.unattended_login': 'Inicio de sesión desatendido',
   'audit.kind.device_trust_changed': 'Confianza del dispositivo modificada',
+  'audit.kind.reboot': 'Reinicio o apagado solicitado',
+  'audit.kind.session_resumed': 'Sesión reanudada tras una conexión perdida',
   'system.heading': 'Este dispositivo',
   'system.autostart': 'Iniciar Lumepeer al iniciar sesión',
   'system.autostartNote':
@@ -358,6 +361,9 @@ export const es: Dictionary = {
   'reboot.waiting.title': 'El dispositivo se está reiniciando',
   'reboot.waiting.body': 'Esperamos a que vuelva. Volver a entrar requiere su contraseña de dispositivo, no los permisos de esta sesión.',
   'reboot.waiting.cancel': 'Dejar de esperar',
+  'resume.waiting.title': 'Se perdió la conexión',
+  'resume.waiting.body': 'Recuperando esta sesión. Conserva los permisos que tenía; no se vuelve a preguntar a nadie.',
+  'resume.waiting.cancel': 'Dejar de reconectar',
   'history.autoReconnect': 'Reconectar por su cuenta',
   'history.autoReconnect.hint': 'Si este dispositivo desaparece, volver a él sin preguntar. Necesita su contraseña de dispositivo guardada aquí, y aún así termina en un inicio de sesión nuevo.',
   'agent.indicator': 'El acceso remoto está activo en este equipo',

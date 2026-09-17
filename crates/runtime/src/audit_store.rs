@@ -424,11 +424,12 @@ fn event_columns(event: &AuditEvent) -> (&'static str, String) {
             "reboot",
             format!("{}:{}", reboot_mode_tag(mode), reboot_outcome_tag(outcome)),
         ),
+        AuditEvent::SessionResumed { role } => ("session_resumed", role_tag(role).to_owned()),
     }
 }
 
 /// Every `kind` [`event_columns`] can produce, for the UI's filter.
-pub const EVENT_KINDS: [&str; 13] = [
+pub const EVENT_KINDS: [&str; 14] = [
     "consent_requested",
     "consent_granted",
     "consent_revoked",
@@ -442,6 +443,7 @@ pub const EVENT_KINDS: [&str; 13] = [
     "unattended_login",
     "device_trust_changed",
     "reboot",
+    "session_resumed",
 ];
 
 /// Which of the two things a `RebootRequest` asked for (ADR 0084).
@@ -718,6 +720,9 @@ mod tests {
             AuditEvent::Reboot {
                 mode: RebootMode::Reboot,
                 outcome: RebootOutcome::Warned,
+            },
+            AuditEvent::SessionResumed {
+                role: Role::ViewOnly,
             },
         ];
         for event in &all {

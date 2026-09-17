@@ -858,3 +858,19 @@ const _: () = assert!(
     REBOOT_WAIT_CEILING_SECS > RECONNECT_WINDOW_SECS,
     "the wait for a rebooting host must outlast the resume window"
 );
+
+/// How often a guest whose session dropped tries to resume it while
+/// [`RECONNECT_WINDOW_SECS`] is still open (§10; ADR 0089).
+///
+/// Short, because a resume is what repairs an ordinary network blip and every
+/// second of it is a second the picture is gone. Not shorter, because each
+/// attempt is a full dial of every transport the plan has, and a link that is
+/// down answers none of them quickly.
+pub const RESUME_RETRY_SECS: u64 = 3;
+
+/// A resume has to get more than one try inside its window, or it is not a
+/// retry at all (§10; ADR 0089).
+const _: () = assert!(
+    RESUME_RETRY_SECS * 3 < RECONNECT_WINDOW_SECS,
+    "a resume must get several attempts inside the reconnect window"
+);

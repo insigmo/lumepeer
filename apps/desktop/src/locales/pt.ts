@@ -23,6 +23,7 @@ export const pt: Dictionary = {
   'invite.cancel': 'Cancelar',
   'invite.denied': 'O outro dispositivo recusou a solicitação.',
   'invite.failed': 'A conexão terminou antes de ser aceita.',
+  'invite.sessionNotResumed': 'Não foi possível retomar a sessão. Conecte-se novamente para pedir uma nova.',
   'invite.unreachable':
     'Não foi possível contatar esse dispositivo. Ele pode estar offline, ou o código de convite pode estar desatualizado — peça um novo.',
   'invite.badTicket': 'Esse código de convite não é válido ou expirou.',
@@ -85,6 +86,8 @@ export const pt: Dictionary = {
   'audit.kind.grant_changed': 'Permissão alterada',
   'audit.kind.unattended_login': 'Login não assistido',
   'audit.kind.device_trust_changed': 'Confiança do dispositivo alterada',
+  'audit.kind.reboot': 'Reinício ou desligamento solicitado',
+  'audit.kind.session_resumed': 'Sessão retomada após queda da conexão',
   'system.heading': 'Este dispositivo',
   'system.autostart': 'Iniciar o Lumepeer ao entrar na sessão',
   'system.autostartNote':
@@ -358,6 +361,9 @@ export const pt: Dictionary = {
   'reboot.waiting.title': 'O dispositivo está reiniciando',
   'reboot.waiting.body': 'Aguardando o retorno. Entrar de novo exige a senha do dispositivo, não os direitos desta sessão.',
   'reboot.waiting.cancel': 'Parar de esperar',
+  'resume.waiting.title': 'A conexão caiu',
+  'resume.waiting.body': 'Recuperando esta sessão. Ela mantém as permissões que tinha; ninguém é consultado novamente.',
+  'resume.waiting.cancel': 'Parar de reconectar',
   'history.autoReconnect': 'Reconectar sozinho',
   'history.autoReconnect.hint': 'Se este dispositivo sumir, voltar a ele sem perguntar. Precisa da senha do dispositivo salva aqui, e ainda assim termina num novo login.',
   'agent.indicator': 'O acesso remoto está ativo neste computador',

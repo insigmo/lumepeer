@@ -23,6 +23,7 @@ export const fr: Dictionary = {
   'invite.cancel': 'Annuler',
   'invite.denied': "L'autre appareil a refusé la demande.",
   'invite.failed': "La connexion s'est terminée avant d'être acceptée.",
+  'invite.sessionNotResumed': "La session n'a pas pu être reprise. Connectez-vous à nouveau pour en demander une nouvelle.",
   'invite.unreachable':
     "Impossible de joindre cet appareil. Il est peut-être hors ligne, ou son code d'invitation n'est plus à jour — demandez-en un nouveau.",
   'invite.badTicket': "Ce code d'invitation n'est pas valide ou a expiré.",
@@ -85,6 +86,8 @@ export const fr: Dictionary = {
   'audit.kind.grant_changed': 'Autorisation modifiée',
   'audit.kind.unattended_login': 'Connexion sans surveillance',
   'audit.kind.device_trust_changed': "Confiance de l'appareil modifiée",
+  'audit.kind.reboot': 'Redémarrage ou arrêt demandé',
+  'audit.kind.session_resumed': 'Session reprise après une coupure de connexion',
   'system.heading': 'Cet appareil',
   'system.autostart': "Démarrer Lumepeer à l'ouverture de session",
   'system.autostartNote':
@@ -358,6 +361,9 @@ export const fr: Dictionary = {
   'reboot.waiting.title': 'L’appareil redémarre',
   'reboot.waiting.body': 'Nous attendons son retour. La reconnexion exigera son mot de passe d’appareil, pas les droits de cette session.',
   'reboot.waiting.cancel': 'Arrêter d’attendre',
+  'resume.waiting.title': 'La connexion a été coupée',
+  'resume.waiting.body': "Reprise de cette session. Elle garde ses droits ; personne n'est sollicité à nouveau.",
+  'resume.waiting.cancel': 'Arrêter la reconnexion',
   'history.autoReconnect': 'Se reconnecter tout seul',
   'history.autoReconnect.hint': 'Si cet appareil disparaît, y revenir sans rien demander. Nécessite son mot de passe d’appareil enregistré ici, et se termine quand même par une nouvelle connexion.',
   'agent.indicator': 'L’accès à distance est actif sur cet ordinateur',

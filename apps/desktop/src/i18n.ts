@@ -81,6 +81,7 @@ export type TranslationKey =
   | 'invite.cancel'
   | 'invite.denied'
   | 'invite.failed'
+  | 'invite.sessionNotResumed'
   | 'invite.unreachable'
   | 'invite.badTicket'
   | 'invite.offline'
@@ -141,6 +142,8 @@ export type TranslationKey =
   | 'audit.kind.grant_changed'
   | 'audit.kind.unattended_login'
   | 'audit.kind.device_trust_changed'
+  | 'audit.kind.reboot'
+  | 'audit.kind.session_resumed'
   | 'system.heading'
   | 'system.autostart'
   | 'system.autostartNote'
@@ -399,6 +402,9 @@ export type TranslationKey =
   | 'reboot.waiting.title'
   | 'reboot.waiting.body'
   | 'reboot.waiting.cancel'
+  | 'resume.waiting.title'
+  | 'resume.waiting.body'
+  | 'resume.waiting.cancel'
   | 'history.autoReconnect'
   | 'history.autoReconnect.hint';
 

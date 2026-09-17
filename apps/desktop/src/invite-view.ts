@@ -32,6 +32,10 @@ export type ConnectPhase =
   // marked trusted and whose device password is remembered; for every other
   // host the phase goes to `idle` and the button is what is left.
   | 'waiting_for_host'
+  // The link to a host dropped mid-session and this node is getting that
+  // same session back, inside the reconnect window (§10; ADR 0089). Nothing
+  // is asked of anyone: what comes back is the session's own rights.
+  | 'resuming'
   | 'connected'
   | 'denied'
   | 'failed';
@@ -47,6 +51,7 @@ const FAILURE_TEXT: Record<string, TranslationKey> = {
   OFFLINE: 'invite.offline',
   INCOMPATIBLE_VERSION: 'invite.versionMismatch',
   TRANSPORT_LOST: 'invite.failed',
+  SESSION_NOT_RESUMED: 'invite.sessionNotResumed',
 };
 
 /**
@@ -99,7 +104,8 @@ export function isConnecting(): boolean {
     phase === 'awaiting_credentials' ||
     // Also a wait, and the longest of them: the form must stay disabled while
     // it runs, or a second dial would race the one the wait is about to make.
-    phase === 'waiting_for_host'
+    phase === 'waiting_for_host' ||
+    phase === 'resuming'
   );
 }
 
@@ -617,11 +623,33 @@ function rebootWaitPanel(locale: Locale): TemplateResult {
   `;
 }
 
+/**
+ * The panel shown while this node gets a dropped session back (ADR 0089).
+ *
+ * Not the restart wait above: nothing here will ask for a password or a new
+ * consent, and saying so is the difference. Cancel ends the attempt, and
+ * connecting again after that is an ordinary new request.
+ */
+function resumeWaitPanel(locale: Locale): TemplateResult {
+  return html`
+    <h1 class="panel-heading">${t(locale, 'resume.waiting.title')}</h1>
+    <p class="panel-subtext" role="status" aria-live="polite" data-testid="resume-waiting">
+      ${t(locale, 'resume.waiting.body')}
+    </p>
+    <button type="button" class="connect-btn" @click=${() => void cancel()}>
+      ${t(locale, 'resume.waiting.cancel')}
+    </button>
+  `;
+}
+
 export function connectPanel(locale: Locale): TemplateResult {
   const waiting = isConnecting();
   const message = errorText(locale);
   if (phase === 'waiting_for_host') {
     return rebootWaitPanel(locale);
+  }
+  if (phase === 'resuming') {
+    return resumeWaitPanel(locale);
   }
   return html`
     <h1 class="panel-heading">${t(locale, 'panel.heading')}</h1>

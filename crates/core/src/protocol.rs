@@ -295,7 +295,17 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// [`FEATURE_REBOOT`] — the same shape [`FEATURE_TERMINAL`] uses, for the same
 /// reason. See
 /// `docs/adr/0084-restarting-the-host-is-its-own-grant-and-a-warned-act.md`.
-pub const PROTOCOL_MINOR: u16 = 17;
+///
+/// 18: no new message. A host at this minor honours a resume claim (§10): a
+/// guest whose session dropped sends an ordinary `Hello` whose envelope names
+/// the dropped connection's `session_id` instead of all zeroes, and the host,
+/// if that session of that peer is inside [`crate::constants::RECONNECT_WINDOW_SECS`],
+/// gives it back with its grants and a `ConsentGrant`, and otherwise closes
+/// the connection without asking anyone. A guest makes the claim only to a
+/// host whose `HelloAck` minor is at least this one, because an older host
+/// reads it as a first connection and raises a consent dialog nobody asked
+/// for. See `docs/adr/0089-a-dropped-session-resumes-inside-its-window.md`.
+pub const PROTOCOL_MINOR: u16 = 18;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].

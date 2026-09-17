@@ -23,6 +23,7 @@ export const ru: Dictionary = {
   'invite.cancel': 'Отмена',
   'invite.denied': 'Другое устройство отклонило запрос.',
   'invite.failed': 'Соединение завершилось до того, как было принято.',
+  'invite.sessionNotResumed': 'Не удалось возобновить сессию. Подключитесь снова, чтобы запросить новую.',
   'invite.unreachable':
     'Не удалось связаться с этим устройством. Возможно, оно не в сети, либо код приглашения устарел — запросите новый.',
   'invite.badTicket': 'Этот код приглашения недействителен или его срок истёк.',
@@ -85,6 +86,8 @@ export const ru: Dictionary = {
   'audit.kind.grant_changed': 'Изменён грант',
   'audit.kind.unattended_login': 'Вход без присутствия',
   'audit.kind.device_trust_changed': 'Изменено доверие к устройству',
+  'audit.kind.reboot': 'Запрошены перезагрузка или выключение',
+  'audit.kind.session_resumed': 'Сессия возобновлена после обрыва связи',
   'system.heading': 'Это устройство',
   'system.autostart': 'Запускать Lumepeer при входе в систему',
   'system.autostartNote':
@@ -355,6 +358,9 @@ export const ru: Dictionary = {
   'reboot.waiting.title': 'Устройство перезагружается',
   'reboot.waiting.body': 'Ждём, пока оно вернётся. Для повторного входа понадобится пароль устройства, а не права этой сессии.',
   'reboot.waiting.cancel': 'Перестать ждать',
+  'resume.waiting.title': 'Связь прервалась',
+  'resume.waiting.body': 'Возвращаем эту сессию. Права сохраняются, повторно никого не спрашиваем.',
+  'resume.waiting.cancel': 'Прекратить переподключение',
   'history.autoReconnect': 'Переподключаться самому',
   'history.autoReconnect.hint': 'Если это устройство пропадёт, возвращаться к нему без запроса. Нужен сохранённый пароль устройства, и вход всё равно будет новым.',
   'agent.indicator': 'На этом компьютере включён удалённый доступ',

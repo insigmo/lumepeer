@@ -23,6 +23,7 @@ export const ja: Dictionary = {
   'invite.cancel': 'キャンセル',
   'invite.denied': '相手のデバイスがリクエストを拒否しました。',
   'invite.failed': '接続は承認される前に終了しました。',
+  'invite.sessionNotResumed': 'セッションを再開できませんでした。新しいセッションを要求するには再度接続してください。',
   'invite.unreachable':
     'そのデバイスに接続できませんでした。オフラインであるか、招待コードが古くなっている可能性があります — 新しいコードを依頼してください。',
   'invite.badTicket': 'この招待コードは無効か、有効期限が切れています。',
@@ -84,6 +85,8 @@ export const ja: Dictionary = {
   'audit.kind.grant_changed': '権限が変更されました',
   'audit.kind.unattended_login': '無人ログイン',
   'audit.kind.device_trust_changed': 'デバイスの信頼状態が変更されました',
+  'audit.kind.reboot': '再起動またはシャットダウンが要求されました',
+  'audit.kind.session_resumed': '接続の切断後にセッションが再開されました',
   'system.heading': 'このデバイス',
   'system.autostart': 'サインイン時に Lumepeer を起動する',
   'system.autostartNote':
@@ -349,6 +352,9 @@ export const ja: Dictionary = {
   'reboot.waiting.title': 'デバイスを再起動しています',
   'reboot.waiting.body': '復帰を待っています。再ログインにはこのセッションの権限ではなく、デバイスのパスワードが必要です。',
   'reboot.waiting.cancel': '待機をやめる',
+  'resume.waiting.title': '接続が切断されました',
+  'resume.waiting.body': 'このセッションを復元しています。権限はそのまま保持され、再度確認を求めることはありません。',
+  'resume.waiting.cancel': '再接続をやめる',
   'history.autoReconnect': '自動で再接続',
   'history.autoReconnect.hint': 'このデバイスがいなくなったら、確認なしで戻ります。デバイスのパスワードの保存が必要で、それでもログインはやり直しになります。',
   'agent.indicator': 'このコンピューターはリモートアクセスが有効です',

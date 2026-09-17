@@ -115,6 +115,16 @@ pub enum AuditEvent {
         /// What the host did about it.
         outcome: RebootOutcome,
     },
+    /// A session that dropped came back inside its reconnect window, with the
+    /// grants it had (§10; ADR 0089).
+    ///
+    /// Its own record rather than a second `ConsentGranted`: nobody granted
+    /// anything, and a log that said so would put a decision in the host
+    /// user's name that they never made.
+    SessionResumed {
+        /// Role the session still holds.
+        role: Role,
+    },
 }
 
 /// One audit record: an event plus the pseudonymized peer it belongs to.

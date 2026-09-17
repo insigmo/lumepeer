@@ -62,6 +62,13 @@ pub struct HelloInfo {
     /// Proof of possession of a valid invite, verified against the ticket
     /// registry before consent is even offered (§7).
     pub invite_proof: Vec<u8>,
+    /// The session this guest says it is coming back to (§10), when its
+    /// `Hello` envelope named one instead of the all-zero id of a first
+    /// connection.
+    ///
+    /// A claim and nothing more: only the host's own record of the session
+    /// that dropped can make it a resume, and that record is the actor's.
+    pub resume_claim: Option<[u8; 16]>,
 }
 
 /// Read half of a [`ControlConnection`].
@@ -318,12 +325,39 @@ pub async fn guest_handshake(
     invite_proof: Vec<u8>,
     features: Vec<String>,
 ) -> Result<ControlConnection> {
+    guest_resume_handshake(connection, role_request, invite_proof, features, None).await
+}
+
+/// [`guest_handshake`], naming the session this guest is coming back to
+/// (§10).
+///
+/// The id travels as the `Hello` envelope's own `session_id`, which a first
+/// connection sends as all zeroes: `Hello` keeps its fields, so a host built
+/// before resume reads an ordinary `Hello` and asks for consent as it always
+/// did. The host still answers with a fresh id on `HelloAck` whatever it
+/// decides; whether the session resumed is said afterwards, by a
+/// `ConsentGrant` or by the connection closing.
+///
+/// # Errors
+/// As [`guest_handshake`].
+pub async fn guest_resume_handshake(
+    connection: PeerConnection,
+    role_request: Role,
+    invite_proof: Vec<u8>,
+    features: Vec<String>,
+    resume: Option<[u8; 16]>,
+) -> Result<ControlConnection> {
     let (send, recv) = connection
         .open_bi()
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
-    let mut control =
-        ControlConnection::new(connection, [0u8; 16], recv, send, Direction::HostToGuest);
+    let mut control = ControlConnection::new(
+        connection,
+        resume.unwrap_or([0u8; 16]),
+        recv,
+        send,
+        Direction::HostToGuest,
+    );
 
     control
         .send(MessageKind::Hello {
@@ -372,6 +406,7 @@ pub async fn host_handshake(connection: PeerConnection) -> Result<(ControlConnec
         ControlConnection::new(connection, [0u8; 16], recv, send, Direction::GuestToHost);
 
     let envelope = control.reader.reader.read_frame().await?;
+    let resume_claim = (envelope.session_id != [0u8; 16]).then_some(envelope.session_id);
     let MessageKind::Hello {
         major,
         minor,
@@ -406,6 +441,7 @@ pub async fn host_handshake(connection: PeerConnection) -> Result<(ControlConnec
             role_request,
             features,
             invite_proof,
+            resume_claim,
         },
     ))
 }
@@ -426,6 +462,10 @@ pub const CLOSE_CONSENT_UNAVAILABLE: u32 = 5;
 /// view window — as opposed to a protocol violation (docs/bugs/02-connect-form.md
 /// task 3, docs/bugs/03-connection-list.md task 3; §18).
 pub const CLOSE_NORMAL: u32 = 6;
+/// QUIC application close code for a resume the host will not honour: no
+/// session of this peer is waiting in its reconnect window under that id
+/// (§10). Never followed by a consent request on the same connection.
+pub const CLOSE_RESUME_REFUSED: u32 = 7;
 
 /// Close code and reason string that a framing error must close the stream
 /// with (§9.1, §18).
@@ -444,6 +484,7 @@ pub fn close_for(error: &NetError) -> (u32, &'static str) {
         NetError::ConsentUnavailable => {
             (CLOSE_CONSENT_UNAVAILABLE, close_code::CONSENT_UNAVAILABLE)
         }
+        NetError::ReconnectRejected => (CLOSE_RESUME_REFUSED, close_code::RESUME_REFUSED),
         _ => (CLOSE_MALFORMED, close_code::MALFORMED),
     }
 }
@@ -488,6 +529,73 @@ mod tests {
             close_for(&NetError::Io("gone".to_owned())).1,
             close_code::MALFORMED
         );
+    }
+
+    #[test]
+    fn a_refused_resume_has_a_close_code_of_its_own() {
+        assert_eq!(
+            close_for(&NetError::ReconnectRejected),
+            (CLOSE_RESUME_REFUSED, close_code::RESUME_REFUSED)
+        );
+    }
+
+    /// §10: a first connection claims nothing, a resuming one names its
+    /// session on the `Hello` envelope, and either way the host hands out a
+    /// fresh id — the claim is the actor's to honour, not the handshake's.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
+    async fn a_resume_claim_reaches_the_host_and_a_first_hello_carries_none() {
+        use crate::endpoint::PeerEndpoint;
+
+        let host = PeerEndpoint::bind_local(iroh::SecretKey::from_bytes(&[3u8; 32]))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::from_bytes(&[4u8; 32]))
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        let addr = host.addr();
+        let claimed = [9u8; 16];
+
+        let host_side = tokio::spawn(async move {
+            let mut claims = Vec::new();
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let connection = host.accept().await.unwrap().unwrap();
+                let (control, hello) = host_handshake(connection).await.unwrap();
+                assert_ne!(control.session_id(), [0u8; 16]);
+                assert_ne!(Some(control.session_id()), hello.resume_claim);
+                claims.push(hello.resume_claim);
+                held.push(control);
+            }
+            (claims, held, host)
+        });
+
+        let first = guest_handshake(
+            guest.connect_control(addr.clone()).await.unwrap(),
+            Role::ViewOnly,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let second = guest_resume_handshake(
+            guest.connect_control(addr).await.unwrap(),
+            Role::ViewOnly,
+            Vec::new(),
+            Vec::new(),
+            Some(claimed),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            second.session_id(),
+            claimed,
+            "the host names the new connection"
+        );
+
+        let (claims, _held, _host) = host_side.await.unwrap();
+        assert_eq!(claims, vec![None, Some(claimed)]);
+        drop((first, second));
     }
 
     #[test]

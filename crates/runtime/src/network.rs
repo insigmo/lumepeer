@@ -32,9 +32,9 @@ use lumepeer_core::constants::{
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
     REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
-    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
-    TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS,
-    TUNNEL_IDLE_TIMEOUT_SECS,
+    RESUME_RETRY_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
+    STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES,
+    TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
@@ -49,7 +49,7 @@ use lumepeer_core::protocol::{
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
 };
-use lumepeer_core::session::{SessionManager, SessionState, TunnelTarget};
+use lumepeer_core::session::{ReconnectDecision, SessionManager, SessionState, TunnelTarget};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
 use lumepeer_media::capture::{
@@ -188,6 +188,14 @@ const TERMINAL_MINOR: u16 = 16;
 /// `FEATURE_REBOOT` string instead, and `HelloAck` carries no feature list for
 /// the guest to read the other way.
 const REBOOT_MINOR: u16 = 17;
+
+/// First `PROTOCOL_MINOR` whose host honours a resume claim (§10; ADR 0089).
+///
+/// Guest side only. An older host reads the claim as an ordinary first
+/// `Hello` and asks its user for consent, which is the dialog nobody at that
+/// machine asked for; so a guest makes the claim only to a host whose
+/// `HelloAck` said at least this.
+const SESSION_RESUME_MINOR: u16 = 18;
 
 /// How many frames one terminal connection queues before its producer waits.
 ///
@@ -750,6 +758,15 @@ pub enum ConnectPhase {
     /// that this node remembers a device password for — every other host gets
     /// the ordinary "connect again" row and no attempt of its own.
     WaitingForHost,
+    /// The link to a host dropped mid-session and this node is trying to
+    /// resume that same session inside [`RECONNECT_WINDOW_SECS`] (§10;
+    /// ADR 0089).
+    ///
+    /// Not [`Self::WaitingForHost`]: nothing here needs a password or a new
+    /// consent, and the session's own rights are what come back. Entered for
+    /// any host new enough to honour it, trusted or not, because a refused
+    /// resume never becomes a request on the host's screen.
+    Resuming,
     /// The host refused, or ended the request without granting.
     Denied,
     /// The dial or the handshake failed, or the host dropped mid-request.
@@ -767,6 +784,7 @@ impl ConnectPhase {
                 | Self::AwaitingConsent
                 | Self::AwaitingCredentials
                 | Self::WaitingForHost
+                | Self::Resuming
         )
     }
 
@@ -780,6 +798,7 @@ impl ConnectPhase {
             Self::AwaitingCredentials => "awaiting_credentials",
             Self::Connected => "connected",
             Self::WaitingForHost => "waiting_for_host",
+            Self::Resuming => "resuming",
             Self::Denied => "denied",
             Self::Failed => "failed",
         }
@@ -1030,6 +1049,10 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Tests only: every connection this node holds drops as a lost link
+    /// would, with no session ended on purpose on either side.
+    #[cfg(test)]
+    SeverLinks { reply: oneshot::Sender<()> },
     InviteCreate {
         role: Role,
         /// Retire every code handed out so far and issue a fresh one. `false`
@@ -1640,6 +1663,20 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Tests only: drops every connection like a lost link (ADR 0089).
+    #[cfg(test)]
+    pub async fn sever_links(&self) {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ActorCommand::SeverLinks { reply })
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
     }
 
     /// Revokes every grant of the peer behind `label`.
@@ -3375,6 +3412,10 @@ struct ConnectionHandle {
     /// string is not: the size ceiling of ADR 0077 has to be known about a
     /// peer *before* an offer is made to it, in both directions.
     peer_minor: u16,
+    /// The id this connection's handshake gave the session, which is what a
+    /// guest names to resume it and what a host checks that name against
+    /// (§10; ADR 0089).
+    session_id: [u8; 16],
 }
 
 /// Whether this build may send `ReceiverReport` towards a peer, from the only
@@ -3798,6 +3839,8 @@ enum ActorEvent {
         /// Which optional codecs the guest's `Hello` advertised understanding
         /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
+        /// The session the guest says it is coming back to (§10; ADR 0089).
+        resume_claim: Option<[u8; 16]>,
     },
     /// A live connection delivered a control message.
     Inbound {
@@ -3941,6 +3984,9 @@ enum ActorEvent {
     /// Guest side: it is time to try a host that went away again (ADR 0084).
     /// `generation` ties it to the wait that armed it.
     ReconnectWaitTick { generation: u64 },
+    /// Host side: the reconnect window of a session that dropped has run out
+    /// (§10; ADR 0089). `session_id` ties it to the drop that armed it.
+    ResumeWindowElapsed { peer: NodeId, session_id: [u8; 16] },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -4003,6 +4049,8 @@ enum Accepted {
         /// Which optional codecs the guest's `Hello` advertised understanding
         /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
+        /// The session the guest says it is coming back to (§10; ADR 0089).
+        resume_claim: Option<[u8; 16]>,
     },
     /// Media ALPN: authenticated only, nothing decided.
     Media {
@@ -4429,6 +4477,10 @@ struct Actor {
     /// Monotonic counter naming the most recent wait, so a tick left over
     /// from a cancelled one does not dial a host nobody is waiting for.
     reconnect_wait_generation: u64,
+    /// Host side: per guest whose session dropped while granted, the id of the
+    /// connection it dropped on, for as long as [`RECONNECT_WINDOW_SECS`]
+    /// lets it come back under that id (§10; ADR 0089).
+    parked_sessions: std::collections::HashMap<NodeId, [u8; 16]>,
     /// Guest side: per watched host, whether its `HelloAck` minor is at least
     /// [`TERMINAL_MINOR`], so this node may ask it for a shell at all.
     terminal_to_host: std::collections::HashMap<NodeId, bool>,
@@ -4734,6 +4786,14 @@ struct ReconnectWait {
     /// Which wait this is; a tick whose generation no longer matches is a
     /// leftover and dials nothing.
     generation: u64,
+    /// The session this wait is first trying to resume, while
+    /// [`RECONNECT_WINDOW_SECS`] lasts and the host has not refused it
+    /// (§10; ADR 0089). `None` is ADR 0084's wait for a new session.
+    resume: Option<[u8; 16]>,
+    /// A resume dial is in flight. Kept here rather than in `connect_phase`,
+    /// which stays [`ConnectPhase::Resuming`] through every attempt so the
+    /// window does not flicker back to the connect form between them.
+    dialing: bool,
 }
 
 /// Everything the obfuscated transport needs across invites on the host side
@@ -7472,6 +7532,7 @@ impl Actor {
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<MessageKind>(8);
         let quic = connection.connection().clone();
         let peer_minor = connection.peer_minor();
+        let session_id = connection.session_id();
         let (mut reader, mut writer) = connection.split();
         let tag = self.label_of(&peer);
 
@@ -7532,6 +7593,7 @@ impl Actor {
                 speaks_remote_sas,
                 speaks_unattended,
                 peer_minor,
+                session_id,
             },
         );
     }
@@ -7577,7 +7639,15 @@ impl Actor {
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
+                resume_claim,
             } => {
+                // First, before a single feature of this `Hello` is recorded:
+                // letting go of a connection this claim proves dead runs the
+                // per-connection teardown, which would otherwise wipe what is
+                // recorded below (ADR 0089).
+                if let Some(claim) = resume_claim {
+                    self.release_connection_claimed_by(peer, claim);
+                }
                 // Host side of the exchange: whether this guest's own reports
                 // may be read at all (ADR 0037). The guest side is recorded in
                 // `on_dialed`, from the `HelloAck` minor.
@@ -7667,7 +7737,13 @@ impl Actor {
                 } else {
                     self.speaks_clipboard_files.remove(&peer);
                 }
-                self.on_handshaked(*connection, peer, &ticket, announces_media_faults);
+                self.on_handshaked(
+                    *connection,
+                    peer,
+                    &ticket,
+                    announces_media_faults,
+                    resume_claim,
+                );
             }
             ActorEvent::Inbound { peer, id, kind } => self.on_inbound(peer, id, &kind),
             ActorEvent::Closed { peer, id } => self.on_closed(peer, id),
@@ -7725,6 +7801,9 @@ impl Actor {
             }
             ActorEvent::ReconnectWaitTick { generation } => {
                 self.on_reconnect_wait_tick(generation);
+            }
+            ActorEvent::ResumeWindowElapsed { peer, session_id } => {
+                self.on_resume_window_elapsed(peer, session_id);
             }
         }
     }
@@ -8275,6 +8354,7 @@ impl Actor {
         peer: NodeId,
         ticket: &InviteTicket,
         announces_media_faults: bool,
+        resume_claim: Option<[u8; 16]>,
     ) {
         // `speaks_remote_sas` is already recorded by `handle_event` before
         // this runs; the parameter list stays untouched here.
@@ -8290,6 +8370,17 @@ impl Actor {
             connection.close_with(&NetError::ConsentUnavailable);
             return;
         }
+        // A guest coming back to a session is not asking for one (§10;
+        // ADR 0089). Decided before the ticket and before anyone is asked:
+        // the session was admitted when it began, and a claim this host will
+        // not honour closes the connection rather than becoming a request.
+        if let Some(claim) = resume_claim {
+            self.on_resume_claim(connection, peer, claim, announces_media_faults);
+            return;
+        }
+        // A new session is new, whatever was waiting in the window: it
+        // inherits nothing, and the old one must not be resumable after it.
+        self.end_parked_session(peer);
         // Single-use enforcement runs here, on the actor's own thread, so two
         // connections racing the same ticket cannot both win it.
         if let Err(error) = self.tickets.claim(ticket, unix_now()) {
@@ -8408,6 +8499,128 @@ impl Actor {
         self.rebuild_labels_and_snapshot();
     }
 
+    /// Host side: keeps a session that dropped resumable for the window, under
+    /// the id of the connection it dropped on (§10; ADR 0089).
+    fn park_session(&mut self, peer: NodeId, session_id: [u8; 16]) {
+        self.parked_sessions.insert(peer, session_id);
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(RECONNECT_WINDOW_SECS)).await;
+            let _ = events
+                .send(ActorEvent::ResumeWindowElapsed { peer, session_id })
+                .await;
+        });
+    }
+
+    /// Host side: a session that dropped can no longer be resumed, and is let
+    /// go (§10; ADR 0089).
+    ///
+    /// `SessionManager` keeps a dropped session in `Reconnecting` until
+    /// somebody asks; ending it here is what stops a guest that never came back
+    /// from holding a place in the concurrent-guest limit afterwards.
+    fn end_parked_session(&mut self, peer: NodeId) {
+        if self.parked_sessions.remove(&peer).is_some()
+            && self.sessions.state(&peer) == SessionState::Reconnecting
+        {
+            let _ = self.sessions.revoke(peer);
+            self.rebuild_labels_and_snapshot();
+        }
+    }
+
+    /// Host side: the window of one drop ran out (§10; ADR 0089). A tick for an
+    /// older drop of the same guest, which resumed and dropped again since,
+    /// finds a different id and leaves the newer one alone.
+    fn on_resume_window_elapsed(&mut self, peer: NodeId, session_id: [u8; 16]) {
+        if self.parked_sessions.get(&peer) != Some(&session_id) {
+            return;
+        }
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            "a dropped session was not resumed inside its window; it has ended"
+        );
+        self.end_parked_session(peer);
+    }
+
+    /// Host side: the link dropped on the guest's side before this host
+    /// noticed (ADR 0089).
+    ///
+    /// The guest is here again, from the same authenticated key, naming the
+    /// connection this host still thinks is live. That connection is gone, and
+    /// it is let go of the way any other drop is, which is also what parks the
+    /// session the claim names.
+    fn release_connection_claimed_by(&mut self, peer: NodeId, claim: [u8; 16]) {
+        let Some((stale_id, stale)) = self
+            .connections
+            .get(&peer)
+            .filter(|handle| handle.session_id == claim)
+            .map(|handle| (handle.id, handle.connection.clone()))
+        else {
+            return;
+        };
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            "a resuming guest replaces a connection that is already gone"
+        );
+        stale.close(
+            lumepeer_net::connection::CLOSE_NORMAL.into(),
+            lumepeer_net::error::close_code::NORMAL.as_bytes(),
+        );
+        self.on_closed(peer, stale_id);
+    }
+
+    /// Host side: a guest names a session it says it is coming back to (§10;
+    /// ADR 0089).
+    ///
+    /// Honoured only for the peer the handshake authenticated, only under the
+    /// id of the connection that session dropped on, and only inside
+    /// [`RECONNECT_WINDOW_SECS`] — `SessionManager::on_reconnect` measures that
+    /// on the monotonic clock. Everything else closes the connection with
+    /// `RESUME_REFUSED` and ends whatever was waiting, and nobody is asked
+    /// anything: a claim is not a request, and turning a refused one into a
+    /// consent dialog would let any guest with an old id raise one unasked.
+    ///
+    /// What comes back is the session's role and grants, exactly as they were.
+    /// What does not is everything that lived on the connection: media starts
+    /// again, and tunnels, shells, transfers and chat are gone (ADR 0089).
+    fn on_resume_claim(
+        &mut self,
+        connection: ControlConnection,
+        peer: NodeId,
+        claim: [u8; 16],
+        announces_media_faults: bool,
+    ) {
+        let tag = self.label_of(&peer);
+        let decision = if self.parked_sessions.get(&peer) == Some(&claim) {
+            self.sessions.on_reconnect(peer)
+        } else {
+            ReconnectDecision::Reject {
+                reason: lumepeer_core::session::RejectReason::UnknownSession,
+            }
+        };
+        let role = self.sessions.role(&peer);
+        let (ReconnectDecision::Resume { .. }, Some(role)) = (decision, role) else {
+            tracing::warn!(peer = %tag, ?decision, "refusing a resume");
+            self.end_parked_session(peer);
+            connection.close_with(&NetError::ReconnectRejected);
+            return;
+        };
+        self.parked_sessions.remove(&peer);
+        self.adopt(
+            connection,
+            peer,
+            announces_media_faults,
+            self.speaks_remote_sas.contains(&peer),
+            self.speaks_unattended.contains(&peer),
+        );
+        tracing::info!(peer = %tag, ?role, "a dropped session resumed inside its window");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::SessionResumed { role },
+        );
+        self.start_granted_session(peer, role);
+        self.rebuild_labels_and_snapshot();
+    }
+
     /// Sends `UnattendedReject` to `peer`, but only if its `Hello` advertised
     /// [`FEATURE_UNATTENDED`] — an older guest would decode the unknown
     /// discriminant as malformed and drop the connection (§9.1).
@@ -8522,6 +8735,16 @@ impl Actor {
             // Guest side: the host decided.
             MessageKind::ConsentGrant(role) => {
                 tracing::info!(peer = %tag, ?role, "remote host granted consent");
+                // A resumed session answers with the grant it still holds,
+                // and that is the end of the wait it was resumed out of
+                // (ADR 0089).
+                if self
+                    .reconnect_wait
+                    .as_ref()
+                    .is_some_and(|wait| wait.peer == peer)
+                {
+                    self.stop_reconnect_wait();
+                }
                 let _ = self.notify.send(ActorNotification::ConsentGranted { role });
                 // Reacted to here rather than through the notification stream:
                 // `ActorNotification` deliberately carries no peer identity
@@ -9075,7 +9298,7 @@ impl Actor {
         if self.connections.get(&peer).is_some_and(|c| c.id != id) {
             return;
         }
-        self.connections.remove(&peer);
+        let closed = self.connections.remove(&peer);
         // An unanswered credential challenge dies with the connection that
         // carried it: a later connection from the same device gets a fresh
         // challenge, and its `UnattendedAuth` is never accepted against a
@@ -9148,15 +9371,43 @@ impl Actor {
         // that revoked, or a window the user closed, is not — both of those
         // close the view first and leave nothing here to arm on (ADR 0084).
         let was_watching = self.views.contains_key(&peer);
+        // A connection that ends before it was ever granted, while this node
+        // was resuming over it, is the host saying no (ADR 0089): it closes a
+        // claim it will not honour instead of asking anyone.
+        let resuming_over_this = !was_watching
+            && self
+                .reconnect_wait
+                .as_ref()
+                .is_some_and(|wait| wait.peer == peer && wait.resume.is_some());
+        let resume_refused = resuming_over_this
+            && closed.as_ref().is_some_and(|handle| {
+                handle
+                    .connection
+                    .closed_by_peer_with(lumepeer_net::connection::CLOSE_RESUME_REFUSED)
+            });
         self.settle_connect(peer, ConnectPhase::Failed);
         // `stop_view` is what writes the history row this wait reads its code
         // out of, so the row exists by the time anything below looks for it.
         self.stop_view(peer);
         if was_watching {
             let host_tag = host_tag(&peer);
-            if self.may_auto_reconnect(&host_tag) {
-                self.start_reconnect_wait(peer, host_tag);
+            // Resume first, for any host new enough to honour it (§10;
+            // ADR 0089); ADR 0084's wait for a new session only for a host
+            // this node may dial unasked.
+            let resume = closed
+                .as_ref()
+                .filter(|handle| handle.peer_minor >= SESSION_RESUME_MINOR)
+                .map(|handle| handle.session_id);
+            if resume.is_some() || self.may_auto_reconnect(&host_tag) {
+                self.start_reconnect_wait(peer, host_tag, resume);
             }
+        } else if resume_refused {
+            self.on_resume_refused(peer);
+        } else if resuming_over_this {
+            // The link went again before the host answered: that is not a
+            // refusal, and the wait's next tick tries once more.
+            self.connect_phase = ConnectPhase::Resuming;
+            self.connect_peer = Some(peer);
         }
         let label = peer_tag(&self.install_salt, &peer);
         if self.sessions.on_disconnect(peer).is_err() {
@@ -9172,6 +9423,11 @@ impl Actor {
             // forget, no matter how many times it disconnects
             // (docs/bugs/03-connection-list.md, task 2).
             self.sessions.forget_consent_rate(&peer);
+            // Held for the window, under the id the guest knows it by, so the
+            // same guest can come back to it (§10; ADR 0089).
+            if let Some(handle) = closed.as_ref() {
+                self.park_session(peer, handle.session_id);
+            }
         }
         tracing::info!(peer = %label, "peer disconnected");
         self.refresh_clipboard_watch();
@@ -9257,6 +9513,15 @@ impl Actor {
                 let result = self.on_grant(&label, role);
                 self.rebuild_labels_and_snapshot();
                 let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            ActorCommand::SeverLinks { reply } => {
+                // A code no side reads as a decision: what the far side sees
+                // is a connection that ended, as it would on a lost link.
+                for handle in self.connections.values() {
+                    handle.connection.close(0u32.into(), b"link lost");
+                }
+                let _ = reply.send(());
             }
             ActorCommand::Revoke { label, reply } => {
                 let result = self.on_revoke(&label);
@@ -12026,6 +12291,29 @@ impl Actor {
         // somebody at this machine instead, and a password arriving after it
         // must not be able to grant a second, different role.
         self.unattended_pending.remove(&peer);
+        self.start_granted_session(peer, role);
+        tracing::info!(peer = %label, ?role, "consent granted");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::ConsentGranted { role },
+        );
+        // The role is the only thing that moves `input` — it is not one of the
+        // four independent grants (ADR 0029) — so a grant is exactly when the
+        // §15 `InputToggled` event happens, and the value is the session's own.
+        let input = self.sessions.grants(&peer).is_some_and(|g| g.input);
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::InputToggled { enabled: input },
+        );
+        Ok(())
+    }
+
+    /// What a session that holds `role` starts with on its connection, whether
+    /// it was just granted or has just resumed (§10; ADR 0089): the grant on
+    /// the wire, capture, and the announcements a new viewer's window needs.
+    fn start_granted_session(&mut self, peer: NodeId, role: Role) {
+        let label = self.label_of(&peer);
+        let label = label.as_str();
         self.send_to(&peer, MessageKind::ConsentGrant(role));
         if self.sessions.grants(&peer).is_some_and(|g| g.view) {
             if let Err(error) = lock_capture(&self.capture).add_viewer(peer) {
@@ -12057,24 +12345,10 @@ impl Actor {
             // whenever the host moves the switch afterwards.
             self.announce_display_modes(peer);
         }
-        tracing::info!(peer = %label, ?role, "consent granted");
-        self.audit(
-            &peer,
-            lumepeer_core::audit::AuditEvent::ConsentGranted { role },
-        );
-        // The role is the only thing that moves `input` — it is not one of the
-        // four independent grants (ADR 0029) — so a grant is exactly when the
-        // §15 `InputToggled` event happens, and the value is the session's own.
-        let input = self.sessions.grants(&peer).is_some_and(|g| g.input);
-        self.audit(
-            &peer,
-            lumepeer_core::audit::AuditEvent::InputToggled { enabled: input },
-        );
         self.refresh_clipboard_watch();
         // A role change moves the `input` grant, and that is one of the two
         // things the cursor channel is decided on (§11).
         self.refresh_cursor_embedding();
-        Ok(())
     }
 
     /// Both directions of "end this session now".
@@ -12460,7 +12734,9 @@ impl Actor {
         };
         if matches!(
             self.connect_phase,
-            ConnectPhase::AwaitingConsent | ConnectPhase::AwaitingCredentials
+            ConnectPhase::AwaitingConsent
+                | ConnectPhase::AwaitingCredentials
+                | ConnectPhase::Resuming
         ) {
             self.close_connection_normal(peer);
         }
@@ -12710,7 +12986,12 @@ impl Actor {
     /// repair with a *new* session that carries none of them. Only once it has
     /// elapsed without the link coming back is this a machine that went away
     /// rather than a link that stuttered.
-    fn start_reconnect_wait(&mut self, peer: NodeId, host_tag: String) {
+    ///
+    /// With `resume`, the wait first tries to get that session back, every
+    /// [`RESUME_RETRY_SECS`] for as long as the window lasts (§10; ADR 0089).
+    /// Those attempts are not new sessions, so they are what the window is
+    /// for rather than a race with it.
+    fn start_reconnect_wait(&mut self, peer: NodeId, host_tag: String, resume: Option<[u8; 16]>) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
         self.reconnect_wait = Some(ReconnectWait {
@@ -12718,19 +12999,111 @@ impl Actor {
             host_tag,
             started_at: std::time::Instant::now(),
             generation,
+            resume,
+            dialing: false,
         });
-        self.connect_phase = ConnectPhase::WaitingForHost;
+        self.connect_phase = if resume.is_some() {
+            ConnectPhase::Resuming
+        } else {
+            ConnectPhase::WaitingForHost
+        };
         self.connect_peer = Some(peer);
         self.connect_failure = None;
         self.connect_code_required = false;
         self.connect_retry_secs = None;
         self.connect_credentials_auto = false;
+        let first_attempt_secs = if resume.is_some() {
+            RESUME_RETRY_SECS
+        } else {
+            RECONNECT_WINDOW_SECS
+        };
         tracing::info!(
             peer = %self.label_of(&peer),
-            first_attempt_secs = RECONNECT_WINDOW_SECS,
+            first_attempt_secs,
+            resuming = resume.is_some(),
             "waiting for a host to come back"
         );
-        self.arm_reconnect_wait(generation, RECONNECT_WINDOW_SECS);
+        self.arm_reconnect_wait(generation, first_attempt_secs);
+    }
+
+    /// Guest side: the host closed a connection this node was resuming over
+    /// without granting anything, which is how it refuses a resume (§10;
+    /// ADR 0089).
+    ///
+    /// The session is gone on the host, so asking again is pointless. What is
+    /// left is ADR 0084's wait for a new session, for a host this node may
+    /// dial unasked, and the ordinary "connect again" for every other.
+    fn on_resume_refused(&mut self, peer: NodeId) {
+        let Some(wait) = self.reconnect_wait.as_mut() else {
+            return;
+        };
+        wait.resume = None;
+        wait.dialing = false;
+        let host_tag = wait.host_tag.clone();
+        tracing::info!(peer = %self.label_of(&peer), "the host did not resume the session");
+        if self.may_auto_reconnect(&host_tag) {
+            self.connect_phase = ConnectPhase::WaitingForHost;
+            self.connect_peer = Some(peer);
+            self.connect_failure = None;
+        } else {
+            self.stop_reconnect_wait();
+            self.connect_phase = ConnectPhase::Failed;
+            self.connect_failure = Some("SESSION_NOT_RESUMED");
+            self.connect_peer = None;
+        }
+    }
+
+    /// Guest side: the resume part of a wait, one tick of it (§10; ADR 0089).
+    ///
+    /// Returns whether the tick is done. `false` hands the tick on to ADR
+    /// 0084's wait for a new session: the window is over, the host never
+    /// answered, and this node may dial it unasked.
+    fn resume_tick(&mut self, wait: &ReconnectWait) -> bool {
+        if wait.started_at.elapsed() >= Duration::from_secs(RECONNECT_WINDOW_SECS) {
+            if let Some(current) = self.reconnect_wait.as_mut() {
+                current.resume = None;
+            }
+            tracing::info!(
+                peer = %self.label_of(&wait.peer),
+                "the session did not come back inside its window"
+            );
+            if !self.may_auto_reconnect(&wait.host_tag) {
+                self.stop_reconnect_wait();
+                if self.connect_phase == ConnectPhase::Resuming {
+                    self.connect_phase = ConnectPhase::Failed;
+                    self.connect_failure = Some("SESSION_NOT_RESUMED");
+                    self.connect_peer = None;
+                }
+                return true;
+            }
+            if self.connect_phase == ConnectPhase::Resuming {
+                self.connect_phase = ConnectPhase::WaitingForHost;
+            }
+            return false;
+        }
+        if self.connect_peer.is_some_and(|peer| peer != wait.peer) {
+            tracing::info!("the connect form moved to another host; the resume ends");
+            self.stop_reconnect_wait();
+            return true;
+        }
+        if wait.dialing || self.connections.contains_key(&wait.peer) {
+            self.arm_reconnect_wait(wait.generation, RESUME_RETRY_SECS);
+            return true;
+        }
+        let Some(code) = self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) else {
+            tracing::info!("the remembered host is gone; the resume ends");
+            self.stop_reconnect_wait();
+            if self.connect_phase == ConnectPhase::Resuming {
+                self.connect_phase = ConnectPhase::Idle;
+                self.connect_peer = None;
+            }
+            return true;
+        };
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, wait.resume) {
+            tracing::debug!(%error, "the host is not reachable yet");
+        }
+        self.arm_reconnect_wait(wait.generation, RESUME_RETRY_SECS);
+        true
     }
 
     /// Wakes the actor when the next attempt is due (ADR 0084).
@@ -12767,6 +13140,18 @@ impl Actor {
             return;
         };
         if wait.generation != generation {
+            return;
+        }
+        if wait.resume.is_some() && self.resume_tick(&wait) {
+            return;
+        }
+        // A resume the host refused leaves a wait still inside the window,
+        // and a new session inside it is what ADR 0084 will not dial.
+        let window = Duration::from_secs(RECONNECT_WINDOW_SECS);
+        if let Some(left) = window.checked_sub(wait.started_at.elapsed())
+            && !left.is_zero()
+        {
+            self.arm_reconnect_wait(generation, left.as_secs().max(1));
             return;
         }
         if wait.started_at.elapsed() >= Duration::from_secs(REBOOT_WAIT_CEILING_SECS) {
@@ -12944,6 +13329,12 @@ impl Actor {
     /// window's frame poll. That is the "the app freezes and then says it
     /// could not connect" report this fixes.
     fn spawn_dial(&mut self, raw: &str) -> Result<(), ActorError> {
+        self.spawn_dial_as(raw, None)
+    }
+
+    /// [`Self::spawn_dial`], resuming the session `resume` names when it names
+    /// one (§10; ADR 0089).
+    fn spawn_dial_as(&mut self, raw: &str, resume: Option<[u8; 16]>) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
         // Dialing a host this node is already talking to would replace the live
@@ -12958,7 +13349,12 @@ impl Actor {
         // A dial already in flight owns `connect_phase`. Letting a second one
         // start would leave two tasks racing to report an outcome into one
         // slot, and the loser would overwrite the winner.
-        if self.connect_phase == ConnectPhase::Dialing {
+        if self.connect_phase == ConnectPhase::Dialing
+            || self
+                .reconnect_wait
+                .as_ref()
+                .is_some_and(|wait| wait.dialing)
+        {
             tracing::info!("a connect attempt is already in flight");
             return Err(ActorError::Net(NetError::AlreadyConnected));
         }
@@ -12973,7 +13369,14 @@ impl Actor {
             )));
         };
 
-        self.connect_phase = ConnectPhase::Dialing;
+        if resume.is_some() {
+            if let Some(wait) = self.reconnect_wait.as_mut() {
+                wait.dialing = true;
+            }
+            self.connect_phase = ConnectPhase::Resuming;
+        } else {
+            self.connect_phase = ConnectPhase::Dialing;
+        }
         self.connect_peer = Some(addr.id);
         self.connect_failure = None;
         // A previous attempt that never reached a grant or a refusal — the
@@ -12996,7 +13399,7 @@ impl Actor {
         let codecs = self.own_codec_support;
         tracing::info!(peer = %tag, plan = ?plan.kinds(), "dialing the host");
         tokio::spawn(async move {
-            let outcome = dial_over_plan(plan, role, proof, &tag, codecs).await;
+            let outcome = dial_over_plan(plan, role, proof, &tag, codecs, resume).await;
             let _ = tx
                 .send(ActorEvent::Dialed {
                     peer,
@@ -13029,6 +13432,14 @@ impl Actor {
             tracing::info!(peer = %tag, "discarding the result of a superseded dial");
             return;
         }
+        let resuming = self
+            .reconnect_wait
+            .as_mut()
+            .filter(|wait| wait.peer == peer)
+            .is_some_and(|wait| {
+                wait.dialing = false;
+                wait.resume.is_some()
+            });
         let control = match result {
             Ok(control) => *control,
             Err(error) => {
@@ -13042,7 +13453,11 @@ impl Actor {
                     .is_some_and(|wait| wait.peer == peer)
                 {
                     tracing::debug!(peer = %tag, %error, "the host is not back yet");
-                    self.connect_phase = ConnectPhase::WaitingForHost;
+                    self.connect_phase = if resuming {
+                        ConnectPhase::Resuming
+                    } else {
+                        ConnectPhase::WaitingForHost
+                    };
                     self.connect_peer = Some(peer);
                     return;
                 }
@@ -13058,7 +13473,11 @@ impl Actor {
         // The host is back, so the wait is over — whatever it decides next is
         // an ordinary consent or an ordinary device password, and this node has
         // no business dialing it again unasked if the answer is no (ADR 0084).
-        self.stop_reconnect_wait();
+        // A resume is the exception: the answer is a `ConsentGrant` or a
+        // closed connection, and the wait is what reads either (ADR 0089).
+        if !resuming {
+            self.stop_reconnect_wait();
+        }
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
         // ticket is the only place this address is known without discovery,
@@ -13077,7 +13496,11 @@ impl Actor {
         // Remembered so the history row written when this session ends can dial
         // the same host again (ADR 0016).
         self.host_invites.insert(peer, code);
-        self.connect_phase = ConnectPhase::AwaitingConsent;
+        self.connect_phase = if resuming {
+            ConnectPhase::Resuming
+        } else {
+            ConnectPhase::AwaitingConsent
+        };
         self.connect_peer = Some(peer);
         // Guest side: this node is the one that *receives* `MediaUnavailable`,
         // so there is no peer capability to remember here.
@@ -13797,6 +14220,7 @@ async fn handshake_and_dispatch(
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
+            resume_claim,
         }) => ActorEvent::Handshaked {
             connection,
             peer,
@@ -13817,6 +14241,7 @@ async fn handshake_and_dispatch(
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
+            resume_claim,
             ticket: *ticket,
         },
         Some(Accepted::Media { connection, peer }) => {
@@ -13992,6 +14417,7 @@ async fn classify_incoming(
             .iter()
             .any(|feature| feature == FEATURE_DISPLAY_MODE),
         guest_codec_support: GuestCodecSupport::from_features(&hello.features),
+        resume_claim: hello.resume_claim,
         connection: Box::new(control),
         peer,
         ticket: Box::new(ticket),
@@ -14023,6 +14449,7 @@ async fn dial_over_plan(
     proof: Vec<u8>,
     tag: &str,
     codecs: GuestCodecSupport,
+    resume: Option<[u8; 16]>,
 ) -> DialOutcome {
     let mut stage = plan.first;
     let mut rest = plan.rest.into_iter();
@@ -14035,6 +14462,7 @@ async fn dial_over_plan(
             proof.clone(),
             tag,
             codecs,
+            resume,
         )
         .await
         {
@@ -14127,6 +14555,7 @@ async fn dial_with_retries(
     proof: Vec<u8>,
     tag: &str,
     codecs: GuestCodecSupport,
+    resume: Option<[u8; 16]>,
 ) -> Result<ControlConnection, NetError> {
     let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
     let mut last = NetError::Dial("no attempt was made".to_owned());
@@ -14140,7 +14569,7 @@ async fn dial_with_retries(
         let by_lookup = attempt.is_multiple_of(2);
         let outcome = tokio::time::timeout(
             attempt_budget,
-            connect_once(dialer, by_lookup, role, proof.clone(), codecs),
+            connect_once(dialer, by_lookup, role, proof.clone(), codecs, resume),
         )
         .await
         .unwrap_or_else(|_| {
@@ -14188,6 +14617,7 @@ async fn connect_once(
     role: Role,
     proof: Vec<u8>,
     codecs: GuestCodecSupport,
+    resume: Option<[u8; 16]>,
 ) -> Result<ControlConnection, NetError> {
     let connection = dialer.connect_control(by_lookup).await?;
     // What this build understands, for a host to decide what it may send.
@@ -14216,7 +14646,7 @@ async fn connect_once(
     // built before ADR 0067 is: H.264, with no `MediaCodec` message sent to
     // it at all.
     features.extend(codecs.features());
-    lumepeer_net::guest_handshake(connection, role, proof, features).await
+    lumepeer_net::guest_resume_handshake(connection, role, proof, features, resume).await
 }
 
 /// Where the host's address book lives, if the config directory resolves at
@@ -14564,6 +14994,7 @@ pub fn spawn_actor_with(
         reboot_generation: 0,
         reconnect_wait: None,
         reconnect_wait_generation: 0,
+        parked_sessions: std::collections::HashMap::new(),
         terminal_to_host: std::collections::HashMap::new(),
         terminals: std::collections::HashMap::new(),
         terminal_backlog: std::collections::HashMap::new(),
@@ -18448,6 +18879,239 @@ mod tests {
                 Err(ActorError::UnknownPeer)
             ),
             "a label that names no remembered host must dial nothing"
+        );
+    }
+
+    /// §10, ADR 0089: a link that drops mid-session comes back as the same
+    /// session. Nobody at the host is asked again, the independent grants the
+    /// host gave are still given, and the guest's window opens again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_link_resumes_the_session_with_its_grants_and_asks_nobody() {
+        let (host, _host_endpoint, host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        host.set_grant(label.clone(), IndependentGrant::Recording, true)
+            .await
+            .unwrap();
+        wait_until("the guest never became a viewer", || {
+            viewers(&host_capture) == 1
+        })
+        .await;
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let rows = host.status().await.unwrap();
+            assert!(
+                rows.iter().all(|row| row.state != SessionStateDto::Pending),
+                "a resume must not become a consent request"
+            );
+            if guest.connect_state().await.unwrap().phase == ConnectPhase::Connected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session never came back"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let rows = host.status().await.unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.label == label)
+            .expect("the resumed session is the same peer's");
+        assert_eq!(row.state, SessionStateDto::Active);
+        assert_eq!(row.role, Role::ViewOnly);
+        assert!(
+            row.grants.recording,
+            "a grant the host gave before the drop is still given after it"
+        );
+        wait_until("the guest's window did not open again", || {
+            recorder.opened().len() == 2
+        })
+        .await;
+        wait_until("the resumed guest is not a viewer again", || {
+            viewers(&host_capture) == 1
+        })
+        .await;
+    }
+
+    /// ADR 0089: a resume claim from a key that holds no session is closed
+    /// with `RESUME_REFUSED`, and nothing appears on the host's screen — a
+    /// claim is not a way to raise a consent request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_claim_for_no_session_is_refused_and_raises_nothing() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let ticket = InviteTicket::from_code(&invite.code).unwrap();
+        let addr = ticket.endpoint_addr().unwrap();
+
+        let stranger = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let control = lumepeer_net::guest_resume_handshake(
+            stranger.connect_control(addr).await.unwrap(),
+            Role::ViewOnly,
+            postcard::to_allocvec(&ticket).unwrap(),
+            Vec::new(),
+            Some([7u8; 16]),
+        )
+        .await
+        .unwrap();
+        let connection = control.connection().clone();
+        let (mut reader, _writer) = control.split();
+        let ended = tokio::time::timeout(TIMEOUT, reader.recv())
+            .await
+            .expect("the host kept a refused claim open");
+        assert!(ended.is_err(), "the host answered a claim it cannot honour");
+        assert!(connection.closed_by_peer_with(lumepeer_net::connection::CLOSE_RESUME_REFUSED));
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.state != SessionStateDto::Pending),
+            "a refused claim must not queue a request"
+        );
+    }
+
+    /// ADR 0089: the guest lost its link but the host has not noticed yet. A
+    /// claim naming the connection the host still holds is what proves that
+    /// connection dead: the host lets go of it and resumes on the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_replaces_a_connection_the_host_has_not_seen_drop() {
+        use lumepeer_core::protocol::MessageKind;
+
+        async fn until_grant(reader: &mut lumepeer_net::ControlReader) -> Role {
+            loop {
+                if let MessageKind::ConsentGrant(role) = reader.recv().await.unwrap().kind {
+                    return role;
+                }
+            }
+        }
+
+        let (host, _host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let ticket = InviteTicket::from_code(&invite.code).unwrap();
+        let addr = ticket.endpoint_addr().unwrap();
+        let proof = postcard::to_allocvec(&ticket).unwrap();
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+
+        let first = lumepeer_net::guest_handshake(
+            guest.connect_control(addr.clone()).await.unwrap(),
+            Role::ViewOnly,
+            proof.clone(),
+            vec![FEATURE_UNATTENDED.to_owned()],
+        )
+        .await
+        .unwrap();
+        let claim = first.session_id();
+        let (mut first_reader, _first_writer) = first.split();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        tokio::time::timeout(TIMEOUT, until_grant(&mut first_reader))
+            .await
+            .unwrap();
+
+        // The first connection is still open on both ends: nothing dropped as
+        // far as the host can tell.
+        let second = lumepeer_net::guest_resume_handshake(
+            guest.connect_control(addr).await.unwrap(),
+            Role::ViewOnly,
+            proof,
+            vec![FEATURE_UNATTENDED.to_owned()],
+            Some(claim),
+        )
+        .await
+        .unwrap();
+        let (mut second_reader, _second_writer) = second.split();
+        let role = tokio::time::timeout(TIMEOUT, until_grant(&mut second_reader))
+            .await
+            .expect("the claim was not honoured");
+        assert_eq!(role, Role::ViewOnly);
+
+        let ended = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                if first_reader.recv().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the connection the claim replaced was left open"
+        );
+        let rows = host.status().await.unwrap();
+        assert!(rows.iter().all(|row| row.state != SessionStateDto::Pending));
+        assert!(
+            rows.iter()
+                .any(|row| row.label == label && row.state == SessionStateDto::Active)
+        );
+    }
+
+    /// ADR 0089: a guest that stops resuming and connects again gets a new
+    /// session — asked for, like any other — and the one that dropped does not
+    /// come back behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connecting_again_instead_of_resuming_asks_for_consent() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code.clone()).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+        guest.connect_cancel().await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while host
+            .status()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.state == SessionStateDto::Active)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host never saw the link drop"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        guest.invite_connect(invite.code).await.unwrap();
+        tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("a new connection must ask again, not walk into the old session");
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.state != SessionStateDto::Active),
+            "the dropped session came back behind a new request"
         );
     }
 
