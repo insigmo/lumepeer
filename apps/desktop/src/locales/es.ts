@@ -120,6 +120,8 @@ export const es: Dictionary = {
   'status.notReady': 'No listo para conectar',
   'status.noCapture':
     'Este dispositivo no admite la captura de pantalla, por lo que quien invite no verá nada. Las sesiones se conectan igualmente y la entrada sigue funcionando.',
+  'status.noCapture.chromeos':
+    'Este dispositivo ejecuta Linux dentro de ChromeOS y las aplicaciones de ahí no pueden ver la pantalla de ChromeOS, por lo que quien invite no verá nada. Conectarse desde aquí a otros dispositivos funciona con normalidad.',
   'status.noEncoder':
     'Este dispositivo no tiene codificador de vídeo, por lo que quien invite no verá nada. Las sesiones se conectan igualmente y la entrada sigue funcionando.',
   'titlebar.minimize': 'Minimizar',

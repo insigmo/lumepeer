@@ -668,6 +668,53 @@ pub fn detect_session_type() -> SessionType {
     )
 }
 
+/// Where ChromeOS's container manager puts the ChromeOS milestone inside every
+/// Linux container it runs (Crostini).
+///
+/// `tremplin`, the daemon that creates those containers, bind-mounts it from
+/// its VM's `/run/cros_milestone` as a device of the container profile, so the
+/// file is ChromeOS's own statement that this is one of its containers rather
+/// than a guess from a desktop name or a hostname.
+#[cfg(all(target_os = "linux", not(target_os = "android")))]
+const CHROMEOS_CONTAINER_MARKER: &str = "/dev/.cros_milestone";
+
+/// Whether this process runs inside ChromeOS's Linux container (Crostini),
+/// where no capture path can reach the ChromeOS screen (gap-tasks/05;
+/// `docs/platform-support.md`).
+///
+/// A container app's display is Sommelier, a proxy compositor that hands it
+/// its own surfaces and, by ChromeOS's design, nothing of the desktop behind
+/// them. So hosting from here is not a backend that is missing but one that
+/// would lie: an X11 capture opens, and sends Xwayland's rootless root window.
+/// Always `false` off Linux.
+#[must_use]
+pub fn inside_chromeos_container() -> bool {
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    {
+        std::path::Path::new(CHROMEOS_CONTAINER_MARKER).exists()
+    }
+    #[cfg(not(all(target_os = "linux", not(target_os = "android"))))]
+    {
+        false
+    }
+}
+
+/// The refusal [`platform_backend`] answers with inside ChromeOS's container.
+///
+/// Refused as [`MediaError::CaptureUnavailable`], the same answer a build with
+/// no backend gives, so everything downstream already says the honest thing:
+/// this host's own window warns that a guest will see nothing, and a guest is
+/// told `NoCaptureBackend` instead of watching a frozen screen (§18, ADR 0024).
+fn refuse_inside_chromeos_container(inside: bool) -> Result<()> {
+    if inside {
+        return Err(MediaError::CaptureUnavailable(
+            "this Linux runs inside a ChromeOS container, which cannot see the ChromeOS screen"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// The platform's capture backend and, where the two cannot be built apart,
 /// the injector that shares its session (§11, ADR 0010).
 ///
@@ -692,6 +739,10 @@ pub type PlatformBackend = (Box<dyn ScreenCapturer>, Option<Box<dyn InputInjecto
 /// [`MediaError::CaptureUnavailable`] when no capture backend is compiled in
 /// for this target.
 pub fn platform_backend() -> Result<PlatformBackend> {
+    // Before any backend is tried: inside ChromeOS's container the X11 path
+    // would open and send Xwayland's own empty root window, which is a
+    // picture of nothing presented as the screen (gap-tasks/05).
+    refuse_inside_chromeos_container(inside_chromeos_container())?;
     #[cfg(all(
         target_os = "linux",
         not(target_os = "android"),
@@ -1029,6 +1080,18 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// gap-tasks/05: inside ChromeOS's container the host role is refused the
+    /// way a missing backend is, so the honest "no picture" path runs instead
+    /// of a capture of Xwayland's empty root window.
+    #[test]
+    fn a_chromeos_container_is_refused_as_having_no_capture() {
+        assert!(matches!(
+            refuse_inside_chromeos_container(true),
+            Err(MediaError::CaptureUnavailable(_))
+        ));
+        assert!(refuse_inside_chromeos_container(false).is_ok());
+    }
 
     /// Capturer that counts starts and stops and always yields the same frame.
     #[derive(Debug, Default)]

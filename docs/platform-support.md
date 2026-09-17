@@ -306,9 +306,23 @@ picture — just the wrong one, the container's own composited output rather
 than the ChromeOS desktop the operator thinks they are sharing. Recognizing
 that specific case (running inside a Crostini container at all, versus a
 real Linux desktop) is new detection work, not a rewire of an existing
-switch, and this batch's file list for Task 2 is `docs/` only — no UI code
-is included in what was authorized here. That is flagged as a follow-up,
-not attempted in this session.
+switch, and this batch's file list for Task 2 was `docs/` only.
+
+**That follow-up is now done in code, and still not run on a device.**
+`lumepeer_media::capture::inside_chromeos_container()` looks for
+`/dev/.cros_milestone` — not a heuristic: `tremplin`, the daemon that
+creates Crostini containers, bind-mounts that file into every container it
+starts from its VM's `/run/cros_milestone`
+([tremplin `main.go`](https://chromium.googlesource.com/chromiumos/platform/tremplin/+/42d020e1b9c64d146390c97b14e415600473fd84/src/chromiumos/tremplin/main.go)).
+When it is there, `platform_backend()` refuses before any backend is tried,
+with the same `CaptureUnavailable` a build without a capture backend gives —
+so the host never sends Xwayland's rootless root window as if it were the
+screen, a connecting guest is told `NoCaptureBackend` (ADR 0024), and the
+host's own window says why in words a person can act on: this Linux runs
+inside ChromeOS and cannot see its screen, and connecting *to* other devices
+from here works as usual. The guest role is untouched. Whether the marker is
+present on a current ChromeOS release, and what the window looks like there,
+is exactly what a Chromebook would still have to confirm.
 
 ### Guest role: expected to work, unverified
 

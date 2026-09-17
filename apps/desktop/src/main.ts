@@ -64,6 +64,10 @@ let savedDevices: AddressBookEntry[] = [];
 // `network_status` says otherwise, so a host that is fine shows no warning.
 let canCapture = true;
 let canEncode = true;
+// Whether this machine is a Linux container inside ChromeOS, which is the one
+// "no capture" a person can act on: host from ChromeOS itself instead
+// (gap-tasks/05).
+let chromeosContainer = false;
 // When each peer last synced a clipboard, by pseudonymized label. Only the
 // timestamp is kept: `clipboard_pull` hands back the text, and this is where
 // that text stops — nothing renders it and nothing stores it (§15).
@@ -127,7 +131,11 @@ function mediaWarning(): TemplateResult | typeof nothing {
   if (canCapture && canEncode) {
     return nothing;
   }
-  const key = canCapture ? 'status.noEncoder' : 'status.noCapture';
+  const key = canCapture
+    ? 'status.noEncoder'
+    : chromeosContainer
+      ? 'status.noCapture.chromeos'
+      : 'status.noCapture';
   return html`<p class="media-warning" role="status" aria-live="polite">${t(locale, key)}</p>`;
 }
 
@@ -325,7 +333,12 @@ async function refresh(): Promise<void> {
       await Promise.all([
         invoke<SessionStatus[]>('session_status'),
         invoke<HistoryEntry[]>('connection_history'),
-        invoke<{ ready: boolean; can_capture: boolean; can_encode: boolean }>('network_status'),
+        invoke<{
+          ready: boolean;
+          can_capture: boolean;
+          can_encode: boolean;
+          capture_unavailable_reason: 'chromeos-container' | null;
+        }>('network_status'),
         invoke<{
           phase: ConnectPhase;
           pending: boolean;
@@ -383,6 +396,7 @@ async function refresh(): Promise<void> {
     networkReady = networkResult.ready;
     canCapture = networkResult.can_capture;
     canEncode = networkResult.can_encode;
+    chromeosContainer = networkResult.capture_unavailable_reason === 'chromeos-container';
     // The peer the drawer is open on ended its session: close rather than
     // leave a transcript poll spinning on a dead label (the poll itself stops
     // on the first IPC error, but this keeps the UI honest immediately).

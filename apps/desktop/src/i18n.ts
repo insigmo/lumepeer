@@ -172,6 +172,7 @@ export type TranslationKey =
   | 'status.ready'
   | 'status.notReady'
   | 'status.noCapture'
+  | 'status.noCapture.chromeos'
   | 'status.noEncoder'
   | 'titlebar.minimize'
   | 'titlebar.maximize'

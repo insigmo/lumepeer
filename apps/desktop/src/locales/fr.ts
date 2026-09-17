@@ -120,6 +120,8 @@ export const fr: Dictionary = {
   'status.notReady': 'Pas prêt à se connecter',
   'status.noCapture':
     "Cet appareil ne prend pas en charge la capture d'écran, les personnes invitées ne verront donc rien. Les sessions se connectent tout de même, et la saisie fonctionne toujours.",
+  'status.noCapture.chromeos':
+    "Cet appareil exécute Linux dans ChromeOS, et les applications qui s'y trouvent ne peuvent pas voir l'écran de ChromeOS, les personnes invitées ne verront donc rien. Se connecter à d'autres appareils depuis celui-ci fonctionne normalement.",
   'status.noEncoder':
     "Cet appareil n'a pas d'encodeur vidéo, les personnes invitées ne verront donc rien. Les sessions se connectent tout de même, et la saisie fonctionne toujours.",
   'titlebar.minimize': 'Réduire',

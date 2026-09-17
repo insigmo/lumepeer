@@ -120,6 +120,8 @@ export const pt: Dictionary = {
   'status.notReady': 'Não está pronto para conectar',
   'status.noCapture':
     'Este dispositivo não tem suporte para captura de tela, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
+  'status.noCapture.chromeos':
+    'Este dispositivo executa o Linux dentro do ChromeOS, e os apps ali não conseguem ver a tela do ChromeOS, então quem você convidar não verá nada. Conectar-se daqui a outros dispositivos funciona normalmente.',
   'status.noEncoder':
     'Este dispositivo não tem codificador de vídeo, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
   'titlebar.minimize': 'Minimizar',

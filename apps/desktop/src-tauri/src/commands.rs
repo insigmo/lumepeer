@@ -585,6 +585,12 @@ pub struct NetworkStatusDto {
     /// ever built inside a session, so nothing has been asked yet on a host
     /// nobody has connected to.
     pub can_encode: bool,
+    /// Why `can_capture` is false, when that is something a person can act
+    /// on rather than a build without a backend: `chromeos-container` for a
+    /// Linux container inside ChromeOS (Crostini), which cannot see the
+    /// ChromeOS screen, so hosting has to happen somewhere else (gap-tasks/05).
+    /// `null` otherwise.
+    pub capture_unavailable_reason: Option<&'static str>,
 }
 
 /// What one live connection's link actually looks like (§18; ADR 0026,
@@ -1161,6 +1167,8 @@ pub fn network_status(
         ready: state.network.online(),
         can_capture: health.can_capture(),
         can_encode: health.can_encode(),
+        capture_unavailable_reason: lumepeer_media::capture::inside_chromeos_container()
+            .then_some("chromeos-container"),
     })
 }
 
