@@ -343,6 +343,7 @@ export const tr: Dictionary = {
   'quality.bitrateLabel': 'Gönderim hızı',
   'quality.fpsLabel': 'Kare hızı',
   'quality.relayLabel': 'Aktarıcı bölgesi',
+  'quality.codecLabel': 'Video kodeki',
   'quality.ms': (value) => `${value} ms`,
   'quality.percent': (value) => `%${value}`,
   'quality.kbps': (value) => `${value} kbit/sn`,

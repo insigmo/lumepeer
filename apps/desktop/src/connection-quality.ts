@@ -32,6 +32,9 @@ export type PathKind = 'direct' | 'relay' | 'mixed' | 'unknown';
  */
 export type TransportKind = 'iroh' | 'obfuscated';
 
+/** A video codec, as the Rust side names it (§11; ADR 0067). */
+export type VideoCodec = 'h264' | 'av1' | 'vp9';
+
 /** One transport the connect tried and gave up on before this session. */
 export interface TransportFallback {
   transport: TransportKind;
@@ -62,6 +65,11 @@ export interface ConnectionStats {
   bitrate_kbps: number | null;
   /** Frame rate this machine is sending at, or null when watching. */
   fps: number | null;
+  /**
+   * Codec the picture travels in, on either side of the session, or null
+   * while no picture does (gap-tasks/06; ADR 0067).
+   */
+  codec: VideoCodec | null;
 }
 
 const PATH_KEY: Readonly<Record<PathKind, TranslationKey>> = {
@@ -69,6 +77,17 @@ const PATH_KEY: Readonly<Record<PathKind, TranslationKey>> = {
   relay: 'quality.path.relay',
   mixed: 'quality.path.mixed',
   unknown: 'quality.path.unknown',
+};
+
+/**
+ * What each codec is called. Not localized: H.264, AV1 and VP9 are the
+ * codecs' own names in every language, the way a relay region is shown as
+ * the region's own code.
+ */
+const CODEC_NAME: Readonly<Record<VideoCodec, string>> = {
+  h264: 'H.264',
+  av1: 'AV1',
+  vp9: 'VP9',
 };
 
 /** What each transport is called, for the row that says one was given up on. */
@@ -173,6 +192,7 @@ export function connectionQuality(
           measured(stats.bitrate_kbps, locale, 'quality.kbps'),
         )}
         ${detail(locale, 'quality.fpsLabel', measured(stats.fps, locale, 'quality.fpsValue'))}
+        ${stats.codec ? detail(locale, 'quality.codecLabel', CODEC_NAME[stats.codec]) : html``}
         ${stats.relay_region
           ? detail(locale, 'quality.relayLabel', stats.relay_region)
           : html``}

@@ -343,6 +343,7 @@ export const fr: Dictionary = {
   'quality.bitrateLabel': "Débit d'envoi",
   'quality.fpsLabel': 'Fréquence d\'images',
   'quality.relayLabel': 'Région du relais',
+  'quality.codecLabel': 'Codec vidéo',
   'quality.ms': (value) => `${value} ms`,
   'quality.percent': (value) => `${value} %`,
   'quality.kbps': (value) => `${value} kbit/s`,

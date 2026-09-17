@@ -327,6 +327,7 @@ export const zh: Dictionary = {
   'quality.bitrateLabel': '发送速率',
   'quality.fpsLabel': '帧率',
   'quality.relayLabel': '中继区域',
+  'quality.codecLabel': '视频编解码器',
   'quality.ms': (value) => `${value} 毫秒`,
   'quality.percent': (value) => `${value}%`,
   'quality.kbps': (value) => `${value} kbit/s`,

@@ -340,6 +340,7 @@ export const ru: Dictionary = {
   'quality.bitrateLabel': 'Скорость отправки',
   'quality.fpsLabel': 'Частота кадров',
   'quality.relayLabel': 'Регион ретранслятора',
+  'quality.codecLabel': 'Видеокодек',
   'quality.ms': (value) => `${value} мс`,
   'quality.percent': (value) => `${value}%`,
   'quality.kbps': (value) => `${value} кбит/с`,

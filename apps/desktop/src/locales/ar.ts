@@ -333,6 +333,7 @@ export const ar: Dictionary = {
   'quality.bitrateLabel': 'معدل الإرسال',
   'quality.fpsLabel': 'معدل الإطارات',
   'quality.relayLabel': 'منطقة خادم الترحيل',
+  'quality.codecLabel': 'ترميز الفيديو',
   'quality.ms': (value) => `${value} م.ث`,
   'quality.percent': (value) => `${value}٪`,
   'quality.kbps': (value) => `${value} ك.بت/ث`,

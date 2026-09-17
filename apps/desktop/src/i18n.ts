@@ -381,6 +381,7 @@ export type TranslationKey =
   | 'quality.bitrateLabel'
   | 'quality.fpsLabel'
   | 'quality.relayLabel'
+  | 'quality.codecLabel'
   | 'quality.ms'
   | 'quality.percent'
   | 'quality.kbps'

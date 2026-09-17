@@ -334,6 +334,7 @@ export const ja: Dictionary = {
   'quality.bitrateLabel': '送信速度',
   'quality.fpsLabel': 'フレームレート',
   'quality.relayLabel': 'リレー地域',
+  'quality.codecLabel': '映像コーデック',
   'quality.ms': (value) => `${value} ms`,
   'quality.percent': (value) => `${value}%`,
   'quality.kbps': (value) => `${value} kbit/s`,
