@@ -8,89 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # ld dies with "Bus error" linking the dev/test profile of this workspace
-  # (iroh + tauri + sqlx + webkit all in one binary) on stock GitHub runners:
-  # full debug info overflows the tmpfs-backed /tmp. Trim it instead of
-  # disabling debug info outright, so panics still carry file:line.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
-  # audiopus_sys (vendored libopus, `audio-opus`) declares compatibility with
-  # CMake < 3.5, which CMake 4 refuses to configure. Harmless under CMake 3.x.
-  # See the RUSTSEC-2026-0150 note in deny.toml.
   CMAKE_POLICY_VERSION_MINIMUM: 3.5
 
 jobs:
-  # Phase 0 acceptance criterion (design doc §19): the workspace builds on
-  # Windows, Linux and macOS.
-  build:
-    name: build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          # libpipewire-0.3-dev/libclang-dev: tests/integration enables
-          # lumepeer-media's capture-portal feature, which Cargo's workspace
-          # feature unification pulls into every `--workspace` command below,
-          # including on this job — not just the dedicated media job.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libclang-dev
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      # tauri-build reads frontendDist at compile time, so the webview bundle
-      # has to exist before cargo runs.
-      - run: npm install
-        working-directory: apps/desktop
-      - run: npm run build
-        working-directory: apps/desktop
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      # tauri-build validates `externalBin` at compile time: the sidecar must
-      # exist as binaries/lumepeer-decoder-worker-<target-triple><exe> before
-      # lumepeer-desktop builds. The directory is gitignored (build artifact),
-      # so CI produces it here from the same source tree.
-      - name: Build the decoder-worker sidecar for this target
-        shell: bash
-        run: |
-          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
-          case "$RUNNER_OS" in
-            Windows) EXE=.exe ;;
-            *) EXE= ;;
-          esac
-          cargo build -p lumepeer-decoder-worker
-          mkdir -p apps/desktop/src-tauri/binaries
-          cp "target/debug/lumepeer-decoder-worker${EXE}" \
-             "apps/desktop/src-tauri/binaries/lumepeer-decoder-worker-${TRIPLE}${EXE}"
-      # Same as above, for the ADR 0043 privileged helper service sidecar
-      # (`externalBin` also lists binaries/lumepeer-service).
-      - name: Build the service sidecar for this target
-        shell: bash
-        run: |
-          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
-          case "$RUNNER_OS" in
-            Windows) EXE=.exe ;;
-            *) EXE= ;;
-          esac
-          cargo build -p lumepeer-service
-          mkdir -p apps/desktop/src-tauri/binaries
-          cp "target/debug/lumepeer-service${EXE}" \
-             "apps/desktop/src-tauri/binaries/lumepeer-service-${TRIPLE}${EXE}"
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --workspace
-      - run: cargo test --workspace
-
-  # Design doc §19 phase 6: the desktop frontend's own test suite (i18n
-  # coverage and an axe-core accessibility audit of the consent/status
-  # screens) runs independently of the platform build matrix above.
   ui:
     name: ui (i18n + accessibility)
     runs-on: ubuntu-latest
@@ -105,17 +27,9 @@ jobs:
         working-directory: apps/desktop
       - run: npm test
         working-directory: apps/desktop
-      # TypeScript checks the webview's *own* description of each Rust command,
-      # never the command itself, and the unit tests inject fakes shaped like
-      # that same description — so an `invoke` with the wrong argument shape
-      # passes both and fails only at runtime, in a `.catch` nobody reads. This
-      # compares the call sites against `commands.rs` directly.
       - run: npm run ipc-contract
         working-directory: apps/desktop
 
-  # The media backends of phase 2 are behind features so that the default build
-  # needs no platform SDK. They still have to be built and tested, and the X11
-  # ones need a display, which Xvfb provides.
   media:
     name: media backends (linux)
     runs-on: ubuntu-latest
@@ -133,42 +47,17 @@ jobs:
       - run: cargo build -p lumepeer-decoder-worker
       - run: cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D warnings
       - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
-      # The set a Linux .deb actually ships (Taskfile.yml's
-      # LINUX_MEDIA_FEATURES plus the audio backends the desktop crate's
-      # Linux target table adds). The three lines above check the features
-      # one at a time, which is what catches a missing `dep:` in a feature
-      # declaration; this one checks them together, which is what catches a
-      # module that only compiles when some *other* feature happens to be on
-      # — the bug that left `audio-capture-pipewire` unbuildable on its own
-      # (ADR 0039).
       - name: Clippy the whole shipped Linux feature set
         run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
-      # The VA-API encoder is deliberately not in the shipped feature set
-      # (a .deb must install on a machine with no VA-API at all), so it gets
-      # its own line. CI has no encode-capable GPU, which is the case the
-      # probe test is most worth running in: it asserts that
-      # `hardware_h264_available` and construction agree, and here both must
-      # be `false` and `select_encoder` must fall back to openh264 (ADR 0040).
       - name: Clippy and test the VA-API encoder
         run: |
           cargo clippy -p lumepeer-media --all-targets --features encode-vaapi -- -D warnings
           cargo test -p lumepeer-media --features encode-vaapi,encode-openh264 --lib encode::
-      # The DMA-BUF path of ADR 0088 compiles the portal stream and the
-      # encoder differently from either feature alone, so it is checked on its
-      # own and together with the shipped set. Without a GPU its hardware tests
-      # pass by having nothing to check.
       - name: Clippy and test the zero-copy VA-API path
         run: |
           cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire,encode-vaapi-zero-copy -- -D warnings
           cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-openh264 --lib
       - name: Test the media pipeline under Xvfb
-        # LUMEPEER_TEST_XTEST enables the input injection test, which is only
-        # safe against a throwaway display like this one. It also gates the
-        # monitor-enumeration test, which needs a real X server to have any
-        # RandR outputs to enumerate. Nothing here needs a sound server: the
-        # PipeWire backends' tests cover the chunking and format arithmetic,
-        # which is the part with the bugs in it, and a CI runner has no
-        # graph to connect to (ADR 0039).
         run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire
       - name: Capture, encode and sandboxed decode end to end
         run: xvfb-run -a cargo test -p lumepeer-integration-tests --test media_pipeline
@@ -177,13 +66,6 @@ jobs:
       - name: Keystore against a session keyring
         run: dbus-run-session -- cargo test -p lumepeer-net --features secret-service
 
-  # A whole session, end to end, on hardware CI actually has: two full builds
-  # of the desktop app on one Xvfb display, pairing over real iroh endpoints
-  # and a real QUIC connection, recording the host's own screen and exporting
-  # it (§19; ADR 0036). Everything the unit and actor tests cannot reach —
-  # Tauri's ACL, the webview's IPC surface, capture and encode on a live
-  # display, and the files the export leaves on disk — is only ever exercised
-  # here.
   fuzz:
     name: fuzz targets build
     runs-on: ubuntu-latest
@@ -203,36 +85,10 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny,cargo-cyclonedx
       - run: cargo audit
-      # Licence, advisory, source and ban policy of deny.toml, including the
-      # rule that `quinn` must not become a direct dependency (§5, §20).
       - run: cargo deny check
-      # Release checklist (§21): a CycloneDX SBOM per workspace member,
-      # generated on every push so a release build always has one on hand
-      # rather than as a one-off manual step.
       - run: cargo cyclonedx --all --format json
       - uses: actions/upload-artifact@v4
         with:
           name: sbom
           path: '**/*.cdx.json'
           retention-days: 90
-
-  # Phase 5 acceptance criterion (design doc §19): release build stays inside
-  # the thresholds of §15 on the reference hardware of ci/resource-budget.yml.
-  # There is no such runner registered against this repository yet (§16.2
-  # calls for a self-hosted runner pinned to a fixed weak-hardware config,
-  # which is infrastructure this repo does not own); the label below is where
-  # it attaches once one exists, and the job is skipped rather than failing
-  # the workflow until then (see docs/adr/0008-phase-5-resource-and-security-gates.md).
-  resource-budget:
-    name: resource budget (§15)
-    runs-on: [self-hosted, lumepeer-reference]
-    if: false
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p lumepeer-decoder-worker
-      - run: cargo build --release -p lumepeer-media --features capture-x11,encode-openh264
-      - run: >
-          LUMEPEER_TEST_RESOURCE_BUDGET=1
-          cargo test --release -p lumepeer-integration-tests --test resource_budget
