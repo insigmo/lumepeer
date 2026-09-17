@@ -3633,6 +3633,36 @@ const fn wire_media_codec(codec: VideoCodec) -> MediaCodec {
     }
 }
 
+/// The monitors of `found` that `MonitorsList` is allowed to carry (§11;
+/// ADR 0028).
+///
+/// `lumepeer_media` models "this host has a screen but nothing has told us its
+/// size yet" as a monitor of 0x0 — which a Wayland host reports for real until
+/// its portal stream is negotiated, and which a host with no session at all
+/// (a headless CI runner, a service before anyone has logged in) reports
+/// forever. The wire has no way to say that: `MessageEnvelope::check_limits`
+/// rejects a zero-sized monitor as malformed, and a malformed frame is a §9.1
+/// protocol fault, so the guest does not ignore the announcement — it records
+/// a violation and drops the control connection, taking the session down with
+/// it moments after consent was granted.
+///
+/// So the unsized ones are dropped here, at the boundary between what this
+/// host knows and what it may claim. A guest that is told about fewer screens
+/// than exist has a shorter picker; a guest that is told about a 0x0 screen
+/// has no session.
+fn wire_monitors(found: Vec<lumepeer_media::capture::HostMonitor>) -> Vec<MonitorInfo> {
+    found
+        .into_iter()
+        .filter(|monitor| monitor.width != 0 && monitor.height != 0)
+        .map(|monitor| MonitorInfo {
+            id: monitor.id,
+            width: monitor.width,
+            height: monitor.height,
+            primary: monitor.primary,
+        })
+        .collect()
+}
+
 /// The codec the diagnostics panel names for one connection, if any picture
 /// is travelling on it (§11, §18; ADR 0067).
 ///
@@ -10538,20 +10568,20 @@ impl Actor {
             return;
         }
         let monitors = match crate::view::host_monitors() {
-            Ok(found) => found
-                .into_iter()
-                .map(|monitor| MonitorInfo {
-                    id: monitor.id,
-                    width: monitor.width,
-                    height: monitor.height,
-                    primary: monitor.primary,
-                })
-                .collect::<Vec<_>>(),
+            Ok(found) => wire_monitors(found),
             Err(error) => {
                 tracing::warn!(peer = %label, %error, "cannot enumerate this host's monitors");
                 return;
             }
         };
+        // Nothing to say is said by saying nothing. A `MonitorsList` with no
+        // entries would read to the guest as "this host has no screens", which
+        // is a different and untrue claim from "this host cannot size its
+        // screens yet" (§18).
+        if monitors.is_empty() {
+            tracing::debug!(peer = %label, "not announcing screens: none of them could be sized");
+            return;
+        }
         tracing::debug!(peer = %label, count = monitors.len(), "announcing this host's screens");
         self.send_to(&peer, MessageKind::MonitorsList { monitors });
     }
@@ -10583,7 +10613,14 @@ impl Actor {
             // wire: nothing else tells this guest's UI why the selector it
             // renders has nothing in it (§18).
             (Vec::new(), Some(DisplayModeUnavailableReason::NotGranted))
-        } else if !lumepeer_media::capture::display_modes_supported() {
+        } else if !lock_capture(&self.capture).display_modes_supported() {
+            // Asked of the capture backend this host is actually running, not
+            // of the platform: `capture::display_modes_supported` re-derives
+            // which backend a session *would* resolve to, which is a second
+            // copy of that decision and is answerable without a backend at
+            // all — so a test harness with its own capturer could never be
+            // heard, and the wiring below could only ever be exercised on a
+            // platform that happens to say yes.
             (
                 Vec::new(),
                 Some(DisplayModeUnavailableReason::PlatformUnsupported),
@@ -15551,6 +15588,63 @@ mod tests {
         assert_eq!(wire_media_codec(VideoCodec::H264).to_wire(), 0);
     }
 
+    /// A host that cannot size a screen announces fewer screens rather than an
+    /// unsized one.
+    ///
+    /// The consequence is the whole point, so it is asserted rather than
+    /// described: a `MonitorsList` carrying a 0x0 monitor does not survive
+    /// `MessageEnvelope::decode`, and a frame the far end calls malformed is a
+    /// §9.1 protocol fault that costs the session — seconds after the host
+    /// granted it. Every Linux host on a Wayland session reports exactly that
+    /// until its portal stream is negotiated.
+    #[test]
+    fn a_screen_this_host_cannot_size_is_left_out_rather_than_announced_unsized() {
+        let monitor = |id, width, height| lumepeer_media::capture::HostMonitor {
+            id,
+            width,
+            height,
+            primary: id == 0,
+        };
+
+        // The unsized one goes; the real one stays, id and all.
+        let mixed = wire_monitors(vec![monitor(0, 0, 0), monitor(1, 2560, 1440)]);
+        assert_eq!(
+            mixed,
+            vec![MonitorInfo {
+                id: 1,
+                width: 2560,
+                height: 1440,
+                primary: false,
+            }]
+        );
+
+        // A host that could size none of them announces nothing at all, which
+        // `announce_monitors` turns into sending no message: an empty list
+        // would claim this host has no screens, which is a different and
+        // untrue thing to say.
+        assert!(wire_monitors(vec![monitor(0, 0, 0)]).is_empty());
+
+        // And the reason for all of the above.
+        let malformed = lumepeer_core::protocol::MessageEnvelope {
+            session_id: [0; 16],
+            direction: lumepeer_core::protocol::Direction::HostToGuest,
+            seq: 0,
+            kind: MessageKind::MonitorsList {
+                monitors: vec![MonitorInfo {
+                    id: 0,
+                    width: 0,
+                    height: 0,
+                    primary: true,
+                }],
+            },
+            body: Vec::new(),
+        };
+        assert!(matches!(
+            lumepeer_core::protocol::MessageEnvelope::decode(&malformed.encode().unwrap()),
+            Err(CoreError::Malformed)
+        ));
+    }
+
     /// gap-tasks/06: the panel names the codec a picture is travelling in,
     /// and nothing for a stream that carries no picture (ADR 0067).
     #[test]
@@ -15780,6 +15874,14 @@ mod tests {
             _target: CaptureTarget,
         ) -> Vec<lumepeer_media::capture::DisplayMode> {
             self.modes.clone()
+        }
+
+        /// Scripted like everything else here: this stand-in *is* a backend
+        /// that can change modes, on every platform the suite runs on. That is
+        /// the whole reason it exists — the wiring below has to be assertable
+        /// on a headless CI runner, where no real backend says yes.
+        fn display_modes_supported(&self) -> bool {
+            true
         }
 
         fn set_display_mode(
@@ -17134,11 +17236,21 @@ mod tests {
         // is the same call the host makes — which is exactly what hid the old
         // code's mistake: it enumerated on the wrong side and got the same
         // answer.
-        let Ok(expected) = crate::view::host_monitors() else {
+        //
+        // Through `wire_monitors`, because what the host may *announce* is the
+        // thing under test, not what it can see: on a machine with no display
+        // session — a CI runner, a Wayland host before its portal stream is
+        // negotiated — enumeration succeeds and reports an unsized screen,
+        // which is not something `MonitorsList` can carry.
+        let expected = crate::view::host_monitors()
+            .map(wire_monitors)
+            .unwrap_or_default();
+        if expected.is_empty() {
             // This build has no way to enumerate displays at all (a Windows
-            // build without `capture-windows`). There is then nothing honest
-            // to announce, and the picker's empty note is the right answer —
-            // never this machine's own screens dressed up as the host's.
+            // build without `capture-windows`), or no screen it could size.
+            // There is then nothing honest to announce, and the picker's empty
+            // note is the right answer — never this machine's own screens
+            // dressed up as the host's.
             tokio::time::sleep(Duration::from_millis(250)).await;
             assert!(
                 guest
@@ -17152,7 +17264,7 @@ mod tests {
                 "a screen that was never announced was accepted"
             );
             return;
-        };
+        }
 
         // Announced with the grant, so it is already there when the picker
         // opens: there is no request message to send.

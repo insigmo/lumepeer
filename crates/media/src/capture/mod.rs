@@ -477,6 +477,25 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
         Vec::new()
     }
 
+    /// Whether this backend can enumerate and change display modes at all
+    /// (ADR 0048).
+    ///
+    /// The same question [`display_modes_supported`] answers from the
+    /// platform, asked of the backend actually running instead. It is the
+    /// backend that knows: the free function has to re-derive which one a
+    /// session *would* resolve to, and a caller holding a capturer already
+    /// has the answer in its hand.
+    ///
+    /// What it distinguishes is an empty [`Self::display_modes`] that means
+    /// "this platform cannot" from one that means "this monitor reported
+    /// nothing" — `DisplayModeUnavailableReason::PlatformUnsupported` against
+    /// `NoModesReported` (§18). The default is `false`, matching the default
+    /// above: a backend that reports no modes and cannot switch has nothing
+    /// to claim here either.
+    fn display_modes_supported(&self) -> bool {
+        false
+    }
+
     /// Switches the monitor `target` names to `mode` (docs/bugs/
     /// 16-host-display-mode.md #2; ADR 0048).
     ///
@@ -801,55 +820,6 @@ pub fn platform_backend() -> Result<PlatformBackend> {
     Ok((platform_capturer()?, None))
 }
 
-/// Whether the capture backend [`platform_backend`] would actually select
-/// can enumerate or change display modes at all (docs/bugs/
-/// 16-host-display-mode.md; ADR 0048).
-///
-/// Mirrors [`platform_backend`]'s own branching exactly, so this can never
-/// drift from which backend a session actually runs on: Windows can in
-/// principle, a Linux session that would resolve to the portal (Wayland, or
-/// `Unknown` treated as Wayland, ADR 0010) cannot, and an X11 session can.
-/// `false` here is what tells [`crate::error::MediaError`] aside — a caller
-/// uses it to distinguish `DisplayModeUnavailableReason::PlatformUnsupported`
-/// from a genuine `NoModesReported` on a platform that enumerates but finds
-/// nothing for this monitor.
-#[must_use]
-pub fn display_modes_supported() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        true
-    }
-    #[cfg(all(
-        target_os = "linux",
-        not(target_os = "android"),
-        feature = "capture-portal"
-    ))]
-    {
-        !matches!(
-            detect_session_type(),
-            SessionType::Wayland | SessionType::Unknown
-        )
-    }
-    #[cfg(all(
-        target_os = "linux",
-        not(target_os = "android"),
-        not(feature = "capture-portal")
-    ))]
-    {
-        // No portal compiled in at all: `platform_capturer` always returns
-        // `X11Capturer` regardless of session type (ADR 0003), so this build
-        // can attempt enumeration even on a Wayland desktop via Xwayland.
-        cfg!(feature = "capture-x11")
-    }
-    #[cfg(not(any(
-        target_os = "windows",
-        all(target_os = "linux", not(target_os = "android"))
-    )))]
-    {
-        false
-    }
-}
-
 /// Opens the capture backend of the current platform.
 ///
 /// # Errors
@@ -1075,6 +1045,14 @@ impl CaptureController {
     #[must_use]
     pub fn display_modes(&self) -> Vec<DisplayMode> {
         self.capturer.display_modes(self.target)
+    }
+
+    /// Whether the backend behind this controller can change display modes at
+    /// all — [`ScreenCapturer::display_modes_supported`] of the capturer in
+    /// use.
+    #[must_use]
+    pub fn display_modes_supported(&self) -> bool {
+        self.capturer.display_modes_supported()
     }
 
     /// Switches the monitor this controller currently targets to `mode`

@@ -192,7 +192,8 @@ fn capture_follows_the_view_grants_of_the_session_manager() {
 }
 
 /// The real platform backend is exercised where a display exists. On a headless
-/// runner `platform_capturer` or `start` fails and the test stops there.
+/// runner `platform_capturer` or `start` fails, or no frame ever arrives, and
+/// the test stops there.
 #[test]
 fn the_platform_backend_captures_the_real_screen_when_one_exists() {
     let Ok(capturer) = platform_capturer() else {
@@ -203,11 +204,29 @@ fn the_platform_backend_captures_the_real_screen_when_one_exists() {
         return;
     }
 
-    // The very first frame after start is never a duplicate.
-    let frame = controller
-        .next_frame()
-        .unwrap()
-        .expect("the first frame after start cannot be a duplicate");
+    // Polled rather than read once, because not every backend hands the first
+    // frame back on the first call. Windows and X11 pull a frame from the
+    // compositor inside `next_frame`; ScreenCaptureKit pushes one from a
+    // delegate on its own queue, so on macOS the first call legitimately
+    // reports `None` — "nothing has arrived yet", not "the screen has not
+    // changed" — until that callback has run at least once.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let frame = loop {
+        match controller.next_frame() {
+            // The backend gave up: nothing to capture here, same as the two
+            // exits above.
+            Err(_) => return,
+            Ok(Some(frame)) => break frame,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // A machine with a display produces a frame in well under five
+                // seconds. A runner with no display session produces none at
+                // all — and says so this way rather than by failing to start,
+                // which is what a headless macOS runner does.
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
     assert!(frame.width >= 2 && frame.height >= 2);
 
     let mut encoder = select_encoder(EncoderConfig::default()).unwrap();

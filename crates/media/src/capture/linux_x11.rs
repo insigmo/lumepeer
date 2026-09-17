@@ -774,6 +774,11 @@ impl ScreenCapturer for X11Capturer {
         display_modes_for(target)
     }
 
+    /// X11 enumerates and switches modes through `RandR` (ADR 0048).
+    fn display_modes_supported(&self) -> bool {
+        true
+    }
+
     fn set_display_mode(
         &mut self,
         target: CaptureTarget,

@@ -1891,6 +1891,12 @@ mod dxgi {
             Self::display_modes_for(target)
         }
 
+        /// Windows enumerates and switches modes through `ChangeDisplaySettingsEx`
+        /// (ADR 0048).
+        fn display_modes_supported(&self) -> bool {
+            true
+        }
+
         fn set_display_mode(
             &mut self,
             target: CaptureTarget,
