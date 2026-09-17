@@ -253,13 +253,12 @@ jobs:
             cargo build --release -p "${BIN}" --target ${{ matrix.target }}
             cp "target/${{ matrix.target }}/release/${BIN}${EXE}"                "apps/desktop/src-tauri/binaries/${BIN}-${{ matrix.target }}${EXE}"
           done
-      # `continue-on-error` plus the retry below, because tauri-action uploads
-      # every asset with no retry of its own: one 5xx from the release API
-      # (which answers with an HTML error page, surfacing here as a bare
-      # `##[error]<!DOCTYPE html>`) loses the whole row. The Rust build is
-      # already on disk by then, so a second attempt only re-bundles and
-      # re-uploads, and tauri-action deletes an asset of the same name before
-      # uploading it, which makes the retry idempotent.
+      # `retryAttempts` below is what keeps a flaky release API from throwing
+      # away a 15-minute build: without it tauri-action uploads every asset
+      # exactly once, so a single 5xx (the upload endpoint answers either with
+      # an HTML error page, surfacing here as a bare `##[error]<!DOCTYPE
+      # html>`, or with `Error creating asset temp dir`) loses the whole row.
+      # `continue-on-error` hands whatever is left to the re-upload step below.
       - uses: tauri-apps/tauri-action@v0
         id: bundle
         continue-on-error: true
@@ -287,22 +286,87 @@ jobs:
           # rows that way and published no manifest at all. The `manifest` job
           # below writes the file once instead, after every row has landed.
           includeUpdaterJson: false
+          # Retries the build and, one at a time, each asset upload.
+          retryAttempts: 3
           args: --target ${{ matrix.target }} --features ${{ matrix.features }}
-      - name: Retry the bundle and upload once
+      # Those retries fire back-to-back with no delay, so an upload endpoint
+      # that is degraded rather than momentarily unlucky outlives all of them:
+      # v0.0.76 lost both amd64 rows that way. This re-uploads with a widening
+      # gap between attempts, and from the bundles already on disk rather than
+      # by re-running `tauri build` for another 15 minutes (which is what the
+      # old retry step did, only to fail on the same endpoint). `--clobber`
+      # replaces whatever half an asset a failed attempt left behind.
+      - name: Re-upload the bundles with backoff
         if: steps.bundle.outcome == 'failure'
-        uses: tauri-apps/tauri-action@v0
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/desktop
-          tagName: ${{ needs.version.outputs.tag }}
-          releaseName: 'Lumepeer ${{ needs.version.outputs.tag }}'
-          releaseDraft: false
-          prerelease: ${{ needs.version.outputs.channel == 'beta' }}
-          includeUpdaterJson: false
-          args: --target ${{ matrix.target }} --features ${{ matrix.features }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BUNDLE_DIR: target/${{ matrix.target }}/release/bundle
+        run: |
+          set -uo pipefail
+
+          # The bundle formats tauri-action uploads. The .zip archives sitting
+          # next to them are updater leftovers that it skips, so skip them too:
+          # nothing on a release page or in latest.json refers to them.
+          PATTERNS=('*.deb' '*.rpm' '*.AppImage' '*.msi' '*-setup.exe' '*.dmg' '*.app.tar.gz')
+          FIND_ARGS=()
+          for PATTERN in "${PATTERNS[@]}"; do
+            FIND_ARGS+=(-o -name "${PATTERN}" -o -name "${PATTERN}.sig")
+          done
+
+          # `-maxdepth 2` keeps this to bundle/<format>/<file>, which is where
+          # every bundle lands, and out of the Lumepeer.app directory tree.
+          FILES=()
+          while IFS= read -r FILE; do
+            FILES+=("${FILE}")
+          done < <(find "${BUNDLE_DIR}" -mindepth 2 -maxdepth 2 -type f \( "${FIND_ARGS[@]:1}" \) | sort)
+
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "::error::no bundles under ${BUNDLE_DIR} — this row failed to build, not to upload" >&2
+            exit 1
+          fi
+
+          # tauri-action renames the macOS updater bundle on the way up to
+          # carry its arch, and the manifest job — plus every client already
+          # holding a darwin-* URL — expects that name, so stage it under the
+          # name rather than the one the CLI wrote.
+          case "${TARGET}" in
+            aarch64-apple-darwin) MAC_ARCH=aarch64 ;;
+            x86_64-apple-darwin) MAC_ARCH=x64 ;;
+            *) MAC_ARCH= ;;
+          esac
+
+          # A relative staging directory on purpose: `gh` is a native binary on
+          # the Windows rows and an absolute MSYS path would reach it mangled.
+          STAGE=.release-upload
+          rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+          for FILE in "${FILES[@]}"; do
+            NAME="$(basename "${FILE}")"
+            if [[ -n "${MAC_ARCH}" && "${NAME}" == *.app.tar.gz* ]]; then
+              BASE="${NAME%%.app.tar.gz*}"
+              NAME="${BASE}_${MAC_ARCH}${NAME#"${BASE}"}"
+            fi
+            cp "${FILE}" "${STAGE}/${NAME}"
+          done
+
+          for FILE in "${STAGE}"/*; do
+            NAME="$(basename "${FILE}")"
+            for ATTEMPT in 1 2 3 4 5; do
+              if gh release upload "${TAG}" "${FILE}" --repo "${GITHUB_REPOSITORY}" --clobber; then
+                echo "uploaded ${NAME}"
+                break
+              fi
+              if [[ "${ATTEMPT}" -eq 5 ]]; then
+                echo "::error::giving up on ${NAME} after ${ATTEMPT} attempts" >&2
+                exit 1
+              fi
+              DELAY=$((ATTEMPT * 30))
+              echo "attempt ${ATTEMPT} on ${NAME} failed, retrying in ${DELAY}s"
+              sleep "${DELAY}"
+            done
+          done
 
   # The updater manifest of ADR 0042, written once by one job rather than
   # merged into by all six build rows — see the `includeUpdaterJson: false`
