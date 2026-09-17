@@ -19069,6 +19069,10 @@ mod tests {
         host.grant(label.clone(), Role::ViewOnly).await.unwrap();
         host.revoke(label).await.unwrap();
         let remembered = wait_for_history(&guest, "nothing to reconnect to").await;
+        // The row is written at the grant, so it says nothing about the revoke
+        // having landed. Until it has, the guest still holds the connection
+        // and a dial to the same host is refused as a duplicate.
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
 
         // Nothing is retyped: the row carries the code, and the code stays in
         // Rust — the caller only names the host.
@@ -19177,21 +19181,33 @@ mod tests {
         let stranger = PeerEndpoint::bind_local(iroh::SecretKey::generate())
             .await
             .unwrap();
-        let control = lumepeer_net::guest_resume_handshake(
-            stranger.connect_control(addr).await.unwrap(),
-            Role::ViewOnly,
-            postcard::to_allocvec(&ticket).unwrap(),
-            Vec::new(),
-            Some([7u8; 16]),
+        // Held apart from the handshake: the host refuses right after its
+        // `HelloAck`, and a close that lands first discards the ack, so the
+        // handshake itself may be what fails. Either way the close is read
+        // off this handle.
+        let connection = stranger.connect_control(addr).await.unwrap();
+        let handshake = tokio::time::timeout(
+            TIMEOUT,
+            lumepeer_net::guest_resume_handshake(
+                connection.clone(),
+                Role::ViewOnly,
+                postcard::to_allocvec(&ticket).unwrap(),
+                Vec::new(),
+                Some([7u8; 16]),
+            ),
         )
         .await
-        .unwrap();
-        let connection = control.connection().clone();
-        let (mut reader, _writer) = control.split();
-        let ended = tokio::time::timeout(TIMEOUT, reader.recv())
+        .expect("the host never answered the claim");
+        if let Ok(control) = handshake {
+            let (mut reader, _writer) = control.split();
+            let ended = tokio::time::timeout(TIMEOUT, reader.recv())
+                .await
+                .expect("the host kept a refused claim open");
+            assert!(ended.is_err(), "the host answered a claim it cannot honour");
+        }
+        tokio::time::timeout(TIMEOUT, connection.closed())
             .await
             .expect("the host kept a refused claim open");
-        assert!(ended.is_err(), "the host answered a claim it cannot honour");
         assert!(connection.closed_by_peer_with(lumepeer_net::connection::CLOSE_RESUME_REFUSED));
         assert!(
             host.status()
