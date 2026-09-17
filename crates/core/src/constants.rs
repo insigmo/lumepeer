@@ -429,6 +429,35 @@ pub const ENCODE_DEFAULT_FPS: u8 = 30;
 /// the host is someone's working machine, not a transcoding farm, and §15
 /// budgets the session, not the box.
 pub const ENCODE_MAX_SOFTWARE_THREADS: u16 = 4;
+/// Lowest quantizer the VA-API encoder's own rate control may choose when the
+/// driver offers only constant-QP encoding (§11; ADR 0088).
+///
+/// An Intel iGPU whose `HuC` firmware is not loaded exposes H.264 low-power
+/// encoding with `VA_RC_CQP` alone, so bitrate is steered by moving the QP
+/// between this and [`VAAPI_CQP_QP_MAX`]. Below 18 H.264 spends bits on detail
+/// a desktop picture does not show, and a static screen would ask for it.
+pub const VAAPI_CQP_QP_MIN: u8 = 18;
+/// Highest quantizer the VA-API encoder's own rate control may choose
+/// (§11; ADR 0088).
+///
+/// Above 44 text stops being readable, which on a remote desktop is the
+/// picture failing rather than degrading; the adaptive ladder's lower rungs
+/// (frame rate, then scale) are what take a link below that.
+pub const VAAPI_CQP_QP_MAX: u8 = 44;
+/// How far, in per cent, the smoothed size of a frame may drift from its share
+/// of the target bitrate before the constant-QP rate control moves the QP by
+/// one step (§11; ADR 0088).
+///
+/// A band rather than a point, so a picture whose size sits near its target
+/// keeps one QP instead of alternating between two every frame.
+pub const VAAPI_CQP_RATE_TOLERANCE_PERCENT: u64 = 15;
+/// Weight of the newest frame in the constant-QP rate control's running frame
+/// size, as a right shift: 3 is one eighth (§11; ADR 0088).
+///
+/// About a quarter of a second at 30 fps, which is short enough to react to a
+/// window being dragged and long enough that one busy frame does not move the
+/// quantizer on its own.
+pub const VAAPI_CQP_SIZE_SMOOTHING_SHIFT: u32 = 3;
 /// Default encoder bitrate (§11).
 ///
 /// Where the adaptive ladder *starts*, not what it spends: the rate control

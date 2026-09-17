@@ -720,14 +720,14 @@ impl ScreenCapturer for X11Capturer {
 
         let timestamp_us =
             u64::try_from(active.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        Ok(Some(Frame {
-            width: u32::from(active.width),
-            height: u32::from(active.height),
+        Ok(Some(Frame::cpu(
+            u32::from(active.width),
+            u32::from(active.height),
             // X11 TrueColor visuals hand back little-endian BGRX in Z_PIXMAP.
-            format: PixelFormat::Bgra8,
+            PixelFormat::Bgra8,
             timestamp_us,
             data,
-        }))
+        )))
     }
 
     fn stop(&mut self) {
