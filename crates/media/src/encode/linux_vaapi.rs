@@ -45,13 +45,18 @@
 use std::rc::Rc;
 
 use cros_libva::{
-    BufferType, Config, Context, Display, EncCodedBuffer, EncMiscParameter,
+    BufferType, Config, Context, Display, DrmDeviceIterator, EncCodedBuffer, EncMiscParameter,
     EncMiscParameterRateControl, EncPictureParameter, EncPictureParameterBufferH264,
     EncSequenceParameter, EncSequenceParameterBufferH264, EncSliceParameter,
     EncSliceParameterBufferH264, H264EncPicFields, H264EncSeqFields, MappedCodedBuffer,
     PictureH264, RcFlags, Surface, UsageHint, VA_ATTRIB_NOT_SUPPORTED, VA_FOURCC_NV12,
     VA_INVALID_ID, VA_PICTURE_H264_INVALID, VA_RC_CBR, VA_RC_CQP, VA_RC_VBR, VA_RT_FORMAT_YUV420,
     VAConfigAttrib, VAConfigAttribType, VAEntrypoint, VAProfile,
+};
+#[cfg(feature = "encode-vaapi-zero-copy")]
+use cros_libva::{
+    ExternalBufferDescriptor, MemoryType, VA_FOURCC_BGRA, VA_FOURCC_BGRX, VA_RT_FORMAT_RGB32,
+    VADRMPRIMESurfaceDescriptor,
 };
 use lumepeer_core::constants::{
     VAAPI_CQP_QP_MAX, VAAPI_CQP_QP_MIN, VAAPI_CQP_RATE_TOLERANCE_PERCENT,
@@ -60,6 +65,8 @@ use lumepeer_core::constants::{
 
 use super::nv12::bgra_to_nv12;
 use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder};
+#[cfg(feature = "encode-vaapi-zero-copy")]
+use crate::capture::DmaBuf;
 use crate::capture::{Frame, PixelFormat};
 use crate::error::{MediaError, Result};
 
@@ -369,11 +376,18 @@ struct Session {
     reconstructions: [Surface<()>; 2],
     context: Rc<Context>,
     rate_control: RateControl,
+    /// The kernel driver of the render node this session encodes on
+    /// (`i915`, `amdgpu`, …), when sysfs says.
+    driver: Option<String>,
     // Held, never read: libva objects are only valid while the config and
     // display that produced them are alive, and declaration order is what
     // makes them outlive the context above.
     _config: Config,
-    _display: Rc<Display>,
+    #[cfg_attr(
+        not(feature = "encode-vaapi-zero-copy"),
+        allow(dead_code, reason = "only a DMA-BUF import needs the display again")
+    )]
+    display: Rc<Display>,
 }
 
 /// Hardware H.264 encoder backed by VA-API.
@@ -397,6 +411,113 @@ pub struct VaapiEncoder {
     since_idr: u32,
     /// The quantizer, when the driver leaves it to this side.
     qp: QpController,
+    /// What the current sequence's pictures come in as, which is what its
+    /// SPS names the colour matrix of. `None` before the first picture.
+    input: Option<InputKind>,
+    /// Whether a DMA-BUF frame has already failed to encode without a
+    /// readback on this machine; the rest of the session reads frames back
+    /// instead of failing the same way every frame (ADR 0088).
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    gpu_refused: bool,
+}
+
+/// What a picture was handed to the driver as (ADR 0088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    /// NV12 this side converted and uploaded, with BT.601.
+    Nv12Upload,
+    /// The compositor's `BGRx` buffer itself, which the driver converts —
+    /// with BT.709 on the Intel driver it was measured on.
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    DmaBufImport,
+}
+
+impl InputKind {
+    /// The matrix the SPS has to name for pictures that came in this way.
+    const fn matrix(self) -> headers::Matrix {
+        match self {
+            Self::Nv12Upload => headers::Matrix::Bt601,
+            #[cfg(feature = "encode-vaapi-zero-copy")]
+            Self::DmaBufImport => headers::Matrix::Bt709,
+        }
+    }
+}
+
+/// A render node that can encode, and how (ADR 0088).
+struct Device {
+    display: Rc<Display>,
+    driver: Option<String>,
+    entrypoint: VAEntrypoint::Type,
+    rate_control: RateControl,
+}
+
+/// The kernel driver behind a DRM node, from sysfs: `/dev/dri/renderD128`
+/// is `/sys/class/drm/renderD128/device/driver`, a link whose last component
+/// is the driver's name.
+fn node_driver(node: &std::path::Path) -> Option<String> {
+    let name = node.file_name()?;
+    let link = std::fs::read_link(
+        std::path::Path::new("/sys/class/drm")
+            .join(name)
+            .join("device/driver"),
+    )
+    .ok()?;
+    Some(link.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Opens the first render node that can encode `profile`, trying the ones
+/// whose kernel driver is `preferred` before the rest.
+///
+/// Not libva's own "first node that initializes": on a machine with two GPUs
+/// that node can be one with a decode-only driver, and the one that encodes is
+/// the second; and a DMA-BUF is only imported without a copy by the GPU that
+/// made it (ADR 0088).
+fn open_device(
+    profile: VAProfile::Type,
+    codec: VideoCodec,
+    preferred: Option<&str>,
+) -> Result<Device> {
+    let mut nodes: Vec<(std::path::PathBuf, Option<String>)> = DrmDeviceIterator::default()
+        .map(|node| {
+            let driver = node_driver(&node);
+            (node, driver)
+        })
+        .collect();
+    nodes.sort_by_key(|(_, driver)| preferred.is_none() || driver.as_deref() != preferred);
+
+    let mut last = MediaError::EncoderUnavailable(
+        "no VA-API display could be opened on any DRM device".to_owned(),
+    );
+    for (node, driver) in nodes {
+        let Ok(display) = Display::open_drm_display(&node) else {
+            continue;
+        };
+        let entrypoint = match display.query_config_entrypoints(profile) {
+            Ok(offered) => encode_entrypoint(&offered),
+            Err(error) => {
+                last = MediaError::EncoderUnavailable(format!("vaQueryConfigEntrypoints: {error}"));
+                continue;
+            }
+        };
+        let Some(entrypoint) = entrypoint else {
+            last = MediaError::EncoderUnavailable(format!(
+                "this VA-API driver has no {codec:?} encode entrypoint"
+            ));
+            continue;
+        };
+        match RateControl::offered_by(&display, profile, entrypoint) {
+            Ok(rate_control) => {
+                return Ok(Device {
+                    display,
+                    driver,
+                    entrypoint,
+                    rate_control,
+                });
+            }
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
 }
 
 // Mirrors the Media Foundation encoder's `Debug`: driver state is neither
@@ -440,29 +561,29 @@ impl VaapiEncoder {
     /// The whole open sequence, shared by the constructor and the probe so
     /// the two can never disagree.
     fn open(width: u32, height: u32, config: EncoderConfig) -> Result<Self> {
+        Self::open_on(width, height, config, None)
+    }
+
+    /// [`Self::open`], on a render node of the `preferred` kernel driver when
+    /// there is one that encodes.
+    fn open_on(
+        width: u32,
+        height: u32,
+        config: EncoderConfig,
+        preferred: Option<&str>,
+    ) -> Result<Self> {
         // Before anything touches libva: a codec this backend has no profile
         // for must be refused without opening a display (ADR 0069, ADR 0071).
         let profile = va_profile(config.codec)?;
         let visible = (width, height);
         let (width, height) = aligned_dims(width, height, coding_block(config.codec)?);
 
-        let display = Display::open().ok_or_else(|| {
-            MediaError::EncoderUnavailable(
-                "no VA-API display could be opened on any DRM device".to_owned(),
-            )
-        })?;
-
-        let entrypoints = display.query_config_entrypoints(profile).map_err(|e| {
-            MediaError::EncoderUnavailable(format!("vaQueryConfigEntrypoints: {e}"))
-        })?;
-        let entrypoint = encode_entrypoint(&entrypoints).ok_or_else(|| {
-            MediaError::EncoderUnavailable(format!(
-                "this VA-API driver has no {:?} encode entrypoint",
-                config.codec
-            ))
-        })?;
-
-        let rate_control = RateControl::offered_by(&display, profile, entrypoint)?;
+        let Device {
+            display,
+            driver,
+            entrypoint,
+            rate_control,
+        } = open_device(profile, config.codec, preferred)?;
 
         let config_handle = display
             .create_config(
@@ -530,6 +651,7 @@ impl VaapiEncoder {
 
         tracing::debug!(
             ?rate_control,
+            ?driver,
             low_power = entrypoint == VAEntrypoint::VAEntrypointEncSliceLP,
             "VA-API H.264 session opened"
         );
@@ -542,8 +664,9 @@ impl VaapiEncoder {
                 reconstructions: [first, second],
                 context,
                 rate_control,
+                driver,
                 _config: config_handle,
-                _display: display,
+                display,
             },
             config,
             dims: (width, height),
@@ -554,6 +677,9 @@ impl VaapiEncoder {
             force_idr: true,
             since_idr: 0,
             qp: QpController::new(),
+            input: None,
+            #[cfg(feature = "encode-vaapi-zero-copy")]
+            gpu_refused: false,
         })
     }
 
@@ -563,11 +689,207 @@ impl VaapiEncoder {
     /// The quantizer carries over: the controller has learned what this
     /// content costs, and a new session is still the same desktop.
     fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        let driver = self.session.driver.clone();
+        self.reopen(width, height, driver.as_deref())
+    }
+
+    /// Replaces the session with one at `width` x `height` on a node of
+    /// `driver`, keeping what this encoder has learned about the machine.
+    fn reopen(&mut self, width: u32, height: u32, driver: Option<&str>) -> Result<()> {
         let qp = self.qp;
-        let reopened = Self::open(width, height, self.config)?;
+        #[cfg(feature = "encode-vaapi-zero-copy")]
+        let gpu_refused = self.gpu_refused;
+        let reopened = Self::open_on(width, height, self.config, driver)?;
         *self = reopened;
         self.qp = qp;
+        #[cfg(feature = "encode-vaapi-zero-copy")]
+        {
+            self.gpu_refused = gpu_refused;
+        }
         Ok(())
+    }
+
+    /// Readies the next picture of `width` x `height` arriving as `kind`, and
+    /// says whether it is an IDR.
+    ///
+    /// A change of input kind is an IDR too: the SPS names the colour matrix,
+    /// and the driver's own conversion and this side's are not the same one.
+    fn start_picture(&mut self, width: u32, height: u32, kind: InputKind) -> Result<bool> {
+        let aligned = aligned_dims(width, height, coding_block(self.config.codec)?);
+        if aligned != self.dims || (width, height) != self.visible {
+            self.resize(width, height)?;
+        }
+        let idr = self.force_idr || self.since_idr >= IDR_PERIOD || self.input != Some(kind);
+        if idr {
+            self.frame_num = 0;
+            self.pic_order_cnt = 0;
+        }
+        self.input = Some(kind);
+        Ok(idr)
+    }
+
+    /// Completes a picture `data` came back for.
+    fn finish_picture(&mut self, timestamp_us: u64, idr: bool, data: Vec<u8>) -> EncodedFrame {
+        let data = if idr && !headers::contains_nal(&data, headers::NAL_SPS) {
+            with_parameter_sets(self, data)
+        } else {
+            data
+        };
+        if idr {
+            self.force_idr = false;
+            self.since_idr = 0;
+        } else {
+            self.since_idr = self.since_idr.saturating_add(1);
+        }
+        self.frame_num = self.frame_num.wrapping_add(1);
+        self.pic_order_cnt = self.pic_order_cnt.wrapping_add(2);
+        // The picture just written is the next one's reference.
+        self.target = 1 - self.target;
+        if self.session.rate_control == RateControl::ConstantQp {
+            self.qp.observe(data.len(), idr, self.config);
+        }
+        EncodedFrame {
+            keyframe: idr,
+            timestamp_us,
+            data,
+        }
+    }
+
+    /// Encodes a frame that is still the compositor's DMA-BUF, by importing it
+    /// as the picture the driver reads (ADR 0088).
+    ///
+    /// # Errors
+    /// [`MediaError::Encode`] when the buffer is not this encoder's GPU's and
+    /// no node of the GPU that made it encodes, or when the driver refuses to
+    /// import or encode it — which the caller answers by reading this frame
+    /// back and the rest of the session's too.
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    fn encode_dmabuf(&mut self, frame: &Frame, dmabuf: &DmaBuf) -> Result<EncodedFrame> {
+        let exporter = dmabuf.exporter();
+        if exporter.is_none() || exporter != self.session.driver {
+            // A buffer from another GPU imports, if at all, as a copy through
+            // main memory — the cost this path exists to remove. Move to a
+            // node of the GPU that made it, if one of those encodes.
+            self.reopen(self.visible.0, self.visible.1, exporter.as_deref())?;
+            if exporter.is_none() || exporter != self.session.driver {
+                return Err(MediaError::Encode(format!(
+                    "the frame's buffer comes from {exporter:?}, and no encoder on that GPU is available"
+                )));
+            }
+        }
+        let va_fourcc = va_fourcc_of(dmabuf.drm_format()).ok_or_else(|| {
+            MediaError::Encode("the frame's buffer is in a format VA-API is not given".to_owned())
+        })?;
+        let visible = (dmabuf.width() & !1, dmabuf.height() & !1);
+        let idr = self.start_picture(visible.0, visible.1, InputKind::DmaBufImport)?;
+
+        let descriptor = PrimeImport::of(dmabuf, va_fourcc)?;
+        let mut surface = self
+            .session
+            .display
+            .create_surfaces(
+                VA_RT_FORMAT_RGB32,
+                Some(va_fourcc),
+                dmabuf.width(),
+                dmabuf.height(),
+                Some(UsageHint::USAGE_HINT_ENCODER),
+                vec![descriptor],
+            )
+            .map_err(|e| MediaError::Encode(format!("importing the DMA-BUF: {e}")))?
+            .pop()
+            .ok_or_else(|| {
+                MediaError::Encode("the DMA-BUF import returned no surface".to_owned())
+            })?;
+
+        let buffers = picture_buffers(self, idr)?;
+        let data = submit(
+            Rc::clone(&self.session.context),
+            &self.session.coded,
+            u64::from(self.pic_order_cnt),
+            buffers,
+            &mut surface,
+        )?;
+        Ok(self.finish_picture(frame.timestamp_us, idr, data))
+    }
+}
+
+/// The VA fourcc of a surface imported from a DMA-BUF of `drm_format`.
+#[cfg(feature = "encode-vaapi-zero-copy")]
+fn va_fourcc_of(drm_format: u32) -> Option<u32> {
+    use crate::capture::pipewire_stream::{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888};
+    match drm_format {
+        DRM_FORMAT_XRGB8888 => Some(VA_FOURCC_BGRX),
+        DRM_FORMAT_ARGB8888 => Some(VA_FOURCC_BGRA),
+        _ => None,
+    }
+}
+
+/// A DMA-BUF handed to `vaCreateSurfaces` as the memory of a surface
+/// (`VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2`).
+///
+/// Owns its own duplicate of the descriptor: `cros-libva` gives a descriptor to
+/// the surface for the surface's whole life, and the frame the buffer came in
+/// with can be dropped first.
+#[cfg(feature = "encode-vaapi-zero-copy")]
+struct PrimeImport {
+    fd: std::os::fd::OwnedFd,
+    fourcc: u32,
+    drm_format: u32,
+    modifier: u64,
+    size: u32,
+    offset: u32,
+    stride: u32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "encode-vaapi-zero-copy")]
+impl PrimeImport {
+    fn of(dmabuf: &DmaBuf, fourcc: u32) -> Result<Self> {
+        let fd = dmabuf
+            .fd()
+            .try_clone_to_owned()
+            .map_err(|e| MediaError::Encode(format!("duplicating the DMA-BUF descriptor: {e}")))?;
+        Ok(Self {
+            fd,
+            fourcc,
+            drm_format: dmabuf.drm_format(),
+            modifier: dmabuf.modifier(),
+            size: dmabuf.size(),
+            offset: dmabuf.offset(),
+            stride: dmabuf.stride(),
+            width: dmabuf.width(),
+            height: dmabuf.height(),
+        })
+    }
+}
+
+#[cfg(feature = "encode-vaapi-zero-copy")]
+impl ExternalBufferDescriptor for PrimeImport {
+    const MEMORY_TYPE: MemoryType = MemoryType::DrmPrime2;
+    type DescriptorAttribute = VADRMPRIMESurfaceDescriptor;
+
+    fn va_surface_attribute(&mut self) -> VADRMPRIMESurfaceDescriptor {
+        use std::os::fd::AsRawFd as _;
+
+        // One object holding one layer of one plane: a BGRx picture.
+        let mut descriptor = VADRMPRIMESurfaceDescriptor {
+            fourcc: self.fourcc,
+            width: self.width,
+            height: self.height,
+            num_objects: 1,
+            num_layers: 1,
+            ..VADRMPRIMESurfaceDescriptor::default()
+        };
+        descriptor.objects[0].fd = self.fd.as_raw_fd();
+        descriptor.objects[0].size = self.size;
+        descriptor.objects[0].drm_format_modifier = self.modifier;
+        descriptor.layers[0].drm_format = self.drm_format;
+        descriptor.layers[0].num_planes = 1;
+        descriptor.layers[0].object_index[0] = 0;
+        descriptor.layers[0].offset[0] = self.offset;
+        descriptor.layers[0].pitch[0] = self.stride;
+        descriptor
     }
 }
 
@@ -621,49 +943,46 @@ fn level_idc(mbs: u32, fps: u8) -> u8 {
 
 impl VideoEncoder for VaapiEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
+        // The frame never left the GPU, and that is the whole point of
+        // ADR 0088: hand the compositor's buffer to the driver rather than
+        // reading it back first. A refusal — a buffer from another GPU, a
+        // driver that will not import it — is not a failed frame: it falls
+        // through to the readback below, once, for the rest of the session.
+        #[cfg(feature = "encode-vaapi-zero-copy")]
+        if let Some(dmabuf) = frame.dmabuf.as_ref()
+            && !self.gpu_refused
+        {
+            match self.encode_dmabuf(frame, dmabuf) {
+                Ok(encoded) => return Ok(encoded),
+                Err(error) => {
+                    tracing::info!(
+                        %error,
+                        "this encoder will not take the compositor's buffers; \
+                         the rest of this session goes through main memory"
+                    );
+                    self.gpu_refused = true;
+                }
+            }
+        }
+
         let (nv12, src_width, src_height) = bgra_to_nv12(frame)?;
-        let (width, height) = aligned_dims(src_width, src_height, coding_block(self.config.codec)?);
-        if (width, height) != self.dims || (src_width, src_height) != self.visible {
-            self.resize(src_width, src_height)?;
-        }
-
-        let idr = self.force_idr || self.since_idr >= IDR_PERIOD;
-        if idr {
-            self.frame_num = 0;
-            self.pic_order_cnt = 0;
-        }
-
+        let idr = self.start_picture(src_width, src_height, InputKind::Nv12Upload)?;
         upload_nv12(
             &self.session.input,
             self.session.nv12_format,
             &nv12,
             (src_width, src_height),
-            (width, height),
+            self.dims,
         )?;
-        let mut data = encode_one(self, idr)?;
-        if idr && !headers::contains_nal(&data, headers::NAL_SPS) {
-            data = with_parameter_sets(self, data);
-        }
-
-        if idr {
-            self.force_idr = false;
-            self.since_idr = 0;
-        } else {
-            self.since_idr = self.since_idr.saturating_add(1);
-        }
-        self.frame_num = self.frame_num.wrapping_add(1);
-        self.pic_order_cnt = self.pic_order_cnt.wrapping_add(2);
-        // The picture just written is the next one's reference.
-        self.target = 1 - self.target;
-        if self.session.rate_control == RateControl::ConstantQp {
-            self.qp.observe(data.len(), idr, self.config);
-        }
-
-        Ok(EncodedFrame {
-            keyframe: idr,
-            timestamp_us: frame.timestamp_us,
-            data,
-        })
+        let buffers = picture_buffers(self, idr)?;
+        let data = submit(
+            Rc::clone(&self.session.context),
+            &self.session.coded,
+            u64::from(self.pic_order_cnt),
+            buffers,
+            &mut self.session.input,
+        )?;
+        Ok(self.finish_picture(frame.timestamp_us, idr, data))
     }
 
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
@@ -706,7 +1025,9 @@ fn with_parameter_sets(encoder: &VaapiEncoder, data: Vec<u8>) -> Vec<u8> {
         log2_max_frame_num_minus4: LOG2_MAX_FRAME_NUM_MINUS4,
         log2_max_poc_lsb_minus4: LOG2_MAX_POC_LSB_MINUS4,
         max_num_ref_frames: MAX_REF_FRAMES,
-        matrix: headers::Matrix::Bt601,
+        matrix: encoder
+            .input
+            .map_or(headers::Matrix::Bt601, InputKind::matrix),
     };
     let mut out = headers::sequence_parameter_set(&sequence);
     out.extend(headers::picture_parameter_set(INITIAL_QP));
@@ -714,16 +1035,13 @@ fn with_parameter_sets(encoder: &VaapiEncoder, data: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Submits the picture already uploaded into the input surface and returns
-/// its bitstream.
+/// The parameter buffers of the next picture.
 ///
-/// The parameter buffers are assembled by the helpers below rather than
-/// inline: VA-API takes an H.264 sequence, picture and slice header as three
-/// separate structs and every field of each has to be named, so one function
-/// holding all of them is neither readable nor reviewable.
-fn encode_one(encoder: &mut VaapiEncoder, idr: bool) -> Result<Vec<u8>> {
-    use cros_libva::Picture;
-
+/// Assembled by the helpers below rather than inline: VA-API takes an H.264
+/// sequence, picture and slice header as three separate structs and every
+/// field of each has to be named, so one function holding all of them is
+/// neither readable nor reviewable.
+fn picture_buffers(encoder: &VaapiEncoder, idr: bool) -> Result<Vec<cros_libva::Buffer>> {
     let (width, height) = encoder.dims;
     let block = coding_block(encoder.config.codec)?;
     let units_wide = u16::try_from(width / block).unwrap_or(u16::MAX);
@@ -732,8 +1050,6 @@ fn encode_one(encoder: &mut VaapiEncoder, idr: bool) -> Result<Vec<u8>> {
     let target_id = encoder.session.reconstructions[encoder.target].id();
     let reference_id = encoder.session.reconstructions[1 - encoder.target].id();
     let coded_id = encoder.session.coded.id();
-    let context = Rc::clone(&encoder.session.context);
-    let pic_order_cnt = encoder.pic_order_cnt;
 
     let mut buffers = Vec::with_capacity(4);
     // Still a match rather than a straight call: every buffer below is
@@ -778,12 +1094,25 @@ fn encode_one(encoder: &mut VaapiEncoder, idr: bool) -> Result<Vec<u8>> {
             ));
         }
     }
+    Ok(buffers)
+}
 
-    let mut picture = Picture::new(
-        u64::from(pic_order_cnt),
-        context,
-        &mut encoder.session.input,
-    );
+/// Submits one picture read from `input` with `buffers`, and returns its
+/// bitstream.
+///
+/// Generic over where `input`'s memory comes from, which is the whole of the
+/// difference between a picture this side uploaded and one that is still the
+/// compositor's buffer (ADR 0088).
+fn submit<D: cros_libva::SurfaceMemoryDescriptor>(
+    context: Rc<Context>,
+    coded: &EncCodedBuffer,
+    timestamp: u64,
+    buffers: Vec<cros_libva::Buffer>,
+    input: &mut Surface<D>,
+) -> Result<Vec<u8>> {
+    use cros_libva::Picture;
+
+    let mut picture = Picture::new(timestamp, context, input);
     for buffer in buffers {
         picture.add_buffer(buffer);
     }
@@ -806,7 +1135,7 @@ fn encode_one(encoder: &mut VaapiEncoder, idr: bool) -> Result<Vec<u8>> {
     // the whole of the reassembly.
     let mut data = Vec::new();
     {
-        let mapped = MappedCodedBuffer::new(&encoder.session.coded)
+        let mapped = MappedCodedBuffer::new(coded)
             .map_err(|e| MediaError::Encode(format!("mapping the coded buffer: {e}")))?;
         for segment in mapped.segments() {
             data.extend_from_slice(segment.buf);
@@ -1178,6 +1507,13 @@ mod headers {
     pub(super) enum Matrix {
         /// BT.601, which `encode::nv12` converts with.
         Bt601,
+        /// BT.709, which the Intel driver converts a `BGRx` surface with before
+        /// encoding it (measured; ADR 0088).
+        #[cfg_attr(
+            not(feature = "encode-vaapi-zero-copy"),
+            allow(dead_code, reason = "only a DMA-BUF import is converted with it")
+        )]
+        Bt709,
     }
 
     impl Matrix {
@@ -1187,6 +1523,7 @@ mod headers {
                 // SMPTE 170M, BT.601's 525-line form; the coefficients are
                 // BT.601's.
                 Self::Bt601 => 6,
+                Self::Bt709 => 1,
             }
         }
     }
@@ -1764,19 +2101,297 @@ mod tests {
                 (width as usize, height as usize),
                 "the crop did not come back out"
             );
-            let (stride, _, _) = picture.strides();
-            let luma = picture.y();
-            let mut squared_error = 0f64;
-            for row in 0..height as usize {
-                for column in 0..width as usize {
-                    let difference = f64::from(luma[row * stride + column])
-                        - f64::from(expected[row * width as usize + column]);
-                    squared_error += difference * difference;
-                }
-            }
-            let mse = squared_error / f64::from(width * height);
-            let psnr = 10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10();
+            let psnr = luma_psnr(&picture, &expected, width, height);
             assert!(psnr > 35.0, "frame {index} came back at {psnr:.1} dB");
         }
+    }
+
+    /// Peak signal-to-noise ratio of a decoded picture's luma against the one
+    /// expected, over the visible `width` x `height`.
+    #[cfg(feature = "encode-openh264")]
+    fn luma_psnr(
+        picture: &openh264::decoder::DecodedYUV<'_>,
+        expected: &[u8],
+        width: u32,
+        height: u32,
+    ) -> f64 {
+        use openh264::formats::YUVSource as _;
+
+        let (stride, _, _) = picture.strides();
+        let luma = picture.y();
+        let mut squared_error = 0f64;
+        for row in 0..height as usize {
+            for column in 0..width as usize {
+                let difference = f64::from(luma[row * stride + column])
+                    - f64::from(expected[row * width as usize + column]);
+                squared_error += difference * difference;
+            }
+        }
+        let mse = squared_error / f64::from(width * height);
+        10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
+    }
+
+    /// A `BGRx` picture the GPU itself holds, exported as a DMA-BUF the way a
+    /// compositor would hand one over, and the pixels that were written.
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    fn exported_picture(width: u32, height: u32, index: u32) -> (std::sync::Arc<DmaBuf>, Vec<u8>) {
+        use cros_libva::Image;
+
+        let device = open_device(
+            VAProfile::VAProfileH264ConstrainedBaseline,
+            VideoCodec::H264,
+            None,
+        )
+        .unwrap();
+        let surface = device
+            .display
+            .create_surfaces(
+                VA_RT_FORMAT_RGB32,
+                Some(VA_FOURCC_BGRX),
+                width,
+                height,
+                Some(UsageHint::USAGE_HINT_EXPORT),
+                vec![()],
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut bgra = vec![0u8; (width * height * 4) as usize];
+        {
+            let mut image = Image::derive_from(&surface, (width, height)).unwrap();
+            let offset = image.image().offsets[0] as usize;
+            let pitch = image.image().pitches[0] as usize;
+            let mapped = image.as_mut();
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel = [
+                        u8::try_from((x * 2 + index * 5) % 256).unwrap(),
+                        u8::try_from((y + x / 2) % 256).unwrap(),
+                        u8::try_from((y * 3 + index) % 256).unwrap(),
+                        255,
+                    ];
+                    let at = ((y * width + x) * 4) as usize;
+                    bgra[at..at + 4].copy_from_slice(&pixel);
+                    let to = offset + y as usize * pitch + x as usize * 4;
+                    mapped[to..to + 4].copy_from_slice(&pixel);
+                }
+            }
+        }
+        surface.sync().unwrap();
+        let mut exported = surface.export_prime().unwrap();
+        let layer = &exported.layers[0];
+        let (drm_format, offset, pitch) = (layer.drm_format, layer.offset[0], layer.pitch[0]);
+        let object = exported
+            .objects
+            .swap_remove(usize::from(layer.object_index[0]));
+        let dmabuf = DmaBuf::detached(
+            object.fd,
+            drm_format,
+            object.drm_format_modifier,
+            offset,
+            pitch,
+            width,
+            height,
+            object.size,
+        );
+        (std::sync::Arc::new(dmabuf), bgra)
+    }
+
+    /// BT.709 luma in studio range, which the driver's own conversion of a
+    /// `BGRx` surface is measured to produce (ADR 0088).
+    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    fn bt709_luma(bgra: &[u8]) -> Vec<u8> {
+        bgra.chunks_exact(4)
+            .map(|pixel| {
+                let (b, g, r) = (
+                    f64::from(pixel[0]),
+                    f64::from(pixel[1]),
+                    f64::from(pixel[2]),
+                );
+                let y = 16.0 + 219.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+                // In 16..=235 by construction.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "in 16..=235"
+                )]
+                let y = y.round() as u8;
+                y
+            })
+            .collect()
+    }
+
+    /// ADR 0088, on the hardware: a frame that exists only as a DMA-BUF is
+    /// encoded without being read back, and decodes to the picture the GPU
+    /// held, converted with the matrix the SPS names.
+    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    #[test]
+    fn a_frame_that_never_left_the_gpu_encodes_and_decodes_back() {
+        if !hardware_available(EncoderConfig::default()) {
+            eprintln!("no VA-API H.264 encoder on this machine; nothing to check");
+            return;
+        }
+        let (width, height) = (320u32, 184u32);
+        let mut hardware = VaapiEncoder::new(EncoderConfig::default()).unwrap();
+        let mut software = openh264::decoder::Decoder::new().unwrap();
+
+        for index in 0..10u32 {
+            let (dmabuf, bgra) = exported_picture(width, height, index);
+            let mut frame = Frame::cpu(
+                width,
+                height,
+                PixelFormat::Bgra8,
+                u64::from(index),
+                Vec::new(),
+            );
+            frame.dmabuf = Some(dmabuf);
+            let bitstream = hardware.encode(&frame).unwrap();
+            assert!(!hardware.gpu_refused, "the driver refused its own buffer");
+            assert_eq!(hardware.input, Some(InputKind::DmaBufImport));
+            assert!(frame.data.is_empty(), "the frame was read back");
+            assert_eq!(bitstream.keyframe, index == 0);
+
+            let picture = software
+                .decode(&bitstream.data)
+                .unwrap()
+                .unwrap_or_else(|| panic!("frame {index} decoded to nothing"));
+            let psnr = luma_psnr(&picture, &bt709_luma(&bgra), width, height);
+            assert!(psnr > 35.0, "frame {index} came back at {psnr:.1} dB");
+        }
+    }
+
+    /// ADR 0088: switching between a buffer the driver imports and a picture
+    /// this side uploads starts a new sequence, because the two are converted
+    /// with different matrices and one SPS can name only one.
+    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    #[test]
+    fn changing_how_pictures_arrive_starts_a_new_sequence() {
+        if !hardware_available(EncoderConfig::default()) {
+            eprintln!("no VA-API H.264 encoder on this machine; nothing to check");
+            return;
+        }
+        let (width, height) = (160u32, 96u32);
+        let mut hardware = VaapiEncoder::new(EncoderConfig::default()).unwrap();
+
+        let (dmabuf, bgra) = exported_picture(width, height, 0);
+        let mut imported = Frame::cpu(width, height, PixelFormat::Bgra8, 0, Vec::new());
+        imported.dmabuf = Some(dmabuf);
+        assert!(hardware.encode(&imported).unwrap().keyframe);
+
+        let uploaded = Frame::cpu(width, height, PixelFormat::Bgra8, 1, bgra);
+        let switched = hardware.encode(&uploaded).unwrap();
+        assert!(switched.keyframe, "a new matrix went out without a new SPS");
+        assert_eq!(hardware.input, Some(InputKind::Nv12Upload));
+        assert!(!hardware.encode(&uploaded).unwrap().keyframe);
+    }
+
+    /// ADR 0088: a frame whose pixels only a DMA-BUF holds still reads back,
+    /// for every consumer that is not this encoder.
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    #[test]
+    fn a_linear_dmabuf_reads_back_to_the_pixels_written_into_it() {
+        if !hardware_available(EncoderConfig::default()) {
+            eprintln!("no VA-API H.264 encoder on this machine; nothing to check");
+            return;
+        }
+        let (dmabuf, bgra) = exported_picture(64, 48, 3);
+        if dmabuf.modifier() != 0 {
+            eprintln!("this driver exports a tiled layout; nothing to read row by row");
+            assert!(dmabuf.pixels().is_err());
+            return;
+        }
+        let pixels = dmabuf.pixels().unwrap();
+        let rgb = |bytes: &[u8]| -> Vec<u8> {
+            bytes
+                .chunks_exact(4)
+                .flat_map(|pixel| pixel[..3].to_vec())
+                .collect()
+        };
+        assert_eq!(rgb(pixels), rgb(&bgra));
+    }
+
+    /// Processor time this process has used, in milliseconds, from
+    /// `/proc/self/stat`: user and system time, in the kernel's fixed
+    /// `USER_HZ` of 100 ticks a second.
+    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    fn process_cpu_ms() -> f64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        // The command name is parenthesized and may hold spaces; the fields
+        // count from after it, where `utime` and `stime` are the 12th and 13th.
+        let after_name = &stat[stat.rfind(')').unwrap() + 2..];
+        let ticks: u32 = after_name
+            .split(' ')
+            .skip(11)
+            .take(2)
+            .map(|field| field.parse::<u32>().unwrap())
+            .sum();
+        f64::from(ticks) * 10.0
+    }
+
+    /// ADR 0088's numbers: processor time per 1080p frame for each way a
+    /// desktop frame can be encoded on this machine. A measurement, not a
+    /// check, so it runs only when asked for:
+    /// `cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-openh264
+    /// --lib -- --ignored --nocapture cpu_per_frame`.
+    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    #[test]
+    #[ignore = "a measurement for ADR 0088, not a check"]
+    fn cpu_per_frame_of_each_encode_path() {
+        const FRAMES: u32 = 600;
+        let (width, height) = (1920u32, 1080u32);
+        if !hardware_available(EncoderConfig::default()) {
+            eprintln!("no VA-API H.264 encoder on this machine; nothing to measure");
+            return;
+        }
+        let pictures: Vec<_> = (0..8)
+            .map(|index| exported_picture(width, height, index))
+            .collect();
+
+        let mut zero_copy = VaapiEncoder::new(EncoderConfig::default()).unwrap();
+        let started = process_cpu_ms();
+        for index in 0..FRAMES {
+            let (dmabuf, _) = &pictures[index as usize % pictures.len()];
+            let mut frame = Frame::cpu(
+                width,
+                height,
+                PixelFormat::Bgra8,
+                u64::from(index),
+                Vec::new(),
+            );
+            frame.dmabuf = Some(std::sync::Arc::clone(dmabuf));
+            zero_copy.encode(&frame).unwrap();
+        }
+        assert!(!zero_copy.gpu_refused);
+        let zero_copy_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
+
+        // What the readback path starts from: the pixels already in main
+        // memory, as the compositor's shared-memory buffers deliver them.
+        let frames: Vec<_> = pictures
+            .iter()
+            .map(|(_, bgra)| Frame::cpu(width, height, PixelFormat::Bgra8, 0, bgra.clone()))
+            .collect();
+        let mut upload = VaapiEncoder::new(EncoderConfig::default()).unwrap();
+        let started = process_cpu_ms();
+        for index in 0..FRAMES {
+            upload
+                .encode(&frames[index as usize % frames.len()])
+                .unwrap();
+        }
+        let upload_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
+
+        let mut software =
+            crate::encode::software::OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+        let started = process_cpu_ms();
+        for index in 0..FRAMES {
+            software
+                .encode(&frames[index as usize % frames.len()])
+                .unwrap();
+        }
+        let software_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
+
+        eprintln!(
+            "1080p CPU ms/frame: VA-API from DMA-BUF {zero_copy_ms:.2}, \
+             VA-API from main memory {upload_ms:.2}, openh264 {software_ms:.2}"
+        );
     }
 }

@@ -79,6 +79,16 @@ encode-openh264 = ["dep:openh264"]
 # shipped Linux feature set: a .deb must install and run on a machine with no
 # VA-API at all, falling back to openh264 (§18).
 encode-vaapi = ["dep:cros-libva"]
+# Hands a Wayland portal frame to the VA-API encoder as the compositor's own
+# DMA-BUF instead of as bytes in main memory (§11, backlog item 33; ADR 0088).
+# The Linux half of what `encode-mf-zero-copy` is on Windows (ADR 0073), and
+# its own feature for the same reason: it needs both ends at once — the
+# portal's PipeWire stream has to offer DMA-BUF and VA-API has to import it —
+# so a build with only one of them cannot have it. `libc` is for the one
+# ioctl reading such a frame back takes (`DMA_BUF_IOCTL_SYNC`). In no release
+# build: `encode-vaapi` is not in one either, since a .deb has to run on a
+# machine with no libva at all (§18).
+encode-vaapi-zero-copy = ["encode-vaapi", "capture-portal", "dep:libc"]
 # VideoToolbox hardware H.264 encoder for macOS (§5.1, §11, §18/§19 phase 4;
 # ADR 0066). Same convention as encode-mf/encode-vaapi: `cargo build
 # --workspace` needs no platform SDK, and every binding it needs is declared
@@ -189,6 +199,10 @@ pipewire = { version = "0.8", optional = true }
 # NVIDIA encode is NVENC, a separate SDK under separate terms, and is a
 # deliberately separate decision.
 cros-libva = { version = "0.0.13", optional = true }
+# `DMA_BUF_IOCTL_SYNC` around reading a DMA-BUF frame back into main memory
+# (encode-vaapi-zero-copy; ADR 0088). Already in the workspace, for the
+# decoder sandbox's seccomp filter.
+libc = { workspace = true, optional = true }
 
 # ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in
 # (§11, ADR 0013), all optional and pulled in only by

@@ -4282,6 +4282,7 @@ dependencies = [
  "cros-libva",
  "dispatch2",
  "iroh-base",
+ "libc",
  "lumepeer-core",
  "memmap2",
  "objc2",

@@ -153,6 +153,14 @@ jobs:
         run: |
           cargo clippy -p lumepeer-media --all-targets --features encode-vaapi -- -D warnings
           cargo test -p lumepeer-media --features encode-vaapi,encode-openh264 --lib encode::
+      # The DMA-BUF path of ADR 0088 compiles the portal stream and the
+      # encoder differently from either feature alone, so it is checked on its
+      # own and together with the shipped set. Without a GPU its hardware tests
+      # pass by having nothing to check.
+      - name: Clippy and test the zero-copy VA-API path
+        run: |
+          cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire,encode-vaapi-zero-copy -- -D warnings
+          cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-openh264 --lib
       - name: Test the media pipeline under Xvfb
         # LUMEPEER_TEST_XTEST enables the input injection test, which is only
         # safe against a throwaway display like this one. It also gates the

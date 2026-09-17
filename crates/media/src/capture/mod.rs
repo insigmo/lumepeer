@@ -18,6 +18,14 @@ pub mod windows;
 #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
 pub use windows::GpuTexture;
 
+/// A captured frame's pixels as the compositor's own DMA-BUF (ADR 0088).
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    feature = "encode-vaapi-zero-copy"
+))]
+pub use pipewire_stream::DmaBuf;
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
@@ -316,9 +324,9 @@ pub struct Frame {
     pub timestamp_us: u64,
     /// Raw pixels, or empty while they are still only on the GPU.
     ///
-    /// Read it through [`Frame::as_cpu`] rather than directly: a frame the
-    /// Windows zero-copy path produced (ADR 0073) carries its pixels in
-    /// [`Frame::gpu`] and fills this the first time somebody asks for them.
+    /// Read it through [`Frame::as_cpu`] rather than directly: a frame one of
+    /// the zero-copy paths produced (ADR 0073, ADR 0088) carries its pixels on
+    /// the GPU and fills this the first time somebody asks for them.
     pub data: Vec<u8>,
     /// The same pixels as a GPU texture, when this frame never went through
     /// main memory (ADR 0073).
@@ -329,11 +337,24 @@ pub struct Frame {
     /// the next frame once nothing downstream still holds this one.
     #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
     pub gpu: Option<std::sync::Arc<GpuTexture>>,
+    /// The same pixels as a DMA-BUF the compositor rendered, when this frame
+    /// never went through main memory (ADR 0088).
+    ///
+    /// Linux's counterpart of `gpu`, and like it present only on the one build
+    /// that has a producer for it. Shared, because the buffer is the
+    /// compositor's: it goes back to the stream it came from when the last
+    /// holder of this frame lets go.
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "encode-vaapi-zero-copy"
+    ))]
+    pub dmabuf: Option<std::sync::Arc<DmaBuf>>,
 }
 
 impl Frame {
     /// A frame whose pixels are already in main memory — what every capture
-    /// backend but the Windows zero-copy path of ADR 0073 produces.
+    /// backend but the zero-copy paths of ADR 0073 and ADR 0088 produces.
     #[must_use]
     pub fn cpu(
         width: u32,
@@ -350,11 +371,17 @@ impl Frame {
             data,
             #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
             gpu: None,
+            #[cfg(all(
+                target_os = "linux",
+                not(target_os = "android"),
+                feature = "encode-vaapi-zero-copy"
+            ))]
+            dmabuf: None,
         }
     }
 
     /// This frame's pixels in main memory, reading them back from the GPU on
-    /// the first call and remembering the result (ADR 0073).
+    /// the first call and remembering the result (ADR 0073, ADR 0088).
     ///
     /// Every consumer that works on pixels — scaling, the software encoder,
     /// the recorder, the tests — goes through this rather than through
@@ -369,6 +396,14 @@ impl Frame {
         #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
         if let Some(gpu) = self.gpu.as_ref() {
             return gpu.pixels();
+        }
+        #[cfg(all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "encode-vaapi-zero-copy"
+        ))]
+        if let Some(dmabuf) = self.dmabuf.as_ref() {
+            return dmabuf.pixels();
         }
         Ok(&self.data)
     }
