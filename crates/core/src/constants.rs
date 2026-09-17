@@ -285,6 +285,20 @@ pub const FILE_OFFER_LEGACY_MAX_BYTES: u64 = 500 * 1024 * 1024;
 /// volume filled to its last byte by a transfer is a machine that stops
 /// working for reasons that have nothing to do with the transfer.
 pub const STAGING_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+/// How much older than this process's epoch a staging file's modification
+/// time has to be before the sweep treats it as left over from an earlier
+/// run (ADR 0077).
+///
+/// A filesystem does not stamp a file with the clock the epoch is read from.
+/// Linux stamps it from the kernel's coarse clock, which trails
+/// `SystemTime::now` by up to one scheduler tick, so a staging file created a
+/// moment after the epoch was taken can carry a modification time from just
+/// before it — and the next sweep into that directory then deleted a transfer
+/// that was still running. FAT is coarser still and rounds a write time down
+/// to two seconds. Two seconds covers both; the price is that a file an
+/// earlier run touched within two seconds of this run's first sweep waits for
+/// the next run to be removed.
+pub const STAGING_SWEEP_TIMESTAMP_SLACK_SECS: u64 = 2;
 /// Maximum byte length of the file name in a `FileOffer` or a
 /// `FileTransferStart` (§9.2; ADR 0032).
 ///
