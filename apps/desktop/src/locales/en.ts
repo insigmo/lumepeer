@@ -126,6 +126,8 @@ export const en: Dictionary = {
   'status.notReady': 'Not ready to connect',
   'status.noCapture':
     'This device has no screen capture support, so anyone you invite will see nothing. Sessions still connect, and input still works.',
+  'status.noCapture.chromeos':
+    'This device runs Linux inside ChromeOS, and apps there cannot see the ChromeOS screen, so anyone you invite will see nothing. Connecting to other devices from here works as usual.',
   'status.noEncoder':
     'This device has no video encoder, so anyone you invite will see nothing. Sessions still connect, and input still works.',
   'titlebar.minimize': 'Minimize',

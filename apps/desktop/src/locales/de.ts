@@ -120,6 +120,8 @@ export const de: Dictionary = {
   'status.notReady': 'Nicht bereit zum Verbinden',
   'status.noCapture':
     'Dieses Gerät unterstützt keine Bildschirmaufnahme, daher sehen eingeladene Personen nichts. Sitzungen verbinden sich trotzdem, und die Eingabe funktioniert weiterhin.',
+  'status.noCapture.chromeos':
+    'Dieses Gerät führt Linux innerhalb von ChromeOS aus, und Apps dort können den ChromeOS-Bildschirm nicht sehen, daher sehen eingeladene Personen nichts. Verbindungen von hier zu anderen Geräten funktionieren wie gewohnt.',
   'status.noEncoder':
     'Dieses Gerät hat keinen Video-Encoder, daher sehen eingeladene Personen nichts. Sitzungen verbinden sich trotzdem, und die Eingabe funktioniert weiterhin.',
   'titlebar.minimize': 'Minimieren',

@@ -120,6 +120,8 @@ export const pl: Dictionary = {
   'status.notReady': 'Niegotowe do połączenia',
   'status.noCapture':
     'To urządzenie nie obsługuje przechwytywania ekranu, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
+  'status.noCapture.chromeos':
+    'To urządzenie uruchamia Linuksa wewnątrz ChromeOS, a aplikacje w nim nie widzą ekranu ChromeOS, więc zaproszone osoby niczego nie zobaczą. Łączenie się stąd z innymi urządzeniami działa jak zwykle.',
   'status.noEncoder':
     'To urządzenie nie ma kodera wideo, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
   'titlebar.minimize': 'Minimalizuj',

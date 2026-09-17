@@ -5,6 +5,8 @@
 // against a mocked `@tauri-apps/api/core`, the way index.html does.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { t } from './i18n';
+
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
@@ -14,7 +16,7 @@ let unattendedEnabled = false;
 const RESPONSES: Record<string, unknown> = {
   session_status: [],
   connection_history: [],
-  network_status: { ready: true, can_capture: true, can_encode: true },
+  network_status: { ready: true, can_capture: true, can_encode: true, capture_unavailable_reason: null },
   connect_status: {
     phase: 'idle',
     pending: false,
@@ -187,5 +189,40 @@ describe('unattended indicator (task 5)', () => {
     unattendedEnabled = false;
     await boot();
     expect(app().querySelector('[data-testid="unattended-indicator"]')).toBeNull();
+  });
+});
+
+describe('media warning (gap-tasks/05)', () => {
+  afterEach(() => {
+    RESPONSES.network_status = {
+      ready: true,
+      can_capture: true,
+      can_encode: true,
+      capture_unavailable_reason: null,
+    };
+  });
+
+  it('says a ChromeOS container cannot see the screen, rather than that capture is missing', async () => {
+    RESPONSES.network_status = {
+      ready: true,
+      can_capture: false,
+      can_encode: true,
+      capture_unavailable_reason: 'chromeos-container',
+    };
+    await boot();
+    const warning = app().querySelector('.media-warning');
+    expect(warning?.textContent).toBe(t('en', 'status.noCapture.chromeos'));
+  });
+
+  it('keeps the plain warning for a machine that simply has no capture', async () => {
+    RESPONSES.network_status = {
+      ready: true,
+      can_capture: false,
+      can_encode: true,
+      capture_unavailable_reason: null,
+    };
+    await boot();
+    const warning = app().querySelector('.media-warning');
+    expect(warning?.textContent).toBe(t('en', 'status.noCapture'));
   });
 });

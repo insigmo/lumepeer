@@ -120,6 +120,8 @@ export const tr: Dictionary = {
   'status.notReady': 'Bağlanmaya hazır değil',
   'status.noCapture':
     'Bu cihazda ekran yakalama desteği yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
+  'status.noCapture.chromeos':
+    'Bu cihaz ChromeOS içinde Linux çalıştırıyor ve oradaki uygulamalar ChromeOS ekranını göremez, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Buradan diğer cihazlara bağlanmak her zamanki gibi çalışır.',
   'status.noEncoder':
     'Bu cihazda video kodlayıcı yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
   'titlebar.minimize': 'Küçült',

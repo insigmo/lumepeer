@@ -2,6 +2,7 @@
 # not force backticks on them.
 doc-valid-idents = [
     "AppContainer",
+    "ChromeOS",
     "MediaCodec",
     "OpenTelemetry",
     "PipeWire",
