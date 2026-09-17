@@ -16596,10 +16596,17 @@ mod tests {
         host.tunnel_set_target(guest_label.clone(), "127.0.0.1".to_owned(), echo_port, true)
             .await
             .unwrap();
-        assert!(
-            echoes_through(forwarded, b"third try").await,
-            "a tunnel with both halves carried nothing"
-        );
+        // Retried, unlike the refusals above: the first connection through
+        // also raises the lazy `rd/tunnel/1` connection, and under a full
+        // workspace run that can outlast one read window. A refusal is an
+        // answer; a slow success is not a failure.
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut carried = echoes_through(forwarded, b"third try").await;
+        while !carried && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            carried = echoes_through(forwarded, b"third try").await;
+        }
+        assert!(carried, "a tunnel with both halves carried nothing");
 
         // The host can see it, which is the other half of §2.2: a tunnel that
         // is carrying traffic is never silent on the host's own screen.
@@ -16820,6 +16827,164 @@ mod tests {
             return false;
         }
         false
+    }
+
+    /// ADR 0079: a terminal is its own grant. A full session's worth of
+    /// `view` is not it, the host re-reads it on every open, and the refusal
+    /// reaches the guest's window as a refusal rather than as silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shell_without_the_terminal_grant_is_refused_and_never_opens() {
+        let (_host, guest, _guest_label, host_label, _clipboard) = file_pair().await;
+
+        guest
+            .terminal_open(host_label.clone(), 80, 24)
+            .await
+            .unwrap();
+        let records =
+            wait_for_terminal_event(&guest, &host_label, |event| event != TERMINAL_EVENT_OUTPUT)
+                .await;
+
+        assert!(
+            records
+                .iter()
+                .any(|(_, event, _)| *event == TERMINAL_EVENT_REFUSED_NOT_GRANTED),
+            "a shell without the grant was not refused as not granted: {records:?}"
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|(_, event, _)| *event == TERMINAL_EVENT_OPENED),
+            "a shell without the grant was opened"
+        );
+    }
+
+    /// ADR 0079 end to end, on a platform whose test process can start a
+    /// shell as itself: with the grant a shell really runs and answers; the
+    /// moment the grant is withdrawn the guest is told it is closed; and the
+    /// next open is refused, because the revoke is not a one-shot.
+    ///
+    /// Unix only: on Windows the shell must be dropped to the desktop user's
+    /// token, which an unelevated test process cannot obtain, and that
+    /// refusal is `crates/terminal`'s own test.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_granted_shell_runs_and_a_revoke_closes_it_and_refuses_the_next() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::Terminal, true)
+            .await
+            .unwrap();
+
+        guest
+            .terminal_open(host_label.clone(), 80, 24)
+            .await
+            .unwrap();
+        let records =
+            wait_for_terminal_event(&guest, &host_label, |event| event != TERMINAL_EVENT_OUTPUT)
+                .await;
+        let Some((shell, _, _)) = records
+            .iter()
+            .find(|(_, event, _)| *event == TERMINAL_EVENT_OPENED)
+        else {
+            panic!("a granted shell did not open: {records:?}");
+        };
+        let shell = *shell;
+
+        // What comes back is computed by the shell, not echoed from the
+        // input: the typed line never contains the answer.
+        guest
+            .terminal_input(
+                host_label.clone(),
+                shell,
+                b"echo lumepeer-$((6*7))\n".to_vec(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut output = Vec::new();
+        while !output.windows(11).any(|window| window == b"lumepeer-42") {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the shell never answered: {}",
+                String::from_utf8_lossy(&output)
+            );
+            let polled = guest.terminal_poll(host_label.clone()).await.unwrap();
+            for (id, event, payload) in terminal_records(&polled) {
+                if id == shell && event == TERMINAL_EVENT_OUTPUT {
+                    output.extend_from_slice(&payload);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        host.set_grant(guest_label.clone(), IndependentGrant::Terminal, false)
+            .await
+            .unwrap();
+        let records =
+            wait_for_terminal_event(&guest, &host_label, |event| event == TERMINAL_EVENT_CLOSED)
+                .await;
+        assert!(
+            records
+                .iter()
+                .any(|(id, event, _)| *id == shell && *event == TERMINAL_EVENT_CLOSED),
+            "the revoke did not close the running shell: {records:?}"
+        );
+
+        guest
+            .terminal_open(host_label.clone(), 80, 24)
+            .await
+            .unwrap();
+        let records =
+            wait_for_terminal_event(&guest, &host_label, |event| event != TERMINAL_EVENT_OUTPUT)
+                .await;
+        assert!(
+            records
+                .iter()
+                .any(|(_, event, _)| *event == TERMINAL_EVENT_REFUSED_NOT_GRANTED),
+            "a shell opened after the revoke was not refused: {records:?}"
+        );
+    }
+
+    /// Polls a guest's terminal queue until one record's event satisfies
+    /// `wanted`, returning every record seen on the way (the queue is drained
+    /// by each poll, so nothing is seen twice).
+    async fn wait_for_terminal_event(
+        guest: &ActorHandle,
+        host_label: &str,
+        wanted: impl Fn(u8) -> bool,
+    ) -> Vec<(ShellId, u8, Vec<u8>)> {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut seen = Vec::new();
+        loop {
+            let polled = guest.terminal_poll(host_label.to_owned()).await.unwrap();
+            let records = terminal_records(&polled);
+            let found = records.iter().any(|(_, event, _)| wanted(*event));
+            seen.extend(records);
+            if found {
+                return seen;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for a terminal event: {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Reads `terminal_drain`'s wire shape back: `count:u16`, then records of
+    /// `shell:u32 | event:u8 | length:u32 | payload`, little endian.
+    fn terminal_records(bytes: &[u8]) -> Vec<(ShellId, u8, Vec<u8>)> {
+        let mut records = Vec::new();
+        let count = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let mut at = 2;
+        for _ in 0..count {
+            let shell = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let event = bytes[at + 4];
+            let length = u32::from_le_bytes(bytes[at + 5..at + 9].try_into().unwrap()) as usize;
+            at += 9;
+            records.push((shell, event, bytes[at..at + length].to_vec()));
+            at += length;
+        }
+        records
     }
 
     /// Polls for the refusal a download is about to produce.

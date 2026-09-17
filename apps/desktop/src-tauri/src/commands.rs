@@ -3663,6 +3663,96 @@ mod tests {
         }
     }
 
+    /// The third of the three places a command is registered: a capability
+    /// that allows it. A command declared and handled but allowed by no
+    /// capability compiles, and every call to it from a window is refused at
+    /// run time — which the webview can swallow without a trace, the way a
+    /// best-effort `.catch(() => {})` does.
+    #[test]
+    fn every_command_the_webview_names_is_allowed_by_a_capability() {
+        let declared = command_list(
+            include_str!("../build.rs"),
+            "const COMMANDS: &[&str] = &[",
+            "];",
+        );
+        let allowed: Vec<String> = ["main.json", "view.json", "hostbar.json"]
+            .iter()
+            .flat_map(|file| capability_commands("capabilities", file))
+            .collect();
+
+        let webview = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+        let mut named = Vec::new();
+        for entry in std::fs::read_dir(&webview).expect("the webview sources") {
+            let path = entry.expect("a directory entry").path();
+            let file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let is_source = path.extension().is_some_and(|extension| extension == "ts")
+                && !path.file_stem().is_some_and(|stem| {
+                    std::path::Path::new(stem)
+                        .extension()
+                        .is_some_and(|inner| inner == "test")
+                });
+            if !is_source {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a webview source");
+            for command in &declared {
+                if ["'", "\"", "`"]
+                    .iter()
+                    .any(|quote| source.contains(&format!("{quote}{command}{quote}")))
+                {
+                    named.push((command.clone(), file.to_owned()));
+                }
+            }
+        }
+        assert!(
+            !named.is_empty(),
+            "no command names were found in the webview"
+        );
+        for (command, file) in named {
+            assert!(
+                allowed.contains(&command),
+                "{file} calls {command}, but no capability in capabilities/ allows it"
+            );
+        }
+    }
+
+    /// `docs/gap-tasks/README.md`: a pilot capability mirrors its production
+    /// counterpart. The pilot build is what end-to-end runs drive, so a
+    /// command missing there is one no e2e run can reach.
+    #[test]
+    fn the_pilot_capabilities_allow_everything_production_does() {
+        for file in ["main.json", "view.json", "hostbar.json"] {
+            let pilot = capability_commands("capabilities-pilot", file);
+            for command in capability_commands("capabilities", file) {
+                assert!(
+                    pilot.contains(&command),
+                    "capabilities/{file} allows {command} and capabilities-pilot/{file} does not"
+                );
+            }
+        }
+    }
+
+    /// The application commands a capability file allows, as command names.
+    fn capability_commands(dir: &str, file: &str) -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(dir)
+            .join(file);
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("a capability file"))
+                .expect("capability JSON");
+        json["permissions"]
+            .as_array()
+            .expect("a permissions list")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|permission| permission.strip_prefix("allow-"))
+            .map(|command| command.replace('-', "_"))
+            .collect()
+    }
+
     /// The entries of a bracketed list in a source file, unquoted and without
     /// their trailing commas.
     fn command_list(source: &str, open: &str, close: &str) -> Vec<String> {
