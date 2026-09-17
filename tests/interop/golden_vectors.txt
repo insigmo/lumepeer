@@ -240,3 +240,9 @@ valid minor16_terminal_close abababababababababababababababab01033a0700
 valid minor17_reboot_request_reboot abababababababababababababababab01043b0000
 valid minor17_reboot_request_shutdown abababababababababababababababab01053b0100
 invalid minor17_reboot_request_unknown_mode abababababababababababababababab01063b0200
+
+# --- Frozen for PROTOCOL_MINOR 18: session resume (ADR 0089). No new message:
+# --- a resume claim is an ordinary Hello whose envelope names the session it
+# --- is coming back to, and a first connection names none (all zeroes).
+valid minor18_hello_first_connection 000000000000000000000000000000000100000100000104636f72650301020300
+valid minor18_hello_resume_claim 1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d0100000100000104636f72650301020300

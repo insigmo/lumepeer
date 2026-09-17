@@ -23,6 +23,7 @@ export const pl: Dictionary = {
   'invite.cancel': 'Anuluj',
   'invite.denied': 'Drugie urządzenie odrzuciło prośbę.',
   'invite.failed': 'Połączenie zakończyło się, zanim zostało zaakceptowane.',
+  'invite.sessionNotResumed': 'Nie udało się wznowić sesji. Połącz się ponownie, aby poprosić o nową.',
   'invite.unreachable':
     'Nie udało się połączyć z tym urządzeniem. Może być offline albo jego kod zaproszenia jest nieaktualny — poproś o nowy.',
   'invite.badTicket': 'Ten kod zaproszenia jest nieprawidłowy lub wygasł.',
@@ -85,6 +86,8 @@ export const pl: Dictionary = {
   'audit.kind.grant_changed': 'Zmieniono uprawnienie',
   'audit.kind.unattended_login': 'Logowanie bez nadzoru',
   'audit.kind.device_trust_changed': 'Zmieniono zaufanie do urządzenia',
+  'audit.kind.reboot': 'Zażądano ponownego uruchomienia lub wyłączenia',
+  'audit.kind.session_resumed': 'Sesja wznowiona po zerwaniu połączenia',
   'system.heading': 'To urządzenie',
   'system.autostart': 'Uruchamiaj Lumepeer przy logowaniu',
   'system.autostartNote':
@@ -361,6 +364,9 @@ export const pl: Dictionary = {
   'reboot.waiting.title': 'Urządzenie uruchamia się ponownie',
   'reboot.waiting.body': 'Czekamy na jego powrót. Ponowne wejście wymaga hasła urządzenia, a nie uprawnień tej sesji.',
   'reboot.waiting.cancel': 'Przestań czekać',
+  'resume.waiting.title': 'Połączenie zostało przerwane',
+  'resume.waiting.body': 'Przywracanie tej sesji. Zachowuje swoje uprawnienia; nikt nie jest ponownie pytany.',
+  'resume.waiting.cancel': 'Przestań łączyć ponownie',
   'history.autoReconnect': 'Łącz ponownie samodzielnie',
   'history.autoReconnect.hint': 'Gdy to urządzenie zniknie, wróć do niego bez pytania. Wymaga zapisanego hasła urządzenia i i tak kończy się nowym logowaniem.',
   'agent.indicator': 'Dostęp zdalny jest aktywny na tym komputerze',

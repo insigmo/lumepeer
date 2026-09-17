@@ -175,6 +175,17 @@ impl PeerConnection {
         }
     }
 
+    /// Whether the far side closed this connection with application close
+    /// code `code` (§18). `false` while it is live, and for any other ending:
+    /// a lost link, a timeout, or this side's own close.
+    #[must_use]
+    pub fn closed_by_peer_with(&self, code: u32) -> bool {
+        matches!(
+            self.close_reason(),
+            Some(ConnectionError::ApplicationClosed(ref close)) if close.error_code == VarInt::from_u32(code)
+        )
+    }
+
     /// Why the connection closed, or `None` while it is still live.
     #[must_use]
     pub fn close_reason(&self) -> Option<ConnectionError> {

@@ -23,6 +23,7 @@ export const de: Dictionary = {
   'invite.cancel': 'Abbrechen',
   'invite.denied': 'Das andere Gerät hat die Anfrage abgelehnt.',
   'invite.failed': 'Die Verbindung wurde beendet, bevor sie angenommen wurde.',
+  'invite.sessionNotResumed': 'Die Sitzung konnte nicht fortgesetzt werden. Verbinden Sie sich erneut, um eine neue anzufragen.',
   'invite.unreachable':
     'Dieses Gerät war nicht erreichbar. Es könnte offline sein, oder der Einladungscode ist nicht mehr aktuell — fragen Sie nach einem neuen.',
   'invite.badTicket': 'Dieser Einladungscode ist ungültig oder abgelaufen.',
@@ -85,6 +86,8 @@ export const de: Dictionary = {
   'audit.kind.grant_changed': 'Berechtigung geändert',
   'audit.kind.unattended_login': 'Unbeaufsichtigte Anmeldung',
   'audit.kind.device_trust_changed': 'Gerätevertrauen geändert',
+  'audit.kind.reboot': 'Neustart oder Herunterfahren angefordert',
+  'audit.kind.session_resumed': 'Sitzung nach Verbindungsabbruch fortgesetzt',
   'system.heading': 'Dieses Gerät',
   'system.autostart': 'Lumepeer bei Anmeldung starten',
   'system.autostartNote':
@@ -361,6 +364,9 @@ export const de: Dictionary = {
   'reboot.waiting.title': 'Das Gerät startet neu',
   'reboot.waiting.body': 'Wir warten, bis es zurück ist. Die erneute Anmeldung braucht sein Gerätepasswort, nicht die Rechte dieser Sitzung.',
   'reboot.waiting.cancel': 'Nicht mehr warten',
+  'resume.waiting.title': 'Die Verbindung ist abgebrochen',
+  'resume.waiting.body': 'Diese Sitzung wird wiederhergestellt. Sie behält ihre Rechte; niemand wird erneut gefragt.',
+  'resume.waiting.cancel': 'Wiederverbinden beenden',
   'history.autoReconnect': 'Von selbst neu verbinden',
   'history.autoReconnect.hint': 'Wenn dieses Gerät verschwindet, ohne Nachfrage zurückkehren. Braucht sein hier gespeichertes Gerätepasswort und endet trotzdem in einer neuen Anmeldung.',
   'agent.indicator': 'Fernzugriff ist auf diesem Computer aktiv',

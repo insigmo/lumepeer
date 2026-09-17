@@ -127,4 +127,6 @@ pub mod close_code {
     /// (docs/bugs/02-connect-form.md task 3, docs/bugs/03-connection-list.md
     /// task 3).
     pub const NORMAL: &str = "NORMAL";
+    /// The host has no session of this peer to resume under that id (§10).
+    pub const RESUME_REFUSED: &str = "RESUME_REFUSED";
 }

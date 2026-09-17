@@ -23,6 +23,7 @@ export const uk: Dictionary = {
   'invite.cancel': 'Скасувати',
   'invite.denied': 'Інший пристрій відхилив запит.',
   'invite.failed': "З'єднання завершилося до того, як його прийняли.",
+  'invite.sessionNotResumed': 'Не вдалося відновити сеанс. Підключіться знову, щоб запросити новий.',
   'invite.unreachable':
     "Не вдалося зв'язатися з цим пристроєм. Можливо, він офлайн, або код запрошення застарів — запросіть новий.",
   'invite.badTicket': 'Цей код запрошення недійсний або його термін дії минув.',
@@ -85,6 +86,8 @@ export const uk: Dictionary = {
   'audit.kind.grant_changed': 'Змінено грант',
   'audit.kind.unattended_login': 'Вхід без присутності',
   'audit.kind.device_trust_changed': 'Змінено довіру до пристрою',
+  'audit.kind.reboot': 'Запитано перезавантаження або вимкнення',
+  'audit.kind.session_resumed': "Сеанс відновлено після обриву зв'язку",
   'system.heading': 'Цей пристрій',
   'system.autostart': 'Запускати Lumepeer під час входу в систему',
   'system.autostartNote':
@@ -360,6 +363,9 @@ export const uk: Dictionary = {
   'reboot.waiting.title': 'Пристрій перезавантажується',
   'reboot.waiting.body': 'Чекаємо, поки він повернеться. Для повторного входу потрібен пароль пристрою, а не права цієї сесії.',
   'reboot.waiting.cancel': 'Припинити очікування',
+  'resume.waiting.title': "Зв'язок перервався",
+  'resume.waiting.body': 'Повертаємо цей сеанс. Права зберігаються, повторно нікого не питаємо.',
+  'resume.waiting.cancel': 'Припинити перепідключення',
   'history.autoReconnect': 'Перепідключатися самостійно',
   'history.autoReconnect.hint': 'Якщо цей пристрій зникне, повертатися до нього без запиту. Потрібен збережений пароль пристрою, і вхід усе одно буде новим.',
   'agent.indicator': 'На цьому комп’ютері увімкнено віддалений доступ',
