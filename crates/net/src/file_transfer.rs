@@ -24,6 +24,7 @@ use std::path::{Component, Path, PathBuf};
 
 use lumepeer_core::constants::{
     FILE_CHUNK_MAX_BYTES, FILE_NAME_MAX_BYTES, MAX_CONCURRENT_FILE_TRANSFERS,
+    STAGING_SWEEP_TIMESTAMP_SLACK_SECS,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -483,12 +484,14 @@ impl StagedReceive {
 const STAGING_PREFIX: &str = ".lumepeer-";
 const STAGING_SUFFIX: &str = ".part";
 
-/// When this process started, as the filesystem measures time.
+/// When this process started staging files, by the wall clock.
 ///
 /// Set on the first sweep rather than at startup: this crate is a library
 /// with no `main` to hook, and the first sweep is the first moment the answer
-/// is needed. Anything this process stages is created after it, so the
-/// comparison below cannot take a live transfer's own file.
+/// is needed. Anything this process stages is created after it — but it is
+/// *stamped* by the filesystem's own, coarser clock, which is why
+/// [`sweep_stale`] compares against this minus
+/// [`STAGING_SWEEP_TIMESTAMP_SLACK_SECS`] rather than against this.
 static PROCESS_EPOCH: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
 
 /// Removes staging files in `dir` that this process did not create
@@ -501,13 +504,26 @@ static PROCESS_EPOCH: std::sync::OnceLock<std::time::SystemTime> = std::sync::On
 /// where nothing ran at all.
 ///
 /// Deliberately narrow. Only names matching `.lumepeer-<id>.part` exactly,
-/// only files, and only ones modified before this process started, so a
-/// transfer running right now in another directory of the same user, or in
-/// this one, is never touched. Failures are logged and ignored: a sweep that
+/// only files, and only ones modified at least
+/// [`STAGING_SWEEP_TIMESTAMP_SLACK_SECS`] before this process's first sweep,
+/// so a transfer running right now in another directory of the same user, or
+/// in this one, is never touched. Failures are logged and ignored: a sweep that
 /// cannot read a directory must not stop the transfer that is about to write
 /// into it.
 pub async fn sweep_stale(dir: &Path) {
     let epoch = *PROCESS_EPOCH.get_or_init(std::time::SystemTime::now);
+    // A staging file this process created a moment after the epoch can carry
+    // a modification time from before it, because the filesystem stamps files
+    // from a coarser clock than `SystemTime::now` reads. Without the slack
+    // that file looked like an earlier run's, and a second transfer into the
+    // same directory deleted the first one mid-flight. A clock so close to
+    // its own epoch that the subtraction underflows has no earlier run to
+    // sweep, so nothing is.
+    let Some(cutoff) = epoch.checked_sub(std::time::Duration::from_secs(
+        STAGING_SWEEP_TIMESTAMP_SLACK_SECS,
+    )) else {
+        return;
+    };
     let Ok(mut reader) = tokio::fs::read_dir(dir).await else {
         return;
     };
@@ -530,7 +546,7 @@ pub async fn sweep_stale(dir: &Path) {
         let Ok(modified) = meta.modified() else {
             continue;
         };
-        if modified >= epoch {
+        if modified >= cutoff {
             continue;
         }
         if let Err(error) = tokio::fs::remove_file(entry.path()).await {
@@ -952,6 +968,57 @@ mod tests {
         );
         second.discard().await;
         live.discard().await;
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A staging file stamped a moment *before* the epoch is still this
+    /// process's own: the filesystem stamps from a coarser clock than the
+    /// epoch is read from, and on Linux that is the ordinary case rather than
+    /// an edge (ADR 0077). Only a file older than the epoch by more than
+    /// `STAGING_SWEEP_TIMESTAMP_SLACK_SECS` is an earlier run's.
+    #[tokio::test]
+    async fn a_file_stamped_just_before_the_epoch_is_not_mistaken_for_an_earlier_run() {
+        let dir = std::env::temp_dir().join(format!("lumepeer-sweep-slack-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Takes the epoch if no other test in this binary has yet.
+        sweep_stale(&dir).await;
+        let epoch = *PROCESS_EPOCH.get().unwrap();
+        let stamp = |path: &Path, at: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        };
+
+        let lagging = dir.join(".lumepeer-51.part");
+        tokio::fs::write(&lagging, b"a transfer that is still running")
+            .await
+            .unwrap();
+        stamp(&lagging, epoch - std::time::Duration::from_millis(5));
+
+        let earlier = dir.join(".lumepeer-52.part");
+        tokio::fs::write(&earlier, b"left behind by a killed process")
+            .await
+            .unwrap();
+        stamp(
+            &earlier,
+            epoch - std::time::Duration::from_secs(STAGING_SWEEP_TIMESTAMP_SLACK_SECS + 1),
+        );
+
+        sweep_stale(&dir).await;
+        assert!(
+            lagging.exists(),
+            "a file stamped by a clock trailing the epoch was swept as an earlier run's"
+        );
+        assert!(
+            !earlier.exists(),
+            "a file older than the slack survived the sweep"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

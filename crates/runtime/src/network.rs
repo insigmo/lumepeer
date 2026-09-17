@@ -3081,12 +3081,51 @@ struct TunnelChannel {
     frames: mpsc::Sender<TunnelWrite>,
     /// Where a frame that arrives goes: one sender per open stream, feeding
     /// the local socket's own write half.
-    streams: Arc<tokio::sync::Mutex<std::collections::HashMap<StreamId, mpsc::Sender<Vec<u8>>>>>,
+    streams: TunnelStreams,
     /// Bytes carried in both directions, for the line the host reads.
     bytes: Arc<AtomicU64>,
     /// The QUIC connection under it, kept so a revoke can close it outright
     /// rather than waiting for the far side to notice (§4; ADR 0078).
     connection: PeerConnection,
+}
+
+/// Which open stream a frame arriving on a tunnel belongs to (ADR 0078).
+///
+/// A plain mutex, taken and released without awaiting anything, so that a
+/// stream is in the table **before** the call that registers it returns. It
+/// was a `tokio::sync::Mutex` filled from a spawned task, and a stream's first
+/// payload could reach the reader before that task had run: the reader found
+/// no stream, treated the payload as one for a connection already closed, and
+/// dropped it — the forwarded connection then waited forever for an answer to
+/// bytes the far side never saw.
+#[derive(Clone, Default)]
+struct TunnelStreams(
+    Arc<std::sync::Mutex<std::collections::HashMap<StreamId, mpsc::Sender<Vec<u8>>>>>,
+);
+
+impl TunnelStreams {
+    fn table(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<StreamId, mpsc::Sender<Vec<u8>>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Makes `stream` reachable by frames that arrive from now on.
+    fn register(&self, stream: StreamId, sender: mpsc::Sender<Vec<u8>>) {
+        self.table().insert(stream, sender);
+    }
+
+    /// Where `stream`'s payloads go, if it is still open.
+    fn sender(&self, stream: StreamId) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.table().get(&stream).cloned()
+    }
+
+    /// Forgets `stream`; dropping its sender closes the local write half.
+    fn remove(&self, stream: StreamId) {
+        self.table().remove(&stream);
+    }
 }
 
 /// One thing to put on a tunnel connection.
@@ -4382,6 +4421,10 @@ struct Actor {
     /// Guest side: sockets accepted on a forwarded port and waiting for the
     /// host to say whether they may be connected.
     tunnel_pending: std::collections::HashMap<(NodeId, StreamId), Box<tokio::net::TcpStream>>,
+    /// Both sides: sockets whose stream the host has agreed to, waiting for
+    /// `rd/tunnel/1` to come up so they can be started (ADR 0078).
+    tunnel_awaiting_channel:
+        std::collections::HashMap<(NodeId, StreamId), Box<tokio::net::TcpStream>>,
     /// Which address each open stream is for, on both sides, for the line the
     /// host reads and for the audit entry when it closes.
     tunnel_streams: std::collections::HashMap<(NodeId, StreamId), TunnelTarget>,
@@ -6135,11 +6178,25 @@ impl Actor {
         let (frames_tx, frames_rx) = mpsc::channel::<TunnelWrite>(64);
         let channel = TunnelChannel {
             frames: frames_tx,
-            streams: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            streams: TunnelStreams::default(),
             bytes: Arc::new(AtomicU64::new(0)),
             connection: connection.clone(),
         };
         self.tunnels.insert(peer, channel.clone());
+        // Streams both sides agreed on while this connection was still coming
+        // up. Started before the reader task below exists, so none of their
+        // frames can arrive ahead of them.
+        let parked: Vec<StreamId> = self
+            .tunnel_awaiting_channel
+            .keys()
+            .filter(|(p, _)| *p == peer)
+            .map(|(_, id)| *id)
+            .collect();
+        for stream_id in parked {
+            if let Some(socket) = self.tunnel_awaiting_channel.remove(&(peer, stream_id)) {
+                self.start_tunnel_stream(peer, stream_id, *socket);
+            }
+        }
         // One bidirectional QUIC stream carries every forwarded connection,
         // told apart by the stream id in each frame's own header. The side
         // that dialed opens it; the other accepts it.
@@ -6221,7 +6278,6 @@ impl Actor {
         if self.tunnel_listeners.contains_key(&(peer, local_port)) {
             return Err(ActorError::Core(CoreError::NotPermitted));
         }
-        self.ensure_tunnel_connection(peer);
 
         // Bound here, on the actor loop, with the blocking API and then
         // handed to tokio: `bind` is one syscall that does not wait on
@@ -6453,16 +6509,19 @@ impl Actor {
         socket: tokio::net::TcpStream,
     ) {
         let Some(channel) = self.tunnels.get(&peer).cloned() else {
+            // Agreed on, but `rd/tunnel/1` is not up yet: it is raised only
+            // once something has actually been forwarded (ADR 0078), and this
+            // is that moment. The stream starts when the connection lands.
+            self.tunnel_awaiting_channel
+                .insert((peer, stream_id), Box::new(socket));
+            self.ensure_tunnel_connection(peer);
             return;
         };
         let events = self.events_tx.clone();
         let (mut read_half, mut write_half) = socket.into_split();
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(16);
-        let streams = Arc::clone(&channel.streams);
+        channel.streams.register(stream_id, inbound_tx);
         let bytes = Arc::clone(&channel.bytes);
-        tokio::spawn(async move {
-            streams.lock().await.insert(stream_id, inbound_tx);
-        });
 
         // Far side to local socket. An idle stream is closed rather than held
         // open forever: a socket on somebody else's machine is not free.
@@ -6580,11 +6639,9 @@ impl Actor {
             return;
         }
         self.tunnel_pending.remove(&(peer, stream_id));
-        if let Some(channel) = self.tunnels.get(&peer).cloned() {
-            let streams = Arc::clone(&channel.streams);
-            tokio::spawn(async move {
-                streams.lock().await.remove(&stream_id);
-            });
+        self.tunnel_awaiting_channel.remove(&(peer, stream_id));
+        if let Some(channel) = self.tunnels.get(&peer) {
+            channel.streams.remove(stream_id);
         }
         if announce {
             self.send_to(&peer, MessageKind::TunnelClose { stream_id });
@@ -6618,6 +6675,7 @@ impl Actor {
             self.send_to(&peer, MessageKind::TunnelClose { stream_id });
         }
         self.tunnel_pending.retain(|(p, _), _| *p != peer);
+        self.tunnel_awaiting_channel.retain(|(p, _), _| *p != peer);
         self.tunnel_listeners.retain(|(p, _), task| {
             if *p == peer {
                 task.abort();
@@ -13271,7 +13329,7 @@ async fn run_tunnel_connection(
         if frame.is_close() {
             // Dropping the sender closes the local socket's write half,
             // which is what turns the far side's `FIN` into one here.
-            channel.streams.lock().await.remove(&stream_id);
+            channel.streams.remove(stream_id);
             let _ = events
                 .send(ActorEvent::Tunnel(TunnelEvent::StreamEnded {
                     peer,
@@ -13280,7 +13338,7 @@ async fn run_tunnel_connection(
                 .await;
             continue;
         }
-        let sender = channel.streams.lock().await.get(&stream_id).cloned();
+        let sender = channel.streams.sender(stream_id);
         let Some(sender) = sender else {
             // A payload for a connection this side has already closed. Not an
             // error and not a reason to tear the tunnel down: both ends may
@@ -13289,7 +13347,7 @@ async fn run_tunnel_connection(
             continue;
         };
         if sender.send(frame.payload).await.is_err() {
-            channel.streams.lock().await.remove(&stream_id);
+            channel.streams.remove(stream_id);
         }
     }
 
@@ -14553,6 +14611,7 @@ pub fn spawn_actor_with(
         tunnel_dialing: std::collections::HashSet::new(),
         tunnel_listeners: std::collections::HashMap::new(),
         tunnel_pending: std::collections::HashMap::new(),
+        tunnel_awaiting_channel: std::collections::HashMap::new(),
         tunnel_streams: std::collections::HashMap::new(),
         next_tunnel_stream: 1,
         tunnel_wanted: std::collections::HashMap::new(),
@@ -15968,28 +16027,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_tunnel_needs_both_halves_and_a_revoke_closes_it_at_once() {
         // A service on the "host's" machine, which in this test is this one.
-        let echo = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let echo_port = echo.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = echo.accept().await {
-                tokio::spawn(async move {
-                    let mut buffer = [0u8; 64];
-                    while let Ok(read) =
-                        tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await
-                    {
-                        if read == 0
-                            || tokio::io::AsyncWriteExt::write_all(&mut socket, &buffer[..read])
-                                .await
-                                .is_err()
-                        {
-                            return;
-                        }
-                    }
-                });
-            }
-        });
+        let echo_port = spawn_echo_service().await;
         let forwarded = free_local_port().await;
 
         let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
@@ -16049,6 +16087,62 @@ mod tests {
         assert!(
             !echoes_through(forwarded, b"after the revoke").await,
             "a withdrawn grant still carried bytes"
+        );
+    }
+
+    /// ADR 0078: a stream is reachable the moment it is registered. The
+    /// reader of a tunnel connection looks a frame's stream up as soon as the
+    /// frame arrives, and a table filled from a spawned task could still be
+    /// empty then — the first payload of a forwarded connection was dropped as
+    /// if that connection had already closed, and the connection hung.
+    #[test]
+    fn a_registered_tunnel_stream_is_reachable_before_anything_else_runs() {
+        let streams = TunnelStreams::default();
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1);
+        streams.register(7, sender);
+        let found = streams.sender(7).unwrap();
+        found.try_send(b"first bytes".to_vec()).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), b"first bytes".to_vec());
+
+        streams.remove(7);
+        assert!(streams.sender(7).is_none());
+    }
+
+    /// ADR 0078: `rd/tunnel/1` is raised once something has actually been
+    /// forwarded, not when the forward is set up. A guest that opens its
+    /// forward first and asks for the grant afterwards — the order a person
+    /// asks in — must get a working tunnel once the host allows it. Dialing at
+    /// set-up instead let the host refuse that connection for want of a grant
+    /// nobody had decided on yet, and the refusal took the whole forward down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forward_opened_before_the_grant_carries_once_the_host_allows_it() {
+        let echo_port = spawn_echo_service().await;
+        let forwarded = free_local_port().await;
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+
+        guest
+            .tunnel_open(
+                host_label.clone(),
+                forwarded,
+                "127.0.0.1".to_owned(),
+                echo_port,
+            )
+            .await
+            .unwrap();
+        // Time enough for a connection dialed at set-up to reach the host and
+        // be refused there. Waiting on a condition is not possible: the point
+        // is that nothing should be happening.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        host.set_grant(guest_label.clone(), IndependentGrant::Tunnel, true)
+            .await
+            .unwrap();
+        host.tunnel_set_target(guest_label, "127.0.0.1".to_owned(), echo_port, true)
+            .await
+            .unwrap();
+        assert!(
+            echoes_through(forwarded, b"asked for before it was allowed").await,
+            "a forward opened before the grant never carried anything"
         );
     }
 
@@ -16116,6 +16210,34 @@ mod tests {
             matches!(again, Err(ActorError::Core(CoreError::NotPermitted))),
             "the same local port was forwarded twice"
         );
+    }
+
+    /// Starts a TCP echo service on the loopback, standing in for a service
+    /// on the host's own machine, and returns its port.
+    async fn spawn_echo_service() -> u16 {
+        let echo = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 64];
+                    while let Ok(read) =
+                        tokio::io::AsyncReadExt::read(&mut socket, &mut buffer).await
+                    {
+                        if read == 0
+                            || tokio::io::AsyncWriteExt::write_all(&mut socket, &buffer[..read])
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        echo_port
     }
 
     /// A port nothing is listening on, for a forward to take.
