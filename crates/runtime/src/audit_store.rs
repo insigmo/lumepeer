@@ -433,7 +433,7 @@ fn event_columns(event: &AuditEvent) -> (&'static str, String) {
 }
 
 /// Every `kind` [`event_columns`] can produce, for the UI's filter.
-pub const EVENT_KINDS: [&str; 14] = [
+pub const EVENT_KINDS: [&str; 15] = [
     "consent_requested",
     "consent_granted",
     "consent_revoked",
