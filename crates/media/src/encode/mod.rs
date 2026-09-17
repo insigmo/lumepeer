@@ -122,10 +122,13 @@ pub trait VideoEncoder: Send {
 /// baseline's (ADR 0069).
 ///
 /// On Linux, with `encode-vaapi` built in, [`linux_vaapi`] does the same
-/// thing through VA-API for H.264: opens a DRM display, creates an H.264
-/// `VAEntrypointEncSlice` config, allocates NV12 surfaces and creates the
-/// encode context, reporting [`EncoderKind::Hardware`] only when all of that
-/// actually succeeds (ADR 0040). It answers `None` for
+/// thing through VA-API for H.264 and then goes the step further
+/// `macos_videotoolbox` goes: it opens a DRM display, creates an H.264 config
+/// on whichever encode entrypoint the driver offers — the low-power one is
+/// the only one on current Intel — and pushes a frame through it, reporting
+/// [`EncoderKind::Hardware`] only when an IDR picture comes back (ADR 0040,
+/// ADR 0088). A context that opened turned out to say nothing about a stream
+/// that decodes. It answers `None` for
 /// [`VideoCodec::Av1`], and not because nobody looked: VA-API's AV1 encode
 /// entrypoint cannot be driven through this workspace's libva bindings at
 /// all, which ADR 0069 records rather than leaving as an unexplained gap.
