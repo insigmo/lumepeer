@@ -166,11 +166,15 @@ impl ViewWindows for AgentViewWindows {
     /// it stays up for as long as that agent is serving. What that costs is an
     /// indicator on a machine nobody is connected to, which is the direction
     /// this project errs in on purpose (§2.2).
+    ///
+    /// What the count *is* used for is remembering it (ADR 0088 §3): somebody
+    /// who signs in while a guest is connected is walking into a session that
+    /// is already being watched, and the state machine records that arrival.
+    /// The indicator is still raised by the attachment and never lowered by
+    /// this call.
     fn set_host_bar(&self, visible: bool) {
-        tracing::debug!(
-            visible,
-            "session-0 host: the agent's indicator follows the attachment, not the session count"
-        );
+        self.screen
+            .with_screen(|screen| screen.guests_changed(visible));
     }
 
     /// Whether anybody is in front of this host to answer a consent dialog.
@@ -181,6 +185,16 @@ impl ViewWindows for AgentViewWindows {
     /// shown (ADR 0085 §3c).
     fn attendance(&self) -> HostAttendance {
         self.screen.with_screen(|screen| screen.attendance())
+    }
+
+    /// Whether the logon screen is what this host is serving (ADR 0088 §1).
+    fn on_secure_desktop(&self) -> bool {
+        self.screen.with_screen(|screen| screen.on_secure_desktop())
+    }
+
+    /// Whether nobody at all is signed in (ADR 0088 §3).
+    fn nobody_signed_in(&self) -> bool {
+        self.screen.with_screen(|screen| screen.nobody_signed_in())
     }
 }
 
@@ -210,6 +224,35 @@ mod tests {
 
         screen.with_screen(SessionScreen::agent_gone);
         assert_eq!(windows.attendance(), HostAttendance::Unattended);
+    }
+
+    /// ADR 0088 §3 at the seam: the runtime's session count reaches the state
+    /// machine, so a sign-in during a live session is recorded as one — and
+    /// the count dropping to zero never lowers anything.
+    #[test]
+    fn the_session_count_is_remembered_and_never_lowers_the_indicator() {
+        let screen = Arc::new(AgentScreen::new());
+        let windows = AgentViewWindows::new(Arc::clone(&screen));
+        screen.with_screen(|screen| {
+            screen.console_session_is(Some(1));
+            screen.agent_launched(1);
+        });
+
+        windows.set_host_bar(true);
+        let commands =
+            screen.with_screen(|screen| screen.on_event(AgentEvent::Attached { session: 1 }, 0));
+        assert!(screen.with_screen(|screen| screen.arrived_during_live_session()));
+        assert_eq!(
+            commands.first(),
+            Some(&AgentCommand::ShowIndicator { on: true })
+        );
+
+        windows.set_host_bar(false);
+        assert_eq!(
+            windows.attendance(),
+            HostAttendance::Attended,
+            "the last guest leaving does not end the attachment or its indicator"
+        );
     }
 
     /// A command with no agent attached is dropped and says so. It must not

@@ -92,10 +92,17 @@ impl InputInjector for AgentInjector {
             // The agent runs as the signed-in user on their own desktop, so
             // what it can inject is what they could type — which is `Full` in
             // this enum's terms.
-            ScreenState::Serving { .. } => InputCapability::Full,
-            ScreenState::NoSession | ScreenState::Starting { .. } | ScreenState::Lost => {
-                InputCapability::None
-            }
+            //
+            // The logon-screen worker performs what it is forwarded too, once
+            // the actor has checked `secure_desktop_input` for it (ADR 0088 §1).
+            ScreenState::Serving { .. } | ScreenState::LogonScreen { .. } => InputCapability::Full,
+            // Nothing attached, or a transition: there is nowhere for a key to
+            // land that belongs to the session the guest was admitted to.
+            ScreenState::NoSession
+            | ScreenState::LogonScreenStarting { .. }
+            | ScreenState::Starting { .. }
+            | ScreenState::Switching { .. }
+            | ScreenState::Lost => InputCapability::None,
         }
     }
 }

@@ -33,6 +33,8 @@
 #[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
+mod logon_screen_worker;
+#[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
 mod secure_desktop_input;
@@ -76,6 +78,16 @@ fn main() {
             .any(|arg| arg == lumepeer_service::SECURE_DESKTOP_WORKER_ARG)
         {
             std::process::exit(i32::try_from(secure_desktop_launch::run_worker()).unwrap_or(1));
+        }
+        // The logon-screen worker (ADR 0088 §1): launched by the session-0
+        // host onto `Winsta0\Winlogon`, it lives for as long as that screen is
+        // served and exits when the host's channel ends. No arguments beyond
+        // the flag — everything it does arrives over that channel.
+        if args
+            .iter()
+            .any(|arg| arg == lumepeer_service::LOGON_SCREEN_WORKER_ARG)
+        {
+            std::process::exit(i32::try_from(logon_screen_worker::run_worker()).unwrap_or(1));
         }
         // The secure-desktop *input* worker (ADR 0057): this binary,
         // re-executed onto `Winsta0\Winlogon` with the input arg followed by

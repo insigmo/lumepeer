@@ -41,6 +41,24 @@ use crate::protocol::{
     SECURE_DESKTOP_FRAME_MAPPING_BYTES, SECURE_DESKTOP_MAPPING_NAME,
 };
 
+/// Name of the mapping the logon-screen worker publishes into (ADR 0088 §1).
+///
+/// `Global\` for the reason [`SECURE_DESKTOP_MAPPING_NAME`] already records:
+/// the host runs in session 0 and its worker runs in the console session, and
+/// a name without the prefix would be created in the caller's own
+/// session-private namespace — invisible across exactly the boundary this
+/// mapping exists to cross.
+const LOGON_SCREEN_MAPPING_NAME: &str = r"Global\lumepeer-logon-screen-frame";
+
+/// Who may open the logon-screen mapping, in SDDL.
+///
+/// `LocalSystem` and administrators, and deliberately **not** the `IU`
+/// interactive users [`FRAME_SDDL`] admits to read. Both ends of this mapping
+/// are `LocalSystem` — the host that creates it and the worker that fills it —
+/// so there is nobody else to admit, and what it holds is a picture of the
+/// screen where this machine's passwords are typed.
+const LOGON_SCREEN_FRAME_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
+
 /// Who may open the secure-desktop mapping, in SDDL — the same three trustees
 /// the pipe's own DACL names (ADR 0043), but asymmetric where the pipe is not:
 /// nothing on the client's side ever writes a frame, so interactive users get
@@ -75,12 +93,12 @@ pub(crate) fn is_sid_string(text: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c == '-' || c == 'S')
 }
 
-/// Which of this crate's two frame mappings a [`Writer`] or [`Reader`] is on.
+/// Which of this crate's frame mappings a [`Writer`] or [`Reader`] is on.
 ///
 /// Enumerated rather than parameterized by a name and a size: the mappings a
 /// `LocalSystem` process publishes are part of what it exposes, and "whatever
-/// the caller named" is not a list anyone can review. There are two, both are
-/// here, and adding a third is a visible change to this enum.
+/// the caller named" is not a list anyone can review. There are three, all of
+/// them are here, and adding a fourth is a visible change to this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameChannel {
     /// One frame of the secure desktop, written by the short-lived worker the
@@ -88,6 +106,21 @@ pub enum FrameChannel {
     SecureDesktop,
     /// Encoded frames from the long-lived session agent (ADR 0085).
     SessionAgent,
+    /// Frames of the logon screen, written by the long-lived worker the
+    /// session-0 host launches onto `Winlogon` (ADR 0088 §1).
+    ///
+    /// Its own mapping rather than [`SecureDesktop`](Self::SecureDesktop)'s,
+    /// even though the pixels are the same shape and come off the same
+    /// desktop: that one is created by the helper service and filled one frame
+    /// per request, this one is created by the host and filled on a tick, and
+    /// a single mapping with two writers on two schedules would be a tear
+    /// nobody could attribute.
+    ///
+    /// Raw `BGRA8`, not the encoded payload [`SessionAgent`](Self::SessionAgent)
+    /// carries. The worker cannot encode: `crates/service` names no lumepeer
+    /// crate at all (ADR 0049 §2), which is the property that keeps a
+    /// `LocalSystem` process on the secure desktop as small as it is.
+    LogonScreen,
 }
 
 impl FrameChannel {
@@ -97,6 +130,7 @@ impl FrameChannel {
         match self {
             Self::SecureDesktop => SECURE_DESKTOP_MAPPING_NAME,
             Self::SessionAgent => AGENT_FRAME_MAPPING_NAME,
+            Self::LogonScreen => LOGON_SCREEN_MAPPING_NAME,
         }
     }
 
@@ -104,7 +138,10 @@ impl FrameChannel {
     #[must_use]
     pub const fn capacity(self) -> usize {
         match self {
-            Self::SecureDesktop => SECURE_DESKTOP_FRAME_CAPACITY_BYTES,
+            // The same screen's worth of `BGRA8` for both: one is a UAC
+            // prompt and the other is the logon screen behind it, and they
+            // are the same desktop at the same size.
+            Self::SecureDesktop | Self::LogonScreen => SECURE_DESKTOP_FRAME_CAPACITY_BYTES,
             Self::SessionAgent => AGENT_FRAME_CAPACITY_BYTES,
         }
     }
@@ -197,6 +234,17 @@ impl Writer {
     #[must_use]
     pub fn create() -> Option<Self> {
         Self::create_with(FrameChannel::SecureDesktop, FRAME_SDDL)
+    }
+
+    /// Creates the logon screen's mapping, writable by `LocalSystem` and
+    /// administrators and readable by nobody else (ADR 0088 §1).
+    ///
+    /// No SID is formatted into this one, because there is no user: the worker
+    /// that fills it runs as `LocalSystem` on `Winlogon`, which is the whole
+    /// reason it can see that desktop at all.
+    #[must_use]
+    pub fn create_for_logon_screen() -> Option<Self> {
+        Self::create_with(FrameChannel::LogonScreen, LOGON_SCREEN_FRAME_SDDL)
     }
 
     /// Creates the session agent's mapping, writable by the one signed-in
@@ -379,6 +427,21 @@ impl Writer {
             );
         }
         true
+    }
+
+    /// Publishes an empty frame, so that whatever was in the mapping stops
+    /// being readable as a picture (ADR 0088 §2).
+    ///
+    /// Every transition between one screen and the next calls this. The reason
+    /// is the whole of ADR 0088 §2: after a fast user switch the frame still
+    /// sitting in the mapping is another person's desktop, and a reader that
+    /// arrived a moment late would copy it out and show it as the current one.
+    /// Zeroing the header rather than the payload is enough and is one write —
+    /// a zero-length frame is what every reader here already treats as "there
+    /// is no picture".
+    pub fn clear(&self) {
+        let cleared = self.write(0, 0, &[]);
+        debug_assert!(cleared, "an empty frame always fits");
     }
 }
 

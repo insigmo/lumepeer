@@ -1004,6 +1004,23 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// session is already running changes the answer, and the next guest to
     /// arrive gets the dialog the one before it could not have been shown.
     fn attendance(&self) -> HostAttendance;
+    /// Whether this host's own screen is the secure desktop right now, for a
+    /// host that has no encode loop to notice it (ADR 0088 §1).
+    ///
+    /// A desktop client learns this per media session, from its own capture
+    /// failing with `SecureDesktopActive`, and answers `false` here. A
+    /// session-0 host serving the logon screen has no capture of its own to
+    /// fail, and this is where it says so — so that a guest's keystroke on
+    /// that screen is gated by `secure_desktop_input` exactly as it is on a
+    /// UAC prompt (ADR 0057, ADR 0061).
+    fn on_secure_desktop(&self) -> bool;
+    /// Whether nobody at all is signed in to this machine (ADR 0088 §3).
+    ///
+    /// Narrower than [`attendance`](Self::attendance): a signed-in desktop
+    /// whose owner walked away is unattended, and still has an indicator on it
+    /// for them to come back to. A machine at its logon screen has no desktop
+    /// to put one on, and an admission to it is audited as its own kind.
+    fn nobody_signed_in(&self) -> bool;
 }
 
 /// [`ViewWindows`] that does nothing, for driving the actor without a webview.
@@ -1033,6 +1050,14 @@ impl ViewWindows for DetachedViewWindows {
     /// onto ADR 0085's credential-only path.
     fn attendance(&self) -> HostAttendance {
         HostAttendance::Attended
+    }
+
+    fn on_secure_desktop(&self) -> bool {
+        false
+    }
+
+    fn nobody_signed_in(&self) -> bool {
+        false
     }
 }
 

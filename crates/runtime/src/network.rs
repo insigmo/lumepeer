@@ -620,6 +620,29 @@ pub struct SessionSnapshot {
 /// to `SendInput` with the very same table `crates/media`'s in-session injector
 /// uses, so a click or keystroke on the secure desktop does what it does on the
 /// ordinary one.
+/// Whether an input event may land where it is going (ADR 0057, ADR 0088 §1).
+///
+/// Off the secure desktop this adds nothing: the controller role was already
+/// checked by `authorize_input`. On it, the event also needs
+/// `secure_desktop_input`, which no role turns on by itself being chosen — and
+/// a session whose grants cannot be read at all is refused, the direction every
+/// other check here fails in.
+fn secure_desktop_input_permitted(on_secure_desktop: bool, grants: Option<Grants>) -> bool {
+    !on_secure_desktop || grants.is_some_and(|grants| grants.secure_desktop_input)
+}
+
+/// Which audit record an unattended admission gets (ADR 0088 §3).
+///
+/// A machine nobody is signed in to gets its own kind: nothing else on it will
+/// ever tell the person who sits down that a guest was let in.
+const fn unattended_login_event(nobody_signed_in: bool, accepted: bool) -> AuditEvent {
+    if nobody_signed_in {
+        AuditEvent::EmptyMachineLogin { accepted }
+    } else {
+        AuditEvent::UnattendedLogin { accepted }
+    }
+}
+
 fn secure_desktop_action(
     event: &InputEventPayload,
 ) -> Option<lumepeer_service::protocol::InjectAction> {
@@ -8421,18 +8444,23 @@ impl Actor {
             .media
             .get(&peer)
             .is_some_and(|session| session.control.secure_desktop_blocked());
+        // ADR 0088 §1: a session-0 host serving the logon screen has no
+        // encode loop to set the per-session flag above, so its screen seam is
+        // what says the next keystroke lands on `Winlogon`. The gate is the
+        // same grant; what differs is only who performs the event — the
+        // logon-screen worker behind the ordinary injector, not the helper.
+        let host_screen_is_secure = self.windows.on_secure_desktop();
+        if !secure_desktop_input_permitted(
+            on_secure_desktop || host_screen_is_secure,
+            self.sessions.grants(&peer),
+        ) {
+            tracing::warn!(
+                peer = %tag,
+                "dropping a secure-desktop input event: secure_desktop_input not granted"
+            );
+            return;
+        }
         if on_secure_desktop {
-            let permitted = self
-                .sessions
-                .grants(&peer)
-                .is_some_and(|grants| grants.secure_desktop_input);
-            if !permitted {
-                tracing::warn!(
-                    peer = %tag,
-                    "dropping a secure-desktop input event: secure_desktop_input not granted"
-                );
-                return;
-            }
             // A pointer move does not spend a worker: every move would
             // otherwise spawn a `LocalSystem` process on `Winlogon`, which a
             // normal mouse drag would turn into a flood. Cache the position and
@@ -8833,7 +8861,8 @@ impl Actor {
                 // factor was presented, and how nearly it matched, would make
                 // the log the oracle the error type refuses to be (§15).
                 tracing::info!(peer = %tag, ?role, "unattended login accepted");
-                self.audit(&peer, AuditEvent::UnattendedLogin { accepted: true });
+                let event = unattended_login_event(self.windows.nobody_signed_in(), true);
+                self.audit(&peer, event);
                 if let Err(error) = self.grant_role(peer, role) {
                     tracing::warn!(peer = %tag, ?error, "cannot start the admitted session");
                     self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
@@ -8847,7 +8876,8 @@ impl Actor {
                 // have to redial to try again.
                 self.unattended_pending.insert(peer);
                 tracing::warn!(peer = %tag, "unattended login refused");
-                self.audit(&peer, AuditEvent::UnattendedLogin { accepted: false });
+                let event = unattended_login_event(self.windows.nobody_signed_in(), false);
+                self.audit(&peer, event);
                 self.send_unattended_reject(peer, rejection_of(&error));
             }
         }
@@ -15248,6 +15278,46 @@ mod tests {
     /// Anything slower than this on loopback means the test is stuck.
     const TIMEOUT: Duration = Duration::from_secs(20);
 
+    /// ADR 0088 §1: typing on the logon screen needs `secure_desktop_input`,
+    /// the same switch a UAC prompt needs — and off the secure desktop the
+    /// grant changes nothing, so an ordinary session is not held to it.
+    #[test]
+    fn secure_desktop_input_gates_only_the_secure_desktop() {
+        let mut full = Grants::from_role(Role::FullControl);
+        assert!(secure_desktop_input_permitted(false, Some(full)));
+        assert!(secure_desktop_input_permitted(true, Some(full)));
+
+        full.set(IndependentGrant::SecureDesktopInput, false);
+        assert!(
+            secure_desktop_input_permitted(false, Some(full)),
+            "an ordinary desktop does not need the secure-desktop switch"
+        );
+        assert!(
+            !secure_desktop_input_permitted(true, Some(full)),
+            "the logon screen does, whatever the role"
+        );
+        assert!(
+            !secure_desktop_input_permitted(true, None),
+            "a session whose grants cannot be read types nowhere secure"
+        );
+    }
+
+    /// ADR 0088 §3: an admission to a machine nobody is signed in to is its own
+    /// audit kind, and an admission to a signed-in machine keeps the old one.
+    #[test]
+    fn an_admission_to_an_empty_machine_is_audited_as_its_own_kind() {
+        for accepted in [true, false] {
+            assert_eq!(
+                unattended_login_event(true, accepted),
+                AuditEvent::EmptyMachineLogin { accepted }
+            );
+            assert_eq!(
+                unattended_login_event(false, accepted),
+                AuditEvent::UnattendedLogin { accepted }
+            );
+        }
+    }
+
     /// The whole of what `RTT_EWMA_ALPHA` means, checked without a clock.
     #[test]
     fn the_first_sample_is_the_average_and_later_ones_are_blended_into_it() {
@@ -15991,6 +16061,9 @@ mod tests {
         /// it; `default()` stays a host somebody could answer a dialog at, so
         /// every other test behaves exactly as it did before.
         unattended: std::sync::atomic::AtomicBool,
+        /// Whether this stand-in is a session-0 host at its logon screen
+        /// (ADR 0088). Off by default for the same reason as `unattended`.
+        logon_screen: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingWindows {
@@ -16040,6 +16113,14 @@ mod tests {
             } else {
                 lumepeer_core::consent::HostAttendance::Attended
             }
+        }
+
+        fn on_secure_desktop(&self) -> bool {
+            self.logon_screen.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn nobody_signed_in(&self) -> bool {
+            self.logon_screen.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
