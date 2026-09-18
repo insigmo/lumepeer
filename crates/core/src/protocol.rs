@@ -1639,9 +1639,9 @@ pub enum InputDetail {
     },
     /// Scroll wheel movement.
     Wheel {
-        /// Horizontal delta.
+        /// Horizontal delta; positive scrolls right.
         dx: i16,
-        /// Vertical delta.
+        /// Vertical delta; positive scrolls up, like a forward wheel notch.
         dy: i16,
     },
 }

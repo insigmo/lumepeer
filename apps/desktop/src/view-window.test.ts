@@ -270,7 +270,7 @@ describe('view window: input listeners follow the live grant', () => {
       'move 32768 16384 0',
       `press ${POINTER_BUTTON_LOGICAL_BASE} 0 0 true`,
       `press ${POINTER_BUTTON_LOGICAL_BASE} 0 0 false`,
-      'wheel 1 -2 0',
+      'wheel 1 2 0',
       'press 97 0 0 true',
       'press 97 0 0 false',
     ]);
@@ -320,7 +320,14 @@ describe('view window: input listeners follow the live grant', () => {
     canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -3, ctrlKey: true, bubbles: true }));
     expect(calls).toEqual([]);
     canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: -3, bubbles: true }));
-    expect(calls).toEqual(['wheel 0 -3 0']);
+    expect(calls).toEqual(['wheel 0 3 0']);
+  });
+
+  it('sends a downward DOM scroll as a negative wheel delta, so the host scrolls down', () => {
+    const { canvas, input, calls } = surface();
+    input.setEnabled(true);
+    canvas.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true }));
+    expect(calls).toEqual(['wheel 0 -100 0']);
   });
 
   it('drops keys with neither a character nor a position on the keyboard', () => {

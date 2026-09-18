@@ -267,11 +267,13 @@ impl crate::capture::InputInjector for WaylandPortalInjector {
                         .await
                 }
                 InputDetail::Wheel { dx, dy } => {
+                    // The wire's `dy` is positive up; the portal's axis is
+                    // positive down, like `wl_pointer.axis`.
                     remote
                         .notify_pointer_axis(
                             session,
                             f64::from(dx),
-                            f64::from(dy),
+                            -f64::from(dy),
                             NotifyPointerAxisOptions::default().set_finish(true),
                         )
                         .await

@@ -939,7 +939,10 @@ export class ViewInput {
     if (event.ctrlKey) {
       return;
     }
-    this.sink.wheel(clampDelta(event.deltaX), clampDelta(event.deltaY), modifiersOf(event));
+    // The wire carries a wheel notch's sign — positive is up and right — while
+    // the DOM reports the direction the content moves, positive down. Vertical
+    // is flipped so a downward scroll here scrolls down on the host.
+    this.sink.wheel(clampDelta(event.deltaX), clampDelta(-event.deltaY), modifiersOf(event));
   };
 
   private readonly onKeyDown = (event: KeyboardEvent): void => this.forwardKey(event, true);
