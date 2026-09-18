@@ -265,6 +265,7 @@ export const ru: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Включить или выключить чат',
   'toolbar.hotkey.send-cad': 'Отправить Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': 'Свернуть или развернуть эту панель инструментов',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Вернуть этой машине Win и Alt+Tab или отдать их хосту',
   'unattended.heading': 'Доступ без присутствия',
   'unattended.explain':
     'Когда это включено, устройство, которое вы пометили как доверенное, может начать сессию, введя пароль этого устройства — никому не нужно находиться здесь, чтобы одобрить это. Этот баннер остаётся, пока функция включена.',

@@ -267,6 +267,7 @@ export const tr: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Sohbeti aç veya kapat',
   'toolbar.hotkey.send-cad': 'Ctrl+Alt+Del gönder',
   'toolbar.hotkey.toggle-toolbar': 'Bu araç çubuğunu daralt veya genişlet',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Win ve Alt+Tab\'ı bu makineye geri ver veya ana makineye gönder',
   'unattended.heading': 'Gözetimsiz erişim',
   'unattended.explain':
     'Bu açıkken, güvenilir olarak işaretlediğiniz bir cihaz, bu cihazın parolasını girerek bir oturum başlatabilir — bunu onaylamak için kimsenin burada oturması gerekmez. Bu bildirim, özellik açık olduğu sürece görünür kalır.',

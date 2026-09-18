@@ -134,6 +134,13 @@ const sink: InputSink = {
 let layout: ViewLayout = defaultLayout();
 let frameSize = { width: 0, height: 0 };
 let fullscreen = false;
+// Whether this machine's own system chords (`Win+D`, `Alt+Tab`, `Ctrl+Esc`,
+// `Alt+F4`, `PrintScreen`) are going to the host rather than to this desktop
+// (ADR 0090). The Rust side owns the truth — it is what holds the hook — and
+// this mirrors it only so `Ctrl+Alt+Shift+K` knows which way to flip. It
+// starts at the Rust side's own default, and the first flip reads back what
+// actually happened, so a mirror that ever drifts corrects itself.
+let keyboardGrab = true;
 let toolbar: ToolbarControls | null = null;
 // The terminal, once somebody has opened it. Mounted on first use rather than
 // with the window: this window's job is the picture, and a session that never
@@ -818,6 +825,21 @@ async function main(): Promise<void> {
       });
     },
     'toggle-toolbar': () => toolbar?.toggleCollapsed(),
+    // While the grab is on, this machine's `Win+D` and `Alt+Tab` go to the
+    // host instead of to this desktop (ADR 0090). This is the way back, and
+    // it is deliberately a chord the grab never claims. The Rust side owns
+    // the state; this only asks it to flip and remembers the answer, so two
+    // presses in quick succession cannot end up fighting over it.
+    'toggle-keyboard-grab': () => {
+      void (async () => {
+        const invoke = await invoker();
+        keyboardGrab =
+          (await invoke('view_keyboard_grab', { args: { peer, on: !keyboardGrab } })) === true;
+      })().catch(() => {
+        // The session ended, or this window is no longer the one it claims
+        // to be. Either way the grab is not this window's to change.
+      });
+    },
   });
   // The remote host's own right-click menu is part of the picture; the
   // local WebView's native one has no business appearing on top of it.

@@ -255,6 +255,7 @@ export const zh: Dictionary = {
   'toolbar.hotkey.toggle-chat': '开启或关闭聊天',
   'toolbar.hotkey.send-cad': '发送 Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': '收起或展开此工具栏',
+  'toolbar.hotkey.toggle-keyboard-grab': '把 Win 和 Alt+Tab 交还本机，或发送给主机',
   'unattended.heading': '无人值守访问',
   'unattended.explain':
     '启用此选项后，您标记为受信任的设备可以通过输入此设备的密码来开始会话——无需有人在场批准。此提示会在功能开启期间持续显示。',

@@ -47,6 +47,7 @@ impl ViewWindows for TauriViewWindows {
         // from `peer_tag`, so there is nothing to escape.
         let url = format!("view.html?peer={peer_label}&input={}", u8::from(input));
         let label = label.to_owned();
+        let peer = peer_label.to_owned();
         let app = self.app.clone();
         // Window creation must happen on the platform's main thread; the actor
         // runs on a tokio worker.
@@ -68,6 +69,12 @@ impl ViewWindows for TauriViewWindows {
                     // drawing behind whatever they were looking at. Raise it
                     // the same way a consent request raises the main window.
                     crate::raise_window(&window);
+                    // Before anything is typed into it: a webview that still
+                    // holds its own accelerator keys answers Ctrl+R by
+                    // reloading the page the remote picture is drawn on, and
+                    // the host never sees the chord at all (ADR 0090).
+                    give_the_chords_to_the_remote_machine(&window);
+                    watch_focus_for_the_keyboard_grab(&window, &peer, input);
                     tracing::info!(window = %label, input, "view window opened");
                 }
                 Err(error) => {
@@ -152,6 +159,65 @@ impl ViewWindows for TauriViewWindows {
     /// is always somebody signed in (ADR 0088 §3).
     fn nobody_signed_in(&self) -> bool {
         false
+    }
+}
+
+/// Arms the keyboard grab while this window is focused, and hands the chords
+/// back when it is not (ADR 0090).
+///
+/// The grab is global — `WH_KEYBOARD_LL` sees every keystroke on the desktop —
+/// so focus is what bounds it to the window that is actually showing a remote
+/// machine. Tracked here, from Tauri's own window events, rather than from
+/// `blur`/`focus` inside the webview: a webview that has not finished loading
+/// reports neither, and the grab must never be left armed over a window the
+/// operator has walked away from.
+fn watch_focus_for_the_keyboard_grab(window: &tauri::WebviewWindow, peer: &str, input: bool) {
+    use tauri::Manager as _;
+
+    let app = window.app_handle().clone();
+    let peer = peer.to_owned();
+    window.on_window_event(move |event| {
+        let grab = app.state::<crate::keyboard_grab::KeyboardGrab>();
+        match event {
+            tauri::WindowEvent::Focused(focused) => grab.focus_changed(&peer, input, *focused),
+            // A window that is going away takes its grab with it, whether or
+            // not a blur arrived first — a revoked session closes the window
+            // without one.
+            tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. } => {
+                grab.window_closed(&peer);
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Stops one view window's webview acting on the chords that belong to the
+/// machine it is showing (ADR 0090).
+///
+/// `WebView2` ships with its browser accelerator keys on and Tauri exposes no
+/// way to turn them off, so `Ctrl+R`, `F5`, `Ctrl+P`, `Ctrl+F`, `Ctrl+U`,
+/// `Ctrl+S`, `Ctrl+0`, `Ctrl+±`, `Alt+Left` and `F12` were all answered
+/// locally — by the window showing the remote screen — and never reached the
+/// host. The COM call that fixes it lives in `lumepeer-guestkeys` because
+/// this crate forbids `unsafe`.
+///
+/// Every failure is a warning inside that crate and nothing here: a window
+/// that keeps a handful of chords still shows the remote screen.
+fn give_the_chords_to_the_remote_machine(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        let queued = window.with_webview(|webview| {
+            lumepeer_guestkeys::keep_accelerators_for_the_remote_machine(&webview.controller());
+        });
+        if let Err(error) = queued {
+            tracing::warn!(%error, "cannot reach this view window's webview");
+        }
+    }
+    // Neither `WebKitGTK` nor `WKWebView` claims the set `WebView2` does, and
+    // what each of them does claim is its own task (ADR 0090).
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
     }
 }
 

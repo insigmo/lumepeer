@@ -60,6 +60,7 @@
     "allow-monitors-list",
     "allow-view-set-scale",
     "allow-view-set-size",
+    "allow-view-keyboard-grab",
     "allow-host-display-modes",
     "allow-host-display-set-mode",
     "allow-session-revoke"

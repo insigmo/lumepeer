@@ -242,6 +242,13 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
     // integer.
     let (width, height) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
     if width <= 0 || height <= 0 {
+        // A desktop with no measurable screen. Worth a line of its own
+        // because it is indistinguishable, from the outside, from every other
+        // reason this function answers `None` — and telling them apart is the
+        // whole point of the logging added here (ADR 0092): the only thing
+        // this module used to say was "nothing to capture", which named none
+        // of the five things that can go wrong.
+        tracing::warn!(width, height, "the secure desktop reports no screen");
         return None;
     }
     // What the fixed mapping can actually carry. On a 1080p-or-smaller screen
@@ -267,6 +274,10 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
             None,
         );
         if dc.is_invalid() {
+            tracing::warn!(
+                error = %windows::core::Error::from_win32(),
+                "no device context for the secure desktop's display"
+            );
             return None;
         }
 
@@ -292,6 +303,12 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
             None,
             0,
         ) else {
+            tracing::warn!(
+                width = target_width,
+                height = target_height,
+                error = %windows::core::Error::from_win32(),
+                "no DIB section for the secure desktop's frame"
+            );
             let _ = DeleteDC(dc);
             return None;
         };
@@ -328,6 +345,20 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         let data = if blitted && !bits.is_null() {
             Some(std::slice::from_raw_parts(bits.cast::<u8>(), bytes).to_vec())
         } else {
+            // The one failure that says something about the *desktop* rather
+            // than about this process: a blit that is refused is a desktop
+            // whose pixels this thread is not being given, which is what
+            // happens when the thread is on `Winlogon` and `Winlogon` is not
+            // the desktop receiving input — a full-screen application or a
+            // mode change, not a UAC prompt (ADR 0092).
+            tracing::warn!(
+                source = format_args!("{width}x{height}"),
+                target = format_args!("{target_width}x{target_height}"),
+                blitted,
+                have_bits = !bits.is_null(),
+                error = %windows::core::Error::from_win32(),
+                "the secure desktop would not blit"
+            );
             None
         };
 

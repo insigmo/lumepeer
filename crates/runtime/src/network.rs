@@ -32,9 +32,9 @@ use lumepeer_core::constants::{
     MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
     REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
-    RESUME_RETRY_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT,
-    STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES,
-    TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
+    RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
+    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
+    TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
@@ -4363,6 +4363,58 @@ fn attempt_shares(stages: usize) -> Vec<u32> {
     shares
 }
 
+/// How hard one dial tries — which is not the same question for a first
+/// connection and for a resume (§10; ADR 0091).
+///
+/// A first connection is a person waiting, and the only thing worse than
+/// waiting is being told "could not connect" while the host was merely
+/// between relays; that is what ADR 0050's wide budget buys. A resume is
+/// nobody waiting on a form: the wait's own tick asks again every
+/// [`RESUME_RETRY_SECS`], so an attempt that holds on is not persistence, it
+/// is the reason the next attempt never happens. Spending the
+/// first-connection budget on a resume let one dial run for
+/// [`DIAL_TOTAL_BUDGET_SECS`] — longer than the whole reconnect window — so a
+/// resume got exactly one try and the window closed underneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DialPace {
+    /// Bound on one attempt: dial *and* handshake together.
+    attempt: Duration,
+    /// Attempts this stage of the plan may spend.
+    attempts: u32,
+}
+
+impl DialPace {
+    /// A first connection: ADR 0050's budget, `share` of it being what this
+    /// stage of the plan was given ([`attempt_shares`]).
+    const fn connecting(share: u32) -> Self {
+        Self {
+            attempt: Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS),
+            attempts: share,
+        }
+    }
+
+    /// A resume: a short dial, twice, because the wait is the retry loop. The
+    /// plan's share does not apply — a resume spends its own attempts, and
+    /// spending five twenty-second ones is what made the window close
+    /// underneath a dial still in flight (ADR 0091).
+    const fn resuming() -> Self {
+        Self {
+            attempt: Duration::from_secs(RESUME_ATTEMPT_TIMEOUT_SECS),
+            attempts: RESUME_ATTEMPTS,
+        }
+    }
+
+    /// The pace a dial runs at, decided by whether it carries a resume claim
+    /// (§10; ADR 0089, ADR 0091).
+    const fn of(resume: Option<[u8; 16]>, share: u32) -> Self {
+        if resume.is_some() {
+            Self::resuming()
+        } else {
+            Self::connecting(share)
+        }
+    }
+}
+
 /// One transport of a [`DialPlan`]: the dialer that speaks it and the share of
 /// [`DIAL_ATTEMPTS`] it may spend before the next one is tried.
 #[derive(Debug)]
@@ -8466,6 +8518,11 @@ impl Actor {
             // normal mouse drag would turn into a flood. Cache the position and
             // return; a following button spends one worker to place the cursor
             // there and one to click (ADR 0057).
+            //
+            // Caching is *all* that happens to a move, which is why the
+            // fallback below has to replay it: while this branch was being
+            // taken for a desktop that was not secure at all, the host's
+            // cursor did not move for the whole episode (ADR 0092).
             if let InputDetail::PointerMove { x, y } = event.detail {
                 self.secure_desktop_pointer = Some((x, y));
                 return;
@@ -8490,11 +8547,67 @@ impl Actor {
                 );
             }
             ok &= lumepeer_service::client::inject_secure_desktop(action);
-            if !ok {
-                tracing::warn!(peer = %tag, "secure-desktop input event did not land");
+            if ok {
+                return;
             }
+            // The helper could not perform it, and *not returning here* is the
+            // whole of ADR 0092.
+            //
+            // What put this branch in play is `DuplicateOutput` answering
+            // `E_ACCESSDENIED`, which the capturer reports as
+            // `SecureDesktopActive`. That is the right reading most of the
+            // time and not the only one: a full-screen exclusive application
+            // (a game, or a `VMware` Workstation window with a virtual machine
+            // in it), a display-mode change and a graphics-driver reset all
+            // refuse duplication the same way, with no secure desktop
+            // anywhere. While that lasted, every click and every keystroke was
+            // handed to a `Winlogon` worker whose `SendInput` could only
+            // answer `ERROR_ACCESS_DENIED`, and pointer moves were cached and
+            // never sent at all. From the guest that is "I cannot control
+            // anything any more", which is how it was reported.
+            //
+            // So a helper that did not land is not the end of the event: fall
+            // through to the ordinary injector, which is where it should have
+            // gone if the desktop was never secure. When the desktop really is
+            // secure, that injector answers `ERROR_ACCESS_DENIED` in its turn
+            // and the event is dropped with a warning, exactly as before.
+            // Nothing is widened by trying: reaching here at all already took
+            // `secure_desktop_input`, which only a full-control session
+            // carries (ADR 0061), and such a session drives the ordinary
+            // desktop anyway.
+            tracing::warn!(
+                peer = %tag,
+                "the secure-desktop helper did not land this event; trying the ordinary desktop"
+            );
+            // The pointer moves that were cached rather than forwarded have to
+            // be made good first, or the click below lands wherever the host's
+            // own cursor happens to sit.
+            if let Some((x, y)) = self.secure_desktop_pointer.take() {
+                self.inject_directly(
+                    peer,
+                    &InputEventPayload {
+                        logical: 0,
+                        scancode: 0,
+                        modifiers: event.modifiers,
+                        detail: InputDetail::PointerMove { x, y },
+                    },
+                );
+            }
+            self.inject_directly(peer, event);
             return;
         }
+        self.inject_directly(peer, event);
+    }
+
+    /// Host side: performs one already-authorized event on this process's own
+    /// desktop, through the in-session injector (§11).
+    ///
+    /// Split out of [`Self::inject`] rather than left inline there because the
+    /// secure-desktop path needs it too, as the fallback of ADR 0092. It takes
+    /// no decision of its own: authorization happened in `inject`, and every
+    /// caller has been through it.
+    fn inject_directly(&mut self, peer: NodeId, event: &InputEventPayload) {
+        let tag = self.label_of(&peer);
         if self.injector.is_none() {
             match platform_injector() {
                 Ok(injector) => self.injector = Some(injector),
@@ -14637,7 +14750,7 @@ async fn dial_over_plan(
     loop {
         let error = match dial_with_retries(
             &stage.dialer,
-            stage.attempts,
+            DialPace::of(resume, stage.attempts),
             role,
             proof.clone(),
             tag,
@@ -14730,14 +14843,17 @@ const fn is_retryable(error: &NetError) -> bool {
 /// mismatch or a refusal is a verdict, and asking again only collects it twice.
 async fn dial_with_retries(
     dialer: &HostDialer,
-    attempts: u32,
+    pace: DialPace,
     role: Role,
     proof: Vec<u8>,
     tag: &str,
     codecs: GuestCodecSupport,
     resume: Option<[u8; 16]>,
 ) -> Result<ControlConnection, NetError> {
-    let attempt_budget = std::time::Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS);
+    let DialPace {
+        attempt: attempt_budget,
+        attempts,
+    } = pace;
     let mut last = NetError::Dial("no attempt was made".to_owned());
     for attempt in 1..=attempts {
         // Alternated rather than "addresses first, then lookup": the ticket's
@@ -14754,7 +14870,8 @@ async fn dial_with_retries(
         .await
         .unwrap_or_else(|_| {
             Err(NetError::Dial(format!(
-                "no answer within {CONNECT_ATTEMPT_TIMEOUT_SECS}s"
+                "no answer within {}s",
+                attempt_budget.as_secs()
             )))
         });
         let error = match outcome {
@@ -15267,7 +15384,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use lumepeer_core::constants::DIAL_TOTAL_BUDGET_SECS;
+    use lumepeer_core::constants::{DIAL_TOTAL_BUDGET_SECS, RESUME_DIAL_BUDGET_SECS};
     use lumepeer_media::capture::{Frame, InputCapability, ScreenCapturer};
     use lumepeer_media::error::{MediaError, Result as MediaResult};
 
@@ -15460,6 +15577,57 @@ mod tests {
             worst_case_secs(&attempt_shares(2)) <= DIAL_TOTAL_BUDGET_SECS,
             "a two-transport plan outgrew the budget of a one-transport dial"
         );
+    }
+
+    /// ADR 0091, the property ADR 0089 assumed and did not have: a resume dial
+    /// has to fit inside the window it is allowed to work in, several times
+    /// over, or the `RESUME_RETRY_SECS` cadence is a cadence of one.
+    ///
+    /// Before this, a resume ran on the first-connection budget of ADR 0050 —
+    /// five attempts at twenty seconds — so one dial could cost longer than
+    /// the whole window, the window closed underneath an attempt still in
+    /// flight, and a dropped link cost a consent dialog.
+    #[test]
+    fn a_resume_dial_fits_inside_its_window_several_times_over() {
+        // What decides the pace is the claim, and nothing else: the same
+        // stage of the same plan is paced one way for a first connection and
+        // another for a resume.
+        for share in [DIAL_ATTEMPTS, TRANSPORT_PROBE_ATTEMPTS, 1] {
+            let connecting = DialPace::of(None, share);
+            let resuming = DialPace::of(Some([7u8; 16]), share);
+
+            // A first connection spends the plan's share at ADR 0050's bound.
+            assert_eq!(connecting.attempts, share);
+            assert_eq!(
+                connecting.attempt,
+                Duration::from_secs(CONNECT_ATTEMPT_TIMEOUT_SECS)
+            );
+
+            // A resume spends its own attempts, whatever the share, and each
+            // one is bounded far below a first connection's.
+            assert_eq!(resuming.attempts, RESUME_ATTEMPTS);
+            assert!(resuming.attempt < connecting.attempt);
+
+            // Two of them, so the two routes of `dial_with_retries` — the
+            // ticket's addresses, and what discovery says now — each get one.
+            // After the kind of network change a resume exists for, the
+            // second is the one that can work.
+            assert!(resuming.attempts >= 2, "a resume dial must try both routes");
+        }
+
+        // And the whole dial leaves room for several more inside one window,
+        // which is exactly what the first-connection budget could not do:
+        // that one is longer than the window it would work inside.
+        const {
+            assert!(
+                RESUME_DIAL_BUDGET_SECS * 4 < RECONNECT_WINDOW_SECS,
+                "a resume dial does not fit inside its window four times over"
+            );
+            assert!(
+                DIAL_TOTAL_BUDGET_SECS > RESUME_DIAL_BUDGET_SECS * 4,
+                "the first-connection budget is no longer the wide one"
+            );
+        }
     }
 
     /// gap-tasks/23 task 2: a transport is chosen per dial, and a reconnect is

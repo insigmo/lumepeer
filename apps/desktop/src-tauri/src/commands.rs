@@ -2787,6 +2787,45 @@ pub async fn view_set_size(
     Ok(())
 }
 
+/// Argument of [`view_keyboard_grab`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyboardGrabArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// `true` to let the system chords reach the host, `false` to keep them
+    /// on this machine. `None` only asks what the grab currently is.
+    pub on: Option<bool>,
+}
+
+/// Guest side: whether this machine's own system chords go to the host
+/// (ADR 0090), and the answer either way.
+///
+/// `Win+D`, `Alt+Tab`, `Ctrl+Esc`, `Ctrl+Shift+Esc`, `Alt+F4` and
+/// `PrintScreen` never reach a window at all — the shell takes them first — so
+/// a remote session cannot be sent them without a keyboard hook, and a hook
+/// that is on means the operator's own `Alt+Tab` stops switching *their*
+/// windows while the view is focused. That is the trade this switch exists
+/// for. It is on by default and `Ctrl+Alt+Shift+K` flips it.
+///
+/// Nothing about a session changes here. The grab decides which keystrokes
+/// this machine notices; whether any of them may be injected is the host's
+/// decision, re-taken per event (§2.3).
+///
+/// # Errors
+/// [`IpcError`] when the calling window is not the view window of `peer`.
+#[tauri::command]
+pub fn view_keyboard_grab(
+    window: Window,
+    grab: tauri::State<'_, crate::keyboard_grab::KeyboardGrab>,
+    args: KeyboardGrabArgs,
+) -> Result<bool, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    Ok(match args.on {
+        Some(on) => grab.set_wanted(on),
+        None => grab.wanted(),
+    })
+}
+
 /// DTO of one monitor of the watched host (§11 `MonitorsList`).
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorDto {

@@ -267,6 +267,7 @@ export const es: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Activar o desactivar el chat',
   'toolbar.hotkey.send-cad': 'Enviar Ctrl+Alt+Supr',
   'toolbar.hotkey.toggle-toolbar': 'Contraer o expandir esta barra de herramientas',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Devolver Win y Alt+Tab a este equipo o enviarlos al anfitrión',
   'unattended.heading': 'Acceso desatendido',
   'unattended.explain':
     'Con esto activado, un dispositivo que haya marcado como de confianza puede iniciar una sesión introduciendo la contraseña de este dispositivo — nadie tiene que estar aquí para aprobarlo. Este aviso permanece mientras esté activado.',

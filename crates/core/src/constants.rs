@@ -99,8 +99,35 @@ pub const MEDIA_REDIAL_BACKOFF_MS: u64 = 500;
 pub const CONSENT_RATE_PER_MINUTE: u32 = 5;
 /// Total size of the host-side consent queue across all guests (§8.1).
 pub const MAX_PENDING_CONSENTS: usize = 3;
-/// Window in which a dropped session may be resumed by the same peer (§10).
-pub const RECONNECT_WINDOW_SECS: u64 = 60;
+/// Window in which a dropped session may be resumed by the same peer (§10;
+/// ADR 0089, widened by ADR 0091).
+///
+/// Was 60 under ADR 0089, which is §10's own number. Measured against a real
+/// link loss — a VPN coming up on one of the two machines — 60 seconds was
+/// not enough for two independent reasons, and only one of them was the
+/// number:
+///
+/// - A resume *dial* could outlive the window it was meant to work inside.
+///   It ran on the first-connection budget of ADR 0050, up to
+///   [`DIAL_TOTAL_BUDGET_SECS`], so the window closed underneath an attempt
+///   still in flight and [`RESUME_RETRY_SECS`] never produced a second one.
+///   That is fixed by [`RESUME_ATTEMPTS`] rather than here.
+/// - An interface change is not instant on either side. The machine whose
+///   network moved has to notice, rebind, re-probe its relay and republish
+///   its address before anything can reach it, and a minute is an ordinary
+///   time for that — longer still if the link is simply gone for a while,
+///   which is the case a person describes as "the internet dropped".
+///
+/// What the window bounds is how long a session's **grants** may come back
+/// without anybody being asked again, and widening it does not widen *who*
+/// may come back: a resume still needs the same authenticated key, the same
+/// session id, and a monotonic clock that cannot be wound back (§10, §12.3;
+/// ADR 0089). What it costs is that a guest slot stays held, and the person
+/// at the host sees the session gone and then back, for up to this long
+/// instead of up to a minute. Still bounded well below
+/// [`REBOOT_WAIT_CEILING_SECS`], so a machine that is actually gone still
+/// ends its sessions.
+pub const RECONNECT_WINDOW_SECS: u64 = 300;
 /// Pause between attempts of `WindowsCapturer` to reopen a Desktop
 /// Duplication lost to the secure desktop (lock screen, UAC prompt or fast
 /// user switch), in milliseconds (docs/bugs/11-uac-degradation.md).
@@ -911,9 +938,49 @@ const _: () = assert!(
 /// down answers none of them quickly.
 pub const RESUME_RETRY_SECS: u64 = 3;
 
-/// A resume has to get more than one try inside its window, or it is not a
-/// retry at all (§10; ADR 0089).
+/// Attempts one resume dial makes before the wait's next tick makes another
+/// (§10; ADR 0091).
+///
+/// Two, not [`DIAL_ATTEMPTS`]'s five, because the retry loop of a resume is
+/// the wait itself: [`RESUME_RETRY_SECS`] already asks again, and spending the
+/// first-connection budget inside one attempt made [`RESUME_RETRY_SECS`]
+/// meaningless — a single dial could take [`DIAL_TOTAL_BUDGET_SECS`], which
+/// is longer than the whole window used to be, so a resume got exactly one
+/// try and the window expired underneath it.
+///
+/// Two rather than one because the two attempts take different routes: the
+/// odd one dials the addresses the ticket carries and the even one asks
+/// discovery where the host is *now* (`by_lookup` in `dial_with_retries`).
+/// After the kind of network change a resume exists for, the second is the
+/// one that can work, so a one-attempt dial would never take it.
+pub const RESUME_ATTEMPTS: u32 = 2;
+
+/// Bound on one attempt of [`RESUME_ATTEMPTS`] — dial *and* handshake
+/// together (§10; ADR 0091).
+///
+/// Much shorter than [`CONNECT_ATTEMPT_TIMEOUT_SECS`], and for a reason that
+/// does not apply to a first connection: a resume is dialing a host it was
+/// talking to seconds ago, over a path one side has just lost. Either that
+/// path is back, in which case it answers quickly, or it is not, in which
+/// case waiting is worse than asking again — the wait's own tick is the
+/// retry, and there are a hundred of them in a window.
+pub const RESUME_ATTEMPT_TIMEOUT_SECS: u64 = 5;
+
+/// Worst case one resume dial may cost, derived the way
+/// [`DIAL_TOTAL_BUDGET_SECS`] is.
+pub const RESUME_DIAL_BUDGET_SECS: u64 = RESUME_ATTEMPTS as u64 * RESUME_ATTEMPT_TIMEOUT_SECS
+    + ((RESUME_ATTEMPTS as u64 - 1) * (DIAL_RETRY_BACKOFF_MS + DIAL_RETRY_BACKOFF_JITTER_MS))
+        / 1_000;
+
+/// A resume has to get several *dials* inside its window, or it is not a retry
+/// at all (§10; ADR 0089, ADR 0091).
+///
+/// Stated against the budget of a whole dial rather than against
+/// [`RESUME_RETRY_SECS`], which is what ADR 0089 asserted and what made this
+/// check pass while the behaviour it describes was false: the tick cannot ask
+/// again while a dial is still in flight, so the cadence that matters is the
+/// dial's own cost, not the timer's.
 const _: () = assert!(
-    RESUME_RETRY_SECS * 3 < RECONNECT_WINDOW_SECS,
-    "a resume must get several attempts inside the reconnect window"
+    RESUME_DIAL_BUDGET_SECS * 4 < RECONNECT_WINDOW_SECS,
+    "a resume must get several dials inside the reconnect window"
 );

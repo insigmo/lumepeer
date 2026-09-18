@@ -119,6 +119,65 @@ pub fn perform(action: InjectAction) -> bool {
     performed
 }
 
+/// The name of the desktop currently receiving input — `"Winlogon"` for a
+/// real secure desktop, `"Default"` for an ordinary one — or `None` when this
+/// process cannot ask.
+///
+/// The one fact that tells a genuine secure-desktop episode from the several
+/// other things that refuse `DuplicateOutput` in exactly the same way: a
+/// full-screen exclusive application, a display-mode change, a graphics-driver
+/// reset. All of them made the host report "the secure desktop is in the
+/// foreground" and route every guest keystroke to a `Winlogon` worker that
+/// could only answer `ERROR_ACCESS_DENIED`, with nothing anywhere saying
+/// which had happened (ADR 0092).
+///
+/// Read-only, and it changes nothing: it opens the input desktop, asks its
+/// name and closes it again. `None` for a caller that may not open it at all,
+/// which is itself informative — an unprivileged process in the user's
+/// session cannot open `Winlogon`.
+#[must_use]
+pub fn input_desktop_name() -> Option<String> {
+    use windows::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+
+    // SAFETY: no arguments beyond flags; the handle is owned here and closed
+    // before returning.
+    let desktop = unsafe {
+        OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0),
+        )
+    }
+    .ok()?;
+
+    // Desktop names are short; 64 wide characters is far more than any of
+    // them needs and the call reports its own truncation rather than writing
+    // past the buffer.
+    let mut name = [0u16; 64];
+    let mut needed = 0u32;
+    // SAFETY: `name` is a live buffer of exactly the byte length passed, and
+    // `needed` is a live `u32`. Nothing retains either past the call.
+    let asked = unsafe {
+        GetUserObjectInformationW(
+            windows::Win32::Foundation::HANDLE(desktop.0.cast()),
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            u32::try_from(size_of_val(&name)).unwrap_or(0),
+            Some(&raw mut needed),
+        )
+    };
+    // SAFETY: `desktop` is live and owned here, and is not used again.
+    unsafe {
+        let _ = CloseDesktop(desktop);
+    }
+    asked.ok()?;
+    let end = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Some(String::from_utf16_lossy(&name[..end]))
+}
+
 /// Moves this thread onto whichever desktop is currently receiving input, and
 /// hands back the handle so [`perform`] can undo it.
 ///

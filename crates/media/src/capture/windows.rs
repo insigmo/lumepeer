@@ -2259,6 +2259,55 @@ mod dxgi {
     /// normalizes the primary display to.
     const ABSOLUTE_RANGE: i32 = 65_535;
 
+    /// Whether an absolute move counts as having landed, given where it was
+    /// aimed, where the cursor was read back, and the same two facts from the
+    /// move before it.
+    ///
+    /// **The question is not "is the cursor where it was aimed".** That is
+    /// what this asked at first, and it is the wrong question, because
+    /// `SendInput` is asynchronous: the injected move is processed by the raw
+    /// input thread, and a `GetCursorPos` issued immediately afterwards can
+    /// still answer with the position from *before* it. On a machine where
+    /// that race goes the same way every time — and there is nothing to stop
+    /// it doing so — every single move read back as a miss, the injector
+    /// concluded after three of them that something held the pointer, and it
+    /// switched a perfectly ordinary desktop to relative motion for the rest
+    /// of the session. Relative motion is subject to the host's own pointer
+    /// acceleration, so the cursor then drifted away from wherever the
+    /// operator was pointing and clicks landed somewhere else: the same
+    /// symptom as the grab this was written to survive (ADR 0065, ADR 0092).
+    ///
+    /// The question that distinguishes them is **did the cursor move at all
+    /// when it was asked to**. A grabbed pointer is pinned: `GetCursorPos`
+    /// answers the same coordinates however far the aim travels. A read-back
+    /// that is merely late answers *the previous aim*, which changes as the
+    /// operator moves. So:
+    ///
+    /// - Close to the aim: landed, and no further argument needed.
+    /// - Nothing was asked of it (the aim did not move): no evidence either
+    ///   way, and a still pointer must not accumulate misses.
+    /// - Otherwise: a miss only if the cursor is at exactly the coordinates
+    ///   the last read-back gave. Anything else is a pointer this injector is
+    ///   moving, whatever lag it is showing.
+    fn absolute_move_landed(
+        aimed: (i32, i32),
+        previous_aim: Option<(i32, i32)>,
+        landed: (i32, i32),
+        previous_landed: Option<(i32, i32)>,
+    ) -> bool {
+        if (landed.0 - aimed.0).abs() <= GRAB_TOLERANCE_PX
+            && (landed.1 - aimed.1).abs() <= GRAB_TOLERANCE_PX
+        {
+            return true;
+        }
+        if previous_aim == Some(aimed) {
+            return true;
+        }
+        // No previous read-back to compare against: the first move of a
+        // session says nothing about whether anything holds the pointer.
+        previous_landed != Some(landed)
+    }
+
     /// Input injection through `SendInput` (§11).
     ///
     /// Almost stateless: every call synthesizes one already-authorized event
@@ -2268,6 +2317,10 @@ mod dxgi {
     /// motion as a delta when the pointer has been taken away from it.
     #[derive(Debug, Default)]
     pub struct WindowsInjector {
+        /// Where the last absolute move read the cursor back, which is what
+        /// [`absolute_move_landed`] compares against to tell a pinned pointer
+        /// from a late read-back (ADR 0092).
+        read_back: Option<(i32, i32)>,
         /// The normalized position the guest last asked for, whether or not
         /// the pointer actually went there.
         asked: Option<(u16, u16)>,
@@ -2355,6 +2408,7 @@ mod dxgi {
         pub const fn connect() -> Result<Self> {
             Ok(Self {
                 asked: None,
+                read_back: None,
                 grab: Grab {
                     misses: 0,
                     held: false,
@@ -2617,8 +2671,9 @@ mod dxgi {
         fn move_to(&mut self, x: u16, y: u16) -> Result<()> {
             let previous = self.asked.replace((x, y));
             let aimed = Self::absolute_pixels(x, y);
+            let previous_aim = previous.map(|(px, py)| Self::absolute_pixels(px, py));
             if self.grab.next_mode() == PointerMode::Relative {
-                let from = previous.map_or(aimed, |(px, py)| Self::absolute_pixels(px, py));
+                let from = previous_aim.unwrap_or(aimed);
                 // A delta of nothing is not an event.
                 if aimed == from {
                     return Ok(());
@@ -2636,8 +2691,8 @@ mod dxgi {
             let Some(landed) = Self::cursor_now() else {
                 return Ok(());
             };
-            let on_target = (landed.0 - aimed.0).abs() <= GRAB_TOLERANCE_PX
-                && (landed.1 - aimed.1).abs() <= GRAB_TOLERANCE_PX;
+            let previous_landed = self.read_back.replace(landed);
+            let on_target = absolute_move_landed(aimed, previous_aim, landed, previous_landed);
             if self.grab.landed(on_target) {
                 if on_target {
                     tracing::info!("the pointer is free again: back to absolute motion");
@@ -2842,6 +2897,70 @@ mod dxgi {
                 Some(VK_CONTROL),
                 "and the old route did not"
             );
+        }
+
+        /// ADR 0092: what counts as a move that did not land. The rule this
+        /// replaces asked whether the cursor was *where it was aimed*, which a
+        /// late `GetCursorPos` answers wrongly every time — and a machine
+        /// whose read-back is consistently one sample behind therefore
+        /// switched every session to relative motion within three moves,
+        /// pointer acceleration and all, with nothing holding the pointer at
+        /// all.
+        #[test]
+        fn a_late_read_back_is_not_a_pointer_somebody_else_is_holding() {
+            // The pinned pointer of a `VMware` grab: the aim travels and the
+            // cursor answers the same coordinates every time.
+            let pinned = (640, 400);
+            assert!(!absolute_move_landed(
+                (100, 100),
+                Some((50, 50)),
+                pinned,
+                Some(pinned)
+            ));
+            assert!(!absolute_move_landed(
+                (200, 200),
+                Some((100, 100)),
+                pinned,
+                Some(pinned)
+            ));
+
+            // A read-back one sample behind: the cursor is at the *previous*
+            // aim, which is nowhere near this one — and is still a pointer
+            // this injector is moving.
+            assert!(absolute_move_landed(
+                (200, 200),
+                Some((100, 100)),
+                (100, 100),
+                Some((50, 50))
+            ));
+
+            // Landed, within the rounding the 0..=65535 grid costs.
+            assert!(absolute_move_landed(
+                (200, 200),
+                Some((100, 100)),
+                (200 + GRAB_TOLERANCE_PX, 200),
+                Some((100, 100))
+            ));
+            assert!(!absolute_move_landed(
+                (200, 200),
+                Some((100, 100)),
+                (200 + GRAB_TOLERANCE_PX + 1, 200),
+                Some((200 + GRAB_TOLERANCE_PX + 1, 200))
+            ));
+
+            // Nothing was asked of it: a pointer the operator is holding still
+            // must not accumulate misses, wherever the host's own mouse has
+            // since left the cursor.
+            assert!(absolute_move_landed(
+                (200, 200),
+                Some((200, 200)),
+                pinned,
+                Some(pinned)
+            ));
+
+            // The first move of a session has nothing to compare against and
+            // is evidence of nothing.
+            assert!(absolute_move_landed((200, 200), None, pinned, None));
         }
 
         /// docs/bugs/17-remote-hotkeys.md: while a `VMware` Workstation window

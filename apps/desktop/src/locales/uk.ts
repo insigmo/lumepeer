@@ -267,6 +267,7 @@ export const uk: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Увімкнути або вимкнути чат',
   'toolbar.hotkey.send-cad': 'Надіслати Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': 'Згорнути або розгорнути цю панель інструментів',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Повернути цій машині Win і Alt+Tab або віддати їх хосту',
   'unattended.heading': 'Доступ без присутності',
   'unattended.explain':
     'Коли це увімкнено, пристрій, який ви позначили як довірений, може почати сеанс, ввівши пароль цього пристрою — нікому не потрібно бути тут, щоб це схвалити. Цей банер лишається, доки функцію ввімкнено.',

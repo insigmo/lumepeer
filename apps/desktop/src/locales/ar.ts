@@ -264,6 +264,7 @@ export const ar: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'تشغيل الدردشة أو إيقافها',
   'toolbar.hotkey.send-cad': 'إرسال Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': 'طي شريط الأدوات أو توسيعه',
+  'toolbar.hotkey.toggle-keyboard-grab': 'إعادة مفتاحي Win و‏Alt+Tab إلى هذا الجهاز أو إرسالهما إلى المضيف',
   'unattended.heading': 'الوصول دون حضور',
   'unattended.explain': 'عند تفعيله يمكن لجهاز وثّقته أن يبدأ جلسة بإدخال كلمة مرور هذا الجهاز، دون حاجة إلى موافقة أحد هنا. يبقى هذا التنبيه ظاهرًا ما دام مفعّلًا.',
   'unattended.indicator': 'الوصول دون حضور مفعّل',

@@ -267,6 +267,7 @@ export const de: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Chat ein- oder ausschalten',
   'toolbar.hotkey.send-cad': 'Strg+Alt+Entf senden',
   'toolbar.hotkey.toggle-toolbar': 'Diese Werkzeugleiste ein- oder ausklappen',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Win und Alt+Tab diesem Rechner zurückgeben oder an den Host senden',
   'unattended.heading': 'Unbeaufsichtigter Zugriff',
   'unattended.explain':
     'Wenn dies aktiviert ist, kann ein von Ihnen als vertrauenswürdig markiertes Gerät eine Sitzung starten, indem es das Gerätepasswort eingibt — niemand muss hier sitzen, um dies zu genehmigen. Dieser Hinweis bleibt sichtbar, solange die Funktion aktiv ist.',

@@ -7,6 +7,7 @@ members = [
     "crates/runtime",
     "crates/host",
     "crates/decoder-worker",
+    "crates/guestkeys",
     "crates/service",
     "crates/terminal",
     "apps/desktop/src-tauri",
@@ -31,6 +32,7 @@ lumepeer-runtime = { path = "crates/runtime" }
 lumepeer-host = { path = "crates/host" }
 lumepeer-service = { path = "crates/service" }
 lumepeer-terminal = { path = "crates/terminal" }
+lumepeer-guestkeys = { path = "crates/guestkeys" }
 lumepeer-decoder-worker = { path = "crates/decoder-worker" }
 
 # Design doc §5 — exact pins, updates go through a dedicated compatibility PR.

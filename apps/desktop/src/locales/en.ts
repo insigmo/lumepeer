@@ -296,6 +296,7 @@ export const en: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Chat on or off',
   'toolbar.hotkey.send-cad': 'Send Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': 'Collapse or expand this toolbar',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Give this machine its own Win and Alt+Tab back, or send them to the host',
   'unattended.heading': 'Unattended access',
   'unattended.explain': 'With this on, a device you have marked trusted can start a session by entering this device password — nobody has to be sitting here to approve it. This banner stays up whenever it is on.',
   'unattended.indicator': 'Unattended access is on',

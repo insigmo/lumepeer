@@ -90,7 +90,19 @@ pub fn run_worker() -> u32 {
         return 1;
     };
     let Some((width, height, data)) = crate::secure_desktop::capture() else {
-        tracing::warn!("secure-desktop worker: nothing to capture");
+        // `capture` has already said which step refused it (ADR 0092). What
+        // this adds is the fact that decides whether any of it could have
+        // worked: which desktop is receiving input right now. `Winlogon` means
+        // a real secure desktop and a genuine failure; anything else means
+        // this worker was launched for an episode that was never a secure
+        // desktop at all — a full-screen application or a display-mode change,
+        // both of which refuse `DuplicateOutput` exactly as a UAC prompt does.
+        tracing::warn!(
+            input_desktop = crate::secure_desktop_input::input_desktop_name()
+                .as_deref()
+                .unwrap_or("unknown"),
+            "secure-desktop worker: nothing to capture"
+        );
         return 1;
     };
     if writer.write(width, height, &data) {

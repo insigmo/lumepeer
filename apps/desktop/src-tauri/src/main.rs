@@ -14,6 +14,8 @@
 mod autostart;
 mod bootstrap;
 mod commands;
+// When the operator's own keyboard belongs to the remote machine (ADR 0090).
+mod keyboard_grab;
 mod logging;
 mod service_control;
 // This same binary, run as a machine's session agent (ADR 0085 §1). Windows
@@ -252,6 +254,10 @@ fn setup_app(
         autostart,
         host_role,
     });
+    // Managed separately from `AppState` because it needs an `AppHandle` of
+    // its own to reach the actor from the grab's drain task, and `AppState`
+    // is what that handle resolves to.
+    app.manage(keyboard_grab::KeyboardGrab::new(app.handle().clone()));
     runtime.spawn(watch_for_window_raising_notifications(
         app.handle().clone(),
         notifications,
@@ -410,6 +416,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::monitors_list,
         commands::view_set_scale,
         commands::view_set_size,
+        commands::view_keyboard_grab,
         commands::host_display_modes,
         commands::host_display_set_mode,
         commands::recordings_list,

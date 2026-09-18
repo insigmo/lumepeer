@@ -312,6 +312,7 @@ export type TranslationKey =
   | 'toolbar.hotkey.toggle-chat'
   | 'toolbar.hotkey.send-cad'
   | 'toolbar.hotkey.toggle-toolbar'
+  | 'toolbar.hotkey.toggle-keyboard-grab'
   | 'unattended.heading'
   | 'unattended.explain'
   | 'unattended.indicator'

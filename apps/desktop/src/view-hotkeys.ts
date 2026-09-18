@@ -22,7 +22,10 @@
 //   both read the same {@link isLocalTextTarget}.
 //
 // A hotkey nobody can see is indistinguishable from a bug, so the same table
-// this module matches against is what the toolbar's help popover lists.
+// this module matches against is what the toolbar's help popover lists. That
+// matters most for `toggle-keyboard-grab` (ADR 0090): while the grab is on,
+// `Alt+Tab` belongs to the remote machine, so this chord is the operator's
+// way back to their own window switcher — and it has to be discoverable.
 
 import { isLocalTextTarget } from './view-window';
 
@@ -33,7 +36,8 @@ export type HotkeyAction =
   | 'reset-view'
   | 'toggle-chat'
   | 'send-cad'
-  | 'toggle-toolbar';
+  | 'toggle-toolbar'
+  | 'toggle-keyboard-grab';
 
 /** The chords, as physical key codes so a non-QWERTY layout still matches. */
 export const HOTKEYS: readonly { code: string; action: HotkeyAction }[] = [
@@ -43,6 +47,7 @@ export const HOTKEYS: readonly { code: string; action: HotkeyAction }[] = [
   { code: 'KeyC', action: 'toggle-chat' },
   { code: 'KeyD', action: 'send-cad' },
   { code: 'KeyT', action: 'toggle-toolbar' },
+  { code: 'KeyK', action: 'toggle-keyboard-grab' },
 ];
 
 /** How the prefix is written wherever the chords are shown to a person. */

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-view-keyboard-grab"
+description = "Enables the view_keyboard_grab command without any pre-configured scope."
+commands.allow = ["view_keyboard_grab"]
+
+[[permission]]
+identifier = "deny-view-keyboard-grab"
+description = "Denies the view_keyboard_grab command without any pre-configured scope."
+commands.deny = ["view_keyboard_grab"]

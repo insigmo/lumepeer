@@ -263,6 +263,7 @@ export const ja: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'チャットのオン/オフ',
   'toolbar.hotkey.send-cad': 'Ctrl+Alt+Del を送信',
   'toolbar.hotkey.toggle-toolbar': 'このツールバーを折りたたむ/展開する',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Win と Alt+Tab をこの端末に戻す、またはホストへ送る',
   'unattended.heading': '無人アクセス',
   'unattended.explain':
     'これを有効にすると、信頼済みとしてマークしたデバイスは、このデバイスのパスワードを入力するだけでセッションを開始できます — 誰かがここにいて承認する必要はありません。有効になっている間、このバナーは常に表示されます。',

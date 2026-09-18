@@ -267,6 +267,7 @@ export const pl: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Włącz lub wyłącz czat',
   'toolbar.hotkey.send-cad': 'Wyślij Ctrl+Alt+Del',
   'toolbar.hotkey.toggle-toolbar': 'Zwiń lub rozwiń ten pasek narzędzi',
+  'toolbar.hotkey.toggle-keyboard-grab': 'Zwróć klawisz Win i Alt+Tab tej maszynie lub wyślij je do hosta',
   'unattended.heading': 'Dostęp bez nadzoru',
   'unattended.explain':
     'Gdy ta opcja jest włączona, urządzenie oznaczone jako zaufane może rozpocząć sesję, wpisując hasło tego urządzenia — nikt nie musi tu siedzieć, aby to zatwierdzić. Ten baner pozostaje widoczny, dopóki funkcja jest włączona.',

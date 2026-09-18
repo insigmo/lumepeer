@@ -67,6 +67,12 @@ lumepeer-service.workspace = true
 # token drop that keeps a shell out of this process's privileges has a safe
 # binding.
 lumepeer-terminal.workspace = true
+# The guest's own keyboard (ADR 0090): the `WebView2` accelerator keys a view
+# window has to give back, and the system chords no window is ever told about.
+# A crate of its own for the reason `lumepeer-terminal` is one — this crate
+# forbids `unsafe`, and neither a COM property setter nor `SetWindowsHookExW`
+# has a safe binding.
+lumepeer-guestkeys.workspace = true
 ed25519-dalek.workspace = true
 iroh.workspace = true
 postcard.workspace = true

@@ -267,6 +267,7 @@ export const fr: Dictionary = {
   'toolbar.hotkey.toggle-chat': 'Activer ou désactiver la discussion',
   'toolbar.hotkey.send-cad': 'Envoyer Ctrl+Alt+Suppr',
   'toolbar.hotkey.toggle-toolbar': "Réduire ou déployer cette barre d'outils",
+  'toolbar.hotkey.toggle-keyboard-grab': 'Rendre Win et Alt+Tab à cette machine ou les envoyer à l\'hôte',
   'unattended.heading': 'Accès sans surveillance',
   'unattended.explain':
     "Lorsque cette option est activée, un appareil que vous avez marqué comme fiable peut démarrer une session en saisissant le mot de passe de cet appareil — personne n'a besoin d'être présent pour l'approuver. Ce bandeau reste affiché tant que c'est actif.",
