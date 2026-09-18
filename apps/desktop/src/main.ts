@@ -444,6 +444,27 @@ onAuditStateChange(renderNow);
 onSystemStateChange(renderNow);
 onSettingsStateChange(renderNow);
 
+// A card's three-dot menu is a `<details>`, which the browser opens and closes
+// by itself — except for the one thing it does not do: close when the pointer
+// goes somewhere else. Both listeners are on the document because the cards
+// themselves are replaced on every poll.
+document.addEventListener('click', (event) => {
+  const inside = (event.target as HTMLElement | null)?.closest('details.peer-menu');
+  for (const menu of document.querySelectorAll('details.peer-menu[open]')) {
+    if (menu !== inside) {
+      menu.removeAttribute('open');
+    }
+  }
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') {
+    return;
+  }
+  for (const menu of document.querySelectorAll('details.peer-menu[open]')) {
+    menu.removeAttribute('open');
+  }
+});
+
 renderNow();
 void refresh();
 // What this process's WebView can decode, asked of the browser and told to

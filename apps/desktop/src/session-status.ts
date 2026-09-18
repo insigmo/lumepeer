@@ -12,6 +12,7 @@ import type { Role } from './consent-dialog';
 import type { ConnectionStats } from './connection-quality';
 import { connectionQuality } from './connection-quality';
 import type { FileCommands, FileTransfers } from './file-transfers';
+import { forgetThumbnail, thumbnailOf } from './peer-thumbnails';
 import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 import { tauriTunnelCommands, tunnelPanel, type TunnelCommands, type TunnelRow } from './tunnels';
 
@@ -361,6 +362,65 @@ const roleKey: Record<Role, 'status.role.viewOnly' | 'status.role.controlLimited
   full_control: 'status.role.fullControl',
 };
 
+/**
+ * The picture of a remembered host, or the glyph that stands in until a
+ * session has been watched long enough to take one (ADR 0094;
+ * `peer-thumbnails.ts`).
+ *
+ * A screen rather than an operating-system logo on purpose: which machine
+ * this is, is a thing people recognize by what was on it, and the logo of an
+ * OS is the one fact every row would have in common.
+ */
+function peerThumbnail(host: string, locale: Locale): TemplateResult {
+  const image = thumbnailOf(host);
+  return html`
+    <span class="peer-thumb" data-testid="peer-thumb">
+      ${image === null
+        ? html`
+            <svg width="34" height="34" viewBox="0 0 24 24" aria-hidden="true" class="peer-thumb-glyph">
+              <rect x="2.5" y="4" width="19" height="13" rx="1.6" stroke="currentColor" stroke-width="1.4" fill="none" />
+              <line x1="8" y1="20" x2="16" y2="20" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              <line x1="12" y1="17" x2="12" y2="20" stroke="currentColor" stroke-width="1.4" />
+            </svg>
+          `
+        : html`<img class="peer-thumb-image" src=${image} alt=${t(locale, 'connections.preview')} />`}
+    </span>
+  `;
+}
+
+/** Closes the menu the pressed item belongs to, whatever the item then does. */
+function closeMenu(event: Event): void {
+  (event.currentTarget as HTMLElement | null)?.closest('details.peer-menu')?.removeAttribute('open');
+}
+
+/**
+ * The card's overflow menu: the three dots, and everything this row can do.
+ *
+ * A `<details>` rather than a hand-rolled popup because this panel re-renders
+ * every second — anything whose openness lived in a template variable would
+ * shut itself while being read. The browser owns the `open` attribute, and
+ * lit-html leaves attributes it does not bind alone.
+ */
+function peerMenu(label: string, locale: Locale, items: (TemplateResult | '')[]): TemplateResult {
+  return html`
+    <details class="peer-menu" data-testid="peer-menu">
+      <summary
+        class="peer-menu-btn"
+        aria-haspopup="menu"
+        aria-label=${`${t(locale, 'connections.actions')}: ${label}`}
+        title=${t(locale, 'connections.actions')}
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="3.2" r="1.5" fill="currentColor" />
+          <circle cx="8" cy="8" r="1.5" fill="currentColor" />
+          <circle cx="8" cy="12.8" r="1.5" fill="currentColor" />
+        </svg>
+      </summary>
+      <div class="peer-menu-list" role="menu">${items}</div>
+    </details>
+  `;
+}
+
 export function sessionStatus(
   sessions: SessionStatus[],
   locale: Locale,
@@ -460,34 +520,68 @@ export function sessionStatus(
           </div>
         `
       : html`
-          <ul class="connections-list" aria-live="polite">
+          <ul class="connections-list connections-grid" aria-live="polite">
             ${sessions.map(
               (session) => html`
-                <li>
-                  <span class="peer-label">${session.peer_label}</span>
-                  <span class="peer-meta">${t(locale, roleKey[session.role])}</span>
-                  <span class="peer-meta">${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span>
+                <li class="peer-card" data-testid="session-card">
+                  <div class="peer-card-face">
+                    ${peerThumbnail('', locale)}
+                    <span class="peer-card-caption">
+                      <span class="peer-meta">${t(locale, roleKey[session.role])}</span>
+                      <span class="peer-meta"
+                        >${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span
+                      >
+                    </span>
+                  </div>
+                  <div class="peer-card-foot">
+                    <span
+                      class="peer-dot"
+                      data-state=${session.state === 'active' ? 'live' : 'pending'}
+                      title=${t(locale, session.state === 'active' ? 'connections.live' : 'connections.idle')}
+                    ></span>
+                    <span class="peer-label">${session.peer_label}</span>
+                    ${peerMenu(session.peer_label, locale, [
+                      session.state === 'active'
+                        ? html`
+                            <button
+                              type="button"
+                              class="peer-menu-item chat-open-btn"
+                              role="menuitem"
+                              aria-label=${`${t(locale, 'chat.open')}: ${session.peer_label}`}
+                              @click=${(event: Event) => {
+                                closeMenu(event);
+                                onOpenChat(session.peer_label);
+                              }}
+                            >
+                              ${t(locale, 'chat.open')}
+                            </button>
+                          `
+                        : '',
+                      session.state === 'active'
+                        ? html`<span class="peer-menu-item" role="menuitem"
+                            >${saveDevice(session.peer_label)}</span
+                          >`
+                        : '',
+                      html`
+                        <button
+                          type="button"
+                          class="peer-menu-item is-destructive revoke-btn"
+                          role="menuitem"
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            void revoke(session.peer_label);
+                          }}
+                        >
+                          ${t(locale, 'status.revoke')}
+                        </button>
+                      `,
+                    ])}
+                  </div>
                   ${Date.now() - (clipboardSyncedAt.get(session.peer_label) ?? 0) < CLIPBOARD_NOTE_MS
                     ? html`<span class="clipboard-note" role="status" data-testid="clipboard-note"
                         >${t(locale, 'status.clipboardSynced')}</span
                       >`
                     : ''}
-                  ${session.state === 'active'
-                    ? html`
-                        <button
-                          type="button"
-                          class="chat-open-btn"
-                          aria-label=${`${t(locale, 'chat.open')}: ${session.peer_label}`}
-                          @click=${() => onOpenChat(session.peer_label)}
-                        >
-                          ${t(locale, 'chat.open')}
-                        </button>
-                      `
-                    : ''}
-                  ${session.state === 'active' ? saveDevice(session.peer_label) : ''}
-                  <button type="button" class="revoke-btn" @click=${() => void revoke(session.peer_label)}>
-                    ${t(locale, 'status.revoke')}
-                  </button>
                   ${session.state === 'active'
                     ? connectionQuality(connectionStats.get(session.peer_label), locale)
                     : ''}
@@ -513,77 +607,113 @@ export function sessionStatus(
             )}
             ${history.map(
               (entry) => html`
-                <li class="history-row">
+                <li class="peer-card history-row" data-testid="history-card">
                   <button
                     type="button"
-                    class="history-reconnect"
+                    class="peer-card-face history-reconnect"
                     ?disabled=${reconnectDisabled}
                     title=${t(locale, 'status.reconnect')}
+                    aria-label=${`${t(locale, 'status.reconnect')}: ${entry.peer_label}`}
                     @click=${() => onReconnect(entry.peer_label)}
                   >
+                    ${peerThumbnail(entry.peer_label, locale)}
+                    <span class="peer-card-caption">
+                      <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
+                      <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
+                    </span>
+                  </button>
+                  <div class="peer-card-foot">
+                    <span
+                      class="peer-dot"
+                      data-state="idle"
+                      title=${t(locale, 'connections.idle')}
+                    ></span>
                     <span class="peer-label">${entry.peer_label}</span>
-                    <span class="peer-meta">${t(locale, roleKey[entry.role])}</span>
-                    <span class="peer-meta history-ended">${relativeTime(entry.last_seen_at, locale)}</span>
-                    <span class="history-action">${t(locale, 'status.reconnect')}</span>
-                  </button>
-                  <label
-                    class="history-autoreconnect"
-                    title=${t(locale, 'history.autoReconnect.hint')}
-                    data-testid="history-auto-reconnect"
-                  >
-                    <input
-                      type="checkbox"
-                      .checked=${entry.trusted === true}
-                      aria-label=${`${t(locale, 'history.autoReconnect')}: ${entry.peer_label}`}
-                      @change=${(event: Event) => {
-                        const on = (event.target as HTMLInputElement).checked;
-                        void setAutoReconnect(entry.peer_label, on).then(onRefresh, (error: unknown) => {
-                          console.error('history_set_trusted failed:', error);
-                          onRefresh();
-                        });
-                      }}
-                    />
-                    <span>${t(locale, 'history.autoReconnect')}</span>
-                  </label>
-                  ${entry.has_password
-                    ? html`<button
-                        type="button"
-                        class="history-forget-password"
-                        title=${t(locale, 'history.forgetPassword.hint')}
-                        aria-label=${`${t(locale, 'history.forgetPassword')}: ${entry.peer_label}`}
-                        @click=${() => {
-                          if (
-                            !globalThis.confirm(
-                              t(locale, 'history.forgetPassword.confirm', entry.peer_label),
-                            )
-                          ) {
-                            return;
-                          }
-                          void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
-                            console.error('history_forget_password failed:', error);
-                            onRefresh();
-                          });
-                        }}
-                      >
-                        ${t(locale, 'history.forgetPassword')}
-                      </button>`
-                    : ''}
-                  <button
-                    type="button"
-                    class="history-remove"
-                    aria-label=${`${t(locale, 'history.remove')}: ${entry.peer_label}`}
-                    @click=${() => {
-                      if (!globalThis.confirm(t(locale, 'history.remove.confirm', entry.peer_label))) {
-                        return;
-                      }
-                      void forgetHistory(entry.peer_label).then(onRefresh, (error: unknown) => {
-                        console.error('history_remove failed:', error);
-                        onRefresh();
-                      });
-                    }}
-                  >
-                    ${t(locale, 'history.remove')}
-                  </button>
+                    ${peerMenu(entry.peer_label, locale, [
+                      html`
+                        <button
+                          type="button"
+                          class="peer-menu-item peer-menu-connect"
+                          role="menuitem"
+                          ?disabled=${reconnectDisabled}
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            onReconnect(entry.peer_label);
+                          }}
+                        >
+                          ${t(locale, 'status.reconnect')}
+                        </button>
+                      `,
+                      html`
+                        <label
+                          class="peer-menu-item history-autoreconnect"
+                          role="menuitem"
+                          title=${t(locale, 'history.autoReconnect.hint')}
+                          data-testid="history-auto-reconnect"
+                        >
+                          <input
+                            type="checkbox"
+                            .checked=${entry.trusted === true}
+                            aria-label=${`${t(locale, 'history.autoReconnect')}: ${entry.peer_label}`}
+                            @change=${(event: Event) => {
+                              const on = (event.target as HTMLInputElement).checked;
+                              void setAutoReconnect(entry.peer_label, on).then(onRefresh, (error: unknown) => {
+                                console.error('history_set_trusted failed:', error);
+                                onRefresh();
+                              });
+                            }}
+                          />
+                          <span>${t(locale, 'history.autoReconnect')}</span>
+                        </label>
+                      `,
+                      entry.has_password
+                        ? html`<button
+                            type="button"
+                            class="peer-menu-item history-forget-password"
+                            role="menuitem"
+                            title=${t(locale, 'history.forgetPassword.hint')}
+                            aria-label=${`${t(locale, 'history.forgetPassword')}: ${entry.peer_label}`}
+                            @click=${(event: Event) => {
+                              closeMenu(event);
+                              if (
+                                !globalThis.confirm(
+                                  t(locale, 'history.forgetPassword.confirm', entry.peer_label),
+                                )
+                              ) {
+                                return;
+                              }
+                              void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
+                                console.error('history_forget_password failed:', error);
+                                onRefresh();
+                              });
+                            }}
+                          >
+                            ${t(locale, 'history.forgetPassword')}
+                          </button>`
+                        : '',
+                      html`
+                        <button
+                          type="button"
+                          class="peer-menu-item is-destructive history-remove"
+                          role="menuitem"
+                          aria-label=${`${t(locale, 'history.remove')}: ${entry.peer_label}`}
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            if (!globalThis.confirm(t(locale, 'history.remove.confirm', entry.peer_label))) {
+                              return;
+                            }
+                            forgetThumbnail(entry.peer_label);
+                            void forgetHistory(entry.peer_label).then(onRefresh, (error: unknown) => {
+                              console.error('history_remove failed:', error);
+                              onRefresh();
+                            });
+                          }}
+                        >
+                          ${t(locale, 'history.remove')}
+                        </button>
+                      `,
+                    ])}
+                  </div>
                 </li>
               `,
             )}

@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
+import { rememberThumbnail, thumbnailOf } from './peer-thumbnails';
 import { sessionStatus, type HistoryEntry } from './session-status';
 
 let container: HTMLElement;
 
 beforeEach(() => {
+  localStorage.clear();
   invoke.mockReset();
   invoke.mockResolvedValue(undefined);
   container = document.createElement('div');
@@ -34,12 +36,61 @@ function render_(onRefresh: () => void = () => {}, onReconnect: (peer: string) =
 }
 
 describe('remembered-host row', () => {
-  it('offers two separate controls, not a button nested in a button', () => {
+  it('keeps the card face and its menu apart, never a button inside a button', () => {
     render_();
     const row = container.querySelector('.history-row');
-    const buttons = row?.querySelectorAll('button') ?? [];
-    expect(buttons).toHaveLength(2);
     expect(row?.querySelector('button > button')).toBeNull();
+    // The face is the connect control; everything else lives in the menu
+    // beside it, so pressing one can never mean the other.
+    expect(row?.querySelector('button.peer-card-face.history-reconnect')).not.toBeNull();
+    expect(row?.querySelector('.peer-card-face .peer-menu')).toBeNull();
+    expect(row?.querySelector('.peer-menu .history-remove')).not.toBeNull();
+  });
+
+  it('puts every action this row has into one menu', () => {
+    render(
+      sessionStatus([], 'en', () => {}, [{ ...ENTRY, has_password: true }], () => {}),
+      container,
+    );
+    const menu = container.querySelector('.history-row .peer-menu-list');
+    expect(menu?.querySelector('.peer-menu-connect')).not.toBeNull();
+    expect(menu?.querySelector('[data-testid="history-auto-reconnect"]')).not.toBeNull();
+    expect(menu?.querySelector('.history-forget-password')).not.toBeNull();
+    expect(menu?.querySelector('.history-remove')).not.toBeNull();
+  });
+
+  it('closes the menu once an action has been taken', async () => {
+    vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    render_();
+    const menu = container.querySelector<HTMLDetailsElement>('.history-row .peer-menu');
+    menu?.setAttribute('open', '');
+    container.querySelector<HTMLButtonElement>('.history-remove')?.click();
+    expect(menu?.hasAttribute('open')).toBe(false);
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_remove', { args: { peer: 'host-ab12' } });
+    });
+  });
+
+  it('shows the last picture of the host, and a screen glyph until there is one', () => {
+    render_();
+    expect(container.querySelector('.peer-thumb .peer-thumb-image')).toBeNull();
+    expect(container.querySelector('.peer-thumb .peer-thumb-glyph')).not.toBeNull();
+
+    rememberThumbnail('host-ab12', 'data:image/jpeg;base64,AAAA');
+    render_();
+    const image = container.querySelector<HTMLImageElement>('.peer-thumb .peer-thumb-image');
+    expect(image?.getAttribute('src')).toBe('data:image/jpeg;base64,AAAA');
+  });
+
+  it('forgets the picture with the row it belonged to', async () => {
+    vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    rememberThumbnail('host-ab12', 'data:image/jpeg;base64,AAAA');
+    render_();
+    container.querySelector<HTMLButtonElement>('.history-remove')?.click();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_remove', { args: { peer: 'host-ab12' } });
+    });
+    expect(thumbnailOf('host-ab12')).toBeNull();
   });
 
   it('clicking the row still reconnects by label', () => {

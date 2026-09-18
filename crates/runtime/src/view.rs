@@ -978,7 +978,14 @@ pub fn window_label(peer_label: &str) -> String {
 /// cycle through a stand-in and never start a webview at all.
 pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// Opens the view window `label` onto `peer_label`.
-    fn open(&self, label: &str, peer_label: &str, input: bool);
+    ///
+    /// `host_label` is the same host's *stable* pseudonym — the one the
+    /// remembered-hosts list is keyed by, which `peer_label` deliberately is
+    /// not (it is re-salted every run so a guest cannot be correlated across
+    /// them). The window needs both: every IPC command names the session by
+    /// `peer_label`, and the picture it keeps for the connection list has to
+    /// be findable tomorrow, under the only name that survives a restart.
+    fn open(&self, label: &str, peer_label: &str, host_label: &str, input: bool);
     /// Closes the view window `label`, if it is open.
     fn close(&self, label: &str);
     /// Host side: puts the always-on-top session bar up, or takes it down.
@@ -1034,7 +1041,7 @@ pub struct DetachedViewWindows;
 
 #[cfg(test)]
 impl ViewWindows for DetachedViewWindows {
-    fn open(&self, label: &str, _peer_label: &str, _input: bool) {
+    fn open(&self, label: &str, _peer_label: &str, _host_label: &str, _input: bool) {
         tracing::debug!(window = %label, "no webview attached: not opening a view window");
     }
 

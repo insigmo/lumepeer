@@ -346,6 +346,31 @@ impl PathKind {
     }
 }
 
+/// The direct addresses a live connection is actually reaching its peer at
+/// (ADR 0093), newest-first order being simply the order iroh reports them.
+///
+/// Empty for a connection carried by a relay alone, and for the obfuscated
+/// transport, which has exactly one address the ticket already pinned — in
+/// both cases there is nothing here the next dial does not already know.
+///
+/// Kept on this side of the IPC boundary. These are addresses of somebody
+/// else's network, remembered so this node can get back to them; §15's rule
+/// is that they never reach the webview, not that this process may not know
+/// where it just connected.
+fn direct_addrs_of(connection: &PeerConnection) -> Vec<String> {
+    let Some(connection) = connection.iroh() else {
+        return Vec::new();
+    };
+    connection
+        .paths()
+        .iter()
+        .filter_map(|path| match path.remote_addr() {
+            iroh::TransportAddr::Ip(addr) => Some(addr.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Classifies a live connection's open paths, and names the relay's region
 /// when one is in use.
 ///
@@ -8364,7 +8389,7 @@ impl Actor {
                 media_connection,
             },
         );
-        self.windows.open(&label, &tag, grants.input);
+        self.windows.open(&label, &tag, &host_tag(&peer), grants.input);
         self.rebuild_labels_and_snapshot();
         // A fresh entry in `self.views` is one of the two reasons the
         // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
@@ -8399,11 +8424,13 @@ impl Actor {
         drop(state.slot);
         self.windows.close(&state.label);
         if let Some(code) = self.host_invites.get(&peer).cloned() {
+            let addrs = self.connected_addrs(&peer);
             self.history.record(
                 host_tag(&peer),
                 state.role,
                 code,
                 self.host_dialers.get(&peer).map(HostDialer::kind),
+                addrs,
             );
         }
         tracing::info!(peer = %self.label_of(&peer), "view window closed");
@@ -9040,11 +9067,13 @@ impl Actor {
                 // `stop_view` still makes when this session ends only
                 // refreshes this same row rather than duplicating it.
                 if let Some(code) = self.host_invites.get(&peer).cloned() {
+                    let addrs = self.connected_addrs(&peer);
                     self.history.record(
                         host_tag(&peer),
                         role,
                         code,
                         self.host_dialers.get(&peer).map(HostDialer::kind),
+                        addrs,
                     );
                 }
                 // Only set when this grant followed a credential submission
@@ -13568,6 +13597,53 @@ impl Actor {
         self.history.transport_of(&host_tag(peer))
     }
 
+    /// Guest side: where the live connection to `peer` is actually reaching it
+    /// (ADR 0093), for the remembered-hosts list to keep.
+    ///
+    /// Empty when there is no connection any more, which is one of the two
+    /// moments a row is written: `ConnectionHistory::record` reads that as
+    /// "nothing to say" and keeps what the connect-time write already put
+    /// there.
+    fn connected_addrs(&self, peer: &NodeId) -> Vec<String> {
+        self.connections
+            .get(peer)
+            .map(|handle| direct_addrs_of(&handle.connection))
+            .unwrap_or_default()
+    }
+
+    /// Guest side: the ticket's address set plus the addresses this host was
+    /// last actually reached at (ADR 0093).
+    ///
+    /// Added to, never replaced: the ticket is what the host published about
+    /// itself and stays the first thing tried. What this adds is the only
+    /// evidence that is not a claim — an address that carried packets — and it
+    /// matters exactly when discovery is worst: a record that failed to
+    /// publish leaves the DHT answering with a previous run's addresses, and
+    /// every attempt then dials a machine that is not there. iroh races the
+    /// whole set, so an address that has since gone stale costs nothing but a
+    /// probe.
+    fn with_remembered_addrs(&self, mut addr: iroh::EndpointAddr) -> iroh::EndpointAddr {
+        let remembered: Vec<std::net::SocketAddr> = self
+            .history
+            .addrs_of(&host_tag(&addr.id))
+            .iter()
+            .filter_map(|text| text.parse().ok())
+            .filter(|parsed| !addr.addrs.contains(&iroh::TransportAddr::Ip(*parsed)))
+            .collect();
+        if remembered.is_empty() {
+            return addr;
+        }
+        tracing::debug!(
+            peer = %self.label_of(&addr.id),
+            remembered = remembered.len(),
+            "adding the addresses this host was last reached at to the dial"
+        );
+        for parsed in remembered {
+            addr = addr.with_ip_addr(parsed);
+        }
+        addr
+    }
+
     /// Guest side: the transports this invite will be dialed over, in the
     /// order they will be tried (gap-tasks/23 task 1; ADR 0083).
     ///
@@ -13596,7 +13672,7 @@ impl Actor {
         let dialers = order.into_iter().filter_map(|transport| match transport {
             TransportKind::Iroh => Some(HostDialer::Iroh {
                 endpoint: self.endpoint.clone(),
-                addr: addr.clone(),
+                addr: self.with_remembered_addrs(addr.clone()),
             }),
             TransportKind::Obfuscated => obfuscated.take(),
         });
@@ -15659,6 +15735,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             Some(TransportKind::Obfuscated),
+            Vec::new(),
         );
         assert_eq!(
             dial_order(true, history.transport_of(&host_tag(&peer))),
@@ -15669,6 +15746,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             Some(TransportKind::Iroh),
+            Vec::new(),
         );
 
         // The resume is decided by peer and session, neither of which the
@@ -16259,7 +16337,7 @@ mod tests {
     }
 
     impl ViewWindows for RecordingWindows {
-        fn open(&self, label: &str, peer_label: &str, input: bool) {
+        fn open(&self, label: &str, peer_label: &str, _host_label: &str, input: bool) {
             self.opened
                 .lock()
                 .unwrap()

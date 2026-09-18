@@ -32,6 +32,7 @@ import {
   type ChatRow,
 } from './chat';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
+import { rememberThumbnail, thumbnailFrom } from './peer-thumbnails';
 import { mountTerminal, type TerminalControls } from './terminal';
 import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
 import {
@@ -83,8 +84,25 @@ import {
  */
 const CURSOR_POLL_INTERVAL_MS = 250;
 
+/**
+ * How often the desktop on screen is kept as this host's picture for the
+ * connection list.
+ *
+ * Rare on purpose: it costs a downscale and a JPEG encode, and what it feeds
+ * is a thumbnail somebody looks at between sessions, not anything live.
+ */
+const THUMBNAIL_INTERVAL_MS = 15_000;
+
 const params = new URLSearchParams(window.location.search);
 const peer = params.get('peer') ?? '';
+/**
+ * The same host under the name the remembered-hosts list knows it by.
+ *
+ * `peer` is re-salted every run and is what every IPC command here names;
+ * this one survives restarts and is what the picture below is filed under, so
+ * the connection list can find it tomorrow.
+ */
+const host = params.get('host') ?? '';
 const canvas = document.querySelector<HTMLCanvasElement>('#screen');
 const cursorLayer = document.querySelector<HTMLCanvasElement>('#cursor');
 const surface = document.querySelector<HTMLElement>('#view');
@@ -548,6 +566,35 @@ async function closeWindow(): Promise<void> {
   await getCurrentWindow().close();
 }
 
+/**
+ * `Date.now()` of the last picture kept for the connection list.
+ *
+ * Starts at the moment this window opened rather than at zero, so the first
+ * capture happens one interval in — by which time the canvas has a desktop on
+ * it, instead of the blank surface it is for the first few frames.
+ */
+let lastThumbnailAt = Date.now();
+
+/**
+ * Keeps what is on screen as this host's picture in the connection list, at
+ * most once every [`THUMBNAIL_INTERVAL_MS`].
+ *
+ * Called from both frame loops rather than from one place inside them: the
+ * canvas is painted by the RGBA path and by the native decoder, and which one
+ * is running is decided at startup.
+ */
+function noteThumbnail(): void {
+  if (!canvas || host === '') {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastThumbnailAt < THUMBNAIL_INTERVAL_MS) {
+    return;
+  }
+  lastThumbnailAt = now;
+  rememberThumbnail(host, thumbnailFrom(canvas));
+}
+
 async function tick(): Promise<void> {
   if (stopped || !canvas) {
     return;
@@ -559,6 +606,7 @@ async function tick(): Promise<void> {
     applySessionFlags(frame);
     if (paintFrame(canvas, frame)) {
       lastPaintedUs = frame.timestampUs;
+      noteThumbnail();
       // The remote screen can change resolution mid-session, and every part
       // of the layout is a function of the frame's size — but only of that,
       // of the window's size and of the display mode, so this is the only
@@ -645,6 +693,7 @@ async function nativeTick(): Promise<void> {
     if (nativeDecoder.push(chunk.frames, chunk.codec).needKeyframe) {
       needKeyframe = true;
     }
+    noteThumbnail();
   } catch {
     // The view is gone (session ended, window closing).
     stopped = true;

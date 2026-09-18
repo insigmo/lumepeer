@@ -524,6 +524,213 @@ button {
   gap: 8px;
 }
 
+/* The connection cards (RustDesk-shaped): a picture of the machine, its id,
+   and one menu holding everything the row can do. A grid rather than a
+   column, because a card is recognized by its picture and a picture wants
+   width, not a line of text's height. */
+.connections-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  align-items: start;
+  gap: 12px;
+}
+
+.connections-grid > li.peer-card {
+  display: block;
+  padding: 0;
+  /* Not `overflow: hidden`, however much the rounded corners would like it:
+     the three-dot menu hangs outside the card and would be clipped away. The
+     face rounds its own two corners instead. */
+  overflow: visible;
+}
+
+.peer-card-face {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  inline-size: 100%;
+  min-block-size: 108px;
+  padding: 10px;
+  border: 0;
+  border-block-end: 1px solid var(--border-subtle);
+  border-start-start-radius: 8px;
+  border-start-end-radius: 8px;
+  background: #f4f5f8;
+  color: #9aa1b1;
+  font: inherit;
+  text-align: center;
+}
+
+/* Only the remembered-host card is a button; a session card is a panel. */
+button.peer-card-face {
+  cursor: pointer;
+}
+
+button.peer-card-face:hover {
+  background: #eceef3;
+}
+
+button.peer-card-face:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.peer-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 100%;
+  block-size: 72px;
+  overflow: hidden;
+  border-radius: 6px;
+}
+
+.peer-thumb-image {
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.peer-card-caption {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.3;
+}
+
+.peer-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+}
+
+.peer-card-foot .peer-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-body);
+}
+
+.peer-dot {
+  inline-size: 8px;
+  block-size: 8px;
+  border-radius: 50%;
+  background: #c7cbd4;
+  flex: none;
+}
+
+.peer-dot[data-state='live'] {
+  background: var(--green);
+}
+
+.peer-dot[data-state='pending'] {
+  background: #e8b046;
+}
+
+/* The three dots. `<details>` keeps its own openness, which is what lets this
+   panel re-render every second without shutting a menu somebody is reading. */
+.peer-menu {
+  position: relative;
+  flex: none;
+}
+
+.peer-menu-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 24px;
+  block-size: 24px;
+  border-radius: 6px;
+  color: #6b7280;
+  cursor: pointer;
+  list-style: none;
+}
+
+.peer-menu-btn::-webkit-details-marker {
+  display: none;
+}
+
+.peer-menu-btn:hover,
+.peer-menu[open] .peer-menu-btn {
+  background: #f0f1f4;
+  color: var(--text-heading);
+}
+
+.peer-menu-list {
+  position: absolute;
+  z-index: 20;
+  inset-block-start: calc(100% + 4px);
+  inset-inline-end: 0;
+  min-inline-size: 190px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--panel-bg);
+  box-shadow: 0 8px 24px rgb(11 18 32 / 14%);
+}
+
+.peer-menu-item,
+.peer-menu-item button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  inline-size: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-heading);
+  font: inherit;
+  font-size: var(--fs-body);
+  text-align: start;
+  cursor: pointer;
+}
+
+.peer-menu-item:hover,
+.peer-menu-item button:hover {
+  background: #f4f5f8;
+}
+
+.peer-menu-item:disabled,
+.peer-menu-item button:disabled {
+  color: #9aa1b1;
+  cursor: default;
+  background: transparent;
+}
+
+.peer-menu-item.is-destructive {
+  color: var(--red);
+}
+
+.peer-menu-item.history-autoreconnect {
+  cursor: pointer;
+}
+
+/* A menu item that is itself a control keeps no padding of its own: the
+   wrapper already placed it. */
+.peer-menu-item > button {
+  padding: 0;
+}
+
+/* The live panels of a session card sit under its footer, full width. */
+.peer-card > .quality,
+.peer-card > .session-recording,
+.peer-card > .record-request,
+.peer-card > .file-panel,
+.peer-card > .tunnel-panel,
+.peer-card > .clipboard-note,
+.peer-card > .secure-desktop-indicator,
+.peer-card > .terminal-indicator {
+  margin: 0 10px 10px;
+}
+
 .connections-list li {
   display: flex;
   align-items: center;
@@ -781,161 +988,21 @@ button {
   color: var(--text-secondary);
 }
 
-.connections-list .chat-open-btn {
-  margin-inline-start: auto;
-  appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.connections-list .chat-open-btn:hover {
-  background: #eef2fe;
-  border-color: var(--blue-solid);
-  color: var(--blue-solid);
-}
-
-.connections-list .revoke-btn {
-  margin-inline-start: auto;
-  appearance: none;
-  border: 1px solid var(--red);
-  background: #fff;
-  color: var(--red);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.connections-list .revoke-btn:hover {
-  background: var(--red-tint);
-}
-
-.connections-list .history-row {
-  background: var(--sidebar-bg);
-  border-style: dashed;
-  /* history-reconnect brings its own padding; history-remove needs a little
-     of its own on the trailing edge (docs/bugs/03-connection-list.md, task
-     5 — a button next to the reconnect control, not inside it). */
-  padding: 0 8px 0 0;
-}
-
-/* A remembered host is somewhere to go back to, so the whole row is the
-   control rather than a label with a small link tucked at the end. */
-.connections-list .history-reconnect {
-  flex: 1;
-  min-width: 0;
-  appearance: none;
-  border: 0;
-  background: transparent;
-  font: inherit;
-  color: inherit;
-  text-align: start;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-  transition: background 0.15s ease;
-}
-
-.connections-list .history-reconnect:hover:not(:disabled) {
-  background: #eef2fe;
-}
-
-.connections-list .history-reconnect:disabled {
-  cursor: default;
-  opacity: 0.55;
-}
-
-.connections-list .history-row .peer-label {
+/* A remembered host is somewhere to go back to, so its whole face is the
+   control (ADR 0094). Everything else that row used to carry side by side
+   is in the menu beside it now, which styles its own items. */
+.connections-grid .history-row .peer-label {
   color: var(--text-secondary);
   font-weight: 500;
 }
 
-.connections-list .history-ended {
-  margin-inline-start: auto;
-}
-
-.connections-list .history-action {
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  color: var(--blue-solid);
-  white-space: nowrap;
-}
-
-/* Same chrome as Remove, minus the destructive red: forgetting a saved
-   password leaves the host in the list, it only stops the silent sign-in. */
-/* Unprompted reconnection, per remembered host (ADR 0084). A switch rather
-   than a button because it is a standing decision, not an action, and it sits
-   in the row it is about so "which machines come back on their own" is
-   answered by looking rather than by opening something. */
-.connections-list .history-autoreconnect {
-  display: inline-flex;
-  flex-shrink: 0;
-  align-items: center;
-  gap: 6px;
-  color: var(--text-muted);
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.connections-list .history-autoreconnect input {
+.peer-menu-item.history-autoreconnect input {
   margin: 0;
   cursor: pointer;
 }
 
-.connections-list .history-forget-password {
-  flex-shrink: 0;
-  appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.connections-list .history-forget-password:hover {
-  background: rgba(0, 0, 0, 0.04);
-  color: var(--text-heading);
-}
-
-.connections-list .history-remove {
-  flex-shrink: 0;
-  appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-  transition:
-    background 0.15s ease,
-    color 0.15s ease,
-    border-color 0.15s ease;
-}
-
-.connections-list .history-remove:hover {
+.peer-menu-item.history-remove:hover {
   background: var(--red-tint);
-  color: var(--red);
-  border-color: var(--red);
 }
 
 /* ---------- Host chat drawer ---------- */

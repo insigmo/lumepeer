@@ -59,6 +59,23 @@ pub struct HistoryEntry {
     /// same "nothing to go on" a host nobody has dialed yet presents.
     #[serde(default)]
     pub transport: Option<TransportKind>,
+    /// Direct addresses the last session with this host was actually reached
+    /// at, newest first (ADR 0093).
+    ///
+    /// Not where the host *says* it is — the invite code already carries that
+    /// — but where it answered from, read off the live connection's own paths.
+    /// The next dial offers them to iroh beside the ticket's, which is what
+    /// gets back to a host whose published record has gone stale: a discovery
+    /// answer can be minutes old or, when a publish failed, a whole run old,
+    /// while a NAT binding that was carrying packets a moment ago is usually
+    /// still open.
+    ///
+    /// Stored as strings so a value this build cannot parse is dropped rather
+    /// than failing the whole file to load, the same way every other field
+    /// here degrades. Empty for a row written before this existed, which reads
+    /// as "nothing remembered" — the behaviour of every earlier build.
+    #[serde(default)]
+    pub addrs: Vec<String>,
     /// Whether a device password is remembered for this host (§8; ADR 0033).
     ///
     /// `#[serde(skip)]` on purpose: the OS keystore is the only thing that
@@ -148,6 +165,17 @@ impl ConnectionHistory {
             .and_then(|entry| entry.transport)
     }
 
+    /// Addresses remembered for `peer_label`, newest first — empty for a host
+    /// that is not listed or whose sessions never reported one (ADR 0093).
+    #[must_use]
+    pub fn addrs_of(&self, peer_label: &str) -> Vec<String> {
+        self.entries
+            .iter()
+            .find(|entry| entry.peer_label == peer_label)
+            .map(|entry| entry.addrs.clone())
+            .unwrap_or_default()
+    }
+
     /// Records one host visit — at connect time or at disconnect, both call
     /// this — and persists the list.
     ///
@@ -174,12 +202,23 @@ impl ConnectionHistory {
         role: Role,
         code: String,
         transport: Option<TransportKind>,
+        addrs: Vec<String>,
     ) {
         let last_seen_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let trusted = self.is_trusted(&peer_label);
         let transport = transport.or_else(|| self.transport_of(&peer_label));
+        // Same rule as `transport`: nothing to say leaves what is remembered
+        // alone. A visit recorded after the connection has already been
+        // dropped knows no addresses, and forgetting the ones that worked over
+        // a bookkeeping detail of when the row happened to be written is
+        // exactly the case this list exists to survive.
+        let addrs = if addrs.is_empty() {
+            self.addrs_of(&peer_label)
+        } else {
+            addrs
+        };
         self.entries.retain(|entry| entry.peer_label != peer_label);
         self.entries.insert(
             0,
@@ -189,6 +228,7 @@ impl ConnectionHistory {
                 last_seen_at,
                 code,
                 transport,
+                addrs,
                 // Answered by the keystore when the actor reads the list, not
                 // by whatever wrote this row.
                 has_password: false,
@@ -283,8 +323,79 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         assert_eq!(history.entries().len(), 1);
+    }
+
+    /// ADR 0093: the addresses a session was actually carried over are kept
+    /// with the row, so the next dial has somewhere to go when discovery
+    /// answers with a stale record.
+    #[test]
+    fn a_visit_remembers_where_the_host_answered_from() {
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            vec!["85.173.126.211:21966".to_owned()],
+        );
+        assert_eq!(history.addrs_of("host-ab12"), vec!["85.173.126.211:21966"]);
+    }
+
+    /// The disconnect write happens after the connection is gone and has no
+    /// addresses to report. Treating that as "forget them" would throw away
+    /// what the connect-time write learned, which is the whole point of
+    /// keeping them.
+    #[test]
+    fn a_visit_with_nothing_to_report_keeps_the_addresses_already_known() {
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            vec!["85.173.126.211:21966".to_owned()],
+        );
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(history.addrs_of("host-ab12"), vec!["85.173.126.211:21966"]);
+    }
+
+    /// A newer session that did reach the host somewhere else replaces them:
+    /// this is a memory of the last route, not a growing list of every one.
+    #[test]
+    fn a_later_visit_replaces_the_addresses_with_its_own() {
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            vec!["85.173.126.211:21966".to_owned()],
+        );
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            vec!["176.208.57.14:9415".to_owned()],
+        );
+        assert_eq!(history.addrs_of("host-ab12"), vec!["176.208.57.14:9415"]);
+    }
+
+    /// A host nobody has reached has nothing to offer a dial, and says so
+    /// rather than making something up.
+    #[test]
+    fn an_unknown_host_remembers_no_addresses() {
+        let history = ConnectionHistory::open(None);
+        assert!(history.addrs_of("host-nobody").is_empty());
     }
 
     #[test]
@@ -296,6 +407,7 @@ mod tests {
                 Role::ViewOnly,
                 format!("code-{n}"),
                 None,
+                Vec::new(),
             );
         }
         assert_eq!(history.entries().len(), MAX_ENTRIES);
@@ -317,18 +429,21 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-cd34".to_owned(),
             Role::ViewOnly,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-ab12".to_owned(),
             Role::FullControl,
             "code-3".to_owned(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(history.entries().len(), 2);
@@ -347,12 +462,14 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-cd34".to_owned(),
             Role::ViewOnly,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
 
         assert!(history.remove("host-ab12"));
@@ -371,6 +488,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         assert!(!history.is_trusted("host-ab12"));
 
@@ -383,6 +501,7 @@ mod tests {
             Role::FullControl,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
         assert!(history.is_trusted("host-ab12"));
         assert_eq!(history.code_of("host-ab12"), Some("code-2"));
@@ -415,12 +534,14 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-cd34".to_owned(),
             Role::ViewOnly,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
         assert!(history.set_trusted("host-ab12", true));
 
@@ -460,6 +581,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
 
         assert!(!history.remove("host-never-connected"));
@@ -478,12 +600,14 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-cd34".to_owned(),
             Role::ViewOnly,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
         assert!(history.remove("host-ab12"));
 
@@ -506,12 +630,14 @@ mod tests {
             Role::FullControl,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
         history.record(
             "host-cd34".to_owned(),
             Role::ViewOnly,
             "code-2".to_owned(),
             None,
+            Vec::new(),
         );
 
         let reloaded = ConnectionHistory::open(Some(path));
@@ -539,6 +665,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             Some(TransportKind::Obfuscated),
+            Vec::new(),
         );
 
         let reloaded = ConnectionHistory::open(Some(path));
@@ -564,12 +691,14 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             Some(TransportKind::Obfuscated),
+            Vec::new(),
         );
         history.record(
             "host-ab12".to_owned(),
             Role::ViewOnly,
             "code-1".to_owned(),
             None,
+            Vec::new(),
         );
 
         assert_eq!(history.entries().len(), 1);
@@ -584,6 +713,7 @@ mod tests {
             Role::ViewOnly,
             "code-1".to_owned(),
             Some(TransportKind::Iroh),
+            Vec::new(),
         );
         assert_eq!(history.transport_of("host-ab12"), Some(TransportKind::Iroh));
     }

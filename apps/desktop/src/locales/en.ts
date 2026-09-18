@@ -151,6 +151,10 @@ export const en: Dictionary = {
   'panel.subtext': 'Paste an invite code to connect to a remote device.',
   'connections.header': 'Connections',
   'connections.refresh': 'Refresh',
+  'connections.actions': 'Actions',
+  'connections.preview': 'Remote desktop preview',
+  'connections.live': 'Connected',
+  'connections.idle': 'Not connected',
   'connections.emptyTitle': 'No connections yet',
   'connections.emptySubtext': 'Connected devices will appear here.',
   // The always-on-top session bar (ADR 0055). Its two chevrons are named for

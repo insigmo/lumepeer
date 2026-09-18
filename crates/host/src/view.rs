@@ -139,7 +139,7 @@ impl ViewWindows for AgentViewWindows {
     /// A service host never views another machine, so there is never one of
     /// these to open. Said out loud rather than silently ignored: if this ever
     /// fires, something asked a session-0 process to draw.
-    fn open(&self, label: &str, _peer_label: &str, _input: bool) {
+    fn open(&self, label: &str, _peer_label: &str, _host_label: &str, _input: bool) {
         tracing::warn!(
             window = %label,
             "a session-0 host was asked to open a view window; there is no desktop to open it on"

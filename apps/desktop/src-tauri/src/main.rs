@@ -457,6 +457,22 @@ fn autostart_cli_flag(args: &[String]) -> Option<bool> {
     }
 }
 
+/// Whether this process may run beside another copy of itself (test stands).
+///
+/// False in every shipped binary: a release build has neither
+/// `debug_assertions` nor the `pilot` feature, so this is a compile-time
+/// `false` and the single-instance plugin is always registered.
+fn second_instance_allowed() -> bool {
+    #[cfg(all(debug_assertions, feature = "pilot"))]
+    {
+        std::env::var_os("LUMEPEER_ALLOW_SECOND_INSTANCE").is_some()
+    }
+    #[cfg(not(all(debug_assertions, feature = "pilot")))]
+    {
+        false
+    }
+}
+
 fn main() {
     // `--enable-autostart` / `--disable-autostart`: a headless call into the
     // same autostart mechanism the settings panel's toggle uses, for
@@ -515,16 +531,31 @@ fn main() {
     // any capability file, so the webview cannot invoke it: registering a
     // plugin makes it available to this process, not to the untrusted
     // presentation layer (§2.3; ADR 0032).
-    let mut builder = tauri::Builder::default()
-        // First in the chain on purpose: a second launch has to be turned away
-        // before any other plugin or the setup hook gets to claim a resource
-        // the running process already owns — above all the iroh endpoint,
-        // whose NodeId is what the invite code already in someone's hands
-        // points at (docs/bugs/01). The callback hands the first process's
-        // window back instead, which is what the second launch was for.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+    let mut builder = tauri::Builder::default();
+    // First in the chain on purpose: a second launch has to be turned away
+    // before any other plugin or the setup hook gets to claim a resource the
+    // running process already owns — above all the iroh endpoint, whose
+    // NodeId is what the invite code already in someone's hands points at
+    // (docs/bugs/01). The callback hands the first process's window back
+    // instead, which is what the second launch was for.
+    //
+    // A two-node test stand is the one case where that is wrong, and on Linux
+    // it is already handled without anyone asking: the plugin's socket lives
+    // under `XDG_RUNTIME_DIR`, so `e2e/ci-stand.sh` gives each node its own
+    // and the two never see each other. The Windows implementation is a named
+    // mutex with no such namespace, so there the same stand has to say so.
+    // Gated on a pilot debug build — the binary that already carries the
+    // automation bridge and is never shipped — *and* on an environment
+    // variable, so even that binary is single-instance unless a stand asked
+    // otherwise. Each node still needs its own data directory and keystore
+    // (`LOCALAPPDATA`, `LUMEPEER_KEYSTORE`): this permits a second process,
+    // never a second process wearing the first one's identity.
+    if !second_instance_allowed() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             focus_main_window(app);
-        }))
+        }));
+    }
+    builder = builder
         // The plugin carries the public key from `tauri.conf.json`; the
         // endpoint is chosen per check instead, because it depends on the
         // configured channel (§21; ADR 0042) and a channel that could only be

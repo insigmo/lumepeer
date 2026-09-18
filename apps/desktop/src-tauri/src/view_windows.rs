@@ -42,10 +42,14 @@ impl TauriViewWindows {
 }
 
 impl ViewWindows for TauriViewWindows {
-    fn open(&self, label: &str, peer_label: &str, input: bool) {
-        // Only the pseudonymized label ever reaches a URL (§15), and it is hex
-        // from `peer_tag`, so there is nothing to escape.
-        let url = format!("view.html?peer={peer_label}&input={}", u8::from(input));
+    fn open(&self, label: &str, peer_label: &str, host_label: &str, input: bool) {
+        // Only pseudonymized labels ever reach a URL (§15), and both are hex
+        // — `peer_tag` for the session, `host_tag` for the remembered host —
+        // so there is nothing to escape.
+        let url = format!(
+            "view.html?peer={peer_label}&host={host_label}&input={}",
+            u8::from(input)
+        );
         let label = label.to_owned();
         let peer = peer_label.to_owned();
         let app = self.app.clone();
