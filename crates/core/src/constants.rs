@@ -241,6 +241,25 @@ pub const TRANSPORT_PROBE_ATTEMPTS: u32 = 2;
 /// there is, and this constant is what a test holds that property against.
 pub const DIAL_TOTAL_BUDGET_SECS: u64 = DIAL_ATTEMPTS as u64 * CONNECT_ATTEMPT_TIMEOUT_SECS
     + ((DIAL_ATTEMPTS as u64 - 1) * (DIAL_RETRY_BACKOFF_MS + DIAL_RETRY_BACKOFF_JITTER_MS)) / 1_000;
+/// Pause before a connect the user asked for is dialed again, after a whole
+/// [`DIAL_ATTEMPTS`] round came back with nothing but this side's own silence
+/// (ADR 0096).
+///
+/// The round is not the end of the attempt any more. A host whose relay link
+/// is down, whose published record is stale, or whose machine is still coming
+/// up answers nothing for minutes at a time, and `DIAL_TOTAL_BUDGET_SECS` of
+/// trying is not long enough to outlast that — the connect used to end in a
+/// failure the user could only answer by clicking the same button again.
+/// While the user has a connect open, this node keeps dialing instead.
+pub const CONNECT_RETRY_BACKOFF_SECS: u64 = 5;
+/// Ceiling the pause of [`CONNECT_RETRY_BACKOFF_SECS`] doubles up to (ADR
+/// 0096).
+///
+/// Bounded rather than unbounded so a host that comes back after an hour is
+/// still found within half a minute, and low enough that the wait never reads
+/// as a hang. A round of dialing already costs [`DIAL_TOTAL_BUDGET_SECS`], so
+/// this is the smaller half of the cycle either way.
+pub const CONNECT_RETRY_BACKOFF_CEILING_SECS: u64 = 30;
 /// Handshakes the host will run concurrently. Beyond this, further incoming
 /// connections are closed immediately rather than queued (§3.2).
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;

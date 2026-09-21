@@ -136,18 +136,26 @@ pub const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
 
 /// Points a builder at a specific relay: `LUMEPEER_RELAY_URL` first, then
 /// whatever `[network].relay_url` of the config carried (§7 fallback path,
-/// docs/relay-deployment.md). Neither means iroh's public fleet.
+/// docs/relay-deployment.md). With neither set, the public fleet is used,
+/// narrowed to the relays this machine can actually reach quickly (ADR 0097).
 ///
 /// A malformed URL is ignored with a warning rather than failing the bind:
 /// binding must keep working offline, and the endpoint logs which relay it
 /// actually reached either way.
-fn with_relay(builder: EndpointBuilder, configured: Option<&str>) -> EndpointBuilder {
-    let (source, url) = match std::env::var(RELAY_URL_ENV) {
-        Ok(from_env) => (RELAY_URL_ENV, from_env),
-        Err(_) => match configured {
-            Some(from_config) => ("[network].relay_url", from_config.to_owned()),
-            None => return builder,
-        },
+async fn with_relay(builder: EndpointBuilder, configured: Option<&str>) -> EndpointBuilder {
+    let named = match std::env::var(RELAY_URL_ENV) {
+        Ok(from_env) => Some((RELAY_URL_ENV, from_env)),
+        Err(_) => configured.map(|from_config| ("[network].relay_url", from_config.to_owned())),
+    };
+    let Some((source, url)) = named else {
+        // Nobody named one, so this node keeps the public fleet — narrowed to
+        // the relays it can actually reach quickly (ADR 0097). `None` leaves
+        // the fleet whole, which is what a measurement with nothing to say
+        // must not overrule.
+        return match crate::relay::nearest().await {
+            Some(relays) => builder.relay_mode(RelayMode::custom(relays)),
+            None => builder,
+        };
     };
     match url.parse::<RelayUrl>() {
         Ok(relay) => {
@@ -196,8 +204,9 @@ impl PeerEndpoint {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
-        builder = with_relay(builder, relay_url);
+        builder = with_relay(builder, relay_url).await;
         builder = with_dht_lookup(builder, &secret_key);
+        builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder
             .bind()
             .await
@@ -228,8 +237,9 @@ impl PeerEndpoint {
             .clear_ip_transports()
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
-        builder = with_relay(builder, relay_url);
+        builder = with_relay(builder, relay_url).await;
         builder = with_dht_lookup(builder, &secret_key);
+        builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder
             .bind()
             .await

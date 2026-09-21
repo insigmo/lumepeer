@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 pub mod connection;
+pub mod dns;
 pub mod endpoint;
 pub mod error;
 pub mod file_transfer;
@@ -17,6 +18,7 @@ pub mod obfuscate;
 pub mod obfuscated_endpoint;
 pub mod peer_connection;
 pub mod reconnect;
+pub mod relay;
 pub mod stun;
 pub mod terminal;
 pub mod ticket;

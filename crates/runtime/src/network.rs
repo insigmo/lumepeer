@@ -24,8 +24,9 @@ use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
 use lumepeer_core::consent::{Admission, ConsentRateLimiter, Grants, IndependentGrant, Role};
 use lumepeer_core::constants::{
-    ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
-    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
+    ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONNECT_RETRY_BACKOFF_CEILING_SECS,
+    CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
+    DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
     DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES,
     FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
     KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
@@ -4140,6 +4141,10 @@ enum ActorEvent {
     /// Guest side: it is time to try a host that went away again (ADR 0084).
     /// `generation` ties it to the wait that armed it.
     ReconnectWaitTick { generation: u64 },
+    /// Guest side: it is time to dial again for a connect the user still has
+    /// open, after a round of attempts found nothing (ADR 0096).
+    /// `generation` ties it to the retry that armed it.
+    ConnectRetryTick { generation: u64 },
     /// Host side: the reconnect window of a session that dropped has run out
     /// (§10; ADR 0089). `session_id` ties it to the drop that armed it.
     ResumeWindowElapsed { peer: NodeId, session_id: [u8; 16] },
@@ -4689,6 +4694,15 @@ struct Actor {
     /// Monotonic counter naming the most recent wait, so a tick left over
     /// from a cancelled one does not dial a host nobody is waiting for.
     reconnect_wait_generation: u64,
+    /// Guest side: the connect the user has open that is still being dialed
+    /// after a round of attempts came back with nothing (ADR 0096).
+    ///
+    /// One slot for the same reason `connect_peer` is one: this node makes
+    /// one outgoing attempt at a time, and this is the sequence of them.
+    connect_retry: Option<ConnectRetry>,
+    /// Monotonic counter naming the most recent retry, so a tick left over
+    /// from a cancelled or superseded connect dials nothing.
+    connect_retry_generation: u64,
     /// Host side: per guest whose session dropped while granted, the id of the
     /// connection it dropped on, for as long as [`RECONNECT_WINDOW_SECS`]
     /// lets it come back under that id (§10; ADR 0089).
@@ -5006,6 +5020,28 @@ struct ReconnectWait {
     /// which stays [`ConnectPhase::Resuming`] through every attempt so the
     /// window does not flicker back to the connect form between them.
     dialing: bool,
+}
+
+/// Guest side: a connect the user has open that has not reached the host yet
+/// (ADR 0096).
+///
+/// Separate from [`ReconnectWait`], which is ADR 0084's *unasked* dial at a
+/// host that went away and is gated on that host being trusted with a
+/// remembered password. Nothing here is unasked: the user pressed Connect and
+/// is still waiting, so the only thing this decides is whether one round of
+/// [`DIAL_ATTEMPTS`] is the end of that wait. It is not.
+#[derive(Debug, Clone)]
+struct ConnectRetry {
+    /// The host being dialed, from the ticket the user handed in.
+    peer: NodeId,
+    /// The invite code to replay. Held here rather than re-read from the
+    /// history, which has no row for a host this node has never reached.
+    code: String,
+    /// Which retry this is; a tick whose generation no longer matches belongs
+    /// to a connect that has since been cancelled or superseded.
+    generation: u64,
+    /// Rounds of [`DIAL_ATTEMPTS`] already spent, for the backoff.
+    rounds: u32,
 }
 
 /// Everything the obfuscated transport needs across invites on the host side
@@ -8035,6 +8071,9 @@ impl Actor {
             ActorEvent::RebootAttempted { peer, mode, error } => {
                 self.on_reboot_attempted(peer, mode, error.as_deref());
             }
+            ActorEvent::ConnectRetryTick { generation } => {
+                self.on_connect_retry_tick(generation);
+            }
             ActorEvent::ReconnectWaitTick { generation } => {
                 self.on_reconnect_wait_tick(generation);
             }
@@ -8488,6 +8527,11 @@ impl Actor {
         if self.connect_phase == ConnectPhase::Dialing && outcome != ConnectPhase::Connected {
             return;
         }
+        // Whatever this settles on, it is an answer, and ADR 0096's rounds
+        // exist only while there is none. A refusal in particular must stay
+        // put: it is the one outcome that dialing again would only collect
+        // twice.
+        self.stop_connect_retry();
         if outcome == ConnectPhase::Connected {
             self.connect_phase = ConnectPhase::Connected;
             return;
@@ -9694,7 +9738,11 @@ impl Actor {
                     .connection
                     .closed_by_peer_with(lumepeer_net::connection::CLOSE_RESUME_REFUSED)
             });
-        self.settle_connect(peer, ConnectPhase::Failed);
+        let dialing_again = self.connect_is_still_unanswered(peer, was_watching, closed.as_ref())
+            && self.retry_connect_soon(peer);
+        if !dialing_again {
+            self.settle_connect(peer, ConnectPhase::Failed);
+        }
         // `stop_view` is what writes the history row this wait reads its code
         // out of, so the row exists by the time anything below looks for it.
         self.stop_view(peer);
@@ -13041,10 +13089,12 @@ impl Actor {
     /// one (see `03`, task 3, for the sibling case on the view-window side).
     fn on_connect_cancel(&mut self) {
         // The one click that calls off a wait for a host that went away
-        // (ADR 0084). It runs before the early return below, because a wait
-        // between attempts has no connection of its own to cancel and would
-        // otherwise be the one state this button could not reach.
+        // (ADR 0084), and the rounds of ADR 0096's connect retry with it.
+        // Both run before the early return below, because a wait between
+        // attempts has no connection of its own to cancel and would otherwise
+        // be the one state this button could not reach.
         self.stop_reconnect_wait();
+        self.stop_connect_retry();
         let Some(peer) = self.connect_peer.take() else {
             return;
         };
@@ -13422,6 +13472,200 @@ impl Actor {
         true
     }
 
+    /// Guest side: whether a connection that just ended leaves the user's own
+    /// connect still waiting on an answer (ADR 0096).
+    ///
+    /// A link that went away before the host ever decided is not an answer —
+    /// it is the case this was written for, where a host granted a session
+    /// whose grant never arrived and the guest sat out a QUIC idle timeout to
+    /// learn it. That connect goes back to dialing rather than to a failure
+    /// the user can only respond to by pressing the same button again.
+    fn connect_is_still_unanswered(
+        &self,
+        peer: NodeId,
+        was_watching: bool,
+        closed: Option<&ConnectionHandle>,
+    ) -> bool {
+        // A host that closed the connection itself answered, whichever code it
+        // used: it refused, it could not queue the request, or it ended the
+        // session. Only a link that died without a word is worth dialing
+        // again. A session that was running, or a resume, is somebody else's
+        // business (§10; ADR 0084, ADR 0089).
+        if was_watching || closed.is_some_and(|handle| handle.connection.closed_by_peer()) {
+            return false;
+        }
+        // `connect_failure` being set is what keeps a verdict a verdict: a
+        // host that refused the device password leaves the phase pending so
+        // the user can retype, and retrying past that would throw the message
+        // away and ask again with a password already known to be wrong.
+        self.connect_failure.is_none()
+            && self.connect_peer == Some(peer)
+            && self.connect_phase.is_pending()
+            && self.reconnect_wait.is_none()
+            && self
+                .connect_retry
+                .as_ref()
+                .is_some_and(|retry| retry.peer == peer)
+    }
+
+    /// Guest side: what a dial that produced no connection leaves behind.
+    ///
+    /// Three outcomes, and only the last of them is one the user is shown:
+    /// a wait for a host that went away treats the failure as the waiting
+    /// itself (ADR 0084), a round of this side's own silence goes back to
+    /// dialing (ADR 0096), and an answer from the host ends the connect.
+    fn on_dial_failed(&mut self, peer: NodeId, tag: &str, error: &NetError, resuming: bool) {
+        // An attempt that failed while waiting for a host to come back is what
+        // waiting *looks like*, not an outcome to put on screen: the machine is
+        // still restarting, and the next tick will try again (ADR 0084).
+        if self
+            .reconnect_wait
+            .as_ref()
+            .is_some_and(|wait| wait.peer == peer)
+        {
+            tracing::debug!(peer = %tag, %error, "the host is not back yet");
+            self.connect_phase = if resuming {
+                ConnectPhase::Resuming
+            } else {
+                ConnectPhase::WaitingForHost
+            };
+            self.connect_peer = Some(peer);
+            return;
+        }
+        // A round of silence is not an outcome the user can act on, so the
+        // connect keeps dialing instead of ending (ADR 0096). Only an answer
+        // from the host is a verdict, by the same `is_retryable` rule one
+        // round's own retry reads.
+        if is_retryable(error) && self.retry_connect_soon(peer) {
+            tracing::warn!(peer = %tag, %error, "a round of dialing found nothing");
+            return;
+        }
+        // Either the host answered, or there is no open connect left to dial
+        // for. Both end here rather than on a spinner nothing will take down.
+        self.stop_connect_retry();
+        tracing::warn!(peer = %tag, %error, "invite connect failed");
+        self.connect_failure = Some(crate::net_errors::net_error_code(error));
+        self.connect_phase = ConnectPhase::Failed;
+        self.connect_peer = None;
+    }
+
+    /// Guest side: keeps dialing a connect the user has open (ADR 0096).
+    ///
+    /// Entered only from a round of [`DIAL_ATTEMPTS`] that ended in this
+    /// side's own silence — never from an answer. A host that refuses, asks
+    /// for a password this node got wrong, or speaks a protocol this build
+    /// does not is a verdict, and repeating the question only collects the
+    /// same answer again; `is_retryable` is the single rule both this and the
+    /// retry inside one round read.
+    ///
+    /// The phase stays [`ConnectPhase::Dialing`] across rounds. That is the
+    /// point: to the user this is still the one connect they started, its
+    /// Cancel button is still the way out, and `on_connect_cancel` ends this
+    /// with everything else by clearing `connect_peer`.
+    fn retry_connect_soon(&mut self, peer: NodeId) -> bool {
+        // Only ever for the connect the user has open: a peer this node is not
+        // dialing has no code remembered here and nothing to ask again. Saying
+        // so rather than doing nothing is what keeps the caller honest — a
+        // silent no-op here would leave a spinner turning over a connect that
+        // nothing was ever going to dial again.
+        let Some(retry) = self
+            .connect_retry
+            .as_ref()
+            .filter(|retry| retry.peer == peer)
+            .cloned()
+        else {
+            return false;
+        };
+        self.connect_retry_generation = self.connect_retry_generation.wrapping_add(1);
+        let generation = self.connect_retry_generation;
+        let rounds = retry.rounds.saturating_add(1);
+        self.connect_retry = Some(ConnectRetry {
+            generation,
+            rounds,
+            ..retry
+        });
+        self.connect_phase = ConnectPhase::Dialing;
+        self.connect_peer = Some(peer);
+        // Nothing to report: this is a connect still running, not one that
+        // ended. A code left here would put a failure on a screen whose
+        // spinner is still turning.
+        self.connect_failure = None;
+        let after_secs = connect_retry_backoff_secs(rounds);
+        tracing::info!(
+            peer = %self.label_of(&peer),
+            rounds,
+            after_secs,
+            "the host has not answered yet; dialing again"
+        );
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(after_secs)).await;
+            let _ = events
+                .send(ActorEvent::ConnectRetryTick { generation })
+                .await;
+        });
+        true
+    }
+
+    /// Guest side: ends the retry, whether the connect succeeded, was called
+    /// off or moved to another host (ADR 0096).
+    ///
+    /// Bumping the generation is what makes it stick, exactly as it does for
+    /// [`Self::stop_reconnect_wait`]: a tick already armed still fires, finds
+    /// a generation that no longer matches, and dials nothing.
+    fn stop_connect_retry(&mut self) {
+        if self.connect_retry.take().is_some() {
+            self.connect_retry_generation = self.connect_retry_generation.wrapping_add(1);
+        }
+    }
+
+    /// Guest side: one more round of dialing for a connect still open (ADR
+    /// 0096).
+    ///
+    /// Every precondition is re-read rather than remembered from when the
+    /// retry was armed: the user may have cancelled, connected elsewhere, or
+    /// the host may have reached this node first in the meantime, and each of
+    /// those means there is nothing left to dial for.
+    fn on_connect_retry_tick(&mut self, generation: u64) {
+        let Some(retry) = self.connect_retry.clone() else {
+            return;
+        };
+        if retry.generation != generation {
+            return;
+        }
+        // Cancelled, or the form moved to another host. Either way this node
+        // makes one outgoing attempt at a time and that attempt is not this
+        // one any more.
+        if self.connect_peer != Some(retry.peer) {
+            self.stop_connect_retry();
+            return;
+        }
+        // The host reached this node by itself in between, or an attempt from
+        // somewhere else is already in flight. Both are better than what this
+        // would start, and `spawn_dial` would refuse it anyway.
+        if self.connections.contains_key(&retry.peer) {
+            self.stop_connect_retry();
+            return;
+        }
+        // `spawn_dial` refuses to start while the phase says a dial is already
+        // in flight, and the phase has said exactly that since the last round
+        // armed this tick — the spinner never went away, which is the point.
+        // Stepping it back for the length of this call is what lets the next
+        // round actually start. Nothing can observe the gap: the actor handles
+        // one message at a time and this one does not await, so the phase is
+        // `Dialing` again — set by `spawn_dial` or by `retry_connect_soon` —
+        // before anything else can read it.
+        self.connect_phase = ConnectPhase::Idle;
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial(&retry.code) {
+            // Nothing to escalate: a dial that will not start now is one this
+            // tick's successor starts instead.
+            tracing::debug!(%error, "the connect could not be dialed again yet");
+            if !self.retry_connect_soon(retry.peer) {
+                self.settle_connect(retry.peer, ConnectPhase::Failed);
+            }
+        }
+    }
+
     /// Wakes the actor when the next attempt is due (ADR 0084).
     fn arm_reconnect_wait(&self, generation: u64, after_secs: u64) {
         let events = self.events_tx.clone();
@@ -13740,6 +13984,30 @@ impl Actor {
         } else {
             self.connect_phase = ConnectPhase::Dialing;
         }
+        // The code of the connect now in flight, so every later round of it
+        // has something to replay (ADR 0096). A dial at a different host
+        // replaces it outright: this node makes one outgoing attempt at a
+        // time, and the rounds already spent belong to the host that is being
+        // left behind.
+        //
+        // Not for a dial `ReconnectWait` started, whether it is resuming a
+        // session or waiting out a reboot (§10; ADR 0084, ADR 0089). That is
+        // its own sequence of attempts, with its own ceiling and its own
+        // reasons to stop, and two sequences dialing one `connect_phase`
+        // would each undo the other's bookkeeping.
+        if resume.is_none() && self.reconnect_wait.is_none() {
+            let rounds = self
+                .connect_retry
+                .as_ref()
+                .filter(|retry| retry.peer == addr.id)
+                .map_or(0, |retry| retry.rounds);
+            self.connect_retry = Some(ConnectRetry {
+                peer: addr.id,
+                code: raw.to_owned(),
+                generation: self.connect_retry_generation,
+                rounds,
+            });
+        }
         self.connect_peer = Some(addr.id);
         self.connect_failure = None;
         // A previous attempt that never reached a grant or a refusal — the
@@ -13812,28 +14080,7 @@ impl Actor {
                 return;
             }
             Err(error) => {
-                // An attempt that failed while waiting for a host to come back
-                // is what waiting *looks like*, not an outcome to put on
-                // screen: the machine is still restarting, and the next tick
-                // will try again (ADR 0084).
-                if self
-                    .reconnect_wait
-                    .as_ref()
-                    .is_some_and(|wait| wait.peer == peer)
-                {
-                    tracing::debug!(peer = %tag, %error, "the host is not back yet");
-                    self.connect_phase = if resuming {
-                        ConnectPhase::Resuming
-                    } else {
-                        ConnectPhase::WaitingForHost
-                    };
-                    self.connect_peer = Some(peer);
-                    return;
-                }
-                tracing::warn!(peer = %tag, %error, "invite connect failed");
-                self.connect_failure = Some(crate::net_errors::net_error_code(&error));
-                self.connect_phase = ConnectPhase::Failed;
-                self.connect_peer = None;
+                self.on_dial_failed(peer, &tag, &error, resuming);
                 return;
             }
         };
@@ -14877,6 +15124,18 @@ struct DialOutcome {
     result: Result<ControlConnection, NetError>,
 }
 
+/// Pause before the `rounds`-th round of dialing one connect (ADR 0096).
+///
+/// Doubles from [`CONNECT_RETRY_BACKOFF_SECS`] and stops at
+/// [`CONNECT_RETRY_BACKOFF_CEILING_SECS`]: a host that is a moment away is
+/// found in seconds, and one that is an hour away costs a probe every half
+/// minute rather than a spin.
+fn connect_retry_backoff_secs(rounds: u32) -> u64 {
+    CONNECT_RETRY_BACKOFF_SECS
+        .saturating_mul(1_u64 << rounds.saturating_sub(1).min(16))
+        .min(CONNECT_RETRY_BACKOFF_CEILING_SECS)
+}
+
 /// Whether a failed attempt is worth another one (ADR 0050).
 ///
 /// This side's own observation that nothing answered, or that a stream
@@ -15368,6 +15627,8 @@ pub fn spawn_actor_with(
         reboot_generation: 0,
         reconnect_wait: None,
         reconnect_wait_generation: 0,
+        connect_retry: None,
+        connect_retry_generation: 0,
         parked_sessions: std::collections::HashMap::new(),
         terminal_to_host: std::collections::HashMap::new(),
         terminals: std::collections::HashMap::new(),
@@ -15599,6 +15860,33 @@ mod tests {
             assert!(order.contains(&TransportKind::Iroh));
             assert!(order.contains(&TransportKind::Obfuscated));
         }
+    }
+
+    /// ADR 0096: the pause between rounds grows, so a host that is a moment
+    /// away is found in seconds and one that is an hour away costs a probe
+    /// every half minute instead of a spin.
+    #[test]
+    fn the_connect_retry_backoff_doubles_up_to_its_ceiling() {
+        assert_eq!(connect_retry_backoff_secs(1), CONNECT_RETRY_BACKOFF_SECS);
+        assert_eq!(connect_retry_backoff_secs(2), CONNECT_RETRY_BACKOFF_SECS * 2);
+        assert_eq!(connect_retry_backoff_secs(3), CONNECT_RETRY_BACKOFF_SECS * 4);
+        for rounds in 4..1_000 {
+            assert_eq!(
+                connect_retry_backoff_secs(rounds),
+                CONNECT_RETRY_BACKOFF_CEILING_SECS,
+                "round {rounds} must sit on the ceiling, never past it"
+            );
+        }
+        // The shift is bounded rather than trusted: a round count this large
+        // is not reachable in practice, and the arithmetic still has to be
+        // total rather than wrap or panic (§2.4).
+        assert_eq!(
+            connect_retry_backoff_secs(u32::MAX),
+            CONNECT_RETRY_BACKOFF_CEILING_SECS
+        );
+        // Round zero never happens — `retry_connect_soon` adds one before
+        // asking — but the floor has to hold anyway.
+        assert_eq!(connect_retry_backoff_secs(0), CONNECT_RETRY_BACKOFF_SECS);
     }
 
     /// gap-tasks/23 task 1: the attempts of ADR 0050 are *divided* between the

@@ -186,6 +186,24 @@ impl PeerConnection {
         )
     }
 
+    /// Whether the far side closed this connection deliberately, whichever
+    /// code it used (§18).
+    ///
+    /// The distinction a guest needs after a connection it was waiting on
+    /// ends: a peer that closed said something — it refused, it could not
+    /// queue the request, it ended the session — and asking again only
+    /// collects the same answer. A link that timed out, was reset, or failed
+    /// at the transport said nothing at all, and is worth dialing again
+    /// (ADR 0096). `false` while the connection is live and for this side's
+    /// own close.
+    #[must_use]
+    pub fn closed_by_peer(&self) -> bool {
+        matches!(
+            self.close_reason(),
+            Some(ConnectionError::ApplicationClosed(_))
+        )
+    }
+
     /// Why the connection closed, or `None` while it is still live.
     #[must_use]
     pub fn close_reason(&self) -> Option<ConnectionError> {
