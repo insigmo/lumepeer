@@ -103,6 +103,8 @@ export const zh: Dictionary = {
   'system.language.systemDefault': '系统默认',
   'status.clipboardSynced': '剪贴板已同步',
   'status.reconnect': '重新连接',
+  'status.reconnectTerminal': '连接到终端',
+  'status.reconnectTerminal.needsFullControl': '只有授予完全控制的主机才能打开 shell。',
   'history.remove': '移除',
   'history.remove.confirm': (name) => `要将 ${name} 从连接列表中移除吗？为其保存的密码也会一并删除。`,
   'history.forgetPassword': '忘记密码',

@@ -105,6 +105,9 @@ export const fr: Dictionary = {
   'system.language.systemDefault': 'Selon le système',
   'status.clipboardSynced': 'Presse-papiers synchronisé',
   'status.reconnect': 'Se reconnecter',
+  'status.reconnectTerminal': 'Se connecter au terminal',
+  'status.reconnectTerminal.needsFullControl':
+    'Seul un hôte ayant accordé le contrôle total permet d’ouvrir un shell.',
   'history.remove': 'Supprimer',
   'history.remove.confirm': (name) =>
     `Supprimer ${name} de la liste des connexions ? Tout mot de passe enregistré pour cet appareil sera aussi supprimé.`,

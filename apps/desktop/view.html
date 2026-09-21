@@ -141,6 +141,15 @@
       #terminal-panel[hidden] {
         display: none;
       }
+      /* A window with no picture in it: the shell is the window (ADR 0101).
+         Set on `#view` by `view.ts` when the actor opened this window for a
+         terminal, so the panel is not a strip along the bottom of a black
+         rectangle nobody is drawing into. */
+      #view.is-terminal-only #terminal-panel {
+        inset: 0;
+        height: auto;
+        background: rgb(0 0 0 / 100%);
+      }
       #terminal-screen {
         flex: 1;
         min-height: 0;

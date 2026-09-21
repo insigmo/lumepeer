@@ -985,7 +985,21 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// them). The window needs both: every IPC command names the session by
     /// `peer_label`, and the picture it keeps for the connection list has to
     /// be findable tomorrow, under the only name that survives a restart.
-    fn open(&self, label: &str, peer_label: &str, host_label: &str, input: bool);
+    ///
+    /// `terminal_only` is a window with a shell in it and no picture at all
+    /// (ADR 0101) — the same session and the same role, opened by a guest
+    /// that never dialled `rd/media/1`. It arrives here rather than being
+    /// inferred from `input` because the two are independent: a screen
+    /// session may be granted no input, and a terminal one is never given
+    /// any.
+    fn open(
+        &self,
+        label: &str,
+        peer_label: &str,
+        host_label: &str,
+        input: bool,
+        terminal_only: bool,
+    );
     /// Closes the view window `label`, if it is open.
     fn close(&self, label: &str);
     /// Host side: puts the always-on-top session bar up, or takes it down.
@@ -1041,7 +1055,14 @@ pub struct DetachedViewWindows;
 
 #[cfg(test)]
 impl ViewWindows for DetachedViewWindows {
-    fn open(&self, label: &str, _peer_label: &str, _host_label: &str, _input: bool) {
+    fn open(
+        &self,
+        label: &str,
+        _peer_label: &str,
+        _host_label: &str,
+        _input: bool,
+        _terminal_only: bool,
+    ) {
         tracing::debug!(window = %label, "no webview attached: not opening a view window");
     }
 

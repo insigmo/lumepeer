@@ -33,6 +33,7 @@ function toolbarHooks(): ToolbarHooks {
     filesAvailable: () => true,
     toggleTerminal: () => false,
     terminalVisible: () => false,
+    terminalOnly: () => false,
     displayMode: () => 'fit',
     setDisplayMode: () => {},
     zoomPercent: () => 100,

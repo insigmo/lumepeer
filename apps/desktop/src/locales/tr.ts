@@ -105,6 +105,9 @@ export const tr: Dictionary = {
   'system.language.systemDefault': 'Sistem varsayılanı',
   'status.clipboardSynced': 'Pano eşitlendi',
   'status.reconnect': 'Yeniden bağlan',
+  'status.reconnectTerminal': 'Terminale bağlan',
+  'status.reconnectTerminal.needsFullControl':
+    'Kabuk yalnızca tam kontrol veren bir ana makinede açılabilir.',
   'history.remove': 'Kaldır',
   'history.remove.confirm': (name) =>
     `${name} bağlantı listesinden kaldırılsın mı? Onun için kaydedilmiş parola da silinir.`,

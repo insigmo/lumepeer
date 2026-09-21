@@ -1084,6 +1084,11 @@ enum ActorCommand {
     /// history row kept. The code never leaves the Rust side (§13).
     HistoryConnect {
         label: String,
+        /// Whether this connect is for a shell and nothing else (ADR 0101).
+        /// The session and the role are the ordinary ones; what changes is
+        /// that the guest never dials `rd/media/1`, so the host never builds
+        /// an encoder, reads a frame or puts a picture on the wire.
+        terminal_only: bool,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Guest side: forget a remembered host (docs/bugs/03-connection-list.md,
@@ -1569,10 +1574,18 @@ impl ActorHandle {
     /// [`ActorError::UnknownPeer`] if no history row carries that label;
     /// [`ActorError::Net`] if the remembered invite no longer works or the
     /// dial fails; [`ActorError::ChannelClosed`] if the actor is gone.
-    pub async fn history_connect(&self, label: String) -> Result<(), ActorError> {
+    pub async fn history_connect(
+        &self,
+        label: String,
+        terminal_only: bool,
+    ) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(ActorCommand::HistoryConnect { label, reply })
+            .send(ActorCommand::HistoryConnect {
+                label,
+                terminal_only,
+                reply,
+            })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -3960,7 +3973,13 @@ struct ViewState {
     /// picture says so on the *control* stream, which only the actor reads
     /// (docs/adr/0024).
     slot_tx: Arc<watch::Sender<ViewSlot>>,
-    task: tokio::task::JoinHandle<()>,
+    /// The `rd/media/1` receive task, or `None` for a terminal session, which
+    /// has no media connection to receive over (ADR 0101).
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether this window is a shell and nothing else (ADR 0101). Read by
+    /// the reconnect wait, so a session that drops comes back as the kind it
+    /// was rather than as a screen one.
+    terminal_only: bool,
     /// The media connection the picture rides. Written by the media task
     /// once dialed, read by the mic toggle; `None` until the first dial
     /// lands and after the media task ends.
@@ -5025,6 +5044,17 @@ struct Actor {
     /// submitting the form. The connect form uses this to keep the modal from
     /// flashing open for a host it already knows the password to.
     connect_credentials_auto: bool,
+    /// Guest side: hosts this node is dialing for a shell and nothing else
+    /// (ADR 0101).
+    ///
+    /// Written where the dial starts, read once by `start_view` when the host
+    /// grants — the intent has to survive the handshake, and the handshake is
+    /// several actor turns long. A set rather than a flag because a dial in
+    /// flight and a session being resumed are two different peers as far as
+    /// this is concerned; emptied by `stop_view` and by a connect that ends
+    /// without a session, so a later ordinary Connect to the same host is an
+    /// ordinary one.
+    pending_terminal_only: std::collections::HashSet<NodeId>,
     /// Whether this process holds the machine's host role and may admit
     /// guests at all (ADR 0085 §4).
     ///
@@ -5084,6 +5114,14 @@ struct ReconnectWait {
     /// which stays [`ConnectPhase::Resuming`] through every attempt so the
     /// window does not flicker back to the connect form between them.
     dialing: bool,
+    /// Whether the session that went away was a shell and nothing else
+    /// (ADR 0101).
+    ///
+    /// Carried here because `stop_view` has already taken the intent out of
+    /// `pending_terminal_only` by the time this wait is armed, and a session
+    /// that came back as a screen one would start an encode loop on the host
+    /// that nobody asked for.
+    terminal_only: bool,
 }
 
 /// Guest side: a connect the user has open that has not reached the host yet
@@ -8456,7 +8494,9 @@ impl Actor {
             return;
         }
         tracing::warn!(peer = %tag, ?reason, "the host cannot produce a picture for this session");
-        state.task.abort();
+        if let Some(task) = state.task.as_ref() {
+            task.abort();
+        }
         let status = ViewStatus::from(reason);
         state.slot_tx.send_modify(|slot| slot.status = status);
     }
@@ -8523,10 +8563,15 @@ impl Actor {
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
             return;
         }
-        let Some(dialer) = self.host_dialers.get(&peer).cloned() else {
+        // The one read of what the dial asked for (ADR 0101). Taken rather
+        // than copied: the intent belongs to this window from here on, and a
+        // later Connect to the same host must start from nothing.
+        let terminal_only = self.pending_terminal_only.remove(&peer);
+        let dialer = self.host_dialers.get(&peer).cloned();
+        if dialer.is_none() && !terminal_only {
             tracing::warn!(peer = %tag, "no remembered address for this host: cannot open media");
             return;
-        };
+        }
 
         let label = window_label(&tag);
         let (slot_tx, slot_rx) = watch::channel(ViewSlot::waiting());
@@ -8540,18 +8585,28 @@ impl Actor {
         let media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>> =
             Arc::new(std::sync::Mutex::new(None));
         let bitstream = Arc::new(BitstreamFeed::default());
-        let task = spawn_media_receiver(
-            MediaTarget {
-                dialer,
-                peer,
-                reports: self.reports_tx.clone(),
-                tag: tag.clone(),
-                worker: None,
-                bitstream: Arc::clone(&bitstream),
-                connection_cell: Arc::clone(&media_connection),
-            },
-            Arc::clone(&slot_tx),
-        );
+        // A terminal session dials nothing here, and that is the whole
+        // mechanism: the host starts its encode loop when it accepts
+        // `rd/media/1` and at no other moment, and only that loop ever reads
+        // a frame — so a guest that never opens the connection is a host that
+        // encodes nothing (ADR 0101). The slot below stays at
+        // `ViewSlot::waiting()` for the life of the window, which the frame
+        // poll answers with no picture.
+        let task = match dialer {
+            Some(dialer) if !terminal_only => Some(spawn_media_receiver(
+                MediaTarget {
+                    dialer,
+                    peer,
+                    reports: self.reports_tx.clone(),
+                    tag: tag.clone(),
+                    worker: None,
+                    bitstream: Arc::clone(&bitstream),
+                    connection_cell: Arc::clone(&media_connection),
+                },
+                Arc::clone(&slot_tx),
+            )),
+            _ => None,
+        };
         let input = Arc::new(AtomicBool::new(grants.input));
         // Starts false and only the host can raise it: a view window claims a
         // recording is running because the host said so, never because this
@@ -8606,10 +8661,20 @@ impl Actor {
                 slot_tx,
                 task,
                 media_connection,
+                terminal_only,
             },
         );
-        self.windows
-            .open(&label, &tag, &host_tag(&peer), grants.input);
+        // `input: false` for a terminal session even under full control: the
+        // window has no picture to map a pointer onto, and the grab of
+        // ADR 0090 would take this desktop's chords away from the person
+        // using it for a window that has nothing to send them to (ADR 0101).
+        self.windows.open(
+            &label,
+            &tag,
+            &host_tag(&peer),
+            grants.input && !terminal_only,
+            terminal_only,
+        );
         self.rebuild_labels_and_snapshot();
         // A fresh entry in `self.views` is one of the two reasons the
         // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
@@ -8627,6 +8692,10 @@ impl Actor {
     /// and it is written on the side that dialed rather than the side that was
     /// dialed.
     fn stop_view(&mut self, peer: NodeId) {
+        // Whether or not a view was open: a dial that never reached one has
+        // an intent recorded against it, and this is one of the two places
+        // that ends (ADR 0101).
+        self.pending_terminal_only.remove(&peer);
         let Some(state) = self.views.remove(&peer) else {
             return;
         };
@@ -8639,8 +8708,10 @@ impl Actor {
             .remove(&self.label_of(&peer));
         // Dropping the receiver already tells the media task to stop; aborting
         // makes sure a decoder does not outlive the session it belonged to
-        // (§8.1).
-        state.task.abort();
+        // (§8.1). A terminal session never had one (ADR 0101).
+        if let Some(task) = state.task.as_ref() {
+            task.abort();
+        }
         drop(state.slot);
         self.windows.close(&state.label);
         if let Some(code) = self.host_invites.get(&peer).cloned() {
@@ -8717,6 +8788,9 @@ impl Actor {
             self.connect_phase = ConnectPhase::Connected;
             return;
         }
+        // No session came of this dial, so neither does the kind of session it
+        // was asking for (ADR 0101).
+        self.pending_terminal_only.remove(&peer);
         self.connect_phase = if self.connect_phase.is_pending() {
             outcome
         } else {
@@ -9905,6 +9979,13 @@ impl Actor {
         // that revoked, or a window the user closed, is not — both of those
         // close the view first and leave nothing here to arm on (ADR 0084).
         let was_watching = self.views.contains_key(&peer);
+        // Read here for the same reason `was_watching` is: `stop_view` below
+        // takes the view away, and the wait armed after it has to know which
+        // kind of session to bring back (ADR 0101).
+        let was_terminal_only = self
+            .views
+            .get(&peer)
+            .is_some_and(|state| state.terminal_only);
         // A connection that ends before it was ever granted, while this node
         // was resuming over it, is the host saying no (ADR 0089): it closes a
         // claim it will not honour instead of asking anyone.
@@ -9937,7 +10018,7 @@ impl Actor {
                 .filter(|handle| handle.peer_minor >= SESSION_RESUME_MINOR)
                 .map(|handle| handle.session_id);
             if resume.is_some() || self.may_auto_reconnect(&host_tag) {
-                self.start_reconnect_wait(peer, host_tag, resume);
+                self.start_reconnect_wait(peer, host_tag, resume, was_terminal_only);
             }
         } else if resume_refused {
             self.on_resume_refused(peer);
@@ -9998,9 +10079,13 @@ impl Actor {
                     .collect();
                 let _ = reply.send(rows);
             }
-            ActorCommand::HistoryConnect { label, reply } => {
+            ActorCommand::HistoryConnect {
+                label,
+                terminal_only,
+                reply,
+            } => {
                 let result = match self.history.code_of(&label).map(ToOwned::to_owned) {
-                    Some(code) => self.spawn_dial(&code),
+                    Some(code) => self.spawn_dial_as(&code, None, terminal_only),
                     None => Err(ActorError::UnknownPeer),
                 };
                 if let Err(ActorError::Net(ref error)) = result {
@@ -13293,6 +13378,7 @@ impl Actor {
         self.connect_retry_secs = None;
         self.pending_remember = None;
         self.connect_credentials_auto = false;
+        self.pending_terminal_only.remove(&peer);
     }
 
     /// Guest side: answers the host's credential challenge (§8; ADR 0033).
@@ -13538,7 +13624,13 @@ impl Actor {
     /// [`RESUME_RETRY_SECS`] for as long as the window lasts (§10; ADR 0089).
     /// Those attempts are not new sessions, so they are what the window is
     /// for rather than a race with it.
-    fn start_reconnect_wait(&mut self, peer: NodeId, host_tag: String, resume: Option<[u8; 16]>) {
+    fn start_reconnect_wait(
+        &mut self,
+        peer: NodeId,
+        host_tag: String,
+        resume: Option<[u8; 16]>,
+        terminal_only: bool,
+    ) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
         self.reconnect_wait = Some(ReconnectWait {
@@ -13548,6 +13640,7 @@ impl Actor {
             generation,
             resume,
             dialing: false,
+            terminal_only,
         });
         self.connect_phase = if resume.is_some() {
             ConnectPhase::Resuming
@@ -13646,7 +13739,9 @@ impl Actor {
             }
             return true;
         };
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, wait.resume) {
+        if let Err(ActorError::Net(ref error)) =
+            self.spawn_dial_as(&code, wait.resume, wait.terminal_only)
+        {
             tracing::debug!(%error, "the host is not reachable yet");
         }
         self.arm_reconnect_wait(wait.generation, RESUME_RETRY_SECS);
@@ -13837,7 +13932,12 @@ impl Actor {
         // `Dialing` again — set by `spawn_dial` or by `retry_connect_soon` —
         // before anything else can read it.
         self.connect_phase = ConnectPhase::Idle;
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial(&retry.code) {
+        // The round before it asked for a shell, so this one does too: the
+        // rounds of ADR 0096 are one connect, not several (ADR 0101).
+        let terminal_only = self.pending_terminal_only.contains(&retry.peer);
+        if let Err(ActorError::Net(ref error)) =
+            self.spawn_dial_as(&retry.code, None, terminal_only)
+        {
             // Nothing to escalate: a dial that will not start now is one this
             // tick's successor starts instead.
             tracing::debug!(%error, "the connect could not be dialed again yet");
@@ -13947,7 +14047,8 @@ impl Actor {
         };
         // A dial that fails here is the ordinary case, not an error: the host
         // is mid-restart and not listening yet. The next tick tries again.
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial(&code) {
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, None, wait.terminal_only)
+        {
             tracing::debug!(%error, "the host is still away");
         }
         self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
@@ -14117,12 +14218,18 @@ impl Actor {
     /// window's frame poll. That is the "the app freezes and then says it
     /// could not connect" report this fixes.
     fn spawn_dial(&mut self, raw: &str) -> Result<(), ActorError> {
-        self.spawn_dial_as(raw, None)
+        self.spawn_dial_as(raw, None, false)
     }
 
     /// [`Self::spawn_dial`], resuming the session `resume` names when it names
-    /// one (§10; ADR 0089).
-    fn spawn_dial_as(&mut self, raw: &str, resume: Option<[u8; 16]>) -> Result<(), ActorError> {
+    /// one (§10; ADR 0089), and asking for a shell rather than a screen when
+    /// `terminal_only` is set (ADR 0101).
+    fn spawn_dial_as(
+        &mut self,
+        raw: &str,
+        resume: Option<[u8; 16]>,
+        terminal_only: bool,
+    ) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
         let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
         // Dialing a host this node is already talking to would replace the live
@@ -14198,6 +14305,15 @@ impl Actor {
         // task 6).
         self.pending_remember = None;
         self.connect_credentials_auto = false;
+        // What kind of session this dial is asking for, kept until the host
+        // grants and `start_view` reads it (ADR 0101). Cleared rather than
+        // left alone when it is not set: an ordinary Connect to a host this
+        // node opened a shell on earlier must be an ordinary session.
+        if terminal_only {
+            self.pending_terminal_only.insert(addr.id);
+        } else {
+            self.pending_terminal_only.remove(&addr.id);
+        }
 
         let tx = self.events_tx.clone();
         let tag = self.label_of(&addr.id);
@@ -15915,6 +16031,7 @@ pub fn spawn_actor_with(
         remembered_passwords,
         pending_remember: None,
         connect_credentials_auto: false,
+        pending_terminal_only: std::collections::HashSet::new(),
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -16823,7 +16940,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, applied)
     }
 
@@ -16855,7 +16972,7 @@ mod tests {
     /// of a grant can be asserted without a Tauri runtime.
     #[derive(Debug, Default)]
     struct RecordingWindows {
-        opened: std::sync::Mutex<Vec<(String, String, bool)>>,
+        opened: std::sync::Mutex<Vec<(String, String, bool, bool)>>,
         closed: std::sync::Mutex<Vec<String>>,
         host_bar: std::sync::atomic::AtomicBool,
         /// Whether this stand-in claims somebody is in front of the host
@@ -16880,7 +16997,10 @@ mod tests {
             windows
         }
 
-        fn opened(&self) -> Vec<(String, String, bool)> {
+        /// Every `open` this stand-in was asked for: window label, peer
+        /// label, whether the window was armed for input, and whether it is a
+        /// terminal-only window (ADR 0101).
+        fn opened(&self) -> Vec<(String, String, bool, bool)> {
             self.opened.lock().unwrap().clone()
         }
 
@@ -16894,11 +17014,20 @@ mod tests {
     }
 
     impl ViewWindows for RecordingWindows {
-        fn open(&self, label: &str, peer_label: &str, _host_label: &str, input: bool) {
-            self.opened
-                .lock()
-                .unwrap()
-                .push((label.to_owned(), peer_label.to_owned(), input));
+        fn open(
+            &self,
+            label: &str,
+            peer_label: &str,
+            _host_label: &str,
+            input: bool,
+            terminal_only: bool,
+        ) {
+            self.opened.lock().unwrap().push((
+                label.to_owned(),
+                peer_label.to_owned(),
+                input,
+                terminal_only,
+            ));
         }
 
         fn close(&self, label: &str) {
@@ -17059,7 +17188,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
 
         ClipboardPair {
             host,
@@ -18045,7 +18174,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, host_clipboard)
     }
 
@@ -18082,7 +18211,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, host_capture)
     }
 
@@ -20244,7 +20373,7 @@ mod tests {
         // Nothing is retyped: the row carries the code, and the code stays in
         // Rust — the caller only names the host.
         guest
-            .history_connect(remembered[0].peer_label.clone())
+            .history_connect(remembered[0].peer_label.clone(), false)
             .await
             .unwrap();
 
@@ -20262,10 +20391,108 @@ mod tests {
 
         assert!(
             matches!(
-                guest.history_connect("no-such-host".to_owned()).await,
+                guest
+                    .history_connect("no-such-host".to_owned(), false)
+                    .await,
                 Err(ActorError::UnknownPeer)
             ),
             "a label that names no remembered host must dial nothing"
+        );
+    }
+
+    /// ADR 0101: connecting to a remembered host "for the terminal" is the
+    /// same session and the same role — what changes is that the guest opens
+    /// no media connection, so the host encodes nothing and the window it
+    /// gets is a shell with no picture behind it.
+    ///
+    /// The ordinary session at the top is what makes the second half mean
+    /// anything: it proves this pair does reach the host's capture when a
+    /// guest asks for a picture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_only_connect_opens_a_window_with_no_media_under_it() {
+        let (host, _host_endpoint, host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        // One ordinary session first, because the remembered row this feature
+        // hangs off is written when a view closes.
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        wait_until("the ordinary session never became a viewer", || {
+            viewers(&host_capture) == 1
+        })
+        .await;
+
+        host.revoke(label).await.unwrap();
+        let remembered = wait_for_history(&guest, "nothing to reconnect to").await;
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+        wait_until("the revoked session is still capturing", || {
+            viewers(&host_capture) == 0
+        })
+        .await;
+
+        guest
+            .history_connect(remembered[0].peer_label.clone(), true)
+            .await
+            .unwrap();
+        let again = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("a terminal connect asks for consent like any other");
+        host.grant(again, Role::FullControl).await.unwrap();
+
+        wait_until("the terminal window was never opened", || {
+            recorder.opened().len() == 2
+        })
+        .await;
+        let (_window, peer_label, input, terminal_only) = recorder.opened().remove(1);
+        assert!(
+            terminal_only,
+            "the window the actor asked for is the terminal one"
+        );
+        assert!(
+            !input,
+            "a terminal window arms no keyboard grab, full control or not"
+        );
+
+        // Long enough that a media receiver, had one been spawned, would have
+        // dialled: the ordinary session above landed its own well inside this.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The session itself is an ordinary full-control one — this side's
+        // own input gate reads the session's grant and lets an event through…
+        guest
+            .input(peer_label.clone(), pointer_event(1, 2))
+            .await
+            .unwrap();
+        // …and yet there is no media connection under it, which is the whole
+        // of the feature. The guest's microphone rides the connection the
+        // picture dialled (§4.1; ADR 0028), so "no connection to ride" is
+        // exactly what a refused mic press reports here, and nothing will
+        // ever open one: this view has no media task at all (ADR 0101).
+        assert!(
+            matches!(
+                guest.mic_toggle(peer_label, true).await,
+                Err(ActorError::UnknownPeer)
+            ),
+            "a terminal session has no media connection for anything to ride"
+        );
+
+        // What is *not* claimed, written down where it cannot rot: the host
+        // still registers a viewer at the grant, because a guest's intent
+        // never reaches the wire and adding a message for it would be a
+        // protocol change (ADR 0101). Its capture backend is therefore
+        // started — but nothing reads a frame out of it, because only the
+        // encode loop does and only an accepted `rd/media/1` starts one.
+        assert_eq!(
+            viewers(&host_capture),
+            1,
+            "the grant is what registers a viewer, terminal session or not"
         );
     }
 
@@ -20957,7 +21184,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (window_label, peer_label, input) = recorder.opened().remove(0);
+        let (window_label, peer_label, input, _terminal_only) = recorder.opened().remove(0);
         assert_eq!(window_label, crate::view::window_label(&peer_label));
         assert!(input, "FullControl carries a live input grant");
 
@@ -21021,7 +21248,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, _input) = recorder.opened().remove(0);
+        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
 
         // Well inside `RECONNECT_WINDOW_SECS`, which is what the guest used to
         // spend waiting before being told the wrong thing.
@@ -21086,7 +21313,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, input) = recorder.opened().remove(0);
+        let (_window, peer_label, input, _terminal_only) = recorder.opened().remove(0);
         assert!(input, "FullControl carries a live input grant");
 
         // The same grant that carries an ordinary keystroke carries this one.
@@ -21117,7 +21344,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, _input) = recorder.opened().remove(0);
+        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
         assert!(matches!(
             guest.sas_request(peer_label).await,
             Err(ActorError::Core(CoreError::NotPermitted))
@@ -21144,7 +21371,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, input) = recorder.opened().remove(0);
+        let (_window, peer_label, input, _terminal_only) = recorder.opened().remove(0);
         assert!(!input, "ViewOnly must never imply input (§2.2, §8.2)");
         assert!(matches!(
             guest.input(peer_label.clone(), pointer_event(3, 4)).await,

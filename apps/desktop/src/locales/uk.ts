@@ -105,6 +105,9 @@ export const uk: Dictionary = {
   'system.language.systemDefault': 'Як у системі',
   'status.clipboardSynced': 'Буфер обміну синхронізовано',
   'status.reconnect': 'Підключитися знову',
+  'status.reconnectTerminal': 'Підключитися до термінала',
+  'status.reconnectTerminal.needsFullControl':
+    'Оболонку можна відкрити лише на хості, який дав повний доступ.',
   'history.remove': 'Видалити',
   'history.remove.confirm': (name) =>
     `Видалити ${name} зі списку підключень? Збережений для нього пароль також буде видалено.`,

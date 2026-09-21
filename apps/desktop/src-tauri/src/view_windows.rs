@@ -42,13 +42,21 @@ impl TauriViewWindows {
 }
 
 impl ViewWindows for TauriViewWindows {
-    fn open(&self, label: &str, peer_label: &str, host_label: &str, input: bool) {
+    fn open(
+        &self,
+        label: &str,
+        peer_label: &str,
+        host_label: &str,
+        input: bool,
+        terminal_only: bool,
+    ) {
         // Only pseudonymized labels ever reach a URL (§15), and both are hex
         // — `peer_tag` for the session, `host_tag` for the remembered host —
         // so there is nothing to escape.
         let url = format!(
-            "view.html?peer={peer_label}&host={host_label}&input={}",
-            u8::from(input)
+            "view.html?peer={peer_label}&host={host_label}&input={}&terminal={}",
+            u8::from(input),
+            u8::from(terminal_only)
         );
         let label = label.to_owned();
         let peer = peer_label.to_owned();
@@ -61,7 +69,11 @@ impl ViewWindows for TauriViewWindows {
                 label.clone(),
                 tauri::WebviewUrl::App(url.into()),
             )
-            .title("Lumepeer — remote screen")
+            .title(if terminal_only {
+                "Lumepeer — remote terminal"
+            } else {
+                "Lumepeer — remote screen"
+            })
             .inner_size(VIEW_WINDOW_WIDTH, VIEW_WINDOW_HEIGHT)
             .resizable(true)
             .build();

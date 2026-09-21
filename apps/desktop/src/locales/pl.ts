@@ -105,6 +105,9 @@ export const pl: Dictionary = {
   'system.language.systemDefault': 'Domyślny systemowy',
   'status.clipboardSynced': 'Schowek zsynchronizowany',
   'status.reconnect': 'Połącz ponownie',
+  'status.reconnectTerminal': 'Połącz z terminalem',
+  'status.reconnectTerminal.needsFullControl':
+    'Powłokę można otworzyć tylko na hoście, który dał pełną kontrolę.',
   'history.remove': 'Usuń',
   'history.remove.confirm': (name) =>
     `Usunąć ${name} z listy połączeń? Hasło zapisane dla tego urządzenia również zostanie usunięte.`,

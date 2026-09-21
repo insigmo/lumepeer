@@ -54,6 +54,7 @@ describe('remembered-host row', () => {
     );
     const menu = container.querySelector('.history-row .peer-menu-list');
     expect(menu?.querySelector('.peer-menu-connect')).not.toBeNull();
+    expect(menu?.querySelector('[data-testid="history-connect-terminal"]')).not.toBeNull();
     expect(menu?.querySelector('[data-testid="history-auto-reconnect"]')).not.toBeNull();
     expect(menu?.querySelector('.history-forget-password')).not.toBeNull();
     expect(menu?.querySelector('.history-remove')).not.toBeNull();
@@ -225,5 +226,53 @@ describe('remembered-host row', () => {
       expect.stringContaining('host-cd34'),
     ]);
     expect(new Set(labels).size).toBe(2);
+  });
+
+  // ADR 0101. A shell is carried by the `terminal` grant, which rides
+  // `Role::FullControl` alone, and the role comes from the code the host
+  // handed out — the guest does not pick it. Offering the item on a row that
+  // could only ever be refused would be offering work that cannot be done.
+  it('offers the terminal only for a host that granted full control', () => {
+    render_();
+    const item = container.querySelector<HTMLButtonElement>(
+      '[data-testid="history-connect-terminal"]',
+    );
+    expect(item).not.toBeNull();
+    expect(item?.disabled).toBe(true);
+    expect(item?.getAttribute('title')).not.toBe('');
+  });
+
+  it('enables the terminal item for a full-control host and asks for a shell', () => {
+    const onReconnect = vi.fn();
+    render(
+      sessionStatus([], 'en', () => {}, [{ ...ENTRY, role: 'full_control' }], onReconnect),
+      container,
+    );
+    const item = container.querySelector<HTMLButtonElement>(
+      '[data-testid="history-connect-terminal"]',
+    );
+    expect(item?.disabled).toBe(false);
+    item?.click();
+    // The second argument is the whole difference from "Connect again": the
+    // same host, the same role, dialled without the media connection.
+    expect(onReconnect).toHaveBeenCalledWith('host-ab12', true);
+  });
+
+  it('keeps the terminal item out of reach while a connect is already in flight', () => {
+    render(
+      sessionStatus(
+        [],
+        'en',
+        () => {},
+        [{ ...ENTRY, role: 'full_control' }],
+        () => {},
+        true,
+      ),
+      container,
+    );
+    expect(
+      container.querySelector<HTMLButtonElement>('[data-testid="history-connect-terminal"]')
+        ?.disabled,
+    ).toBe(true);
   });
 });

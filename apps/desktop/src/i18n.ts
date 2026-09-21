@@ -160,6 +160,11 @@ export type TranslationKey =
   | 'system.language.systemDefault'
   | 'status.clipboardSynced'
   | 'status.reconnect'
+  // Opens a shell on a remembered host and nothing else (ADR 0101), plus the
+  // reason the item is unreachable for a host that granted a lesser role:
+  // the `terminal` grant rides `Role::FullControl` alone.
+  | 'status.reconnectTerminal'
+  | 'status.reconnectTerminal.needsFullControl'
   | 'history.remove'
   | 'history.remove.confirm'
   | 'history.forgetPassword'

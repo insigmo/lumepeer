@@ -105,6 +105,9 @@ export const it: Dictionary = {
   'system.language.systemDefault': 'Predefinita di sistema',
   'status.clipboardSynced': 'Appunti sincronizzati',
   'status.reconnect': 'Connetti di nuovo',
+  'status.reconnectTerminal': 'Connetti al terminale',
+  'status.reconnectTerminal.needsFullControl':
+    'Solo un host che ha concesso il controllo completo permette di aprire una shell.',
   'history.remove': 'Rimuovi',
   'history.remove.confirm': (name) =>
     `Rimuovere ${name} dall'elenco delle connessioni? Verrà eliminata anche l'eventuale password salvata per esso.`,

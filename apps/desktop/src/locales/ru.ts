@@ -105,6 +105,9 @@ export const ru: Dictionary = {
   'system.language.systemDefault': 'Как в системе',
   'status.clipboardSynced': 'Буфер обмена синхронизирован',
   'status.reconnect': 'Подключиться снова',
+  'status.reconnectTerminal': 'Подключиться к терминалу',
+  'status.reconnectTerminal.needsFullControl':
+    'Оболочку можно открыть только на хосте, давшем полный доступ.',
   'history.remove': 'Удалить',
   'history.remove.confirm': (name) =>
     `Удалить ${name} из списка подключений? Сохранённый для него пароль также будет удалён.`,

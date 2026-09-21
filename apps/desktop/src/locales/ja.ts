@@ -104,6 +104,9 @@ export const ja: Dictionary = {
   'system.language.systemDefault': 'システムの既定値',
   'status.clipboardSynced': 'クリップボードを同期しました',
   'status.reconnect': '再接続',
+  'status.reconnectTerminal': 'ターミナルに接続',
+  'status.reconnectTerminal.needsFullControl':
+    'シェルを開けるのはフルコントロールを許可したホストだけです。',
   'history.remove': '削除',
   'history.remove.confirm': (name) =>
     `${name} を接続リストから削除しますか？ 保存されているパスワードも一緒に削除されます。`,

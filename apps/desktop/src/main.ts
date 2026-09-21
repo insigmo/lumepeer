@@ -239,7 +239,7 @@ function renderNow(): void {
                 locale,
                 () => void refresh(),
                 history,
-                (peer) => void reconnect(peer),
+                (peer, terminalOnly) => void reconnect(peer, terminalOnly),
                 isConnecting(),
                 openChat,
                 clipboardSyncedAt,

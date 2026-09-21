@@ -426,7 +426,12 @@ export function sessionStatus(
   locale: Locale,
   onRefresh: () => void = () => {},
   history: HistoryEntry[] = [],
-  onReconnect: (peer: string) => void = () => {},
+  /**
+   * Dials a remembered host again. `terminalOnly` asks for a shell and
+   * nothing else — the same session and the same role, but the guest never
+   * opens the media connection, so the host encodes nothing (ADR 0101).
+   */
+  onReconnect: (peer: string, terminalOnly?: boolean) => void = () => {},
   reconnectDisabled = false,
   onOpenChat: (peer: string) => void = () => {},
   /**
@@ -642,6 +647,24 @@ export function sessionStatus(
                           }}
                         >
                           ${t(locale, 'status.reconnect')}
+                        </button>
+                      `,
+                      html`
+                        <button
+                          type="button"
+                          class="peer-menu-item peer-menu-connect-terminal"
+                          role="menuitem"
+                          data-testid="history-connect-terminal"
+                          ?disabled=${reconnectDisabled || entry.role !== 'full_control'}
+                          title=${entry.role === 'full_control'
+                            ? ''
+                            : t(locale, 'status.reconnectTerminal.needsFullControl')}
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            onReconnect(entry.peer_label, true);
+                          }}
+                        >
+                          ${t(locale, 'status.reconnectTerminal')}
                         </button>
                       `,
                       html`

@@ -105,6 +105,9 @@ export const de: Dictionary = {
   'system.language.systemDefault': 'Systemstandard',
   'status.clipboardSynced': 'Zwischenablage synchronisiert',
   'status.reconnect': 'Erneut verbinden',
+  'status.reconnectTerminal': 'Mit Terminal verbinden',
+  'status.reconnectTerminal.needsFullControl':
+    'Eine Shell lässt sich nur auf einem Host mit Vollzugriff öffnen.',
   'history.remove': 'Entfernen',
   'history.remove.confirm': (name) =>
     `${name} aus der Verbindungsliste entfernen? Ein dafür gespeichertes Passwort wird ebenfalls gelöscht.`,

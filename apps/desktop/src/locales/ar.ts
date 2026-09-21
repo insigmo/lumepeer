@@ -104,6 +104,9 @@ export const ar: Dictionary = {
   'system.language.systemDefault': 'لغة النظام',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
+  'status.reconnectTerminal': 'الاتصال بالطرفية',
+  'status.reconnectTerminal.needsFullControl':
+    'لا يمكن فتح صدفة إلا على مضيف منح تحكمًا كاملًا.',
   'history.remove': 'إزالة',
   'history.remove.confirm': (name) =>
     `إزالة ${name} من قائمة الاتصالات؟ سيُحذف أي كلمة مرور محفوظة له أيضًا.`,

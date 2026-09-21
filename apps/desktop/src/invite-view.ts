@@ -479,9 +479,15 @@ async function connect(ticket: string): Promise<void> {
   await attempt('invite_connect', { args: { ticket } });
 }
 
-/** Dials a host the app already remembers, by its history label (§21 item 5). */
-export async function reconnect(peer: string): Promise<void> {
-  await attempt('history_connect', { args: { peer } });
+/**
+ * Dials a host the app already remembers, by its history label (§21 item 5).
+ *
+ * `terminalOnly` asks that host for a shell and nothing else (ADR 0101): the
+ * same session and the same role, dialled without the media connection, so
+ * nothing on the far side encodes or sends a picture.
+ */
+export async function reconnect(peer: string, terminalOnly = false): Promise<void> {
+  await attempt('history_connect', { args: { peer, terminal_only: terminalOnly } });
 }
 
 /**

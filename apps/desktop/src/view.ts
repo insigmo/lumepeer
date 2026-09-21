@@ -103,6 +103,17 @@ const peer = params.get('peer') ?? '';
  * the connection list can find it tomorrow.
  */
 const host = params.get('host') ?? '';
+/**
+ * Whether this window is a shell and nothing else (ADR 0101).
+ *
+ * Set by the actor when the connect asked for a terminal: such a guest never
+ * dialled `rd/media/1`, so there is no picture on the way and the host builds
+ * no encoder for it. Everything below that is about a picture — the frame loops, the
+ * cursor, the thumbnail, the pan and zoom, the overlay that would otherwise
+ * sit at "waiting for the host's picture" forever — is left unstarted rather
+ * than started and ignored.
+ */
+const terminalOnly = params.get('terminal') === '1';
 const canvas = document.querySelector<HTMLCanvasElement>('#screen');
 const cursorLayer = document.querySelector<HTMLCanvasElement>('#cursor');
 const surface = document.querySelector<HTMLElement>('#view');
@@ -449,6 +460,11 @@ let streamSizeTimer: ReturnType<typeof setTimeout> | undefined;
  * ends up at, and every value on the way there is one nobody will look at.
  */
 function syncStreamSize(): void {
+  // A window with no picture in it has no size to ask the host to encode at
+  // (ADR 0101), and the host it is talking to is not encoding anything.
+  if (terminalOnly) {
+    return;
+  }
   const wanted = streamSizeFor(layout, viewportBox(), window.devicePixelRatio || 1, pictureCeiling);
   if (
     !wanted ||
@@ -713,8 +729,26 @@ function nativeLoop(): void {
 }
 
 async function main(): Promise<void> {
-  renderOverlay();
-  renderRecording();
+  if (terminalOnly) {
+    // The picture's own elements go, rather than being left behind empty: a
+    // canvas at the size of the window would sit under the shell and take
+    // the pointer events meant for it.
+    if (canvas) {
+      canvas.hidden = true;
+    }
+    if (cursorLayer) {
+      cursorLayer.hidden = true;
+    }
+    // What the stylesheet keys the full-height terminal off.
+    surface?.classList.add('is-terminal-only');
+    if (terminalPanel) {
+      terminalPanel.hidden = false;
+      void openTerminal();
+    }
+  } else {
+    renderOverlay();
+    renderRecording();
+  }
   // The chat panel polls the actor's transcript; it exists only while this
   // window does, so no explicit teardown beyond the poll's own stop. The
   // toolbar's chat button toggles exactly this panel.
@@ -777,6 +811,9 @@ async function main(): Promise<void> {
       terminalVisible(): boolean {
         return terminalPanel !== null && !terminalPanel.hidden;
       },
+      terminalOnly(): boolean {
+        return terminalOnly;
+      },
       displayMode: () => layout.mode,
       setDisplayMode,
       zoomPercent: () =>
@@ -801,7 +838,7 @@ async function main(): Promise<void> {
   }
   // Panning and zooming are local: neither reaches the host, and both are
   // arranged so the plain left button — which does — is never taken.
-  if (surface) {
+  if (surface && !terminalOnly) {
     installPan(
       surface,
       {
@@ -825,11 +862,13 @@ async function main(): Promise<void> {
       { passive: false },
     );
   }
-  window.addEventListener('resize', applyLayout);
+  if (!terminalOnly) {
+    window.addEventListener('resize', applyLayout);
+  }
   // Where the local cursor is drawn. Tracked on the surface rather than on the
   // canvas so the pointer leaving the picture hides it instead of freezing it
   // at the edge.
-  if (surface) {
+  if (surface && !terminalOnly) {
     surface.addEventListener('pointermove', (event) => {
       pointerAt = { x: event.clientX, y: event.clientY };
       placeCursor();
@@ -839,9 +878,11 @@ async function main(): Promise<void> {
       placeCursor();
     });
   }
-  setInterval(() => {
-    void pollCursor();
-  }, CURSOR_POLL_INTERVAL_MS);
+  if (!terminalOnly) {
+    setInterval(() => {
+      void pollCursor();
+    }, CURSOR_POLL_INTERVAL_MS);
+  }
   // The file manager polls whether or not its panel is open: the answer that
   // says whether the host allows it at all is the same one that fills the
   // panes, and the toolbar button is drawn from it (ADR 0076).
@@ -855,6 +896,10 @@ async function main(): Promise<void> {
   // Installed before the input forwarder attaches, and in the capture phase,
   // so a matched chord is marked before it can be sent to the host (§11).
   installHotkeys(document, {
+    // Left bound even on a terminal window: what they move is a hidden
+    // canvas, nothing they touch reaches the host (`syncStreamSize` refuses
+    // outright), and one set of chords in both kinds of window is one fewer
+    // thing that behaves differently.
     'toggle-fullscreen': () => void setFullscreen(!fullscreen),
     'cycle-display-mode': () => setDisplayMode(nextDisplayMode(layout.mode)),
     'reset-view': resetView,
@@ -905,6 +950,12 @@ async function main(): Promise<void> {
     terminal?.stop();
     void endSession();
   });
+  if (terminalOnly) {
+    // Neither frame loop starts, which is also what keeps the Rust side from
+    // ever starting the decoder worker of §11.3: the first frame command is
+    // what tells it which side decodes (ADR 0058, ADR 0101).
+    return;
+  }
   // Which side decodes. The window is the only one that knows whether its own
   // `WebView` has a usable `VideoDecoder`, and the Rust side reads the answer
   // off whichever command the first call uses — so asking here, once, is also

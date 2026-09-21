@@ -453,7 +453,9 @@ describe('remembered hosts', () => {
   it('reconnects by label, never by handing the invite code back to the webview', async () => {
     const view = await load();
     await view.reconnect('host-ab12');
-    expect(invoke).toHaveBeenCalledWith('history_connect', { args: { peer: 'host-ab12' } });
+    expect(invoke).toHaveBeenCalledWith('history_connect', {
+      args: { peer: 'host-ab12', terminal_only: false },
+    });
     view.setConnectPhase('connected');
   });
 });

@@ -406,6 +406,14 @@ pub struct HistoryEntryDto {
 pub struct HistoryConnectArgs {
     /// Label of the remembered host, as `connection_history` handed it out.
     pub peer: String,
+    /// Whether to open a shell and nothing else (ADR 0101).
+    ///
+    /// The same session and the same role either way; what it changes is that
+    /// the guest never dials `rd/media/1`, so the host never builds an encoder
+    /// or puts a picture on the wire. Defaulted so the ordinary Connect keeps
+    /// sending `{ peer }` alone.
+    #[serde(default)]
+    pub terminal_only: bool,
 }
 
 /// Argument of [`history_remove`].
@@ -832,7 +840,10 @@ pub async fn history_connect(
     args: HistoryConnectArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    state.network.history_connect(args.peer).await?;
+    state
+        .network
+        .history_connect(args.peer, args.terminal_only)
+        .await?;
     Ok(())
 }
 

@@ -111,6 +111,9 @@ export const en: Dictionary = {
   'system.language.systemDefault': 'System default',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
+  'status.reconnectTerminal': 'Connect to terminal',
+  'status.reconnectTerminal.needsFullControl':
+    'Only a host that granted full control can open a shell.',
   'history.remove': 'Remove',
   'history.remove.confirm': (name) =>
     `Remove ${name} from the connection list? Any password saved for it is deleted too.`,
