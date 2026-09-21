@@ -260,6 +260,43 @@ pub const CONNECT_RETRY_BACKOFF_SECS: u64 = 5;
 /// as a hang. A round of dialing already costs [`DIAL_TOTAL_BUDGET_SECS`], so
 /// this is the smaller half of the cycle either way.
 pub const CONNECT_RETRY_BACKOFF_CEILING_SECS: u64 = 30;
+/// How often a guest looks up where its saved hosts are now, without dialing
+/// any of them (ADR 0099).
+///
+/// Half an hour. What the refresh catches is a host that moved — rebooted onto
+/// a new public address, changed network, had its NAT binding recycled — and
+/// it costs a DNS and DHT query per saved host, which is why it is not a
+/// minute. It is also not an hour, because the point is that the address in
+/// hand when the user presses Connect is *recent*: a record up to half an hour
+/// old is one a dial can start on, and one up to an hour old often is not.
+pub const SAVED_HOST_REFRESH_SECS: u64 = 30 * 60;
+/// Pause before the first sweep of [`SAVED_HOST_REFRESH_SECS`] (ADR 0099).
+///
+/// Long enough for this node's own endpoint to have reached a relay and
+/// published itself, since a lookup from an endpoint that is not online yet
+/// mostly answers nothing. Short enough that a user who starts the app and
+/// then goes to click a saved host has the fresh address before they arrive.
+pub const SAVED_HOST_FIRST_REFRESH_SECS: u64 = 20;
+/// Bound on looking one saved host up (ADR 0099).
+///
+/// The DHT answers when it answers, and this runs behind nobody's spinner, so
+/// the only thing this protects is the sweep itself: a host that cannot be
+/// found must not hold up the one after it.
+pub const SAVED_HOST_LOOKUP_TIMEOUT_SECS: u64 = 8;
+/// How many saved hosts one sweep refreshes (ADR 0099).
+///
+/// The list holds up to fifty, and looking all of them up every half hour
+/// would put fifty DHT queries on the network for a user who has one host they
+/// actually use. The list is newest-first, so this is the hosts somebody has
+/// actually been connecting to.
+pub const SAVED_HOSTS_PER_REFRESH: usize = 8;
+/// Direct addresses remembered per saved host (ADR 0093, ADR 0099).
+///
+/// Every one of them is offered to iroh on the next dial and costs a probe, so
+/// this is a cap on the dial's own fan-out as much as on the file's size. Four
+/// is a host with an IPv4 and an IPv6 address on two interfaces, which is the
+/// widest real machine this has met.
+pub const SAVED_HOST_ADDRS: usize = 4;
 /// Handshakes the host will run concurrently. Beyond this, further incoming
 /// connections are closed immediately rather than queued (§3.2).
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;

@@ -239,6 +239,42 @@ impl ConnectionHistory {
         self.save();
     }
 
+    /// Replaces the addresses remembered for `peer_label` with what a
+    /// background lookup just found (ADR 0099).
+    ///
+    /// Replaces rather than merges, and that is the point: this is the answer
+    /// to "where is that host *now*", and keeping last week's answer beside it
+    /// would put an address on the next dial that is known to be out of date.
+    /// What a live session reported is written by [`Self::record`] and wins
+    /// the same way — whichever of the two spoke most recently is the one
+    /// worth dialing.
+    ///
+    /// Nothing is created: a lookup for a host that has since been forgotten
+    /// has nowhere to land, and inventing a row for it would put a host back
+    /// in a list the user cleared it out of.
+    ///
+    /// Returns whether a row was there to write to, and `false` for an empty
+    /// answer — a lookup that found nothing has learnt nothing, and must not
+    /// be allowed to erase addresses that were working.
+    pub fn remember_addrs(&mut self, peer_label: &str, addrs: Vec<String>) -> bool {
+        if addrs.is_empty() {
+            return false;
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.peer_label == peer_label)
+        else {
+            return false;
+        };
+        if entry.addrs == addrs {
+            return false;
+        }
+        entry.addrs = addrs;
+        self.save();
+        true
+    }
+
     /// Whether `peer_label` is a host this node may dial again on its own
     /// (ADR 0084). A host that is not listed is not trusted, like every other
     /// deny-by-default answer here.
@@ -366,6 +402,37 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(history.addrs_of("host-ab12"), vec!["85.173.126.211:21966"]);
+    }
+
+    /// ADR 0099: a background lookup writes where the host is *now* over the
+    /// row it belongs to, so the next dial starts from a fresh address rather
+    /// than the one the last session happened to end on.
+    #[test]
+    fn a_background_lookup_replaces_the_addresses_of_a_saved_host() {
+        let mut history = ConnectionHistory::open(None);
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-1".to_owned(),
+            None,
+            vec!["85.173.126.211:21966".to_owned()],
+        );
+        assert!(history.remember_addrs("host-ab12", vec!["203.0.113.9:4433".to_owned()]));
+        assert_eq!(history.addrs_of("host-ab12"), vec!["203.0.113.9:4433"]);
+
+        // A lookup that found nothing has learnt nothing, and must not be able
+        // to erase an address that was working.
+        assert!(!history.remember_addrs("host-ab12", Vec::new()));
+        assert_eq!(history.addrs_of("host-ab12"), vec!["203.0.113.9:4433"]);
+
+        // The same answer twice is not a write: the file is only rewritten
+        // when the host actually moved.
+        assert!(!history.remember_addrs("host-ab12", vec!["203.0.113.9:4433".to_owned()]));
+
+        // A host the user has removed from the list stays removed. A lookup
+        // must never be able to put one back.
+        assert!(!history.remember_addrs("host-never-seen", vec!["203.0.113.9:4433".to_owned()]));
+        assert_eq!(history.entries().len(), 1);
     }
 
     /// A newer session that did reach the host somewhere else replaces them:

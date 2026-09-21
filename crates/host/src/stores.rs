@@ -67,6 +67,17 @@ fn audit_path(directory: &Path) -> PathBuf {
     directory.join("audit.db")
 }
 
+/// Where the relay measurement of ADR 0098 is kept between runs.
+///
+/// It matters more on a service host than anywhere else: this process starts
+/// with the machine, often before the network is up, and a bind that measures
+/// nothing would otherwise spend the rest of its run on the whole global
+/// fleet.
+#[must_use]
+pub fn relay_cache_path(directory: &Path) -> PathBuf {
+    directory.join("relays.json")
+}
+
 /// Reads the keystore secret, creating it on first run.
 ///
 /// `None` when it can be neither read nor written, which the caller must treat

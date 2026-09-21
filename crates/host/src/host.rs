@@ -115,13 +115,15 @@ async fn host(stopping: &AtomicBool) {
     // same relay and the same transport preference the client ships with, and
     // ADR 0087 records making them configurable as not done.
     let settings = lumepeer_runtime::config::Settings::default();
-    let endpoint = match PeerEndpoint::bind_with_lan(secret_key, settings.relay_url()).await {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            tracing::error!(%error, "cannot bind this machine's endpoint; not hosting");
-            return;
-        }
-    };
+    let relay_cache = Some(crate::stores::relay_cache_path(&directory));
+    let endpoint =
+        match PeerEndpoint::bind_with_lan(secret_key, settings.relay_url(), relay_cache).await {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::error!(%error, "cannot bind this machine's endpoint; not hosting");
+                return;
+            }
+        };
 
     let screen = Arc::new(AgentScreen::new());
     // No capture backend is compiled into this binary (see the crate header),

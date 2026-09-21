@@ -21,6 +21,9 @@ noq = "=1.2.0"
 tokio.workspace = true
 serde.workspace = true
 serde-big-array.workspace = true
+# The relay measurement kept between runs (ADR 0098) — one small JSON file,
+# read at bind and rewritten on every re-measure.
+serde_json.workspace = true
 postcard.workspace = true
 ed25519-dalek.workspace = true
 blake3.workspace = true
@@ -40,6 +43,11 @@ rcgen = "0.14"
 # feature.
 lumepeer-media.workspace = true
 iroh-mainline-address-lookup = "=0.5.0"
+# The stream combinators iroh's own address-lookup API hands back (ADR 0099).
+# Already in the dependency tree transitively via `iroh`; pinned here to the
+# exact version it resolves to, for the same reason `noq` is — the `Stream`
+# these yield and the `StreamExt` used to poll it have to be one crate.
+n0-future = "=0.3.2"
 
 [dev-dependencies]
 proptest.workspace = true

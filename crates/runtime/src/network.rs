@@ -26,15 +26,17 @@ use lumepeer_core::consent::{Admission, ConsentRateLimiter, Grants, IndependentG
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONNECT_RETRY_BACKOFF_CEILING_SECS,
     CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
-    DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
-    DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES,
-    FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
-    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
-    MAX_DIR_MANIFEST_ENTRIES, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
-    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS, DISPLAY_MODE_CONFIRM_TIMEOUT_SECS,
+    FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS,
+    FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
+    MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
+    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
+    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, REBOOT_WAIT_CEILING_SECS,
+    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
     RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
+    RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
+    SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
     TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
@@ -412,6 +414,47 @@ fn path_of(connection: &PeerConnection) -> (PathKind, Option<String>) {
         (false, false) => PathKind::Unknown,
     };
     (kind, region)
+}
+
+/// How a live connection is reaching its peer right now, as the two things a
+/// log line needs: the route, and the round trip of the path that is actually
+/// carrying packets (ADR 0099).
+///
+/// This is the answer to the one question the diagnostics panel could already
+/// show and the log could not — *did this session go direct, or through a
+/// relay, and which one*. A panel answers it for whoever is looking at that
+/// screen right now; a log answers it afterwards, on the machine that had the
+/// problem, which is the only place a report like "it was slow yesterday" can
+/// be settled.
+///
+/// The route is deliberately the part without a number in it. It changes when
+/// something happened — a hole punch landed, a relay was lost, iroh moved the
+/// selected path — and that is what is worth a line. The round trip moves on
+/// every measurement and would turn the same line into noise.
+fn route_of(connection: &PeerConnection) -> (String, Option<u64>) {
+    let (kind, region) = path_of(connection);
+    let Some(iroh) = connection.iroh() else {
+        // One direct UDP path by construction, with no paths to report and
+        // nothing to choose between them (ADR 0052).
+        return (format!("{} (obfuscated)", kind.code()), None);
+    };
+    let paths = iroh.paths();
+    let selected = paths.iter().find(iroh::endpoint::Path::is_selected);
+    let carrying =
+        selected.as_ref().map_or(
+            "none",
+            |path| {
+                if path.is_relay() { "relay" } else { "direct" }
+            },
+        );
+    let rtt = selected
+        .as_ref()
+        .and_then(|path| u64::try_from(path.rtt().as_millis()).ok());
+    let route = match region {
+        Some(region) => format!("{} via {region}, carrying {carrying}", kind.code()),
+        None => format!("{}, carrying {carrying}", kind.code()),
+    };
+    (route, rtt)
 }
 
 /// The leading DNS label of a relay URL, which is the region in every relay
@@ -3510,6 +3553,14 @@ struct ConnectionHandle {
     /// guest names to resume it and what a host checks that name against
     /// (§10; ADR 0089).
     session_id: [u8; 16],
+    /// The route [`route_of`] last put in the log for this connection, so the
+    /// same one is not repeated every ping (ADR 0099).
+    ///
+    /// On the handle rather than in a map beside it: a route is a fact about
+    /// one generation of one connection, and a map would have to be swept by
+    /// every path that ends a session — which is exactly the kind of
+    /// bookkeeping that gets forgotten on the seventh one.
+    logged_route: Option<String>,
 }
 
 /// Whether this build may send `ReceiverReport` towards a peer, from the only
@@ -4148,6 +4199,19 @@ enum ActorEvent {
     /// Host side: the reconnect window of a session that dropped has run out
     /// (§10; ADR 0089). `session_id` ties it to the drop that armed it.
     ResumeWindowElapsed { peer: NodeId, session_id: [u8; 16] },
+    /// Guest side: a background lookup found where one saved host is now
+    /// (ADR 0099).
+    ///
+    /// Carries the label rather than the `NodeId` because that is what the
+    /// remembered-hosts list is keyed by, and because the sweep that produced
+    /// it already had to resolve the label to dial anything at all.
+    HostLocated {
+        /// The row of the remembered-hosts list this is about.
+        host_tag: String,
+        /// The direct addresses the lookup answered with, as text, in the
+        /// order they were found.
+        addrs: Vec<String>,
+    },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -5200,6 +5264,14 @@ impl Actor {
         // which is what gets a number on screen without a 20-second wait.
         let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Where the saved hosts are now (ADR 0099). The first tick fires
+        // immediately, which is why it is armed to start late: a lookup from
+        // an endpoint that has not reached a relay yet mostly answers nothing.
+        let mut locate = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(SAVED_HOST_FIRST_REFRESH_SECS),
+            Duration::from_secs(SAVED_HOST_REFRESH_SECS),
+        );
+        locate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = self.rx.recv() => {
@@ -5243,7 +5315,11 @@ impl Actor {
                         self.on_cursor_shape(peer, shape);
                     }
                 }
-                _ = ping.tick() => self.send_pings(),
+                _ = ping.tick() => {
+                    self.send_pings();
+                    self.log_routes();
+                }
+                _ = locate.tick() => self.refresh_saved_hosts(),
             }
             // One place, after every turn, rather than at each of the half
             // dozen paths that start or end a session: a consent, a revoke, a
@@ -5287,6 +5363,101 @@ impl Actor {
             let nonce = rand::rng().next_u64();
             self.rtt.entry(peer).or_default().sent(nonce);
             self.send_to(&peer, MessageKind::Ping(nonce));
+        }
+    }
+
+    /// Guest side: looks up where the saved hosts are now, so the next dial
+    /// to one of them starts from an address that is minutes old (ADR 0099).
+    ///
+    /// **Nothing is dialed and nothing reaches those machines.** This is the
+    /// discovery half of a connect — DNS and the Mainline DHT — run ahead of
+    /// time rather than while a user watches a spinner. A host that rebooted
+    /// onto a new address, changed network or had its NAT binding recycled is
+    /// found here instead of during the first attempt that cannot reach it,
+    /// and `with_remembered_addrs` puts the answer into the dial.
+    ///
+    /// Off the actor loop, like every other network wait: a DHT query is
+    /// seconds, and the actor cannot spend seconds. It comes back as
+    /// [`ActorEvent::HostLocated`], which is the only thread allowed to write
+    /// the list.
+    fn refresh_saved_hosts(&mut self) {
+        // A ticket is what turns a remembered row back into an endpoint to
+        // look up: the label is a one-way hash and the code is the only thing
+        // in the row that names the host. A row whose code no longer parses is
+        // one this build cannot dial either, so skipping it costs nothing.
+        let targets: Vec<(String, NodeId)> = self
+            .history
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                let ticket = InviteTicket::from_code(&entry.code).ok()?;
+                let addr = ticket.endpoint_addr().ok()?;
+                Some((entry.peer_label.clone(), addr.id))
+            })
+            // Never the host a session is already running against: its live
+            // connection is the better answer, and `ConnectionHistory::record`
+            // writes it when the session ends.
+            .filter(|(_, peer)| !self.connections.contains_key(peer))
+            .take(SAVED_HOSTS_PER_REFRESH)
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            // One at a time. A sweep of eight lookups fired together is eight
+            // DHT queries in one breath from a client that is not connecting
+            // to anything, and the whole point of doing this early is that
+            // nobody is waiting for it.
+            for (host_tag, peer) in targets {
+                let Ok(found) = endpoint
+                    .locate(peer, Duration::from_secs(SAVED_HOST_LOOKUP_TIMEOUT_SECS))
+                    .await
+                else {
+                    return;
+                };
+                if found.is_empty() {
+                    continue;
+                }
+                let addrs = found
+                    .into_iter()
+                    .take(SAVED_HOST_ADDRS)
+                    .map(|addr| addr.to_string())
+                    .collect();
+                if events
+                    .send(ActorEvent::HostLocated { host_tag, addrs })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Says in the log how each live session is actually reaching its peer —
+    /// the first time, and every time that changes (ADR 0099).
+    ///
+    /// On the ping tick rather than on a timer of its own: the two questions
+    /// have the same cadence, because they are the same question asked of the
+    /// link from two sides, and a session that just came up over a relay wants
+    /// its hole punch noticed within one keepalive and not within one minute.
+    fn log_routes(&mut self) {
+        let salt = self.install_salt;
+        for (peer, handle) in &mut self.connections {
+            let (route, rtt_ms) = route_of(&handle.connection);
+            if handle.logged_route.as_deref() == Some(route.as_str()) {
+                continue;
+            }
+            tracing::info!(
+                peer = %peer_tag(&salt, peer),
+                route = %route,
+                rtt_ms = rtt_ms.unwrap_or_default(),
+                first = handle.logged_route.is_none(),
+                "how this session is reaching its peer"
+            );
+            handle.logged_route = Some(route);
         }
     }
 
@@ -7866,6 +8037,7 @@ impl Actor {
                 speaks_unattended,
                 peer_minor,
                 session_id,
+                logged_route: None,
             },
         );
     }
@@ -8079,6 +8251,14 @@ impl Actor {
             }
             ActorEvent::ResumeWindowElapsed { peer, session_id } => {
                 self.on_resume_window_elapsed(peer, session_id);
+            }
+            ActorEvent::HostLocated { host_tag, addrs } => {
+                if self.history.remember_addrs(&host_tag, addrs) {
+                    tracing::debug!(
+                        peer = %host_tag,
+                        "a saved host moved; the next dial to it starts from the new address"
+                    );
+                }
             }
         }
     }
@@ -8428,7 +8608,8 @@ impl Actor {
                 media_connection,
             },
         );
-        self.windows.open(&label, &tag, &host_tag(&peer), grants.input);
+        self.windows
+            .open(&label, &tag, &host_tag(&peer), grants.input);
         self.rebuild_labels_and_snapshot();
         // A fresh entry in `self.views` is one of the two reasons the
         // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
@@ -13533,11 +13714,11 @@ impl Actor {
             return;
         }
         // A round of silence is not an outcome the user can act on, so the
-        // connect keeps dialing instead of ending (ADR 0096). Only an answer
-        // from the host is a verdict, by the same `is_retryable` rule one
-        // round's own retry reads.
+        // connect keeps dialing instead of ending (ADR 0096). Only a verdict
+        // from the host ends a connect, and `is_verdict` is the one place that
+        // list is written down (ADR 0100).
         if is_retryable(error) && self.retry_connect_soon(peer) {
-            tracing::warn!(peer = %tag, %error, "a round of dialing found nothing");
+            tracing::warn!(peer = %tag, %error, "a round of dialing found no answer");
             return;
         }
         // Either the host answered, or there is no open connect left to dial
@@ -15136,14 +15317,49 @@ fn connect_retry_backoff_secs(rounds: u32) -> u64 {
         .min(CONNECT_RETRY_BACKOFF_CEILING_SECS)
 }
 
-/// Whether a failed attempt is worth another one (ADR 0050).
+/// Whether a failed attempt is a **verdict** — something the far side decided
+/// about this guest, which asking again can only collect a second time (ADR
+/// 0050, ADR 0100).
 ///
-/// This side's own observation that nothing answered, or that a stream
-/// stopped — never an answer from the host. Both the retry within one
-/// transport and the fallback to the next one read this single rule, so the
-/// two cannot drift apart into "retried here but not there".
+/// Four of them, and they are the whole list:
+///
+/// * the invite does not decode, or does not verify — a different code is the
+///   only thing that changes that;
+/// * this build and that host do not speak the same protocol major;
+/// * this node already holds a control connection to that host;
+/// * a resume was refused, which is §10's business and not a connect's;
+/// * the host said it has no way to admit this guest at all — nobody is at it
+///   and it has no device password to check (ADR 0085 §2), or something else
+///   on that machine holds the host role. It is the host speaking, and a
+///   second ask collects the same sentence.
+///
+/// Everything else is retried. That is the inversion ADR 0100 made: the list
+/// used to be the other way round — *only* `Dial` and `Io` were retried — so
+/// every failure nobody had classified landed in "give up", and a keystore
+/// that was busy, an endpoint that had not reached a relay yet, a datagram
+/// that failed its own authentication or a stream that ended mid-frame all
+/// reached the user as "the host refused the connection". None of those is a
+/// host refusing anything.
+const fn is_verdict(error: &NetError) -> bool {
+    matches!(
+        *error,
+        NetError::InvalidTicket
+            | NetError::MalformedTicket
+            | NetError::AlreadyConnected
+            | NetError::ReconnectRejected
+            | NetError::ConsentUnavailable
+            | NetError::Framing(lumepeer_core::CoreError::IncompatibleVersion { .. })
+    )
+}
+
+/// Whether a failed attempt is worth another one (ADR 0050, ADR 0100).
+///
+/// Anything that is not a verdict. The retry within one transport, the
+/// fallback to the next one and the round the connect starts again (ADR 0096)
+/// all read this single rule, so they cannot drift apart into "retried here
+/// but not there".
 const fn is_retryable(error: &NetError) -> bool {
-    matches!(*error, NetError::Dial(_) | NetError::Io(_))
+    !is_verdict(error)
 }
 
 /// One outgoing control connection — dial and handshake — retried up to
@@ -15868,8 +16084,14 @@ mod tests {
     #[test]
     fn the_connect_retry_backoff_doubles_up_to_its_ceiling() {
         assert_eq!(connect_retry_backoff_secs(1), CONNECT_RETRY_BACKOFF_SECS);
-        assert_eq!(connect_retry_backoff_secs(2), CONNECT_RETRY_BACKOFF_SECS * 2);
-        assert_eq!(connect_retry_backoff_secs(3), CONNECT_RETRY_BACKOFF_SECS * 4);
+        assert_eq!(
+            connect_retry_backoff_secs(2),
+            CONNECT_RETRY_BACKOFF_SECS * 2
+        );
+        assert_eq!(
+            connect_retry_backoff_secs(3),
+            CONNECT_RETRY_BACKOFF_SECS * 4
+        );
         for rounds in 4..1_000 {
             assert_eq!(
                 connect_retry_backoff_secs(rounds),
@@ -15941,6 +16163,53 @@ mod tests {
             worst_case_secs(&attempt_shares(2)) <= DIAL_TOTAL_BUDGET_SECS,
             "a two-transport plan outgrew the budget of a one-transport dial"
         );
+    }
+
+    /// ADR 0100's whole promise, as a table: a connect ends on an answer from
+    /// the far side and on nothing else.
+    ///
+    /// Written as the exhaustive list rather than as a spot check, because the
+    /// failure this fixes was a *missing* case — an error nobody had classified
+    /// fell into "give up" and reached the user as "the host refused the
+    /// connection". A new `NetError` variant must land on the retry side by
+    /// default, and this is what says so.
+    #[test]
+    fn only_an_answer_from_the_host_ends_a_connect() {
+        use lumepeer_core::CoreError;
+
+        // Verdicts. Asking again collects the same answer, so the user is
+        // told instead of watching a spinner that will never stop.
+        for verdict in [
+            NetError::InvalidTicket,
+            NetError::MalformedTicket,
+            NetError::AlreadyConnected,
+            NetError::ReconnectRejected,
+            NetError::ConsentUnavailable,
+            NetError::Framing(CoreError::IncompatibleVersion {
+                local: 1,
+                remote: 9,
+            }),
+        ] {
+            assert!(is_verdict(&verdict), "{verdict} must end the connect");
+            assert!(!is_retryable(&verdict));
+        }
+
+        // Everything else. Each of these used to end a user's connect with a
+        // message about the far side refusing, and none of them is the far
+        // side deciding anything.
+        for transient in [
+            NetError::Dial("no answer".to_owned()),
+            NetError::Io("connection lost".to_owned()),
+            NetError::Endpoint("bind failed".to_owned()),
+            NetError::Offline,
+            NetError::Obfuscation,
+            NetError::Keystore("busy".to_owned()),
+            NetError::TruncatedStream("hello"),
+            NetError::Framing(CoreError::Malformed),
+        ] {
+            assert!(!is_verdict(&transient), "{transient} is not an answer");
+            assert!(is_retryable(&transient), "{transient} is worth another try");
+        }
     }
 
     /// ADR 0091, the property ADR 0089 assumed and did not have: a resume dial

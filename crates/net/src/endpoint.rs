@@ -10,6 +10,7 @@ use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl};
 
 use crate::error::{NetError, Result};
 use crate::peer_connection::PeerConnection;
+use crate::relay::Fleet;
 
 /// Control channel ALPN: `Hello`/consent/input/clipboard. Opened first (§4.1).
 pub const ALPN_CONTROL: &[u8] = b"rd/control/1";
@@ -137,27 +138,39 @@ pub const RELAY_URL_ENV: &str = "LUMEPEER_RELAY_URL";
 /// Points a builder at a specific relay: `LUMEPEER_RELAY_URL` first, then
 /// whatever `[network].relay_url` of the config carried (§7 fallback path,
 /// docs/relay-deployment.md). With neither set, the public fleet is used,
-/// narrowed to the relays this machine can actually reach quickly (ADR 0097).
+/// narrowed to the one relay this machine reaches quickest, with the rest
+/// held in reserve off the map (ADR 0097, ADR 0098).
+///
+/// Returns the [`Fleet`] that narrowing produced, when it produced one, so
+/// the caller can hand it the bound endpoint to go on watching. A configured
+/// relay returns `None`: somebody named that relay on purpose, and there is
+/// nothing left to choose or to keep honest.
 ///
 /// A malformed URL is ignored with a warning rather than failing the bind:
 /// binding must keep working offline, and the endpoint logs which relay it
 /// actually reached either way.
-async fn with_relay(builder: EndpointBuilder, configured: Option<&str>) -> EndpointBuilder {
+async fn with_relay(
+    builder: EndpointBuilder,
+    configured: Option<&str>,
+    relay_cache: Option<std::path::PathBuf>,
+) -> (EndpointBuilder, Option<Fleet>) {
     let named = match std::env::var(RELAY_URL_ENV) {
         Ok(from_env) => Some((RELAY_URL_ENV, from_env)),
         Err(_) => configured.map(|from_config| ("[network].relay_url", from_config.to_owned())),
     };
     let Some((source, url)) = named else {
         // Nobody named one, so this node keeps the public fleet — narrowed to
-        // the relays it can actually reach quickly (ADR 0097). `None` leaves
-        // the fleet whole, which is what a measurement with nothing to say
-        // must not overrule.
-        return match crate::relay::nearest().await {
+        // the nearest relay it can actually reach (ADR 0098). `chosen` being
+        // `None` leaves the fleet whole, which is what a measurement with
+        // nothing to say must not overrule.
+        let fleet = Fleet::measured(relay_cache).await;
+        let builder = match fleet.chosen() {
             Some(relays) => builder.relay_mode(RelayMode::custom(relays)),
             None => builder,
         };
+        return (builder, Some(fleet));
     };
-    match url.parse::<RelayUrl>() {
+    let builder = match url.parse::<RelayUrl>() {
         Ok(relay) => {
             tracing::info!(%url, %source, "using a configured relay");
             builder.relay_mode(RelayMode::custom([relay]))
@@ -166,7 +179,8 @@ async fn with_relay(builder: EndpointBuilder, configured: Option<&str>) -> Endpo
             tracing::warn!(%error, %url, %source, "ignoring the relay: not a valid relay URL");
             builder
         }
-    }
+    };
+    (builder, None)
 }
 
 impl PeerEndpoint {
@@ -174,7 +188,10 @@ impl PeerEndpoint {
     /// (§7, §11.2), with relays, address lookup and direct IP paths enabled.
     ///
     /// `relay_url` is the relay from the configuration file, if the caller
-    /// found one; `LUMEPEER_RELAY_URL` still wins over it.
+    /// found one; `LUMEPEER_RELAY_URL` still wins over it. `relay_cache` is
+    /// where the relay measurement of ADR 0098 is kept between runs; `None`
+    /// measures afresh every time, which is what the tests and the probes
+    /// want.
     ///
     /// Which transports it gets is decided by [`relay_only_enabled`]: the
     /// default is [`Self::bind_with_lan`], and only an explicit
@@ -182,11 +199,15 @@ impl PeerEndpoint {
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if binding or discovery setup fails.
-    pub async fn bind(secret_key: iroh::SecretKey, relay_url: Option<&str>) -> Result<Self> {
+    pub async fn bind(
+        secret_key: iroh::SecretKey,
+        relay_url: Option<&str>,
+        relay_cache: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         if relay_only_enabled() {
-            Self::bind_relay_only(secret_key, relay_url).await
+            Self::bind_relay_only(secret_key, relay_url, relay_cache).await
         } else {
-            Self::bind_with_lan(secret_key, relay_url).await
+            Self::bind_with_lan(secret_key, relay_url, relay_cache).await
         }
     }
 
@@ -200,17 +221,22 @@ impl PeerEndpoint {
     pub async fn bind_with_lan(
         secret_key: iroh::SecretKey,
         relay_url: Option<&str>,
+        relay_cache: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
-        builder = with_relay(builder, relay_url).await;
+        let fleet;
+        (builder, fleet) = with_relay(builder, relay_url, relay_cache).await;
         builder = with_dht_lookup(builder, &secret_key);
         builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder
             .bind()
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        if let Some(fleet) = fleet {
+            fleet.watch(inner.clone());
+        }
         Ok(Self { inner })
     }
 
@@ -232,18 +258,23 @@ impl PeerEndpoint {
     pub async fn bind_relay_only(
         secret_key: iroh::SecretKey,
         relay_url: Option<&str>,
+        relay_cache: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let mut builder = Endpoint::builder(presets::N0)
             .clear_ip_transports()
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
-        builder = with_relay(builder, relay_url).await;
+        let fleet;
+        (builder, fleet) = with_relay(builder, relay_url, relay_cache).await;
         builder = with_dht_lookup(builder, &secret_key);
         builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder
             .bind()
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        if let Some(fleet) = fleet {
+            fleet.watch(inner.clone());
+        }
         Ok(Self { inner })
     }
 
@@ -279,6 +310,63 @@ impl PeerEndpoint {
     /// dialable from outside the local network.
     pub async fn online(&self) {
         self.inner.online().await;
+    }
+
+    /// Where `peer` says it is **right now**, asked of the address-lookup
+    /// services alone (ADR 0099).
+    ///
+    /// No connection is made and nothing reaches the far machine: this is the
+    /// DNS and DHT half of a dial, run on its own so its answer can be had
+    /// before anybody presses Connect. A saved host whose addresses were
+    /// refreshed in the background starts its dial on an address that is
+    /// minutes old rather than one that is a session old — which is the
+    /// difference between hole-punching immediately and hole-punching after
+    /// iroh has finished a lookup the user is waiting on.
+    ///
+    /// Only IP addresses come back. A relay URL is not somewhere this node
+    /// can go directly, and the relay it would name is the *far* machine's
+    /// choice of relay, which this side's own fleet has nothing to do with.
+    ///
+    /// `budget` bounds the whole call: the DHT answers when it answers, and a
+    /// background refresh must never be the thing holding a task open.
+    ///
+    /// # Errors
+    /// [`NetError::Endpoint`] when the endpoint is closed, and therefore has
+    /// no lookup services left to ask.
+    pub async fn locate(
+        &self,
+        peer: lumepeer_core::NodeId,
+        budget: std::time::Duration,
+    ) -> Result<Vec<std::net::SocketAddr>> {
+        use n0_future::StreamExt as _;
+
+        let lookup = self
+            .inner
+            .address_lookup()
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        let mut found: Vec<std::net::SocketAddr> = Vec::new();
+        let collect = async {
+            let mut items = std::pin::pin!(lookup.resolve(peer));
+            // Every service is queried at once and each answer arrives as it
+            // is produced, so this drains rather than taking the first: the
+            // fast service is not always the one that knows where the host
+            // moved to.
+            while let Some(item) = items.next().await {
+                let Ok(Ok(item)) = item else { continue };
+                for addr in item.to_endpoint_addr().addrs {
+                    if let iroh::TransportAddr::Ip(ip) = addr
+                        && !found.contains(&ip)
+                    {
+                        found.push(ip);
+                    }
+                }
+            }
+        };
+        // A lookup that runs out of budget keeps whatever it already has: a
+        // partial answer is still a better dial than none, and this is the
+        // one caller for which taking longer is never worth it.
+        let _ = tokio::time::timeout(budget, collect).await;
+        Ok(found)
     }
 
     /// Dials `addr` on the control ALPN. Media and file connections are opened

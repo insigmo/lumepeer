@@ -88,7 +88,7 @@ async fn bind() -> Result<(PeerEndpoint, SigningKey), String> {
     );
     let secret = iroh::SecretKey::generate();
     let identity = SigningKey::from_bytes(&secret.to_bytes());
-    let endpoint = PeerEndpoint::bind(secret, None)
+    let endpoint = PeerEndpoint::bind(secret, None, None)
         .await
         .map_err(|e| format!("bind: {e}"))?;
     println!("NODE {}", endpoint.node_id());

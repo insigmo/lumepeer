@@ -88,6 +88,7 @@ pub async fn spawn_actor(
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let relay = settings.relay_url();
+    let relay_cache = relay_cache_path(&app);
     // Relay-only is a WAN test, never the default: with the IP transports
     // cleared every session lives or dies with one relay link, and a client
     // whose relay flaps cannot connect at all (ADR 0026).
@@ -95,10 +96,10 @@ pub async fn spawn_actor(
         tracing::info!(
             "transport: relay only — direct IP paths are off, so every session goes over the internet"
         );
-        PeerEndpoint::bind_relay_only(secret_key, relay).await?
+        PeerEndpoint::bind_relay_only(secret_key, relay, relay_cache).await?
     } else {
         tracing::info!("transport: direct IP paths preferred, relay as the fallback");
-        PeerEndpoint::bind_with_lan(secret_key, relay).await?
+        PeerEndpoint::bind_with_lan(secret_key, relay, relay_cache).await?
     };
     let audit = open_audit_log(&app, store.as_ref()).await;
     // A second, independent handle on the same keystore: every native backend
@@ -194,6 +195,24 @@ async fn open_audit_log(
 /// Where the connection history file lives, if the app data directory can be
 /// resolved at all. `None` degrades the feature to in-memory-only for this
 /// run rather than failing startup over a convenience list (§18).
+/// Where the relay measurement of ADR 0098 is kept between runs.
+///
+/// Beside the connection history rather than in the config directory: it is
+/// not configuration anybody edits, it is what this machine measured about its
+/// own network, and it is rewritten every half hour. `None` measures afresh at
+/// every start, which costs a bind up to one probe timeout and loses the
+/// narrowing entirely on a machine that starts before its network is up.
+fn relay_cache_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager as _;
+    match app.path().app_local_data_dir() {
+        Ok(dir) => Some(dir.join("relays.json")),
+        Err(error) => {
+            tracing::warn!(%error, "cannot resolve the app data directory; the relay measurement will not persist");
+            None
+        }
+    }
+}
+
 fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     use tauri::Manager as _;
     match app.path().app_local_data_dir() {
