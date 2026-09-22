@@ -10,7 +10,9 @@
 //!
 //! Being on `Winlogon` is necessary and not sufficient: see [`perform`] for
 //! why this worker asks which desktop currently holds input rather than
-//! assuming it is the one it was launched onto.
+//! assuming it is the one it was launched onto, and
+//! [`attach_to_input_desktop`] for the right it has to ask for while doing so
+//! (ADR 0104).
 //!
 //! The `SendInput` mapping here is deliberately the same one
 //! `crates/media/src/capture/windows.rs`'s `WindowsInjector` uses — logical
@@ -28,8 +30,9 @@
 )]
 
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS,
-    DESKTOP_WRITEOBJECTS, GetThreadDesktop, OpenInputDesktop, SetThreadDesktop,
+    CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, DESKTOP_JOURNALPLAYBACK,
+    DESKTOP_READOBJECTS, DESKTOP_WRITEOBJECTS, GetThreadDesktop, OpenInputDesktop,
+    SetThreadDesktop,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -99,6 +102,19 @@ pub fn perform(action: InjectAction) -> bool {
         InjectAction::Press { logical } => press(logical, true),
         InjectAction::Release { logical } => press(logical, false),
     };
+    if !performed {
+        // Read before the restore below, or it would name where the worker
+        // ended up rather than where it was refused. This is what `send`'s
+        // `ERROR_ACCESS_DENIED` does not carry on its own, and what ADR 0104
+        // cost nine reproductions for want of: a refusal that says the worker
+        // *was* on the desktop receiving input rules out the whole family of
+        // "it was on the wrong desktop" explanations in one line.
+        tracing::warn!(
+            input_desktop = input_desktop_name().as_deref().unwrap_or("unknown"),
+            moved_onto_it = input_desktop.is_some(),
+            "the secure-desktop input worker could not perform the event"
+        );
+    }
 
     if let Some(desktop) = input_desktop {
         if let Some(original) = launched_on
@@ -185,6 +201,24 @@ pub fn input_desktop_name() -> Option<String> {
 /// could not be opened, or it could not be switched to. Both are the
 /// pre-existing behaviour, not a new failure: the event is still attempted on
 /// the desktop the service launched this worker onto.
+///
+/// **The access mask is the whole of ADR 0104.** `DESKTOP_JOURNALPLAYBACK` is
+/// what `SendInput` checks for on the thread's desktop handle, and asking for
+/// `DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS` alone is why every event this
+/// worker was ever given came back `ERROR_ACCESS_DENIED`. Nothing about the
+/// refusal said so: `OpenInputDesktop` granted the handle, `SetThreadDesktop`
+/// moved onto it, both reported success, and the rights the handle did not
+/// carry were only consulted at the last step. Measured side by side on one
+/// machine, same process, same desktop, microseconds apart:
+///
+/// ```text
+/// DIAG ladder mask="0x81" switched=true sent=0 err=5
+/// DIAG ladder mask="0xa1" switched=true sent=1
+/// ```
+///
+/// The name is a historical one — journal playback is the old hook-based way
+/// of feeding synthetic input, and `SendInput` inherited its access check.
+/// Nothing here plays back a journal.
 fn attach_to_input_desktop() -> Option<windows::Win32::System::StationsAndDesktops::HDESK> {
     // SAFETY: no arguments beyond flags; the returned handle is owned by this
     // function's caller and closed there.
@@ -192,7 +226,9 @@ fn attach_to_input_desktop() -> Option<windows::Win32::System::StationsAndDeskto
         OpenInputDesktop(
             DESKTOP_CONTROL_FLAGS(0),
             false,
-            DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0),
+            DESKTOP_ACCESS_FLAGS(
+                DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0 | DESKTOP_JOURNALPLAYBACK.0,
+            ),
         )
     }
     .inspect_err(|error| tracing::warn!(%error, "cannot open the desktop receiving input"))
