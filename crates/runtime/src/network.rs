@@ -4777,6 +4777,13 @@ struct Actor {
     /// Monotonic counter naming the most recent wait, so a tick left over
     /// from a cancelled one does not dial a host nobody is waiting for.
     reconnect_wait_generation: u64,
+    /// Guest side: the view window belonging to the session `reconnect_wait`
+    /// is trying to get back (docs/bugs/22 task 2; ADR 0105).
+    ///
+    /// One slot because `reconnect_wait` is one slot: this is that wait's own
+    /// window, held open with its last picture still on it, and it lives and
+    /// dies with the wait.
+    parked_view: Option<ParkedView>,
     /// Guest side: the connect the user has open that is still being dialed
     /// after a round of attempts came back with nothing (ADR 0096).
     ///
@@ -5124,6 +5131,37 @@ struct ReconnectWait {
     terminal_only: bool,
 }
 
+/// Guest side: the view window of a session that lost its link, held open
+/// while [`ReconnectWait`] tries to get that session back (docs/bugs/22
+/// task 2; ADR 0105).
+///
+/// Everything a live view holds stays here untouched but the media task,
+/// which went with the connection: the window, the feed the window polls, the
+/// last picture on it. That is the whole point — a resume that works draws
+/// its next frame onto the picture the user was already looking at, instead
+/// of a window disappearing and a new one taking its place.
+struct ParkedView {
+    /// The host whose session is being waited for. Always the peer of the
+    /// live [`ReconnectWait`]; a parked view without one is a leak, which is
+    /// what `close_parked_view_without_a_wait` exists to catch.
+    peer: NodeId,
+    /// The view as it was, minus its media task. Handed straight back to
+    /// `self.views` when the session comes back.
+    state: ViewState,
+}
+
+/// What [`Actor::end_view`] does with the window it is taking out of
+/// `self.views` (docs/bugs/22 task 2; ADR 0105).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewEnd {
+    /// The session is over: the window closes and its feed goes with it.
+    Closed,
+    /// The link went away and a resume is about to be tried: the window
+    /// stays up, showing its last picture under the "reconnecting" banner,
+    /// and keeps its feed so it has something to poll.
+    Parked,
+}
+
 /// Guest side: a connect the user has open that has not reached the host yet
 /// (ADR 0096).
 ///
@@ -5290,6 +5328,13 @@ impl Actor {
         // has to be able to name it over IPC — `view_next_frame`, the input
         // commands and the window's own close/revoke all go through a label.
         for peer in self.views.keys().copied().collect::<Vec<_>>() {
+            let label = peer_tag(&self.install_salt, &peer);
+            self.labels.insert(label, peer);
+        }
+        // And a window that is up but whose session is away, for the same
+        // reason (ADR 0105): the one command it can still send is its own
+        // close, and that command names this host by label too.
+        if let Some(peer) = self.parked_view.as_ref().map(|parked| parked.peer) {
             let label = peer_tag(&self.install_salt, &peer);
             self.labels.insert(label, peer);
         }
@@ -8563,6 +8608,14 @@ impl Actor {
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
             return;
         }
+        // A window parked while its session was away is the window this grant
+        // belongs in. Nothing is opened, nothing is re-laid-out: the picture
+        // the user is looking at is the one the next frame draws over
+        // (docs/bugs/22 task 2; ADR 0105).
+        if self.parked_view.as_ref().is_some_and(|p| p.peer == peer) {
+            self.revive_parked_view(peer, role, grants);
+            return;
+        }
         // The one read of what the dial asked for (ADR 0101). Taken rather
         // than copied: the intent belongs to this window from here on, and a
         // later Connect to the same host must start from nothing.
@@ -8692,28 +8745,48 @@ impl Actor {
     /// and it is written on the side that dialed rather than the side that was
     /// dialed.
     fn stop_view(&mut self, peer: NodeId) {
+        self.end_view(peer, ViewEnd::Closed);
+    }
+
+    /// Guest side: takes the session away from its view window but leaves the
+    /// window up, because a resume is about to try to bring that session back
+    /// (docs/bugs/22 task 2; ADR 0105).
+    ///
+    /// Everything that lived on the connection still dies here — the media
+    /// task, and, at this function's caller, the tunnels, shells and
+    /// transfers — so ADR 0089's line holds. What survives is the window and
+    /// the last picture drawn on it, which belong to the user rather than to
+    /// the connection.
+    fn park_view(&mut self, peer: NodeId) {
+        self.end_view(peer, ViewEnd::Parked);
+    }
+
+    /// The body of both: `end` is the one thing they disagree about.
+    fn end_view(&mut self, peer: NodeId, end: ViewEnd) {
         // Whether or not a view was open: a dial that never reached one has
         // an intent recorded against it, and this is one of the two places
         // that ends (ADR 0101).
         self.pending_terminal_only.remove(&peer);
-        let Some(state) = self.views.remove(&peer) else {
+        let Some(mut state) = self.views.remove(&peer) else {
             return;
         };
-        // Taken out before the window is told to close, so a frame poll racing
-        // a revoke can only read the live grant or nothing at all — never a
-        // grant that has just been withdrawn (§8.1).
-        self.view_feeds
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.label_of(&peer));
+        if end == ViewEnd::Closed {
+            // Taken out before the window is told to close, so a frame poll
+            // racing a revoke can only read the live grant or nothing at all
+            // — never a grant that has just been withdrawn (§8.1). A parked
+            // window keeps its feed: it is still polling, and the feed is
+            // what hands it the last picture and the banner over it.
+            self.view_feeds
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.label_of(&peer));
+        }
         // Dropping the receiver already tells the media task to stop; aborting
         // makes sure a decoder does not outlive the session it belonged to
         // (§8.1). A terminal session never had one (ADR 0101).
-        if let Some(task) = state.task.as_ref() {
+        if let Some(task) = state.task.take() {
             task.abort();
         }
-        drop(state.slot);
-        self.windows.close(&state.label);
         if let Some(code) = self.host_invites.get(&peer).cloned() {
             let addrs = self.connected_addrs(&peer);
             self.history.record(
@@ -8724,11 +8797,177 @@ impl Actor {
                 addrs,
             );
         }
-        tracing::info!(peer = %self.label_of(&peer), "view window closed");
+        match end {
+            ViewEnd::Closed => {
+                drop(state.slot);
+                self.windows.close(&state.label);
+                tracing::info!(peer = %self.label_of(&peer), "view window closed");
+            }
+            ViewEnd::Parked => {
+                // Input first, and through the feed rather than the window:
+                // the grant is gone with the connection, and a keystroke
+                // typed at a frozen picture has nowhere to go. The window
+                // stops accepting them on its very next poll (§8.1).
+                state.input.store(false, Ordering::Relaxed);
+                // The host is no longer saying anything about recording, so
+                // §17's indicator must not keep claiming it is.
+                state.recording.store(false, Ordering::Relaxed);
+                // The bitstream this window was decoding ended mid-stream.
+                // Saying so is what makes the window throw its decoder away
+                // and wait for an intra frame rather than paint garbage over
+                // the picture it is keeping (ADR 0058).
+                if let Some(feed) = self
+                    .view_feeds
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&self.label_of(&peer))
+                {
+                    feed.bitstream.desync();
+                }
+                // Keeps whatever picture is in the slot and changes only the
+                // status, which is what puts the non-blocking banner over it
+                // (`view-window.ts::viewOverlay`).
+                state
+                    .slot_tx
+                    .send_modify(|slot| slot.status = ViewStatus::Reconnecting);
+                // The connection it rode is gone; a mic toggle must not find
+                // a handle to a closed one here.
+                *state
+                    .media_connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                tracing::info!(
+                    peer = %self.label_of(&peer),
+                    "the view window is waiting for its session to come back"
+                );
+                self.parked_view = Some(ParkedView { peer, state });
+            }
+        }
         // The last view closing may be the only reason the watcher was on
         // (docs/bugs/10-clipboard-auto.md #1): with `self.views` empty and no
-        // host-side `clipboard_read` live, nothing is left to justify it.
+        // host-side `clipboard_read` live, nothing is left to justify it. A
+        // parked view is no different — there is no connection left to offer
+        // this desktop's clipboard over.
         self.refresh_clipboard_watch();
+    }
+
+    /// Guest side: puts a session that came back into the window it left
+    /// (docs/bugs/22 task 2; ADR 0105).
+    ///
+    /// The counterpart of [`park_view`](Self::park_view), and the reason it
+    /// keeps the feed: the window has been polling that feed the whole time,
+    /// so it never learned the session went away as anything but a banner —
+    /// and it learns the session is back the same way, by the picture moving
+    /// again.
+    fn revive_parked_view(&mut self, peer: NodeId, role: Role, grants: Grants) {
+        let Some(mut state) = self.parked_view.take().map(|parked| parked.state) else {
+            return;
+        };
+        let tag = self.label_of(&peer);
+        // The dial that brought the session back recorded the intent again
+        // (ADR 0101), and it is answered here rather than acted on: this
+        // window was built for one kind of session and its URL cannot change,
+        // so the window is what decides which kind came back.
+        self.pending_terminal_only.remove(&peer);
+        // The feed's own bitstream, not a new one: this window has been
+        // polling that queue all along, and `park_view` already told it the
+        // stream broke, so it is waiting for exactly the intra frame the
+        // re-dialed media connection will open with (ADR 0058).
+        let bitstream = self
+            .view_feeds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&tag)
+            .map(|feed| Arc::clone(&feed.bitstream));
+        let dialer = self.host_dialers.get(&peer).cloned();
+        state.role = role;
+        state.grants = grants;
+        state.input.store(grants.input, Ordering::Relaxed);
+        state.task = match (dialer, bitstream) {
+            (Some(dialer), Some(bitstream)) if !state.terminal_only => Some(spawn_media_receiver(
+                MediaTarget {
+                    dialer,
+                    peer,
+                    reports: self.reports_tx.clone(),
+                    tag: tag.clone(),
+                    worker: None,
+                    bitstream,
+                    connection_cell: Arc::clone(&state.media_connection),
+                },
+                Arc::clone(&state.slot_tx),
+            )),
+            _ => None,
+        };
+        if state.task.is_none() && !state.terminal_only {
+            // No address to dial media over, and no feed to dial it into.
+            // The session is back but its picture is not, and the window
+            // saying "reconnecting" over a frozen frame for good would be a
+            // lie — the one status the pipeline itself cannot report.
+            tracing::warn!(peer = %tag, "no remembered address for this host: the picture cannot come back");
+            self.parked_view = Some(ParkedView { peer, state });
+            self.close_parked_view();
+            return;
+        }
+        if state.terminal_only {
+            // Nothing will ever move a terminal window's status off
+            // `Reconnecting`: it has no media task, and never had one
+            // (ADR 0101).
+            state
+                .slot_tx
+                .send_modify(|slot| slot.status = ViewStatus::Waiting);
+        }
+        tracing::info!(
+            peer = %tag,
+            input = grants.input,
+            "the session came back into the window it left"
+        );
+        self.views.insert(peer, state);
+        self.rebuild_labels_and_snapshot();
+        // The same entry in `self.views` that justified the clipboard watcher
+        // before the link went away justifies it again now
+        // (docs/bugs/10-clipboard-auto.md #1).
+        self.refresh_clipboard_watch();
+    }
+
+    /// Guest side: closes a parked window for good (docs/bugs/22 task 2;
+    /// ADR 0105).
+    ///
+    /// The history row was already written when it was parked, so there is
+    /// nothing to remember here that is not remembered: this is only the
+    /// window and the feed behind it.
+    fn close_parked_view(&mut self) {
+        let Some(parked) = self.parked_view.take() else {
+            return;
+        };
+        self.view_feeds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.label_of(&parked.peer));
+        drop(parked.state.slot);
+        self.windows.close(&parked.state.label);
+        tracing::info!(
+            peer = %self.label_of(&parked.peer),
+            "the session did not come back; the view window closed"
+        );
+        self.refresh_clipboard_watch();
+    }
+
+    /// Guest side: the invariant of [`ParkedView`], enforced once rather than
+    /// argued about at each site (docs/bugs/22 task 2; ADR 0105).
+    ///
+    /// A parked window is a window something is still trying to fill. The
+    /// moment no wait is running for its host — the wait gave up, the user
+    /// went somewhere else, the host answered and then said nothing — it is a
+    /// frozen picture nobody is coming back to, and it closes.
+    fn close_parked_view_without_a_wait(&mut self) {
+        let waited_for = self.reconnect_wait.as_ref().map(|wait| wait.peer);
+        if self
+            .parked_view
+            .as_ref()
+            .is_some_and(|parked| waited_for != Some(parked.peer))
+        {
+            self.close_parked_view();
+        }
     }
 
     /// Drops this node's control connection to `peer` outright, citing the
@@ -9343,13 +9582,15 @@ impl Actor {
                 tracing::info!(peer = %tag, ?role, "remote host granted consent");
                 // A resumed session answers with the grant it still holds,
                 // and that is the end of the wait it was resumed out of
-                // (ADR 0089).
+                // (ADR 0089). `finish`, not `stop`: `start_view` below is
+                // about to draw this grant into the window that wait parked
+                // (ADR 0105).
                 if self
                     .reconnect_wait
                     .as_ref()
                     .is_some_and(|wait| wait.peer == peer)
                 {
-                    self.stop_reconnect_wait();
+                    self.finish_reconnect_wait();
                 }
                 let _ = self.notify.send(ActorNotification::ConsentGranted { role });
                 // Reacted to here rather than through the notification stream:
@@ -10005,21 +10246,29 @@ impl Actor {
         if !dialing_again {
             self.settle_connect(peer, ConnectPhase::Failed);
         }
-        // `stop_view` is what writes the history row this wait reads its code
-        // out of, so the row exists by the time anything below looks for it.
-        self.stop_view(peer);
-        if was_watching {
-            let host_tag = host_tag(&peer);
-            // Resume first, for any host new enough to honour it (§10;
-            // ADR 0089); ADR 0084's wait for a new session only for a host
-            // this node may dial unasked.
-            let resume = closed
-                .as_ref()
-                .filter(|handle| handle.peer_minor >= SESSION_RESUME_MINOR)
-                .map(|handle| handle.session_id);
-            if resume.is_some() || self.may_auto_reconnect(&host_tag) {
-                self.start_reconnect_wait(peer, host_tag, resume, was_terminal_only);
-            }
+        // Resume first, for any host new enough to honour it (§10; ADR 0089);
+        // ADR 0084's wait for a new session only for a host this node may
+        // dial unasked. Read here rather than below because it is also what
+        // decides whether the window closes (ADR 0105).
+        let resume = closed
+            .as_ref()
+            .filter(|handle| handle.peer_minor >= SESSION_RESUME_MINOR)
+            .map(|handle| handle.session_id);
+        // A wait about to start is a window about to be filled again, so the
+        // window stays where it is, under a "reconnecting" banner, instead of
+        // vanishing and reappearing twelve seconds later (docs/bugs/22 task 2;
+        // ADR 0105). Either branch writes the history row this wait reads its
+        // code out of, so the row exists by the time anything below looks for
+        // it.
+        let waiting =
+            was_watching && (resume.is_some() || self.may_auto_reconnect(&host_tag(&peer)));
+        if waiting {
+            self.park_view(peer);
+        } else {
+            self.stop_view(peer);
+        }
+        if waiting {
+            self.start_reconnect_wait(peer, host_tag(&peer), resume, was_terminal_only);
         } else if resume_refused {
             self.on_resume_refused(peer);
         } else if resuming_over_this {
@@ -10049,6 +10298,12 @@ impl Actor {
             }
         }
         tracing::info!(peer = %label, "peer disconnected");
+        // A window is parked only while something is still trying to fill it
+        // (ADR 0105). The case this catches is the host that answered a wait's
+        // dial, ended the wait, and then dropped without granting anything:
+        // nobody is coming back, and a frozen picture with no wait behind it
+        // is a window that would never close by itself.
+        self.close_parked_view_without_a_wait();
         self.refresh_clipboard_watch();
         let _ = self.notify.send(ActorNotification::Disconnected);
         self.rebuild_labels_and_snapshot();
@@ -12989,6 +13244,23 @@ impl Actor {
     /// as a disconnect and answers with its own `remove_viewer`.
     fn on_revoke(&mut self, label: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
+        // The window is up but its session is away, being waited for
+        // (ADR 0105). Closing it is the user saying they are done waiting,
+        // which is the third of the three ways a parked window ends — and the
+        // only one that comes from the person in front of it.
+        if self
+            .parked_view
+            .as_ref()
+            .is_some_and(|parked| parked.peer == peer)
+        {
+            tracing::info!(peer = %label, "leaving a session that was still coming back");
+            // Takes the wait down and the window with it, in that order.
+            self.stop_reconnect_wait();
+            self.settle_connect(peer, ConnectPhase::Idle);
+            self.drop_file_state(peer);
+            self.host_dialers.remove(&peer);
+            return Ok(());
+        }
         if self.views.contains_key(&peer) {
             tracing::info!(peer = %label, "leaving a session from the view window");
             self.settle_connect(peer, ConnectPhase::Idle);
@@ -13965,6 +14237,28 @@ impl Actor {
     /// still fires, finds a generation that no longer matches, and dials
     /// nothing.
     fn stop_reconnect_wait(&mut self) {
+        self.end_reconnect_wait();
+        // Nothing is going to fill that window now (ADR 0105). This is the
+        // "gave up" funnel — the host refused, the user called it off, the
+        // ceiling was reached, the form moved somewhere else — and it is the
+        // one place a parked window has to close.
+        self.close_parked_view();
+    }
+
+    /// Guest side: ends the wait because it *worked* (ADR 0084, ADR 0089;
+    /// ADR 0105).
+    ///
+    /// The same thing as [`stop_reconnect_wait`](Self::stop_reconnect_wait)
+    /// but for the window: a host that is answering right now is about to
+    /// grant, and `start_view` puts that grant back into the very window this
+    /// wait parked. Closing it here would close it a few milliseconds before
+    /// the picture came back.
+    fn finish_reconnect_wait(&mut self) {
+        self.end_reconnect_wait();
+    }
+
+    /// The bookkeeping both share.
+    fn end_reconnect_wait(&mut self) {
         if self.reconnect_wait.take().is_some() {
             self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         }
@@ -14388,8 +14682,22 @@ impl Actor {
         // no business dialing it again unasked if the answer is no (ADR 0084).
         // A resume is the exception: the answer is a `ConsentGrant` or a
         // closed connection, and the wait is what reads either (ADR 0089).
+        //
+        // Which of the two endings this is decides what happens to the window
+        // that wait parked (ADR 0105). A host that is answering right now is
+        // the one whose picture is frozen on it, and its next `ConsentGrant`
+        // goes back into that window; a dial at any *other* host is the user
+        // leaving this wait behind, and the window goes with it.
         if !resuming {
-            self.stop_reconnect_wait();
+            if self
+                .reconnect_wait
+                .as_ref()
+                .is_some_and(|wait| wait.peer == peer)
+            {
+                self.finish_reconnect_wait();
+            } else {
+                self.stop_reconnect_wait();
+            }
         }
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
@@ -15959,6 +16267,7 @@ pub fn spawn_actor_with(
         reboot_generation: 0,
         reconnect_wait: None,
         reconnect_wait_generation: 0,
+        parked_view: None,
         connect_retry: None,
         connect_retry_generation: 0,
         parked_sessions: std::collections::HashMap::new(),
@@ -16060,7 +16369,7 @@ mod tests {
 
     use super::*;
     use crate::clipboard_os::testing::{SharedTestClipboard, test_clipboard};
-    use crate::view::DetachedViewWindows;
+    use crate::view::{DetachedViewWindows, VIEW_FLAG_INPUT};
 
     /// Anything slower than this on loopback means the test is stuck.
     const TIMEOUT: Duration = Duration::from_secs(20);
@@ -20552,14 +20861,118 @@ mod tests {
             row.grants.recording,
             "a grant the host gave before the drop is still given after it"
         );
-        wait_until("the guest's window did not open again", || {
-            recorder.opened().len() == 2
-        })
-        .await;
         wait_until("the resumed guest is not a viewer again", || {
             viewers(&host_capture) == 1
         })
         .await;
+        // ADR 0105, and the half of this ADR 0089 test that used to assert
+        // the opposite: the window a session comes back into is the window it
+        // left. One `open` for the whole thing and no `close` at all — the
+        // picture never went away, so there was never a second window to put
+        // it back into.
+        assert_eq!(
+            recorder.opened().len(),
+            1,
+            "a resumed session must not open a second window"
+        );
+        assert!(
+            recorder.closed().is_empty(),
+            "a resumed session must not close the window it is resuming into"
+        );
+    }
+
+    /// ADR 0105: the other half, where the resume never lands. The window
+    /// stays up for as long as something is trying to fill it — last picture
+    /// on the canvas, "reconnecting" over it, input taken away — and it goes
+    /// when the person in front of it says they are done waiting.
+    ///
+    /// The host here is a bare endpoint that answers the first handshake and
+    /// nothing after it, so the resume has nowhere to land and the wait can
+    /// be inspected at leisure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_window_outlives_a_dropped_link_and_closes_when_the_wait_is_called_off() {
+        use lumepeer_core::protocol::MessageKind;
+
+        async fn next_control(endpoint: &PeerEndpoint) -> PeerConnection {
+            loop {
+                if let Ok(connection) = endpoint.accept().await.unwrap()
+                    && connection.alpn() == lumepeer_net::ALPN_CONTROL
+                {
+                    return connection;
+                }
+            }
+        }
+
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::FullControl,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+        let (mut session, _hello) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed");
+        session
+            .send(MessageKind::ConsentGrant(Role::FullControl))
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        wait_until("the view window never opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (window, peer_label, input, _terminal) = recorder.opened().remove(0);
+        assert!(input, "a full-control session arms its window for input");
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+
+        assert!(
+            recorder.closed().is_empty(),
+            "a session being resumed must not take its window down"
+        );
+        let frame = guest
+            .view_frame(&peer_label, 0)
+            .expect("a parked window still has a feed to poll");
+        assert_eq!(
+            frame[0],
+            ViewStatus::Reconnecting.code(),
+            "the banner over the last picture says the session is coming back"
+        );
+        assert_eq!(
+            frame[1] & VIEW_FLAG_INPUT,
+            0,
+            "a picture nothing is behind takes no input"
+        );
+
+        // The one ending that comes from the person in front of the window.
+        guest.connect_cancel().await.unwrap();
+        wait_until("the window outlived the wait that was filling it", || {
+            recorder.closed() == vec![window.clone()]
+        })
+        .await;
+        assert!(
+            guest.view_frame(&peer_label, 0).is_err(),
+            "a closed window keeps no feed"
+        );
     }
 
     /// ADR 0089: a resume claim from a key that holds no session is closed
