@@ -28,9 +28,11 @@ export type ConnectPhase =
   | 'awaiting_consent'
   | 'awaiting_credentials'
   // The host went away and this node is waiting for it to come back, rather
-  // than for it to answer (ADR 0084). Reached only for a device the user
-  // marked trusted and whose device password is remembered; for every other
-  // host the phase goes to `idle` and the button is what is left.
+  // than for it to answer (ADR 0084). Reached for any host whose session this
+  // node was in, once §10's resume window has passed without it coming back
+  // (ADR 0106). What the wait asks for from here is a *new* session, so
+  // somebody is asked when it lands — the address book's "reconnect on its
+  // own" is only about whether that somebody is asked at all.
   | 'waiting_for_host'
   // The link to a host dropped mid-session and this node is getting that
   // same session back, inside the reconnect window (§10; ADR 0089). Nothing
