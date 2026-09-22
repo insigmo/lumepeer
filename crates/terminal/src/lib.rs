@@ -12,7 +12,7 @@
 //! and `apps/desktop/src-tauri` carries no `unsafe` at all by policy — it
 //! delegates every such need to a compiled crate (`fs4`, `keyring`,
 //! `lumepeer-service`). `GetShellWindow`/`DuplicateTokenEx`/
-//! `CreateProcessAsUserW` and the `ConPTY` handles have no safe bindings, so
+//! `CreateProcessWithTokenW` and the `openpty` pair have no safe bindings, so
 //! they live here. It also means `cargo test -p lumepeer-terminal` runs
 //! without the Tauri build script, the `requireAdministrator` manifest or the
 //! sidecar binaries in the way.
@@ -22,9 +22,12 @@
 //! **The shell gets the desktop user's privileges, never this process's.**
 //! On Windows the client runs elevated (ADR 0057), so the drop is explicit:
 //! the token comes from the process behind `GetShellWindow()`, which is
-//! Explorer running unelevated as the person at the machine. On Unix the
-//! client already *is* that person — except when it is `root`, which is the
-//! one case where the sentence would be false, and is refused for the same
+//! Explorer running unelevated as the person at the machine, and the shell is
+//! started on the far side of it by `crates/terminal-worker` — because the one
+//! call an elevated process may make with somebody else's token cannot carry a
+//! pseudo-console, and the one that can is refused to it (ADR 0102). On Unix
+//! the client already *is* that person — except when it is `root`, which is
+//! the one case where the sentence would be false, and is refused for the same
 //! reason. Where the drop cannot be made, [`ShellError::CannotDropPrivileges`]
 //! comes back and **no process is created**. There is no fallback: an
 //! administrator shell by accident is the outcome this crate exists to
@@ -47,6 +50,8 @@
 #![warn(missing_docs)]
 
 use std::io::{Read, Write};
+
+pub mod worker_protocol;
 
 #[cfg(unix)]
 mod unix;
@@ -85,11 +90,12 @@ pub enum ShellError {
     /// was not run at all.
     ///
     /// On Windows: the elevated client found no unelevated desktop session to
-    /// take a token from, or the spawn with that token was refused. On Unix:
-    /// the client is running as `root`, and "drop to whom" is a decision
-    /// nobody made.
+    /// take a token from, or the worker could not be started with that token
+    /// (ADR 0102). On Unix: the client is running as `root`, and "drop to
+    /// whom" is a decision nobody made.
     CannotDropPrivileges,
-    /// There is no shell to run, or the pseudo-terminal could not be created.
+    /// There is no shell to run, the pseudo-terminal could not be created, or
+    /// on Windows the worker that owns it was never staged beside the client.
     Unavailable,
 }
 

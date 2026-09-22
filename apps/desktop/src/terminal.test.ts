@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SUPPORTED_LOCALES, t } from './i18n';
 import {
   decodeTerminalPoll,
+  mountTerminal,
   terminalChrome,
   TerminalSession,
   type TerminalCommands,
@@ -20,6 +21,21 @@ import {
   type TerminalScreen,
 } from './terminal';
 
+// `mountTerminal` loads the emulator itself, and a real `xterm.js` in jsdom
+// would measure a font that is not there. These six calls are the whole of
+// what it asks of one, so the stand-in is the whole of what it needs.
+vi.mock('@xterm/xterm', () => ({
+  Terminal: class {
+    cols = 80;
+    rows = 24;
+    open(): void {}
+    write(): void {}
+    writeln(): void {}
+    onData(): void {}
+    onResize(): void {}
+    dispose(): void {}
+  },
+}));
 const PEER = 'guest-ab12';
 
 const EVENT_OUTPUT = 0;
@@ -230,6 +246,89 @@ describe('a refusal', () => {
   });
 });
 
+// §18 item 1: the Close button. It is the only way out of a panel whose host
+// said no, so it is never disabled and it closes the terminal rather than
+// merely ending a shell that may never have started.
+describe('the close button', () => {
+  let root: HTMLElement;
+  let chrome: HTMLElement;
+
+  beforeEach(() => {
+    root = document.createElement('div');
+    chrome = document.createElement('div');
+    document.body.append(root, chrome);
+  });
+
+  afterEach(() => {
+    root.remove();
+    chrome.remove();
+  });
+
+  function button(): HTMLButtonElement | null {
+    return chrome.querySelector<HTMLButtonElement>('[data-testid="terminal-close"]');
+  }
+
+  const STATUSES = ['idle', 'opening', 'open', 'closed', 'refused'] as const;
+
+  it('is active in every state the panel can be in', () => {
+    for (const status of STATUSES) {
+      render(terminalChrome(status, 'en', () => {}), chrome);
+      expect(button()?.disabled, `disabled while ${status}`).toBe(false);
+    }
+  });
+
+  // The case the person actually hit: the host refused, no shell was ever
+  // named, and the button is the only thing left that can dismiss the panel.
+  it('closes the terminal after a refusal, with no shell to end', async () => {
+    const cmds = commands();
+    const onClose = vi.fn();
+    const controls = await mountTerminal(root, chrome, 'en', PEER, onClose, cmds);
+    cmds.poll.mockResolvedValue(body([{ shell: 0, event: 5 }]));
+
+    await vi.waitFor(() => {
+      expect(chrome.querySelector('[data-testid="terminal-state"]')?.textContent?.trim()).toBe(
+        t('en', 'terminal.refusedHeading'),
+      );
+    });
+    button()?.click();
+    await vi.waitFor(() => {
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(cmds.close).not.toHaveBeenCalled();
+    controls.stop();
+  });
+
+  // ADR 0079: the shell dies on the host before this side stops looking at
+  // it, never the other way round.
+  it('ends the shell on the host before it closes the terminal', async () => {
+    const order: string[] = [];
+    const cmds = commands();
+    cmds.close.mockImplementation(() => {
+      order.push('terminal_close');
+      return Promise.resolve();
+    });
+    const onClose = vi.fn(() => {
+      order.push('onClose');
+    });
+    const controls = await mountTerminal(root, chrome, 'en', PEER, onClose, cmds);
+    cmds.poll.mockResolvedValue(body([{ shell: 11, event: EVENT_OPENED }]));
+
+    await vi.waitFor(() => {
+      expect(button()?.disabled).toBe(false);
+      expect(chrome.querySelector('[data-testid="terminal-state"]')?.textContent?.trim()).toBe(
+        t('en', 'terminal.running'),
+      );
+    });
+    button()?.click();
+    await vi.waitFor(() => {
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+    expect(cmds.close).toHaveBeenCalledWith(PEER, 11);
+    expect(order).toEqual(['terminal_close', 'onClose']);
+    controls.stop();
+  });
+});
+
 describe('accessibility', () => {
   const LAYOUT_DEPENDENT_RULES = ['color-contrast', 'target-size'];
   let container: HTMLElement;
@@ -256,11 +355,4 @@ describe('accessibility', () => {
       expect(button?.disabled).toBe(false);
     });
   }
-
-  it('cannot end a shell that is not running', () => {
-    render(terminalChrome('idle', 'en', () => {}), container);
-    expect(
-      container.querySelector<HTMLButtonElement>('[data-testid="terminal-close"]')?.disabled,
-    ).toBe(true);
-  });
 });

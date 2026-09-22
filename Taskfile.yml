@@ -175,6 +175,12 @@ tasks:
       # explanation rather than holding privileges for nothing.
       - cargo build --release -p lumepeer-service --target {{.TARGET}}
       - cp target/{{.TARGET}}/release/lumepeer-service{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-service-{{.TARGET}}{{.EXT}}
+      # The unelevated pseudo-console of ADR 0102. Staged the same way and for
+      # the same reason as the two above: without it an installed Windows
+      # client finds no worker beside itself and refuses every shell a guest
+      # asks for, while a `cargo build` tree happens to work.
+      - cargo build --release -p lumepeer-terminal-worker --target {{.TARGET}}
+      - cp target/{{.TARGET}}/release/lumepeer-terminal-worker{{.EXT}} {{.DESKTOP_DIR}}/src-tauri/binaries/lumepeer-terminal-worker-{{.TARGET}}{{.EXT}}
 
   build:client:linux-amd64:
     desc: Build the Linux amd64 client (.deb + .rpm)

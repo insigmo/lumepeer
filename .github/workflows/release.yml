@@ -244,12 +244,14 @@ jobs:
             Windows) EXE=.exe ;;
             *) EXE= ;;
           esac
-          # `lumepeer-service` is the privileged helper of ADR 0043. It is
-          # staged for every target because `externalBin` is not per-platform;
-          # off Windows the binary exits with an explanation, because there is
-          # no privileged action there for a daemon to hold.
+          # `lumepeer-service` is the privileged helper of ADR 0043 and
+          # `lumepeer-terminal-worker` the unelevated pseudo-console of
+          # ADR 0102. Both are staged for every target because `externalBin`
+          # is not per-platform; off Windows each exits with an explanation,
+          # because there is no privileged action there for a daemon to hold
+          # and no drop there for a worker to be on the far side of.
           mkdir -p apps/desktop/src-tauri/binaries
-          for BIN in lumepeer-decoder-worker lumepeer-service; do
+          for BIN in lumepeer-decoder-worker lumepeer-service lumepeer-terminal-worker; do
             cargo build --release -p "${BIN}" --target ${{ matrix.target }}
             cp "target/${{ matrix.target }}/release/${BIN}${EXE}"                "apps/desktop/src-tauri/binaries/${BIN}-${{ matrix.target }}${EXE}"
           done

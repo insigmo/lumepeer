@@ -32,7 +32,8 @@
     "targets": "all",
     "externalBin": [
       "binaries/lumepeer-decoder-worker",
-      "binaries/lumepeer-service"
+      "binaries/lumepeer-service",
+      "binaries/lumepeer-terminal-worker"
     ],
     "icon": [
       "icons/32x32.png",

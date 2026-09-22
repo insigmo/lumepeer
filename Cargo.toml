@@ -10,6 +10,7 @@ members = [
     "crates/guestkeys",
     "crates/service",
     "crates/terminal",
+    "crates/terminal-worker",
     "apps/desktop/src-tauri",
     "services/broker",
     "tests/integration",
@@ -32,6 +33,7 @@ lumepeer-runtime = { path = "crates/runtime" }
 lumepeer-host = { path = "crates/host" }
 lumepeer-service = { path = "crates/service" }
 lumepeer-terminal = { path = "crates/terminal" }
+lumepeer-terminal-worker = { path = "crates/terminal-worker" }
 lumepeer-guestkeys = { path = "crates/guestkeys" }
 lumepeer-decoder-worker = { path = "crates/decoder-worker" }
 

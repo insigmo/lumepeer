@@ -1,0 +1,37 @@
+[package]
+name = "lumepeer-terminal-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "Lumepeer unelevated pseudo-console worker (ADR 0102)"
+
+[[bin]]
+name = "lumepeer-terminal-worker"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The frame codec, shared with the client end so the two cannot drift.
+lumepeer-terminal.workspace = true
+
+# ConPTY, the process-thread attribute list and the job object. Same version
+# the rest of the workspace resolves to, so no second `windows` tree appears.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
+# The end-to-end test drives the client half, which is the other side of the
+# same conversation. Nothing in the shipped worker depends on it.
+[dev-dependencies]
+lumepeer-terminal.workspace = true

@@ -286,10 +286,36 @@ async function openTerminal(): Promise<void> {
     return;
   }
   try {
-    terminal ??= await mountTerminal(terminalScreen, terminalChrome, locale, peer);
+    terminal ??= await mountTerminal(terminalScreen, terminalChrome, locale, peer, closeTerminal);
     await terminal.start();
   } catch (error) {
     console.error('the terminal could not be opened:', error);
+  }
+}
+
+/**
+ * What the panel's Close button does once the shell has been ended for it.
+ *
+ * Which of the two this is depends on what the window is, which is why the
+ * panel asks rather than deciding (ADR 0101). A window that is a shell and
+ * nothing else has nothing left to show, so it goes; a window with a picture
+ * in it keeps the picture and loses the strip along the bottom — exactly what
+ * the toolbar's own terminal button does in this direction, redraw included,
+ * so the button stops claiming the panel is open. Opening it again raises a
+ * fresh shell through `openTerminal`.
+ */
+function closeTerminal(): void {
+  if (terminalOnly) {
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) => getCurrentWindow().close())
+      .catch((error: unknown) => {
+        console.error('the terminal window could not be closed:', error);
+      });
+    return;
+  }
+  if (terminalPanel) {
+    terminalPanel.hidden = true;
+    toolbar?.redraw();
   }
 }
 

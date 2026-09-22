@@ -32,17 +32,16 @@ nix = { version = "0.28", features = ["user"] }
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.28", features = ["signal", "process"] }
 
-# ConPTY, and the token drop it exists to make possible (ADR 0079 decision 2).
-# `CreatePseudoConsole`, the process-thread attribute list,
-# `CreateProcessAsUserW` and `DuplicateTokenEx` have no safe bindings; same
-# major version `lumepeer-service` already resolves to, so no second `windows`
-# tree appears.
+# The token drop of ADR 0079 decision 2, and the worker launch of ADR 0102.
+# `DuplicateTokenEx`, `CreateProcessWithTokenW` and the token queries have no
+# safe bindings; the pseudo-console itself is the worker's, so
+# `Win32_System_Console` is not here. Same major version `lumepeer-service`
+# already resolves to, so no second `windows` tree appears.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
-    "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",

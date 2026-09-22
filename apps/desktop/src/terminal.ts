@@ -313,7 +313,13 @@ export function terminalStatusKey(status: TerminalStatus): TranslationKey {
 
 /**
  * The panel's chrome: a heading, a line saying what is happening, and the one
- * button that ends the shell.
+ * button that closes the terminal.
+ *
+ * The button is never disabled. What the panel is doing is what `term-state`
+ * says; a button greyed out because the host refused is a button that cannot
+ * dismiss the refusal, which is the state a person most wants out of. What
+ * `onClose` does is the window's decision, not this function's — see
+ * {@link mountTerminal}.
  *
  * The emulator itself is not in here — `xterm.js` owns its own element and
  * would be destroyed by a re-render, so the host element is created once and
@@ -334,7 +340,6 @@ export function terminalChrome(
         type="button"
         class="term-close"
         data-testid="terminal-close"
-        ?disabled=${status !== 'open'}
         @click=${onClose}
       >
         ${t(locale, 'terminal.close')}
@@ -365,12 +370,20 @@ export interface TerminalControls {
  * The emulator is loaded on first use rather than with the window: a session
  * that never opens a terminal should not pay for one, and this is a view
  * window whose job is the picture.
+ *
+ * `onClose` is what the Close button does once the shell is gone — close the
+ * window, or hide the panel, depending on which of the two this window is
+ * (ADR 0101). The choice belongs to the window and the shell belongs here, so
+ * the order is fixed here and only the second half is handed out: the host is
+ * told to end the shell first, and a shell left running on somebody else's
+ * machine by a window that closed is the one outcome ADR 0079 may not produce.
  */
 export async function mountTerminal(
   root: HTMLElement,
   chrome: HTMLElement,
   locale: Locale,
   peer: string,
+  onClose: () => void,
   commands: TerminalCommands = tauriTerminalCommands,
 ): Promise<TerminalControls> {
   const { Terminal } = await import('@xterm/xterm');
@@ -391,7 +404,14 @@ export async function mountTerminal(
   const draw = (): void => {
     render(
       terminalChrome(session.status, locale, () => {
-        void session.close().catch(reportFailure('the shell could not be closed'));
+        // `onClose` runs even when the close failed. The call has been made
+        // either way, the session's own end kills the shell again behind it,
+        // and a button that does nothing because the host was unreachable is
+        // the state this whole change exists to remove.
+        void session
+          .close()
+          .catch(reportFailure('the shell could not be closed'))
+          .then(onClose);
       }),
       chrome,
     );
