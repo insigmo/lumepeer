@@ -29,6 +29,11 @@ pub use pipewire_stream::DmaBuf;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
+// Compiled on every platform, not only the two above: it is a table of plain
+// integers, and the host this workspace is usually built on is not a Mac
+// (ADR 0104).
+pub mod macos_keys;
+
 #[cfg(all(
     target_os = "linux",
     not(target_os = "android"),

@@ -134,6 +134,14 @@ lumepeer-media = { workspace = true, features = [
 # already depends on.
 x11-clipboard.workspace = true
 percent-encoding.workspace = true
+# Loads the ayatana-appindicator library before `tray-icon` reaches for it, so
+# a desktop without it gets a warning instead of the panic that takes the whole
+# start down (docs/bugs/19-startup-autostart-and-linux-tray.md #2). Picked over
+# the `libloading` that `libappindicator-sys` itself uses because its
+# `Library::open` is a safe function and this crate is
+# `#![forbid(unsafe_code)]`; `tao` already pulls this exact version into every
+# Linux build, so no new dependency enters `Cargo.lock`.
+dlopen2 = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `audio-capture-screencapturekit` sits here rather than only in the

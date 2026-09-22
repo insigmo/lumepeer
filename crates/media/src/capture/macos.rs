@@ -1505,7 +1505,35 @@ mod screen_capture_kit {
             Ok(())
         }
 
-        fn key(logical: u32, pressed: bool) -> Result<()> {
+        /// Presses what the guest asked for, by position or by character.
+        ///
+        /// The order is the one `WindowsInjector::key` and `X11Injector::key`
+        /// already use, and it is the whole decision (ADR 0065, ADR 0104):
+        ///
+        /// 1. **By position, whenever there is one and the character is not
+        ///    the point.** That is every keystroke under Cmd, Ctrl or Option
+        ///    — a command is addressed to a key, and `Cmd+C` is
+        ///    `kVK_Command` plus `kVK_ANSI_C`, not the letter 'c'. A host
+        ///    handed 'c' through `CGEventKeyboardSetUnicodeString` produces a
+        ///    stray character with Cmd held and no copy at all, and on a
+        ///    Cyrillic layout not even that. And it is every key that names
+        ///    itself rather than a character, which must go by position for a
+        ///    second reason: a browser reports `ctrlKey` on Ctrl's keydown
+        ///    and not on its keyup, so a rule reading the modifiers alone
+        ///    would press one modifier and release another.
+        /// 2. **By key code** when the guest sent no position for a key it
+        ///    named, which is every guest older than ADR 0065.
+        /// 3. **By character** for the rest, which is typing, so the letter
+        ///    the operator meant appears whatever layout the host is set to.
+        ///    Shift is not a chord modifier for exactly this reason: it
+        ///    *selects* a character rather than commanding with it.
+        fn key(logical: u32, scancode: u32, modifiers: u32, pressed: bool) -> Result<()> {
+            if let Some(vk) = crate::capture::macos_keys::key_code_at(scancode)
+                && (lumepeer_core::protocol::is_chord(modifiers)
+                    || lumepeer_core::protocol::names_a_key(logical))
+            {
+                return Self::key_vk(vk, pressed);
+            }
             if let Some(vk) = named_key_vk(logical) {
                 return Self::key_vk(vk, pressed);
             }
@@ -1517,7 +1545,7 @@ mod screen_capture_kit {
             // is the honest answer, and the error says which key it was.
             if (0xe000..=0xe1ff).contains(&logical) || logical == 0 {
                 return Err(MediaError::InputUnavailable(format!(
-                    "logical key {logical} has no macOS key code"
+                    "logical key {logical} has no macOS key code, and scancode {scancode} names no key this keyboard has"
                 )));
             }
             let ch = char::from_u32(logical).ok_or_else(|| {
@@ -1610,7 +1638,7 @@ mod screen_capture_kit {
                     if event.logical >= POINTER_BUTTON_LOGICAL_BASE {
                         self.button(event.logical, pressed)
                     } else {
-                        Self::key(event.logical, pressed)
+                        Self::key(event.logical, event.scancode, event.modifiers, pressed)
                     }
                 }
             }

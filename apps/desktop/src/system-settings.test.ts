@@ -70,6 +70,29 @@ describe('system settings', () => {
     ).toBe(true);
   });
 
+  // Autostart is on from the first launch of an installed copy (ADR 0103),
+  // so a panel with a default of its own would draw a cleared box on exactly
+  // the machine where it is ticked. There is no default: the row is not there
+  // until the machine has said.
+  it('draws no autostart row until the machine has answered', async () => {
+    let answer = (_enabled: boolean): void => {};
+    commands.autostartStatus = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    mount();
+    await settle();
+    expect(container.querySelector('[data-testid="autostart-toggle"]')).toBeNull();
+
+    answer(true);
+    await settle();
+    expect(
+      (container.querySelector('[data-testid="autostart-toggle"]') as HTMLInputElement).checked,
+    ).toBe(true);
+  });
+
   it('turns autostart on and off through the core', async () => {
     mount();
     await settle();

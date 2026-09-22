@@ -53,7 +53,18 @@ export const tauriSystemCommands: SystemCommands = {
 
 interface State {
   loaded: boolean;
-  autostart: boolean;
+  /**
+   * What this machine does at sign-in, or `null` while `autostartStatus` has
+   * not answered yet.
+   *
+   * Deliberately not `false` until then. Autostart is on by default from the
+   * first launch onward (ADR 0103), so a `false` here would draw a cleared
+   * box on exactly the installation where the box is checked, and then tick
+   * it a frame later. The row waits for the answer instead — the panel keeps
+   * no default of its own, which is the same rule that makes the toggle read
+   * the machine on every render rather than remember a value.
+   */
+  autostart: boolean | null;
   autostartError: boolean;
   checking: boolean;
   checked: boolean;
@@ -65,7 +76,7 @@ interface State {
 
 const state: State = {
   loaded: false,
-  autostart: false,
+  autostart: null,
   autostartError: false,
   checking: false,
   checked: false,
@@ -85,7 +96,7 @@ export function onSystemStateChange(callback: () => void): void {
 /** Test seam: drops the panel's state between cases. */
 export function resetSystemSettings(): void {
   state.loaded = false;
-  state.autostart = false;
+  state.autostart = null;
   state.autostartError = false;
   state.checking = false;
   state.checked = false;
@@ -152,11 +163,12 @@ export function systemSettings(
         </select>
       </div>
 
+      ${state.autostart === null && !state.autostartError ? "" : html`
       <label class="system-row">
         <input
           type="checkbox"
           data-testid="autostart-toggle"
-          .checked=${state.autostart}
+          .checked=${state.autostart ?? false}
           @change=${(event: Event) => {
             const input = event.target as HTMLInputElement;
             const wanted = input.checked;
@@ -173,7 +185,7 @@ export function systemSettings(
                 // has nothing to write, and the box would keep showing what the
                 // user wanted instead of what this machine actually does.
                 state.autostartError = true;
-                input.checked = state.autostart;
+                input.checked = state.autostart ?? false;
                 onChange?.();
               },
             );
@@ -193,6 +205,7 @@ export function systemSettings(
             </p>`
           : ""
       }
+      `}
       <div class="system-row">
         <button
           type="button"

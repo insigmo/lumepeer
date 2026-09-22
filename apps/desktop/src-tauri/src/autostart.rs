@@ -23,8 +23,14 @@
 //! deleted, not blanked; the plist and the `.desktop` file are unlinked, not
 //! left with a disabled flag. Software you cannot uninstall from its own
 //! settings is what this app must not be.
+//!
+//! **On by default** (ADR 0103): the entry is written once, by the app
+//! itself, the first time an installed copy runs — never by an installer,
+//! which on Windows runs elevated and would write the wrong user's `HKCU`. A
+//! marker file records that this has happened, so the paragraph above stays
+//! true: off is off, and the next start does not argue.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Name the entry is written under, on every platform.
 const ENTRY_NAME: &str = "io.insigmo.lumepeer";
@@ -88,38 +94,91 @@ impl Autostart {
         }
     }
 
-    /// Runs the macOS-only startup reconciliation `.dmg`'s lack of any
-    /// install or removal hook makes necessary (docs/bugs/
-    /// 12-service-lifecycle.md task 4; D6):
+    /// Turns autostart on once, the first time this installed copy ever runs
+    /// (ADR 0103), and on macOS clears away a login item left pointing at an
+    /// app that is gone (docs/bugs/12-service-lifecycle.md task 4; D6).
     ///
-    /// - **Turns autostart on once**, the first time this installed copy
-    ///   ever runs — `.dmg` is a drag-install with no `postinst` to flip the
-    ///   switch the way deb/rpm can (`--enable-autostart` in `main.rs`).
-    /// - **Removes a stale entry.** The same lack of an uninstall hook means
-    ///   deleting the app from `/Applications` cannot clean up after itself;
-    ///   the next time *any* copy of this app starts, it checks whether the
-    ///   login item it finds still points at a file that exists, and removes
-    ///   it if not, rather than leaving a permanently broken one behind.
+    /// **Nothing but the app itself can arrange the default.** On Windows the
+    /// bundle is `installMode: perMachine`, so the NSIS hooks run elevated and
+    /// the `HKCU` they would write is the administrator's hive rather than the
+    /// hive of whoever later sits at the machine — the exact trap
+    /// `packaging/deb-postinst.sh` sidesteps with `su -l "$target_user"`. On
+    /// macOS `.dmg` is a drag-install with no hook of any kind. Only here is
+    /// "the current user" not a guess.
     ///
-    /// A no-op everywhere else: Windows and Linux both get autostart from a
-    /// hook that runs exactly once (the NSIS installer/uninstaller and
-    /// deb/rpm's postinst/prerm respectively), so neither needs a check on
-    /// every ordinary startup. Failures are logged and swallowed — this runs
-    /// on every launch and must never be the reason the app fails to open.
-    #[allow(
-        clippy::unused_self,
-        reason = "self is read on macOS only (platform::reconcile_first_launch); a no-op stub \
-                  on every other target so `main.rs` can call this unconditionally"
-    )]
+    /// **Exactly once.** A marker file records that a first launch has
+    /// happened, and while it exists this does nothing at all. That marker is
+    /// the whole difference between "on by default" and "cannot be turned
+    /// off": somebody who moves the switch to off (ADR 0042) is not argued
+    /// with at the next start.
+    ///
+    /// Failures are logged and swallowed — this runs on every launch and must
+    /// never be the reason the app fails to open.
     pub fn reconcile_first_launch(&self) {
+        // macOS only. A drag-install has no uninstall hook either, so a copy
+        // deleted from `/Applications` leaves a login item behind that nothing
+        // else will ever remove; deb/rpm's `prerm` and the NSIS uninstaller do
+        // this for the other two platforms.
         #[cfg(target_os = "macos")]
-        platform::reconcile_first_launch(self);
+        platform::remove_stale_login_item();
+
+        let Some(marker) = first_launch_marker() else {
+            tracing::warn!("no per-user directory: cannot tell whether this is a first launch");
+            return;
+        };
+        self.reconcile_with_marker(&marker);
     }
+
+    /// [`Self::reconcile_first_launch`] against a marker path handed to it, so
+    /// a test can give it one that is not this machine's own.
+    fn reconcile_with_marker(&self, marker: &Path) {
+        let Some(exe) = self.exe.as_deref() else {
+            return;
+        };
+        if marker.exists() {
+            return;
+        }
+        if !platform::is_enabled()
+            && let Err(error) = platform::enable(exe)
+        {
+            tracing::warn!(%error, "could not turn on autostart at first launch");
+        }
+        // On a first run the directory this lives in may not exist yet:
+        // nothing has been written into it.
+        if let Some(parent) = marker.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(%error, "could not create {}", parent.display());
+        }
+        if let Err(error) = std::fs::write(marker, b"") {
+            tracing::warn!(%error, "could not record that first launch ran");
+        }
+    }
+}
+
+/// Where the "first launch already ran" marker lives.
+///
+/// **The macOS path does not move.** Installed copies already have one next to
+/// the login item, and reading a marker from a new path would look exactly
+/// like a machine that has never run this app — turning autostart back on for
+/// everybody who deliberately turned it off. The other two platforms have no
+/// `LaunchAgents` directory to put it in and never had a marker to keep, so
+/// theirs goes where the app keeps the rest of its per-user files.
+fn first_launch_marker() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        return Some(
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{ENTRY_NAME}.first-launch")),
+        );
+    }
+    lumepeer_runtime::config::config_dir().map(|dir| dir.join("autostart-first-launch"))
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{DISPLAY_NAME, ENTRY_NAME};
+    use super::DISPLAY_NAME;
     use std::path::Path;
 
     use winreg::RegKey;
@@ -161,10 +220,6 @@ mod platform {
             Err(error) => Err(format!("cannot remove the startup entry: {error}")),
         }
     }
-
-    /// Unused off the other platforms; kept so every arm has the same shape.
-    #[allow(dead_code, reason = "the name is used by the other platform arms")]
-    const _: &str = ENTRY_NAME;
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -257,20 +312,6 @@ mod platform {
         )
     }
 
-    /// Where the "first launch already ran" marker lives, next to the plist
-    /// itself. Only meaningful on macOS — Linux enables and disables
-    /// autostart from packaging hooks instead (task 4), so it never needs
-    /// this file, and never writes one.
-    #[cfg(target_os = "macos")]
-    fn first_launch_marker() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").map(PathBuf::from)?;
-        Some(
-            home.join("Library")
-                .join("LaunchAgents")
-                .join(format!("{ENTRY_NAME}.first-launch")),
-        )
-    }
-
     /// Pulls the path back out of the `<string>` inside `plist`'s
     /// `ProgramArguments` array.
     ///
@@ -285,45 +326,27 @@ mod platform {
         Some(after_array[start..start + end].trim())
     }
 
+    /// Removes a login item whose target no longer exists — most plausibly
+    /// this exact app, deleted from `/Applications` by dragging it to the
+    /// Trash, with nothing left behind to have disabled it first — rather
+    /// than leaving it to fail silently at every future login.
+    ///
     /// See [`super::Autostart::reconcile_first_launch`].
     #[cfg(target_os = "macos")]
-    pub fn reconcile_first_launch(autostart: &super::Autostart) {
-        let Some(exe) = autostart.exe.as_deref() else {
+    pub fn remove_stale_login_item() {
+        let Some(path) = entry_path() else {
             return;
         };
-
-        // A login item whose target no longer exists — most plausibly this
-        // exact app, deleted from `/Applications` by dragging it to the
-        // Trash, with nothing left behind to have disabled it first — is
-        // removed rather than left to fail silently at every future login.
-        if let Some(path) = entry_path() {
-            let stale = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|body| recorded_target(&body).map(str::to_owned))
-                .is_some_and(|target| !Path::new(&target).exists());
-            if stale {
-                tracing::warn!(
-                    "the login item points at a file that no longer exists; removing it"
-                );
-                if let Err(error) = disable() {
-                    tracing::warn!(%error, "could not remove the stale login item");
-                }
-            }
-        }
-
-        let Some(marker) = first_launch_marker() else {
-            return;
-        };
-        if marker.exists() {
+        let stale = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|body| recorded_target(&body).map(str::to_owned))
+            .is_some_and(|target| !Path::new(&target).exists());
+        if !stale {
             return;
         }
-        if !is_enabled()
-            && let Err(error) = enable(exe)
-        {
-            tracing::warn!(%error, "could not turn on autostart at first launch");
-        }
-        if let Err(error) = std::fs::write(&marker, b"") {
-            tracing::warn!(%error, "could not record that first launch ran");
+        tracing::warn!("the login item points at a file that no longer exists; removing it");
+        if let Err(error) = disable() {
+            tracing::warn!(%error, "could not remove the stale login item");
         }
     }
 
@@ -382,5 +405,34 @@ mod tests {
         }
         assert!(autostart.set(false).is_ok());
         assert!(!autostart.is_enabled());
+    }
+
+    /// The marker is the whole difference between "on by default" and "cannot
+    /// be turned off": with one on disk, a start turns nothing on.
+    #[test]
+    fn an_existing_marker_turns_nothing_on() {
+        // Only meaningful on a machine with no entry of its own — and a
+        // developer who has one keeps it, exactly as in the test above.
+        let autostart = Autostart::for_this_app();
+        if autostart.is_enabled() {
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "lumepeer-first-launch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("autostart-first-launch");
+        std::fs::write(&marker, b"").unwrap();
+
+        autostart.reconcile_with_marker(&marker);
+
+        assert!(
+            !autostart.is_enabled(),
+            "a marker on disk must stop first-launch from writing an entry"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

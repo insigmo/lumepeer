@@ -55,6 +55,14 @@ pub struct AppState {
                   actor was already told at spawn time"
     )]
     pub host_role: Option<HostRoleGuard>,
+    /// Whether this process actually put a tray icon up.
+    ///
+    /// `false` only on a Linux desktop with no ayatana-appindicator library
+    /// installed (docs/bugs/19-startup-autostart-and-linux-tray.md #2). Read
+    /// by the window-close handler in [`main`], which hides a window instead
+    /// of closing it — and with no tray there would be nothing left to bring
+    /// it back from.
+    pub tray: bool,
 }
 
 /// The platform's host-role guard, or a placeholder where there is none.
@@ -144,7 +152,50 @@ fn focus_main_window(app: &tauri::AppHandle) {
     }
 }
 
-/// Installs the tray icon and its menu.
+/// Whether the library the Linux tray is built on can be loaded at all.
+///
+/// `tray-icon` reaches the system tray through `libappindicator-sys`, which
+/// loads `libayatana-appindicator3` lazily — inside `TrayIconBuilder::build`,
+/// at the first call into it — and **panics** when no version of it is on the
+/// machine. A panic is not the `Err` [`install_tray`] could degrade on, and
+/// `catch_unwind` cannot turn it into one either: the release profile is
+/// `panic = "abort"` (workspace `Cargo.toml`), so the process is gone before
+/// anything gets to log why. That is a desktop on which this app does not
+/// start at all (docs/bugs/19-startup-autostart-and-linux-tray.md #2).
+///
+/// So the load is tried here first, with the same four names in the same
+/// order and through the same `RTLD_LOCAL | RTLD_LAZY` that crate uses — the
+/// list includes the two unversioned names its `backcompat` feature adds,
+/// which is on by default and which nothing in this tree turns off. A handle
+/// that opens is deliberately leaked rather than closed: the library registers
+/// `GType`s as it loads, and unloading it again only for `libappindicator-sys`
+/// to load it a second time is how that becomes a crash instead of a tray.
+///
+/// `dlopen2` rather than the `libloading` that crate itself uses, for one
+/// reason: its `Library::open` is a safe function and this crate is
+/// `#![forbid(unsafe_code)]`. Same dependency tree, same version — `tao`
+/// already pulls it into every Linux build.
+#[cfg(target_os = "linux")]
+fn appindicator_is_loadable() -> bool {
+    const NAMES: [&str; 4] = [
+        "libayatana-appindicator3.so.1",
+        "libappindicator3.so.1",
+        "libayatana-appindicator3.so",
+        "libappindicator3.so",
+    ];
+
+    NAMES
+        .iter()
+        .any(|name| match dlopen2::raw::Library::open(name) {
+            Ok(library) => {
+                std::mem::forget(library);
+                true
+            }
+            Err(_) => false,
+        })
+}
+
+/// Installs the tray icon and its menu, and answers whether one went up.
 ///
 /// Closing the window must not stop remote sessions: the app keeps running in
 /// the tray, and the close handler in [`main`] hides the window rather than
@@ -152,13 +203,29 @@ fn focus_main_window(app: &tauri::AppHandle) {
 /// missing bundled icon degrades to a blank tray entry and a warning rather
 /// than taking the start down with it (§18).
 ///
+/// A machine that cannot have a tray at all answers `false`, and that is what
+/// stops the same close handler hiding windows: without an icon to click,
+/// hiding the window would leave a running process nobody can reach, which is
+/// the other half of the same failure.
+///
 /// This is the only tray icon the app has. `tauri.conf.json` deliberately
 /// declares no `app.trayIcon`: Tauri would build a second entry from it, with
 /// neither this menu nor this click handler, and an inert icon next to the
 /// working one is what the user sees as "one of them does nothing".
-fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+fn install_tray(app: &tauri::App) -> tauri::Result<bool> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
+
+    #[cfg(target_os = "linux")]
+    if !appindicator_is_loadable() {
+        tracing::error!(
+            "no ayatana-appindicator library on this machine, so there will be no tray icon \
+             and closing the window will quit lumepeer instead of hiding it; install \
+             libayatana-appindicator3-1 (Debian/Ubuntu) or libayatana-appindicator-gtk3 \
+             (Fedora) to get the tray back"
+        );
+        return Ok(false);
+    }
 
     let show_item = MenuItem::with_id(app, "show", "Show Lumepeer", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -194,7 +261,20 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    Ok(())
+    Ok(true)
+}
+
+/// Whether this process has a tray icon to bring a hidden window back from.
+///
+/// "No" while the state is not up yet, which is the safe direction: a window
+/// closing before [`setup_app`] has run is one no tray could restore either.
+fn has_tray(window: &tauri::Window) -> bool {
+    use tauri::Manager as _;
+
+    window
+        .app_handle()
+        .try_state::<AppState>()
+        .is_some_and(|state| state.tray)
 }
 
 /// Binds the endpoint, publishes the state every IPC command reads, and puts
@@ -236,23 +316,28 @@ fn setup_app(
     }
     let notifications = network.subscribe();
     let autostart = autostart::Autostart::for_this_app();
-    // macOS only (docs/bugs/12-service-lifecycle.md task 4; D6): `.dmg` is a
-    // drag-install with no post-install hook at all, unlike deb/rpm, so
-    // there is nothing to call `--enable-autostart` at install time. Turning
-    // it on happens here instead, once, the first time an installed copy
-    // ever runs; the same call also removes a stale login item a previous,
-    // since-deleted copy left behind, since a drag-install has no uninstall
-    // hook to have done that either. A no-op on Windows and Linux, which get
-    // autostart from a hook that runs exactly once already.
+    // Autostart is on by default, and the app itself is what turns it on —
+    // once, the first time an installed copy runs (ADR 0103). No installer
+    // can: the Windows one is `perMachine` and runs elevated, so the `HKCU`
+    // it would write is the administrator's hive and not this user's, and
+    // macOS's `.dmg` is a drag-install with no hook at all. The same call
+    // removes a macOS login item a since-deleted copy left behind, which a
+    // drag-install has no uninstall hook to have done either
+    // (docs/bugs/12-service-lifecycle.md task 4; D6).
     autostart.reconcile_first_launch();
     // Off the setup thread: `ensure_installed` shells out, and start-up is
     // not the place to wait on a subprocess.
     runtime.spawn_blocking(service_control::ensure_installed);
+    // Before the state rather than after it, because whether there is a tray
+    // is part of that state: the window-close handler has to know whether
+    // hiding a window leaves anything to bring it back.
+    let tray = install_tray(app)?;
     app.manage(AppState {
         network,
         update_url,
         autostart,
         host_role,
+        tray,
     });
     // Managed separately from `AppState` because it needs an `AppHandle` of
     // its own to reach the actor from the grab's drain task, and `AppState`
@@ -265,8 +350,6 @@ fn setup_app(
     // The runtime owns every actor and connection task; dropping it here would
     // abort all of them.
     app.manage(runtime);
-
-    install_tray(app)?;
 
     Ok(())
 }
@@ -583,16 +666,26 @@ fn main() {
             // Closing the window hides it instead of quitting: lumepeer keeps
             // serving remote sessions from the tray until "Quit" is chosen.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
                 // The session bar is the exception: it is the host's "somebody
                 // is connected, and here is the stop button" surface, and it
                 // goes away when the last session ends and not before
                 // (ADR 0055). Hiding it on an Alt+F4 would leave a live but
                 // invisible window and no indicator at all, which is the gap
                 // it exists to close.
-                if window.label() != crate::view_windows::HOST_BAR_LABEL {
-                    let _ = window.hide();
+                if window.label() == crate::view_windows::HOST_BAR_LABEL {
+                    api.prevent_close();
+                    return;
                 }
+                // Without a tray there is no icon to click and nothing to
+                // restore a hidden window from, so hiding it would leave a
+                // running process the user cannot reach. The close is allowed
+                // through instead, and with the last window gone the app ends
+                // (docs/bugs/19-startup-autostart-and-linux-tray.md #2).
+                if !has_tray(window) {
+                    return;
+                }
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(invoke_handler())

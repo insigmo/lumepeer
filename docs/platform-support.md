@@ -364,3 +364,33 @@ committed FreeBSD support, and the `webkit2gtk-4.1` port has a recent,
 real, unresolved build failure in FreeBSD's own package infrastructure)
 recorded there in full. No hardware was available to attempt a build either
 way.
+
+## The tray indicator library, and what each packaging format calls it
+
+The Linux tray is `tray-icon` over `libappindicator-sys`, which loads
+`libayatana-appindicator3` by `dlopen` at the moment the icon is built. It is
+a hard runtime requirement of every Linux build — without it there is no tray,
+and before
+[docs/bugs/19-startup-autostart-and-linux-tray.md](bugs/19-startup-autostart-and-linux-tray.md)
+there was no application either, because the failure to load is a panic inside
+that crate rather than an error anything could degrade on.
+
+The two packaging formats spell the package differently, which is why
+`tauri.conf.json` lists a different name under `deb.depends` and
+`rpm.depends`:
+
+| Format | Package | Checked against |
+| --- | --- | --- |
+| `.deb` (Debian/Ubuntu) | `libayatana-appindicator3-1` | Debian 13 trixie, `0.5.94-1`, installed on the WSL Debian build box |
+| `.rpm` (Fedora) | `libayatana-appindicator-gtk3` | `mdapi.fedoraproject.org` rawhide, `0.6.0-1.fc46`; it is also what `packages.fedoraproject.org` lists as the provider of `libayatana-appindicator3.so.1` |
+
+Fedora is the RPM distribution these names target, the same assumption the
+pre-existing `rpm.depends` entry `pipewire-libs` already makes (openSUSE would
+call that one `libpipewire-0_3-0`). The `.rpm` is built on Ubuntu by the
+release workflow's `rpm` tool, so nothing in CI resolves these names — they
+are only checked when somebody installs the package.
+
+A machine that has the package removed anyway is no longer a machine on which
+the app fails to start: it logs an error naming both package names, runs
+without a tray, and closing its window quits it rather than hiding it
+somewhere with no icon to click.

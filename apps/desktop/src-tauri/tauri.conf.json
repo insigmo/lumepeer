@@ -51,13 +51,13 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libpipewire-0.3-0"],
+        "depends": ["libpipewire-0.3-0", "libayatana-appindicator3-1"],
         "recommends": ["xdg-desktop-portal", "pipewire"],
         "postInstallScript": "packaging/deb-postinst.sh",
         "preRemoveScript": "packaging/deb-prerm.sh"
       },
       "rpm": {
-        "depends": ["pipewire-libs"],
+        "depends": ["pipewire-libs", "libayatana-appindicator-gtk3"],
         "recommends": ["xdg-desktop-portal", "pipewire"],
         "postInstallScript": "packaging/rpm-post.sh",
         "preRemoveScript": "packaging/rpm-preun.sh"

@@ -4204,6 +4204,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "clipboard-win",
+ "dlopen2",
  "ed25519-dalek 2.2.0",
  "fs4",
  "iroh",
