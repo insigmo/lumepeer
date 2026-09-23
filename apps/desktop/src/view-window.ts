@@ -1144,6 +1144,20 @@ function clampDelta(value: number): number {
 }
 
 /**
+ * The part of `status` a terminal window (ADR 0101) has anything to say about.
+ *
+ * Only a dropped session: ADR 0105 keeps the window open while it waits for
+ * the session to come back, and the guest has to know why the shell stopped
+ * answering. Every other status is about a picture this window never asked
+ * for — `waiting` in particular is what it reports for the whole session, and
+ * what it goes back to on return — so they all read as `live`, which the
+ * overlay draws as nothing.
+ */
+export function terminalWindowStatus(status: ViewStatus): ViewStatus {
+  return status === 'reconnecting' ? 'reconnecting' : 'live';
+}
+
+/**
  * Status overlay of the view window.
  *
  * `waiting` and `reconnecting` are inline and non-blocking — the last picture
