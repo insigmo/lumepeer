@@ -184,10 +184,7 @@ pub fn resolver() -> DnsResolver {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        reason = "a failed assumption must fail the test"
-    )]
+    #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
 
