@@ -1664,17 +1664,26 @@ pub async fn input_pointer_move(
 
 /// Forwards a key or pointer-button press/release to the host (§11).
 ///
+/// A `Ctrl`, `Alt` or `Shift` the live keyboard grab has already sent is
+/// dropped here rather than sent twice: the grab sends those itself, in order
+/// with the chord they are held for, and still lets the webview see them
+/// (ADR 0107).
+///
 /// # Errors
 /// As [`input_pointer_move`].
 #[tauri::command]
 pub async fn input_press(
     window: Window,
     state: tauri::State<'_, AppState>,
+    grab: tauri::State<'_, crate::keyboard_grab::KeyboardGrab>,
     args: PressArgs,
 ) -> Result<(), IpcError> {
     use lumepeer_core::protocol::{InputDetail, InputEventPayload};
 
     check_view_window(&window, &args.peer)?;
+    if grab.already_sent(&args.peer, args.scancode) {
+        return Ok(());
+    }
     state
         .network
         .input(
@@ -2806,6 +2815,10 @@ pub struct KeyboardGrabArgs {
     /// `true` to let the system chords reach the host, `false` to keep them
     /// on this machine. `None` only asks what the grab currently is.
     pub on: Option<bool>,
+    /// `true` when one of the window's own text fields — the chat box, the
+    /// terminal — took the keyboard focus, `false` when none has it any more.
+    /// The grab steps aside meanwhile (ADR 0107). `None` leaves it as it is.
+    pub local_field: Option<bool>,
 }
 
 /// Guest side: whether this machine's own system chords go to the host
@@ -2831,6 +2844,9 @@ pub fn view_keyboard_grab(
     args: KeyboardGrabArgs,
 ) -> Result<bool, IpcError> {
     check_view_window(&window, &args.peer)?;
+    if let Some(typing) = args.local_field {
+        grab.typing_here(&args.peer, typing);
+    }
     Ok(match args.on {
         Some(on) => grab.set_wanted(on),
         None => grab.wanted(),

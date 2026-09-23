@@ -14,9 +14,10 @@
 //!   one webview.
 //! - **The OS eats the rest.** `Win+D`, `Alt+Tab`, `Ctrl+Esc`,
 //!   `Ctrl+Shift+Esc`, `Alt+F4`, `PrintScreen`: the shell claims these before
-//!   any window sees them, so no amount of `preventDefault` reaches them.
-//!   [`grab`] installs a low-level keyboard hook that takes exactly those and
-//!   hands them over instead.
+//!   any window sees them, so no amount of `preventDefault` reaches them — and
+//!   so does any other program on this machine that registered a global
+//!   hotkey. [`grab`] installs a low-level keyboard hook that takes every
+//!   chord ([`route`], ADR 0107) and hands it over instead.
 //!
 //! **Nothing here decides anything about a session.** A grabbed keystroke
 //! goes to the same `SessionManager::authorize_input` on the host as one that
@@ -63,8 +64,8 @@ pub type Sink = std::sync::Arc<dyn Fn(GrabbedKey) + Send + Sync>;
 /// Modifier keys held at the moment a keystroke happened.
 ///
 /// Its own type rather than the packed bitmask because the decision in
-/// [`claimed_by_the_remote_machine`] reads the modifiers one at a time, and a
-/// bitmask at that call site is how the wrong bit gets tested.
+/// [`route`] reads the modifiers one at a time, and a bitmask at that call
+/// site is how the wrong bit gets tested.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -82,6 +83,25 @@ pub struct Held {
 }
 
 impl Held {
+    /// The modifiers among `positions`, which are the evdev codes a grab has
+    /// sent a press for and not yet a release.
+    ///
+    /// Read from what the grab sent rather than asked of the OS:
+    /// `GetAsyncKeyState` inside a `WH_KEYBOARD_LL` callback does not yet
+    /// reflect the event being handled, and never reflects one the hook
+    /// swallowed. `Win` is swallowed, so a grab that asked the OS never saw
+    /// it held — `Win+D` left as `Win` and a stray 'd'.
+    #[must_use]
+    pub fn of_positions(positions: &std::collections::BTreeSet<u32>) -> Self {
+        let any = |codes: [u32; 2]| codes.iter().any(|code| positions.contains(code));
+        Self {
+            shift: any([EVDEV_LEFT_SHIFT, EVDEV_RIGHT_SHIFT]),
+            ctrl: any([EVDEV_LEFT_CTRL, EVDEV_RIGHT_CTRL]),
+            alt: any([EVDEV_LEFT_ALT, EVDEV_RIGHT_ALT]),
+            meta: any([EVDEV_LEFT_META, EVDEV_RIGHT_META]),
+        }
+    }
+
     /// These modifiers as the wire's `MODIFIER_*` bitmask.
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -102,6 +122,23 @@ impl Held {
         bits
     }
 }
+
+/// evdev code of the left `Shift`.
+const EVDEV_LEFT_SHIFT: u32 = 42;
+/// evdev code of the right `Shift`.
+const EVDEV_RIGHT_SHIFT: u32 = 54;
+/// evdev code of the left `Ctrl`.
+const EVDEV_LEFT_CTRL: u32 = 29;
+/// evdev code of the right `Ctrl`.
+const EVDEV_RIGHT_CTRL: u32 = 97;
+/// evdev code of the left `Alt`.
+const EVDEV_LEFT_ALT: u32 = 56;
+/// evdev code of the right `Alt` (`AltGr` on many layouts).
+const EVDEV_RIGHT_ALT: u32 = 100;
+/// evdev code of the left `Win`.
+const EVDEV_LEFT_META: u32 = 125;
+/// evdev code of the right `Win`.
+const EVDEV_RIGHT_META: u32 = 126;
 
 /// Virtual-key codes this crate names. Windows-only values, but the table and
 /// the decision that reads it are plain integers, so both compile — and are
@@ -241,8 +278,6 @@ mod vk {
     pub(crate) const DIVIDE: u16 = 0x6F;
     /// `VK_F1`.
     pub(crate) const F1: u16 = 0x70;
-    /// `VK_F4`.
-    pub(crate) const F4: u16 = 0x73;
     /// `VK_F10`.
     pub(crate) const F10: u16 = 0x79;
     /// `VK_F11`.
@@ -297,53 +332,149 @@ mod vk {
     pub(crate) const OEM_6: u16 = 0xDD;
     /// `VK_OEM_7` (`'`).
     pub(crate) const OEM_7: u16 = 0xDE;
+    /// `VK_OEM_8`, the last of the layout-defined punctuation keys.
+    pub(crate) const OEM_8: u16 = 0xDF;
     /// `VK_OEM_102`, the extra key on a 102-key keyboard.
     pub(crate) const OEM_102: u16 = 0xE2;
 }
 
-/// Whether this keystroke belongs to the remote machine, so the local OS must
-/// not be allowed to act on it.
+/// Where a live grab sends one keystroke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Left to this machine. The webview sees it, and `ViewInput` forwards it
+    /// if it is typing — as a character, in the operator's own layout
+    /// (ADR 0065).
+    Here,
+    /// Sent to the remote machine and hidden from this one.
+    There,
+    /// Sent to the remote machine *and* let through here: `Ctrl`, `Alt` and
+    /// `Shift` themselves. This machine has to go on seeing them, or the view
+    /// window could not recognise its own `Ctrl+Alt+Shift` chords, and a
+    /// `Ctrl` that one side believes held and the other does not is how keys
+    /// get stuck. The view window must therefore not forward them a second
+    /// time; see [`shared_with_this_machine`].
+    Both,
+}
+
+/// Where a live grab sends this keystroke (ADR 0107).
 ///
-/// **This is the whole of what a grab claims, and it is deliberately narrow.**
-/// Everything else keeps travelling the ordinary way — the webview sees it,
-/// `ViewInput` forwards it, and the operator's own machine is untouched — so a
-/// bug here cannot cost anyone their keyboard beyond this list. What is on the
-/// list is exactly the set no window can receive:
+/// `sent` is whether the grab has already sent this key's press and not yet
+/// its release; `held` is the modifiers it has sent the same way
+/// ([`Held::of_positions`]).
 ///
-/// - **Either `Win` key, and anything held with one.** `Win+D`, `Win+E`,
-///   `Win+L`, `Win+Tab`, `Win+arrow`, `Win+Shift+S`: the shell takes all of
-///   them, and the key itself as well.
-/// - **`Alt+Tab`, `Alt+Shift+Tab` and `Alt+Esc`** — window switching.
-/// - **`Ctrl+Esc`** (the Start menu) and **`Ctrl+Shift+Esc`** (Task Manager).
-/// - **`Alt+F4`.** Claimed on purpose, the way every remote-control tool
-///   claims it: closing the *remote* window is what the operator means. The
-///   view window's own chords all start `Ctrl+Alt+Shift`, which is not on this
-///   list, so releasing the grab from the keyboard still works.
+/// **Every chord is the remote machine's.** ADR 0090 took only the chords no
+/// window can receive and left the rest to the webview, and that was not
+/// enough, for two reasons. Whatever this machine claims first — the shell, a
+/// global hotkey another program registered, the webview — never reached the
+/// webview at all. And what did reach it travelled a different path from the
+/// grab's, so `Alt` could arrive at the host after the `Tab` it was held for.
+/// So a grab now takes, in one ordered stream:
+///
+/// - **`Ctrl`, `Alt` and `Shift` themselves**, as [`Route::Both`]. `VMware`'s
+///   `Ctrl+Alt` is nothing but these.
+/// - **Either `Win` key**, hidden from this machine.
+/// - **Any key held under `Ctrl`, `Alt` or `Win`**: `Ctrl+G`, `Ctrl+C`,
+///   `Alt+Tab`, `Alt+F4`, `Win+D`, `Ctrl+Shift+Esc`, `Alt+Space`.
+/// - **Any key under `Shift` that does not type a character**: `Shift+Tab`,
+///   `Shift+Del`, `Shift+F10`, `Shift+arrow`. `Shift` travels here, so the
+///   key it selects with has to travel with it.
 /// - **`PrintScreen`**, which opens the local screen-clipping tool.
 ///
-/// Not on the list, and unreachable for a different reason: `Ctrl+Alt+Del`.
-/// The Secure Attention Sequence is not hookable by design, which is what
-/// makes it secure; the view window sends it as a request instead (ADR 0028).
+/// Plain typing is not a chord and stays [`Route::Here`]: a character typed in
+/// the operator's layout is still sent as that character, whatever the host's
+/// layout is.
+///
+/// Also left here:
+///
+/// - **The view window's own chords**, everything under exactly
+///   `Ctrl+Alt+Shift`: they include the one that releases this grab.
+/// - **`Ctrl+Alt+Del`.** The Secure Attention Sequence is not hookable by
+///   design, which is what makes it secure; this machine acts on it whatever a
+///   hook answers, and the view window sends the host its own as a request
+///   (ADR 0028).
+/// - **`Win+L`**, which locks this machine the same way.
+/// - **A release whose press the grab did not send.** The key went down before
+///   the grab did, so this machine has it down and has to see it come up.
+///
+/// A key the grab sent down stays the remote machine's until it comes up,
+/// whatever was let go of in between, so a press and its release always
+/// travel the same way.
 #[must_use]
-pub const fn claimed_by_the_remote_machine(virtual_key: u16, held: Held) -> bool {
-    // The Win keys and everything under them. Tested before the modifier
-    // combinations below because `Win` is the one modifier that is itself
-    // unreachable: a window that let the press through has already lost the
-    // chord, whatever it does with the key that follows.
-    if held.meta || matches!(virtual_key, vk::LWIN | vk::RWIN) {
-        return true;
+pub const fn route(virtual_key: u16, pressed: bool, sent: bool, held: Held) -> Route {
+    if matches!(
+        virtual_key,
+        vk::LSHIFT | vk::RSHIFT | vk::LCONTROL | vk::RCONTROL | vk::LMENU | vk::RMENU
+    ) {
+        return Route::Both;
     }
-    match virtual_key {
-        // Alt+Tab / Alt+Shift+Tab (window switching) and Alt+F4 (close).
-        vk::TAB | vk::F4 => held.alt,
-        // Alt+Esc, Ctrl+Esc, Ctrl+Shift+Esc. Plain Escape is emphatically not
-        // claimed: it is one of the most-used keys on a remote machine and it
-        // already reaches the webview perfectly well.
-        vk::ESCAPE => held.alt || held.ctrl,
-        // The local screen-clipping tool, with or without a modifier.
-        vk::SNAPSHOT => true,
-        _ => false,
+    if sent {
+        return Route::There;
     }
+    if !pressed {
+        return Route::Here;
+    }
+    // `Win` is the one modifier that is itself unreachable: a window that let
+    // the press through has already lost the chord, whatever it does with the
+    // key that follows.
+    if matches!(virtual_key, vk::LWIN | vk::RWIN) {
+        return Route::There;
+    }
+    if held.ctrl && held.alt && held.shift && !held.meta {
+        return Route::Here;
+    }
+    if held.ctrl && held.alt && matches!(virtual_key, vk::DELETE | vk::DECIMAL) {
+        return Route::Here;
+    }
+    if held.meta && virtual_key == vk::LETTER_L {
+        return Route::Here;
+    }
+    if held.ctrl || held.alt || held.meta {
+        return Route::There;
+    }
+    if held.shift && !types_a_character(virtual_key) {
+        return Route::There;
+    }
+    if virtual_key == vk::SNAPSHOT {
+        return Route::There;
+    }
+    Route::Here
+}
+
+/// Whether this key types a character rather than naming an action: the
+/// letters, the digit row, the layout's punctuation, space, and the numpad
+/// with `NumLock` on.
+///
+/// With `NumLock` off the numpad reports `VK_HOME` and friends instead, which
+/// is exactly right: those keys then move, and `Shift` selects with them.
+const fn types_a_character(virtual_key: u16) -> bool {
+    matches!(
+        virtual_key,
+        vk::SPACE
+            | vk::DIGIT0..=vk::DIGIT9
+            | vk::LETTER_A..=vk::LETTER_Z
+            | vk::NUMPAD0..=vk::DIVIDE
+            | vk::OEM_1..=vk::OEM_3
+            | vk::OEM_4..=vk::OEM_8
+            | vk::OEM_102
+    )
+}
+
+/// Whether a live grab sends this physical key to the remote machine *and*
+/// lets it through here — `Ctrl`, `Alt` and `Shift` ([`Route::Both`]) — so a
+/// view window sees it too and must not forward it a second time.
+///
+/// `scancode` is an evdev code, as a view window sends it.
+#[must_use]
+pub const fn shared_with_this_machine(scancode: u32) -> bool {
+    matches!(
+        scancode,
+        EVDEV_LEFT_SHIFT
+            | EVDEV_RIGHT_SHIFT
+            | EVDEV_LEFT_CTRL
+            | EVDEV_RIGHT_CTRL
+            | EVDEV_LEFT_ALT
+            | EVDEV_RIGHT_ALT
+    )
 }
 
 /// The evdev code for a physical key named by its Windows virtual key, or
@@ -364,6 +495,12 @@ pub const fn claimed_by_the_remote_machine(virtual_key: u16, held: Held) -> bool
 /// `None` is not an error, it is "this build does not know where that key
 /// sits" — the caller passes the keystroke on to the ordinary path rather than
 /// forwarding a position it made up.
+///
+/// A `Shift` with the `E0` prefix is `None` for that reason. Neither `Shift`
+/// carries the prefix; one that does is a *fake* shift the keyboard or the OS
+/// wraps around a numpad or navigation key to undo `NumLock`, and the host's
+/// own OS makes the same ones for the same key. Forwarded, it would hold
+/// `Shift` down over there around an arrow nobody meant to select with.
 #[must_use]
 pub fn evdev_of_virtual_key(virtual_key: u16, extended: bool) -> Option<u32> {
     // The keys that exist in two places and are told apart only by the
@@ -373,6 +510,9 @@ pub fn evdev_of_virtual_key(virtual_key: u16, extended: bool) -> Option<u32> {
     if extended {
         if virtual_key == vk::RETURN {
             return Some(96);
+        }
+        if matches!(virtual_key, vk::LSHIFT | vk::RSHIFT) {
+            return None;
         }
     } else if let Some(position) = numpad_position(virtual_key) {
         return Some(position);
@@ -393,18 +533,18 @@ pub fn evdev_of_virtual_key(virtual_key: u16, extended: bool) -> Option<u32> {
         vk::OEM_4 => 26,
         vk::OEM_6 => 27,
         vk::RETURN => 28,
-        vk::LCONTROL => 29,
+        vk::LCONTROL => EVDEV_LEFT_CTRL,
         vk::OEM_1 => 39,
         vk::OEM_7 => 40,
         vk::OEM_3 => 41,
-        vk::LSHIFT => 42,
+        vk::LSHIFT => EVDEV_LEFT_SHIFT,
         vk::OEM_5 => 43,
         vk::OEM_COMMA => 51,
         vk::OEM_PERIOD => 52,
         vk::OEM_2 => 53,
-        vk::RSHIFT => 54,
+        vk::RSHIFT => EVDEV_RIGHT_SHIFT,
         vk::MULTIPLY => 55,
-        vk::LMENU => 56,
+        vk::LMENU => EVDEV_LEFT_ALT,
         vk::SPACE => 57,
         vk::CAPITAL => 58,
         vk::F1..=vk::F10 => 59 + u32::from(virtual_key - vk::F1),
@@ -416,10 +556,10 @@ pub fn evdev_of_virtual_key(virtual_key: u16, extended: bool) -> Option<u32> {
         vk::OEM_102 => 86,
         vk::F11 => 87,
         vk::F12 => 88,
-        vk::RCONTROL => 97,
+        vk::RCONTROL => EVDEV_RIGHT_CTRL,
         vk::DIVIDE => 98,
         vk::SNAPSHOT => 99,
-        vk::RMENU => 100,
+        vk::RMENU => EVDEV_RIGHT_ALT,
         vk::HOME => 102,
         vk::UP => 103,
         vk::PRIOR => 104,
@@ -434,8 +574,8 @@ pub fn evdev_of_virtual_key(virtual_key: u16, extended: bool) -> Option<u32> {
         vk::VOLUME_DOWN => 114,
         vk::VOLUME_UP => 115,
         vk::PAUSE => 119,
-        vk::LWIN => 125,
-        vk::RWIN => 126,
+        vk::LWIN => EVDEV_LEFT_META,
+        vk::RWIN => EVDEV_RIGHT_META,
         vk::APPS => 127,
         vk::F13..=vk::F24 => 183 + u32::from(virtual_key - vk::F13),
         _ => return None,
@@ -498,8 +638,8 @@ fn letter_position(virtual_key: u16) -> Option<u32> {
     })
 }
 
-/// Takes the system chords of [`claimed_by_the_remote_machine`] away from this
-/// machine and sends them to `sink` instead, until the returned guard drops.
+/// Takes the chords of [`route`] away from this machine and sends them to
+/// `sink` instead, until the returned guard drops.
 ///
 /// Returns `None` where there is nothing to install — every platform but
 /// Windows — and on Windows when the hook cannot be installed, which is a
@@ -556,50 +696,132 @@ mod tests {
         meta: false,
     };
 
-    /// The chords no window can receive are claimed, and the ones that reach
-    /// the webview perfectly well are left alone. The second half matters more
-    /// than the first: every key claimed here is a key the operator's own
-    /// machine stops responding to.
+    const SHIFT: Held = Held {
+        shift: true,
+        ..NONE
+    };
+    const CTRL: Held = Held { ctrl: true, ..NONE };
+    const ALT: Held = Held { alt: true, ..NONE };
+    const META: Held = Held { meta: true, ..NONE };
+
+    /// `VK_F4`, named once for the `Alt+F4` cases.
+    const F4: u16 = vk::F1 + 3;
+
+    /// Where a fresh press goes: nothing about it sent yet.
+    const fn press(virtual_key: u16, held: Held) -> Route {
+        route(virtual_key, true, false, held)
+    }
+
+    /// Every chord goes to the remote machine, including the ones this report
+    /// was about — `VMware`'s `Ctrl+G`, and `Ctrl+Alt`, which is nothing but
+    /// its two modifiers — and the ones ADR 0090 already took.
     #[test]
-    fn a_grab_claims_the_system_chords_and_nothing_else() {
-        let meta = Held { meta: true, ..NONE };
-        let alt = Held { alt: true, ..NONE };
-        let ctrl = Held { ctrl: true, ..NONE };
+    fn a_grab_sends_every_chord() {
+        let ctrl_shift = Held {
+            shift: true,
+            ..CTRL
+        };
+        let ctrl_alt = Held { alt: true, ..CTRL };
+        for (virtual_key, held, chord) in [
+            (vk::LETTER_G, CTRL, "Ctrl+G"),
+            (vk::LETTER_C, CTRL, "Ctrl+C"),
+            (vk::LETTER_V, CTRL, "Ctrl+V"),
+            (vk::LETTER_T, ctrl_shift, "Ctrl+Shift+T"),
+            (vk::ESCAPE, CTRL, "Ctrl+Esc"),
+            (vk::ESCAPE, ctrl_shift, "Ctrl+Shift+Esc"),
+            (vk::LEFT, ctrl_alt, "Ctrl+Alt+Left"),
+            (vk::INSERT, ctrl_alt, "Ctrl+Alt+Ins"),
+            (vk::TAB, ALT, "Alt+Tab"),
+            (vk::TAB, Held { shift: true, ..ALT }, "Alt+Shift+Tab"),
+            (F4, ALT, "Alt+F4"),
+            (vk::SPACE, ALT, "Alt+Space"),
+            (vk::LETTER_D, META, "Win+D"),
+            (vk::LEFT, Held { ctrl: true, ..META }, "Win+Ctrl+Left"),
+            (vk::TAB, SHIFT, "Shift+Tab"),
+            (vk::DELETE, SHIFT, "Shift+Del"),
+            (vk::F1 + 9, SHIFT, "Shift+F10"),
+            (vk::RIGHT, SHIFT, "Shift+Right"),
+            (vk::SNAPSHOT, NONE, "PrintScreen"),
+            (vk::LWIN, NONE, "Win"),
+            (vk::RWIN, NONE, "right Win"),
+        ] {
+            assert_eq!(press(virtual_key, held), Route::There, "{chord}");
+        }
+    }
 
-        // Either Win key, and anything under one.
-        assert!(claimed_by_the_remote_machine(vk::LWIN, NONE));
-        assert!(claimed_by_the_remote_machine(vk::RWIN, NONE));
-        assert!(claimed_by_the_remote_machine(0x44, meta));
-        assert!(claimed_by_the_remote_machine(vk::TAB, meta));
-        assert!(claimed_by_the_remote_machine(vk::LEFT, meta));
-
-        // Window switching, the Start menu, Task Manager, Alt+F4.
-        assert!(claimed_by_the_remote_machine(vk::TAB, alt));
-        assert!(claimed_by_the_remote_machine(
-            vk::TAB,
-            Held { shift: true, ..alt }
-        ));
-        assert!(claimed_by_the_remote_machine(vk::ESCAPE, alt));
-        assert!(claimed_by_the_remote_machine(vk::ESCAPE, ctrl));
-        assert!(claimed_by_the_remote_machine(
-            vk::ESCAPE,
-            Held {
-                shift: true,
-                ..ctrl
+    /// `Ctrl`, `Alt` and `Shift` go to the remote machine and stay visible
+    /// here, pressed or released, whatever else is held — including the
+    /// half of `Ctrl+Alt+Shift` the window's own chords start with.
+    #[test]
+    fn ctrl_alt_and_shift_are_sent_and_still_seen_here() {
+        let everything = Held {
+            shift: true,
+            ctrl: true,
+            alt: true,
+            meta: true,
+        };
+        for virtual_key in [
+            vk::LSHIFT,
+            vk::RSHIFT,
+            vk::LCONTROL,
+            vk::RCONTROL,
+            vk::LMENU,
+            vk::RMENU,
+        ] {
+            for held in [NONE, CTRL, everything] {
+                for (pressed, sent) in [(true, false), (true, true), (false, true), (false, false)]
+                {
+                    assert_eq!(
+                        route(virtual_key, pressed, sent, held),
+                        Route::Both,
+                        "{virtual_key:#04x}"
+                    );
+                }
             }
-        ));
-        assert!(claimed_by_the_remote_machine(vk::F4, alt));
-        assert!(claimed_by_the_remote_machine(vk::SNAPSHOT, NONE));
+            assert_eq!(
+                evdev_of_virtual_key(virtual_key, false).map(shared_with_this_machine),
+                Some(true),
+                "a view window would forward {virtual_key:#04x} a second time"
+            );
+        }
+        // The Win keys are hidden from this machine, so a view window never
+        // sees them to forward in the first place.
+        assert!(!shared_with_this_machine(EVDEV_LEFT_META));
+        assert!(!shared_with_this_machine(EVDEV_RIGHT_META));
+        // Nor is anything else shared: a pointer button travels with 0.
+        assert!(!shared_with_this_machine(0));
+        assert!(!shared_with_this_machine(30));
+    }
 
-        // Ordinary typing, ordinary chords, and the keys a remote operator
-        // needs most.
-        assert!(!claimed_by_the_remote_machine(0x41, NONE));
-        assert!(!claimed_by_the_remote_machine(0x43, ctrl));
-        assert!(!claimed_by_the_remote_machine(0x56, ctrl));
-        assert!(!claimed_by_the_remote_machine(vk::ESCAPE, NONE));
-        assert!(!claimed_by_the_remote_machine(vk::TAB, NONE));
-        assert!(!claimed_by_the_remote_machine(vk::F4, NONE));
-        assert!(!claimed_by_the_remote_machine(vk::DELETE, ctrl));
+    /// Typing is not a chord. Plain and shifted characters, and the keys a
+    /// remote operator types between them, stay on the webview's path, which
+    /// sends the character the operator's own layout makes (ADR 0065).
+    #[test]
+    fn typing_is_left_to_this_machine() {
+        for (virtual_key, held) in [
+            (vk::LETTER_A, NONE),
+            (vk::LETTER_A, SHIFT),
+            (vk::DIGIT1, SHIFT),
+            (vk::SPACE, SHIFT),
+            (vk::OEM_1, SHIFT),
+            (vk::OEM_8, SHIFT),
+            (vk::OEM_102, SHIFT),
+            (vk::NUMPAD0 + 5, SHIFT),
+            (vk::DIVIDE, SHIFT),
+            (vk::ESCAPE, NONE),
+            (vk::TAB, NONE),
+            (vk::RETURN, NONE),
+            (vk::BACK, NONE),
+            (vk::LEFT, NONE),
+            (vk::F1 + 4, NONE),
+            (vk::DELETE, NONE),
+        ] {
+            assert_eq!(
+                press(virtual_key, held),
+                Route::Here,
+                "{virtual_key:#04x} under {held:?}"
+            );
+        }
     }
 
     /// The view window's own chords all start `Ctrl+Alt+Shift`, and a grab
@@ -613,13 +835,78 @@ mod tests {
             alt: true,
             meta: false,
         };
-        // KeyF, KeyM, Digit0, KeyC, KeyD, KeyT, and the K this adds.
+        // KeyF, KeyM, Digit0, KeyC, KeyD, KeyT, KeyK.
         for key in [0x46, 0x4D, 0x30, 0x43, 0x44, 0x54, 0x4B] {
-            assert!(
-                !claimed_by_the_remote_machine(key, prefix),
-                "the grab claimed one of the window's own chords: {key:#04x}"
+            assert_eq!(
+                press(key, prefix),
+                Route::Here,
+                "the grab took one of the window's own chords: {key:#04x}"
             );
         }
+        // With `Win` held too it is not the window's chord, and it goes over.
+        assert_eq!(
+            press(
+                0x4B,
+                Held {
+                    meta: true,
+                    ..prefix
+                }
+            ),
+            Route::There
+        );
+    }
+
+    /// What this machine acts on whatever a hook answers is not sent: the
+    /// operator would get it twice, here and there.
+    #[test]
+    fn the_protected_chords_stay_here() {
+        let ctrl_alt = Held { alt: true, ..CTRL };
+        assert_eq!(press(vk::DELETE, ctrl_alt), Route::Here);
+        // The numpad's Del, with `NumLock` on and off.
+        assert_eq!(press(vk::DECIMAL, ctrl_alt), Route::Here);
+        assert_eq!(press(vk::LETTER_L, META), Route::Here);
+    }
+
+    /// A key the remote machine was sent down stays its own until it comes
+    /// up, even once the chord that sent it is over: `Ctrl` let go of before
+    /// the `C` must not strand `C` held down over there.
+    #[test]
+    fn a_key_sent_down_is_sent_up() {
+        // The repeat of a key held after its chord ended.
+        assert_eq!(route(vk::LETTER_C, true, true, NONE), Route::There);
+        // Its release.
+        assert_eq!(route(vk::LETTER_C, false, true, NONE), Route::There);
+        assert_eq!(route(vk::LWIN, false, true, NONE), Route::There);
+        // And a release the grab never sent the press for is this machine's:
+        // the key went down before the grab did.
+        assert_eq!(route(vk::LETTER_C, false, false, CTRL), Route::Here);
+        assert_eq!(route(vk::LWIN, false, false, NONE), Route::Here);
+    }
+
+    /// The modifiers a grab holds are the ones it sent, either hand.
+    #[test]
+    fn the_held_modifiers_are_the_ones_sent() {
+        use std::collections::BTreeSet;
+
+        assert_eq!(Held::of_positions(&BTreeSet::new()), NONE);
+        assert_eq!(Held::of_positions(&BTreeSet::from([30, 46])), NONE);
+        assert_eq!(
+            Held::of_positions(&BTreeSet::from([EVDEV_RIGHT_CTRL, 46])),
+            CTRL
+        );
+        assert_eq!(
+            Held::of_positions(&BTreeSet::from([
+                EVDEV_LEFT_SHIFT,
+                EVDEV_RIGHT_ALT,
+                EVDEV_LEFT_META
+            ])),
+            Held {
+                shift: true,
+                alt: true,
+                meta: true,
+                ctrl: false
+            }
+        );
     }
 
     /// Every position this places must be the one `physical_key` in
@@ -699,6 +986,9 @@ mod tests {
         for virtual_key in [0x15u16, 0x1C, 0xA6, 0xA7, 0xFA] {
             assert_eq!(evdev_of_virtual_key(virtual_key, false), None);
         }
+        // A fake shift: a real `Shift` never carries the `E0` prefix.
+        assert_eq!(evdev_of_virtual_key(vk::LSHIFT, true), None);
+        assert_eq!(evdev_of_virtual_key(vk::RSHIFT, true), None);
     }
 
     /// The bitmask is the wire's, in the wire's order.

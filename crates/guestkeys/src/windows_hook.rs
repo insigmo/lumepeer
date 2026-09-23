@@ -2,9 +2,10 @@
 //!
 //! `WH_KEYBOARD_LL` is the only way to see `Win+D` or `Alt+Tab` from a
 //! process: the shell claims them before any window is told, so a webview
-//! never gets a `keydown` to cancel. A hook sits above the shell, which is why
-//! the chord can be taken — and why it is taken for exactly the list in
-//! [`crate::claimed_by_the_remote_machine`] and nothing else.
+//! never gets a `keydown` to cancel. A hook sits above the shell, and above
+//! every global hotkey another program registered, which is why a chord can
+//! be taken at all — and each keystroke goes exactly where [`crate::route`]
+//! says.
 //!
 //! Three facts about `WH_KEYBOARD_LL` shape everything here:
 //!
@@ -24,9 +25,9 @@
 
 #![allow(
     unsafe_code,
-    reason = "SetWindowsHookExW, the hook callback and GetAsyncKeyState are raw \
-              FFI with no safe binding; same justification standard as SendInput \
-              (ADR 0012) and the rest of this workspace's Win32 surface"
+    reason = "SetWindowsHookExW and the hook callback are raw FFI with no safe \
+              binding; same justification standard as SendInput (ADR 0012) and \
+              the rest of this workspace's Win32 surface"
 )]
 
 use std::collections::BTreeSet;
@@ -34,25 +35,13 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED,
     LLKHF_UP, MSG, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
     WM_QUIT,
 };
 
-use crate::{GrabbedKey, Held, Sink, claimed_by_the_remote_machine, evdev_of_virtual_key};
-
-/// `VK_SHIFT`, the either-hand virtual key `GetAsyncKeyState` answers for.
-const VK_SHIFT_ANY: i32 = 0x10;
-/// `VK_CONTROL`, either hand.
-const VK_CONTROL_ANY: i32 = 0x11;
-/// `VK_MENU` (Alt), either hand.
-const VK_MENU_ANY: i32 = 0x12;
-/// `VK_LWIN`.
-const VK_LWIN_STATE: i32 = 0x5B;
-/// `VK_RWIN`.
-const VK_RWIN_STATE: i32 = 0x5C;
+use crate::{GrabbedKey, Held, Route, Sink, evdev_of_virtual_key, route};
 
 /// What the hook callback needs, and the only mutable state this module has.
 struct Grabbing {
@@ -64,7 +53,9 @@ struct Grabbing {
     /// being released mid-`Win+D` — would otherwise leave `Win` held down on
     /// the host, and every later keystroke would silently be a chord (§11,
     /// the same failure `ViewInput::releaseHeld` exists for on the webview
-    /// side).
+    /// side). It is also where the grab reads which modifiers are held
+    /// ([`Held::of_positions`]): every modifier pressed while it is live is
+    /// sent, so this is exactly what the host has down.
     held: BTreeSet<u32>,
 }
 
@@ -213,34 +204,13 @@ fn pump() {
     }
 }
 
-/// Whether a modifier virtual key is down right now.
-fn down(virtual_key: i32) -> bool {
-    // SAFETY: takes a virtual key by value and returns a bitfield. The high
-    // bit is "currently down", which is the only bit this reads.
-    let state = unsafe { GetAsyncKeyState(virtual_key) };
-    state < 0
-}
-
-/// The modifiers held at this instant, as the hook has to ask for them.
-///
-/// `GetAsyncKeyState` rather than the keystroke's own flags because
-/// `KBDLLHOOKSTRUCT` carries only `LLKHF_ALTDOWN` — there is no Ctrl, Shift
-/// or Win bit in it — and a chord needs all four.
-fn modifiers_now() -> Held {
-    Held {
-        shift: down(VK_SHIFT_ANY),
-        ctrl: down(VK_CONTROL_ANY),
-        alt: down(VK_MENU_ANY),
-        meta: down(VK_LWIN_STATE) || down(VK_RWIN_STATE),
-    }
-}
-
-/// Whether this keystroke was claimed, having already been handed to the sink.
+/// Whether this keystroke is hidden from this machine, having already been
+/// handed to the sink if it goes to the remote one.
 ///
 /// Split out of [`hook_proc`] so the FFI boundary holds nothing but the
 /// pointer read and the return value: everything that could fail — a poisoned
 /// lock, a key with no known position, a sink that has gone away — is decided
-/// here, in safe code, and answers "not claimed" so the keystroke keeps
+/// here, in safe code, and answers "not hidden" so the keystroke keeps
 /// travelling the ordinary way.
 fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
     if event.flags.contains(LLKHF_INJECTED) {
@@ -251,27 +221,29 @@ fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
     let Ok(virtual_key) = u16::try_from(event.vkCode) else {
         return false;
     };
-    let pressed = !event.flags.contains(LLKHF_UP);
-    let held = modifiers_now();
-    if !claimed_by_the_remote_machine(virtual_key, held) {
-        return false;
-    }
+    // A key whose position this build cannot name is better left to the
+    // local machine than forwarded as a key nobody pressed.
     let Some(scancode) = evdev_of_virtual_key(virtual_key, event.flags.contains(LLKHF_EXTENDED))
     else {
-        // A claimed chord whose position this build cannot name is better
-        // left to the local machine than forwarded as a key nobody pressed.
-        tracing::debug!(
-            virtual_key,
-            "a system chord with no known position: leaving it to this machine"
-        );
         return false;
     };
+    let pressed = !event.flags.contains(LLKHF_UP);
     let Ok(mut slot) = GRABBING.lock() else {
         return false;
     };
     let Some(grabbing) = slot.as_mut() else {
         return false;
     };
+    let sent = grabbing.held.contains(&scancode);
+    let route = route(
+        virtual_key,
+        pressed,
+        sent,
+        Held::of_positions(&grabbing.held),
+    );
+    if route == Route::Here {
+        return false;
+    }
     // A key held down repeats, and every repeat is a press the host wants:
     // holding an arrow under `Win` has to keep moving the window over there.
     // The set is what has to be released later, so a repeat only ever adds.
@@ -282,10 +254,13 @@ fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
     }
     (grabbing.sink)(GrabbedKey {
         scancode,
-        modifiers: held.bits(),
+        // After the update, so a modifier's own press carries its bit and its
+        // release does not — what a browser reports, and what the host has
+        // always been sent.
+        modifiers: Held::of_positions(&grabbing.held).bits(),
         pressed,
     });
-    true
+    route == Route::There
 }
 
 /// The hook callback. Returns 1 for a keystroke this machine must not act on,

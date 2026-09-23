@@ -7,8 +7,9 @@
 //!
 //! The rule is one line long, and every part of it matters:
 //!
-//! > A grab is live while a view window that holds `input` is focused, and
-//! > the operator has not released it.
+//! > A grab is live while a view window that holds `input` is focused, none
+//! > of that window's own text fields is, and the operator has not released
+//! > it.
 //!
 //! - **Focused**, because a grab is global: `WH_KEYBOARD_LL` sees every
 //!   keystroke on the desktop, so a grab that outlived the window's focus
@@ -16,6 +17,9 @@
 //! - **Holds `input`**, because a view-only session has nothing to do with a
 //!   keystroke. The host re-checks this per event regardless (§2.3); this
 //!   only keeps the local keyboard from being taken for no reason.
+//! - **Not in its own field**, because a grab takes every chord (ADR 0107):
+//!   `Ctrl+V` into the chat box, or `Ctrl+C` into the terminal, would
+//!   otherwise go to the host rather than into the field it was typed in.
 //! - **Has not released it**, because claiming `Alt+Tab` means the operator
 //!   cannot `Alt+Tab` away from the window. `Ctrl+Alt+Shift+K` gives the
 //!   chords back, and the toolbar's hotkey list says so — a grab nobody can
@@ -24,6 +28,7 @@
 //! The grab is on by default, because the reason it exists is that a remote
 //! machine could not be given its own hotkeys.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use lumepeer_core::protocol::{InputDetail, InputEventPayload};
@@ -46,8 +51,20 @@ struct State {
     /// Pseudonymized label of the focused view window that holds `input`, if
     /// one is focused at all.
     focused: Option<String>,
+    /// View windows one of whose own text fields — the chat box, the
+    /// terminal — has the keyboard focus. Kept across the window losing and
+    /// regaining focus, because the field keeps it too.
+    typing_here: BTreeSet<String>,
     /// The live grab, and the host it is sending to.
     live: Option<Live>,
+}
+
+impl State {
+    /// The host a grab should be sending to right now, if any.
+    fn holder(&self) -> Option<&str> {
+        let peer = self.focused.as_deref()?;
+        (self.wanted && !self.typing_here.contains(peer)).then_some(peer)
+    }
 }
 
 /// A grab that is installed right now.
@@ -90,6 +107,7 @@ impl KeyboardGrab {
             state: Mutex::new(State {
                 wanted: GRABBED_BY_DEFAULT,
                 focused: None,
+                typing_here: BTreeSet::new(),
                 live: None,
             }),
         }
@@ -135,16 +153,49 @@ impl KeyboardGrab {
     /// first, which is the case when the session was revoked rather than the
     /// window closed.
     pub fn window_closed(&self, peer: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.typing_here.remove(peer);
+        }
         self.focus_changed(peer, false, false);
+    }
+
+    /// One of `peer`'s view window's own text fields gained or lost the
+    /// keyboard focus. The grab steps aside while one has it.
+    pub fn typing_here(&self, peer: &str, typing: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if typing {
+            state.typing_here.insert(peer.to_owned());
+        } else {
+            state.typing_here.remove(peer);
+        }
+        self.reconcile(&mut state);
+    }
+
+    /// Whether a key `peer`'s view window is about to forward has already
+    /// gone to `peer` through the live grab.
+    ///
+    /// `Ctrl`, `Alt` and `Shift` do, while a grab is live: it sends them
+    /// itself, in order with the chord they are held for, and still lets this
+    /// machine see them (`lumepeer_guestkeys::Route::Both`). The webview sees
+    /// them as well and would send each one a second time.
+    #[must_use]
+    pub fn already_sent(&self, peer: &str, scancode: u32) -> bool {
+        lumepeer_guestkeys::shared_with_this_machine(scancode)
+            && self
+                .state
+                .lock()
+                .is_ok_and(|state| state.live.as_ref().is_some_and(|live| live.peer == peer))
     }
 
     /// Makes the live grab match what the state says it should be.
     ///
     /// Idempotent, and the only place a grab is installed or dropped, so
     /// "focused, permitted and wanted" is checked once rather than at each of
-    /// the three callers.
+    /// the callers.
     fn reconcile(&self, state: &mut State) {
-        let should_hold = state.wanted.then(|| state.focused.clone()).flatten();
+        let should_hold = state.holder().map(str::to_owned);
         match (&state.live, should_hold) {
             // Already grabbing for the right host, or already not grabbing.
             (Some(live), Some(peer)) if live.peer == peer => {}
@@ -236,29 +287,34 @@ mod tests {
         let mut state = State {
             wanted: true,
             focused: None,
+            typing_here: BTreeSet::new(),
             live: None,
         };
-        assert!(
-            state
-                .wanted
-                .then(|| state.focused.clone())
-                .flatten()
-                .is_none()
-        );
+        assert_eq!(state.holder(), None);
 
         state.focused = Some("abc".to_owned());
-        assert_eq!(
-            state.wanted.then(|| state.focused.clone()).flatten(),
-            Some("abc".to_owned())
-        );
+        assert_eq!(state.holder(), Some("abc"));
 
         state.wanted = false;
-        assert!(
-            state
-                .wanted
-                .then(|| state.focused.clone())
-                .flatten()
-                .is_none()
-        );
+        assert_eq!(state.holder(), None);
+    }
+
+    /// A grab takes every chord, so while the window's own chat box or
+    /// terminal has the focus it must step aside: `Ctrl+V` there pastes into
+    /// the field, not into the host (ADR 0107). Only that window's field
+    /// counts — another view window typing into its chat box is no reason to
+    /// leave this one without its chords.
+    #[test]
+    fn nothing_is_grabbed_while_the_window_types_into_its_own_field() {
+        let mut state = State {
+            wanted: true,
+            focused: Some("abc".to_owned()),
+            typing_here: BTreeSet::from(["abc".to_owned()]),
+            live: None,
+        };
+        assert_eq!(state.holder(), None);
+
+        state.typing_here = BTreeSet::from(["xyz".to_owned()]);
+        assert_eq!(state.holder(), Some("abc"));
     }
 }

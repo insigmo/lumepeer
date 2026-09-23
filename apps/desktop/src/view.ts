@@ -55,6 +55,7 @@ import {
   frameResized,
   imageRenderingFor,
   installPan,
+  isLocalTextTarget,
   NATIVE_PICTURE_CEILING,
   nextDisplayMode,
   paintCursor,
@@ -961,6 +962,31 @@ async function main(): Promise<void> {
       });
     },
   });
+  // The grab takes every chord (ADR 0107), so while one of this window's own
+  // fields — the chat box, the terminal — has the focus it has to step aside,
+  // or `Ctrl+V` into the chat box would paste on the host instead. Read once
+  // the focus has settled: mid-`focusout` the element about to receive it is
+  // not `activeElement` yet, and when the whole window loses focus
+  // `activeElement` does not change at all, which is what keeps a chat box
+  // that had it counted as typing when the window comes back.
+  let typingHere = false;
+  const syncTypingHere = (): void => {
+    setTimeout(() => {
+      const typing = isLocalTextTarget(document.activeElement);
+      if (typing === typingHere) {
+        return;
+      }
+      typingHere = typing;
+      void invoker()
+        .then((invoke) => invoke('view_keyboard_grab', { args: { peer, local_field: typing } }))
+        .catch(() => {
+          // The session ended, or this window is no longer the one it claims
+          // to be. Either way the grab is not this window's to change.
+        });
+    }, 0);
+  };
+  document.addEventListener('focusin', syncTypingHere);
+  document.addEventListener('focusout', syncTypingHere);
   // The remote host's own right-click menu is part of the picture; the
   // local WebView's native one has no business appearing on top of it.
   suppressContextMenu(document);
