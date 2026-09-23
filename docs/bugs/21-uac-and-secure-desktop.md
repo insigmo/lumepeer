@@ -348,6 +348,9 @@ foreground` при заведомом отсутствии UAC. Пока так�
 - [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
       -- -D warnings`, `cargo test --workspace` — сверено с базовым прогоном
       (на машине с установленной `LumepeerHelper` он красный и без правок).
+      **2026-09-23, пачка `23`, А5:** это неверно с `33956bc` (2026-08-31).
+      С `__COMPAT_LAYER=RunAsInvoker` и службой в состоянии `RUNNING` прогон
+      зелёный; красный без прослойки только `os error 740`.
 - [x] Тестовый бинарь десктоп-крейта запускался с
       `__COMPAT_LAYER=RunAsInvoker` (манифест `requireAdministrator`,
       иначе `os error 740`).
