@@ -8,6 +8,7 @@ pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
 | `connect` | invite → dial → grant works and the host's picture reaches the guest's view window           |
 | `mouse`   | a pointer move of 10 host pixels to the right in the guest's view moves the host's cursor by 10 ±1 px right and 0 ±1 px down |
 | `keys`    | `Hello, lumepeer 42` typed in the guest's view arrives as exactly that text, and 10 chords (Ctrl+A/C/V/Z, Ctrl+Shift+Z, Alt+X, Ctrl+Alt+J, Shift+Left, Ctrl+Home, Ctrl+Enter) arrive with the same modifiers |
+| `hotkeys` | Windows guest only: the same 10 chords pressed on the guest's own keyboard with its keyboard grab live arrive with the same modifiers, and Ctrl+A, Ctrl+C, Ctrl+End, Ctrl+V on `lumepeer` in the host's tracker leave `lumepeerlumepeer` |
 
 `guest->host` means the guest controls the host. The pairs are win↔mac, win↔linux,
 mac↔linux and win↔beta, in both directions.
@@ -58,6 +59,10 @@ How to read it:
   Security' (PickerHost.exe)` names the window that has the host's keyboard
   instead of the app, here a firewall prompt; the page's own `hasFocus()`
   says true under it.
+- `hotkeys`: the same `(saw ...)` notation. `its grab is NOT live` means the
+  guest's keyboard hook was not installed when the keys went in, and `the view
+  forwarded input_press ok=N` counts what went the webview's way instead; with
+  the grab live that is only Ctrl/Alt/Shift, which the app then drops.
 - `SKIP no session` means `connect` failed for that pair, `SKIP <host> is down`
   means that machine never came up; the `hosts:` line says why.
 
@@ -71,11 +76,16 @@ How to read it:
   `RunAsInvoker`), and so, unlike the shipped client, it is not elevated.
 - **beta** (Windows, `bberb@beta`): the app is started elevated in the logged-in
   session by the `LumepeerE2E` scheduled task, since sshd's session 0 has no
-  desktop. `LumepeerE2EClick` makes the one click the keys test needs there,
-  and `LumepeerE2EQuery` asks that desktop which window has the keyboard. The
+  desktop. `LumepeerE2EQuery` runs what has to happen on that desktop: the
+  click the keys tests need, and asking which window has the keyboard. The
   first time a freshly deployed build listens, Windows Defender Firewall asks
   whether to allow it (beta's Wi-Fi is a *Public* network). Until somebody
-  answers at the screen, that prompt holds the keyboard.
+  answers at the screen, that prompt holds the keyboard. The installed client
+  must not be running there: it holds the machine's host role and the e2e app
+  then answers `NOT_THE_HOST`. And a VMware Workstation window holding its
+  input grab (a click into the VM) freezes the cursor for every program, so
+  no click reaches the tracker; an injected Ctrl+Alt does not release it, only
+  a real one at the machine does.
 - **mac** (`betal@betals-mac`): the Xcode Command Line Tools, rustup, node,
   cmake, and a `~/lumepeer-env.sh` that puts them on the PATH (deploy.sh
   sources it). All of it was installed on 2026-09-24 without sudo: the Command
@@ -110,8 +120,9 @@ How to read it:
   Wayland, which has no global cursor position, the tracker's own pointer events
   stand in, and the main window is maximized so the pointer is over it.
 - The tracker needs the host's real keyboard focus. tauri-pilot raises the
-  window. On Windows that does not reach into WebView2, so the agent clicks the
-  tracker, or failing that the guest clicks it through the session.
+  window. On Windows that does not reach into WebView2, so the agent puts the
+  window on top and clicks the tracker, or failing that the guest clicks it
+  through the session.
 - The **guest** acts through DOM events dispatched into its view window: pointer
   moves at computed coordinates, and keys with the `key`, `code` and modifiers
   a US keyboard produces, at typing speed. Everything after that is real. OS-level
@@ -119,8 +130,13 @@ How to read it:
   layout, so Russian letters came out as VK_PACKET with no keyup.
 - The guest's keyboard grab (ADR 0090/0107) is released for the keys test. It
   sends Ctrl/Alt/Shift from an OS hook and drops the webview's copies, and
-  synthetic events never pass that hook. The hook ignores injected keys anyway,
-  so it cannot be tested automatically.
+  synthetic events never pass that hook.
+- The hotkeys test drives that hook, which is the path a person's chord takes
+  on a Windows guest. The agent clicks into the view's picture (on the host's
+  tracker), then presses scan codes through `SendInput` with `dwExtraInfo` set
+  to `E2E_MARK`. The hook ignores injected keys except ones carrying that mark,
+  and only in a pilot build (`lumepeer-guestkeys/e2e`). While it runs, this
+  machine's own keyboard belongs to the host.
 - A **spy** in the guest's view counts every `input_*` IPC call and its outcome,
   via `fetch`, the transport Tauri's IPC uses.
 - Before each pair, a machine whose app died or panicked (a poisoned lock

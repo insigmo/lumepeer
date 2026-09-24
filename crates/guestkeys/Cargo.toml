@@ -10,6 +10,13 @@ description = "Lumepeer guest-side keyboard: the keys a webview never sees (ADR 
 [lints]
 workspace = true
 
+[features]
+# The hook takes injected keystrokes that carry the e2e matrix's mark
+# (e2e/matrix/agent.py), so a test can press a chord the hook sees. Enabled
+# only by the desktop app's `pilot` feature, and inert without
+# `debug_assertions` like the rest of pilot.
+e2e = []
+
 [dependencies]
 lumepeer-core.workspace = true
 tracing.workspace = true

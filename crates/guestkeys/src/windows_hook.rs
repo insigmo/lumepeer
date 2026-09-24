@@ -213,7 +213,7 @@ fn pump() {
 /// here, in safe code, and answers "not hidden" so the keystroke keeps
 /// travelling the ordinary way.
 fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
-    if event.flags.contains(LLKHF_INJECTED) {
+    if event.flags.contains(LLKHF_INJECTED) && !pressed_by_the_e2e_matrix(event) {
         // Something synthesized this — quite possibly this very application,
         // on a host that is also a guest. Claiming it would be a loop.
         return false;
@@ -261,6 +261,21 @@ fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
         pressed,
     });
     route == Route::There
+}
+
+/// `dwExtraInfo` of the keystrokes the e2e matrix injects on a guest
+/// (`E2E_MARK` in e2e/matrix/agent.py): "LUME".
+const E2E_MARK: usize = 0x4C55_4D45;
+
+/// Whether an injected keystroke is the e2e matrix pressing a key, which a
+/// pilot debug build treats as a person's.
+///
+/// Every injected keystroke is otherwise left alone (see [`claim`]), so no
+/// test could ever press a chord this hook sees, and the chords it sends went
+/// untested while the ones a webview sends passed. The mark keeps this to the
+/// harness: this application's own injection, as a host, carries none.
+fn pressed_by_the_e2e_matrix(event: &KBDLLHOOKSTRUCT) -> bool {
+    cfg!(all(feature = "e2e", debug_assertions)) && event.dwExtraInfo == E2E_MARK
 }
 
 /// The hook callback. Returns 1 for a keystroke this machine must not act on,

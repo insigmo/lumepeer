@@ -45,7 +45,10 @@ decode-openh264 = ["lumepeer-media/decode-openh264", "lumepeer-runtime/decode-op
 # cross-platform UI debugging; main.rs additionally gates it on
 # `debug_assertions` so it cannot end up in a release binary even if this
 # feature were mistakenly enabled for one.
-pilot = ["dep:tauri-plugin-pilot"]
+#
+# Also lets the e2e matrix drive the keyboard grab's hook with keystrokes it
+# injects and marks (`lumepeer-guestkeys/e2e`).
+pilot = ["dep:tauri-plugin-pilot", "lumepeer-guestkeys/e2e"]
 
 [build-dependencies]
 tauri-build.workspace = true

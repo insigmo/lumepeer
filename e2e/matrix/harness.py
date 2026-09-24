@@ -160,11 +160,11 @@ TRACKER_READ_JS = """(() => {
   return { keys: st.keys, ptr: st.ptr, text: ta.value, focus: document.hasFocus() };
 })()"""
 
-TRACKER_RESET_JS = """((block) => {
+TRACKER_RESET_JS = """((block, text) => {
   const st = window.__e2e, ta = document.getElementById('e2e-tracker');
-  st.keys = []; st.block = block; ta.value = ''; ta.focus();
+  st.keys = []; st.block = block; ta.value = text; ta.focus();
   return document.hasFocus();
-})(%s)"""
+})(%s, %s)"""
 
 # The guest-side spy in a view window: every input_* IPC call the window
 # makes, and how it ended. Tauri's IPC goes through `fetch` to ipc.localhost
@@ -207,11 +207,16 @@ VIEW_STATE_JS = """(() => {
 # its OS hook and drops the webview's copies while it is live. Synthetic key
 # events never pass that hook, so with the grab live every chord would lose
 # its modifiers on the way: the keys test releases it, as Ctrl+Alt+Shift+K
-# does. Its hook ignores injected keys, so no automated test can drive it.
-GRAB_OFF_JS = """(async () => {
+# does, and the hotkeys test, which presses real keys, turns it back on. The
+# setting lasts as long as the app.
+GRAB_JS = """(async () => {
   const peer = new URLSearchParams(location.search).get('peer');
-  return await window.__TAURI_INTERNALS__.invoke('view_keyboard_grab', { args: { peer, on: false } });
+  return await window.__TAURI_INTERNALS__.invoke('view_keyboard_grab', { args: { peer, on: %s } });
 })()"""
+
+# What the guest logs when its grab goes live and when it is released.
+GRAB_LIVE = "the system chords now reach the remote machine"
+GRAB_RELEASED = "the keyboard grab is released"
 
 # Synthetic pointer events on the element under the point, the way a real
 # move would arrive: the view's own handlers map them onto the host's screen.
@@ -294,6 +299,24 @@ def hotkey_of(combo):
     mods, _, code = parse(combo)
     vk = ord(code[-1]) if code.startswith(("Key", "Digit")) else VK[code]
     return [sum(HOTKEY_MODS[m] for m in mods), vk]
+
+
+# Set 1 scan codes of the keys the chords use, where a US keyboard has them.
+SCAN = ({c: 0x10 + i for i, c in enumerate("qwertyuiop")} | {c: 0x1E + i for i, c in enumerate("asdfghjkl")}
+        | {c: 0x2C + i for i, c in enumerate("zxcvbnm")})
+SCAN_NAMED = {"ControlLeft": (0x1D, False), "ShiftLeft": (0x2A, False), "AltLeft": (0x38, False),
+              "Enter": (0x1C, False), "Tab": (0x0F, False), "Escape": (0x01, False), "Backspace": (0x0E, False),
+              "Space": (0x39, False), "ArrowLeft": (0x4B, True), "ArrowRight": (0x4D, True),
+              "ArrowUp": (0x48, True), "ArrowDown": (0x50, True), "Home": (0x47, True), "End": (0x4F, True)}
+
+
+def os_events(combo):
+    """`combo` as a keyboard presses it, modifiers first: [scan code, extended, up]."""
+    out = []
+    for kind, _, code, _ in synthetic_events(combo):
+        scan, extended = (SCAN[code[3:].lower()], False) if code.startswith("Key") else SCAN_NAMED[code]
+        out.append([scan, extended, kind == "keyup"])
+    return out
 
 
 def synthetic_events(combo):
@@ -445,9 +468,9 @@ class Host:
     def tracker(self):
         return self.js(TRACKER_READ_JS)
 
-    def tracker_reset(self, block):
+    def tracker_reset(self, block, text=""):
         self.js(TRACKER_JS)
-        return self.js(TRACKER_RESET_JS % json.dumps(block))
+        return self.js(TRACKER_RESET_JS % (json.dumps(block), json.dumps(text)))
 
     def cursor(self):
         """This machine's pointer in physical pixels, or None if unknown."""
@@ -481,12 +504,15 @@ class Host:
         size = self.ipc("plugin:window|inner_size", {"label": "main"})
         return pos["x"] + size["width"] // 2, pos["y"] + size["height"] // 2
 
-    def os_click(self, x, y):
-        """A real click at screen pixel x, y, where the agent can make one."""
+    def os_click(self, view=False, x=None, y=None):
+        """A real click into the app's main window (its middle) or its view
+        window (at client pixel x, y), raised above whatever covers it first,
+        where the agent can make one (Windows): `at` is where it clicked,
+        `focused` whether the window then has the keyboard."""
         try:
-            return self.agent.call("click", timeout=30, x=x, y=y)["clicked"]
-        except HostError:
-            return False
+            return self.agent.call("focus_window", timeout=60, view=view, x=x, y=y)
+        except HostError as error:
+            return {"focused": False, "why": str(error)}
 
     def foreground(self):
         """The window that has this machine's keyboard, where the agent can
@@ -506,6 +532,19 @@ class Host:
         except HostError:
             return []
         return [c for c, t in zip(combos, taken) if t]
+
+    def press_keys(self, combos):
+        """`combos` pressed on this machine's own keyboard, the way its
+        keyboard grab sees a person press them (Windows); how many key events
+        went in, and which window had the keyboard at the end."""
+        events = [e for combo in combos for e in os_events(combo)]
+        return self.agent.call("press_keys", timeout=60, events=events)
+
+    def grab_live(self):
+        """Whether this machine's keyboard grab is live, by its last word on
+        it in the log."""
+        lines = self.log_lines(grep=[GRAB_LIVE, GRAB_RELEASED], limit=1)
+        return bool(lines) and GRAB_LIVE in lines[-1]
 
     # -- the app's log --
 

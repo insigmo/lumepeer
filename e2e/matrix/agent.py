@@ -24,6 +24,12 @@ import time
 IDENTIFIER = "io.insigmo.lumepeer"
 WINDOWS = os.name == "nt"
 MACOS = sys.platform == "darwin"
+# `dwExtraInfo` of every key press_keys injects ("LUME"). A guest's keyboard
+# grab leaves injected keys alone except these, and only in a pilot build
+# (E2E_MARK in crates/guestkeys/src/windows_hook.rs).
+E2E_MARK = 0x4C554D45
+MAIN_TITLE = "Lumepeer"
+VIEW_TITLE = "Lumepeer — remote screen"
 
 # Variables that tie a process to the logged-in graphical session on Linux.
 # An ssh login has none of them, and an app started without them has no
@@ -281,29 +287,16 @@ def op_alive(_):
 
 
 def click(x, y):
+    """A left click at screen pixel x, y; False if the cursor would not go there."""
     import ctypes
 
     user32 = ctypes.windll.user32
     user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # physical pixels
-    user32.SetCursorPos(x, y)
+    moved = user32.SetCursorPos(x, y)
     user32.mouse_event(2, 0, 0, 0, 0)
     user32.mouse_event(4, 0, 0, 0, 0)
+    return bool(moved)
 
-
-def op_click(req):
-    """A left click at screen pixel x, y of the logged-in desktop (Windows).
-
-    A WebView2 window raised by SetForegroundWindow is active, but its
-    webview still has no keyboard focus, so key events never reach the page.
-    Only a real click gives it that, exactly as for a person."""
-    if not WINDOWS:
-        return {"clicked": False}
-    x, y = int(req["x"]), int(req["y"])
-    if windows_session_id() == 0:
-        in_session(["--click", str(x), str(y)], "LumepeerE2EClick", wait=2)
-    else:
-        click(x, y)
-    return {"clicked": True}
 
 
 def foreground(_):
@@ -342,7 +335,109 @@ def taken_hotkeys(chords):
     return taken
 
 
-QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys}
+def app_window(pids, title):
+    """The largest visible top-level window of `pids` titled exactly `title`,
+    or None. Largest, because the host's session bar is titled "Lumepeer"
+    just like the main window."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        text = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, text, 256)
+        if pid.value in pids and user32.IsWindowVisible(hwnd) and text.value == title:
+            rect = wintypes.RECT()
+            user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+            found.append(((rect.right - rect.left) * (rect.bottom - rect.top), hwnd))
+        return True
+
+    user32.EnumWindows(each, 0)
+    return max(found)[1] if found else None
+
+
+def focus_window(arg):
+    """A person's click into the app's window titled `title`, at client pixel
+    x, y (the middle when not given), the window raised first. Only a click
+    gives a WebView2 page the keyboard, and on a guest it is what arms the
+    keyboard grab."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # physical pixels
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = app_window(arg["pids"], arg["title"])
+    if not hwnd:
+        return {"focused": False, "why": "no window titled %r" % arg["title"]}
+    # To the top of the z-order without asking to be activated, which Windows
+    # refuses a process that is not in the foreground; another program's
+    # window (a VM's, say) would take the click otherwise.
+    flags = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    for after in (-1, -2):  # HWND_TOPMOST, then HWND_NOTOPMOST
+        user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(after), 0, 0, 0, 0, flags)
+    if arg.get("x") is None:
+        client = wintypes.RECT()
+        user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(client))
+        point = wintypes.POINT(client.right // 2, client.bottom // 2)
+    else:
+        point = wintypes.POINT(int(arg["x"]), int(arg["y"]))
+    user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(point))
+    time.sleep(0.2)
+    answer = {"at": [point.x, point.y]}
+    if not click(point.x, point.y):
+        # VMware Workstation holding its input grab: the cursor is frozen for
+        # every program, the click lands in the VM, and nothing short of a
+        # real Ctrl+Alt at that machine lets go (an injected one does not).
+        answer["cursor"] = "frozen, a VM's input grab?"
+    time.sleep(0.5)
+    answer["focused"] = user32.GetForegroundWindow() == hwnd
+    return answer
+
+
+def press_keys(arg):
+    """Presses `events` ([scan code, extended, up]) on this desktop's keyboard,
+    marked so the guest's grab takes them as a person's, while the view window
+    has the keyboard. By scan code, so this machine's layout makes of each
+    position what it would of a real key."""
+    import ctypes
+    from ctypes import wintypes
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class MOUSEINPUT(ctypes.Structure):  # only for the size of INPUT's union
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class UNION(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", UNION)]
+
+    user32 = ctypes.windll.user32
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    hwnd = app_window(arg["pids"], VIEW_TITLE)
+    if not hwnd or user32.GetForegroundWindow() != hwnd:
+        return {"pressed": 0, "foreground": foreground(None)}
+    pressed = 0
+    for scan, extended, up in arg["events"]:
+        key = INPUT(type=1)  # INPUT_KEYBOARD
+        # KEYEVENTF_SCANCODE, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP
+        key.u.ki = KEYBDINPUT(0, scan, 0x0008 | (0x0001 if extended else 0) | (0x0002 if up else 0), 0, E2E_MARK)
+        pressed += user32.SendInput(1, ctypes.byref(key), ctypes.sizeof(INPUT))
+        time.sleep(0.04)  # a person's rhythm
+    return {"pressed": pressed, "foreground": foreground(None)}
+
+
+QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys, "focus_window": focus_window, "press_keys": press_keys}
 
 
 def on_desktop(name, arg):
@@ -382,6 +477,20 @@ def op_hotkeys(req):
     if not WINDOWS:
         return {"taken": [False] * len(req["chords"])}
     return {"taken": on_desktop("hotkeys", req["chords"])}
+
+
+def op_focus_window(req):
+    if not WINDOWS:
+        return {"focused": False, "why": "only on Windows"}
+    title = VIEW_TITLE if req.get("view") else MAIN_TITLE
+    return on_desktop("focus_window", {"pids": processes_of(State.exe), "title": title,
+                                       "x": req.get("x"), "y": req.get("y")})
+
+
+def op_press_keys(req):
+    if not WINDOWS:
+        return {"pressed": 0}
+    return on_desktop("press_keys", {"pids": processes_of(State.exe), "events": req["events"]})
 
 
 # ── tauri-pilot ─────────────────────────────────────────────────────────────
@@ -483,7 +592,8 @@ def op_log(req):
 
 
 OPS = {"hello": op_hello, "start": op_start, "stop": op_stop, "alive": op_alive,
-       "click": op_click, "foreground": op_foreground, "hotkeys": op_hotkeys, "pilot": op_pilot, "log": op_log}
+       "foreground": op_foreground, "hotkeys": op_hotkeys, "focus_window": op_focus_window,
+       "press_keys": op_press_keys, "pilot": op_pilot, "log": op_log}
 
 
 def main():
@@ -505,8 +615,6 @@ if __name__ == "__main__":
         with open(sys.argv[2]) as f:
             spec = json.load(f)
         spawn_windows(spec["exe"], dict(os.environ, **spec["env"]), spec["stdout"])
-    elif sys.argv[1:2] == ["--click"]:
-        click(int(sys.argv[2]), int(sys.argv[3]))
     elif sys.argv[1:2] == ["--query"]:
         out = os.path.join(work_dir(), sys.argv[2] + ".json")
         with open(out + ".in") as f:
