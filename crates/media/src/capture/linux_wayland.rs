@@ -55,6 +55,10 @@ pub struct WaylandPortalCapturer {
     shared: Arc<Mutex<Option<portal::PortalHandle>>>,
     #[cfg(feature = "capture-portal")]
     stream: Option<crate::capture::pipewire_stream::PipeWireFrameThread>,
+    /// The handshake in flight, answered once somebody has dealt with the
+    /// portal's dialog.
+    #[cfg(feature = "capture-portal")]
+    negotiating: Option<std::sync::mpsc::Receiver<Result<portal::PortalHandle>>>,
 }
 
 impl WaylandPortalCapturer {
@@ -74,9 +78,40 @@ impl WaylandPortalCapturer {
             Self {
                 shared: Arc::clone(&shared),
                 stream: None,
+                negotiating: None,
             },
             WaylandPortalInjector::new(shared),
         )
+    }
+
+    /// Opens the PipeWire stream of the negotiated session.
+    #[cfg(feature = "capture-portal")]
+    fn start_stream(&mut self) -> Result<()> {
+        let guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (node_id, stream_size) = match guard.as_ref() {
+            Some(handle) => (handle.node_id(), handle.stream_size_handle()),
+            None => {
+                // Unreachable in practice (only called once a session is
+                // there), but refusing here rather than assuming it beats a
+                // panic if a future refactor breaks that invariant (§21).
+                return Err(MediaError::CaptureUnavailable(
+                    "portal negotiation produced no session".to_owned(),
+                ));
+            }
+        };
+        drop(guard);
+
+        let node_id = node_id.ok_or_else(|| {
+            MediaError::CaptureUnavailable("the portal granted no PipeWire stream".to_owned())
+        })?;
+        self.stream = Some(crate::capture::pipewire_stream::PipeWireFrameThread::spawn(
+            node_id,
+            stream_size,
+        )?);
+        Ok(())
     }
 }
 
@@ -84,33 +119,32 @@ impl ScreenCapturer for WaylandPortalCapturer {
     fn start(&mut self, _target: CaptureTarget) -> Result<()> {
         #[cfg(feature = "capture-portal")]
         {
-            let mut guard = self
+            let negotiated = self
                 .shared
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.is_none() {
-                *guard = Some(portal::PortalHandle::negotiate()?);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if negotiated {
+                return self.start_stream();
             }
-            let (node_id, stream_size) = match guard.as_ref() {
-                Some(handle) => (handle.node_id(), handle.stream_size_handle()),
-                None => {
-                    // Unreachable in practice (just negotiated above), but
-                    // refusing here rather than assuming it beats a panic if
-                    // a future refactor breaks that invariant (§21).
-                    return Err(MediaError::CaptureUnavailable(
-                        "portal negotiation produced no session".to_owned(),
-                    ));
-                }
-            };
-            drop(guard);
-
-            let node_id = node_id.ok_or_else(|| {
-                MediaError::CaptureUnavailable("the portal granted no PipeWire stream".to_owned())
-            })?;
-            self.stream = Some(crate::capture::pipewire_stream::PipeWireFrameThread::spawn(
-                node_id,
-                stream_size,
-            )?);
+            // `Start` shows the portal's dialog and does not answer until a
+            // person has, while `start` runs on the network actor: waiting
+            // for it there stalled every command the host had, the grant
+            // itself included, for as long as the dialog stayed up. So the
+            // handshake runs on a thread of its own, and `next_frame` picks
+            // up its answer.
+            if self.negotiating.is_none() {
+                let (answer, negotiating) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("wayland-portal".to_owned())
+                    .spawn(move || {
+                        // Nobody is waiting any more if the capturer was
+                        // stopped meanwhile; the session is dropped here.
+                        let _ = answer.send(portal::PortalHandle::negotiate());
+                    })
+                    .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+                self.negotiating = Some(negotiating);
+            }
             Ok(())
         }
         #[cfg(not(feature = "capture-portal"))]
@@ -124,6 +158,31 @@ impl ScreenCapturer for WaylandPortalCapturer {
     fn next_frame(&mut self) -> Result<Option<Frame>> {
         #[cfg(feature = "capture-portal")]
         {
+            use std::sync::mpsc::TryRecvError;
+
+            let answer = match self
+                .negotiating
+                .as_ref()
+                .map(std::sync::mpsc::Receiver::try_recv)
+            {
+                None => None,
+                // The dialog is still up: no picture yet, and no failure.
+                Some(Err(TryRecvError::Empty)) => return Ok(None),
+                Some(answer) => Some(answer),
+            };
+            if let Some(answer) = answer {
+                self.negotiating = None;
+                let handle = answer.map_err(|_| {
+                    MediaError::CaptureUnavailable(
+                        "the portal handshake ended without an answer".to_owned(),
+                    )
+                })??;
+                *self
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+                self.start_stream()?;
+            }
             let stream = self
                 .stream
                 .as_ref()
@@ -140,6 +199,7 @@ impl ScreenCapturer for WaylandPortalCapturer {
         #[cfg(feature = "capture-portal")]
         {
             self.stream = None;
+            self.negotiating = None;
             let mut guard = self
                 .shared
                 .lock()
@@ -245,7 +305,7 @@ impl crate::capture::InputInjector for WaylandPortalInjector {
 
         let (stream_width, stream_height) = handle.stream_size();
 
-        handle.runtime().block_on(async {
+        handle.block_on(async {
             match event.detail {
                 InputDetail::PointerMove { x, y } => {
                     // notify_pointer_motion_absolute wants coordinates in
@@ -311,7 +371,7 @@ impl crate::capture::InputInjector for WaylandPortalInjector {
                 }
             }
             .map_err(|e| MediaError::InputUnavailable(e.to_string()))
-        })
+        })?
     }
 
     fn capability(&self) -> InputCapability {
@@ -414,11 +474,59 @@ pub mod portal {
         (width > 0 && height > 0).then_some((width, height))
     }
 
+    /// The private current-thread runtime the portal's D-Bus calls run on.
+    ///
+    /// Capture starts and input arrives on the network actor, which is a task
+    /// on a worker of the app's own runtime, and tokio refuses both to
+    /// `block_on` a second runtime and to drop one on such a thread. Doing
+    /// either there panicked every Wayland host on its first grant and
+    /// poisoned its session state. So each call runs on a plain OS thread of
+    /// its own, as the Secret Service keystore does, and the runtime is shut
+    /// down without waiting for anything.
+    #[derive(Debug)]
+    struct PortalRuntime(Option<tokio::runtime::Runtime>);
+
+    impl PortalRuntime {
+        fn new() -> Result<Self> {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| Self(Some(runtime)))
+                .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))
+        }
+
+        fn block_on<F>(&self, future: F) -> Result<F::Output>
+        where
+            F: std::future::Future + Send,
+            F::Output: Send,
+        {
+            let runtime = self.0.as_ref().ok_or_else(|| {
+                MediaError::CaptureUnavailable("the portal runtime is shut down".to_owned())
+            })?;
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| runtime.block_on(future))
+                    .join()
+                    .map_err(|_| {
+                        MediaError::CaptureUnavailable("the portal call panicked".to_owned())
+                    })
+            })
+        }
+    }
+
+    impl Drop for PortalRuntime {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+
     /// Live portal session: the negotiated grant plus everything needed to
     /// keep injecting input and consuming frames for the session's duration.
     #[derive(Debug)]
     pub struct PortalHandle {
-        runtime: tokio::runtime::Runtime,
+        runtime: PortalRuntime,
         remote: RemoteDesktop,
         session: Session<RemoteDesktop>,
         node_id: Option<u32>,
@@ -436,12 +544,9 @@ pub mod portal {
         /// dialog, [`MediaError::CaptureUnavailable`] when no portal is
         /// reachable.
         pub fn negotiate() -> Result<Self> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            let runtime = PortalRuntime::new()?;
             let (remote, session, node_id, input, steps) =
-                runtime.block_on(Self::negotiate_async())?;
+                runtime.block_on(Self::negotiate_async())??;
             Ok(Self {
                 runtime,
                 remote,
@@ -566,11 +671,18 @@ pub mod portal {
             &self.session
         }
 
-        /// The tokio runtime the handshake ran on, reused for `notify_*`
-        /// calls so the injector doesn't spin up a runtime per event.
-        #[must_use]
-        pub const fn runtime(&self) -> &tokio::runtime::Runtime {
-            &self.runtime
+        /// Runs `future` on the runtime the handshake ran on, reused for
+        /// `notify_*` calls so the injector doesn't spin up a runtime per
+        /// event. Safe to call from inside another tokio runtime.
+        ///
+        /// # Errors
+        /// [`MediaError::CaptureUnavailable`] when the call panicked.
+        pub fn block_on<F>(&self, future: F) -> Result<F::Output>
+        where
+            F: std::future::Future + Send,
+            F::Output: Send,
+        {
+            self.runtime.block_on(future)
         }
 
         /// A clone of the shared, atomically-updated stream size, to hand to
@@ -597,6 +709,29 @@ pub mod portal {
                 MediaError::PermissionDenied
             }
             other => MediaError::CaptureUnavailable(other.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
+
+        use super::PortalRuntime;
+
+        /// Capture starts and input arrives on the network actor, a task on a
+        /// worker of the app's runtime: the portal runtime has to run and shut
+        /// down there without tokio's nested-runtime panics.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_portal_runtime_runs_and_drops_inside_another_runtime() {
+            let runtime = PortalRuntime::new().unwrap();
+            let answer = runtime
+                .block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    42
+                })
+                .unwrap();
+            assert_eq!(answer, 42);
+            drop(runtime);
         }
     }
 }
@@ -652,8 +787,13 @@ mod tests {
             InputCapability::PortalRemoteDesktop
         );
 
-        // Negotiating triggers the real system consent dialog.
+        // Negotiating triggers the real system consent dialog, on a thread of
+        // its own; `next_frame` collects the answer.
         let _ = capturer.start(CaptureTarget::PrimaryDisplay);
+        while capturer.negotiating.is_some() {
+            let _ = capturer.next_frame();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
 
         // Whatever the user granted, capability must be one of the two valid
         // outcomes, and stopping must always forget the session.

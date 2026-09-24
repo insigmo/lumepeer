@@ -299,6 +299,9 @@ pub struct MediaFoundationEncoder {
     /// re-logging — every frame (ADR 0073).
     #[cfg(feature = "encode-mf-zero-copy")]
     gpu_refused: bool,
+    /// What the AV1 output of the current transform needs before a decoder
+    /// can use it. Unused for H.264.
+    av1: Av1Stream,
     // Keeps `MFStartup`/`MFShutdown` balanced for as long as `transform` (and
     // any COM object it produced) is alive. Order matters: this must drop
     // after `transform`, which Rust guarantees by declaration order.
@@ -358,6 +361,7 @@ impl MediaFoundationEncoder {
             d3d_attached: false,
             #[cfg(feature = "encode-mf-zero-copy")]
             gpu_refused: false,
+            av1: Av1Stream::default(),
             mf,
         })
     }
@@ -401,6 +405,9 @@ impl MediaFoundationEncoder {
         // the old one is not a promise this one made.
         self.pump.reset();
         self.needs_drain = false;
+        // A new transform starts a new stream, with a file header and a
+        // sequence header of its own.
+        self.av1 = Av1Stream::default();
         Ok(())
     }
 
@@ -476,6 +483,9 @@ impl MediaFoundationEncoder {
             }
         };
         encoded.timestamp_us = frame.timestamp_us;
+        if self.config.codec == VideoCodec::Av1 {
+            self.av1.normalize(&mut encoded, self.config.fps);
+        }
         Ok(encoded)
     }
 
@@ -671,6 +681,9 @@ impl VideoEncoder for MediaFoundationEncoder {
             }
         };
         encoded.timestamp_us = frame.timestamp_us;
+        if self.config.codec == VideoCodec::Av1 {
+            self.av1.normalize(&mut encoded, self.config.fps);
+        }
         Ok(encoded)
     }
 
@@ -1547,33 +1560,271 @@ const AV1_LEB128_CONTINUATION: u8 = 0b1000_0000;
 /// is a bitstream parser either way, so it neither panics nor loops on one
 /// (§21).
 fn av1_has_sequence_header(data: &[u8]) -> bool {
+    av1_obus(data).any(|(obu_type, _)| obu_type == AV1_OBU_SEQUENCE_HEADER)
+}
+
+/// The OBUs of an AV1 temporal unit, as `(obu_type, byte range)`, in order.
+///
+/// Stops at the first thing it cannot walk, for the reasons
+/// [`av1_has_sequence_header`] gives: a header with no size field, a forbidden
+/// bit, a length that runs off the end.
+fn av1_obus(data: &[u8]) -> impl Iterator<Item = (u8, std::ops::Range<usize>)> + '_ {
     let mut at = 0usize;
-    while let Some(&header) = data.get(at) {
-        if header & AV1_OBU_FORBIDDEN_BIT != 0 {
-            return false;
-        }
-        if (header >> AV1_OBU_TYPE_SHIFT) & AV1_OBU_TYPE_MASK == AV1_OBU_SEQUENCE_HEADER {
-            return true;
-        }
-        if header & AV1_OBU_HAS_SIZE_FIELD == 0 {
-            return false;
+    std::iter::from_fn(move || {
+        let header = *data.get(at)?;
+        if header & AV1_OBU_FORBIDDEN_BIT != 0 || header & AV1_OBU_HAS_SIZE_FIELD == 0 {
+            return None;
         }
         let after_header = at + 1 + usize::from(header & AV1_OBU_EXTENSION_FLAG != 0);
-        let Some((payload, leb_bytes)) = read_leb128(data, after_header) else {
-            return false;
-        };
+        let (payload, leb_bytes) = read_leb128(data, after_header)?;
         // Always strictly greater than `at`: `after_header` is at least
         // `at + 1` and `leb_bytes` is at least 1, so the walk cannot stand
         // still even on a zero-length payload.
-        let Some(next) = after_header
+        let end = after_header
             .checked_add(leb_bytes)
             .and_then(|end| end.checked_add(payload))
-        else {
-            return false;
-        };
-        at = next;
+            .filter(|&end| end <= data.len())?;
+        let obu = (header >> AV1_OBU_TYPE_SHIFT) & AV1_OBU_TYPE_MASK;
+        let range = at..end;
+        at = end;
+        Some((obu, range))
+    })
+}
+
+/// `OBU_TEMPORAL_DELIMITER` (AV1 specification, section 6.2.2): the first
+/// OBU of a temporal unit when there is one.
+const AV1_OBU_TEMPORAL_DELIMITER: u8 = 2;
+/// Leads the file header of an IVF stream.
+const IVF_SIGNATURE: &[u8; 4] = b"DKIF";
+/// Bytes of the IVF header in front of every frame: a 32-bit frame size and
+/// a 64-bit timestamp, both little-endian.
+const IVF_FRAME_HEADER_BYTES: usize = 12;
+
+/// Turns an AV1 encoder MFT's output into temporal units a decoder can join.
+///
+/// Intel's AV1 encoder MFT does not emit the low-overhead bitstream format
+/// alone. It frames every sample as IVF: a 12-byte frame header in front of
+/// each temporal unit, and a 32-byte file header in front of that on the very
+/// first sample the process gets out of it. The sequence header OBU comes
+/// once per transform, in its first temporal unit, and never again, not even
+/// on the key frames a guest asks for. Handed on as it came, the guest's
+/// decoder read the IVF headers as OBUs and refused every frame, and a key
+/// frame with no sequence header in front of it cannot start a decoder
+/// anyway: a session with an Intel AV1 host never showed a picture (e2e
+/// matrix, 2026-09-24).
+///
+/// Its sequence header also declares level 2.0 whatever the picture, which
+/// ends at 147 456 pixels, and Chromium's decoder refuses a key frame bigger
+/// than its level allows ("marked as type `key` but wasn't a key frame") even
+/// though dav1d and libaom decode the very same bytes. `MF_MT_VIDEO_LEVEL`
+/// does not change what it writes.
+///
+/// So the IVF headers are taken off, the level is raised to one that covers
+/// the picture, and the last sequence header is put back in front of every
+/// key frame that arrives without one. The frame header is
+/// recognized by its shape rather than by the file header announcing it,
+/// because only one transform per process ever writes that, and the one that
+/// did is usually the rehearsal of [`encodes_one_frame`]. Output that is
+/// plain OBUs already never has that shape and goes through untouched.
+#[derive(Debug, Default)]
+struct Av1Stream {
+    /// The last sequence header OBU, whole.
+    sequence_header: Option<Vec<u8>>,
+}
+
+impl Av1Stream {
+    fn normalize(&mut self, encoded: &mut EncodedFrame, fps: u8) {
+        let data = &mut encoded.data;
+        if data.starts_with(IVF_SIGNATURE) {
+            let file_header = data
+                .get(6..8)
+                .map_or(0, |len| usize::from(u16::from_le_bytes([len[0], len[1]])));
+            data.drain(..file_header.min(data.len()));
+        }
+        if starts_with_ivf_frame_header(data) {
+            data.drain(..IVF_FRAME_HEADER_BYTES);
+        }
+
+        let obus: Vec<_> = av1_obus(data).collect();
+        if let Some((_, range)) = obus.iter().find(|(obu, _)| *obu == AV1_OBU_SEQUENCE_HEADER) {
+            let range = range.clone();
+            let sequence_header = av1_raise_level(&data[range.clone()], fps)
+                .unwrap_or_else(|| data[range.clone()].to_vec());
+            data.splice(range, sequence_header.iter().copied());
+            self.sequence_header = Some(sequence_header);
+            encoded.keyframe = true;
+            return;
+        }
+        if encoded.keyframe
+            && let Some(sequence_header) = &self.sequence_header
+        {
+            // After the temporal delimiter, which has to stay first.
+            let at = obus
+                .first()
+                .filter(|(obu, _)| *obu == AV1_OBU_TEMPORAL_DELIMITER)
+                .map_or(0, |(_, range)| range.end);
+            data.splice(at..at, sequence_header.iter().copied());
+        }
     }
-    false
+}
+
+/// AV1 levels as (`seq_level_idx`, `MaxPicSize`, `MaxHSize`, `MaxVSize`,
+/// `MaxDisplayRate`), from Annex A of the AV1 specification.
+const AV1_LEVELS: [(u32, u64, u32, u32, u64); 11] = [
+    (0, 147_456, 2048, 1152, 4_423_680),
+    (1, 278_784, 2816, 1584, 8_363_520),
+    (4, 665_856, 4352, 2448, 19_975_680),
+    (5, 1_065_024, 5504, 3096, 31_950_720),
+    (8, 2_359_296, 6144, 3456, 70_778_880),
+    (9, 2_359_296, 6144, 3456, 141_557_760),
+    (12, 8_912_896, 8192, 4352, 267_386_880),
+    (13, 8_912_896, 8192, 4352, 534_773_760),
+    (16, 35_651_584, 16384, 8704, 1_069_547_520),
+    (17, 35_651_584, 16384, 8704, 2_139_095_040),
+    (18, 35_651_584, 16384, 8704, 4_278_190_080),
+];
+/// The last `seq_level_idx` without a `seq_tier` bit after it.
+const AV1_LAST_LEVEL_WITHOUT_TIER: u32 = 7;
+
+/// The lowest AV1 level whose limits cover a `width`x`height` picture at `fps`.
+fn av1_level(width: u32, height: u32, fps: u8) -> u32 {
+    let pixels = u64::from(width) * u64::from(height);
+    AV1_LEVELS
+        .iter()
+        .find(|&&(_, max_pixels, max_width, max_height, max_rate)| {
+            pixels <= max_pixels
+                && width <= max_width
+                && height <= max_height
+                && pixels * u64::from(fps) <= max_rate
+        })
+        .or(AV1_LEVELS.last())
+        .map_or(0, |&(level, ..)| level)
+}
+
+/// A sequence header OBU whose operating points declare a level too low for
+/// the pictures it announces, rewritten to the lowest level that covers them;
+/// `None` when it needs nothing, or has a shape this does not rewrite.
+///
+/// Only the fields up to the maximum frame size are read (AV1 specification,
+/// section 5.5.1). Everything after them is copied bit for bit, up to the
+/// trailing one bit that closes the payload, so nothing this does not
+/// understand can be altered. A header with timing information or a reduced
+/// still-picture header is left alone: Intel's MFT writes neither.
+fn av1_raise_level(obu: &[u8], fps: u8) -> Option<Vec<u8>> {
+    let header_bytes = 1 + usize::from(obu.first()? & AV1_OBU_EXTENSION_FLAG != 0);
+    let (size, leb_bytes) = read_leb128(obu, header_bytes)?;
+    let start = header_bytes + leb_bytes;
+    let payload = obu.get(start..start.checked_add(size)?)?;
+    let bits: Vec<bool> = payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1 == 1))
+        .collect();
+    // The trailing one bit; everything before it is the header's own.
+    let bits = &bits[..bits.iter().rposition(|&bit| bit)?];
+    let mut at = 0;
+
+    let _profile_and_still_picture = read_bits(bits, &mut at, 4)?;
+    let reduced_still_picture_header = read_bits(bits, &mut at, 1)?;
+    let timing_info_present = read_bits(bits, &mut at, 1)?;
+    if reduced_still_picture_header != 0 || timing_info_present != 0 {
+        return None;
+    }
+    let initial_display_delay_present = read_bits(bits, &mut at, 1)? != 0;
+    let operating_points = read_bits(bits, &mut at, 5)? + 1;
+    let points_start = at;
+    // (operating_point_idc, seq_level_idx, seq_tier, the bits after them)
+    let mut points = Vec::new();
+    for _ in 0..operating_points {
+        let idc = read_bits(bits, &mut at, 12)?;
+        let level = read_bits(bits, &mut at, 5)?;
+        let tier = if level > AV1_LAST_LEVEL_WITHOUT_TIER {
+            read_bits(bits, &mut at, 1)?
+        } else {
+            0
+        };
+        let delay_start = at;
+        if initial_display_delay_present && read_bits(bits, &mut at, 1)? != 0 {
+            read_bits(bits, &mut at, 4)?;
+        }
+        points.push((idc, level, tier, delay_start..at));
+    }
+    let points_end = at;
+    let width_bits = read_bits(bits, &mut at, 4)? + 1;
+    let height_bits = read_bits(bits, &mut at, 4)? + 1;
+    let width = read_bits(bits, &mut at, usize::try_from(width_bits).ok()?)? + 1;
+    let height = read_bits(bits, &mut at, usize::try_from(height_bits).ok()?)? + 1;
+
+    let needed = av1_level(width, height, fps);
+    if points.iter().all(|&(_, level, ..)| level >= needed) {
+        return None;
+    }
+    let mut out = bits[..points_start].to_vec();
+    for (idc, level, tier, delay) in points {
+        let level = level.max(needed);
+        write_bits(&mut out, idc, 12);
+        write_bits(&mut out, level, 5);
+        if level > AV1_LAST_LEVEL_WITHOUT_TIER {
+            write_bits(&mut out, tier, 1);
+        }
+        out.extend_from_slice(&bits[delay]);
+    }
+    out.extend_from_slice(&bits[points_end..]);
+    out.push(true);
+    out.resize(out.len().div_ceil(8) * 8, false);
+
+    let payload: Vec<u8> = out
+        .chunks(8)
+        .map(|byte| {
+            byte.iter()
+                .fold(0u8, |acc, &bit| (acc << 1) | u8::from(bit))
+        })
+        .collect();
+    let mut rewritten = obu[..header_bytes].to_vec();
+    write_leb128(&mut rewritten, payload.len());
+    rewritten.extend_from_slice(&payload);
+    Some(rewritten)
+}
+
+/// `n` bits at `at`, most significant first, advancing `at`.
+fn read_bits(bits: &[bool], at: &mut usize, n: usize) -> Option<u32> {
+    let value = bits
+        .get(*at..at.checked_add(n)?)?
+        .iter()
+        .fold(0u32, |acc, &bit| (acc << 1) | u32::from(bit));
+    *at += n;
+    Some(value)
+}
+
+/// The low `n` bits of `value`, most significant first.
+fn write_bits(out: &mut Vec<bool>, value: u32, n: u32) {
+    out.extend((0..n).rev().map(|bit| (value >> bit) & 1 == 1));
+}
+
+/// Appends `value` as leb128.
+fn write_leb128(out: &mut Vec<u8>, mut value: usize) {
+    loop {
+        let byte = u8::try_from(value & usize::from(AV1_LEB128_PAYLOAD_MASK)).unwrap_or(0);
+        value >>= AV1_LEB128_PAYLOAD_BITS;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | AV1_LEB128_CONTINUATION);
+    }
+}
+
+/// Whether `data` opens with an IVF frame header: a size that is exactly the
+/// rest of the sample, and a rest that walks as OBUs to its last byte.
+fn starts_with_ivf_frame_header(data: &[u8]) -> bool {
+    let (Some(size), Some(rest)) = (data.get(..4), data.get(IVF_FRAME_HEADER_BYTES..)) else {
+        return false;
+    };
+    let size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
+    !rest.is_empty()
+        && usize::try_from(size).is_ok_and(|size| size == rest.len())
+        && av1_obus(rest)
+            .last()
+            .is_some_and(|(_, range)| range.end == rest.len())
 }
 
 /// Reads the leb128 at `at`, returning its value and how many bytes it took,
@@ -2621,6 +2872,110 @@ mod tests {
         assert!(!av1_has_sequence_header(&[obu_header(2)]));
         // A length that claims more than is there.
         assert!(!av1_has_sequence_header(&[obu_header(6), 0x40, 0x00]));
+    }
+
+    /// A temporal unit of the IVF stream Intel's AV1 MFT writes: the frame
+    /// header in front, and the file header too on the first one.
+    fn ivf_sample(first: bool, obus: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if first {
+            out.extend_from_slice(b"DKIF\x00\x00\x20\x00AV01\x80\x07\x38\x04");
+            out.extend_from_slice(&[0xe8, 0x03, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        out.extend_from_slice(&u32::try_from(obus.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(&0x31a9u64.to_le_bytes());
+        out.extend_from_slice(obus);
+        out
+    }
+
+    fn normalized(stream: &mut Av1Stream, keyframe: bool, data: Vec<u8>) -> EncodedFrame {
+        let mut encoded = EncodedFrame {
+            keyframe,
+            timestamp_us: 0,
+            data,
+        };
+        stream.normalize(&mut encoded, 30);
+        encoded
+    }
+
+    #[test]
+    fn an_ivf_av1_stream_loses_its_headers_and_every_key_frame_gets_a_sequence_header() {
+        let delimiter = [obu_header(2), 0x00];
+        let sequence = [obu_header(1), 0x02, 0x11, 0x22];
+        let picture = [obu_header(6), 0x03, 0xAA, 0xBB, 0xCC];
+        let mut stream = Av1Stream::default();
+
+        let first = normalized(
+            &mut stream,
+            true,
+            ivf_sample(true, &[&delimiter[..], &sequence, &picture].concat()),
+        );
+        assert_eq!(first.data, [&delimiter[..], &sequence, &picture].concat());
+        assert!(first.keyframe);
+
+        let delta = normalized(
+            &mut stream,
+            false,
+            ivf_sample(false, &[&delimiter[..], &picture].concat()),
+        );
+        assert_eq!(delta.data, [&delimiter[..], &picture].concat());
+        assert!(!delta.keyframe);
+
+        let key = normalized(
+            &mut stream,
+            true,
+            ivf_sample(false, &[&delimiter[..], &picture].concat()),
+        );
+        assert_eq!(key.data, [&delimiter[..], &sequence, &picture].concat());
+        assert!(av1_has_sequence_header(&key.data));
+
+        // Every transform after the process's first: no file header at all.
+        let mut later = Av1Stream::default();
+        let unit = [&delimiter[..], &sequence, &picture].concat();
+        assert_eq!(
+            normalized(&mut later, true, ivf_sample(false, &unit)).data,
+            unit
+        );
+    }
+
+    /// The sequence header Intel's AV1 MFT wrote for a 1080p stream, level 2.0
+    /// and all, and what Chromium's decoder accepts: the same header at 4.0.
+    #[test]
+    fn a_level_too_low_for_the_picture_is_raised_and_nothing_else_changes() {
+        let intel = [
+            0x0e, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x05, 0x57, 0x7f, 0x86, 0xe0, 0x17, 0xe8, 0x02,
+        ];
+        let raised = [
+            0x0e, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x42, 0xab, 0xbf, 0xc3, 0x70, 0x0b, 0xf4, 0x01,
+        ];
+        assert_eq!(av1_raise_level(&intel, 30).unwrap(), raised);
+        assert_eq!(
+            av1_raise_level(&raised, 30),
+            None,
+            "4.0 already covers 1080p30"
+        );
+        assert_eq!(av1_level(1920, 1080, 30), 8);
+        assert_eq!(av1_level(1920, 1080, 60), 9);
+        assert_eq!(av1_level(3840, 2160, 30), 12);
+        assert_eq!(av1_level(256, 256, 30), 0);
+    }
+
+    #[test]
+    fn a_plain_obu_av1_stream_goes_through_untouched() {
+        let unit = [
+            obu_header(2),
+            0x00,
+            obu_header(1),
+            0x01,
+            0x00,
+            obu_header(6),
+            0x01,
+            0xAA,
+        ];
+        let mut stream = Av1Stream::default();
+        assert_eq!(normalized(&mut stream, true, unit.to_vec()).data, unit);
+        let delta = [obu_header(2), 0x00, obu_header(6), 0x01, 0xAA];
+        assert_eq!(normalized(&mut stream, false, delta.to_vec()).data, delta);
     }
 
     /// The two scanners must never be applied to each other's bitstream: an

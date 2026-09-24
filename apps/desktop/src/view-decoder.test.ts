@@ -247,23 +247,74 @@ describe('supportedOptionalCodecs', () => {
     await expect(supportedOptionalCodecs()).resolves.toEqual([]);
   });
 
-  it('asks the browser once per optional codec, never a table of assumptions', async () => {
-    const asked: unknown[] = [];
-    const scope = globalThis as { VideoDecoder?: unknown };
-    scope.VideoDecoder = {
-      isConfigSupported: (config: { codec: string }) => {
+  /**
+   * A `VideoDecoder` that claims only the AV1 config this module uses, and
+   * whose decode either produces a picture or fails, as `decodes` says.
+   */
+  function fakeDecoder(decodes: boolean): { asked: string[]; restore: () => void } {
+    const asked: string[] = [];
+    const scope = globalThis as { VideoDecoder?: unknown; EncodedVideoChunk?: unknown };
+    scope.VideoDecoder = class {
+      state = 'unconfigured';
+      readonly #init: { output: (frame: { close(): void }) => void; error: (e: Error) => void };
+      static isConfigSupported(config: { codec: string }) {
         asked.push(config.codec);
         // Only the AV1 config this module uses is "supported" here, so a
         // table that assumed every codec is available would be caught by
-        // the exact set this asserts on below.
+        // the exact set asserted on.
         return Promise.resolve({ supported: config.codec === 'av01.0.05M.08' });
+      }
+      constructor(init: { output: (frame: { close(): void }) => void; error: (e: Error) => void }) {
+        this.#init = init;
+      }
+      configure() {
+        this.state = 'configured';
+      }
+      decode() {
+        if (decodes) {
+          this.#init.output({ close() {} });
+        } else {
+          this.#init.error(new Error('EncodingError: Decode error'));
+        }
+      }
+      flush() {
+        return decodes ? Promise.resolve() : Promise.reject(new Error('Decode error'));
+      }
+      close() {
+        this.state = 'closed';
+      }
+    };
+    scope.EncodedVideoChunk = class {
+      constructor(init: Record<string, unknown>) {
+        Object.assign(this, init);
+      }
+    };
+    return {
+      asked,
+      restore: () => {
+        delete scope.VideoDecoder;
+        delete scope.EncodedVideoChunk;
       },
     };
+  }
+
+  it('asks the browser once per optional codec, never a table of assumptions', async () => {
+    const { asked, restore } = fakeDecoder(true);
     try {
       await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
       expect(asked).toEqual(['av01.0.05M.08', 'vp09.00.10.08']);
     } finally {
-      delete scope.VideoDecoder;
+      restore();
+    }
+  });
+
+  it('leaves out a codec the browser claims but cannot decode a key frame of', async () => {
+    // WebKitGTK on Debian 13 answers yes for AV1 and then fails every frame.
+    const { restore } = fakeDecoder(false);
+    try {
+      await expect(supportedOptionalCodecs()).resolves.toEqual([]);
+    } finally {
+      restore();
     }
   });
 

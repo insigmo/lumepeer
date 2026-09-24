@@ -1,0 +1,42 @@
+# Machines of the lumepeer e2e matrix (e2e/matrix/README.md).
+#
+# `ssh` empty means this machine. `app` is relative to the repo root on this
+# machine and to the ssh user's home on the others; deploy.sh puts it there.
+# `python` is the interpreter the agent runs under over ssh.
+
+[matrix]
+# [guest, host]: the guest controls the host.
+pairs = [
+  ["win", "mac"], ["win", "linux"],
+  ["mac", "win"], ["mac", "linux"],
+  ["linux", "win"], ["linux", "mac"],
+  ["win", "beta"], ["beta", "win"],
+]
+rust_log = "info"
+# Seconds from the grant to the first picture in the guest's view. A Wayland
+# host gets longer: somebody has to approve its portal dialog first.
+picture_timeout = 40
+wayland_picture_timeout = 120
+
+[hosts.win]
+os = "windows"
+app = "target/e2e/win/lumepeer-desktop.exe"
+
+[hosts.beta]
+os = "windows"
+ssh = "bberb@beta"
+python = "python"
+app = "AppData/Local/lumepeer-e2e/app/lumepeer-desktop.exe"
+
+[hosts.mac]
+os = "macos"
+ssh = "betal@betals-mac"
+# The Command Line Tools interpreter by path: /usr/bin/python3 is only a stub
+# that pops up an install dialog on the Mac when they are missing.
+python = "/Library/Developer/CommandLineTools/usr/bin/python3"
+app = "lumepeer/target/debug/bundle/macos/Lumepeer.app"
+
+[hosts.linux]
+os = "linux"
+ssh = "beta@debian"
+app = ".lumepeer-e2e/app/lumepeer-desktop"

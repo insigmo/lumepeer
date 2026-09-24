@@ -268,6 +268,70 @@ const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.Vp9, str
 };
 
 /**
+ * A 64x64 grey AV1 key frame (libaom, Main profile, 8-bit): one whole temporal
+ * unit, sequence header included, for {@link decodesAKeyFrame}.
+ */
+const AV1_PROBE_FRAME = new Uint8Array([
+  0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0x9b, 0x5f, 0x20, 0x08, 0x32, 0x0f,
+  0x10, 0x00, 0x90, 0x00, 0x08, 0x20, 0x82, 0x20, 0x00, 0x00, 0xb4, 0x55, 0xb0, 0x75, 0xac,
+]);
+
+/**
+ * A real key frame for each optional codec that a host can actually send.
+ *
+ * VP9 has none: no encoder anywhere in this workspace produces it, so what
+ * this `WebView` says about it decides nothing yet.
+ */
+const DECODE_PROBES: Partial<Record<WireCodec, Uint8Array>> = {
+  [WireCodec.Av1]: AV1_PROBE_FRAME,
+};
+
+/** How long a probe decode may take before the codec counts as missing. */
+const DECODE_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Whether this `WebView` actually turns `frame`, a key frame of `codec`, into
+ * a picture.
+ *
+ * `isConfigSupported` alone is not that answer. WebKitGTK says yes to AV1
+ * whenever some GStreamer element claims the caps, and on Debian 13 the one
+ * that wins cannot decode it, so every frame came back as a decode error: a
+ * Linux guest told an AV1 host it could decode AV1 and never showed a
+ * picture (e2e matrix, 2026-09-24).
+ */
+function decodesAKeyFrame(codec: string, frame: Uint8Array): Promise<boolean> {
+  return new Promise((resolve) => {
+    let decoder: VideoDecoder | null = null;
+    const finish = (decoded: boolean): void => {
+      clearTimeout(timer);
+      try {
+        if (decoder && decoder.state !== 'closed') {
+          decoder.close();
+        }
+      } catch {
+        // Already gone; nothing to release.
+      }
+      resolve(decoded);
+    };
+    const timer = setTimeout(() => finish(false), DECODE_PROBE_TIMEOUT_MS);
+    try {
+      decoder = new VideoDecoder({
+        output: (picture) => {
+          picture.close();
+          finish(true);
+        },
+        error: () => finish(false),
+      });
+      decoder.configure({ codec, optimizeForLatency: true });
+      decoder.decode(new EncodedVideoChunk({ type: 'key', timestamp: 0, data: frame }));
+      decoder.flush().catch(() => finish(false));
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+/**
  * Which optional codecs (beyond the mandatory H.264 baseline) this `WebView`
  * can actually decode right now (ADR 0067).
  *
@@ -276,7 +340,9 @@ const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.Vp9, str
  * assumption is the same shape of mistake as v0.0.14's blank screen (see the
  * comment above the build matrix in `.github/workflows/release.yml`), where a
  * release shipped without the software-encoder fallback a hardware-less host
- * actually needed. H.264 is not asked about here: it is the mandatory baseline
+ * actually needed. A codec a host can actually send is then held to a real
+ * decode too ({@link decodesAKeyFrame}), since a `WebView` can say yes to a
+ * configuration it cannot decode. H.264 is not asked about here: it is the mandatory baseline
  * every peer can decode and has no
  * `Hello.features` string of its own (see {@link nativeDecodingAvailable}
  * for that one's own baseline probe).
@@ -292,7 +358,11 @@ export async function supportedOptionalCodecs(): Promise<WireCodec[]> {
         codec: OPTIONAL_CODEC_CONFIGS[codec],
         optimizeForLatency: true,
       });
-      if (support.supported === true) {
+      const probe = DECODE_PROBES[codec];
+      if (
+        support.supported === true &&
+        (!probe || (await decodesAKeyFrame(OPTIONAL_CODEC_CONFIGS[codec], probe)))
+      ) {
         supported.push(codec);
       }
     } catch {
