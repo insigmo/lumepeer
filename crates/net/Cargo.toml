@@ -48,6 +48,10 @@ iroh-mainline-address-lookup = "=0.5.0"
 # exact version it resolves to, for the same reason `noq` is — the `Stream`
 # these yield and the `StreamExt` used to poll it have to be one crate.
 n0-future = "=0.3.2"
+# The DHT the obfuscated transport's rendezvous records live in (ADR 0113).
+# Already in the dependency tree via `iroh-mainline-address-lookup`; pinned to
+# the exact version it resolves to, so the process runs one DHT implementation.
+n0-mainline = "=0.6.0"
 
 [dev-dependencies]
 proptest.workspace = true

@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use lumepeer_core::consent::Role;
 use lumepeer_net::obfuscated_endpoint::{GuestObfuscatedEndpoint, STUN_SERVERS, bind_host};
+use lumepeer_net::rendezvous::Rendezvous;
 use lumepeer_net::stun;
 use lumepeer_net::ticket::INVITE_ID_BYTES;
 use lumepeer_net::{InviteTicket, PeerConnection};
@@ -120,7 +121,10 @@ async fn host(guests: u32) -> Result<(), String> {
     let secret = iroh::SecretKey::generate();
     let identity = SigningKey::from_bytes(&secret.to_bytes());
 
-    let bound = bind_host(&invite_id, &identity)
+    // The real product path since ADR 0113: the host publishes where it is
+    // and punches back towards every guest that knocks.
+    let rendezvous = Rendezvous::start().map_err(|e| e.to_string())?;
+    let bound = bind_host(&invite_id, &identity, Some(rendezvous))
         .await
         .map_err(|e| e.to_string())?;
     let Some(public_addr) = bound.public_addr else {
@@ -139,11 +143,14 @@ async fn host(guests: u32) -> Result<(), String> {
         .await
         .map_err(|e| format!("stub iroh bind: {e}"))?;
 
-    let ticket = InviteTicket::issue(
+    // Under the id the endpoint was bound with: `issue` would mint another,
+    // and a guest holding it would seal with keys this endpoint cannot open.
+    let ticket = InviteTicket::issue_with_id(
         &identity,
         &iroh_stub.addr(),
         Role::ViewOnly,
         unix_now(),
+        invite_id,
         Some(public_addr),
         Some(bound.cert_fingerprint),
     )
@@ -228,7 +235,14 @@ async fn guest(code: &str, attempts: u32) -> Result<(), String> {
                 .to_owned(),
         );
     };
+    let host = ticket
+        .endpoint_addr()
+        .map_err(|e| format!("ticket address: {e}"))?
+        .id;
     println!("DIALING target={target}, {attempts} punch(es)");
+    // One DHT client for every punch, as the app has one per process
+    // (ADR 0113): each punch still knocks from its own fresh socket.
+    let rendezvous = Rendezvous::start().map_err(|e| e.to_string())?;
 
     // The guest's own throwaway identity: its certificate names it to the
     // host exactly as the iroh path's endpoint key would (ADR 0080).
@@ -236,7 +250,16 @@ async fn guest(code: &str, attempts: u32) -> Result<(), String> {
     let mut landed = 0u32;
     for attempt in 1..=attempts {
         let started = Instant::now();
-        match punch(&ticket.invite_id, &identity, target, fingerprint).await {
+        match punch(
+            &ticket.invite_id,
+            &identity,
+            host,
+            target,
+            fingerprint,
+            &rendezvous,
+        )
+        .await
+        {
             Ok(()) => {
                 landed += 1;
                 println!(
@@ -265,11 +288,20 @@ async fn guest(code: &str, attempts: u32) -> Result<(), String> {
 async fn punch(
     invite_id: &[u8; INVITE_ID_BYTES],
     identity: &SigningKey,
+    host: lumepeer_core::NodeId,
     target: SocketAddr,
     fingerprint: [u8; 32],
+    rendezvous: &Rendezvous,
 ) -> Result<(), String> {
-    let endpoint = GuestObfuscatedEndpoint::bind(invite_id, identity, target, fingerprint)
-        .map_err(|e| format!("bind: {e}"))?;
+    let endpoint = GuestObfuscatedEndpoint::bind(
+        invite_id,
+        identity,
+        host,
+        target,
+        fingerprint,
+        Some(rendezvous.clone()),
+    )
+    .map_err(|e| format!("bind: {e}"))?;
     let outcome = ping(&endpoint).await;
     endpoint.close().await;
     outcome
@@ -279,7 +311,7 @@ async fn punch(
 /// a connection that carries nothing proves less than the session needs.
 async fn ping(endpoint: &GuestObfuscatedEndpoint) -> Result<(), String> {
     let connection = endpoint
-        .connect(lumepeer_net::ALPN_CONTROL)
+        .connect_control()
         .await
         .map_err(|e| format!("dial: {e}"))?;
     println!("CONNECTED peer={}", connection.peer());

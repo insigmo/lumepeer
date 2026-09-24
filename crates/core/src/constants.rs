@@ -494,6 +494,33 @@ pub const OBFUSCATED_CONNECT_RETRY_BACKOFF_MS: u64 = 500;
 /// so the whole train bounds a failed punch at
 /// [`OBFUSCATED_CONNECT_ATTEMPTS`] × (this + [`OBFUSCATED_CONNECT_RETRY_BACKOFF_MS`]).
 pub const OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS: u64 = 2_000;
+/// Pause between one knock poll finishing and the next starting, seconds
+/// (ADR 0113).
+///
+/// It bounds how long a guest waits for the host's half of the punch, and it
+/// is the one recurring cost of the rendezvous: every poll is a DHT lookup.
+/// Measured on the public DHT (2026-09-24) a poll takes 7-10 s and about 66
+/// requests out and 20 answers in, some 15 KB, so this pause makes a host that
+/// keeps an invite open cost roughly 0.8 KB/s. It is sized so that a guest's
+/// knock is answered within the obfuscated share of one dial round.
+pub const RENDEZVOUS_POLL_SECS: u64 = 25 * 60;
+/// How often a host republishes an unchanged rendezvous record, seconds
+/// (ADR 0113). DHT nodes drop a mutable item they have not been sent again
+/// within about two hours; a changed address is published at once.
+pub const RENDEZVOUS_REPUBLISH_SECS: u64 = 30 * 60;
+/// Longest one rendezvous lookup may run before the caller takes what it has,
+/// seconds (ADR 0113).
+pub const RENDEZVOUS_LOOKUP_TIMEOUT_SECS: u64 = 10;
+/// A knock older than this when the host first sees it is not answered,
+/// seconds (ADR 0113): it is a dial that has long given up, and punching
+/// towards it would only send packets at an address nobody is listening on.
+pub const RENDEZVOUS_KNOCK_FRESH_SECS: u64 = 120;
+/// Packets a host sends towards a guest that knocked, one per
+/// [`RENDEZVOUS_PUNCH_INTERVAL_MS`] (ADR 0113). Spread over the guest's own
+/// punch train, so one of them is on the wire whichever of its attempts is.
+pub const RENDEZVOUS_PUNCH_PACKETS: u32 = 10;
+/// Spacing of a host's punch packets, milliseconds (ADR 0113).
+pub const RENDEZVOUS_PUNCH_INTERVAL_MS: u64 = 1_000;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).

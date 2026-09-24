@@ -20,16 +20,26 @@
 //! the punch. The guest's half is [`punch`]: the dial itself, on a bounded
 //! cadence, so its packets are ordinary sealed datagrams and a punch that
 //! cannot land fails in seconds instead of minutes.
+//!
+//! ADR 0113 gives the punch its missing half through `crate::rendezvous`: the
+//! host publishes where its endpoint is *now* and polls for knocks, and a
+//! guest that knocks gets packets sent towards it, which is what opens a NAT
+//! that filters by sender. The guest also stops taking the ticket's address as
+//! the only truth: a host that restarted or moved uplinks is somewhere else,
+//! and its record says where. The pinned certificate needs no such help — it
+//! is the same on every bind (see [`identity_certificate`]).
 
 use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     NAT_MAPPING_KEEPALIVE_SECS, OBFUSCATED_CONNECT_ATTEMPTS, OBFUSCATED_CONNECT_RETRY_BACKOFF_MS,
-    OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS,
+    OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS, RENDEZVOUS_KNOCK_FRESH_SECS, RENDEZVOUS_POLL_SECS,
+    RENDEZVOUS_PUNCH_INTERVAL_MS, RENDEZVOUS_PUNCH_PACKETS, RENDEZVOUS_REPUBLISH_SECS,
+    STUN_QUERY_TIMEOUT_MS,
 };
 use noq::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -42,11 +52,13 @@ use noq::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use noq::{
     AsyncUdpSocket, ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
 };
+use rand::{Rng as _, RngExt as _};
 
 use crate::endpoint::SUPPORTED_ALPNS;
 use crate::error::{NetError, Result};
-use crate::obfuscate::{ObfuscatedSocket, Obfuscator, obfuscated_transport_config};
+use crate::obfuscate::{ObfuscatedSocket, Obfuscator, StunTap, obfuscated_transport_config};
 use crate::peer_connection::PeerConnection;
+use crate::rendezvous::Rendezvous;
 use crate::stun;
 use crate::ticket::INVITE_ID_BYTES;
 
@@ -133,10 +145,11 @@ impl std::fmt::Debug for IdentityCertificate {
 
 /// Generates a self-signed certificate whose key is `identity`.
 ///
-/// A fresh certificate every bind, over a key that never changes: the serial
-/// and validity differ per bind, so the fingerprint an invite pins is the one
-/// this endpoint presents and no other, while the identity inside it stays the
-/// node's own.
+/// The same certificate on every bind: `rcgen` derives the serial from the
+/// key and uses fixed validity dates, and an ed25519 signature is
+/// deterministic. So the fingerprint an invite pins still names the
+/// certificate a host presents after it restarts, which is what lets a
+/// restored invite be served again at all (ADR 0113).
 ///
 /// # Errors
 /// [`NetError::Endpoint`] if the key cannot be encoded or the certificate
@@ -310,6 +323,11 @@ pub struct HostObfuscatedEndpoint {
     /// server to keep hitting. Owned here so the task dies with the endpoint
     /// instead of with the process (gap-tasks/21 task 1; ADR 0080).
     keepalive: Option<tokio::task::JoinHandle<()>>,
+    /// The rendezvous of [`serve_rendezvous`] — publishing this endpoint's
+    /// address and answering knocks — when the caller gave it a DHT and STUN
+    /// found an address to publish (ADR 0113). Dies with the endpoint, like
+    /// the keep-alive.
+    rendezvous: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for HostObfuscatedEndpoint {
@@ -380,9 +398,13 @@ impl HostObfuscatedEndpoint {
         self.endpoint.wait_idle().await;
     }
 
-    /// Aborts the keep-alive task, if one is running. Idempotent.
+    /// Aborts the keep-alive and rendezvous tasks, if they are running.
+    /// Idempotent.
     fn stop_keepalive(&mut self) {
-        if let Some(task) = self.keepalive.take() {
+        for task in [self.keepalive.take(), self.rendezvous.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -446,6 +468,11 @@ impl ObfuscatedAcceptor {
 /// channel to coordinate). That task now stops with the endpoint rather than
 /// with the process — see [`HostObfuscatedEndpoint::close`].
 ///
+/// With a `rendezvous` it also publishes the address to the DHT, republishes
+/// it whenever the keep-alive's STUN answer says it moved, and punches towards
+/// every guest that knocks (ADR 0113) — the simultaneous send the keep-alive
+/// alone could never be.
+///
 /// `identity` is this node's ed25519 endpoint key: the certificate is
 /// generated from it, so a guest that connects here is talking to the same
 /// `NodeId` the iroh path would have given it (ADR 0080).
@@ -456,8 +483,9 @@ impl ObfuscatedAcceptor {
 pub async fn bind_host(
     invite_id: &[u8; INVITE_ID_BYTES],
     identity: &SigningKey,
+    rendezvous: Option<Rendezvous>,
 ) -> Result<HostObfuscatedEndpoint> {
-    bind_host_via(invite_id, identity, STUN_SERVERS).await
+    bind_host_via(invite_id, identity, STUN_SERVERS, rendezvous).await
 }
 
 /// [`bind_host`], with the reflector list named by the caller.
@@ -469,6 +497,7 @@ async fn bind_host_via(
     invite_id: &[u8; INVITE_ID_BYTES],
     identity: &SigningKey,
     servers: &[&str],
+    rendezvous: Option<Rendezvous>,
 ) -> Result<HostObfuscatedEndpoint> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| NetError::Endpoint(e.to_string()))?;
     let probe_socket = socket
@@ -477,11 +506,11 @@ async fn bind_host_via(
     let keepalive_socket = socket
         .try_clone()
         .map_err(|e| NetError::Endpoint(e.to_string()))?;
+    let punch_socket = socket
+        .try_clone()
+        .map_err(|e| NetError::Endpoint(e.to_string()))?;
 
-    let resolved: Vec<SocketAddr> = servers
-        .iter()
-        .filter_map(|server| server.to_socket_addrs().ok().and_then(|mut a| a.next()))
-        .collect();
+    let resolved = resolve_servers(servers);
     let (public_addr, stun_server) =
         tokio::task::spawn_blocking(move || discover_public_addr(&probe_socket, &resolved))
             .await
@@ -489,14 +518,29 @@ async fn bind_host_via(
 
     let keepalive = stun_server.map(|server| spawn_keepalive(keepalive_socket, server));
 
+    // Once `noq` owns the socket the keep-alive cannot read its own answers,
+    // so they come back through the tap — which is how a host whose uplink
+    // changed finds out (ADR 0113).
+    let (current_addr, watched_addr) = tokio::sync::watch::channel(public_addr);
     let runtime: Arc<dyn noq::Runtime> = Arc::new(TokioRuntime);
     let wrapped = runtime
         .wrap_udp_socket(socket)
         .map_err(|e| NetError::Endpoint(e.to_string()))?;
-    let obfuscated_socket: Box<dyn AsyncUdpSocket> = Box::new(ObfuscatedSocket::new(
-        wrapped,
-        Obfuscator::for_host(invite_id),
-    ));
+    let obfuscated_socket: Box<dyn AsyncUdpSocket> = Box::new(
+        ObfuscatedSocket::new(wrapped, Obfuscator::for_host(invite_id)).with_stun_tap(
+            StunTap::new(stun_server.into_iter().collect(), current_addr),
+        ),
+    );
+    let rendezvous = match (rendezvous, public_addr) {
+        (Some(rendezvous), Some(_)) => Some(tokio::spawn(serve_rendezvous(
+            rendezvous,
+            identity.clone(),
+            *invite_id,
+            watched_addr,
+            punch_socket,
+        ))),
+        _ => None,
+    };
 
     let certificate = identity_certificate(identity)?;
     let cert_fingerprint = certificate.fingerprint;
@@ -532,7 +576,23 @@ async fn bind_host_via(
         public_addr,
         cert_fingerprint,
         keepalive,
+        rendezvous,
     })
+}
+
+/// Resolves each reflector name to its first address, skipping the ones that
+/// do not resolve. Blocking: DNS.
+fn resolve_servers<S: AsRef<str>>(servers: &[S]) -> Vec<SocketAddr> {
+    servers
+        .iter()
+        .filter_map(|server| {
+            server
+                .as_ref()
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut a| a.next())
+        })
+        .collect()
 }
 
 /// Tries each of `servers` in turn on `socket`, returning the first reflexive
@@ -551,15 +611,15 @@ fn discover_public_addr(
 }
 
 /// Resends a STUN request to `server` on `socket` every
-/// `NAT_MAPPING_KEEPALIVE_SECS`, forever. The reply is not needed — only the
-/// outbound packet, which is what a NAT counts to keep a mapping alive; a
-/// failed/timed-out reply just means one keepalive tick, not the mapping,
-/// was lost.
+/// `NAT_MAPPING_KEEPALIVE_SECS`, forever. The outbound packet is what a NAT
+/// counts to keep a mapping alive; the answer is read by the socket's STUN tap
+/// rather than here, because `noq` owns the socket's reads (ADR 0113). A lost
+/// answer costs one tick of address tracking, never the mapping.
 ///
 /// The handle is returned rather than dropped: the endpoint owns it and aborts
 /// it on close, so a retired invite stops holding its mapping open
 /// (gap-tasks/21 task 1; ADR 0080).
-fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) -> tokio::task::JoinHandle<()> {
+fn spawn_keepalive(socket: UdpSocket, server: SocketAddr) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(NAT_MAPPING_KEEPALIVE_SECS));
         // The STUN probe during bind already sent one packet; skip the
@@ -568,19 +628,115 @@ fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) -> tokio::task::Jo
         interval.tick().await;
         loop {
             interval.tick().await;
-            let sent = tokio::task::spawn_blocking(move || {
-                let _ = stun::reflexive_addr(&socket, server);
-                socket
-            })
-            .await;
-            match sent {
-                Ok(returned) => socket = returned,
-                // The blocking task panicked or was cancelled; the socket is
-                // gone, so there is nothing left to keep the mapping with.
-                Err(_) => return,
-            }
+            let _ = stun::send_binding_request(&socket, server);
         }
     })
+}
+
+/// The host's half of the rendezvous (ADR 0113), for the life of one endpoint.
+///
+/// Publishes where the endpoint is reachable — at once, whenever the STUN tap
+/// reports that the mapping moved, and every [`RENDEZVOUS_REPUBLISH_SECS`] so
+/// DHT nodes keep it — and polls for a guest's knock, [`RENDEZVOUS_POLL_SECS`]
+/// after the previous poll finished. Each new knock is answered with a train
+/// of packets towards the guest's address from this endpoint's own socket: the
+/// send that makes a NAT which filters by sender let the guest's next packet
+/// in.
+///
+/// A knock that is already there when the endpoint starts is only answered if
+/// it is recent by its own clock; every knock after that is new by
+/// construction (its sequence number is higher than the last one seen), so no
+/// clock between the two machines has to agree.
+async fn serve_rendezvous(
+    rendezvous: Rendezvous,
+    identity: SigningKey,
+    invite_id: [u8; INVITE_ID_BYTES],
+    mut addr: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    punch_socket: UdpSocket,
+) {
+    let punch_socket = Arc::new(punch_socket);
+    let mut republish = tokio::time::interval(Duration::from_secs(RENDEZVOUS_REPUBLISH_SECS));
+    let mut poll = tokio::time::interval(Duration::from_secs(RENDEZVOUS_POLL_SECS));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Owned here so an endpoint that closes takes its punches and publishes
+    // with it.
+    let mut work = tokio::task::JoinSet::new();
+    let mut last_knock: Option<i64> = None;
+    let mut first_poll = true;
+    loop {
+        tokio::select! {
+            _ = republish.tick() => {}
+            changed = addr.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                tracing::info!(addr = ?*addr.borrow(), "the obfuscated endpoint's public address moved");
+                republish.reset();
+            }
+            _ = poll.tick() => {
+                let knock = rendezvous.knock_after(&invite_id, last_knock).await;
+                // The pause counts from the end of a poll: a lookup takes
+                // seconds, and counting from its start would poll back to back.
+                poll.reset();
+                let Some(knock) = knock else {
+                    first_poll = false;
+                    continue;
+                };
+                last_knock = Some(knock.seq);
+                let fresh = !first_poll || unix_now().saturating_sub(knock.at) <= RENDEZVOUS_KNOCK_FRESH_SECS;
+                first_poll = false;
+                if fresh {
+                    tracing::info!(guest = %knock.addr, "a guest knocked: punching towards it");
+                    work.spawn(punch_towards(Arc::clone(&punch_socket), knock.addr));
+                }
+                continue;
+            }
+            Some(_) = work.join_next(), if !work.is_empty() => continue,
+        }
+        // Reached from the two publish arms only.
+        let Some(current) = *addr.borrow() else {
+            continue;
+        };
+        let rendezvous = rendezvous.clone();
+        let identity = identity.clone();
+        work.spawn(async move {
+            match rendezvous
+                .publish_host(&identity, &invite_id, current)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(addr = %current, "published the obfuscated address to the DHT");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not publish the obfuscated address to the DHT");
+                }
+            }
+        });
+    }
+}
+
+/// Sends [`RENDEZVOUS_PUNCH_PACKETS`] datagrams of random bytes to `to`, one
+/// every [`RENDEZVOUS_PUNCH_INTERVAL_MS`].
+///
+/// Random bytes are what every sealed datagram of this transport already looks
+/// like, so a punch adds no shape of its own to the wire (ADR 0082), and the
+/// guest's socket drops them as undecryptable noise. Only the sending matters:
+/// it is what leaves this side's NAT expecting packets from the guest.
+async fn punch_towards(socket: Arc<UdpSocket>, to: SocketAddr) {
+    let mut interval = tokio::time::interval(Duration::from_millis(RENDEZVOUS_PUNCH_INTERVAL_MS));
+    for _ in 0..RENDEZVOUS_PUNCH_PACKETS {
+        interval.tick().await;
+        let mut noise = vec![0u8; rand::rng().random_range(48..=96)];
+        rand::rng().fill_bytes(&mut noise);
+        let _ = socket.send_to(&noise, to);
+    }
+}
+
+/// Seconds since the Unix epoch, or zero on a clock set before it.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// A guest's obfuscated endpoint, bound once for one host and reused for every
@@ -593,13 +749,35 @@ fn spawn_keepalive(mut socket: UdpSocket, server: SocketAddr) -> tokio::task::Jo
 /// delay a revoke on the control one.
 pub struct GuestObfuscatedEndpoint {
     endpoint: Endpoint,
-    /// The host's address from the invite ticket (ADR 0053).
-    target: SocketAddr,
+    /// Where the host's endpoint is: the ticket's address (ADR 0053) until
+    /// the host's rendezvous record names a newer one (ADR 0113).
+    target: Arc<Mutex<SocketAddr>>,
+    /// The host's endpoint key, which its rendezvous record is signed with
+    /// (ADR 0113).
+    host: NodeId,
     /// Blake3 of the host certificate the ticket pinned.
     expected_fingerprint: [u8; 32],
     /// This guest's own certificate, presented on every channel so the host
     /// learns which `NodeId` is dialing it.
     certificate: Arc<IdentityCertificate>,
+    /// The invite this endpoint dials under, which names its rendezvous
+    /// records.
+    invite_id: [u8; INVITE_ID_BYTES],
+    /// The rendezvous, when the caller gave this endpoint a DHT (ADR 0113).
+    rendezvous: Option<GuestRendezvous>,
+}
+
+/// What a guest endpoint needs to look up its host and knock (ADR 0113).
+struct GuestRendezvous {
+    dht: Rendezvous,
+    /// A clone of the endpoint's socket, to send STUN queries from — the
+    /// knock has to name the mapping the dial itself goes out through.
+    stun_socket: Arc<UdpSocket>,
+    /// Reflectors whose answers the socket hands over, and the answer.
+    tap: StunTap,
+    reflexive: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    /// Names of the reflectors to ask, resolved inside the dial.
+    servers: &'static [&'static str],
 }
 
 impl std::fmt::Debug for GuestObfuscatedEndpoint {
@@ -614,6 +792,10 @@ impl GuestObfuscatedEndpoint {
     /// Binds a socket for one host: obfuscated with `invite_id`'s keys, and
     /// carrying a certificate generated from this node's `identity`.
     ///
+    /// `host` is the host's endpoint key and `target`/`expected_fingerprint`
+    /// what its ticket said. With a `rendezvous`, [`Self::connect_control`]
+    /// also asks the DHT where the host is now and knocks (ADR 0113).
+    ///
     /// Nothing is dialed here — [`Self::connect`] opens each channel — so a
     /// bound endpoint costs one UDP socket and no traffic at all.
     ///
@@ -623,18 +805,49 @@ impl GuestObfuscatedEndpoint {
     pub fn bind(
         invite_id: &[u8; INVITE_ID_BYTES],
         identity: &SigningKey,
+        host: NodeId,
         target: SocketAddr,
         expected_fingerprint: [u8; 32],
+        rendezvous: Option<Rendezvous>,
+    ) -> Result<Self> {
+        Self::bind_via(
+            invite_id,
+            identity,
+            host,
+            target,
+            expected_fingerprint,
+            rendezvous,
+            STUN_SERVERS,
+        )
+    }
+
+    /// [`Self::bind`], with the reflector list named by the caller, so a test
+    /// can learn this socket's address from a local reflector.
+    fn bind_via(
+        invite_id: &[u8; INVITE_ID_BYTES],
+        identity: &SigningKey,
+        host: NodeId,
+        target: SocketAddr,
+        expected_fingerprint: [u8; 32],
+        rendezvous: Option<Rendezvous>,
+        servers: &'static [&'static str],
     ) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| NetError::Endpoint(e.to_string()))?;
+        let stun_socket = socket
+            .try_clone()
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        let (reflexive_tx, reflexive) = tokio::sync::watch::channel(None);
+        // Empty until the dial resolves the reflectors: that is DNS, and this
+        // runs on the actor's thread.
+        let tap = StunTap::new(Vec::new(), reflexive_tx);
         let runtime: Arc<dyn noq::Runtime> = Arc::new(TokioRuntime);
         let wrapped = runtime
             .wrap_udp_socket(socket)
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
-        let obfuscated_socket: Box<dyn AsyncUdpSocket> = Box::new(ObfuscatedSocket::new(
-            wrapped,
-            Obfuscator::for_guest(invite_id),
-        ));
+        let obfuscated_socket: Box<dyn AsyncUdpSocket> = Box::new(
+            ObfuscatedSocket::new(wrapped, Obfuscator::for_guest(invite_id))
+                .with_stun_tap(tap.clone()),
+        );
         let endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
             None,
@@ -645,10 +858,79 @@ impl GuestObfuscatedEndpoint {
 
         Ok(Self {
             endpoint,
-            target,
+            target: Arc::new(Mutex::new(target)),
+            host,
             expected_fingerprint,
             certificate: Arc::new(identity_certificate(identity)?),
+            invite_id: *invite_id,
+            rendezvous: rendezvous.map(|dht| GuestRendezvous {
+                dht,
+                stun_socket: Arc::new(stun_socket),
+                tap,
+                reflexive,
+                servers,
+            }),
         })
+    }
+
+    /// Opens the control channel: one attempt of a dial (ADR 0083).
+    ///
+    /// With a rendezvous, the attempt also looks the host up and knocks, both
+    /// in the background so the punch starts at once (ADR 0113): a lookup that
+    /// finds the host somewhere else moves the target under the punch's later
+    /// packets, and the knock is what brings the host's own packets towards
+    /// this socket. Neither is waited for — a DHT that answers slowly or not
+    /// at all leaves this exactly the dial it was before the rendezvous.
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub async fn connect_control(&self) -> Result<PeerConnection> {
+        if let Some(rendezvous) = &self.rendezvous {
+            self.start_rendezvous(rendezvous);
+        }
+        self.connect(crate::endpoint::ALPN_CONTROL).await
+    }
+
+    /// Spawns this attempt's lookup and knock (see [`Self::connect_control`]).
+    fn start_rendezvous(&self, rendezvous: &GuestRendezvous) {
+        let dht = rendezvous.dht.clone();
+        let host = self.host;
+        let invite_id = self.invite_id;
+        let target = Arc::clone(&self.target);
+        tokio::spawn(async move {
+            let Some(seen) = dht.host(&host, &invite_id).await else {
+                return;
+            };
+            let Ok(mut current) = target.lock() else {
+                return;
+            };
+            if *current != seen.addr {
+                tracing::info!(
+                    from = %*current,
+                    to = %seen.addr,
+                    "the host's obfuscated endpoint has moved: dialing where it says it is now"
+                );
+                *current = seen.addr;
+            }
+        });
+
+        let dht = rendezvous.dht.clone();
+        let socket = Arc::clone(&rendezvous.stun_socket);
+        let tap = rendezvous.tap.clone();
+        let reflexive = rendezvous.reflexive.clone();
+        let servers = rendezvous.servers;
+        tokio::spawn(async move {
+            let Some(own) = own_reflexive_addr(&socket, &tap, reflexive, servers).await else {
+                tracing::warn!("no reflector answered: cannot knock, the host will not punch back");
+                return;
+            };
+            match dht.knock(&invite_id, own).await {
+                Ok(()) => {
+                    tracing::info!(addr = %own, "knocked: asked the host to punch towards this guest");
+                }
+                Err(error) => tracing::warn!(%error, "could not knock"),
+            }
+        });
     }
 
     /// Opens one channel to the host, on `alpn`, punching towards it as it
@@ -689,8 +971,14 @@ impl GuestObfuscatedEndpoint {
         client_config.transport_config(Arc::new(obfuscated_transport_config()));
 
         let connection = punch(|| async {
+            // Read per attempt: the rendezvous may have moved it since the
+            // last one (ADR 0113).
+            let target = *self
+                .target
+                .lock()
+                .map_err(|_| NetError::Dial("the dial target is poisoned".to_owned()))?;
             self.endpoint
-                .connect_with(client_config.clone(), self.target, CERT_SUBJECT)
+                .connect_with(client_config.clone(), target, CERT_SUBJECT)
                 .map_err(|e| NetError::Dial(e.to_string()))?
                 .await
                 .map_err(|e| NetError::Dial(e.to_string()))
@@ -710,6 +998,41 @@ impl GuestObfuscatedEndpoint {
         self.endpoint.close(noq::VarInt::from_u32(0), b"");
         self.endpoint.wait_idle().await;
     }
+}
+
+/// The public address of a guest endpoint's socket, for its knock (ADR 0113).
+///
+/// Known after the first attempt of a dial — the socket and its mapping stay
+/// the same for the whole dial — and otherwise asked of each reflector in turn
+/// through `socket`, with the answer arriving by the socket's STUN tap because
+/// `noq` owns the reads.
+async fn own_reflexive_addr(
+    socket: &UdpSocket,
+    tap: &StunTap,
+    mut reflexive: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    servers: &'static [&'static str],
+) -> Option<SocketAddr> {
+    if let Some(known) = *reflexive.borrow() {
+        return Some(known);
+    }
+    let resolved = tokio::task::spawn_blocking(move || resolve_servers(servers))
+        .await
+        .ok()?;
+    tap.set_servers(resolved.clone());
+    for server in resolved {
+        if stun::send_binding_request(socket, server).is_err() {
+            continue;
+        }
+        let answered = tokio::time::timeout(
+            Duration::from_millis(STUN_QUERY_TIMEOUT_MS),
+            reflexive.wait_for(Option::is_some),
+        )
+        .await;
+        if let Ok(Ok(addr)) = answered {
+            return *addr;
+        }
+    }
+    None
 }
 
 /// The guest's half of the hole punch: `dial` up to
@@ -976,7 +1299,7 @@ mod tests {
     #[tokio::test]
     async fn closing_the_endpoint_stops_the_keepalive_task() {
         let (reflector, reflector_task) = spawn_reflector().await;
-        let host = bind_host_via(&INVITE, &identity(1), &[&reflector.to_string()])
+        let host = bind_host_via(&INVITE, &identity(1), &[&reflector.to_string()], None)
             .await
             .unwrap();
 
@@ -1116,7 +1439,7 @@ mod tests {
         let (reflector, reflector_task) = spawn_reflector().await;
         reflector_task.abort();
 
-        let host = bind_host_via(&INVITE, &identity(1), &[&reflector.to_string()])
+        let host = bind_host_via(&INVITE, &identity(1), &[&reflector.to_string()], None)
             .await
             .unwrap();
         assert!(host.public_addr.is_none());
@@ -1154,7 +1477,9 @@ mod tests {
         // STUN server would report is neither available nor wanted. The
         // endpoint binds and accepts all the same — `public_addr: None` is an
         // ordinary outcome, not a failure (task 1 item 3).
-        let host = bind_host_via(&INVITE, &host_identity, &[]).await.unwrap();
+        let host = bind_host_via(&INVITE, &host_identity, &[], None)
+            .await
+            .unwrap();
         assert!(host.public_addr.is_none());
         let target = SocketAddr::new(
             Ipv4Addr::LOCALHOST.into(),
@@ -1192,8 +1517,16 @@ mod tests {
             (peer, control)
         });
 
-        let guest =
-            GuestObfuscatedEndpoint::bind(&INVITE, &guest_identity, target, fingerprint).unwrap();
+        let host_id = NodeId::from_bytes(&host_identity.verifying_key().to_bytes()).unwrap();
+        let guest = GuestObfuscatedEndpoint::bind(
+            &INVITE,
+            &guest_identity,
+            host_id,
+            target,
+            fingerprint,
+            None,
+        )
+        .unwrap();
         let connection = guest.connect(crate::endpoint::ALPN_CONTROL).await.unwrap();
         let mut control = guest_handshake(connection, Role::FullControl, Vec::new(), Vec::new())
             .await
@@ -1217,5 +1550,93 @@ mod tests {
         );
 
         guest.close().await;
+    }
+
+    /// ADR 0113 (B): a host that restarts presents the very certificate the
+    /// invite pinned, so a restored invite can be served again — and a node
+    /// with a different identity presents a different one.
+    #[tokio::test]
+    async fn a_restarted_host_presents_the_certificate_the_invite_pinned() {
+        let before = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let pinned = before.cert_fingerprint;
+        before.close().await;
+
+        let after = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(after.cert_fingerprint, pinned);
+        after.close().await;
+
+        let stranger = bind_host_via(&INVITE, &identity(3), &[], None)
+            .await
+            .unwrap();
+        assert_ne!(stranger.cert_fingerprint, pinned);
+        stranger.close().await;
+    }
+
+    /// ADR 0113: the guest holds a ticket whose address is dead, the host's
+    /// rendezvous record says where it is now, and the dial gets there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_rendezvous_leads_a_guest_to_where_the_host_is_now() {
+        let testnet = n0_mainline::Testnet::new(5).await.unwrap();
+        let (reflector, reflector_task) = spawn_reflector().await;
+        let host_identity = identity(1);
+        let host_id = NodeId::from_bytes(&host_identity.verifying_key().to_bytes()).unwrap();
+
+        let host = bind_host_via(
+            &INVITE,
+            &host_identity,
+            &[&reflector.to_string()],
+            Some(Rendezvous::with_bootstrap(&testnet.bootstrap).unwrap()),
+        )
+        .await
+        .unwrap();
+        let now_at = host.public_addr.expect("the local reflector answered");
+        let pinned = host.cert_fingerprint;
+        let serving = tokio::spawn(async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let peer = connection.peer();
+            connection.closed().await;
+            (peer, host)
+        });
+
+        let guest_dht = Rendezvous::with_bootstrap(&testnet.bootstrap).unwrap();
+        for _ in 0..100 {
+            if guest_dht.host(&host_id, &INVITE).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let published = guest_dht.host(&host_id, &INVITE).await.unwrap();
+        assert_eq!(published.addr, now_at);
+
+        // What the ticket said: a socket that is bound and never answers.
+        let stale = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let reflectors: &'static [&'static str] =
+            Box::leak(vec![&*Box::leak(reflector.to_string().into_boxed_str())].into_boxed_slice());
+        let guest = GuestObfuscatedEndpoint::bind_via(
+            &INVITE,
+            &identity(2),
+            host_id,
+            stale.local_addr().unwrap(),
+            pinned,
+            Some(guest_dht),
+            reflectors,
+        )
+        .unwrap();
+        let connection = guest.connect_control().await.unwrap();
+        assert_eq!(connection.peer(), host_id);
+        connection.close(0u32.into(), b"done");
+
+        let (peer, host) = serving.await.unwrap();
+        assert_eq!(
+            peer,
+            NodeId::from_bytes(&identity(2).verifying_key().to_bytes()).unwrap()
+        );
+        guest.close().await;
+        host.close().await;
+        reflector_task.abort();
     }
 }

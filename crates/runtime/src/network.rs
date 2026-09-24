@@ -4210,6 +4210,19 @@ enum ActorEvent {
     /// the same classify-and-handshake path as an iroh one, which is where the
     /// invite it claims to hold is actually checked (§7, §9.1).
     ObfuscatedIncoming { connection: Box<PeerConnection> },
+    /// Host side: the obfuscated endpoint for an invite restored at startup
+    /// finished binding (ADR 0113).
+    ///
+    /// A restored invite used to come back with its obfuscated address and no
+    /// endpoint behind it, so every guest's punch went to a socket that no
+    /// longer existed. It is only kept if that invite is still the live one —
+    /// an invite issued while this bound has already replaced it.
+    ObfuscatedRestored {
+        /// The invite id the endpoint's datagram keys were derived from.
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        /// The bound endpoint, or `None` when it could not be bound at all.
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+    },
     /// A display-mode switch's confirmation window elapsed off the actor
     /// loop (docs/bugs/16-host-display-mode.md #3; ADR 0048). `generation`
     /// ties this to the switch that armed it; the actor checks both that its
@@ -4417,9 +4430,9 @@ impl HostDialer {
     ///
     /// `by_lookup` strips the ticket's addresses so iroh reaches the host by
     /// its endpoint key alone, which is what finds a host that rebooted onto a
-    /// new address (ADR 0062). The obfuscated transport has no lookup service
-    /// and exactly one address — the one the ticket pinned — so it ignores the
-    /// hint and dials the same target every time.
+    /// new address (ADR 0062). The obfuscated transport ignores the hint: every
+    /// attempt of its own already asks the DHT where the host is now and
+    /// knocks (ADR 0113).
     ///
     /// # Errors
     /// [`NetError::Dial`] if the channel cannot be opened.
@@ -4433,7 +4446,8 @@ impl HostDialer {
                     )
                     .await
             }
-            _ => self.connect(lumepeer_net::ALPN_CONTROL).await,
+            Self::Iroh { .. } => self.connect(lumepeer_net::ALPN_CONTROL).await,
+            Self::Obfuscated(endpoint) => endpoint.connect_control().await,
         }
     }
 
@@ -5235,6 +5249,11 @@ struct ObfuscatedHost {
     /// (double NAT), in which case the ticket carries nothing about this
     /// transport and every guest falls back to the iroh path.
     endpoint: Option<HostObfuscatedEndpoint>,
+    /// The DHT the transport's rendezvous runs over (ADR 0113), shared by the
+    /// host endpoint and every guest dial of this run. `None` with the flag
+    /// off, or when the DHT socket could not be bound — the transport then
+    /// works as it did before, from the ticket's address alone.
+    rendezvous: Option<lumepeer_net::rendezvous::Rendezvous>,
 }
 
 impl Actor {
@@ -5383,6 +5402,7 @@ impl Actor {
             Duration::from_secs(SAVED_HOST_REFRESH_SECS),
         );
         locate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.rebind_restored_obfuscated();
         loop {
             tokio::select! {
                 command = self.rx.recv() => {
@@ -8345,6 +8365,10 @@ impl Actor {
             ActorEvent::ObfuscatedIncoming { connection } => {
                 self.spawn_obfuscated_incoming(*connection);
             }
+            ActorEvent::ObfuscatedRestored {
+                invite_id,
+                endpoint,
+            } => self.on_obfuscated_restored(invite_id, endpoint),
             ActorEvent::DisplayModeConfirmTimeout { generation } => {
                 self.on_display_mode_confirm_timeout(generation);
             }
@@ -11574,21 +11598,25 @@ impl Actor {
         // endpoint key, so a guest that dials it authenticates the same
         // `NodeId` the iroh path would have given it (ADR 0080).
         let identity = self.identity.clone();
+        let rendezvous = self.obfuscated.rendezvous.clone();
         tokio::spawn(async move {
-            let endpoint =
-                match lumepeer_net::obfuscated_endpoint::bind_host(&invite_id, &identity).await {
-                    Ok(endpoint) => Some(Box::new(endpoint)),
-                    Err(error) => {
-                        // Not fatal, and not a refusal to issue: the invite is
-                        // still worth handing out over the iroh path this
-                        // transport was only ever added beside (ADR 0052).
-                        tracing::warn!(
-                            %error,
-                            "could not bind the obfuscated endpoint for this invite"
-                        );
-                        None
-                    }
-                };
+            let endpoint = match lumepeer_net::obfuscated_endpoint::bind_host(
+                &invite_id, &identity, rendezvous,
+            )
+            .await
+            {
+                Ok(endpoint) => Some(Box::new(endpoint)),
+                Err(error) => {
+                    // Not fatal, and not a refusal to issue: the invite is
+                    // still worth handing out over the iroh path this
+                    // transport was only ever added beside (ADR 0052).
+                    tracing::warn!(
+                        %error,
+                        "could not bind the obfuscated endpoint for this invite"
+                    );
+                    None
+                }
+            };
             let _ = events
                 .send(ActorEvent::ObfuscatedBound {
                     invite_id,
@@ -11695,6 +11723,80 @@ impl Actor {
     /// The close is spawned because it awaits the QUIC shutdown, and the actor
     /// loop is not a place to await anything (ADR 0027). Its keep-alive is
     /// aborted the moment `close` starts, which is the half that matters.
+    /// Host side, at startup: binds the obfuscated endpoint again for the
+    /// invite restored from disk (ADR 0113).
+    ///
+    /// ADR 0062 brought the invite back so the code somebody wrote down still
+    /// claims, but not the endpoint its ticket advertises, so every guest's
+    /// punch went to a socket that died with the previous run. The ticket's
+    /// address is stale anyway after a restart; what makes the new endpoint
+    /// findable is its rendezvous record. Only an invite whose ticket carries
+    /// an obfuscated address is worth it — a guest only tries this transport
+    /// for one.
+    fn rebind_restored_obfuscated(&mut self) {
+        if !self.obfuscated.enabled || self.obfuscated.endpoint.is_some() {
+            return;
+        }
+        let Some(ticket) = self
+            .live_invite
+            .as_ref()
+            .and_then(|live| InviteTicket::from_code(&live.code).ok())
+            .filter(|ticket| ticket.obfuscated_addr.is_some())
+        else {
+            return;
+        };
+        let invite_id = ticket.invite_id;
+        let identity = self.identity.clone();
+        let rendezvous = self.obfuscated.rendezvous.clone();
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let endpoint = match lumepeer_net::obfuscated_endpoint::bind_host(
+                &invite_id, &identity, rendezvous,
+            )
+            .await
+            {
+                Ok(endpoint) => Some(Box::new(endpoint)),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "could not bind the obfuscated endpoint for the restored invite"
+                    );
+                    None
+                }
+            };
+            let _ = events
+                .send(ActorEvent::ObfuscatedRestored {
+                    invite_id,
+                    endpoint,
+                })
+                .await;
+        });
+    }
+
+    /// Host side: the endpoint of [`Self::rebind_restored_obfuscated`] is
+    /// bound. Kept only while its invite is still the live one and nothing
+    /// took its place, and only with an address to publish.
+    fn on_obfuscated_restored(
+        &mut self,
+        invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
+        endpoint: Option<Box<HostObfuscatedEndpoint>>,
+    ) {
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+        let still_live = self
+            .live_invite
+            .as_ref()
+            .and_then(|live| InviteTicket::from_code(&live.code).ok())
+            .is_some_and(|ticket| ticket.invite_id == invite_id);
+        if !still_live || self.obfuscated.endpoint.is_some() || endpoint.public_addr.is_none() {
+            tokio::spawn(async move { endpoint.close().await });
+            return;
+        }
+        tracing::info!("serving the restored invite on the obfuscated transport again");
+        self.replace_obfuscated_host(Some(*endpoint));
+    }
+
     fn replace_obfuscated_host(&mut self, next: Option<HostObfuscatedEndpoint>) {
         if let Some(previous) = self.obfuscated.endpoint.take() {
             tracing::info!("closing the obfuscated endpoint of the replaced invite");
@@ -14510,7 +14612,7 @@ impl Actor {
     /// failing the connect: it is a local failure — no socket — and the iroh
     /// transport needs no socket of its own, so there is still a way to reach
     /// the host (gap-tasks/23 task 1; ADR 0083).
-    fn obfuscated_dialer(&self, ticket: &InviteTicket) -> Option<HostDialer> {
+    fn obfuscated_dialer(&self, ticket: &InviteTicket, host: NodeId) -> Option<HostDialer> {
         if !self.obfuscated.enabled {
             return None;
         }
@@ -14523,8 +14625,10 @@ impl Actor {
         match lumepeer_net::obfuscated_endpoint::GuestObfuscatedEndpoint::bind(
             &ticket.invite_id,
             &self.identity,
+            host,
             target,
             fingerprint,
+            self.obfuscated.rendezvous.clone(),
         ) {
             Ok(endpoint) => Some(HostDialer::Obfuscated(Arc::new(endpoint))),
             Err(error) => {
@@ -14618,7 +14722,7 @@ impl Actor {
     /// iroh transport and that dialer always builds — and is handled by the
     /// caller rather than asserted away.
     fn dial_plan(&self, ticket: &InviteTicket, addr: &iroh::EndpointAddr) -> Option<DialPlan> {
-        let mut obfuscated = self.obfuscated_dialer(ticket);
+        let mut obfuscated = self.obfuscated_dialer(ticket, addr.id);
         let order = dial_order(obfuscated.is_some(), self.remembered_transport(&addr.id));
         let dialers = order.into_iter().filter_map(|transport| match transport {
             TransportKind::Iroh => Some(HostDialer::Iroh {
@@ -16256,6 +16360,25 @@ fn sweep_clipboard_files() {
     });
 }
 
+/// The DHT client the obfuscated transport's rendezvous runs over (ADR 0113),
+/// or `None` when its socket cannot be bound.
+///
+/// Not a failed start: the rendezvous is an additional way to be found, and
+/// without it the transport still dials the ticket's address exactly as it
+/// did before (§18).
+fn start_rendezvous() -> Option<lumepeer_net::rendezvous::Rendezvous> {
+    match lumepeer_net::rendezvous::Rendezvous::start() {
+        Ok(rendezvous) => Some(rendezvous),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "no DHT for the obfuscated transport's rendezvous: it dials the ticket's address alone"
+            );
+            None
+        }
+    }
+}
+
 /// Spawns the actor over an already bound endpoint. Split out of
 /// [`spawn_actor`] so the loop can be driven in tests without a keystore, a
 /// relay or a Tauri window: `windows`, `media` and `clipboard` are the three
@@ -16446,6 +16569,7 @@ pub fn spawn_actor_with(
         transport_fallbacks: std::collections::HashMap::new(),
         obfuscated: ObfuscatedHost {
             enabled: policy.obfuscated,
+            rendezvous: policy.obfuscated.then(start_rendezvous).flatten(),
             ..ObfuscatedHost::default()
         },
         hosting: policy.hosting,

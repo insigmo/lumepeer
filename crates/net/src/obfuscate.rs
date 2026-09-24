@@ -239,6 +239,7 @@ fn split_by_stride(raw: &[u8], len: usize, stride: usize) -> Vec<&[u8]> {
 pub struct ObfuscatedSocket {
     inner: Box<dyn AsyncUdpSocket>,
     obfuscator: Obfuscator,
+    stun_tap: Option<StunTap>,
 }
 
 impl ObfuscatedSocket {
@@ -246,7 +247,76 @@ impl ObfuscatedSocket {
     /// `obfuscator`.
     #[must_use]
     pub fn new(inner: Box<dyn AsyncUdpSocket>, obfuscator: Obfuscator) -> Self {
-        Self { inner, obfuscator }
+        Self {
+            inner,
+            obfuscator,
+            stun_tap: None,
+        }
+    }
+
+    /// Also hands STUN answers from the tap's reflectors to the tap instead of
+    /// dropping them as noise (ADR 0113).
+    #[must_use]
+    pub fn with_stun_tap(mut self, tap: StunTap) -> Self {
+        self.stun_tap = Some(tap);
+        self
+    }
+}
+
+/// Where the reflexive address of an obfuscated socket goes once `noq` owns
+/// the socket (ADR 0113).
+///
+/// A socket `noq` has wrapped is non-blocking and read by `noq` alone, so a
+/// STUN query sent on it later can no longer wait for its own answer: the
+/// answer arrives here, where it would otherwise fail to open and be dropped
+/// as noise. Only a Binding success from one of the tap's reflectors is taken,
+/// so a peer cannot move the address by sending STUN-shaped packets of its own.
+#[derive(Debug, Clone)]
+pub struct StunTap {
+    servers: std::sync::Arc<std::sync::RwLock<Vec<SocketAddr>>>,
+    addr: tokio::sync::watch::Sender<Option<SocketAddr>>,
+}
+
+impl StunTap {
+    /// A tap for answers from `servers`, publishing on `addr`.
+    #[must_use]
+    pub fn new(
+        servers: Vec<SocketAddr>,
+        addr: tokio::sync::watch::Sender<Option<SocketAddr>>,
+    ) -> Self {
+        Self {
+            servers: std::sync::Arc::new(std::sync::RwLock::new(servers)),
+            addr,
+        }
+    }
+
+    /// Replaces the reflectors whose answers are taken, for a caller that only
+    /// learns them after the socket is wrapped (the guest resolves them off the
+    /// actor thread, inside its dial).
+    pub fn set_servers(&self, servers: Vec<SocketAddr>) {
+        if let Ok(mut current) = self.servers.write() {
+            *current = servers;
+        }
+    }
+
+    /// Publishes the address in `datagram` if it is a STUN answer from a
+    /// tapped reflector; anything else is left alone.
+    fn take(&self, from: SocketAddr, datagram: &[u8]) {
+        if !self
+            .servers
+            .read()
+            .is_ok_and(|servers| servers.contains(&from))
+        {
+            return;
+        }
+        let Some(mapped) = crate::stun::binding_success_addr(datagram) else {
+            return;
+        };
+        self.addr.send_if_modified(|current| {
+            let changed = *current != Some(mapped);
+            *current = Some(mapped);
+            changed
+        });
     }
 }
 
@@ -293,9 +363,13 @@ impl AsyncUdpSocket for ObfuscatedSocket {
             for (raw, raw_meta) in wire.iter().zip(wire_meta.iter()).take(received) {
                 for datagram in split_by_stride(raw, raw_meta.len, raw_meta.stride) {
                     let Ok(plain) = self.obfuscator.open(datagram) else {
-                        // Forged, tampered, or sealed under a different key:
-                        // untrusted input, dropped silently and the
-                        // connection stays up (task 17 trap; §2.4).
+                        // A STUN answer to this socket's own query (ADR 0113),
+                        // or else forged, tampered, or sealed under a
+                        // different key: untrusted input, dropped silently
+                        // and the connection stays up (task 17 trap; §2.4).
+                        if let Some(tap) = &self.stun_tap {
+                            tap.take(raw_meta.addr, datagram);
+                        }
                         continue;
                     };
                     let Some(dest_meta) = meta.get_mut(out) else {
@@ -624,6 +698,50 @@ mod tests {
         let (from, plain) = recv_datagram(&mut host).await.unwrap();
         assert_eq!(from, guest_addr);
         assert_eq!(plain, b"pong");
+    }
+
+    /// A Binding success whose `XOR-MAPPED-ADDRESS` is 192.0.2.1:32853 (the
+    /// RFC 5769 §2.2 sample).
+    fn stun_success() -> Vec<u8> {
+        let mut msg = vec![0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42];
+        msg.extend_from_slice(&[0x5a; 12]);
+        msg.extend_from_slice(&[0x00, 0x20, 0x00, 0x08]);
+        msg.extend_from_slice(&[0x00, 0x01, 0xa1, 0x47, 0xe1, 0x12, 0xa6, 0x43]);
+        msg
+    }
+
+    /// ADR 0113: a STUN answer from a tapped reflector reaches the tap and
+    /// never `noq`; the same bytes from anyone else move nothing, and sealed
+    /// traffic still flows past the tap untouched.
+    #[tokio::test]
+    async fn the_stun_tap_takes_reflector_answers_and_nothing_else() {
+        let runtime: Arc<dyn Runtime> = Arc::new(TokioRuntime);
+        let reflector = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let mut guest = ObfuscatedSocket::new(
+            runtime
+                .wrap_udp_socket(UdpSocket::bind("127.0.0.1:0").unwrap())
+                .unwrap(),
+            Obfuscator::for_guest(&INVITE),
+        )
+        .with_stun_tap(StunTap::new(vec![reflector.local_addr().unwrap()], tx));
+        let guest_addr = guest.local_addr().unwrap();
+
+        stranger.send_to(&stun_success(), guest_addr).unwrap();
+        reflector.send_to(&stun_success(), guest_addr).unwrap();
+        let host = Obfuscator::for_host(&INVITE);
+        stranger
+            .send_to(&host.seal(b"after").unwrap(), guest_addr)
+            .unwrap();
+
+        // The stranger's STUN packet fails to open and is dropped, the
+        // reflector's goes to the tap: the first datagram `noq` sees is the
+        // sealed one.
+        let (from, plain) = recv_datagram(&mut guest).await.unwrap();
+        assert_eq!(from, stranger.local_addr().unwrap());
+        assert_eq!(plain, b"after");
+        assert_eq!(*rx.borrow(), Some("192.0.2.1:32853".parse().unwrap()));
     }
 
     /// Fase 4 (task 17 increment 1, §7.2; the readiness criterion of §3

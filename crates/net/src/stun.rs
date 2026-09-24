@@ -88,6 +88,36 @@ pub fn reflexive_addr(socket: &UdpSocket, server: SocketAddr) -> Result<SocketAd
         .ok_or_else(|| NetError::Io("malformed stun reply".to_owned()))
 }
 
+/// Sends one Binding request from `socket` to `server` and returns at once.
+///
+/// For a socket something else reads (ADR 0113): once `noq` owns a socket it
+/// is non-blocking and its reader takes every datagram, so the answer is not
+/// waited for here. It comes back through the obfuscated socket's STUN tap
+/// (`crate::obfuscate::StunTap`), read with [`binding_success_addr`].
+///
+/// # Errors
+/// [`NetError::Io`] if the send fails.
+pub fn send_binding_request(socket: &UdpSocket, server: SocketAddr) -> Result<()> {
+    let mut txid = [0u8; TXID_BYTES];
+    rand::rng().fill_bytes(&mut txid);
+    socket
+        .send_to(&binding_request(&txid), server)
+        .map(|_| ())
+        .map_err(|e| NetError::Io(e.to_string()))
+}
+
+/// The reflexive address in a Binding success response, whatever transaction
+/// it answers.
+///
+/// The transaction id cannot be checked by a reader that did not send the
+/// request (see [`send_binding_request`]); the caller checks the source
+/// address instead. `None` for anything that is not a well-formed success.
+#[must_use]
+pub fn binding_success_addr(msg: &[u8]) -> Option<SocketAddr> {
+    let txid: [u8; TXID_BYTES] = msg.get(8..HEADER_BYTES)?.try_into().ok()?;
+    parse_binding_response(&txid, msg)
+}
+
 /// Builds a 20-byte Binding request with no attributes.
 fn binding_request(txid: &[u8; TXID_BYTES]) -> [u8; HEADER_BYTES] {
     let mut msg = [0u8; HEADER_BYTES];
@@ -216,6 +246,17 @@ mod tests {
         // Claim the attribute is far longer than the bytes present.
         msg[22..24].copy_from_slice(&0xffffu16.to_be_bytes());
         assert!(parse_binding_response(&RFC_TXID, &msg).is_none());
+    }
+
+    #[test]
+    fn a_success_is_read_without_knowing_its_transaction() {
+        assert_eq!(
+            binding_success_addr(&rfc_response()),
+            Some("192.0.2.1:32853".parse().unwrap())
+        );
+        for len in 0..rfc_response().len() {
+            assert!(binding_success_addr(&rfc_response()[..len]).is_none());
+        }
     }
 
     #[test]
