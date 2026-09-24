@@ -15,6 +15,7 @@ have nothing but python3.
 import glob
 import json
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -101,6 +102,31 @@ def linux_session_env():
     return own if "WAYLAND_DISPLAY" in own or "DISPLAY" in own else {}
 
 
+def mac_screen_locked():
+    """Whether the Mac's screen is locked. Its windows are hidden then, so a
+    webview draws nothing, and the system refuses to capture the screen."""
+    try:
+        root = plistlib.loads(run(["ioreg", "-n", "Root", "-d1", "-a"]).encode())
+    except (plistlib.InvalidFileException, ValueError, OSError):
+        return None
+    users = root.get("IOConsoleUsers", [])
+    return any(u.get("CGSSessionScreenIsLocked", False) for u in users if u.get("kCGSSessionOnConsoleKey"))
+
+
+def linux_screen_locked():
+    """Whether this user's graphical session is locked, as logind has it. A
+    Wayland compositor sends no frames to a window under the lock screen, so
+    a webview there draws nothing, though its page still calls itself
+    visible."""
+    for line in run(["loginctl", "list-sessions", "--no-legend"]).splitlines():
+        props = dict(kv.split("=", 1) for kv in run(
+            ["loginctl", "show-session", line.split()[0], "-p", "Type", "-p", "User", "-p", "LockedHint"]
+        ).splitlines() if "=" in kv)
+        if props.get("Type") in ("wayland", "x11") and props.get("User") == str(os.getuid()):
+            return props.get("LockedHint") == "yes"
+    return None
+
+
 def op_hello(_):
     info = {"platform": sys.platform, "host": socket.gethostname(), "python": sys.version.split()[0]}
     if WINDOWS:
@@ -110,12 +136,14 @@ def op_hello(_):
     elif MACOS:
         info["os"] = "macos"
         info["version"] = "macOS " + run(["sw_vers", "-productVersion"]) + " " + os.uname().machine
+        info["locked"] = mac_screen_locked()
     else:
         info["os"] = "linux"
         env = linux_session_env()
         info["session"] = env.get("XDG_SESSION_TYPE", "none")
         info["desktop"] = env.get("XDG_CURRENT_DESKTOP", "")
         info["version"] = run(["sh", "-c", ". /etc/os-release; echo $PRETTY_NAME"]) + " " + os.uname().machine
+        info["locked"] = linux_screen_locked()
         if not env:
             info["error"] = "no graphical session found (nobody logged in at the screen?)"
     return info

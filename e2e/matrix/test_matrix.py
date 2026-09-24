@@ -9,6 +9,10 @@
 4. hotkeys (Windows guest): the same chords once more, pressed on the
    guest's own keyboard with its grab live, and Ctrl+A/C/V have to copy and
    paste on the host.
+5. terminal: the guest reconnects to the host for the terminal alone, the
+   way a person does from the remembered host's row; the shell's prompt has
+   to show before anything is typed, a typed command has to answer, and
+   Close has to end the shell on the host.
 
 What the guest does in 1-3 is dispatched into its view window as DOM events,
 key by key and in a person's rhythm, carrying the `key`, `code` and modifiers
@@ -25,12 +29,14 @@ grab of a pilot build takes them as a person's (agent.py `press_keys`).
 """
 
 import json
+import re
 import time
 
 import pytest
 
-from harness import (GRAB_JS, KEYS_JS, POINTER_JS, SPY_READ_JS, VIEW_STATE_JS, expected, host_flags, label,
-                     os_events, parse, synthetic_events, text_combos, with_logs)
+from harness import (GRAB_JS, KEYS_JS, POINTER_JS, SPY_READ_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS,
+                     TERMINAL_TYPE_JS, VIEW_STATE_JS, connect, disconnect, expected, host_flags, label, os_events,
+                     parse, sessions_of, synthetic_events, text_combos, with_logs)
 
 TEXT = "Hello, lumepeer 42"
 # Chords every host OS delivers to a focused webview and none of them acts
@@ -324,3 +330,126 @@ def test_hotkeys(session, request):
         fail(with_logs(" | ".join(problems + [guest]) + host_flags(h, s.peer) + untested, [g, h],
                        {g.name: gmark, h.name: mark}))
     note(request, f"{len(CHORDS) - len(taken)} chords ok through the grab, copy/paste ok{untested}")
+
+
+# ── 5 ───────────────────────────────────────────────────────────────────────
+
+# A sum in the host's own shell, `%COMSPEC%` on Windows and `$SHELL`
+# elsewhere (ADR 0079): the answer is nowhere in what was typed, so seeing it
+# means the shell ran the line.
+SUM = {"windows": "set /a 4200+37", "unix": "echo $((4200+37))"}
+ANSWER = "4237"
+PROMPT_WAIT = 10  # seconds
+
+
+def terminal_screen(guest, view):
+    """What the guest's terminal window shows: `text`, `state`, `hidden`."""
+    screen = guest.js(TERMINAL_SCREEN_JS, window=view) or {}
+    return {"text": screen.get("text") or "", "state": screen.get("state"), "hidden": screen.get("hidden")}
+
+
+def arrived(guest, view):
+    """What the terminal's polls brought the window since the spy was last read."""
+    return guest.js("(window.__e2eSpy || {}).termText || ''", window=view) or ""
+
+
+def screen_tail(text):
+    text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07", "", text)  # what a terminal draws, not its escapes
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return " / ".join(lines[-2:])[:160] or "blank"
+
+
+def terminal_calls(spy):
+    term = (spy or {}).get("term") or {}
+    return (f"{guest_calls(spy, 'terminal_poll')}, polls brought {term.get('output', 0)} output bytes, "
+            f"opened={term.get('opened', 0)} closed={term.get('closed', 0)} refused={term.get('refused', 0)}")
+
+
+def terminal_active(host, peer):
+    """The host's own account: whether this guest has a shell running there."""
+    row = next((x for x in sessions_of(host) if x.get("peer_label") == peer), None)
+    return row and row.get("terminal_active")
+
+
+def test_terminal(session, request):
+    s = live(session)
+    g, h = s.guest, s.host
+    # Connecting for the terminal is reconnecting to a remembered host
+    # (ADR 0101), and the guest remembers the host once this session's view
+    # closes: the session ends here, which is why this test comes last.
+    remembered = g.js("new URLSearchParams(location.search).get('host')", window=s.view)
+    disconnect(s)
+    if not remembered:
+        fail(f"{g.name}'s view window names no remembered host to reconnect to")
+    g.wait(lambda: any(r["peer_label"] == remembered for r in g.ipc("connection_history")), 15,
+           "never remembered the host after the session")
+    t = connect(g, h, 0, remembered=remembered)
+    if t.connect_error:
+        fail(f"connect for the terminal: {t.connect_error}")
+    mark = h.log_mark()
+    # What reached the window and what it drew are checked apart: a window
+    # that is hidden, or under a lock screen, draws nothing, whatever it got.
+    locked = g.screen_locked()
+    try:
+        # The shell speaks first; nothing is typed until it has.
+        start = time.monotonic()
+        while True:
+            got, screen = arrived(g, t.view), terminal_screen(g, t.view)
+            drawn = screen["text"].strip()
+            if ((got or drawn) and (drawn or screen["hidden"] or locked)) or time.monotonic() - start > PROMPT_WAIT:
+                break
+            time.sleep(0.3)
+        prompt_secs = time.monotonic() - start
+        spy_prompt = g.js(SPY_READ_JS, window=t.view) or {}
+        # The spy goes in once the window exists, so a very quick prompt can
+        # be past it and only on the screen.
+        prompt_arrived = spy_prompt.get("termText") or screen["text"]
+        prompt_screen = screen
+        active = terminal_active(h, t.peer)
+
+        command = SUM["windows" if h.os == "windows" else "unix"]
+        typed = g.js(TERMINAL_TYPE_JS % json.dumps(command + "\r"), window=t.view)
+        deadline = time.monotonic() + 10
+        while True:
+            got, screen = arrived(g, t.view), terminal_screen(g, t.view)
+            if ANSWER in got and (ANSWER in screen["text"] or screen["hidden"] or locked):
+                break
+            if time.monotonic() > deadline:
+                break
+            time.sleep(0.3)
+        spy_command = g.js(SPY_READ_JS, window=t.view) or {}
+        answer_arrived = ANSWER in (spy_command.get("termText") or "")
+
+        g.js(TERMINAL_CLOSE_JS, window=t.view)
+        deadline = time.monotonic() + 10
+        while terminal_active(h, t.peer) and time.monotonic() < deadline:
+            time.sleep(0.3)
+        still = terminal_active(h, t.peer)
+
+        problems = []
+        if not prompt_arrived.strip():
+            problems.append(f"the terminal stayed blank for {PROMPT_WAIT}s with nothing typed: no output reached "
+                            f"the window (status '{prompt_screen['state']}'; {terminal_calls(spy_prompt)})")
+        elif not prompt_screen["text"].strip() and not prompt_screen["hidden"] and not locked:
+            problems.append(f"the window got the shell's prompt ({screen_tail(prompt_arrived)}) but its terminal "
+                            f"showed nothing for {PROMPT_WAIT}s")
+        if not active:
+            problems.append(f"the host's session had no shell running (terminal_active={active}) once it opened")
+        if not answer_arrived:
+            problems.append(f"'{command}' typed ({typed} keys): {ANSWER} never reached the window (status "
+                            f"'{screen['state']}'; {guest_calls(spy_command, 'terminal_input')}; "
+                            f"{terminal_calls(spy_command)}); it got: {screen_tail(spy_command.get('termText') or '')}")
+        elif ANSWER not in screen["text"] and not screen["hidden"] and not locked:
+            problems.append(f"{ANSWER} reached the window but its terminal never showed it; screen: "
+                            f"{screen_tail(screen['text'])}")
+        if still:
+            problems.append("the host still ran the shell 10s after Close")
+        blind = "screen locked" if locked else "window hidden" if prompt_screen["hidden"] or screen["hidden"] else ""
+        untested = f" | drawing untested, {g.name}: {blind}" if blind else ""
+        if problems:
+            fail(with_log(" | ".join(problems) + untested, t, mark))
+        shown = prompt_screen["text"] if prompt_screen["text"].strip() else prompt_arrived
+        note(request, f"prompt after {prompt_secs:.1f}s ({screen_tail(shown)}), {command} -> {ANSWER}, "
+                      f"Close ended the shell{untested}")
+    finally:
+        disconnect(t)

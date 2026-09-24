@@ -166,18 +166,35 @@ TRACKER_RESET_JS = """((block, text) => {
   return document.hasFocus();
 })(%s, %s)"""
 
-# The guest-side spy in a view window: every input_* IPC call the window
-# makes, and how it ended. Tauri's IPC goes through `fetch` to ipc.localhost
-# (ipc://localhost on macOS/Linux), and `invoke` itself is frozen, so fetch is
-# where a call can be watched.
+# The guest-side spy in a view window: every input_* and terminal_* IPC call
+# the window makes, and how it ended. Tauri's IPC goes through `fetch` to
+# ipc.localhost (ipc://localhost on macOS/Linux), and `invoke` itself is
+# frozen, so fetch is where a call can be watched. `term` tallies what the
+# terminal's polls brought, from the body terminal.ts decodes (count:u16, then
+# shell:u32 | event:u8 | length:u32 | payload, little endian): output bytes,
+# and how many opened / closed / refused records. `termText` is the tail of
+# that output as text: what reached the window, drawn or not.
 SPY_JS = r"""(() => {
   if (window.__e2eSpy) return 'present';
-  const sp = window.__e2eSpy = { calls: {}, errs: [] };
+  const sp = window.__e2eSpy = { calls: {}, errs: [], term: {}, termText: '' };
+  const tally = (body) => {
+    const v = new DataView(body);
+    let at = 2;
+    for (let i = 0, n = body.byteLength >= 2 ? v.getUint16(0, true) : 0; i < n && at + 9 <= body.byteLength; i++) {
+      const event = v.getUint8(at + 4), len = v.getUint32(at + 5, true);
+      const name = ['output', 'opened', 'closed'][event] || 'refused';
+      sp.term[name] = (sp.term[name] || 0) + (event === 0 ? len : 1);
+      if (event === 0) {
+        sp.termText = (sp.termText + new TextDecoder().decode(new Uint8Array(body, at + 9, len))).slice(-4096);
+      }
+      at += 9 + len;
+    }
+  };
   const orig = window.fetch;
   window.fetch = function (input) {
     const promise = orig.apply(this, arguments);
     const url = String((input && input.url) || input);
-    const m = url.match(/^(?:https?:\/\/ipc\.localhost|ipc:\/\/localhost)\/(input_[a-z_]+)/);
+    const m = url.match(/^(?:https?:\/\/ipc\.localhost|ipc:\/\/localhost)\/((?:input|terminal)_[a-z_]+)/);
     if (m) {
       const c = sp.calls[m[1]] = sp.calls[m[1]] || { n: 0, ok: 0, err: 0 };
       c.n++;
@@ -185,7 +202,10 @@ SPY_JS = r"""(() => {
         if (r.headers.get('Tauri-Response') === 'error') {
           c.err++;
           if (sp.errs.length < 4) sp.errs.push(m[1] + ':' + (await r.clone().text()).slice(0, 80));
-        } else c.ok++;
+        } else {
+          c.ok++;
+          if (m[1] === 'terminal_poll') tally(await r.clone().arrayBuffer());
+        }
       }, (e) => { c.err++; if (sp.errs.length < 4) sp.errs.push(m[1] + ':' + e); });
     }
     return promise;
@@ -193,7 +213,52 @@ SPY_JS = r"""(() => {
   return 'installed';
 })()"""
 
-SPY_READ_JS = "(() => { const s = window.__e2eSpy; const r = s ? JSON.parse(JSON.stringify(s)) : null; if (s) { s.calls = {}; s.errs = []; } return r; })()"
+SPY_READ_JS = "(() => { const s = window.__e2eSpy; const r = s ? JSON.parse(JSON.stringify(s)) : null; if (s) { s.calls = {}; s.errs = []; s.term = {}; s.termText = ''; } return r; })()"
+
+# What the guest's terminal shows: the emulator's rows as text, from the
+# DOM renderer, which is what a person looks at; and the panel's status line.
+# xterm.js draws on animation frames, which a hidden page (a locked screen, a
+# display asleep) does not get, so what it shows then says nothing.
+TERMINAL_SCREEN_JS = """(() => {
+  const rows = document.querySelector('#terminal-screen .xterm-rows');
+  const state = document.querySelector('[data-testid=terminal-state]');
+  return { text: rows ? rows.innerText.replace(/\\u00a0/g, ' ') : null,
+           state: state ? state.textContent.trim() : null, hidden: document.visibilityState === 'hidden' };
+})()"""
+
+# Keys typed into the terminal the way xterm.js reads a keyboard: a character
+# from its keypress (`charCode`), Enter from its keydown (`keyCode` 13). A
+# constructed event leaves those legacy fields 0, so they are set on the
+# event itself. All at once rather than at a person's pace: a hidden page (a
+# locked Mac) runs its timers so seldom that a paced line outlasts the eval.
+TERMINAL_TYPE_JS = """((text) => {
+  const ta = document.querySelector('#terminal-screen .xterm-helper-textarea');
+  if (!ta) return -1;
+  ta.focus();
+  const send = (type, key, legacy) => {
+    const e = new KeyboardEvent(type, { key, bubbles: true, cancelable: true });
+    for (const [name, value] of Object.entries(legacy)) Object.defineProperty(e, name, { get: () => value });
+    ta.dispatchEvent(e);
+  };
+  for (const ch of text) {
+    if (ch === '\\r') {
+      send('keydown', 'Enter', { keyCode: 13, which: 13 });
+      send('keyup', 'Enter', { keyCode: 13, which: 13 });
+    } else {
+      const code = ch.charCodeAt(0);
+      send('keydown', ch, { keyCode: 0, which: 0 });
+      send('keypress', ch, { charCode: code, keyCode: code, which: code });
+      send('keyup', ch, { keyCode: 0, which: 0 });
+    }
+  }
+  return text.length;
+})(%s)"""
+
+TERMINAL_CLOSE_JS = """(() => {
+  const button = document.querySelector('[data-testid=terminal-close]');
+  if (button) button.click();
+  return !!button;
+})()"""
 
 VIEW_STATE_JS = """(() => {
   const c = document.getElementById('screen'), o = document.getElementById('overlay');
@@ -361,8 +426,17 @@ class Host:
         mon = self.monitor or {}
         size = mon.get("size", {})
         extra = f" {self.info.get('session')}" if self.os == "linux" else ""
+        locked = ", screen LOCKED" if self.info.get("locked") else ""
         return (f"{self.name}=ok({self.info.get('version', self.os).strip()}{extra}, "
-                f"{size.get('width')}x{size.get('height')}@{mon.get('scaleFactor')})")
+                f"{size.get('width')}x{size.get('height')}@{mon.get('scaleFactor')}{locked})")
+
+    def screen_locked(self):
+        """Whether this machine's screen is locked right now, where the agent
+        can tell (macOS): nothing draws in its windows then."""
+        try:
+            return bool(self.agent.call("hello").get("locked"))
+        except HostError:
+            return False
 
     # -- lifecycle --
 
@@ -650,15 +724,33 @@ def reset(machine):
             pass
 
 
-def connect(guest, host, picture_timeout):
+def connect(guest, host, picture_timeout, remembered=None):
+    """A granted full-control session from `guest` to `host`: through an
+    invite, or, given `remembered` (the host's label in the guest's history),
+    connected for the terminal alone, which has no picture (ADR 0101)."""
     s = Session(guest, host)
     reset(guest)
     reset(host)
     t0 = time.monotonic()
     marks = {m.name: m.log_mark() for m in (guest, host)}
     try:
-        code = host.ipc("invite_create", {"args": {"role": "full_control"}})["code"]
-        guest.ipc("invite_connect", {"args": {"ticket": code}})
+        if remembered:
+            # The connection of the session before can take a moment to let
+            # go after its window closed, and a link that stuttered during it
+            # has the guest dialing back in by itself (ADR 0105).
+            deadline = time.monotonic() + 20
+            while True:
+                try:
+                    guest.ipc("history_connect", {"args": {"peer": remembered, "terminal_only": True}})
+                    break
+                except Refused as error:
+                    if error.code != "ALREADY_CONNECTED" or time.monotonic() > deadline:
+                        raise
+                    reset(guest)
+                    time.sleep(1)
+        else:
+            code = host.ipc("invite_create", {"args": {"role": "full_control"}})["code"]
+            guest.ipc("invite_connect", {"args": {"ticket": code}})
 
         def pending():
             ph = phase_of(guest)
@@ -678,6 +770,8 @@ def connect(guest, host, picture_timeout):
         s.connect_error = with_logs(str(error), (host, guest), marks)
         return s
     guest.js(SPY_JS, window=s.view)
+    if remembered:
+        return s
     if host.wayland:
         log(f"{host.name}: approve the screen-share / remote-control portal dialog on its screen "
             f"(waiting up to {picture_timeout}s)")

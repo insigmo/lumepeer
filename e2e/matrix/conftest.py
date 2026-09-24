@@ -126,7 +126,7 @@ def pytest_terminal_summary(terminalreporter):
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"== lumepeer e2e matrix | {stamp} | {build_id()} =="]
     lines += ["hosts: " + " ".join(m.describe() for m in MACHINES.values())]
-    lines += [f"{pair:<12} {name:<7} {status:<5} {text}" for pair, name, status, text in RESULTS]
+    lines += [f"{pair:<12} {name:<8} {status:<5} {text}" for pair, name, status, text in RESULTS]
     lines += [f"app logs: {OUT.relative_to(REPO).as_posix()}/<host>.log   guest->host = guest controls host"]
     report = "\n".join(lines)
     (OUT / "report.txt").write_text(report + "\n", encoding="utf-8")

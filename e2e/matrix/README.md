@@ -1,7 +1,7 @@
 # e2e matrix: remote input between real machines
 
 pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
-`hosts.toml` runs the same three scenarios:
+`hosts.toml` runs the same scenarios:
 
 | test      | passes when                                                                                  |
 |-----------|----------------------------------------------------------------------------------------------|
@@ -9,6 +9,7 @@ pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
 | `mouse`   | a pointer move of 10 host pixels to the right in the guest's view moves the host's cursor by 10 ±1 px right and 0 ±1 px down |
 | `keys`    | `Hello, lumepeer 42` typed in the guest's view arrives as exactly that text, and 10 chords (Ctrl+A/C/V/Z, Ctrl+Shift+Z, Alt+X, Ctrl+Alt+J, Shift+Left, Ctrl+Home, Ctrl+Enter) arrive with the same modifiers |
 | `hotkeys` | Windows guest only: the same 10 chords pressed on the guest's own keyboard with its keyboard grab live arrive with the same modifiers, and Ctrl+A, Ctrl+C, Ctrl+End, Ctrl+V on `lumepeer` in the host's tracker leave `lumepeerlumepeer` |
+| `terminal` | the guest reconnects to the host for the terminal alone, as the remembered host's terminal button does (ADR 0101); the host's shell shows its prompt before anything is typed, `echo $((4200+37))` (`set /a 4200+37` on a Windows host) typed into it shows `4237`, and Close leaves no shell running on the host |
 
 `guest->host` means the guest controls the host. The pairs are win↔mac, win↔linux,
 mac↔linux and win↔beta, in both directions.
@@ -63,17 +64,37 @@ How to read it:
   guest's keyboard hook was not installed when the keys went in, and `the view
   forwarded input_press ok=N` counts what went the webview's way instead; with
   the grab live that is only Ctrl/Alt/Shift, which the app then drops.
+- `terminal`: `prompt after 0.4s (...)` is how long the terminal took to show
+  something with nothing typed, and the last lines it showed. `stayed blank`
+  is the empty terminal a person sees; `polls brought N output bytes` next to
+  it says whether the host sent nothing (0) or the window did not draw what
+  it got. `drawing untested, mac: screen locked` means the output reached the
+  guest's window, which was checked, but that window could not draw it: a
+  page under a lock screen, or hidden, gets no animation frames, and xterm.js
+  draws on those. The test ends the pair's ordinary session to reconnect, so
+  it runs after the others.
+- `session_grant: CORE concurrent guest limit for plan reached: 1` on a host
+  whose terminal was just tested: pressing Close there ends the guest's
+  session from the guest's side, and the host holds that session for its
+  resume window (5 minutes, ADR 0089) as if the link had dropped. That is
+  the app, not the harness. A new run starts every app afresh.
+- `screen LOCKED` on the `hosts:` line: that Mac or Linux screen is locked. A
+  locked host gives no picture (a Mac says its system "did not allow Lumepeer
+  to record its screen"), and a locked guest draws nothing in its windows.
 - `SKIP no session` means `connect` failed for that pair, `SKIP <host> is down`
   means that machine never came up; the `hosts:` line says why.
 
 ## What each machine needs
 
 - **All of them:** somebody logged in at the screen (capture needs a real
-  desktop session) and python3 for `agent.py` (stdlib only). pytest itself runs
-  on this machine and needs python 3.11+.
+  desktop session), the screen unlocked, and python3 for `agent.py` (stdlib
+  only). pytest itself runs on this machine and needs python 3.11+.
 - **win** (this machine): nothing else. The e2e app runs beside the installed,
   elevated client (`LUMEPEER_ALLOW_SECOND_INSTANCE`, its own file keystore,
   `RunAsInvoker`), and so, unlike the shipped client, it is not elevated.
+  While the installed Lumepeer service is hosting this machine, the e2e app
+  answers `NOT_THE_HOST` and every pair with win as the host fails to
+  connect.
 - **beta** (Windows, `bberb@beta`): the app is started elevated in the logged-in
   session by the `LumepeerE2E` scheduled task, since sshd's session 0 has no
   desktop. `LumepeerE2EQuery` runs what has to happen on that desktop: the
