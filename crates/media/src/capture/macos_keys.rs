@@ -1,9 +1,9 @@
-//! Where a physical key sits on a macOS keyboard, by evdev code (ADR 0104).
+//! Where a physical key sits on a macOS keyboard, by evdev code (ADR 0108).
 //!
 //! `InputEventPayload::scancode` has carried an evdev code since ADR 0065:
 //! one physical encoding crosses the wire and each host platform translates
 //! from it. Windows does that in `capture::windows::physical_key` and X11 in
-//! `X11Injector::keycode`; this is the third translation, and until ADR 0104
+//! `X11Injector::keycode`; this is the third translation, and until ADR 0108
 //! it did not exist, so a macOS host had no way to press a key *by position*
 //! at all. Everything arrived as a character through
 //! `CGEventKeyboardSetUnicodeString`, which carries no virtual key — so
@@ -172,7 +172,7 @@ mod tests {
 
     /// The keys a chord is actually made of. Every one of these is a key the
     /// report in `docs/bugs/20-hotkeys-and-vmware-grab.md` named, and before
-    /// ADR 0104 not one of them could be pressed by position on a Mac.
+    /// ADR 0108 not one of them could be pressed by position on a Mac.
     #[test]
     fn the_keys_a_chord_is_made_of_all_have_a_position() {
         // Cmd/Ctrl/Alt/Shift, either hand.

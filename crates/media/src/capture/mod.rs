@@ -31,7 +31,7 @@ pub mod macos;
 
 // Compiled on every platform, not only the two above: it is a table of plain
 // integers, and the host this workspace is usually built on is not a Mac
-// (ADR 0104).
+// (ADR 0108).
 pub mod macos_keys;
 
 #[cfg(all(

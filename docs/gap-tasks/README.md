@@ -99,9 +99,15 @@ cargo clippy -p lumepeer-media --all-targets --features capture-screencapturekit
 
 ### Известные ловушки прогона (не чинить, не пугаться)
 
-- **`cargo test --workspace` на Windows-машине с установленной службой
-  `LumepeerHelper` красный и без твоих правок.** Сначала зафиксируй базовый
-  прогон на чистом дереве, сравнивай с ним, а не с нулём.
+- **Установленная служба `LumepeerHelper` прогон больше не краснит** — с
+  `33956bc` (2026-08-31) `endpoint.rs::the_endpoint_answers_and_refuses`
+  пропускает себя, когда труба занята; проверено в `docs/bugs/23`, задача А5.
+  Красный прогон — это теперь сигнал, а не мебель. Базовый прогон на чистом
+  дереве всё равно фиксируй: сравнивай с ним, а не с нулём. Но служба пишет в
+  свой лог следы тестов: `view.rs::secure_desktop_frame_is_gated_by_the_grant_before_anything_else`
+  ходит в настоящую службу, и одиночная строка `nothing to capture
+  input_desktop="Default"` в `C:\ProgramData\Lumepeer\logs` — это он, а не
+  эпизод захвата.
 - **Плоский `cargo test` собирает `apps/desktop/src-tauri` без единого
   capture-бэкенда**, и тесты про мониторы/захват молча уходят в
   деградированную ветку. Тест, который должен что-то доказать про захват,

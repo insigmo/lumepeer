@@ -43,6 +43,7 @@ import {
   POINTER_BUTTON_PAN,
   remotePointer,
   suppressContextMenu,
+  terminalWindowStatus,
   ViewInput,
   viewOverlay,
   VIEW_RESPONSE_HEADER_BYTES,
@@ -1095,6 +1096,34 @@ describe('view window: status overlay', () => {
     expect(button?.autofocus).toBe(true);
     button?.click();
     expect(dismissed).toHaveBeenCalledOnce();
+  });
+
+  // A terminal window (ADR 0101) runs no frame loop, so nothing used to carry
+  // the status of a session that dropped under it: ADR 0105 kept the window
+  // open and waiting, and said nothing (docs/bugs/22, task 2).
+  it('tells a terminal window its session is reconnecting, in the same words as a picture', () => {
+    render(viewOverlay(terminalWindowStatus('reconnecting'), 'en', noop), container);
+    const shown = container.textContent?.trim();
+    render(viewOverlay('reconnecting', 'en', noop), container);
+    expect(shown).not.toBe('');
+    expect(shown).toBe(container.textContent?.trim());
+  });
+
+  // Every other status is about a picture the terminal window never asked
+  // for: `waiting` in particular is what it reports for the whole session,
+  // and is what it goes back to once the session returns.
+  it('shows a terminal window nothing about a picture it never asked for', () => {
+    for (const status of [
+      'waiting',
+      'live',
+      'secure-desktop',
+      'failed',
+      'no-capture',
+      'no-encoder',
+    ] as ViewStatus[]) {
+      render(viewOverlay(terminalWindowStatus(status), 'en', noop), container);
+      expect(container.textContent?.trim()).toBe('');
+    }
   });
 
   for (const locale of SUPPORTED_LOCALES) {

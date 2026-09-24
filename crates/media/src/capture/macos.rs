@@ -1508,7 +1508,7 @@ mod screen_capture_kit {
         /// Presses what the guest asked for, by position or by character.
         ///
         /// The order is the one `WindowsInjector::key` and `X11Injector::key`
-        /// already use, and it is the whole decision (ADR 0065, ADR 0104):
+        /// already use, and it is the whole decision (ADR 0065, ADR 0108):
         ///
         /// 1. **By position, whenever there is one and the character is not
         ///    the point.** That is every keystroke under Cmd, Ctrl or Option

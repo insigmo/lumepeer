@@ -379,10 +379,19 @@ Some(std::ptr::from_ref(&console.0).cast::<c_void>()),
 
 ### Чего НЕ сделано
 
-- **На `beta` не проверено.** Хост был offline весь разбор (tailscale: «last
-  seen 22h ago»). Всё, что выше, проверено на `DESKTOP-EFHI52Q`, включая
-  поднятый прогон — то есть ровно ту конфигурацию, в которой `beta` отказывал.
-  Остаётся открыть терминал на `beta` и убедиться.
+- ~~На `beta` не проверено.~~ Проверено 2026-09-23 по хостовым логам `beta`
+  (пачка `23`, задача А0):
+  - **v0.0.83**, `lumepeer-2026-09-22-140606.log`, 14:07:53Z, 14:08:32Z,
+    14:08:36Z: `refusing a remote shell: the interactive user's token was
+    found but the shell could not be started with it`. Гипотеза A
+    подтверждена на самом `beta`: токен получен, сорвался запуск.
+  - **v0.0.84**, `lumepeer-2026-09-22-212155.log`: в 21:23:21Z `a remote
+    shell started`, в 21:23:53Z `a shell is gone why=terminal-closed-by-guest`.
+    Оболочка запускается, Close её убивает.
+
+  Логом не подтверждалось одно: видел ли гость приглашение и эхо. Человек
+  ответил 2026-09-23 (вопрос В1 в `23`): **да, всё было видно**. Пачка `18`
+  закрыта целиком.
 - `cargo test -p lumepeer-desktop --bin` по-прежнему `os error 740` — это
   известное и не связанное с этим: манифест `requireAdministrator` попадает на
   тестовый бинарь (см. `project_lumepeer_desktop_tests_need_runasinvoker`).

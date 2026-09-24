@@ -64,6 +64,7 @@ import {
   recordingBadge,
   streamSizeFor,
   suppressContextMenu,
+  terminalWindowStatus,
   ViewInput,
   viewOverlay,
   zoomBy,
@@ -755,6 +756,46 @@ function nativeLoop(): void {
   });
 }
 
+/**
+ * One turn of a terminal window's status loop (ADR 0101, ADR 0105).
+ *
+ * Neither frame loop runs here, and they were the only thing that carried
+ * `status`, so a session that dropped under a shell went unannounced. The
+ * chunk command reads the same feed and is the one of the two that starts
+ * nothing: on a session with no media connection it holds the call for
+ * `BITSTREAM_POLL_TIMEOUT_MS` and answers with the status alone, where the
+ * frame command would start the decoder worker of §11.3 for a picture that
+ * never comes.
+ */
+async function terminalStatusTick(): Promise<void> {
+  if (stopped) {
+    return;
+  }
+  try {
+    const invoke = await invoker();
+    const response = await invoke('view_next_chunk', { args: { peer, need_keyframe: false } });
+    const shown = terminalWindowStatus(decodeViewChunk(response as ArrayBuffer).status);
+    if (shown !== status) {
+      status = shown;
+      renderOverlay();
+    }
+  } catch {
+    // The session is over and the window is on its way out; a banner saying
+    // it is coming back would be the one wrong thing left on screen.
+    stopped = true;
+    status = 'live';
+    renderOverlay();
+  }
+}
+
+function terminalStatusLoop(): void {
+  void terminalStatusTick().finally(() => {
+    if (!stopped) {
+      terminalStatusLoop();
+    }
+  });
+}
+
 async function main(): Promise<void> {
   if (terminalOnly) {
     // The picture's own elements go, rather than being left behind empty: a
@@ -1005,7 +1046,9 @@ async function main(): Promise<void> {
   if (terminalOnly) {
     // Neither frame loop starts, which is also what keeps the Rust side from
     // ever starting the decoder worker of §11.3: the first frame command is
-    // what tells it which side decodes (ADR 0058, ADR 0101).
+    // what tells it which side decodes (ADR 0058, ADR 0101). Only the status
+    // is still worth asking for.
+    terminalStatusLoop();
     return;
   }
   // Which side decodes. The window is the only one that knows whether its own

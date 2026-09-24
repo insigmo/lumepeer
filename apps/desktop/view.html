@@ -150,6 +150,15 @@
         height: auto;
         background: rgb(0 0 0 / 100%);
       }
+      /* The "reconnecting" banner of a terminal window. The panel fills the
+         window and comes later in the document, so without this it would
+         cover the banner; and at the bottom rather than the top, where it
+         would cover the panel's own Close button. */
+      #view.is-terminal-only .view-banner {
+        z-index: 1;
+        inset-block-start: auto;
+        inset-block-end: 0;
+      }
       #terminal-screen {
         flex: 1;
         min-height: 0;
