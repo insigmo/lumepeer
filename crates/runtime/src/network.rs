@@ -15072,6 +15072,19 @@ async fn run_terminal_connection(
             .await;
         return;
     };
+    // QUIC tells the far side about a stream only once bytes flow on it, and
+    // a shell speaks first: without this the host sat in `accept_bi` and the
+    // prompt waited in its queue until the guest's first keystroke, a blank
+    // window until then. So the dialer writes at once, a close for shell 0,
+    // which no shell ever is — a host that predates this reads it as the end
+    // of a shell it does not have, which is nothing.
+    if dialed && let Err(error) = write_terminal_close(&mut send, 0).await {
+        tracing::debug!(peer = %tag, %error, "the terminal stream could not be opened");
+        let _ = events
+            .send(ActorEvent::Terminal(TerminalEvent::ConnectFailed { peer }))
+            .await;
+        return;
+    }
 
     let writer_tag = tag.clone();
     let writer = tokio::spawn(async move {
@@ -15098,6 +15111,10 @@ async fn run_terminal_connection(
                 break;
             }
         };
+        if frame.shell == 0 {
+            // The dialer's opening frame above.
+            continue;
+        }
         let event = if frame.is_close() {
             TerminalEvent::ShellEnded {
                 peer,
@@ -18432,6 +18449,26 @@ mod tests {
             panic!("a granted shell did not open: {records:?}");
         };
         let shell = *shell;
+
+        // A shell speaks first, with its prompt, and that has to reach the
+        // guest before anything is typed: a window that stays blank until a
+        // key is pressed looks like a shell that never started. It may have
+        // come with the `opened` already.
+        let spoke = |records: &[(ShellId, u8, Vec<u8>)]| {
+            records.iter().any(|(id, event, payload)| {
+                *id == shell && *event == TERMINAL_EVENT_OUTPUT && !payload.is_empty()
+            })
+        };
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut polled = records;
+        while !spoke(&polled) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the shell's prompt never reached the guest before anything was typed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            polled = terminal_records(&guest.terminal_poll(host_label.clone()).await.unwrap());
+        }
 
         // What comes back is computed by the shell, not echoed from the
         // input: the typed line never contains the answer.

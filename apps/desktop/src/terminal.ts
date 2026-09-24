@@ -192,6 +192,8 @@ export class TerminalSession {
   #shell: number | null = null;
   #status: TerminalStatus = 'idle';
   #refusal: TerminalRefusal | null = null;
+  /** The keystroke on its way to the host that the next one waits for. */
+  #sending: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly peer: string,
@@ -265,13 +267,22 @@ export class TerminalSession {
     }
   }
 
-  /** What was typed, on its way to the shell. */
+  /**
+   * What was typed, on its way to the shell, in the order it was typed.
+   *
+   * Each keystroke is its own IPC call, and calls made without waiting for
+   * the one before race each other to the actor: typed quickly, `echo` could
+   * reach the shell as `ohce`. So each waits for the last, failed or not.
+   */
   async send(data: string): Promise<void> {
     const shell = this.#shell;
     if (shell === null) {
       return;
     }
-    await this.commands.input(this.peer, shell, Array.from(new TextEncoder().encode(data)));
+    const bytes = Array.from(new TextEncoder().encode(data));
+    const sent = this.#sending.then(() => this.commands.input(this.peer, shell, bytes));
+    this.#sending = sent.catch(() => undefined);
+    await sent;
   }
 
   /** This window changed size, so the shell's own idea of it must too. */

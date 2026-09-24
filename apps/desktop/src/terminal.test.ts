@@ -178,6 +178,43 @@ describe('one shell', () => {
     expect(cmds.close).not.toHaveBeenCalled();
   });
 
+  // Every keystroke is its own IPC call, and calls made without waiting for
+  // the one before race each other to the actor: a line typed quickly reached
+  // a Linux host's bash scrambled.
+  it('sends what was typed in the order it was typed, however fast', async () => {
+    const cmds = commands();
+    const started: string[] = [];
+    const finish: Array<() => void> = [];
+    cmds.input.mockImplementation((_peer: string, _shell: number, data: number[]) => {
+      started.push(new TextDecoder().decode(new Uint8Array(data)));
+      return new Promise<void>((resolve) => finish.push(resolve));
+    });
+    const session = new TerminalSession(PEER, cmds, screen(), 'en');
+    session.apply(decodeTerminalPoll(body([{ shell: 1, event: EVENT_OPENED }])));
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    const sent = ['e', 'c', 'h', 'o'].map((key) => session.send(key));
+    await settle();
+    expect(started).toEqual(['e']);
+    for (let next = finish.shift(); next; next = finish.shift()) {
+      next();
+      await settle();
+    }
+    await Promise.all(sent);
+    expect(started).toEqual(['e', 'c', 'h', 'o']);
+  });
+
+  it('keeps typing after one keystroke could not be sent', async () => {
+    const cmds = commands();
+    cmds.input.mockRejectedValueOnce(new Error('the terminal channel is full'));
+    const session = new TerminalSession(PEER, cmds, screen(), 'en');
+    session.apply(decodeTerminalPoll(body([{ shell: 1, event: EVENT_OPENED }])));
+
+    await expect(session.send('a')).rejects.toThrow('full');
+    await session.send('b');
+    expect(cmds.input).toHaveBeenLastCalledWith(PEER, 1, [98]);
+  });
+
   it('draws its own shell and drops output addressed to another', () => {
     const sink = screen();
     const session = new TerminalSession(PEER, commands(), sink, 'en');
