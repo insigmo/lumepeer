@@ -178,6 +178,8 @@ export const en: Dictionary = {
     'The other device has no screen capture support, so it cannot send its screen. The connection itself is fine.',
   'view.unavailable.noEncoder':
     'The other device has no video encoder, so it cannot send its screen. The connection itself is fine.',
+  'view.unavailable.captureDenied':
+    "The other device's system did not allow Lumepeer to record its screen. Someone at that device has to allow screen recording for Lumepeer, then you can connect again. The connection itself is fine.",
   'view.unavailable.dismiss': 'Close',
   'view.recording': 'This session is being recorded',
   'chat.logLabel': 'Chat',

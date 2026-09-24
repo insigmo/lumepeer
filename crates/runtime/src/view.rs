@@ -456,7 +456,9 @@ impl MediaHealth {
     /// other two, it is not a fact about this host's platform or build — it
     /// is expected to clear on its own, and a future guest must not be
     /// refused a session over a UAC prompt that has since closed
-    /// (`docs/bugs/11-uac-degradation.md`).
+    /// (`docs/bugs/11-uac-degradation.md`). `CaptureDenied` is not recorded
+    /// for the same reason: someone at this host can grant capture, and the
+    /// next session must ask the operating system again (ADR 0110).
     pub fn record(&self, reason: MediaUnavailableReason) {
         match reason {
             MediaUnavailableReason::NoCaptureBackend => {
@@ -465,7 +467,8 @@ impl MediaHealth {
             MediaUnavailableReason::NoEncoder => {
                 self.encoder_missing.store(true, Ordering::Relaxed);
             }
-            MediaUnavailableReason::SecureDesktopActive => {}
+            MediaUnavailableReason::SecureDesktopActive | MediaUnavailableReason::CaptureDenied => {
+            }
         }
     }
 
@@ -838,6 +841,9 @@ pub enum ViewStatus {
     /// fine, and the picture underneath is only stale, not lost
     /// (`docs/bugs/11-uac-degradation.md`).
     SecureDesktop,
+    /// The host's operating system refused it screen capture (ADR 0110).
+    /// Terminal, same as `NoCapture`, with text that says who can fix it.
+    CaptureDenied,
 }
 
 impl From<MediaUnavailableReason> for ViewStatus {
@@ -846,6 +852,7 @@ impl From<MediaUnavailableReason> for ViewStatus {
             MediaUnavailableReason::NoCaptureBackend => Self::NoCapture,
             MediaUnavailableReason::NoEncoder => Self::NoEncoder,
             MediaUnavailableReason::SecureDesktopActive => Self::SecureDesktop,
+            MediaUnavailableReason::CaptureDenied => Self::CaptureDenied,
         }
     }
 }
@@ -866,6 +873,7 @@ impl ViewStatus {
             Self::NoCapture => 4,
             Self::NoEncoder => 5,
             Self::SecureDesktop => 6,
+            Self::CaptureDenied => 7,
         }
     }
 
@@ -873,7 +881,10 @@ impl ViewStatus {
     /// guest has nothing left to wait for.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Failed | Self::NoCapture | Self::NoEncoder)
+        matches!(
+            self,
+            Self::Failed | Self::NoCapture | Self::NoEncoder | Self::CaptureDenied
+        )
     }
 }
 
@@ -1343,6 +1354,17 @@ pub fn spawn_encode_loop(
                         sleep_for_the_rest_of(interval, tick_started).await;
                         continue;
                     }
+                }
+                // The operating system said no: the Wayland portal's dialog
+                // was dismissed. Ending the loop alone left the guest
+                // redialing a media stream that could never carry a frame
+                // (ADR 0110).
+                Ok(Err(MediaError::PermissionDenied)) => {
+                    tracing::warn!(peer = %tag, "the OS refused screen capture: this session stays blank");
+                    let _ = faults
+                        .send((peer, MediaUnavailableReason::CaptureDenied))
+                        .await;
+                    return;
                 }
                 Ok(Err(error)) => {
                     tracing::info!(peer = %tag, %error, "capture ended: stopping the encode loop");

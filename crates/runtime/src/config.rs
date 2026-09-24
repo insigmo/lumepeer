@@ -47,13 +47,17 @@ pub struct Network {
     /// mode of ADR 0020 — a deliberate WAN test, never a shipping default.
     pub prefer_direct: bool,
     /// Whether this node may use the obfuscated serverless transport beside
-    /// the iroh path (ADR 0052, ADR 0080).
+    /// the iroh path (ADR 0052, ADR 0080, ADR 0111).
     ///
-    /// **Off by default**, and deliberately so: the transport is new, it is
-    /// added beside iroh rather than in place of it, and turning it on costs
-    /// a host a STUN round trip to a public reflector every time it issues an
-    /// invite. Automatic selection between the two and the fallback when the
-    /// obfuscated path fails are gap-tasks/23, not this flag.
+    /// **On by default.** gap-tasks/23's automatic selection and fallback are
+    /// now in place — [`crate::network`] dials the obfuscated path first and
+    /// the iroh path second within one dial budget, and reconnect re-runs the
+    /// same plan — so the transport is a default rather than an opt-in
+    /// (ADR 0111). It stays *beside* iroh, never in place of it: a host whose
+    /// STUN discovery finds nothing simply issues a ticket without an
+    /// obfuscated address, and the guest falls back to iroh exactly as before.
+    /// Setting this to `false` is the escape hatch for a node that wants to
+    /// skip the per-invite STUN round trip on a network it knows is clean.
     pub obfuscated: bool,
 }
 
@@ -62,7 +66,7 @@ impl Default for Network {
         Self {
             relay_url: None,
             prefer_direct: true,
-            obfuscated: false,
+            obfuscated: true,
         }
     }
 }
@@ -231,11 +235,12 @@ impl Settings {
         !self.network.prefer_direct || lumepeer_net::endpoint::relay_only_enabled()
     }
 
-    /// Whether this run may use the obfuscated transport at all (ADR 0080).
+    /// Whether this run may use the obfuscated transport at all (ADR 0080,
+    /// ADR 0111).
     ///
-    /// Off unless `[network] obfuscated` says otherwise, which is what makes
-    /// "with the flag off nothing changed" a property of the build rather
-    /// than of a code path nobody took.
+    /// On unless `[network] obfuscated = false` says otherwise: the transport
+    /// is preferred automatically with iroh as the fallback, and a network
+    /// that wants none of it turns the whole thing off with one key.
     #[must_use]
     pub const fn obfuscated(&self) -> bool {
         self.network.obfuscated
@@ -353,8 +358,8 @@ mod tests {
             "direct paths are the shipping default (ADR 0026)"
         );
         assert!(
-            !settings.obfuscated(),
-            "the obfuscated transport is opt-in, never a shipping default (ADR 0080)"
+            settings.obfuscated(),
+            "the obfuscated transport is preferred automatically, with iroh as the fallback (ADR 0111)"
         );
     }
 
@@ -367,8 +372,8 @@ mod tests {
         let parsed = toml::from_str::<Settings>(text).expect("config/default.toml must parse");
         assert!(parsed.network.prefer_direct);
         assert!(
-            !parsed.obfuscated(),
-            "config/default.toml must ship with the obfuscated transport off (ADR 0080)"
+            parsed.obfuscated(),
+            "config/default.toml must ship with the obfuscated transport on (ADR 0111)"
         );
         assert_eq!(parsed.logging.directory.as_deref(), Some("logs"));
     }

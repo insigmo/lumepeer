@@ -31,6 +31,7 @@ const STATUS_BY_CODE: readonly ViewStatus[] = [
   'no-capture',
   'no-encoder',
   'secure-desktop',
+  'capture-denied',
 ];
 
 /** Bytes of the fixed header every `view_next_chunk` response carries. */

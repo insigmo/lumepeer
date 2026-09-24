@@ -22,6 +22,8 @@ import { t } from './i18n';
 /// picture at all — a different thing from `failed`, which is a connection
 /// that was lost. Nothing was lost in those two, and nothing is worth
 /// retrying, so the window says so instead of blaming the network.
+/// `capture-denied` is the same kind of answer from a host whose operating
+/// system refused it screen capture (ADR 0110).
 export type ViewStatus =
   | 'waiting'
   | 'live'
@@ -29,7 +31,8 @@ export type ViewStatus =
   | 'failed'
   | 'no-capture'
   | 'no-encoder'
-  | 'secure-desktop';
+  | 'secure-desktop'
+  | 'capture-denied';
 
 // Append-only: this array's index is the byte the Rust side's `ViewStatus::code`
 // writes into the IPC response (`apps/desktop/src-tauri/src/view.rs`).
@@ -41,6 +44,7 @@ const STATUS_BY_CODE: readonly ViewStatus[] = [
   'no-capture',
   'no-encoder',
   'secure-desktop',
+  'capture-denied',
 ];
 
 /** Bytes of the fixed header every `view_next_frame` response carries. */
@@ -1168,10 +1172,15 @@ export function viewOverlay(status: ViewStatus, locale: Locale, onDismiss: () =>
       onDismiss,
     );
   }
-  if (status === 'no-capture' || status === 'no-encoder') {
+  if (status === 'no-capture' || status === 'no-encoder' || status === 'capture-denied') {
+    const body = {
+      'no-capture': 'view.unavailable.noCapture',
+      'no-encoder': 'view.unavailable.noEncoder',
+      'capture-denied': 'view.unavailable.captureDenied',
+    } as const;
     return terminalModal(
       t(locale, 'view.unavailable.title'),
-      t(locale, status === 'no-capture' ? 'view.unavailable.noCapture' : 'view.unavailable.noEncoder'),
+      t(locale, body[status]),
       t(locale, 'view.unavailable.dismiss'),
       onDismiss,
     );

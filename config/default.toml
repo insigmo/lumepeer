@@ -20,12 +20,14 @@ prefer_direct = true
 # relay_url = "https://relay.example.com"
 # The obfuscated serverless transport of ADR 0052: direct QUIC whose every
 # datagram is sealed, discovered through a stateless STUN reflector, with no
-# server ever in the data path. Off by default — it is added beside the iroh
-# path, not in place of it, and turning it on costs a host one STUN round trip
-# per invite. With it off nothing about this node changes (ADR 0080).
-# Choosing between the two paths automatically, and falling back when the
-# obfuscated one cannot be reached, is separate work and is not this flag.
-obfuscated = false
+# server ever in the data path. On by default — it is preferred automatically
+# and iroh is the fallback, within one dial budget, so a client on a network
+# that freezes relay traffic still has a path that carries no fixed header for
+# such filtering to key on (ADR 0111). It stays beside the iroh path, never in
+# place of it: a host whose STUN discovery finds nothing issues a ticket with
+# no obfuscated address and the guest falls back to iroh. Set it to false to
+# skip the per-invite STUN round trip on a network you know is clean.
+obfuscated = true
 
 [logging]
 # Human-readable on stdout in development, structured JSON to file in

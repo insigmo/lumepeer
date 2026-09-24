@@ -149,6 +149,11 @@ describe('view window: frame decoding', () => {
     expect(decodeViewFrame(response({ status: 5, input: false, width: 0, height: 0 })).status).toBe('no-encoder');
   });
 
+  // Code 7 is `ViewStatus::CaptureDenied` in view.rs (ADR 0110).
+  it('decodes the capture-denied status', () => {
+    expect(decodeViewFrame(response({ status: 7, input: false, width: 0, height: 0 })).status).toBe('capture-denied');
+  });
+
   // Code 6 is `ViewStatus::SecureDesktop` in view.rs (docs/bugs/11-uac-degradation.md).
   it('decodes the secure-desktop status', () => {
     expect(decodeViewFrame(response({ status: 6, input: false, width: 0, height: 0 })).status).toBe(
@@ -1066,6 +1071,7 @@ describe('view window: status overlay', () => {
     for (const [status, fragment] of [
       ['no-capture', 'screen capture'],
       ['no-encoder', 'video encoder'],
+      ['capture-denied', 'allow screen recording'],
     ] as [ViewStatus, string][]) {
       const dismissed = vi.fn();
       render(viewOverlay(status, 'en', dismissed), container);
@@ -1099,6 +1105,7 @@ describe('view window: status overlay', () => {
       'failed',
       'no-capture',
       'no-encoder',
+      'capture-denied',
     ] as ViewStatus[]) {
       it(`has no axe violations (${status}, ${locale})`, async () => {
         render(viewOverlay(status, locale, noop), container);

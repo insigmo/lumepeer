@@ -168,6 +168,8 @@ export const es: Dictionary = {
     'El otro dispositivo no admite la captura de pantalla, por lo que no puede enviar su pantalla. La conexión en sí funciona bien.',
   'view.unavailable.noEncoder':
     'El otro dispositivo no tiene codificador de vídeo, por lo que no puede enviar su pantalla. La conexión en sí funciona bien.',
+  'view.unavailable.captureDenied':
+    'El sistema del otro dispositivo no permitió a Lumepeer grabar su pantalla. Alguien en ese dispositivo tiene que permitir la grabación de pantalla a Lumepeer; después podrá volver a conectarse. La conexión en sí funciona bien.',
   'view.unavailable.dismiss': 'Cerrar',
   'view.recording': 'Esta sesión se está grabando',
   'chat.logLabel': 'Chat',

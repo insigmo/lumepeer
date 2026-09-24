@@ -168,6 +168,8 @@ export const pt: Dictionary = {
     'O outro dispositivo não tem suporte para captura de tela, então não pode enviar sua tela. A conexão em si está funcionando bem.',
   'view.unavailable.noEncoder':
     'O outro dispositivo não tem codificador de vídeo, então não pode enviar sua tela. A conexão em si está funcionando bem.',
+  'view.unavailable.captureDenied':
+    'O sistema do outro dispositivo não permitiu que o Lumepeer gravasse a tela. Alguém nesse dispositivo precisa permitir a gravação de tela para o Lumepeer; depois você pode se conectar de novo. A conexão em si está funcionando bem.',
   'view.unavailable.dismiss': 'Fechar',
   'view.recording': 'Esta sessão está sendo gravada',
   'chat.logLabel': 'Chat',

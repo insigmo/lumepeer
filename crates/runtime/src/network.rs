@@ -200,6 +200,26 @@ const REBOOT_MINOR: u16 = 17;
 /// `HelloAck` said at least this.
 const SESSION_RESUME_MINOR: u16 = 18;
 
+/// First `PROTOCOL_MINOR` that decodes `MediaUnavailableReason::CaptureDenied`
+/// (ADR 0110).
+///
+/// Host side: the variant rides the `FEATURE_MEDIA_UNAVAILABLE` message, so
+/// that string alone is not enough; a guest below this minor would read the
+/// unknown variant as malformed and close the connection (§9.1).
+const CAPTURE_DENIED_MINOR: u16 = 19;
+
+/// Whether a guest can decode `MediaUnavailable(reason)`: it advertised
+/// `FEATURE_MEDIA_UNAVAILABLE`, and for `CaptureDenied` it is also at
+/// [`CAPTURE_DENIED_MINOR`] or later.
+fn announces_media_fault(
+    speaks_media_unavailable: bool,
+    peer_minor: u16,
+    reason: MediaUnavailableReason,
+) -> bool {
+    speaks_media_unavailable
+        && (reason != MediaUnavailableReason::CaptureDenied || peer_minor >= CAPTURE_DENIED_MINOR)
+}
+
 /// How many frames one terminal connection queues before its producer waits.
 ///
 /// The tunnel's writer queue in named form. Deep enough that a shell dumping a
@@ -3808,7 +3828,8 @@ fn codec_in_use(
         ViewStatus::Waiting
         | ViewStatus::Failed
         | ViewStatus::NoCapture
-        | ViewStatus::NoEncoder => None,
+        | ViewStatus::NoEncoder
+        | ViewStatus::CaptureDenied => None,
     }
 }
 
@@ -5199,8 +5220,9 @@ struct ConnectRetry {
 #[derive(Debug, Default)]
 struct ObfuscatedHost {
     /// Whether this run may use the transport at all (`[network] obfuscated`,
-    /// off by default). With it off nothing here is ever bound or dialed and
-    /// the node behaves exactly as it did before this transport existed.
+    /// on by default; ADR 0111). With it off nothing here is ever bound or
+    /// dialed and the node behaves exactly as it did before this transport
+    /// existed.
     enabled: bool,
     /// Whether a bind is in flight, so a second invite request cannot start a
     /// second one racing it.
@@ -8496,7 +8518,7 @@ impl Actor {
         let announces = self
             .connections
             .get(&peer)
-            .is_some_and(|c| c.announces_media_faults);
+            .is_some_and(|c| announces_media_fault(c.announces_media_faults, c.peer_minor, reason));
         if !announces {
             tracing::debug!(
                 peer = %self.label_of(&peer),
@@ -8548,8 +8570,16 @@ impl Actor {
         if let Some(task) = state.task.as_ref() {
             task.abort();
         }
+        // The first terminal reason stands. A guest that dialed media before
+        // the grant-time announcement landed can hear a second one from the
+        // encode loop that dial started, and that one names the wrong cause
+        // (ADR 0110).
         let status = ViewStatus::from(reason);
-        state.slot_tx.send_modify(|slot| slot.status = status);
+        state.slot_tx.send_modify(|slot| {
+            if !slot.status.is_terminal() {
+                slot.status = status;
+            }
+        });
     }
 
     /// Host side: stops sending video to `peer` and drops it as a viewer, which
@@ -13220,12 +13250,23 @@ impl Actor {
         let label = label.as_str();
         self.send_to(&peer, MessageKind::ConsentGrant(role));
         if self.sessions.grants(&peer).is_some_and(|g| g.view) {
-            if let Err(error) = lock_capture(&self.capture).add_viewer(peer) {
-                tracing::warn!(
-                    peer = %label,
-                    %error,
-                    "consent granted but this platform cannot capture"
-                );
+            let added = lock_capture(&self.capture).add_viewer(peer);
+            match added {
+                Ok(()) => {}
+                // macOS without Screen Recording. The guest is told now, or it
+                // would redial a media stream that can never carry a frame for
+                // as long as its window stays open (ADR 0110).
+                Err(lumepeer_media::error::MediaError::PermissionDenied) => {
+                    tracing::warn!(peer = %label, "consent granted but the OS refused screen capture");
+                    self.announce_media_fault(peer, MediaUnavailableReason::CaptureDenied);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        peer = %label,
+                        %error,
+                        "consent granted but this platform cannot capture"
+                    );
+                }
             }
             // Announced here rather than waiting for the guest's media dial:
             // the guest opens its window on the `ConsentGrant` this function
@@ -14427,7 +14468,7 @@ impl Actor {
     /// use it at all (gap-tasks/21 task 3; ADR 0080).
     ///
     /// Two conditions, both required, neither guessed at: this run must have
-    /// `[network] obfuscated` on — off in every shipping build — and the
+    /// `[network] obfuscated` on — the shipping default (ADR 0111) — and the
     /// ticket must carry both an address for that transport and the
     /// fingerprint to pin its certificate by (ADR 0053). A ticket from a host
     /// whose STUN discovery found nothing carries neither, and is dialed over
@@ -17159,6 +17200,27 @@ mod tests {
         fn stop(&mut self) {
             self.running = false;
         }
+
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::None
+        }
+    }
+
+    /// Capturer of a Mac without Screen Recording: every start is refused
+    /// (ADR 0110).
+    #[derive(Debug, Default)]
+    struct DeniedCapturer;
+
+    impl ScreenCapturer for DeniedCapturer {
+        fn start(&mut self, _target: CaptureTarget) -> MediaResult<()> {
+            Err(MediaError::PermissionDenied)
+        }
+
+        fn next_frame(&mut self) -> MediaResult<Option<Frame>> {
+            Err(MediaError::CaptureUnavailable("never started".to_owned()))
+        }
+
+        fn stop(&mut self) {}
 
         fn input_capability(&self) -> InputCapability {
             InputCapability::None
@@ -21762,6 +21824,79 @@ mod tests {
             guest.media_health().can_capture(),
             "the fault belongs to the host that has it, not to whoever heard about it"
         );
+    }
+
+    /// ADR 0110: a host whose OS refuses it capture (a Mac without Screen
+    /// Recording) tells the guest so. Before, the guest sat on "Waiting for
+    /// the remote screen" and redialed media about every 0.8 s for as long as
+    /// its window stayed open.
+    ///
+    /// Not recorded on the host: granting the permission is someone's click
+    /// away, and the next session must ask again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_the_os_refused_capture_tells_the_guest_why() {
+        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(CaptureController::new(
+            Box::new(DeniedCapturer),
+            CaptureTarget::PrimaryDisplay,
+        )));
+        let (host, _host_endpoint) =
+            actor_with_media(Arc::new(DetachedViewWindows), test_media(&capture)).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let frame = guest.view_frame(&peer_label, 0).unwrap();
+            if frame[0] == ViewStatus::CaptureDenied.code() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guest was never told the OS refused capture (status {})",
+                frame[0]
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let rows = host.status().await.unwrap();
+        assert!(
+            rows.iter().any(|r| r.state == SessionStateDto::Active),
+            "a refused capture must not end the session"
+        );
+        assert!(
+            host.media_health().fault().is_none(),
+            "a permission is not a fact about the build: the next session asks again"
+        );
+    }
+
+    /// ADR 0110: `CaptureDenied` is a variant a guest below minor 19 cannot
+    /// decode, and an undecodable frame closes the connection (§9.1).
+    #[test]
+    fn capture_denied_goes_only_to_a_guest_that_can_decode_it() {
+        let denied = MediaUnavailableReason::CaptureDenied;
+        let blind = MediaUnavailableReason::NoCaptureBackend;
+        assert!(announces_media_fault(true, CAPTURE_DENIED_MINOR, denied));
+        assert!(!announces_media_fault(
+            true,
+            CAPTURE_DENIED_MINOR - 1,
+            denied
+        ));
+        assert!(announces_media_fault(true, CAPTURE_DENIED_MINOR - 1, blind));
+        assert!(!announces_media_fault(false, CAPTURE_DENIED_MINOR, denied));
     }
 
     /// §11, ADR 0028: a guest holding the `input` grant can put the

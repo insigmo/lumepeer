@@ -88,10 +88,46 @@ for bin in $SIDECARS; do cp "target/debug/\$bin" "apps/desktop/src-tauri/binarie
 cd apps/desktop
 npm install --no-audit --no-fund >/dev/null
 npx tauri build --debug --bundles app --features "$MAC_FEATURES" --config ../../target-e2e-pilot.conf.json
+
+# TCC keeps a Screen Recording / Accessibility grant against the app's bundle
+# id and designated requirement. Tauri leaves this bundle unsigned, which has
+# no requirement a grant can stick to, and it shares its bundle id with the
+# (also unsigned) /Applications/Lumepeer.app, so the one switch in System
+# Settings belonged to whichever of the two asked last. The e2e app gets its
+# own bundle id and name, and a signature by a self-signed certificate made
+# once on this Mac: the requirement then stays the same across rebuilds and
+# one grant lasts. The runtime identifier (pilot socket, data) is compiled in
+# and does not change. The keychain password guards only this throwaway key.
+app=\$HOME/lumepeer/target/debug/bundle/macos/Lumepeer.app
+kc=\$HOME/Library/Keychains/lumepeer-e2e.keychain-db
+if [ ! -f "\$kc" ]; then
+  tmp=\$(mktemp -d)
+  printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=Lumepeer E2E\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' > "\$tmp/c.cnf"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "\$tmp/c.cnf" -keyout "\$tmp/k.pem" -out "\$tmp/c.pem" 2>/dev/null
+  openssl pkcs12 -export -inkey "\$tmp/k.pem" -in "\$tmp/c.pem" -name "Lumepeer E2E" -passout pass:e2e -out "\$tmp/i.p12"
+  security create-keychain -p e2e "\$kc"
+  security set-keychain-settings "\$kc"
+  security unlock-keychain -p e2e "\$kc"
+  security import "\$tmp/i.p12" -k "\$kc" -P e2e -T /usr/bin/codesign
+  security set-key-partition-list -S apple-tool:,apple: -s -k e2e "\$kc" >/dev/null
+  rm -rf "\$tmp"
+fi
+identity=\$(security find-identity -p codesigning "\$kc" | sed -n 's/^ *1) \([0-9A-F]*\) "Lumepeer E2E".*/\1/p')
+plutil -replace CFBundleIdentifier -string io.insigmo.lumepeer.e2e "\$app/Contents/Info.plist"
+plutil -replace CFBundleName -string "Lumepeer E2E" "\$app/Contents/Info.plist"
+plutil -replace CFBundleDisplayName -string "Lumepeer E2E" "\$app/Contents/Info.plist"
+# codesign finds an identity only in the search list; the keychain joins it
+# for this one call.
+keychains=\$(security list-keychains -d user | tr -d '"' | xargs)
+trap 'security list-keychains -d user -s \$keychains' EXIT
+security list-keychains -d user -s \$keychains "\$kc"
+security unlock-keychain -p e2e "\$kc"
+codesign --force --deep -s "\$identity" "\$app"
+codesign -d -r- "\$app" 2>&1 | tail -1
 EOF
   echo "   $MAC:lumepeer/target/debug/bundle/macos/Lumepeer.app"
-  echo "   A rebuilt app is a new ad-hoc signature: grant it Screen Recording and"
-  echo "   Accessibility again (System Settings > Privacy & Security) at the Mac."
+  echo "   Signed as \"Lumepeer E2E\" (io.insigmo.lumepeer.e2e). Grant that entry Screen"
+  echo "   Recording and Accessibility once at the Mac; rebuilds keep the grant."
 }
 
 linux() {

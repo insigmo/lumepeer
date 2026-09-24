@@ -168,6 +168,8 @@ export const de: Dictionary = {
     'Das andere Gerät unterstützt keine Bildschirmaufnahme und kann daher kein Bild senden. Die Verbindung selbst ist in Ordnung.',
   'view.unavailable.noEncoder':
     'Das andere Gerät hat keinen Video-Encoder und kann daher kein Bild senden. Die Verbindung selbst ist in Ordnung.',
+  'view.unavailable.captureDenied':
+    'Das System des anderen Geräts hat Lumepeer die Bildschirmaufnahme nicht erlaubt. Jemand an diesem Gerät muss Lumepeer die Bildschirmaufnahme erlauben, danach können Sie sich erneut verbinden. Die Verbindung selbst ist in Ordnung.',
   'view.unavailable.dismiss': 'Schließen',
   'view.recording': 'Diese Sitzung wird aufgezeichnet',
   'chat.logLabel': 'Chat',

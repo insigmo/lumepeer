@@ -305,7 +305,15 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// host whose `HelloAck` minor is at least this one, because an older host
 /// reads it as a first connection and raises a consent dialog nobody asked
 /// for. See `docs/adr/0089-a-dropped-session-resumes-inside-its-window.md`.
-pub const PROTOCOL_MINOR: u16 = 18;
+///
+/// 19: no new message. Appended [`MediaUnavailableReason::CaptureDenied`]
+/// after `SecureDesktopActive`: the host's operating system refused this app
+/// screen capture (macOS Screen Recording not granted, a Wayland portal
+/// dialog dismissed). A host sends it only to a guest whose `Hello` minor is
+/// at least this one; an older guest decodes the unknown variant as malformed
+/// and closes the connection (§9.1), so it is told nothing, as before. See
+/// `docs/adr/0110-a-host-the-os-refused-capture-says-so.md`.
+pub const PROTOCOL_MINOR: u16 = 19;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -1426,6 +1434,13 @@ pub enum MediaUnavailableReason {
     /// above, this is not permanent: the session stays open, and the guest
     /// should expect it to clear without a reconnect.
     SecureDesktopActive,
+    /// The host's operating system refused this app screen capture: macOS
+    /// Screen Recording is not granted, or the Wayland portal dialog was
+    /// dismissed. Terminal for this session, like `NoCaptureBackend`, but
+    /// not a fact about the host's build: someone at the host can grant it,
+    /// and a later session asks again. Sent only to a guest at minor 19 or
+    /// later (ADR 0110).
+    CaptureDenied,
 }
 
 /// Pixel geometry plus pixel payload of one cursor shape (§11).
@@ -2462,6 +2477,8 @@ mod tests {
         for reason in [
             MediaUnavailableReason::NoCaptureBackend,
             MediaUnavailableReason::NoEncoder,
+            MediaUnavailableReason::SecureDesktopActive,
+            MediaUnavailableReason::CaptureDenied,
         ] {
             let original = envelope(MessageKind::MediaUnavailable(reason));
             let bytes = original.encode().unwrap();

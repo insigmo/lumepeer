@@ -168,6 +168,8 @@ export const fr: Dictionary = {
     "L'autre appareil ne prend pas en charge la capture d'écran, il ne peut donc pas envoyer son écran. La connexion elle-même fonctionne bien.",
   'view.unavailable.noEncoder':
     "L'autre appareil n'a pas d'encodeur vidéo, il ne peut donc pas envoyer son écran. La connexion elle-même fonctionne bien.",
+  'view.unavailable.captureDenied':
+    "Le système de l'autre appareil n'a pas autorisé Lumepeer à enregistrer son écran. Quelqu'un sur cet appareil doit autoriser l'enregistrement de l'écran pour Lumepeer, puis vous pourrez vous reconnecter. La connexion elle-même fonctionne bien.",
   'view.unavailable.dismiss': 'Fermer',
   'view.recording': 'Cette session est en cours d\'enregistrement',
   'chat.logLabel': 'Discussion',

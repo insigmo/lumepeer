@@ -57,10 +57,20 @@ use crate::ticket::INVITE_ID_BYTES;
 /// reflectors the transport discovers with: an answer from a different list
 /// would say nothing about the address this endpoint advertises
 /// (gap-tasks/22 task 2).
+///
+/// The list spreads across independent operators and across ports on purpose
+/// (ADR 0111): discovery returns on the first reflector that answers, so a
+/// reflector an ISP has frozen only costs the next one a try, and a network
+/// that filters STUN's usual UDP/3478 can still be discovered through an
+/// operator that answers on 443. Only when *every* reflector is unreachable
+/// does the host issue a ticket with no obfuscated address and its guests fall
+/// back to iroh — an ordinary outcome, not a failure.
 pub const STUN_SERVERS: &[&str] = &[
     "stun.cloudflare.com:3478",
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
+    "stun.nextcloud.com:443",
+    "stun.sipgate.net:3478",
 ];
 
 /// Subject name both sides put in their certificate and dial by.

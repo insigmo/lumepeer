@@ -218,6 +218,7 @@ export type TranslationKey =
   | 'view.unavailable.title'
   | 'view.unavailable.noCapture'
   | 'view.unavailable.noEncoder'
+  | 'view.unavailable.captureDenied'
   | 'view.unavailable.dismiss'
   | 'view.recording'
   | 'chat.logLabel'

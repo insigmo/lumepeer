@@ -83,9 +83,12 @@ How to read it:
   which an admin account may run without a password (touch
   `/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress` first so
   `softwareupdate -l` lists them), and rustup, node and cmake into the home
-  directory (`~/.cargo`, `~/.local/node`, `~/.local/cmake`). After every `deploy.sh mac`,
-  grant the rebuilt `~/lumepeer/target/debug/bundle/macos/Lumepeer.app`
-  **Screen Recording** and **Accessibility** at the Mac.
+  directory (`~/.cargo`, `~/.local/node`, `~/.local/cmake`). deploy.sh signs
+  the app as **Lumepeer E2E** (`io.insigmo.lumepeer.e2e`) with a self-signed
+  certificate kept in `~/Library/Keychains/lumepeer-e2e.keychain-db`, so it is
+  not confused with `/Applications/Lumepeer.app` and a grant survives rebuilds.
+  Grant *Lumepeer E2E* **Screen Recording** and **Accessibility** at the Mac
+  once; again only if that keychain is deleted.
 - **linux** (`beta@debian`, KDE Wayland): as a host it asks for screen-share and
   remote-control permission through the portal **on every session**
   (`PersistMode::DoNot`), so someone has to click *Share* on the VM while the

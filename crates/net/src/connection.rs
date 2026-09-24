@@ -455,6 +455,7 @@ pub async fn host_handshake(connection: PeerConnection) -> Result<(ControlConnec
         return Err(error);
     }
 
+    control.peer_minor = minor;
     control.set_session_id(SessionManager::new_session_id());
     control
         .send(MessageKind::HelloAck {
