@@ -9024,6 +9024,10 @@ impl Actor {
     /// connect attempt or closing the view window — not a protocol fault
     /// (docs/bugs/02-connect-form.md task 3, docs/bugs/03-connection-list.md
     /// task 3).
+    ///
+    /// A host ends the session on this code instead of holding it for a
+    /// resume (ADR 0112), so nothing that means to come back may close with
+    /// it.
     fn close_connection_normal(&mut self, peer: NodeId) {
         self.close_connection_with(
             peer,
@@ -9376,6 +9380,52 @@ impl Actor {
             let _ = self.notify.send(ActorNotification::ConsentRequested);
         }
         self.rebuild_labels_and_snapshot();
+    }
+
+    /// Host side: what becomes of `peer`'s session once its connection has
+    /// ended (§10; ADR 0089, ADR 0112).
+    fn end_or_park_session(
+        &mut self,
+        peer: NodeId,
+        label: &str,
+        closed: Option<&ConnectionHandle>,
+    ) {
+        // The guest closed this connection itself, with the code for leaving
+        // on purpose: a window closed, a connect called off (ADR 0112). Only
+        // the far side's close counts. `release_connection_claimed_by` closes
+        // with the same code from this side, and the session it lets go of has
+        // to be parked for the claim right behind it.
+        let left_on_purpose = closed.is_some_and(|handle| {
+            handle
+                .connection
+                .closed_by_peer_with(lumepeer_net::connection::CLOSE_NORMAL)
+        });
+        if self.sessions.on_disconnect(peer).is_err() {
+            // No active session to move into the reconnect window, so this was
+            // a guest that dropped before the host decided: drop its queued
+            // request instead of leaving it pending forever.
+            let _ = self.sessions.revoke(peer);
+        } else {
+            // `on_disconnect` only succeeds for a peer that had reached an
+            // active, granted session — never for one still only queued —
+            // so forgetting the consent-rate counter here cannot be used to
+            // flood past it: a peer that was never granted anything gets no
+            // forget, no matter how many times it disconnects
+            // (docs/bugs/03-connection-list.md, task 2).
+            self.sessions.forget_consent_rate(&peer);
+            if left_on_purpose {
+                // Nobody is coming back to this session. Parked, it would hold
+                // the plan's guest place and the controller role for the whole
+                // window, and the host's own list, which leaves a parked
+                // session out, would have no row to end it by (ADR 0112).
+                let _ = self.sessions.revoke(peer);
+                tracing::info!(peer = %label, "the guest left on purpose; its session has ended");
+            } else if let Some(handle) = closed {
+                // Held for the window, under the id the guest knows it by, so
+                // the same guest can come back to it (§10; ADR 0089).
+                self.park_session(peer, handle.session_id);
+            }
+        }
     }
 
     /// Host side: keeps a session that dropped resumable for the window, under
@@ -10332,25 +10382,7 @@ impl Actor {
             self.connect_peer = Some(peer);
         }
         let label = peer_tag(&self.install_salt, &peer);
-        if self.sessions.on_disconnect(peer).is_err() {
-            // No active session to move into the reconnect window, so this was
-            // a guest that dropped before the host decided: drop its queued
-            // request instead of leaving it pending forever.
-            let _ = self.sessions.revoke(peer);
-        } else {
-            // `on_disconnect` only succeeds for a peer that had reached an
-            // active, granted session — never for one still only queued —
-            // so forgetting the consent-rate counter here cannot be used to
-            // flood past it: a peer that was never granted anything gets no
-            // forget, no matter how many times it disconnects
-            // (docs/bugs/03-connection-list.md, task 2).
-            self.sessions.forget_consent_rate(&peer);
-            // Held for the window, under the id the guest knows it by, so the
-            // same guest can come back to it (§10; ADR 0089).
-            if let Some(handle) = closed.as_ref() {
-                self.park_session(peer, handle.session_id);
-            }
-        }
+        self.end_or_park_session(peer, &label, closed.as_ref());
         tracing::info!(peer = %label, "peer disconnected");
         // A window is parked only while something is still trying to fill it
         // (ADR 0105). The case this catches is the host that answered a wait's
@@ -21441,6 +21473,70 @@ mod tests {
                 .iter()
                 .all(|row| row.state != SessionStateDto::Active),
             "the dropped session came back behind a new request"
+        );
+    }
+
+    /// ADR 0112: a guest that closes its window has left on purpose, and the
+    /// host ends that session there and then. It used to park it for a resume
+    /// nobody was coming back for, where for all of `RECONNECT_WINDOW_SECS` it
+    /// still held the plan's one guest place — and the host's own list, which
+    /// leaves a parked session out, had no row to end it by.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_that_closes_its_window_frees_its_place_at_once() {
+        // The premise: every actor here runs on a plan with one guest place.
+        // With two, the second grant below would pass whatever the host did
+        // with the first session.
+        assert_eq!(SessionManager::new().plan().max_concurrent_guests(), 1);
+
+        let (host, _host_endpoint, _capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (first, _first_endpoint, _first_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        let (second, _second_endpoint, _second_capture) = actor().await;
+
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        first.invite_connect(invite.code.clone()).await.unwrap();
+        let first_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(first_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        wait_for_phase(&first, ConnectPhase::Connected).await;
+        wait_until("the first guest never opened its window", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+
+        // Close, in the window: the guest's `on_revoke`, which ends in
+        // `close_connection_normal`.
+        first.revoke(host_label).await.unwrap();
+        wait_for_phase(&first, ConnectPhase::Idle).await;
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while host
+            .status()
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.label == first_label)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host never saw the first guest leave"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        second.invite_connect(invite.code).await.unwrap();
+        let second_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("the second guest's request never reached the host");
+        assert_ne!(second_label, first_label);
+        let granted = host.grant(second_label, Role::FullControl).await;
+        assert!(
+            granted.is_ok(),
+            "a guest that left on purpose still holds the only place: {granted:?}"
         );
     }
 
