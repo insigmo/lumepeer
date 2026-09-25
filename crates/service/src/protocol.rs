@@ -74,6 +74,39 @@ pub const OP_INJECT_SECURE_DESKTOP: u8 = 0x03;
 /// wrong across the two sides.
 pub const INJECT_PAYLOAD_LEN: usize = 9;
 
+/// Perform one input event on the **ordinary** desktop (`Winsta0\Default`) of
+/// the active console session, through the persistent `LocalSystem` injector
+/// the service keeps there (ADR 0114).
+///
+/// The everyday sibling of [`OP_INJECT_SECURE_DESKTOP`]. That one exists so a
+/// guest can reach a UAC prompt on `Winlogon`, an event at a time, through a
+/// worker that lives milliseconds; this one exists so the whole session's input
+/// is performed by a process running as `LocalSystem` rather than by the
+/// unelevated host itself — the only integrity level whose `SendInput` a
+/// System-integrity foreground window (a `VMware` guest's `MKSEmbedded`, the
+/// case this was built for) does not silently drop under UIPI. The host still
+/// authorizes every event in `lumepeer-core` before this pipe is touched, and a
+/// service that cannot carry it out answers [`STATUS_REFUSED`] so the host falls
+/// back to its own in-process injector (ADR 0114 §3).
+///
+/// An `OP_INJECT_DESKTOP` request frame is followed on the wire by exactly
+/// [`DESKTOP_INJECT_PAYLOAD_LEN`] more bytes — a size fixed here at compile time
+/// and never named by the caller, the same rule [`OP_INJECT_SECURE_DESKTOP`]
+/// follows. The descriptor is wider than that one's because the ordinary
+/// injector reproduces chords and grabbing hooks exactly, which needs the
+/// guest's `scancode` and `modifiers` as well as its `logical` code (the v0.0.92
+/// scan-code fix); the secure-desktop worker drops both and types by virtual
+/// key, which is enough for a password field and not for Ctrl+V into a VM.
+pub const OP_INJECT_DESKTOP: u8 = 0x04;
+
+/// Bytes of the fixed descriptor that follows an [`OP_INJECT_DESKTOP`] request:
+/// `kind:u8 | logical:u32 | scancode:u32 | modifiers:u32 | a:i16 | b:i16`,
+/// little-endian. `a`/`b` are `x`/`y` for a move and `dx`/`dy` for a wheel, and
+/// are unused for a press or release. Read and written as a plain byte array,
+/// so there is no struct layout to get wrong across the three sides that carry
+/// it (client, service, injector).
+pub const DESKTOP_INJECT_PAYLOAD_LEN: usize = 17;
+
 /// What an [`OP_INJECT_SECURE_DESKTOP`] descriptor asks the worker to do.
 ///
 /// `logical` is the guest's own logical key/button code — the exact encoding
@@ -281,6 +314,123 @@ pub fn inject_from_args(kind: u32, logical: u32, x: u32, y: u32) -> Option<Injec
     }
 }
 
+/// What an [`OP_INJECT_DESKTOP`] descriptor asks the ordinary-desktop injector
+/// to do — the ordinary sibling of [`InjectAction`], carrying the two fields it
+/// deliberately omits.
+///
+/// `scancode` and `modifiers` are the guest's own, the exact values
+/// `lumepeer_core::protocol::InputEventPayload` carries, so the injector's
+/// `WindowsInjector` reproduces the same chord, layout and grabbing-hook
+/// behaviour the host's in-process injector would have — which is the whole
+/// reason this event is wider than the secure-desktop one (ADR 0114 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DesktopInjectEvent {
+    /// The guest's logical key/button code (ignored by a move or a wheel).
+    pub logical: u32,
+    /// The guest's physical scan code, or `0` when it has none.
+    pub scancode: u32,
+    /// The guest's active modifiers at the time of the event.
+    pub modifiers: u32,
+    /// What kind of event this is, and its move/wheel payload.
+    pub detail: DesktopInjectDetail,
+}
+
+/// The kind of event a [`DesktopInjectEvent`] carries.
+///
+/// A local mirror of `lumepeer_core::protocol::InputDetail`, reproduced here
+/// for the dependency reason this crate's other wire types are (ADR 0043,
+/// ADR 0049 §2): `crates/service` does not link `lumepeer-core`, and the
+/// injector — which does — maps this back onto `InputDetail` at the far end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopInjectDetail {
+    /// Press the key or button named by [`DesktopInjectEvent::logical`].
+    Press,
+    /// Release the key or button named by [`DesktopInjectEvent::logical`].
+    Release,
+    /// Move the pointer to an absolute, normalized point.
+    Move {
+        /// Horizontal position, `0..=65535`.
+        x: u16,
+        /// Vertical position, `0..=65535`.
+        y: u16,
+    },
+    /// Scroll by a signed delta.
+    Wheel {
+        /// Horizontal delta, as the guest sent it.
+        dx: i16,
+        /// Vertical delta, as the guest sent it.
+        dy: i16,
+    },
+}
+
+/// Byte-0 discriminant of a [`DesktopInjectDetail::Press`] descriptor.
+const DESKTOP_KIND_PRESS: u8 = 1;
+/// Byte-0 discriminant of a [`DesktopInjectDetail::Release`] descriptor.
+const DESKTOP_KIND_RELEASE: u8 = 2;
+/// Byte-0 discriminant of a [`DesktopInjectDetail::Move`] descriptor.
+const DESKTOP_KIND_MOVE: u8 = 3;
+/// Byte-0 discriminant of a [`DesktopInjectDetail::Wheel`] descriptor.
+const DESKTOP_KIND_WHEEL: u8 = 4;
+
+/// Serializes a [`DesktopInjectEvent`] into the fixed descriptor that follows an
+/// [`OP_INJECT_DESKTOP`] request on the wire.
+///
+/// Every field has a slot whether or not this event uses it, so the encoding is
+/// a fixed [`DESKTOP_INJECT_PAYLOAD_LEN`] bytes with no branch on length. The
+/// `a`/`b` pair carries `x`/`y` for a move and `dx`/`dy` for a wheel; it is zero
+/// for a press or a release, which [`parse_desktop_inject`] does not read.
+#[must_use]
+pub fn encode_desktop_inject(event: DesktopInjectEvent) -> [u8; DESKTOP_INJECT_PAYLOAD_LEN] {
+    let mut out = [0u8; DESKTOP_INJECT_PAYLOAD_LEN];
+    out[1..5].copy_from_slice(&event.logical.to_le_bytes());
+    out[5..9].copy_from_slice(&event.scancode.to_le_bytes());
+    out[9..13].copy_from_slice(&event.modifiers.to_le_bytes());
+    match event.detail {
+        DesktopInjectDetail::Press => out[0] = DESKTOP_KIND_PRESS,
+        DesktopInjectDetail::Release => out[0] = DESKTOP_KIND_RELEASE,
+        DesktopInjectDetail::Move { x, y } => {
+            out[0] = DESKTOP_KIND_MOVE;
+            out[13..15].copy_from_slice(&x.to_le_bytes());
+            out[15..17].copy_from_slice(&y.to_le_bytes());
+        }
+        DesktopInjectDetail::Wheel { dx, dy } => {
+            out[0] = DESKTOP_KIND_WHEEL;
+            out[13..15].copy_from_slice(&dx.to_le_bytes());
+            out[15..17].copy_from_slice(&dy.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// The [`DesktopInjectEvent`] a descriptor names, or `None` if byte 0 is not a
+/// kind this protocol knows — the same one-bit "no" an unknown opcode gets.
+#[must_use]
+pub fn parse_desktop_inject(
+    payload: &[u8; DESKTOP_INJECT_PAYLOAD_LEN],
+) -> Option<DesktopInjectEvent> {
+    let logical = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let scancode = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+    let modifiers = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+    let a = u16::from_le_bytes([payload[13], payload[14]]);
+    let b = u16::from_le_bytes([payload[15], payload[16]]);
+    let detail = match payload[0] {
+        DESKTOP_KIND_PRESS => DesktopInjectDetail::Press,
+        DESKTOP_KIND_RELEASE => DesktopInjectDetail::Release,
+        DESKTOP_KIND_MOVE => DesktopInjectDetail::Move { x: a, y: b },
+        DESKTOP_KIND_WHEEL => DesktopInjectDetail::Wheel {
+            dx: a.cast_signed(),
+            dy: b.cast_signed(),
+        },
+        _ => return None,
+    };
+    Some(DesktopInjectEvent {
+        logical,
+        scancode,
+        modifiers,
+        detail,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,9 +455,74 @@ mod tests {
     /// one and have the service perform another.
     #[test]
     fn the_operations_are_distinct() {
-        assert_ne!(OP_DELIVER_SAS, OP_CAPTURE_SECURE_DESKTOP);
-        assert_ne!(OP_DELIVER_SAS, OP_INJECT_SECURE_DESKTOP);
-        assert_ne!(OP_CAPTURE_SECURE_DESKTOP, OP_INJECT_SECURE_DESKTOP);
+        let ops = [
+            OP_DELIVER_SAS,
+            OP_CAPTURE_SECURE_DESKTOP,
+            OP_INJECT_SECURE_DESKTOP,
+            OP_INJECT_DESKTOP,
+        ];
+        for (i, a) in ops.iter().enumerate() {
+            for b in &ops[i + 1..] {
+                assert_ne!(a, b, "two operations must never share an opcode");
+            }
+        }
+    }
+
+    /// Every ordinary-desktop event survives the fixed descriptor unchanged,
+    /// including the `scancode` and `modifiers` the secure-desktop descriptor
+    /// drops and both signs of a wheel delta.
+    #[test]
+    fn desktop_inject_events_round_trip_through_the_fixed_descriptor() {
+        for event in [
+            DesktopInjectEvent {
+                logical: 0x0d,
+                scancode: 0x1c,
+                modifiers: 0,
+                detail: DesktopInjectDetail::Press,
+            },
+            DesktopInjectEvent {
+                logical: u32::MAX,
+                scancode: u32::MAX,
+                modifiers: u32::MAX,
+                detail: DesktopInjectDetail::Release,
+            },
+            DesktopInjectEvent {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: DesktopInjectDetail::Move {
+                    x: u16::MAX,
+                    y: 12_345,
+                },
+            },
+            DesktopInjectEvent {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: DesktopInjectDetail::Wheel {
+                    dx: i16::MIN,
+                    dy: i16::MAX,
+                },
+            },
+        ] {
+            assert_eq!(
+                parse_desktop_inject(&encode_desktop_inject(event)),
+                Some(event)
+            );
+        }
+    }
+
+    /// A descriptor whose kind byte names nothing is refused, not guessed.
+    #[test]
+    fn an_unknown_desktop_inject_kind_is_refused() {
+        let mut payload = encode_desktop_inject(DesktopInjectEvent {
+            logical: 1,
+            scancode: 2,
+            modifiers: 3,
+            detail: DesktopInjectDetail::Press,
+        });
+        payload[0] = 0xff;
+        assert_eq!(parse_desktop_inject(&payload), None);
     }
 
     /// Every inject action survives the fixed descriptor unchanged, including

@@ -748,6 +748,32 @@ fn secure_desktop_action(
     }
 }
 
+/// The ordinary-desktop injector's view of one event (ADR 0114).
+///
+/// Unlike [`secure_desktop_action`], this carries every field the in-process
+/// injector would have used — `scancode` and `modifiers` as well as `logical` —
+/// because the `LocalSystem` injector at the far end runs the same
+/// `WindowsInjector`, and dropping either would cost the scan-code chord path
+/// (Ctrl+V into a VM) and the grab detection. It also carries the wheel, which
+/// the secure desktop has no meaning for and the ordinary one does.
+fn desktop_inject_event(
+    event: &InputEventPayload,
+) -> lumepeer_service::protocol::DesktopInjectEvent {
+    use lumepeer_service::protocol::{DesktopInjectDetail, DesktopInjectEvent};
+    let detail = match event.detail {
+        InputDetail::Press => DesktopInjectDetail::Press,
+        InputDetail::Release => DesktopInjectDetail::Release,
+        InputDetail::PointerMove { x, y } => DesktopInjectDetail::Move { x, y },
+        InputDetail::Wheel { dx, dy } => DesktopInjectDetail::Wheel { dx, dy },
+    };
+    DesktopInjectEvent {
+        logical: event.logical,
+        scancode: event.scancode,
+        modifiers: event.modifiers,
+        detail,
+    }
+}
+
 /// What `invite_create` hands back to the UI.
 #[derive(Debug, Clone)]
 pub struct InviteDto {
@@ -9237,6 +9263,22 @@ impl Actor {
     /// caller has been through it.
     fn inject_directly(&mut self, peer: NodeId, event: &InputEventPayload) {
         let tag = self.label_of(&peer);
+        // Prefer the `LocalSystem` desktop injector the service keeps in the
+        // console session (ADR 0114). Its `SendInput` comes from a process whose
+        // integrity UIPI does not put behind a System-integrity foreground
+        // window — a `VMware` guest's, the case this exists for — which the
+        // host's own in-process `SendInput` is, so a key or a click that
+        // vanished before now lands. Authorization already happened in `inject`,
+        // so this only decides *who performs* the event, never whether it may be.
+        //
+        // A `false` — no service, the injector not up yet, its channel gone —
+        // falls through to the in-process injector below, which is what
+        // performed every event before 0114 and still does when the service
+        // cannot (§18; ADR 0114 §3). Off Windows the call is a no-op `false`, so
+        // nothing changes there.
+        if lumepeer_service::client::inject_desktop(desktop_inject_event(event)) {
+            return;
+        }
         if self.injector.is_none() {
             match platform_injector() {
                 Ok(injector) => self.injector = Some(injector),

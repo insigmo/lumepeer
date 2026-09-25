@@ -25,6 +25,8 @@ pub mod agent_launch;
 pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
+pub mod desktop_input_channel;
+#[cfg(target_os = "windows")]
 pub mod frame;
 #[cfg(target_os = "windows")]
 pub mod host_role;
@@ -91,3 +93,26 @@ pub const LOGON_SCREEN_WORKER_ARG: &str = "--logon-screen-worker";
 /// already validated, and `main.rs` re-parses them under the same bounds
 /// (ADR 0057 §3).
 pub const SECURE_DESKTOP_INPUT_WORKER_ARG: &str = "--secure-desktop-input-worker";
+
+/// The single argument that starts the desktop application as this machine's
+/// `LocalSystem` desktop injector (ADR 0114).
+///
+/// The service launches a copy of the desktop binary with exactly this argument
+/// into the console session's `Winsta0\Default` desktop, keeping its own
+/// `LocalSystem` token rather than dropping to the signed-in user the way the
+/// session agent does (`agent_launch`). It lives for as long as the console
+/// session does: it opens the desktop injector channel
+/// ([`desktop_input_channel`]) and performs the input the service forwards to
+/// it, through the very same `WindowsInjector` the host would run in-process.
+///
+/// The injector is the desktop binary, not this one, for the reason the session
+/// agent is (ADR 0085 §1): the injection logic — scan codes, chords, the
+/// grab/relative pointer state machine — lives in `crates/media`, which this
+/// privileged binary deliberately does not link. Keeping one implementation and
+/// launching it is how a host avoids two injectors kept in step by review.
+///
+/// Distinct from [`SESSION_AGENT_ARG`], which is the same desktop and the
+/// signed-in user's token; the two are launched, checked and torn down apart so
+/// "the injector is `LocalSystem`, the agent is not" stays a fact a reader can
+/// see rather than a flag they must trace (ADR 0114 §1).
+pub const SYSTEM_INPUT_WORKER_ARG: &str = "--system-input-worker";

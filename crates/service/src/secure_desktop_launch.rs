@@ -190,7 +190,13 @@ fn run_worker_with_args(arg_tail: &str) -> bool {
 /// which `LocalSystem` holds; an unprivileged run (a developer's `--console`)
 /// fails here cleanly rather than reaching for a desktop it could not open
 /// anyway.
-fn duplicate_own_token_for_session(session: u32) -> Option<HANDLE> {
+///
+/// `pub(crate)` so the persistent desktop injector reuses this exact
+/// token-restamp rather than growing a second copy of it
+/// (`system_injector_launch`, ADR 0114): that launcher wants the same
+/// `LocalSystem`-in-the-console-session token this one builds, only for a
+/// process that lives a session instead of one event.
+pub(crate) fn duplicate_own_token_for_session(session: u32) -> Option<HANDLE> {
     let mut process_token = HANDLE::default();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no close;
     // `process_token` is a local that outlives the call and is only written.

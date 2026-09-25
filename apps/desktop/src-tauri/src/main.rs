@@ -22,6 +22,10 @@ mod service_control;
 // only: there is no session-0 host on the other platforms to launch one.
 #[cfg(target_os = "windows")]
 mod session_agent;
+// This same binary, run as a machine's `LocalSystem` desktop injector
+// (ADR 0114). Windows only, for the same reason the agent is.
+#[cfg(target_os = "windows")]
+mod system_input_worker;
 mod view_windows;
 
 // The session runtime itself lives in `crates/runtime` (ADR 0085 §1): the
@@ -575,6 +579,17 @@ fn main() {
         .any(|arg| arg == lumepeer_service::SESSION_AGENT_ARG)
     {
         session_agent::run();
+    }
+    // Before everything, for the same reason the agent is (ADR 0114): this
+    // process is a `LocalSystem` injector, not a client. An injector that got as
+    // far as the single-instance check, the tray or the actor would be a second
+    // host on a machine whose service launched it only to press keys.
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::SYSTEM_INPUT_WORKER_ARG)
+    {
+        system_input_worker::run();
     }
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {

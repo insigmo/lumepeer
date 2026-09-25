@@ -18,7 +18,9 @@
 //! missing service degrades the privilege level or the picture, never leaves
 //! the caller unable to tell what happened (§18).
 
-use crate::protocol::{InjectAction, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS};
+use crate::protocol::{
+    DesktopInjectEvent, InjectAction, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS,
+};
 
 /// Asks the service to deliver the Secure Attention Sequence.
 ///
@@ -110,6 +112,32 @@ pub fn inject_secure_desktop(action: InjectAction) -> bool {
     }
 }
 
+/// Asks the service to perform one input event on the ordinary desktop, through
+/// the persistent `LocalSystem` injector it keeps in the console session
+/// (ADR 0114).
+///
+/// Returns whether the service confirmed it. `false` covers every reason at
+/// once, exactly like [`inject_secure_desktop`]: no service, not reachable, the
+/// caller's session is not the one on the console, the injector is not up yet,
+/// or it refused the descriptor. The caller — the host actor, which has already
+/// authorized the event in `lumepeer-core` — treats all of them the same and
+/// falls back to its own in-process injector for this event (ADR 0114 §3), so a
+/// missing or still-starting injector degrades to the pre-0114 behaviour rather
+/// than dropping the event.
+#[must_use]
+pub fn inject_desktop(event: DesktopInjectEvent) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        round_trip_inject_desktop(event)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No such injector off Windows, so no service, so nothing to ask.
+        let _ = event;
+        false
+    }
+}
+
 /// Whether the service is reachable right now.
 ///
 /// Distinct from "installed": a service that is installed but stopped is not
@@ -173,6 +201,35 @@ fn round_trip_inject(action: InjectAction) -> bool {
     let mut message = [0u8; FRAME_LEN + INJECT_PAYLOAD_LEN];
     message[..FRAME_LEN].copy_from_slice(&request(OP_INJECT_SECURE_DESKTOP));
     message[FRAME_LEN..].copy_from_slice(&encode_inject(action));
+    if pipe.write_all(&message).is_err() || pipe.flush().is_err() {
+        return false;
+    }
+    let mut reply = [0u8; FRAME_LEN];
+    if pipe.read_exact(&mut reply).is_err() {
+        return false;
+    }
+    succeeded(&reply)
+}
+
+/// The [`round_trip_inject`] variant that carries a [`DesktopInjectEvent`]: the
+/// two-byte request frame followed by the fixed
+/// [`crate::protocol::DESKTOP_INJECT_PAYLOAD_LEN`] descriptor, then the ordinary
+/// two-byte reply. Written as one contiguous buffer so the service reads a whole
+/// request or none of it.
+#[cfg(target_os = "windows")]
+fn round_trip_inject_desktop(event: DesktopInjectEvent) -> bool {
+    use crate::protocol::{
+        DESKTOP_INJECT_PAYLOAD_LEN, FRAME_LEN, OP_INJECT_DESKTOP, encode_desktop_inject, request,
+        succeeded,
+    };
+    use std::io::{Read as _, Write as _};
+
+    let Some(mut pipe) = open() else {
+        return false;
+    };
+    let mut message = [0u8; FRAME_LEN + DESKTOP_INJECT_PAYLOAD_LEN];
+    message[..FRAME_LEN].copy_from_slice(&request(OP_INJECT_DESKTOP));
+    message[FRAME_LEN..].copy_from_slice(&encode_desktop_inject(event));
     if pipe.write_all(&message).is_err() || pipe.flush().is_err() {
         return false;
     }

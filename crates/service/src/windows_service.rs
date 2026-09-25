@@ -16,6 +16,7 @@
 )]
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authentication::Identity::SendSAS;
@@ -40,10 +41,15 @@ use windows::Win32::System::Services::{
 use windows::core::{PCWSTR, PWSTR};
 
 use lumepeer_service::SERVICE_NAME;
+use lumepeer_service::agent_launch::console_session;
+use lumepeer_service::desktop_input_channel::InjectorHost;
 use lumepeer_service::protocol::{
-    ENDPOINT, FRAME_LEN, INJECT_PAYLOAD_LEN, OP_CAPTURE_SECURE_DESKTOP, OP_DELIVER_SAS,
-    OP_INJECT_SECURE_DESKTOP, STATUS_OK, STATUS_REFUSED, parse_inject, parse_request, response,
+    DESKTOP_INJECT_PAYLOAD_LEN, ENDPOINT, FRAME_LEN, INJECT_PAYLOAD_LEN, OP_CAPTURE_SECURE_DESKTOP,
+    OP_DELIVER_SAS, OP_INJECT_DESKTOP, OP_INJECT_SECURE_DESKTOP, STATUS_OK, STATUS_REFUSED,
+    parse_desktop_inject, parse_inject, parse_request, response,
 };
+
+use crate::system_injector_launch::SystemInjector;
 
 /// Who may open the pipe, in SDDL.
 ///
@@ -189,18 +195,32 @@ pub fn serve_until_stopped(stopping: &AtomicBool) {
     // the first capture request, then kept — this is the only long-lived
     // state the accept loop carries.
     let mut secure_desktop_writer: Option<lumepeer_service::frame::Writer> = None;
+    // The persistent `LocalSystem` desktop injector (ADR 0114), started lazily on
+    // the first ordinary-desktop inject and then supervised on its own thread for
+    // the rest of the service's run. `None` until something asks for it, so a
+    // machine that never drives the desktop through the service never launches
+    // one. Torn down before this function returns, so the injector does not
+    // outlive the service that vouches for it.
+    let mut desktop_injector: Option<DesktopInjector> = None;
     loop {
         let Some(pipe) = create_pipe() else {
             tracing::error!("cannot create the service endpoint; giving up");
+            stop_desktop_injector(&mut desktop_injector);
             return;
         };
-        let served = accept_and_serve(pipe, stopping, &mut secure_desktop_writer);
+        let served = accept_and_serve(
+            pipe,
+            stopping,
+            &mut secure_desktop_writer,
+            &mut desktop_injector,
+        );
         // SAFETY: `pipe` came from `CreateNamedPipeW` above and is not used
         // again after this call.
         unsafe {
             let _ = CloseHandle(pipe);
         }
         if !served || stopping.load(Ordering::SeqCst) {
+            stop_desktop_injector(&mut desktop_injector);
             return;
         }
     }
@@ -268,6 +288,7 @@ fn accept_and_serve(
     pipe: HANDLE,
     stopping: &AtomicBool,
     secure_desktop_writer: &mut Option<lumepeer_service::frame::Writer>,
+    desktop_injector: &mut Option<DesktopInjector>,
 ) -> bool {
     // SAFETY: `pipe` is a live named-pipe handle from `create_pipe`.
     let connected = unsafe { ConnectNamedPipe(pipe, None) };
@@ -296,7 +317,7 @@ fn accept_and_serve(
     // `read` outlives the call.
     let ok = unsafe { ReadFile(pipe, Some(&mut frame), Some(&raw mut read), None) };
     let status = if ok.is_ok() && read as usize == FRAME_LEN {
-        serve(pipe, frame, secure_desktop_writer)
+        serve(pipe, frame, secure_desktop_writer, desktop_injector)
     } else {
         // A short or failed read is not an operation. Answering `refused`
         // rather than staying silent keeps the client from waiting out its
@@ -335,6 +356,7 @@ fn serve(
     pipe: HANDLE,
     frame: [u8; FRAME_LEN],
     secure_desktop_writer: &mut Option<lumepeer_service::frame::Writer>,
+    desktop_injector: &mut Option<DesktopInjector>,
 ) -> u8 {
     match parse_request(&frame) {
         Some(OP_DELIVER_SAS) => {
@@ -352,10 +374,56 @@ fn serve(
             serve_secure_desktop_capture(pipe, secure_desktop_writer)
         }
         Some(OP_INJECT_SECURE_DESKTOP) => serve_secure_desktop_inject(pipe),
+        Some(OP_INJECT_DESKTOP) => serve_desktop_inject(pipe, desktop_injector),
         _ => {
             tracing::warn!("refusing an unknown request");
             STATUS_REFUSED
         }
+    }
+}
+
+/// [`OP_INJECT_DESKTOP`]'s half of [`serve`] (ADR 0114).
+///
+/// Reads the fixed descriptor that follows the opcode, applies the same
+/// console-session binding [`serve_secure_desktop_inject`] does — a caller in
+/// another interactive session must not be able to drive the physical console's
+/// desktop — and, if it parses, forwards the event to the persistent
+/// `LocalSystem` injector, starting one on the first call.
+///
+/// The whole authorization question of "may *this guest* inject here" was
+/// already answered in `lumepeer-core`, in the host, before this pipe was
+/// touched (ADR 0114 §4). What is left here is mechanical: whose desktop this is,
+/// and whether the bytes name an event this protocol knows. A `false` from the
+/// injector — not up yet, or its channel gone — is [`STATUS_REFUSED`], which the
+/// host reads as "perform this one in-process" (ADR 0114 §3).
+fn serve_desktop_inject(pipe: HANDLE, desktop_injector: &mut Option<DesktopInjector>) -> u8 {
+    if !caller_is_in_active_console_session(pipe) {
+        tracing::warn!("refusing a desktop inject from outside the active console session");
+        return STATUS_REFUSED;
+    }
+    let mut payload = [0u8; DESKTOP_INJECT_PAYLOAD_LEN];
+    let mut read = 0u32;
+    // SAFETY: `payload` is a live buffer of exactly the length passed, and `read`
+    // outlives the call. The size is the protocol's own constant, not a value the
+    // caller named.
+    let ok = unsafe { ReadFile(pipe, Some(&mut payload), Some(&raw mut read), None) };
+    if ok.is_err() || read as usize != DESKTOP_INJECT_PAYLOAD_LEN {
+        tracing::warn!("desktop inject: short or failed descriptor read");
+        return STATUS_REFUSED;
+    }
+    let Some(event) = parse_desktop_inject(&payload) else {
+        tracing::warn!("desktop inject: descriptor names no known event");
+        return STATUS_REFUSED;
+    };
+    let injector = desktop_injector.get_or_insert_with(DesktopInjector::start);
+    if injector.send(event) {
+        STATUS_OK
+    } else {
+        // Not up yet (the supervisor is still launching or accepting), or its
+        // channel just went. Either way the host performs this event with its own
+        // in-process injector; the next event will find the injector connected,
+        // or start a fresh supervisor if this one has wound down.
+        STATUS_REFUSED
     }
 }
 
@@ -474,6 +542,228 @@ fn caller_is_in_active_console_session(pipe: HANDLE) -> bool {
         return false;
     }
     true
+}
+
+/// How often the injector supervisor checks that its process is still alive and
+/// still the console session's.
+const SUPERVISION_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long the supervisor waits before relaunching after a failure — a launch
+/// that refused, or an injector that died — so a machine that cannot start one
+/// does not spin.
+const RELAUNCH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The persistent `LocalSystem` desktop injector, and the thread that keeps it
+/// alive (ADR 0114).
+///
+/// The service holds one of these from the first ordinary-desktop inject until
+/// it stops. The supervisor thread launches the injector, waits for it on the
+/// [`InjectorHost`] channel, and relaunches it whenever it dies or the console
+/// session changes; the accept loop only ever [`send`](Self::send)s to whatever
+/// the supervisor currently holds, so a single blocking accept never wedges the
+/// service's one-connection-at-a-time loop (the reason this runs on a thread of
+/// its own rather than inline, the same shape a real host supervises its agent
+/// with).
+struct DesktopInjector {
+    /// The current channel to the injector, or `None` while none is connected.
+    /// The supervisor fills and clears it; the accept loop only reads it.
+    host: Arc<Mutex<Option<InjectorHost>>>,
+    /// Set to end the supervisor and stop the injector.
+    stop: Arc<AtomicBool>,
+    /// The supervisor thread, taken and joined by [`stop`](Self::stop).
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DesktopInjector {
+    /// Starts the supervisor thread. It launches the injector on its own,
+    /// lazily — this only spins the thread up.
+    fn start() -> Self {
+        let host = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let host = Arc::clone(&host);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || supervise(&host, &stop))
+        };
+        Self {
+            host,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Forwards one already-authorized event to the injector.
+    ///
+    /// `false` when no injector is connected right now, or when the write did
+    /// not go out whole — both of which the caller reads the same way, as "do
+    /// this one in-process" (ADR 0114 §3). Nothing here blocks on the supervisor:
+    /// it takes the lock, sends or does not, and returns.
+    fn send(&self, event: lumepeer_service::protocol::DesktopInjectEvent) -> bool {
+        let mut guard = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_mut() {
+            Some(host) => host.send(event),
+            None => false,
+        }
+    }
+
+    /// Ends the supervisor and stops the injector process.
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Break any accept the supervisor is blocked in the same way
+        // `agent_channel`'s watchdog and `handler` break their own waits: connect
+        // to the endpoint. This process is not the injector, so the accept turns
+        // it away, then reads the stop flag and gives up.
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lumepeer_service::desktop_input_channel::DESKTOP_INPUT_ENDPOINT);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!("the desktop injector supervisor panicked on its way out");
+        }
+    }
+}
+
+/// Stops the injector supervisor if one was started, leaving the slot empty.
+fn stop_desktop_injector(slot: &mut Option<DesktopInjector>) {
+    if let Some(injector) = slot.take() {
+        injector.stop();
+    }
+}
+
+/// The supervisor loop: keep a `LocalSystem` injector alive on the console
+/// session for as long as `stop` is not set.
+///
+/// One launch, one accept, and a watch that ends the attachment when the process
+/// dies or the console moves to another session — then round again. The
+/// structure mirrors `crates/host/src/agent.rs`'s own supervision, minus the
+/// screen: there is no capture here and nothing to publish, only input to
+/// perform.
+fn supervise(host: &Arc<Mutex<Option<InjectorHost>>>, stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        let Some(session) = console_session() else {
+            // Nobody at the console — session 0, or a switch in flight. Nothing
+            // to inject onto; wait and look again.
+            std::thread::sleep(SUPERVISION_TICK);
+            continue;
+        };
+        let Some(injector) = SystemInjector::start(session) else {
+            // `SystemInjector::start` has already said why. Back off so a machine
+            // that cannot launch one does not spin on it.
+            std::thread::sleep(RELAUNCH_BACKOFF);
+            continue;
+        };
+        tracing::info!(session, pid = injector.pid(), "desktop injector launched");
+        serve_through(host, injector, stop);
+        if !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(RELAUNCH_BACKOFF);
+        }
+    }
+    tracing::info!("desktop injector supervisor stopped");
+}
+
+/// Serves through one launched injector until the attachment ends, then stops
+/// it and leaves nothing of it behind — the mirror of `agent.rs`'s `serve`.
+fn serve_through(
+    host: &Arc<Mutex<Option<InjectorHost>>>,
+    injector: SystemInjector,
+    stop: &AtomicBool,
+) {
+    let pid = injector.pid();
+    // Set for as long as this attachment should live. The watchdog clears it, and
+    // the accept reads it — which is what lets a dead process, a session change or
+    // a stop end a wait no flag can interrupt.
+    let attached = AtomicBool::new(true);
+    // The injector owns raw process handles and is `Send` but not `Sync`; the
+    // watchdog asks it questions from another thread, so it goes behind a mutex
+    // exactly as `agent.rs` puts its own launched process.
+    let injector = Mutex::new(injector);
+
+    // A scope rather than `spawn`, so "this thread is joined before these borrows
+    // end" is said to the compiler rather than asserted in a comment.
+    std::thread::scope(|threads| {
+        let watchdog = threads.spawn(|| watch_injector(&injector, &attached, stop));
+        let keep_waiting = || attached.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst);
+        if let Some(link) = InjectorHost::accept_from_system_while(pid, &keep_waiting) {
+            {
+                let mut guard = host
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = Some(link);
+            }
+            // Hold the attachment open until the watchdog says it is over. The
+            // accept loop is doing the actual sending, into the link now in
+            // `host`; there is nothing to do here but wait for the end.
+            while attached.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(SUPERVISION_TICK);
+            }
+            // Stop sending before the process is torn down, so no event is handed
+            // to a pipe that is about to close.
+            let mut guard = host
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = None;
+        } else {
+            tracing::warn!(pid, "the desktop injector never connected");
+        }
+        attached.store(false, Ordering::SeqCst);
+        let _ = watchdog.join();
+    });
+
+    // `stop` rather than letting the handle drop: dropping stops *watching* the
+    // process, which would leave it injecting onto a desktop the service no
+    // longer believes in.
+    match injector.into_inner() {
+        Ok(injector) => injector.stop(),
+        Err(poisoned) => poisoned.into_inner().stop(),
+    }
+}
+
+/// Watches the injector, ending the attachment when it dies, the console moves
+/// away from it, or the service stops — then breaks the accept the way this
+/// codebase always breaks a pipe wait, by connecting to the endpoint.
+fn watch_injector(injector: &Mutex<SystemInjector>, attached: &AtomicBool, stop: &AtomicBool) {
+    fn still_serving(injector: &Mutex<SystemInjector>) -> bool {
+        let injector = injector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !injector.is_alive() {
+            tracing::info!(
+                pid = injector.pid(),
+                code = ?injector.exit_code(),
+                "the desktop injector exited"
+            );
+            return false;
+        }
+        if !injector.serves_the_console() {
+            tracing::info!(
+                pid = injector.pid(),
+                "the desktop injector no longer serves the console session"
+            );
+            return false;
+        }
+        true
+    }
+
+    while attached.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
+        if !still_serving(injector) {
+            break;
+        }
+        std::thread::sleep(SUPERVISION_TICK);
+    }
+    attached.store(false, Ordering::SeqCst);
+    // The connect at the end is the point: `ConnectNamedPipe` is a wait no flag
+    // interrupts, and connecting to the pipe is how this codebase breaks one. A
+    // connection from this process is not the injector, so the accept turns it
+    // away and, on the next round, asks `keep_waiting` and gives up.
+    let _ = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lumepeer_service::desktop_input_channel::DESKTOP_INPUT_ENDPOINT);
 }
 
 /// A null-terminated UTF-16 copy of `text`, for the `W` entry points.

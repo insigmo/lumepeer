@@ -41,6 +41,8 @@ mod secure_desktop_input;
 #[cfg(target_os = "windows")]
 mod secure_desktop_launch;
 #[cfg(target_os = "windows")]
+mod system_injector_launch;
+#[cfg(target_os = "windows")]
 mod windows_service;
 
 fn main() {
