@@ -100,7 +100,8 @@ mod dxgi {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+        MAPVK_VK_TO_VSC,
         MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
         MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
         MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
@@ -2452,23 +2453,36 @@ mod dxgi {
             )
         }
 
-        /// Presses one key by position, carrying the scan code a real
-        /// keyboard would have put on the wire.
+        /// Presses one key by *position*, as the hardware scan code a real
+        /// keyboard would have put on the wire — `KEYEVENTF_SCANCODE`, with no
+        /// virtual key at all.
         ///
-        /// `wScan` is filled in even though `wVk` alone is enough for an
-        /// ordinary window, because an ordinary window is not the only thing
-        /// reading: a `VMware` Workstation window with a virtual machine in it
-        /// takes the keyboard through a low-level hook and forwards *scan
-        /// codes* into the guest OS, and a press with none reaches it as
-        /// nothing at all (docs/bugs/17-remote-hotkeys.md). `MapVirtualKeyW`
-        /// answers for the host's own current layout, which is the layout the
-        /// key is about to be pressed on.
+        /// This is the difference that lets a chord reach more than an ordinary
+        /// window, and it is why `RustDesk`'s default "map mode" injects this way
+        /// (`rdev::simulate_code`, which sets `KEYEVENTF_SCANCODE` and leaves
+        /// `wVk` at 0). A `VMware`/`VirtualBox` window with a virtual machine in
+        /// it, a full-screen game reading `DirectInput`, and an RDP client all
+        /// read the keyboard *below* the window through the scan code; a press
+        /// addressed by virtual key alone carries a scan code Windows fills in
+        /// only as a hint and those consumers never see it, so keys typed
+        /// towards a VM arrived nowhere (docs/bugs/17-remote-hotkeys.md). Sent
+        /// by scan code, Windows itself resolves the virtual key from the host's
+        /// current layout on the way up, so an accelerator (Ctrl+C) still fires
+        /// for the ordinary window while the raw scan code also reaches the VM.
+        ///
+        /// `MapVirtualKeyW` answers for the host's own current layout, which is
+        /// the layout the key is about to be pressed on. A virtual key with no
+        /// scan code at all (some media and browser keys) answers 0; there is
+        /// nothing to press by position then, so it falls back to the virtual
+        /// key, which is exactly what it was before this existed.
         fn key_physical(key: PhysicalKey, pressed: bool) -> Result<()> {
             // SAFETY: a pure lookup against the calling thread's keyboard
             // layout. It takes and returns plain integers, borrows nothing,
-            // and answers 0 for a virtual key with no scan code — which is
-            // the same "no scan code" a `wScan` of 0 already meant.
-            let scan = unsafe { MapVirtualKeyW(u32::from(key.vk.0), MAPVK_VK_TO_VSC) };
+            // and answers 0 for a virtual key with no scan code.
+            let scan = u16::try_from(unsafe {
+                MapVirtualKeyW(u32::from(key.vk.0), MAPVK_VK_TO_VSC)
+            })
+            .unwrap_or(0);
             let mut flags = KEYBD_EVENT_FLAGS::default();
             if key.extended {
                 flags |= KEYEVENTF_EXTENDEDKEY;
@@ -2476,12 +2490,20 @@ mod dxgi {
             if !pressed {
                 flags |= KEYEVENTF_KEYUP;
             }
+            // By scan code whenever there is one — the path that reaches a VM;
+            // by virtual key only for a key that has none to send.
+            let vk = if scan == 0 {
+                key.vk
+            } else {
+                flags |= KEYEVENTF_SCANCODE;
+                VIRTUAL_KEY(0)
+            };
             Self::send(&[INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: key.vk,
-                        wScan: u16::try_from(scan).unwrap_or(0),
+                        wVk: vk,
+                        wScan: scan,
                         dwFlags: flags,
                         time: 0,
                         dwExtraInfo: 0,
