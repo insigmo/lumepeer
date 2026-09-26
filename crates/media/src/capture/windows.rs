@@ -64,6 +64,7 @@ pub use stub::{WindowsCapturer, WindowsInjector};
     reason = "DXGI Desktop Duplication is COM and SendInput is raw FFI; every IDXGIOutputDuplication/ID3D11Device call in the `windows` crate is `unsafe fn`. See ADR 0012."
 )]
 mod dxgi {
+    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
     use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS};
@@ -99,28 +100,30 @@ mod dxgi {
         SRCCOPY, SelectObject,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
-        MAPVK_VK_TO_VSC, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
-        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
-        MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyW, SendInput, VIRTUAL_KEY,
-        VK_ADD, VK_APPS, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE,
-        VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
-        VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_OEM_1,
-        VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA,
-        VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN,
-        VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE,
-        VK_SUBTRACT, VK_TAB, VK_UP,
+        GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
+        KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
+        MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
+        MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW,
+        MapVirtualKeyW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_ADD, VK_APPS, VK_BACK, VK_CAPITAL,
+        VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
+        VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY,
+        VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4,
+        VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+        VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+        VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+        VkKeyScanExW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+        GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
+        SM_CYSCREEN,
     };
     use windows::core::{Interface as _, PCWSTR};
 
     use lumepeer_core::protocol::{
-        CursorShapeData, InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE, is_chord,
-        names_a_key,
+        CursorShapeData, InputDetail, InputEventPayload, MODIFIER_SHIFT,
+        POINTER_BUTTON_LOGICAL_BASE, is_chord, names_a_key,
     };
 
     use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
@@ -2099,8 +2102,9 @@ mod dxgi {
     /// there is one on every desktop that matters here: a `VMware` Workstation
     /// window with a virtual machine in it takes the keyboard through a
     /// low-level hook and hands the guest OS scan codes. A `KEYEVENTF_UNICODE`
-    /// press carries no scan code at all, which is why keys typed towards a
-    /// VM arrived nowhere (docs/bugs/17-remote-hotkeys.md).
+    /// press carries the character where the scan code belongs, which the VM
+    /// reads as a key: '1' arrived as N (docs/bugs/17-remote-hotkeys.md,
+    /// ADR 0115).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct PhysicalKey {
         vk: VIRTUAL_KEY,
@@ -2236,6 +2240,129 @@ mod dxgi {
         Some(PhysicalKey { vk, extended })
     }
 
+    /// A key exactly as this host pressed it — what `SendInput` was given,
+    /// less the key-up flag — so that its release can go out the same way.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct HostKey {
+        vk: VIRTUAL_KEY,
+        scan: u16,
+        flags: KEYBD_EVENT_FLAGS,
+    }
+
+    /// `ToUnicodeEx`'s "leave the keyboard state alone" bit (Windows 10 1607
+    /// and later): asking what a dead key types must not leave that dead key
+    /// pending for whoever types next.
+    const TO_UNICODE_KEEP_STATE: u32 = 0x4;
+
+    /// The keyboard layout Windows will read an injected scan code with: the
+    /// one of the thread that owns the foreground window. Layouts are per
+    /// thread, and this process's own — a `LocalSystem` worker's especially
+    /// (ADR 0114) — says nothing about the one the operator is typing into.
+    fn foreground_layout() -> HKL {
+        // SAFETY: no arguments; answers a window handle, null when nothing
+        // is in the foreground.
+        let window = unsafe { GetForegroundWindow() };
+        // SAFETY: a lookup by handle that answers 0 for a null or dead
+        // window; no process id is asked for.
+        let thread = unsafe { GetWindowThreadProcessId(window, None) };
+        // SAFETY: a lookup by thread id; 0 is this thread, which is the
+        // right fallback when there is no foreground window to ask about.
+        unsafe { GetKeyboardLayout(thread) }
+    }
+
+    /// The key on `layout` that types exactly `ch` at the guest's shift
+    /// level, as the scan code a real keyboard would send — or `None`, and
+    /// then the character goes as itself (ADR 0115).
+    ///
+    /// This is what makes typing reach a virtual machine. A `VMware` window
+    /// reads the scan code of every keystroke and hands it to the guest OS,
+    /// and `KEYEVENTF_UNICODE` puts the *character* in that field: '1' is
+    /// 0x31, which is the scan code of N, and a letter is 0x61..0x7A, which
+    /// names no key at all. So typed digits came out as letters inside the
+    /// VM and typed letters as nothing.
+    ///
+    /// Two candidates, and a candidate counts only if the host really types
+    /// `ch` with it: the key under the guest's own finger, and whichever key
+    /// the host's layout carries `ch` on. They are the same key when the two
+    /// layouts agree; when they do not (a Russian guest's '.' sits where a US
+    /// host has '/'), the second finds the host's own. A numpad digit's own
+    /// key is never a candidate — what it presses depends on the host's
+    /// `NumLock`, which may not be the guest's — so the digit row types it.
+    fn typed_key(
+        ch: char,
+        position: Option<PhysicalKey>,
+        shifted: bool,
+        layout: HKL,
+    ) -> Option<HostKey> {
+        // Outside the BMP a character is two UTF-16 units, and no key types
+        // that.
+        let unit = u16::try_from(u32::from(ch)).ok()?;
+        let follows_num_lock =
+            |vk: VIRTUAL_KEY| (VK_NUMPAD0.0..=VK_NUMPAD9.0).contains(&vk.0) || vk == VK_DECIMAL;
+        let under_finger = position
+            .map(|key| key.vk)
+            .filter(|vk| !follows_num_lock(*vk));
+        // SAFETY: a pure lookup against a layout handle, integers in and out.
+        let scanned = unsafe { VkKeyScanExW(unit, layout) };
+        // The low byte is the virtual key; -1 is "no key types this".
+        let on_layout = (scanned != -1).then(|| VIRTUAL_KEY(scanned.cast_unsigned() & 0x00FF));
+        [under_finger, on_layout]
+            .into_iter()
+            .flatten()
+            .find_map(|vk| {
+                // SAFETY: a pure lookup against a layout handle, integers in and
+                // out; 0 for a virtual key with no scan code.
+                let scan =
+                    unsafe { MapVirtualKeyExW(u32::from(vk.0), MAPVK_VK_TO_VSC_EX, Some(layout)) };
+                let low = u16::try_from(scan & 0x00FF).ok()?;
+                if low == 0 || !types_exactly(vk, u32::from(low), unit, shifted, layout) {
+                    return None;
+                }
+                let mut flags = KEYEVENTF_SCANCODE;
+                if scan >> 8 == 0xE0 {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                Some(HostKey {
+                    vk: VIRTUAL_KEY(0),
+                    scan: low,
+                    flags,
+                })
+            })
+    }
+
+    /// Whether pressing `vk` on `layout` types exactly the one UTF-16 unit
+    /// `unit`, with Shift as the guest holds it and `CapsLock` either way.
+    ///
+    /// Either way because this host cannot read its own `CapsLock` reliably
+    /// from a thread that never receives keyboard input, and the guest's
+    /// `CapsLock` presses reach it anyway, so the two normally agree. A dead
+    /// key answers negative and an `AltGr` character is not produced without
+    /// `AltGr` held, so both stay characters.
+    fn types_exactly(vk: VIRTUAL_KEY, scan: u32, unit: u16, shifted: bool, layout: HKL) -> bool {
+        let mut state = [0u8; 256];
+        if shifted {
+            state[usize::from(VK_SHIFT.0)] = 0x80;
+        }
+        [false, true].into_iter().any(|caps| {
+            state[usize::from(VK_CAPITAL.0)] = u8::from(caps);
+            let mut typed = [0u16; 4];
+            // SAFETY: `state` and `typed` are live, fully initialized arrays
+            // for the call and nothing retains them; the keep-state flag
+            // means the call changes no keyboard state of anybody's.
+            let count = unsafe {
+                ToUnicodeEx(
+                    u32::from(vk.0),
+                    scan,
+                    &state,
+                    &mut typed,
+                    TO_UNICODE_KEEP_STATE,
+                    Some(layout),
+                )
+            };
+            count == 1 && typed[0] == unit
+        })
+    }
+
     /// Consecutive absolute moves that must fail to land before the injector
     /// decides something has taken the pointer and starts sending relative
     /// motion instead.
@@ -2327,6 +2454,13 @@ mod dxgi {
         asked: Option<(u16, u16)>,
         /// Which mechanism is currently reaching the pointer.
         grab: Grab,
+        /// Guest keys this host pressed by scan code and has not released,
+        /// by the guest's evdev code. The release — and every auto-repeat —
+        /// goes out as the key that went down, whatever character the guest
+        /// reports for it by then: Shift pressed mid-hold turns a Russian
+        /// guest's '.' into ',', which a US host has on another key, and
+        /// the first key would stay down (ADR 0115).
+        down: BTreeMap<u32, HostKey>,
     }
 
     /// How the next pointer move has to be sent.
@@ -2415,6 +2549,7 @@ mod dxgi {
                     held: false,
                     since_probe: 0,
                 },
+                down: BTreeMap::new(),
             })
         }
 
@@ -2440,20 +2575,20 @@ mod dxgi {
         }
 
         fn key_vk(vk: VIRTUAL_KEY, pressed: bool) -> Result<()> {
-            Self::key_physical(
-                PhysicalKey {
+            Self::press(
+                Self::by_position(PhysicalKey {
                     vk,
                     // Windows works the prefix out from the virtual key on
                     // its own for the keys that only exist in one place; the
                     // ones that exist twice come through `physical_key`,
                     // which knows which of the two it is.
                     extended: false,
-                },
+                }),
                 pressed,
             )
         }
 
-        /// Presses one key by *position*, as the hardware scan code a real
+        /// One key by *position*, as the hardware scan code a real
         /// keyboard would have put on the wire — `KEYEVENTF_SCANCODE`, with no
         /// virtual key at all.
         ///
@@ -2475,7 +2610,7 @@ mod dxgi {
         /// scan code at all (some media and browser keys) answers 0; there is
         /// nothing to press by position then, so it falls back to the virtual
         /// key, which is exactly what it was before this existed.
-        fn key_physical(key: PhysicalKey, pressed: bool) -> Result<()> {
+        fn by_position(key: PhysicalKey) -> HostKey {
             // SAFETY: a pure lookup against the calling thread's keyboard
             // layout. It takes and returns plain integers, borrows nothing,
             // and answers 0 for a virtual key with no scan code.
@@ -2486,9 +2621,6 @@ mod dxgi {
             if key.extended {
                 flags |= KEYEVENTF_EXTENDEDKEY;
             }
-            if !pressed {
-                flags |= KEYEVENTF_KEYUP;
-            }
             // By scan code whenever there is one — the path that reaches a VM;
             // by virtual key only for a key that has none to send.
             let vk = if scan == 0 {
@@ -2497,13 +2629,22 @@ mod dxgi {
                 flags |= KEYEVENTF_SCANCODE;
                 VIRTUAL_KEY(0)
             };
+            HostKey { vk, scan, flags }
+        }
+
+        /// Presses or releases a key exactly as `key` describes it.
+        fn press(key: HostKey, pressed: bool) -> Result<()> {
             Self::send(&[INPUT {
                 r#type: INPUT_KEYBOARD,
                 Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: vk,
-                        wScan: scan,
-                        dwFlags: flags,
+                        wVk: key.vk,
+                        wScan: key.scan,
+                        dwFlags: if pressed {
+                            key.flags
+                        } else {
+                            key.flags | KEYEVENTF_KEYUP
+                        },
                         time: 0,
                         dwExtraInfo: 0,
                     },
@@ -2554,16 +2695,56 @@ mod dxgi {
         ///    the *left* key and leaves the right one held.
         /// 2. **By virtual key** when the guest sent no position for a key it
         ///    named, which is every guest older than this rule.
-        /// 3. **By character** for the rest, which is typing, so the letter
-        ///    the operator meant appears whatever layout the host is set to.
+        /// 3. **Typing, by the host's own key for the character** when the
+        ///    host's layout has one at the guest's shift level
+        ///    ([`typed_key`], ADR 0115). The letter the operator meant still
+        ///    appears, and it arrives with a real scan code, which is the only
+        ///    thing a virtual machine's window reads.
+        /// 4. **By character** for the rest — a character the host's layout
+        ///    cannot type — so it appears whatever layout the host is set to.
         ///    Shift is not a chord modifier for exactly this reason: it
         ///    *selects* a character rather than commanding with it.
-        fn key(logical: u32, scancode: u32, modifiers: u32, pressed: bool) -> Result<()> {
+        ///
+        /// Whatever went down by scan code comes back up — and repeats — as
+        /// the same key, before any of that is asked again.
+        fn key(
+            &mut self,
+            logical: u32,
+            scancode: u32,
+            modifiers: u32,
+            pressed: bool,
+        ) -> Result<()> {
+            let held = if pressed {
+                self.down.get(&scancode).copied()
+            } else {
+                self.down.remove(&scancode)
+            };
+            if let Some(key) = held {
+                return Self::press(key, pressed);
+            }
             let physical = physical_key(scancode);
-            if let Some(key) = physical
-                && (is_chord(modifiers) || names_a_key(logical))
-            {
-                return Self::key_physical(key, pressed);
+            let host_key = match physical {
+                Some(key) if is_chord(modifiers) || names_a_key(logical) => {
+                    Some(Self::by_position(key))
+                }
+                // Only on the way down: a typed key that went down as a
+                // character comes back up as one.
+                _ if pressed && scancode != 0 && !names_a_key(logical) => char::from_u32(logical)
+                    .and_then(|ch| {
+                        typed_key(
+                            ch,
+                            physical,
+                            modifiers & MODIFIER_SHIFT != 0,
+                            foreground_layout(),
+                        )
+                    }),
+                _ => None,
+            };
+            if let Some(key) = host_key {
+                if pressed {
+                    self.down.insert(scancode, key);
+                }
+                return Self::press(key, pressed);
             }
             if let Some(vk) = named_key_vk(logical) {
                 return Self::key_vk(vk, pressed);
@@ -2767,7 +2948,7 @@ mod dxgi {
                     if event.logical >= POINTER_BUTTON_LOGICAL_BASE {
                         Self::button(event.logical, pressed)
                     } else {
-                        Self::key(event.logical, event.scancode, event.modifiers, pressed)
+                        self.key(event.logical, event.scancode, event.modifiers, pressed)
                     }
                 }
             }
@@ -2889,6 +3070,66 @@ mod dxgi {
             // host cannot type at all.
             assert_eq!(named_key_vk(0x0441), None, "Cyrillic es is not a named key");
             assert!(!names_a_key(0x0441));
+        }
+
+        /// The US layout, when this machine has it loaded, which is what
+        /// makes the scan codes below mean something to assert.
+        fn us_layout() -> Option<HKL> {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayoutList;
+
+            let mut layouts = [HKL::default(); 64];
+            // SAFETY: `layouts` is a live buffer of the length passed, and
+            // nothing retains it past the call.
+            let count = unsafe { GetKeyboardLayoutList(Some(&mut layouts)) };
+            layouts
+                .into_iter()
+                .take(usize::try_from(count).ok()?)
+                .find(|layout| layout.0.addr() & 0xFFFF_FFFF == 0x0409_0409)
+        }
+
+        /// Typing goes out as the host's own key for the character, with the
+        /// scan code a real keyboard would send — the only thing a `VMware`
+        /// window reads (ADR 0115).
+        #[test]
+        fn a_typed_character_goes_out_as_the_host_key_that_types_it() {
+            let Some(us) = us_layout() else {
+                eprintln!("skipped: the US keyboard layout is not loaded on this machine");
+                return;
+            };
+            let scan = |ch: char, evdev: u32, shifted: bool| {
+                typed_key(ch, physical_key(evdev), shifted, us).map(|key| key.scan)
+            };
+
+            // The report: '1' went into the VM as 0x31, which is N, and '2'
+            // as 0x32, which is M. The digit row is 0x02 onwards.
+            assert_eq!(scan('1', 2, false), Some(0x02));
+            assert_eq!(scan('2', 3, false), Some(0x03));
+            // Letters were 0x61..0x7A, which is no key at all.
+            assert_eq!(scan('a', 30, false), Some(0x1E));
+            assert_eq!(scan('A', 30, true), Some(0x1E));
+            // Unshifted 'A' is the same key with CapsLock on.
+            assert_eq!(scan('A', 30, false), Some(0x1E));
+            // Space was 0x20, which is D.
+            assert_eq!(scan(' ', 57, false), Some(0x39));
+            assert_eq!(scan('!', 2, true), Some(0x02));
+
+            // The key would type '1' without Shift, not '!'.
+            assert_eq!(scan('!', 2, false), None);
+            // Nothing on a US layout types Cyrillic: it goes as itself.
+            assert_eq!(scan('ф', 30, false), None);
+            // A Russian guest's '.' is under its '/' key; the host types it
+            // with its own '.' key.
+            assert_eq!(scan('.', 53, false), Some(0x34));
+            // The numpad's '*' needs no Shift on its own key...
+            assert_eq!(scan('*', 55, false), Some(0x37));
+            // ...but a numpad digit is typed on the digit row, since what its
+            // own key presses depends on the host's NumLock.
+            assert_eq!(scan('1', 79, false), Some(0x02));
+            // The numpad's '/' is told from the main one by the E0 prefix.
+            let divide = typed_key('/', physical_key(98), false, us).unwrap();
+            assert_eq!(divide.scan, 0x35);
+            assert!(divide.flags.contains(KEYEVENTF_EXTENDEDKEY));
+            assert!(divide.flags.contains(KEYEVENTF_SCANCODE));
         }
 
         /// A modifier is released by the same route it was pressed by.
