@@ -4526,13 +4526,18 @@ fn dial_order(
     vec![TransportKind::Obfuscated, TransportKind::Iroh]
 }
 
+/// Tailscale's IPv6 prefix, `fd7a:115c:a1e0::/48`: every tailnet peer has an
+/// address in it beside its `100.64.0.0/10` one.
+const TAILNET_V6_PREFIX: [u16; 3] = [0xfd7a, 0x115c, 0xa1e0];
+
 /// Whether any of the remembered addresses a session last reached its host on
 /// (ADR 0093) is a nearby one: a private, link-local or loopback address
 /// (ADR 0116).
 ///
 /// The carrier-grade NAT range is *not* nearby: it is where overlay networks
 /// such as Tailscale put their peers, which may be anywhere on the internet
-/// and drop in and out of reach.
+/// and drop in and out of reach. Nor is [`TAILNET_V6_PREFIX`], the same
+/// tailnet over IPv6, though it sits inside the unique-local range.
 fn reached_nearby(addrs: &[String]) -> bool {
     addrs.iter().any(|addr| {
         let ip = addr
@@ -4544,7 +4549,8 @@ fn reached_nearby(addrs: &[String]) -> bool {
                 ip.is_private() || ip.is_link_local() || ip.is_loopback()
             }
             Ok(std::net::IpAddr::V6(ip)) => {
-                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+                ip.segments()[..3] != TAILNET_V6_PREFIX
+                    && (ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local())
             }
             Err(_) => false,
         }
@@ -16879,13 +16885,31 @@ mod tests {
         assert!(nearby(&["10.0.0.5:1"]));
         assert!(nearby(&["172.26.16.1:1"]));
         assert!(nearby(&["[fe80::1]:1"]));
-        assert!(nearby(&["[fd7a:115c:a1e0::1]:1"]));
+        assert!(nearby(&["[fd12:3456:789a::1]:1"]));
         assert!(nearby(&["85.173.133.45:1", "192.168.1.97:52052"]));
-        // A tailnet peer, a public address, nothing, and junk are not.
+        // A tailnet peer over either family, a public address, nothing, and
+        // junk are not.
         assert!(!nearby(&["100.96.209.116:52052"]));
+        assert!(!nearby(&["[fd7a:115c:a1e0::1]:1"]));
+        assert!(!nearby(&[
+            "[fd7a:115c:a1e0:ab12:4843:cd96:6258:b240]:41641"
+        ]));
         assert!(!nearby(&["85.173.133.45:18058"]));
         assert!(!nearby(&[]));
         assert!(!nearby(&["not an address"]));
+    }
+
+    /// ADR 0116: a host iroh last reached over the tailnet's IPv6 address is
+    /// as far away as one reached over its `100.64.0.0/10` address — the
+    /// 2026-09-26 report again, on the other address family, since every
+    /// tailnet peer has both.
+    #[test]
+    fn a_host_last_reached_over_the_tailnet_ipv6_is_dialed_obfuscated_first() {
+        let history = ["[fd7a:115c:a1e0::5f01:2c3d]:52052".to_owned()];
+        assert_eq!(
+            dial_order(true, Some(TransportKind::Iroh), reached_nearby(&history)),
+            vec![TransportKind::Obfuscated, TransportKind::Iroh]
+        );
     }
 
     /// gap-tasks/23 task 1: a memory reorders what is available and can never

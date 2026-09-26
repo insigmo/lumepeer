@@ -76,8 +76,8 @@ attempt in flight would wait a second or more for its retransmission.
 
 **Iroh only leads a dial when it last reached the host on a nearby address**
 (a private, link-local or loopback one). A host last reached across the
-internet — over a relay, or over a tailnet address in 100.64.0.0/10 — is
-dialed obfuscated first. On a LAN iroh's direct path is still the near one,
+internet — over a relay, or over a tailnet address in 100.64.0.0/10 or its
+IPv6 twin fd7a:115c:a1e0::/48 — is dialed obfuscated first. On a LAN iroh's direct path is still the near one,
 and the obfuscated transport would need the router to hairpin.
 
 **A host retries binding the restored invite's endpoint** on every ping tick
@@ -132,3 +132,29 @@ subscribed from `beta` within one second.
   Concurrent" on. Those are where to look; its wired port is unused.
 - Both ends need this version: an older host never hears a push knock, and an
   older guest never sends one. Either way the dial behaves as it did before.
+
+## Amended the same day, after tests against a loopback relay
+
+Twenty new test scenarios cover the push channel, most of them end to end
+against a stand-in relay on loopback (`nostr::test_relay`; a relay URL may be
+`ws://` and name its own port for that — the port used to be ignored). They
+found five things, all fixed:
+
+- **A knock pushed through a relay waited for the DHT poll.** The poll ran
+  inside the host's rendezvous loop, and its lookup takes 7-10 s on the public
+  DHT; the first one starts as the endpoint binds, which is exactly when a
+  guest resuming after the host restarted knocks. It is a task of its own now
+  (`poll_knocks`).
+- **The host's answer during the last punch attempt ended the dial.** The
+  attempt was abandoned and there was none after it. The last attempt is no
+  longer cut short.
+- **A DHT lookup could move the dial target back.** It lands seconds after the
+  relays' answer, often with a record from before the host moved, and later
+  channels of the session then dialed the old address. The target now only
+  moves to a record at least as new, by the host's own clock, as the one it
+  holds.
+- **Tailscale's IPv6 addresses counted as nearby.** They are unique-local, so
+  a host last reached over the tailnet's IPv6 address still had iroh lead.
+- **A renewed subscription asked for everything since the channel opened.**
+  The `REQ` is built per connection now, so a relay that does store the
+  ephemeral kind cannot replay a day of knocks at a reconnect.

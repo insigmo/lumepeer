@@ -522,6 +522,98 @@ mod tests {
         );
     }
 
+    /// Each invite signals on a topic of its own that anyone holding the
+    /// invite derives alike, and that shows a relay nothing of the invite.
+    #[test]
+    fn every_invite_signals_on_a_topic_of_its_own() {
+        let own = topic(&INVITE);
+        assert_eq!(own, topic(&INVITE), "both sides derive one topic");
+        assert_eq!(own.len(), TOPIC_BYTES * 2);
+        assert!(own.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(own, topic(&[0x43; INVITE_ID_BYTES]));
+        assert!(!own.contains(&HEXLOWER.encode(&INVITE[..4])));
+    }
+
+    /// No relays configured is no push channel at all: the DHT alone, as
+    /// before ADR 0116.
+    #[tokio::test]
+    async fn without_relays_there_is_no_push_channel() {
+        let dht = Rendezvous::with_bootstrap(&[]).unwrap();
+        assert!(dht.host_signals(&INVITE).is_none());
+        assert!(dht.guest_signals(&INVITE).is_none());
+        let off = dht.with_relays(&[]);
+        assert!(off.host_signals(&INVITE).is_none());
+        assert!(off.guest_signals(&INVITE).is_none());
+    }
+
+    /// The next record `signals` hears, or a failure naming `what`.
+    async fn next(signals: &mut Signals, what: &str) -> Sighting {
+        tokio::time::timeout(Duration::from_secs(10), signals.heard())
+            .await
+            .unwrap_or_else(|_| panic!("{what} never arrived"))
+            .expect("the channel is alive")
+    }
+
+    /// ADR 0116: the knock reaches the host and the host's answer reaches
+    /// the guest over a relay, each side hearing only the other one — the
+    /// relay echoes a side's own record back to it, and that is skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_knock_and_the_answer_cross_the_relays() {
+        let relay = crate::nostr::test_relay::Relay::start().await;
+        let dht = Rendezvous::with_bootstrap(&[])
+            .unwrap()
+            .with_relays(std::slice::from_ref(&relay.url));
+        let mut host = dht.host_signals(&INVITE).unwrap();
+        let mut guest = dht.guest_signals(&INVITE).unwrap();
+        relay
+            .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
+            .await;
+
+        let guest_at: SocketAddr = "198.51.100.9:51515".parse().unwrap();
+        guest.say(guest_at);
+        assert_eq!(next(&mut host, "the knock").await.addr, guest_at);
+
+        let host_at: SocketAddr = "203.0.113.7:4115".parse().unwrap();
+        host.speaker().say(host_at);
+        let answer = next(&mut guest, "the answer").await;
+        assert_eq!(
+            answer.addr, host_at,
+            "the guest's own knock, echoed first, must not be taken for the answer"
+        );
+        assert!(answer.at > 0 && i64::try_from(answer.at).unwrap() == answer.seq);
+    }
+
+    /// Anything on the topic that is not the other side's record under this
+    /// invite is skipped, and the record behind it still arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn junk_on_the_topic_is_skipped() {
+        let relay = crate::nostr::test_relay::Relay::start().await;
+        let dht = Rendezvous::with_bootstrap(&[])
+            .unwrap()
+            .with_relays(std::slice::from_ref(&relay.url));
+        let mut host = dht.host_signals(&INVITE).unwrap();
+        let stranger = crate::nostr::Channel::open(&[&relay.url], &topic(&INVITE));
+        relay
+            .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
+            .await;
+
+        let somewhere: SocketAddr = "192.0.2.1:1".parse().unwrap();
+        let other_invite = seal(&[0x43; INVITE_ID_BYTES], Kind::Knock, somewhere, 1).unwrap();
+        let host_kind = seal(&INVITE, Kind::Host, somewhere, 1).unwrap();
+        for junk in [
+            "not hex at all".to_owned(),
+            "00ff".to_owned(),
+            HEXLOWER.encode(&other_invite),
+            HEXLOWER.encode(&host_kind),
+        ] {
+            stranger.publish(&junk);
+        }
+        let knock: SocketAddr = "198.51.100.9:51515".parse().unwrap();
+        stranger.publish(&HEXLOWER.encode(&seal(&INVITE, Kind::Knock, knock, 2).unwrap()));
+
+        assert_eq!(next(&mut host, "the real knock").await.addr, knock);
+    }
+
     /// Both records cross a private DHT: the host's address reaches the
     /// guest, the guest's knock reaches the host, and a later publish wins
     /// over an earlier one.

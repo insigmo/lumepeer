@@ -131,13 +131,11 @@ impl Channel {
         let (outbox, _) = broadcast::channel(OUTBOX_CAPACITY);
         let (inbox_tx, inbox) = mpsc::channel(INBOX_CAPACITY);
         let topic: Arc<str> = Arc::from(topic);
-        let request: Arc<str> = Arc::from(subscription(&topic));
         let tasks = relays
             .iter()
             .map(|relay| {
                 tokio::spawn(serve_relay(
                     Arc::from(relay.as_ref()),
-                    Arc::clone(&request),
                     Arc::clone(&topic),
                     outbox.subscribe(),
                     inbox_tx.clone(),
@@ -248,6 +246,11 @@ fn random_key() -> SigningKey {
 
 /// The `REQ` that subscribes to `topic`: live events only, since the kind is
 /// ephemeral and nothing older is stored anyway.
+///
+/// Built for each connection, not once per channel: a relay that does keep
+/// the kind answers a `since` with everything after it, and one fixed when
+/// the channel opened would have every reconnect replay every knock since —
+/// each one a punch and an answer out of a host that is long past it.
 fn subscription(topic: &str) -> String {
     serde_json::json!([
         "REQ",
@@ -351,7 +354,6 @@ fn parse_frame(text: &str, topic: &str) -> Frame {
 /// connection fails, wait and connect again.
 async fn serve_relay(
     relay: Arc<str>,
-    request: Arc<str>,
     topic: Arc<str>,
     mut outbox: broadcast::Receiver<Outgoing>,
     inbox: mpsc::Sender<Heard>,
@@ -359,7 +361,7 @@ async fn serve_relay(
     let mut failures = 0u32;
     loop {
         let started = Instant::now();
-        match serve_connection(&relay, &request, &topic, &mut outbox, &inbox).await {
+        match serve_connection(&relay, &topic, &mut outbox, &inbox).await {
             Ok(()) => return,
             Err(error) => tracing::debug!(%relay, %error, "signalling relay connection ended"),
         }
@@ -390,7 +392,6 @@ fn reconnect_pause(failures: u32) -> Duration {
 /// should end; `Err` when the connection failed and should be replaced.
 async fn serve_connection(
     relay: &str,
-    request: &str,
     topic: &str,
     outbox: &mut broadcast::Receiver<Outgoing>,
     inbox: &mpsc::Sender<Heard>,
@@ -402,7 +403,7 @@ async fn serve_connection(
     .await
     .map_err(|_| "connect timed out".to_owned())??;
     socket
-        .send(Message::text(request.to_owned()))
+        .send(Message::text(subscription(topic)))
         .await
         .map_err(|e| e.to_string())?;
     tracing::debug!(%relay, "signalling relay subscribed");
@@ -461,19 +462,14 @@ async fn serve_connection(
     }
 }
 
-/// Opens a WebSocket to `relay`, a `wss://` URL: TCP to its first IPv4
-/// address (a machine with no route to the IPv6 internet is common, ADR
-/// 0095), TLS against the web PKI, then the upgrade.
+/// Opens a WebSocket to `relay`: TCP to its first IPv4 address (a machine
+/// with no route to the IPv6 internet is common, ADR 0095), TLS against the
+/// web PKI for a `wss://` relay, then the upgrade.
 async fn connect(relay: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
     let builder = ClientBuilder::new().uri(relay).map_err(|e| e.to_string())?;
-    let host = relay
-        .strip_prefix("wss://")
-        .ok_or_else(|| format!("not a wss:// relay: {relay}"))?
-        .split(['/', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_owned();
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 443))
+    let (tls, host, port) =
+        relay_target(relay).ok_or_else(|| format!("not a ws:// or wss:// relay: {relay}"))?;
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| e.to_string())?
         .collect();
@@ -485,12 +481,36 @@ async fn connect(relay: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream
         .ok_or_else(|| format!("{host} did not resolve"))?;
     let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let _ = tcp.set_nodelay(true);
-    let tls = tls_connector()
-        .wrap(&host, tcp)
+    let stream = if tls {
+        tls_connector()
+            .wrap(host, tcp)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        MaybeTlsStream::Plain(tcp)
+    };
+    let (socket, _) = builder
+        .connect_on(stream)
         .await
         .map_err(|e| e.to_string())?;
-    let (socket, _) = builder.connect_on(tls).await.map_err(|e| e.to_string())?;
     Ok(socket)
+}
+
+/// Whether `relay` wants TLS, and the host and port to reach it on:
+/// `wss://host[:port][/...]`, or `ws://` for a relay on a private test
+/// network. `None` for any other scheme, an empty host, a port that is not
+/// one, or an IPv6 literal, which no relay in use is.
+fn relay_target(relay: &str) -> Option<(bool, &str, u16)> {
+    let (tls, rest) = match relay.strip_prefix("wss://") {
+        Some(rest) => (true, rest),
+        None => (false, relay.strip_prefix("ws://")?),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (authority, if tls { 443 } else { 80 }),
+    };
+    (!host.is_empty() && !host.starts_with('[')).then_some((tls, host, port))
 }
 
 /// A TLS connector trusting the web PKI roots, built once per process.
@@ -525,6 +545,7 @@ fn unix_now() -> u64 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use super::test_relay::Relay;
     use super::*;
     use k256::schnorr::{Signature, VerifyingKey};
 
@@ -599,5 +620,464 @@ mod tests {
         assert_eq!(secs(2), 2);
         assert_eq!(secs(3), 4);
         assert_eq!(secs(40), SIGNAL_RECONNECT_CEILING_SECS);
+    }
+
+    /// A relay is dialed on the port its URL names: a relay on a port of its
+    /// own used to be dialed on 443 whatever the URL said.
+    #[test]
+    fn a_relay_url_names_its_scheme_host_and_port() {
+        assert_eq!(
+            relay_target("wss://relay.damus.io"),
+            Some((true, "relay.damus.io", 443))
+        );
+        assert_eq!(
+            relay_target("wss://relay.example:7777/nostr"),
+            Some((true, "relay.example", 7777))
+        );
+        assert_eq!(
+            relay_target("ws://127.0.0.1:4000"),
+            Some((false, "127.0.0.1", 4000))
+        );
+        assert_eq!(
+            relay_target("ws://relay.local/"),
+            Some((false, "relay.local", 80))
+        );
+        for bad in [
+            "https://relay.damus.io",
+            "relay.damus.io",
+            "wss://",
+            "wss://:443",
+            "wss://relay.example:port",
+            "wss://relay.example:70000",
+            "wss://[::1]:443",
+        ] {
+            assert_eq!(relay_target(bad), None, "{bad}");
+        }
+    }
+
+    /// How long a test waits for something a loopback relay delivers before
+    /// calling it lost.
+    const DELIVERY: Duration = Duration::from_secs(10);
+    /// How long a test waits to be sure something is *not* delivered.
+    const QUIET: Duration = Duration::from_millis(400);
+
+    /// The next event `channel` hears, or a failure naming `what`.
+    async fn next(channel: &mut Channel, what: &str) -> String {
+        tokio::time::timeout(DELIVERY, channel.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{what} never arrived"))
+            .expect("the channel is alive")
+    }
+
+    /// Asserts `channel` hears nothing more for a while.
+    async fn silent(channel: &mut Channel, what: &str) {
+        if let Ok(heard) = tokio::time::timeout(QUIET, channel.recv()).await {
+            panic!("{what}, but heard {heard:?}");
+        }
+    }
+
+    /// The `["EVENT", "lp", {...}]` a relay forwards for an event this
+    /// client signs, with the parts a test wants to vary.
+    fn forwarded(subscription: &str, topic: &str, kind: u32, content: &str) -> String {
+        let frame = event_frame(&random_key(), topic, content, unix_now()).unwrap();
+        let mut frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let mut event = frame[1].take();
+        event["kind"] = kind.into();
+        serde_json::json!(["EVENT", subscription, event]).to_string()
+    }
+
+    /// The whole round trip on one relay: what one channel publishes reaches
+    /// the other channel on the topic, once, and comes back to its sender
+    /// as relays echo it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_reaches_the_other_channel_on_the_topic_once() {
+        let relay = Relay::start().await;
+        let mut guest = Channel::open(&[&relay.url], "t1");
+        let mut host = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
+            .await;
+
+        guest.publish("aa");
+        assert_eq!(next(&mut host, "the guest's event").await, "aa");
+        assert_eq!(next(&mut guest, "the relay's echo").await, "aa");
+        silent(&mut host, "one event is heard once").await;
+    }
+
+    /// A message published while the relay cannot be reached yet goes out
+    /// the moment it can — the guest knocks before its relays have answered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_published_before_the_relay_is_up_goes_out_when_it_is() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        // Nothing listens on `port` now: the first connect is refused.
+        let early = Channel::open(&[format!("ws://{port}")], "t1");
+        early.publish("early");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let relay = Relay::start_at(port).await;
+        relay
+            .wait_for("the message published before it was up", |seen| {
+                seen.events.iter().any(|event| event["content"] == "early")
+            })
+            .await;
+        drop(early);
+    }
+
+    /// Every relay forwards the same event; the reader hears it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copies_of_one_event_from_several_relays_are_heard_once() {
+        let first = Relay::start().await;
+        let second = Relay::start().await;
+        let relays = [&first.url, &second.url];
+        let guest = Channel::open(&relays, "t1");
+        let mut host = Channel::open(&relays, "t1");
+        for relay in [&first, &second] {
+            relay
+                .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
+                .await;
+        }
+
+        guest.publish("once");
+        assert_eq!(next(&mut host, "the event").await, "once");
+        silent(&mut host, "the second relay's copy must be dropped").await;
+        for relay in [&first, &second] {
+            assert_eq!(relay.seen(|seen| seen.events.len()), 1);
+        }
+    }
+
+    /// What a relay says off this channel's subscription, topic or kind, and
+    /// what is not a message at all, never reaches the reader — and does not
+    /// cost the connection either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_this_channels_events_reach_it_whatever_a_relay_sends() {
+        let relay = Relay::start().await;
+        let mut channel = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("the subscription", |seen| seen.filters.len() == 1)
+            .await;
+
+        for junk in [
+            forwarded(SUBSCRIPTION_ID, "t2", SIGNAL_EVENT_KIND, "other topic"),
+            forwarded("zz", "t1", SIGNAL_EVENT_KIND, "other subscription"),
+            forwarded(SUBSCRIPTION_ID, "t1", 1, "a stored kind"),
+            "not json".to_owned(),
+            r#"["NOTICE","slow down"]"#.to_owned(),
+            r#"["EOSE","lp"]"#.to_owned(),
+            r#"["OK","00",false,"blocked"]"#.to_owned(),
+        ] {
+            relay.say(&junk);
+        }
+        relay.say(&forwarded(SUBSCRIPTION_ID, "t1", SIGNAL_EVENT_KIND, "mine"));
+
+        assert_eq!(next(&mut channel, "the one real event").await, "mine");
+        assert_eq!(
+            relay.seen(|seen| seen.accepted),
+            1,
+            "junk is no reason to reconnect"
+        );
+    }
+
+    /// A relay that ends the subscription is subscribed to again, and the new
+    /// subscription asks for events from *now*: one that asked from when the
+    /// channel opened would have a relay that keeps ephemeral events replay
+    /// every knock since then, and the host punch towards each of them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_subscription_is_renewed_from_the_time_it_is_renewed() {
+        let relay = Relay::start().await;
+        let mut channel = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("the subscription", |seen| seen.filters.len() == 1)
+            .await;
+
+        relay.say(r#"["CLOSED","lp","error: shutting down"]"#);
+        relay
+            .wait_for("the renewed subscription", |seen| seen.filters.len() == 2)
+            .await;
+        let (first, renewed) = relay.seen(|seen| {
+            (
+                seen.filters[0]["since"].as_u64().unwrap(),
+                seen.filters[1]["since"].as_u64().unwrap(),
+            )
+        });
+        assert!(
+            renewed > first,
+            "the renewed subscription asked from {renewed}, the first from {first}"
+        );
+
+        let other = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("the other subscription", |seen| seen.filters.len() == 3)
+            .await;
+        other.publish("after");
+        assert_eq!(
+            next(&mut channel, "an event after the renewal").await,
+            "after"
+        );
+    }
+
+    /// A relay that drops the connection is dialed again, and what is
+    /// published afterwards arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_connection_is_replaced() {
+        let relay = Relay::start().await;
+        let mut channel = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("the subscription", |seen| seen.filters.len() == 1)
+            .await;
+
+        relay.kick();
+        relay
+            .wait_for("the connection again", |seen| {
+                seen.accepted == 2 && seen.filters.len() == 2
+            })
+            .await;
+        let other = Channel::open(&[&relay.url], "t1");
+        relay
+            .wait_for("the other subscription", |seen| seen.filters.len() == 3)
+            .await;
+        other.publish("again");
+        assert_eq!(next(&mut channel, "an event after the drop").await, "again");
+    }
+
+    /// A relay that cannot be reached at all costs nothing while another one
+    /// carries the messages both ways.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dead_relay_costs_nothing_while_another_answers() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let relay = Relay::start().await;
+        let mut both = Channel::open(&[format!("ws://{dead}"), relay.url.clone()], "t1");
+        let mut live = Channel::open(std::slice::from_ref(&relay.url), "t1");
+        relay
+            .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
+            .await;
+
+        live.publish("to both");
+        assert_eq!(next(&mut both, "the live relay's event").await, "to both");
+        both.publish("from both");
+        assert_eq!(
+            next(&mut live, "an event out through the live relay").await,
+            "to both"
+        );
+        assert_eq!(
+            next(&mut live, "an event out through the live relay").await,
+            "from both"
+        );
+    }
+
+    /// Dropping a channel closes every relay connection it holds: an endpoint
+    /// that is gone must not keep eight sockets open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_the_channel_closes_its_connections() {
+        let first = Relay::start().await;
+        let second = Relay::start().await;
+        let channel = Channel::open(&[&first.url, &second.url], "t1");
+        for relay in [&first, &second] {
+            relay
+                .wait_for("the connection", |seen| seen.open == 1)
+                .await;
+        }
+
+        drop(channel);
+        for relay in [&first, &second] {
+            relay
+                .wait_for("the connection closing", |seen| seen.open == 0)
+                .await;
+        }
+    }
+}
+
+/// A stand-in for a public relay on loopback, for the tests of this module
+/// and of the rendezvous built on it (ADR 0116).
+#[cfg(test)]
+pub(crate) mod test_relay {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use n0_future::{SinkExt as _, StreamExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::broadcast;
+    use tokio_websockets::{Message, ServerBuilder};
+
+    /// What a test makes every open connection of a relay do.
+    #[derive(Debug, Clone)]
+    enum Control {
+        /// Send this text frame as it is.
+        Raw(String),
+        /// Drop the connection without a close frame, as a relay that
+        /// restarts does.
+        Kick,
+    }
+
+    /// What a relay has seen, for a test to assert on.
+    #[derive(Debug, Default)]
+    pub(crate) struct Seen {
+        /// The filter of every `REQ`, in the order they came.
+        pub(crate) filters: Vec<serde_json::Value>,
+        /// Every event published to it, in order.
+        pub(crate) events: Vec<serde_json::Value>,
+        /// Connections accepted so far.
+        pub(crate) accepted: usize,
+        /// Connections open right now.
+        pub(crate) open: usize,
+    }
+
+    /// Speaks just enough NIP-01: remembers each connection's subscription,
+    /// answers every `EVENT` with `OK`, and forwards it to every connection
+    /// subscribed to its topic — the sender's own included, as public relays
+    /// do.
+    pub(crate) struct Relay {
+        /// Where to reach it: `ws://127.0.0.1:<port>`.
+        pub(crate) url: String,
+        seen: Arc<Mutex<Seen>>,
+        control: broadcast::Sender<Control>,
+        listener: tokio::task::JoinHandle<()>,
+    }
+
+    impl Relay {
+        pub(crate) async fn start() -> Self {
+            Self::start_at("127.0.0.1:0".parse().unwrap()).await
+        }
+
+        pub(crate) async fn start_at(addr: SocketAddr) -> Self {
+            let listener = TcpListener::bind(addr).await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let (control, _) = broadcast::channel(64);
+            let (events, _) = broadcast::channel(64);
+            let accepting = tokio::spawn({
+                let seen = Arc::clone(&seen);
+                let control = control.clone();
+                async move {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        tokio::spawn(serve(
+                            stream,
+                            Arc::clone(&seen),
+                            events.clone(),
+                            control.subscribe(),
+                        ));
+                    }
+                }
+            });
+            Self {
+                url,
+                seen,
+                control,
+                listener: accepting,
+            }
+        }
+
+        /// Sends `text` to every open connection.
+        pub(crate) fn say(&self, text: &str) {
+            let _ = self.control.send(Control::Raw(text.to_owned()));
+        }
+
+        /// Drops every open connection.
+        pub(crate) fn kick(&self) {
+            let _ = self.control.send(Control::Kick);
+        }
+
+        /// Reads what it has seen so far.
+        pub(crate) fn seen<T>(&self, read: impl FnOnce(&Seen) -> T) -> T {
+            read(&self.seen.lock().unwrap())
+        }
+
+        /// Waits until what it has seen satisfies `ready`, or fails naming
+        /// `what` after ten seconds.
+        pub(crate) async fn wait_for(&self, what: &str, ready: impl Fn(&Seen) -> bool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !self.seen(&ready) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the relay never saw {what}: {:?}",
+                    self.seen.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    impl Drop for Relay {
+        fn drop(&mut self) {
+            self.listener.abort();
+            self.kick();
+        }
+    }
+
+    async fn serve(
+        stream: TcpStream,
+        seen: Arc<Mutex<Seen>>,
+        events: broadcast::Sender<serde_json::Value>,
+        mut control: broadcast::Receiver<Control>,
+    ) {
+        let Ok((_, mut socket)) = ServerBuilder::new().accept(stream).await else {
+            return;
+        };
+        {
+            let mut seen = seen.lock().unwrap();
+            seen.accepted += 1;
+            seen.open += 1;
+        }
+        let mut forwarded = events.subscribe();
+        // This connection's subscription: its id and its topic.
+        let mut subscription: Option<(String, String)> = None;
+        loop {
+            tokio::select! {
+                frame = socket.next() => {
+                    let Some(Ok(frame)) = frame else { break };
+                    let Some(text) = frame.as_text() else { continue };
+                    let Ok(message) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    match message[0].as_str() {
+                        Some("REQ") => {
+                            seen.lock().unwrap().filters.push(message[2].clone());
+                            subscription = Some((
+                                message[1].as_str().unwrap_or_default().to_owned(),
+                                message[2]["#t"][0].as_str().unwrap_or_default().to_owned(),
+                            ));
+                        }
+                        Some("EVENT") => {
+                            let event = message[1].clone();
+                            seen.lock().unwrap().events.push(event.clone());
+                            let ok = serde_json::json!(["OK", event["id"], true, ""]).to_string();
+                            if socket.send(Message::text(ok)).await.is_err() {
+                                break;
+                            }
+                            let _ = events.send(event);
+                        }
+                        _ => {}
+                    }
+                }
+                event = forwarded.recv() => {
+                    let Ok(event) = event else { continue };
+                    let Some((id, topic)) = &subscription else { continue };
+                    if event["tags"][0][1].as_str() != Some(topic.as_str()) {
+                        continue;
+                    }
+                    let frame = serde_json::json!(["EVENT", id, event]).to_string();
+                    if socket.send(Message::text(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                control = control.recv() => match control {
+                    Ok(Control::Raw(text)) => {
+                        if socket.send(Message::text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Control::Kick) | Err(_) => break,
+                },
+            }
+        }
+        seen.lock().unwrap().open -= 1;
     }
 }

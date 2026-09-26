@@ -71,6 +71,9 @@ sha2 = "0.10"
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+# The server half, for the loopback stand-in relay the signalling tests talk
+# to instead of the public ones (ADR 0116).
+tokio-websockets = { version = "0.13", default-features = false, features = ["server"] }
 # Only for the `wan_probe`/`obfuscated_wan_probe` examples, which need iroh's
 # own logs (and, for the latter, this crate's own tracing) to explain a
 # failed connection.
