@@ -8,7 +8,7 @@
 // Pure render function plus module state (`open`, `onChange`), the same
 // shape as `invite-view.ts` and `unattended-settings.ts`.
 
-import { html, nothing, type TemplateResult } from 'lit-html';
+import { html, nothing, svg, type TemplateResult } from 'lit-html';
 
 import type { AddressBookEntry } from './address-book';
 import { addressBook } from './address-book';
@@ -20,12 +20,12 @@ import { t } from './i18n';
 import type { RecordingEntry, RecordingsCommands } from './recordings';
 import { recordingsPanel } from './recordings';
 import type { SystemCommands } from './system-settings';
-import { systemSettings } from './system-settings';
+import { systemSettings, updateSettings } from './system-settings';
 import type { UnattendedStatus } from './unattended-settings';
 import { unattendedSettings } from './unattended-settings';
 
-/** The three sections the panels are grouped into. */
-export type SettingsTab = 'system' | 'access' | 'recordings';
+/** The four sections the panels are grouped into. */
+export type SettingsTab = 'system' | 'access' | 'recordings' | 'about';
 
 /**
  * The tabs, in order, with the label key each one carries.
@@ -33,20 +33,43 @@ export type SettingsTab = 'system' | 'access' | 'recordings';
  * A flat list of six panels had the address book, the unattended password,
  * invite revocation, recordings, the audit log and the system switches in one
  * scroll, which is what made finding any of them a hunt. The grouping is by
- * the question being answered: what this machine is and who it lets in, how a
- * trusted device authenticates, and what has been kept about sessions that
- * already happened.
+ * the question being answered: how this window looks and behaves, who this
+ * machine lets in and how they prove it, what has been kept about sessions
+ * that already happened, and which build this is (ADR 0117).
  *
- * `system` is first and holds what used to be a separate Devices tab. The two
- * were the same subject read twice — this machine's own settings, and the
- * devices this machine deals with — and the split only decided which of them
- * an operator had to click past first.
+ * `access` holds what used to be a separate Devices tab: the saved devices and
+ * the unattended password are one subject read twice — which devices are
+ * trusted, and what a trusted device must still prove — and splitting them
+ * only decided which half an operator had to click past first.
  */
 const TABS: readonly { readonly id: SettingsTab; readonly label: TranslationKey }[] = [
   { id: 'system', label: 'settings.tab.system' },
   { id: 'access', label: 'settings.tab.access' },
   { id: 'recordings', label: 'settings.tab.recordings' },
+  { id: 'about', label: 'settings.tab.about' },
 ];
+
+/** One drawn glyph per section, in the stroke the rest of the chrome uses. */
+const TAB_ICONS: Record<SettingsTab, TemplateResult> = {
+  system: tabIcon(svg`<path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6" /><circle cx="10" cy="4.5" r="1.5" /><circle cx="6" cy="11.5" r="1.5" />`),
+  access: tabIcon(svg`<path d="M8 1.75 2.75 3.9v3.6c0 3.1 2.2 5.6 5.25 6.75 3.05-1.15 5.25-3.65 5.25-6.75V3.9Z" /><path d="m5.9 8 1.5 1.5L10.3 6.6" />`),
+  recordings: tabIcon(svg`<rect x="1.75" y="3.5" width="9" height="9" rx="2" /><path d="m10.75 7 3.5-2v6l-3.5-2" />`),
+  about: tabIcon(svg`<circle cx="8" cy="8" r="6.25" /><path d="M8 7.25v4M8 4.9v.1" />`),
+};
+
+function tabIcon(body: ReturnType<typeof svg>): TemplateResult {
+  return html`<svg
+    viewBox="0 0 16 16"
+    width="16"
+    height="16"
+    aria-hidden="true"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >${body}</svg>`;
+}
 
 let open = false;
 /** Which section is showing. Reset on close, so opening starts predictably. */
@@ -71,14 +94,19 @@ export function isSettingsOpen(): boolean {
   return open;
 }
 
-/** Opens the settings screen, remembering what to return focus to. */
-export function openSettings(): void {
+/**
+ * Opens the settings screen on `section`, remembering what to return focus to.
+ * Already open, it only switches section: the sidebar's version line and its
+ * update notice both land on About.
+ */
+export function openSettings(section: SettingsTab = 'system'): void {
   if (open) {
+    selectTab(section);
     return;
   }
   trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   open = true;
-  tab = 'system';
+  tab = section;
   focusToken += 1;
   notify();
 }
@@ -111,13 +139,20 @@ export function activeTab(): SettingsTab {
 /**
  * Arrow-key movement along the tab strip, as the WAI-ARIA tabs pattern wants
  * it: only the selected tab is in the tab order, so the arrows are the only
- * way a keyboard reaches the others. Direction follows the document, so it
- * still reads left-to-right in Arabic's mirrored layout.
+ * way a keyboard reaches the others. The strip stands as a column beside the
+ * panels and lies as a row above them in a narrow window, so both axes move
+ * it; the horizontal one follows the document, so it still reads
+ * left-to-right in Arabic's mirrored layout.
  */
 function onTabKey(event: KeyboardEvent, id: SettingsTab): void {
   const back = document.documentElement.dir === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
   const forward = back === 'ArrowLeft' ? 'ArrowRight' : 'ArrowLeft';
-  const step = event.key === forward ? 1 : event.key === back ? -1 : 0;
+  const step =
+    event.key === forward || event.key === 'ArrowDown'
+      ? 1
+      : event.key === back || event.key === 'ArrowUp'
+        ? -1
+        : 0;
   if (step === 0) {
     return;
   }
@@ -157,29 +192,32 @@ function section(panels: SettingsPanels): TemplateResult {
   const { locale } = panels;
   switch (tab) {
     case 'system':
-      // How the app itself behaves, who this machine lets in, and the code it
-      // hands out to invite them.
+      // How the app itself looks and behaves on this machine.
+      return html`${systemSettings(locale, panels.systemCommands, panels.onLocaleChange)}`;
+    case 'access':
+      // Who this machine lets in: how a trusted device proves it is itself,
+      // which devices are trusted, and the code it hands out to invite them.
       return html`
-        ${systemSettings(locale, panels.systemCommands, panels.onLocaleChange)}
+        ${unattendedSettings(panels.unattended, locale, panels.onRefresh)}
         ${addressBook(panels.savedDevices, locale, panels.onRefresh)}
         ${inviteRefreshPanel(locale)}
       `;
-    case 'access':
-      // How a device that is already trusted proves it is itself.
-      return html`${unattendedSettings(panels.unattended, locale, panels.onRefresh)}`;
     case 'recordings':
       // What this machine has kept about sessions that already happened.
       return html`
         ${recordingsPanel(panels.recordings, locale, panels.recordingsCommands, panels.onRefresh)}
         ${auditPanel(locale, panels.auditCommands)}
       `;
+    case 'about':
+      // Which build this is, and whether a newer one exists.
+      return html`${updateSettings(locale, panels.systemCommands)}`;
   }
 }
 
 /**
  * The settings screen: this device, the address book, invite revocation,
  * unattended access, recordings and the audit log, moved here from the main
- * panel (DECISIONS.md D9) and grouped into the three sections of [`TABS`].
+ * panel (DECISIONS.md D9) and grouped into the sections of [`TABS`].
  * None of these panels are rewritten — each keeps its own render function and
  * arguments; this module only decides which of them are on screen.
  */
@@ -214,10 +252,17 @@ export function settingsView(panels: SettingsPanels): TemplateResult | typeof no
             aria-label=${t(locale, 'settings.close')}
             @click=${() => closeSettings()}
           >
-            ×
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+              <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
           </button>
         </div>
-        <div class="settings-tabs" role="tablist" aria-label=${t(locale, 'settings.tabs.label')}>
+        <div
+          class="settings-tabs"
+          role="tablist"
+          aria-orientation="vertical"
+          aria-label=${t(locale, 'settings.tabs.label')}
+        >
           ${TABS.map(
             (entry) => html`
               <button
@@ -231,7 +276,7 @@ export function settingsView(panels: SettingsPanels): TemplateResult | typeof no
                 @keydown=${(event: KeyboardEvent) => onTabKey(event, entry.id)}
                 @click=${() => selectTab(entry.id)}
               >
-                ${t(locale, entry.label)}
+                ${TAB_ICONS[entry.id]}<span>${t(locale, entry.label)}</span>
               </button>
             `,
           )}

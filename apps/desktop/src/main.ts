@@ -30,7 +30,14 @@ import {
   type ConnectPhase,
 } from './invite-view';
 import { onAuditStateChange, tauriAuditCommands } from './audit-log';
-import { onSystemStateChange, tauriSystemCommands } from './system-settings';
+import {
+  appVersion,
+  availableUpdate,
+  checkForUpdatesAtLaunch,
+  loadAppVersion,
+  onSystemStateChange,
+  tauriSystemCommands,
+} from './system-settings';
 import { logoMark } from './logo';
 import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
 import { rebootBanner, type RebootPending } from './reboot-banner';
@@ -40,6 +47,7 @@ import type { TunnelRow } from './tunnels';
 import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
+import { applyTheme } from './theme';
 import { titleBar } from './title-bar';
 import { onUnattendedStateChange, unattendedIndicator, type UnattendedStatus } from './unattended-settings';
 import { supportedOptionalCodecs } from './view-decoder';
@@ -185,6 +193,47 @@ function closeChat(): void {
   }
 }
 
+/**
+ * The sidebar's line about a newer release, once a check has found one (ADR
+ * 0117). It opens About rather than installing: installing is a decision, and
+ * the place to make it is the one that says what installing will do.
+ */
+function updateNotice(): TemplateResult | typeof nothing {
+  const update = availableUpdate();
+  if (!update) {
+    return nothing;
+  }
+  return html`<button
+    type="button"
+    class="update-chip"
+    data-testid="update-chip"
+    @click=${() => openSettings('about')}
+  >
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor"
+      stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 2.5v8M4.75 7.25 8 10.5l3.25-3.25M3 13.5h10" />
+    </svg>
+    <span>${t(locale, 'sidebar.updateAvailable', update.version)}</span>
+  </button>`;
+}
+
+/** This build's version, which also opens About — where the update check is. */
+function versionButton(): TemplateResult | typeof nothing {
+  const version = appVersion();
+  if (!version) {
+    return nothing;
+  }
+  return html`<button
+    type="button"
+    class="version-btn"
+    data-testid="sidebar-version"
+    aria-label=${t(locale, 'system.version', version)}
+    @click=${() => openSettings('about')}
+  >
+    v${version}
+  </button>`;
+}
+
 function applyDir(): void {
   document.documentElement.lang = locale;
   document.documentElement.dir = dirOf(locale);
@@ -205,10 +254,12 @@ function renderNow(): void {
           ${titleBar(locale)}
           <div class="window-body">
             <aside class="sidebar">
-              <div class="brand-row">${logoMark()}<span class="brand-name">Lumepeer</span></div>
+              <div class="brand-row" data-tauri-drag-region>
+                ${logoMark()}<span class="brand-name">Lumepeer</span>
+              </div>
               ${inviteCodePanel(locale)}
               <div class="sidebar-bottom">
-                ${statusPill(networkReady, locale)}
+                ${updateNotice()} ${statusPill(networkReady, locale)}
                 ${unattendedIndicator(unattended, locale)}
                 <div class="sidebar-divider"></div>
                 <div class="footer-tag">
@@ -218,6 +269,7 @@ function renderNow(): void {
                     <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="currentColor" stroke-width="1.2" />
                   </svg>
                   <span>${t(locale, 'sidebar.serverless')}</span>
+                  ${versionButton()}
                   <button
                     type="button"
                     class="settings-btn"
@@ -436,6 +488,9 @@ export function setLocale(next: Locale): void {
   renderNow();
 }
 
+// Before the first render, so a window set to dark never paints light first.
+applyTheme();
+
 onInviteStateChange(renderNow);
 onUnattendedStateChange(renderNow);
 onAddressBookStateChange(renderNow);
@@ -467,6 +522,8 @@ document.addEventListener('keydown', (event) => {
 
 renderNow();
 void refresh();
+loadAppVersion(tauriSystemCommands);
+checkForUpdatesAtLaunch(tauriSystemCommands);
 // What this process's WebView can decode, asked of the browser and told to
 // the actor once, before any connect (§11; ADR 0070). It has to happen here
 // rather than in the view window: `Hello` is sent while dialing, and the view

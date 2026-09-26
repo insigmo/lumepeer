@@ -4,17 +4,22 @@
 // that the autostart toggle reflects the machine rather than the click, that
 // an update is never installed by a check, and that a failed install says so
 // instead of claiming a new version is running.
-import { render } from 'lit-html';
+import { html, render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { getStoredLocaleChoice, setStoredLocaleChoice, t } from './i18n';
 import {
+  appVersion,
+  availableUpdate,
+  checkForUpdatesAtLaunch,
   onSystemStateChange,
   resetSystemSettings,
   systemSettings,
+  updateSettings,
   type SystemCommands,
   type UpdateInfo,
 } from './system-settings';
+import { getStoredTheme } from './theme';
 
 const update: UpdateInfo = { version: '0.0.24', current: '0.0.23', notes: '' };
 
@@ -24,9 +29,10 @@ let setMock: ReturnType<typeof vi.fn>;
 let checkMock: ReturnType<typeof vi.fn>;
 let installMock: ReturnType<typeof vi.fn>;
 
+// General and About together, the way the two tabs split this module.
 function mount(): void {
   const paint = (): void => {
-    render(systemSettings('en', commands), container);
+    render(html`${systemSettings('en', commands)}${updateSettings('en', commands)}`, container);
   };
   onSystemStateChange(paint);
   paint();
@@ -51,6 +57,7 @@ beforeEach(() => {
     autostartSet: setMock as unknown as SystemCommands['autostartSet'],
     updateCheck: checkMock as unknown as SystemCommands['updateCheck'],
     updateInstall: installMock as unknown as SystemCommands['updateInstall'],
+    appVersion: vi.fn().mockResolvedValue('0.0.23'),
   };
 });
 
@@ -58,6 +65,7 @@ afterEach(() => {
   container.remove();
   resetSystemSettings();
   localStorage.clear();
+  delete document.documentElement.dataset.theme;
 });
 
 describe('system settings', () => {
@@ -208,5 +216,94 @@ describe('language picker', () => {
 
     expect(getStoredLocaleChoice()).toBeNull();
     expect(onLocaleChange).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('theme picker (ADR 0117)', () => {
+  it('starts on "system" and leaves the page to the system scheme', () => {
+    mount();
+    expect((container.querySelector('[data-testid="theme-system"]') as HTMLInputElement).checked).toBe(true);
+    expect(document.documentElement.dataset.theme).toBeUndefined();
+  });
+
+  it('applies and remembers an explicit choice, and "system" clears it again', () => {
+    mount();
+    const dark = container.querySelector('[data-testid="theme-dark"]') as HTMLInputElement;
+    dark.checked = true;
+    dark.dispatchEvent(new Event('change'));
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(getStoredTheme()).toBe('dark');
+
+    const system = container.querySelector('[data-testid="theme-system"]') as HTMLInputElement;
+    system.checked = true;
+    system.dispatchEvent(new Event('change'));
+    expect(document.documentElement.dataset.theme).toBeUndefined();
+    expect(getStoredTheme()).toBe('system');
+  });
+});
+
+describe('version and updates (ADR 0117)', () => {
+  it('shows the version the bundle reports', async () => {
+    mount();
+    await settle();
+    expect(appVersion()).toBe('0.0.23');
+    expect(container.querySelector('[data-testid="app-version"]')?.textContent).toBe(
+      t('en', 'system.version', '0.0.23'),
+    );
+  });
+
+  it('asks once at launch and offers what it found, without installing it', async () => {
+    checkMock.mockResolvedValue(update);
+    checkForUpdatesAtLaunch(commands);
+    await settle();
+    expect(checkMock).toHaveBeenCalledTimes(1);
+    expect(availableUpdate()?.version).toBe('0.0.24');
+    expect(installMock).not.toHaveBeenCalled();
+  });
+
+  it('does not ask at launch once that is switched off', async () => {
+    mount();
+    await settle();
+    const toggle = container.querySelector('[data-testid="update-autocheck"]') as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event('change'));
+
+    checkForUpdatesAtLaunch(commands);
+    await settle();
+    expect(checkMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed launch-time check to itself', async () => {
+    checkMock.mockRejectedValue(new Error('offline'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    checkForUpdatesAtLaunch(commands);
+    mount();
+    await settle();
+    expect(container.querySelector('[data-testid="update-error"]')).toBeNull();
+  });
+
+  it('says a build without an update channel has none, rather than that it failed', async () => {
+    checkMock.mockRejectedValue({ code: 'UPDATE_OFF', message: 'no endpoint' });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mount();
+    await settle();
+    (container.querySelector('[data-testid="update-check"]') as HTMLButtonElement).click();
+    await settle();
+    expect(container.querySelector('[data-testid="update-error"]')?.textContent).toBe(
+      t('en', 'system.updateOff'),
+    );
+  });
+
+  it('stops offering an update once it is installed', async () => {
+    checkMock.mockResolvedValue(update);
+    mount();
+    await settle();
+    (container.querySelector('[data-testid="update-check"]') as HTMLButtonElement).click();
+    await settle();
+    expect(availableUpdate()).not.toBeNull();
+    (container.querySelector('[data-testid="update-install"]') as HTMLButtonElement).click();
+    await settle();
+    expect(availableUpdate()).toBeNull();
   });
 });

@@ -11,7 +11,6 @@
 
 import { html, type TemplateResult } from 'lit-html';
 
-import { logoMark } from './logo';
 import type { Locale } from './i18n';
 import { t } from './i18n';
 
@@ -30,10 +29,13 @@ async function closeWindow(): Promise<void> {
   await getCurrentWindow().close();
 }
 
+// The strip runs over the main panel only: the sidebar climbs to the top edge
+// beside it and carries the product mark, so the strip itself is just the drag
+// surface and the three controls.
 export function titleBar(locale: Locale): TemplateResult {
   return html`
     <div class="title-bar" data-tauri-drag-region>
-      <div class="title-bar-left" data-tauri-drag-region>${logoMark()}<span>Lumepeer</span></div>
+      <div class="title-bar-left" data-tauri-drag-region></div>
       <div class="title-bar-controls">
         <button type="button" aria-label=${t(locale, 'titlebar.minimize')} @click=${() => void minimize()}>
           <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">

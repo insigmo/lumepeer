@@ -1,26 +1,182 @@
 /* Visual system for the main window (PRODUCT.md, status-pill-preview.html
    variant A — light status pill in sidebar colors). Logical properties
    throughout so the existing en/ar + ltr/rtl split (i18n.ts) mirrors
-   correctly instead of just the text. */
+   correctly instead of just the text.
+
+   Light and dark (ADR 0117): every colour below is a token, the light set on
+   :root and the dark set under `prefers-color-scheme: dark`, with
+   `data-theme` on <html> (theme.ts) overriding the system either way. A
+   colour written anywhere else in this file is a colour that will be wrong in
+   one of the two themes. */
 
 :root {
-  --blue-solid: #3564e4;
-  --blue-solid-hover: #2e58d6;
-  --green: #47be88;
-  --green-tint: #eef8f4;
-  --red: #e04f5f;
-  --red-tint: #fcedef;
-  --sidebar-bg: #fafafc;
-  --panel-bg: #ffffff;
-  --titlebar-bg: #f4f4f5;
-  --border-subtle: #eaecef;
-  --text-heading: #0b1220;
-  --text-secondary: #4b5568;
+  color-scheme: light;
 
-  --fs-micro: 11px;
+  /* Surfaces, from the back of the window to the front. */
+  --bg: #ffffff;
+  --surface-1: #f6f7f9;
+  --surface-2: #eff1f5;
+  --surface-3: #e6e9ef;
+  --raised: #ffffff;
+  --group-bg: #f8f9fb;
+  --control-bg: #ffffff;
+  --hover: rgb(15 23 42 / 5%);
+  --hover-strong: rgb(15 23 42 / 9%);
+
+  --border: #e3e7ed;
+  --border-strong: #cdd3dc;
+
+  --text: #0b1220;
+  --text-2: #4b5568;
+  --text-3: #667085;
+  --text-disabled: #9aa1b1;
+
+  --accent: #3564e4;
+  --accent-hover: #2b55d0;
+  --accent-text: #2b55d0;
+  --accent-soft: #edf2fe;
+  --accent-soft-strong: #dfe8fd;
+  --accent-ring: rgb(53 100 228 / 26%);
+  --on-accent: #ffffff;
+  --selection: rgb(53 100 228 / 20%);
+
+  --green: #2fb57a;
+  --green-soft: #e8f7f0;
+  --green-text: #11774c;
+  --red: #d63345;
+  --red-soft: #fdeef0;
+  --danger-solid: #d63345;
+  --amber: #9a5b00;
+  --amber-dot: #e39b17;
+  --amber-soft: #fdf4e3;
+
+  --switch-off: #cdd3dc;
+  --scrollbar: rgb(15 23 42 / 18%);
+  --logo-ring: transparent;
+
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 6%);
+  --shadow-md: 0 6px 16px -4px rgb(16 24 40 / 12%), 0 2px 4px -2px rgb(16 24 40 / 6%);
+  --shadow-lg: 0 28px 56px -12px rgb(16 24 40 / 30%), 0 0 0 1px rgb(16 24 40 / 4%);
+  --scrim: rgb(11 18 32 / 42%);
+
+  --radius-sm: 6px;
+  --radius: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --font-ui:
+    'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, 'Helvetica Neue',
+    Arial, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --fs-micro: 12px;
   --fs-body: 13px;
   --fs-emphasis: 15px;
-  --fs-display: 20px;
+  --fs-display: 22px;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* The dark palette, twice: once for "follow the system" and once for an
+   explicit choice. CSS has no way to share a declaration block between a
+   media query and a selector, and the duplication is the price of needing no
+   script to track the system's setting. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --bg: #13161c;
+    --surface-1: #0e1115;
+    --surface-2: #1b1f27;
+    --surface-3: #242a34;
+    --raised: #191d25;
+    --group-bg: #1d2129;
+    --control-bg: #20252e;
+    --hover: rgb(255 255 255 / 6%);
+    --hover-strong: rgb(255 255 255 / 10%);
+
+    --border: #272c36;
+    --border-strong: #373e4b;
+
+    --text: #e9ecf2;
+    --text-2: #aab1bf;
+    --text-3: #8d95a5;
+    --text-disabled: #5e6676;
+
+    --accent: #3d6be6;
+    --accent-hover: #4a77ee;
+    --accent-text: #8aa9ff;
+    --accent-soft: rgb(79 123 240 / 15%);
+    --accent-soft-strong: rgb(79 123 240 / 24%);
+    --accent-ring: rgb(110 145 245 / 40%);
+    --selection: rgb(110 145 245 / 35%);
+
+    --green: #3ccf8e;
+    --green-soft: rgb(60 207 142 / 13%);
+    --green-text: #62dca5;
+    --red: #ff6d7b;
+    --red-soft: rgb(255 109 123 / 13%);
+    --amber: #f2b441;
+    --amber-dot: #f2b441;
+    --amber-soft: rgb(242 180 65 / 13%);
+
+    --switch-off: #3a414e;
+    --scrollbar: rgb(255 255 255 / 16%);
+    --logo-ring: rgb(255 255 255 / 9%);
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+    --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
+    --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
+    --scrim: rgb(3 5 9 / 62%);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #13161c;
+  --surface-1: #0e1115;
+  --surface-2: #1b1f27;
+  --surface-3: #242a34;
+  --raised: #191d25;
+  --group-bg: #1d2129;
+  --control-bg: #20252e;
+  --hover: rgb(255 255 255 / 6%);
+  --hover-strong: rgb(255 255 255 / 10%);
+
+  --border: #272c36;
+  --border-strong: #373e4b;
+
+  --text: #e9ecf2;
+  --text-2: #aab1bf;
+  --text-3: #8d95a5;
+  --text-disabled: #5e6676;
+
+  --accent: #3d6be6;
+  --accent-hover: #4a77ee;
+  --accent-text: #8aa9ff;
+  --accent-soft: rgb(79 123 240 / 15%);
+  --accent-soft-strong: rgb(79 123 240 / 24%);
+  --accent-ring: rgb(110 145 245 / 40%);
+  --selection: rgb(110 145 245 / 35%);
+
+  --green: #3ccf8e;
+  --green-soft: rgb(60 207 142 / 13%);
+  --green-text: #62dca5;
+  --red: #ff6d7b;
+  --red-soft: rgb(255 109 123 / 13%);
+  --amber: #f2b441;
+  --amber-dot: #f2b441;
+  --amber-soft: rgb(242 180 65 / 13%);
+
+  --switch-off: #3a414e;
+  --scrollbar: rgb(255 255 255 / 16%);
+  --logo-ring: rgb(255 255 255 / 9%);
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+  --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
+  --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
+  --scrim: rgb(3 5 9 / 62%);
 }
 
 * {
@@ -32,10 +188,9 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  background: var(--panel-bg);
-  color: var(--text-heading);
-  font-family:
-    -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
   font-size: var(--fs-body);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
@@ -43,6 +198,29 @@ body {
 
 #app {
   height: 100%;
+}
+
+/* The parts of the page nobody draws still carry the palette: a selection, a
+   caret or a scrollbar in the browser's own blue is the one detail that gives
+   a dark window away as a web page. */
+::selection {
+  background: var(--selection);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar) transparent;
+}
+
+input,
+textarea {
+  caret-color: var(--accent);
+}
+
+input[type='checkbox'],
+input[type='radio'],
+progress {
+  accent-color: var(--accent);
 }
 
 .sr-only {
@@ -58,7 +236,7 @@ body {
 }
 
 :focus-visible {
-  outline: 2px solid var(--blue-solid);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -66,67 +244,197 @@ button {
   font: inherit;
 }
 
+/* One form-control vocabulary for every panel. Element selectors, so any
+   class-level rule below that sizes a particular field still wins. */
+input[type='text'],
+input[type='password'],
+input[type='search'],
+input[type='number'],
+input[type='date'],
+input[type='datetime-local'],
+select,
+textarea {
+  font: inherit;
+  color: var(--text);
+  background-color: var(--control-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-3);
+}
+
+input[type='text']:focus-visible,
+input[type='password']:focus-visible,
+input[type='search']:focus-visible,
+input[type='number']:focus-visible,
+input[type='date']:focus-visible,
+input[type='datetime-local']:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+/* A drawn chevron in the palette instead of the platform's arrow, which is
+   black on a dark field. Two gradients rather than an image, so it takes the
+   token colour and needs nothing from the CSP. */
+select {
+  appearance: none;
+  padding: 6px 30px 6px 10px;
+  min-height: 32px;
+  cursor: pointer;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-3) 50%),
+    linear-gradient(135deg, var(--text-3) 50%, transparent 50%);
+  background-position:
+    calc(100% - 16px) 50%,
+    calc(100% - 11px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+[dir='rtl'] select {
+  padding: 6px 10px 6px 30px;
+  background-position:
+    11px 50%,
+    16px 50%;
+}
+
+select option {
+  background: var(--raised);
+  color: var(--text);
+}
+
+/* The button every panel reaches for: a quiet, bordered control. `.btn-primary`
+   is the one action a row exists for. Panels that predate these classes keep
+   their own names and are folded into the same look further down. */
+.btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 6px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--control-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-body);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.btn:disabled {
+  color: var(--text-disabled);
+  cursor: default;
+  box-shadow: none;
+}
+
+.btn-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+  color: var(--on-accent);
+  opacity: 0.6;
+}
+
+/* ---------- Window frame ----------
+   The sidebar climbs to the top edge and the title strip covers only the main
+   panel: the product mark sits once, at the top of the sidebar, and the strip
+   is left as what it actually is — a drag surface with three controls. The
+   window body dissolves into the frame's grid (`display: contents`) so its two
+   children can take the rows they need. */
 .window-shell {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
+}
+
+.window-body {
+  display: contents;
 }
 
 /* ---------- Title bar ---------- */
 .title-bar {
-  background: var(--titlebar-bg);
+  grid-column: 2;
+  grid-row: 1;
+  background: var(--bg);
   user-select: none;
   cursor: default;
-  border-block-end: 1px solid var(--border-subtle);
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: space-between;
-  padding-block: 10px;
-  padding-inline: 14px 8px;
+  block-size: 40px;
   flex: none;
 }
 
 .title-bar-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: var(--fs-body);
-  font-weight: 600;
-  color: var(--text-heading);
   /* Fill the free space so the whole strip left of the window controls drags. */
   flex: 1;
   min-width: 0;
 }
 
-/* The drag region is matched against the mousedown target, so the logo and the
-   product name must not be targets of their own. */
-.title-bar-left > * {
+/* The drag region is matched against the mousedown target, so nothing inside
+   it may be a target of its own. */
+.title-bar-left > *,
+.brand-row > * {
   pointer-events: none;
 }
 
 .title-bar-controls {
   display: flex;
-  align-items: center;
+  align-items: stretch;
 }
 
 .title-bar-controls button {
   appearance: none;
   border: 0;
   background: transparent;
-  width: 34px;
-  height: 30px;
+  width: 46px;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #6b7280;
-  border-radius: 4px;
+  color: var(--text-3);
   cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
 }
 
 .title-bar-controls button:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--hover);
+  color: var(--text);
 }
 
+/* The platform's own close red, in both themes: it is the one colour every
+   Windows user reads as "this closes the window" before reading anything. */
 .title-bar-controls button.close-btn:hover {
   background: #e81123;
   color: #fff;
@@ -138,6 +446,8 @@ button {
   flex: none;
   display: block;
   border-radius: 22%;
+  /* The tile is dark navy by design; on the dark sidebar it needs an edge. */
+  box-shadow: 0 0 0 1px var(--logo-ring);
 }
 
 .brand-row .logo-icon {
@@ -145,19 +455,14 @@ button {
   height: 26px;
 }
 
-/* ---------- Window body ---------- */
-.window-body {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-
+/* ---------- Sidebar ---------- */
 .sidebar {
-  width: 220px;
-  flex: none;
-  background: var(--sidebar-bg);
-  border-inline-end: 1px solid var(--border-subtle);
-  padding: 20px 16px;
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  min-height: 0;
+  background: var(--surface-1);
+  border-inline-end: 1px solid var(--border);
+  padding: 0 14px 14px;
   display: flex;
   flex-direction: column;
   overflow-y: auto;
@@ -166,8 +471,12 @@ button {
 .brand-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-block-end: 22px;
+  gap: 10px;
+  block-size: 56px;
+  flex: none;
+  padding-inline: 4px;
+  margin-block-end: 10px;
+  user-select: none;
 }
 
 .brand-row .brand-name {
@@ -179,8 +488,9 @@ button {
 .field-label {
   font-size: var(--fs-micro);
   font-weight: 600;
-  color: var(--text-secondary);
-  margin: 0 0 6px;
+  color: var(--text-2);
+  margin: 0 0 7px;
+  padding-inline: 2px;
 }
 
 /* An invite code is ~200 characters (D3 in docs/bugs/DECISIONS.md: the format
@@ -191,51 +501,78 @@ button {
 .code-box {
   display: block;
   width: 100%;
-  background: #fff;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  padding: 10px 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: var(--fs-emphasis);
-  font-weight: 700;
-  color: var(--blue-solid);
-  letter-spacing: 0.03em;
-  text-align: start;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 11px 12px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-text);
+  letter-spacing: 0.02em;
+  /* A code is Latin text in every locale; in Arabic's mirrored layout it
+     still reads, and clips, from its own first character. */
+  direction: ltr;
+  text-align: left;
   margin: 0 0 8px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   user-select: text;
+  box-shadow: var(--shadow-sm);
 }
 
 .copy-btn,
 .create-btn {
   width: 100%;
   appearance: none;
-  background: #fff;
-  border: 1px solid var(--blue-solid);
-  color: var(--blue-solid);
+  background: var(--control-bg);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-body);
   font-weight: 600;
-  padding: 8px 10px;
-  border-radius: 8px;
+  min-height: 34px;
+  padding: 7px 10px;
+  border-radius: 9px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  gap: 7px;
   cursor: pointer;
-  transition: background 150ms ease;
+  box-shadow: var(--shadow-sm);
+  transition:
+    background 150ms ease,
+    border-color 150ms ease;
 }
 
-.copy-btn:hover,
+/* With no code yet, creating one is the only thing this block offers, so it
+   carries the accent. Copying is a convenience beside a code already shown. */
+.create-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+
+.copy-btn:hover {
+  background: var(--surface-2);
+}
+
 .create-btn:hover {
-  background: #eef2fe;
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
-.copy-btn:disabled {
+.copy-btn:disabled,
+.create-btn:disabled {
   cursor: default;
   opacity: 0.7;
+}
+
+/* The front sheet of the copy glyph is filled so it hides the back one; the
+   fill follows the button rather than being white in both themes. */
+.copy-btn svg rect + rect {
+  fill: var(--control-bg);
 }
 
 .copy-btn {
@@ -244,32 +581,63 @@ button {
 
 .sidebar-bottom {
   margin-block-start: auto;
+  padding-block-start: 16px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
+}
+
+/* A newer release exists (ADR 0117). Accent-tinted rather than solid: it is
+   news, not an alarm, and it sits above the connection status it must not
+   out-shout. */
+.update-chip {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  text-align: start;
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.update-chip:hover {
+  background: var(--accent-soft-strong);
+}
+
+.update-chip svg {
+  flex: none;
 }
 
 /* ---------- Status pill (variant A: light, tinted to state) ---------- */
 .status-pill {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   padding: 9px 12px;
   border-radius: 10px;
   font-size: var(--fs-body);
   font-weight: 600;
-  color: var(--text-heading);
+  color: var(--text);
   transition:
     background 200ms ease,
     color 200ms ease;
 }
 
 .status-pill[data-state='ready'] {
-  background: var(--green-tint);
+  background: var(--green-soft);
 }
 
 .status-pill[data-state='not-ready'] {
-  background: var(--red-tint);
+  background: var(--red-soft);
 }
 
 .status-dot {
@@ -321,7 +689,7 @@ button {
 
 .sidebar-divider {
   height: 1px;
-  background: var(--border-subtle);
+  background: var(--border);
 }
 
 .footer-tag {
@@ -329,7 +697,29 @@ button {
   align-items: center;
   gap: 6px;
   font-size: var(--fs-micro);
-  color: var(--text-secondary);
+  color: var(--text-3);
+  padding-inline-start: 4px;
+}
+
+/* The running version, in the corner every desktop app keeps it. It opens
+   About, where the update check lives, so it is a button and not a label. */
+.version-btn {
+  margin-inline-start: auto;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.version-btn:hover {
+  background: var(--hover);
+  color: var(--text);
 }
 
 .settings-btn {
@@ -340,17 +730,24 @@ button {
   appearance: none;
   border: 0;
   background: transparent;
-  color: var(--text-secondary);
-  width: 22px;
-  height: 22px;
-  padding: 3px;
-  border-radius: 6px;
+  color: var(--text-2);
+  width: 28px;
+  height: 28px;
+  padding: 6px;
+  border-radius: 7px;
   cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.version-btn + .settings-btn {
+  margin-inline-start: 0;
 }
 
 .settings-btn:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: var(--text-heading);
+  background: var(--hover-strong);
+  color: var(--text);
 }
 
 .settings-btn svg {
@@ -360,30 +757,35 @@ button {
 
 /* ---------- Main panel ---------- */
 .main-panel {
-  flex: 1;
-  padding: 28px 32px;
+  grid-column: 2;
+  grid-row: 2;
+  padding: 6px 36px 36px;
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
+  background: var(--bg);
 }
 
 .panel-heading {
   font-size: var(--fs-display);
   font-weight: 700;
   margin: 0 0 6px;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.015em;
 }
 
 .panel-subtext {
   font-size: var(--fs-body);
-  color: var(--text-secondary);
+  color: var(--text-2);
   margin: 0 0 18px;
   line-height: 1.5;
+  max-width: 62ch;
 }
 
 .connect-row {
   display: flex;
   gap: 10px;
   margin-bottom: 12px;
+  max-width: 720px;
 }
 
 .connect-row input {
@@ -391,33 +793,35 @@ button {
   min-width: 0;
   font: inherit;
   font-size: var(--fs-body);
+  min-height: 44px;
   padding: 11px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  color: var(--text-heading);
-  background: #fff;
-}
-
-.connect-row input::placeholder {
-  color: #6b7280;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--control-bg);
+  box-shadow: var(--shadow-sm);
 }
 
 .connect-row input:focus {
-  border-color: var(--blue-solid);
+  border-color: var(--accent);
 }
 
 .connect-btn {
   appearance: none;
   border: 0;
-  background: var(--blue-solid);
-  color: #fff;
+  background: var(--accent);
+  color: var(--on-accent);
   font: inherit;
   font-size: var(--fs-body);
   font-weight: 600;
-  padding: 11px 20px;
-  border-radius: 9px;
+  min-height: 44px;
+  padding: 11px 22px;
+  border-radius: 10px;
   cursor: pointer;
-  transition: background 150ms ease;
+  box-shadow: var(--shadow-sm);
+  transition:
+    background 150ms ease,
+    transform 150ms var(--ease-out);
   /* Sized for the longer of "Connect"/"Cancel" (and their `ar` equivalents)
      so swapping between the two never changes the button's width. */
   min-width: 9ch;
@@ -425,7 +829,11 @@ button {
 }
 
 .connect-btn:hover {
-  background: var(--blue-solid-hover);
+  background: var(--accent-hover);
+}
+
+.connect-btn:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .connect-btn:disabled {
@@ -440,22 +848,22 @@ button {
 }
 
 .connect-status {
-  color: var(--text-muted);
+  color: var(--text-3);
   font-size: var(--fs-body);
   margin: 0 0 18px;
 }
 
 .main-divider {
   height: 1px;
-  background: var(--border-subtle);
-  margin-bottom: 18px;
+  background: var(--border);
+  margin-block: 26px 22px;
 }
 
 .connections-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 .connections-header h2 {
@@ -468,10 +876,10 @@ button {
   appearance: none;
   border: 0;
   background: transparent;
-  color: #6b7280;
-  width: 26px;
-  height: 26px;
-  border-radius: 6px;
+  color: var(--text-3);
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -479,8 +887,8 @@ button {
 }
 
 .refresh-btn:hover {
-  background: #f0f1f4;
-  color: var(--text-heading);
+  background: var(--hover);
+  color: var(--text);
 }
 
 .empty-state {
@@ -488,18 +896,20 @@ button {
   flex-direction: column;
   align-items: center;
   text-align: center;
-  padding: 30px 20px;
+  padding: 44px 20px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
 }
 
 .empty-icon-circle {
-  width: 68px;
-  height: 68px;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
-  background: #f1f2f5;
+  background: var(--surface-2);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #b4b9c4;
+  color: var(--text-3);
   margin-bottom: 14px;
 }
 
@@ -511,8 +921,10 @@ button {
 
 .empty-subtext {
   font-size: var(--fs-body);
-  color: var(--text-secondary);
+  color: var(--text-2);
   margin: 0;
+  max-width: 44ch;
+  line-height: 1.5;
 }
 
 .connections-list {
@@ -530,18 +942,28 @@ button {
    width, not a line of text's height. */
 .connections-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   align-items: start;
-  gap: 12px;
+  gap: 14px;
 }
 
 .connections-grid > li.peer-card {
   display: block;
   padding: 0;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  transition:
+    border-color 160ms ease,
+    box-shadow 200ms var(--ease-out);
   /* Not `overflow: hidden`, however much the rounded corners would like it:
      the three-dot menu hangs outside the card and would be clipped away. The
      face rounds its own two corners instead. */
   overflow: visible;
+}
+
+.connections-grid > li.peer-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
 }
 
 .peer-card-face {
@@ -551,14 +973,14 @@ button {
   justify-content: center;
   gap: 6px;
   inline-size: 100%;
-  min-block-size: 108px;
-  padding: 10px;
+  min-block-size: 112px;
+  padding: 12px 10px 10px;
   border: 0;
-  border-block-end: 1px solid var(--border-subtle);
-  border-start-start-radius: 8px;
-  border-start-end-radius: 8px;
-  background: #f4f5f8;
-  color: #9aa1b1;
+  border-block-end: 1px solid var(--border);
+  border-start-start-radius: 11px;
+  border-start-end-radius: 11px;
+  background: var(--surface-2);
+  color: var(--text-3);
   font: inherit;
   text-align: center;
 }
@@ -566,10 +988,11 @@ button {
 /* Only the remembered-host card is a button; a session card is a panel. */
 button.peer-card-face {
   cursor: pointer;
+  transition: background 150ms ease;
 }
 
 button.peer-card-face:hover {
-  background: #eceef3;
+  background: var(--surface-3);
 }
 
 button.peer-card-face:disabled {
@@ -584,28 +1007,28 @@ button.peer-card-face:disabled {
   inline-size: 100%;
   block-size: 72px;
   overflow: hidden;
-  border-radius: 6px;
+  border-radius: 7px;
 }
 
 .peer-thumb-image {
   inline-size: 100%;
   block-size: 100%;
   object-fit: cover;
-  border-radius: 6px;
+  border-radius: 7px;
 }
 
 .peer-card-caption {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  line-height: 1.3;
+  line-height: 1.35;
 }
 
 .peer-card-foot {
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 8px 10px;
+  gap: 8px;
+  padding: 9px 10px 9px 12px;
 }
 
 .peer-card-foot .peer-label {
@@ -620,16 +1043,18 @@ button.peer-card-face:disabled {
   inline-size: 8px;
   block-size: 8px;
   border-radius: 50%;
-  background: #c7cbd4;
+  background: var(--border-strong);
   flex: none;
 }
 
 .peer-dot[data-state='live'] {
   background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-soft);
 }
 
 .peer-dot[data-state='pending'] {
-  background: #e8b046;
+  background: var(--amber-dot);
+  box-shadow: 0 0 0 3px var(--amber-soft);
 }
 
 /* The three dots. `<details>` keeps its own openness, which is what lets this
@@ -643,10 +1068,10 @@ button.peer-card-face:disabled {
   display: flex;
   align-items: center;
   justify-content: center;
-  inline-size: 24px;
-  block-size: 24px;
-  border-radius: 6px;
-  color: #6b7280;
+  inline-size: 26px;
+  block-size: 26px;
+  border-radius: 7px;
+  color: var(--text-3);
   cursor: pointer;
   list-style: none;
 }
@@ -657,23 +1082,24 @@ button.peer-card-face:disabled {
 
 .peer-menu-btn:hover,
 .peer-menu[open] .peer-menu-btn {
-  background: #f0f1f4;
-  color: var(--text-heading);
+  background: var(--hover-strong);
+  color: var(--text);
 }
 
 .peer-menu-list {
   position: absolute;
   z-index: 20;
-  inset-block-start: calc(100% + 4px);
+  inset-block-start: calc(100% + 6px);
   inset-inline-end: 0;
-  min-inline-size: 190px;
-  padding: 4px;
+  min-inline-size: 200px;
+  padding: 5px;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--panel-bg);
-  box-shadow: 0 8px 24px rgb(11 18 32 / 14%);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--raised);
+  box-shadow: var(--shadow-md);
+  animation: pop-in 140ms var(--ease-out);
 }
 
 .peer-menu-item,
@@ -686,7 +1112,7 @@ button.peer-card-face:disabled {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: var(--text-heading);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-body);
   text-align: start;
@@ -695,12 +1121,12 @@ button.peer-card-face:disabled {
 
 .peer-menu-item:hover,
 .peer-menu-item button:hover {
-  background: #f4f5f8;
+  background: var(--hover);
 }
 
 .peer-menu-item:disabled,
 .peer-menu-item button:disabled {
-  color: #9aa1b1;
+  color: var(--text-disabled);
   cursor: default;
   background: transparent;
 }
@@ -728,7 +1154,39 @@ button.peer-card-face:disabled {
 .peer-card > .clipboard-note,
 .peer-card > .secure-desktop-indicator,
 .peer-card > .terminal-indicator {
-  margin: 0 10px 10px;
+  margin: 0 12px 12px;
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .peer-menu-list,
+  .settings-backdrop,
+  .settings-panel,
+  .consent-backdrop,
+  .consent-backdrop .consent,
+  .credentials-backdrop,
+  .credentials-backdrop .credentials-panel {
+    animation: none;
+  }
 }
 
 .connections-list li {
@@ -739,26 +1197,26 @@ button.peer-card-face:disabled {
   flex-wrap: wrap;
   gap: 10px;
   padding: 10px 12px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 9px;
-  background: var(--panel-bg);
+  background: var(--raised);
 }
 
 .connections-list .peer-label {
   font-weight: 600;
-  color: var(--text-heading);
+  color: var(--text);
 }
 
 .connections-list .peer-meta {
-  color: var(--text-secondary);
+  color: var(--text-2);
   font-size: var(--fs-micro);
 }
 
 /* The fact that a clipboard synced, never its content (§15). */
 .connections-list .clipboard-note {
-  color: var(--text-secondary);
+  color: var(--text-2);
   font-size: var(--fs-micro);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 999px;
   padding: 1px 8px;
 }
@@ -776,10 +1234,10 @@ button.peer-card-face:disabled {
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  background: var(--sidebar-bg);
-  color: var(--text-secondary);
+  background: var(--group-bg);
+  color: var(--text-2);
   font-size: var(--fs-micro);
   cursor: pointer;
   list-style: none;
@@ -794,7 +1252,7 @@ button.peer-card-face:disabled {
   height: 7px;
   flex: none;
   border-radius: 50%;
-  background: var(--text-secondary);
+  background: var(--text-2);
 }
 
 .connections-list .quality-dot[data-path='direct'] {
@@ -803,20 +1261,20 @@ button.peer-card-face:disabled {
 
 .connections-list .quality-dot[data-path='relay'],
 .connections-list .quality-dot[data-path='mixed'] {
-  background: var(--amber, #c8891f);
+  background: var(--amber);
 }
 
 .connections-list .quality-path {
   font-weight: 600;
-  color: var(--text-heading);
+  color: var(--text);
 }
 
 .connections-list .quality-details {
   margin-top: 6px;
   padding: 8px 10px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: var(--sidebar-bg);
+  background: var(--group-bg);
   font-size: var(--fs-micro);
 }
 
@@ -829,11 +1287,11 @@ button.peer-card-face:disabled {
 }
 
 .connections-list .quality-label {
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 .connections-list .quality-value {
-  color: var(--text-heading);
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 
@@ -841,7 +1299,7 @@ button.peer-card-face:disabled {
 .connections-list .file-panel {
   flex-basis: 100%;
   margin-top: 8px;
-  border-top: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border);
   padding-top: 8px;
 }
 
@@ -852,12 +1310,25 @@ button.peer-card-face:disabled {
   gap: 8px;
 }
 
+/* A card is too narrow to set the hint beside its title without wrapping it
+   into a ragged right-aligned block, so there the two stack. */
+.peer-card .file-panel-head {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+.peer-card .file-panel-hint {
+  text-align: start;
+  line-height: 1.45;
+}
+
 /* The panel starts no transfer of its own any more, so the head is a title
    and the one line saying how sending actually works. */
 .connections-list .file-panel-hint {
   margin: 0;
   font-size: var(--fs-micro);
-  color: var(--text-secondary);
+  color: var(--text-2);
   text-align: end;
 }
 
@@ -865,7 +1336,7 @@ button.peer-card-face:disabled {
   margin: 0;
   font-size: var(--fs-micro);
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-2);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -890,14 +1361,14 @@ button.peer-card-face:disabled {
 
 .connections-list .file-name {
   font-weight: 600;
-  color: var(--text-heading);
+  color: var(--text);
   overflow-wrap: anywhere;
 }
 
 .connections-list .file-size,
 .connections-list .file-direction,
 .connections-list .file-state {
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 .connections-list .file-panel progress {
@@ -913,7 +1384,7 @@ button.peer-card-face:disabled {
 .connections-list .tunnel-panel {
   flex-basis: 100%;
   margin-top: 8px;
-  border-top: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border);
   padding-top: 8px;
 }
 
@@ -928,7 +1399,7 @@ button.peer-card-face:disabled {
   margin: 0;
   font-size: var(--fs-micro);
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-2);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -938,13 +1409,13 @@ button.peer-card-face:disabled {
 .connections-list .tunnel-active {
   font-size: var(--fs-micro);
   font-weight: 600;
-  color: var(--blue-solid);
+  color: var(--accent);
 }
 
 .connections-list .tunnel-panel p {
   margin: 6px 0 0;
   font-size: var(--fs-micro);
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 .connections-list .tunnel-targets {
@@ -965,12 +1436,12 @@ button.peer-card-face:disabled {
 
 .connections-list .tunnel-address {
   font-weight: 600;
-  color: var(--text-heading);
+  color: var(--text);
   overflow-wrap: anywhere;
 }
 
 .connections-list .tunnel-streams {
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 .connections-list .tunnel-add {
@@ -985,14 +1456,14 @@ button.peer-card-face:disabled {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 /* A remembered host is somewhere to go back to, so its whole face is the
    control (ADR 0094). Everything else that row used to carry side by side
    is in the menu beside it now, which styles its own items. */
 .connections-grid .history-row .peer-label {
-  color: var(--text-secondary);
+  color: var(--text-2);
   font-weight: 500;
 }
 
@@ -1002,7 +1473,7 @@ button.peer-card-face:disabled {
 }
 
 .peer-menu-item.history-remove:hover {
-  background: var(--red-tint);
+  background: var(--red-soft);
 }
 
 /* ---------- Host chat drawer ---------- */
@@ -1015,10 +1486,10 @@ button.peer-card-face:disabled {
   max-height: 55vh;
   display: flex;
   flex-direction: column;
-  background: var(--panel-bg);
-  border: 1px solid var(--border-subtle);
+  background: var(--raised);
+  border: 1px solid var(--border);
   border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(11, 18, 32, 0.16);
+  box-shadow: var(--shadow-md);
   overflow: hidden;
 }
 
@@ -1031,15 +1502,15 @@ button.peer-card-face:disabled {
   display: flex;
   justify-content: flex-end;
   padding: 4px 6px;
-  border-block-end: 1px solid var(--border-subtle);
-  background: var(--titlebar-bg);
+  border-block-end: 1px solid var(--border);
+  background: var(--surface-1);
 }
 
 .host-chat-close {
   appearance: none;
   border: 0;
   background: transparent;
-  color: #6b7280;
+  color: var(--text-3);
   font-size: 16px;
   line-height: 1;
   width: 26px;
@@ -1049,8 +1520,8 @@ button.peer-card-face:disabled {
 }
 
 .host-chat-close:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: var(--text-heading);
+  background: var(--hover);
+  color: var(--text);
 }
 
 .host-chat-body {
@@ -1076,41 +1547,41 @@ button.peer-card-face:disabled {
 
 .host-chat-body .chat-out {
   text-align: end;
-  color: var(--blue-solid);
+  color: var(--accent);
 }
 
 .host-chat-body .chat-in {
   text-align: start;
-  color: var(--text-heading);
+  color: var(--text);
 }
 
 .host-chat-body .chat-compose {
   display: flex;
   gap: 6px;
   padding: 8px;
-  border-block-start: 1px solid var(--border-subtle);
+  border-block-start: 1px solid var(--border);
 }
 
 .host-chat-body .chat-input {
   flex: 1;
   min-width: 0;
   font: inherit;
-  color: var(--text-heading);
-  background: #fff;
-  border: 1px solid var(--border-subtle);
+  color: var(--text);
+  background: var(--control-bg);
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 7px 10px;
 }
 
 .host-chat-body .chat-input:focus {
-  border-color: var(--blue-solid);
+  border-color: var(--accent);
 }
 
 .host-chat-body .chat-send {
   appearance: none;
-  border: 1px solid var(--blue-solid);
-  background: #fff;
-  color: var(--blue-solid);
+  border: 1px solid var(--accent);
+  background: var(--control-bg);
+  color: var(--accent);
   font: inherit;
   font-weight: 600;
   border-radius: 8px;
@@ -1119,7 +1590,7 @@ button.peer-card-face:disabled {
 }
 
 .host-chat-body .chat-send:hover {
-  background: #eef2fe;
+  background: var(--accent-soft);
 }
 
 /* ---------- Consent modal ---------- */
@@ -1138,16 +1609,19 @@ button.peer-card-face:disabled {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(11, 18, 32, 0.45);
+  background: var(--scrim);
+  animation: fade-in 160ms ease-out;
 }
 
 .consent-backdrop .consent {
-  background: var(--panel-bg);
-  border-radius: 14px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
   padding: 26px 28px;
-  max-width: 360px;
+  max-width: 380px;
   width: 100%;
+  animation: dialog-in 220ms var(--ease-out);
 }
 
 .consent-backdrop h1 {
@@ -1158,7 +1632,7 @@ button.peer-card-face:disabled {
 
 .consent-backdrop p {
   font-size: var(--fs-body);
-  color: var(--text-secondary);
+  color: var(--text-2);
   line-height: 1.5;
   margin: 0 0 20px;
 }
@@ -1171,20 +1645,22 @@ button.peer-card-face:disabled {
 
 .consent-actions button {
   appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
+  border: 1px solid var(--border-strong);
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-body);
   font-weight: 600;
+  min-height: 40px;
   padding: 10px 14px;
-  border-radius: 9px;
+  border-radius: 10px;
   cursor: pointer;
+  box-shadow: var(--shadow-sm);
   transition: background 150ms ease;
 }
 
 .consent-actions button:hover {
-  background: #f4f5f8;
+  background: var(--hover);
 }
 
 .consent-actions .consent-action-deny {
@@ -1193,21 +1669,21 @@ button.peer-card-face:disabled {
 }
 
 .consent-actions .consent-action-deny:hover {
-  background: var(--red-tint);
+  background: var(--red-soft);
 }
 
 .consent-actions .consent-action-view:hover {
-  background: #eef2fe;
+  background: var(--accent-soft);
 }
 
 .consent-actions .consent-action-full {
-  border-color: var(--blue-solid);
-  background: var(--blue-solid);
-  color: #fff;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .consent-actions .consent-action-full:hover {
-  background: var(--blue-solid-hover);
+  background: var(--accent-hover);
 }
 
 /* ---------- Credentials modal (docs/bugs/02-connect-form.md, task 5) ----------
@@ -1222,16 +1698,19 @@ button.peer-card-face:disabled {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(11, 18, 32, 0.45);
+  background: var(--scrim);
+  animation: fade-in 160ms ease-out;
 }
 
 .credentials-backdrop .credentials-panel {
-  background: var(--panel-bg);
-  border-radius: 14px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
   padding: 26px 28px;
-  max-width: 360px;
+  max-width: 380px;
   width: 100%;
+  animation: dialog-in 220ms var(--ease-out);
 }
 
 .credentials-head {
@@ -1253,7 +1732,7 @@ button.peer-card-face:disabled {
   appearance: none;
   border: 0;
   background: transparent;
-  color: #6b7280;
+  color: var(--text-3);
   font-size: 18px;
   line-height: 1;
   width: 28px;
@@ -1264,8 +1743,8 @@ button.peer-card-face:disabled {
 }
 
 .credentials-close:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: var(--text-heading);
+  background: var(--hover);
+  color: var(--text);
 }
 
 /* ---------- Settings screen (docs/bugs/05-settings-window.md) ----------
@@ -1280,33 +1759,42 @@ button.peer-card-face:disabled {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 20px;
-  background: rgba(11, 18, 32, 0.45);
+  padding: 24px;
+  background: var(--scrim);
+  animation: fade-in 160ms ease-out;
 }
 
+/* A sectioned sheet rather than a scrolling form: the heading runs across the
+   top, the sections stand in a column on the left, and only the body scrolls.
+   A fixed height, so moving between sections never makes the sheet jump. */
 .settings-backdrop .settings-panel {
-  display: flex;
-  flex-direction: column;
-  background: var(--panel-bg);
-  border-radius: 14px;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
-  max-width: 560px;
-  width: 100%;
-  max-height: min(720px, 90vh);
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  width: min(800px, 100%);
+  height: min(620px, 100%);
+  overflow: hidden;
+  animation: dialog-in 220ms var(--ease-out);
 }
 
 .settings-head {
-  flex: none;
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 20px 24px;
-  border-block-end: 1px solid var(--border-subtle);
+  padding-block: 12px;
+  padding-inline: 22px 12px;
+  border-block-end: 1px solid var(--border);
 }
 
 .settings-head h2 {
-  font-size: var(--fs-emphasis);
+  font-size: 16px;
   font-weight: 700;
+  letter-spacing: -0.01em;
   margin: 0;
 }
 
@@ -1314,87 +1802,347 @@ button.peer-card-face:disabled {
   appearance: none;
   border: 0;
   background: transparent;
-  color: #6b7280;
-  font-size: 18px;
-  line-height: 1;
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
+  color: var(--text-3);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
   cursor: pointer;
 }
 
 .settings-close:hover {
-  background: rgba(0, 0, 0, 0.05);
-  color: var(--text-heading);
+  background: var(--hover-strong);
+  color: var(--text);
 }
 
-/* Section strip under the settings heading. Six panels in one scroll was the
-   complaint; these are the four groups they fall into. */
+/* The section column. Six panels in one scroll was the complaint; these are
+   the groups they fall into. */
 .settings-tabs {
-  flex: none;
+  grid-column: 1;
+  grid-row: 2;
   display: flex;
+  flex-direction: column;
   gap: 2px;
-  padding: 8px 16px 0;
-  border-block-end: 1px solid var(--border-subtle);
+  padding: 12px 10px;
+  background: var(--surface-1);
+  border-inline-end: 1px solid var(--border);
+  overflow-y: auto;
 }
 
 .settings-tab {
   appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  inline-size: 100%;
   border: 0;
-  border-block-end: 2px solid transparent;
   background: transparent;
-  color: var(--text-secondary);
+  color: var(--text-2);
   font: inherit;
   font-size: var(--fs-body);
-  font-weight: 600;
-  padding: 9px 12px;
-  margin-block-end: -1px;
-  border-radius: 7px 7px 0 0;
+  font-weight: 500;
+  padding: 8px 10px;
+  border-radius: 8px;
+  text-align: start;
   cursor: pointer;
   white-space: nowrap;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.settings-tab svg {
+  flex: none;
+  color: var(--text-3);
+}
+
+.settings-tab span {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .settings-tab:hover {
-  background: rgba(0, 0, 0, 0.04);
-  color: var(--text-heading);
+  background: var(--hover);
+  color: var(--text);
 }
 
-.settings-tab-active {
-  color: var(--text-heading);
-  border-block-end-color: var(--blue-solid);
+.settings-tab-active,
+.settings-tab-active:hover {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.settings-tab-active svg {
+  color: currentColor;
 }
 
 .settings-body {
-  flex: 1;
+  grid-column: 2;
+  grid-row: 2;
   min-height: 0;
   overflow-y: auto;
-  padding: 20px 24px 24px;
+  padding: 22px 26px 28px;
 }
 
-.invite-refresh {
+.settings-body > :first-child,
+.system-settings > :first-child {
+  margin-top: 0;
+}
+
+/* In a narrow window the column lies down as a row above the body. */
+@media (max-width: 640px) {
+  .settings-backdrop {
+    padding: 10px;
+  }
+
+  .settings-backdrop .settings-panel {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+    height: 100%;
+  }
+
+  .settings-tabs {
+    grid-column: 1;
+    grid-row: 2;
+    flex-direction: row;
+    overflow-x: auto;
+    border-inline-end: 0;
+    border-block-end: 1px solid var(--border);
+    padding: 8px;
+  }
+
+  .settings-tab {
+    inline-size: auto;
+  }
+
+  .settings-body {
+    grid-column: 1;
+    grid-row: 3;
+    padding: 18px 16px 22px;
+  }
+}
+
+/* ---------- Settings cards ----------
+   Every panel the settings screen hosts is one card in one language: the same
+   surface, edge, radius and heading, whichever module draws it. */
+.settings-group,
+.invite-refresh,
+.unattended-panel,
+.address-book,
+.recordings,
+.audit {
   margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--sidebar-bg);
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--group-bg);
 }
 
-.invite-refresh-btn {
-  appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 7px 12px;
-  border-radius: 7px;
+.settings-group h3,
+.unattended-panel h3,
+.address-book h3,
+.recordings h3,
+.audit h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+}
+
+/* One setting per row: what it is on the leading side, the control on the
+   trailing side, rows ruled apart. */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding-block: 12px;
+  border-block-start: 1px solid var(--border);
+}
+
+.settings-group h3 + .setting-row {
+  border-block-start: 0;
+  padding-block-start: 6px;
+}
+
+.setting-row:last-child {
+  padding-block-end: 0;
+}
+
+label.setting-row {
   cursor: pointer;
+}
+
+.setting-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.setting-label {
+  font-size: var(--fs-body);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.setting-note {
+  font-size: var(--fs-micro);
+  line-height: 1.5;
+  color: var(--text-3);
+  max-width: 58ch;
+}
+
+.setting-row > select {
+  flex: none;
+  min-width: 180px;
+}
+
+.setting-row > .btn {
+  flex: none;
+}
+
+/* The theme picker: three options, one always chosen — real radio inputs, so
+   the arrow keys and the screen reader get the behaviour for free, dressed as
+   a segmented control. */
+.segmented {
+  display: inline-flex;
+  flex: none;
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
+.segment {
+  position: relative;
+  display: flex;
+}
+
+.segment input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.segment span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  color: var(--text-2);
+  font-size: var(--fs-micro);
+  font-weight: 500;
+  white-space: nowrap;
+  transition:
+    background 150ms ease,
+    color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.segment:hover span {
+  color: var(--text);
+}
+
+.segment input:checked + span {
+  background: var(--raised);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow:
+    var(--shadow-sm),
+    0 0 0 1px var(--border);
+}
+
+.segment input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* On/off settings. Still a checkbox to every script and assistive technology
+   (`role="switch"` says which kind); only the drawing changes. */
+input[type='checkbox'].switch {
+  appearance: none;
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: 20px;
+  margin: 0;
+  border-radius: 999px;
+  background: var(--switch-off);
+  cursor: pointer;
+  transition: background 180ms var(--ease-out);
+}
+
+input[type='checkbox'].switch::before {
+  content: '';
+  position: absolute;
+  inset-block-start: 2px;
+  inset-inline-start: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 25%);
+  transition: transform 180ms var(--ease-out);
+}
+
+input[type='checkbox'].switch:checked {
+  background: var(--accent);
+}
+
+input[type='checkbox'].switch:checked::before {
+  transform: translateX(16px);
+}
+
+[dir='rtl'] input[type='checkbox'].switch:checked::before {
+  transform: translateX(-16px);
+}
+
+input[type='checkbox'].switch:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* About: the mark, the name and the build, then the update rows under them. */
+.about-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-block-end: 16px;
+}
+
+.about-head .logo-icon {
+  width: 44px;
+  height: 44px;
+}
+
+.about-title p {
+  margin: 0;
+}
+
+.about-name {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.about-title .about-version {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
 }
 
 .invite-refresh-note {
   margin: 8px 0 0;
-  color: var(--text-muted);
+  color: var(--text-3);
   font-size: var(--fs-micro);
 }
 
@@ -1410,7 +2158,7 @@ button.peer-card-face:disabled {
   padding: 8px 12px;
   border: 1px solid var(--red);
   border-radius: 8px;
-  background: var(--red-tint);
+  background: var(--red-soft);
   color: var(--red);
   font-size: var(--fs-micro);
   font-weight: 600;
@@ -1427,9 +2175,9 @@ button.peer-card-face:disabled {
   gap: 12px;
   margin: 0 0 10px;
   padding: 10px 12px;
-  border: 1px solid var(--red);
-  border-radius: 8px;
-  background: var(--red);
+  border: 1px solid var(--danger-solid);
+  border-radius: 10px;
+  background: var(--danger-solid);
   color: #fff;
   font-size: var(--fs-micro);
 }
@@ -1447,7 +2195,7 @@ button.peer-card-face:disabled {
   border: 1px solid #fff;
   border-radius: 6px;
   background: #fff;
-  color: var(--red);
+  color: var(--danger-solid);
   font-size: var(--fs-micro);
   font-weight: 600;
   cursor: pointer;
@@ -1476,9 +2224,9 @@ button.peer-card-face:disabled {
 
 .connections-list .record-btn {
   appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
+  border: 1px solid var(--border);
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-micro);
   font-weight: 600;
@@ -1488,7 +2236,7 @@ button.peer-card-face:disabled {
 }
 
 .connections-list .record-btn:disabled {
-  color: var(--text-secondary);
+  color: var(--text-2);
   cursor: not-allowed;
 }
 
@@ -1510,7 +2258,7 @@ button.peer-card-face:disabled {
    surfaces that stay on screen, and the full path is available on hover for
    the operator who needs it. */
 .connections-list .recording-path {
-  color: var(--text-secondary);
+  color: var(--text-2);
   font-size: var(--fs-micro);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1525,18 +2273,18 @@ button.peer-card-face:disabled {
   gap: 8px;
   margin-top: 6px;
   padding: 8px 10px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 7px;
-  background: var(--sidebar-bg);
+  background: var(--group-bg);
   font-size: var(--fs-micro);
 }
 
 .connections-list .record-allow,
 .connections-list .record-deny {
   appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
+  border: 1px solid var(--border);
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-micro);
   font-weight: 600;
@@ -1608,7 +2356,7 @@ button.peer-card-face:disabled {
   align-items: center;
   gap: 6px;
   font-size: var(--fs-micro);
-  color: var(--amber, #c8891f);
+  color: var(--amber);
 }
 
 .unattended-indicator::before {
@@ -1617,22 +2365,7 @@ button.peer-card-face:disabled {
   height: 6px;
   flex: none;
   border-radius: 50%;
-  background: var(--amber, #c8891f);
-}
-
-.unattended-panel,
-.address-book {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--sidebar-bg);
-}
-
-.unattended-panel h3,
-.address-book h3 {
-  margin: 0 0 4px;
-  font-size: var(--fs-body);
+  background: var(--amber);
 }
 
 .unattended-explain,
@@ -1640,9 +2373,10 @@ button.peer-card-face:disabled {
 .credentials-body,
 .totp-note,
 .unattended-hint {
-  margin: 0 0 10px;
-  color: var(--text-muted);
+  margin: 0 0 12px;
+  color: var(--text-3);
   font-size: var(--fs-micro);
+  line-height: 1.5;
 }
 
 .unattended-state {
@@ -1661,18 +2395,23 @@ button.peer-card-face:disabled {
 }
 
 .unattended-password input,
-.credentials-form input,
+.credentials-form input {
+  flex: 1 1 160px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 10px;
+  font-size: var(--fs-micro);
+}
+
 .unattended-panel select,
 .address-book select {
   flex: 1 1 160px;
   min-width: 0;
-  padding: 7px 9px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
-  font: inherit;
   font-size: var(--fs-micro);
 }
 
+/* The panels' own buttons, folded into `.btn`'s look (see the top of this
+   file). The class-less ones are the audit panel's. */
 .unattended-save,
 .unattended-disable,
 .credentials-submit,
@@ -1680,21 +2419,72 @@ button.peer-card-face:disabled {
 .book-forget,
 .book-save-btn,
 .trust-accept,
-.trust-cancel {
+.trust-cancel,
+.invite-refresh-btn,
+.audit-clear-yes,
+.settings-body button:not([class]) {
   appearance: none;
-  border: 1px solid var(--border-subtle);
-  background: #fff;
-  color: var(--text-heading);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  border: 1px solid var(--border-strong);
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-micro);
   font-weight: 600;
-  padding: 7px 12px;
-  border-radius: 7px;
+  padding: 5px 12px;
+  border-radius: 8px;
   cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: background 150ms ease;
+}
+
+.unattended-save:hover:not(:disabled),
+.totp-done:hover:not(:disabled),
+.book-forget:hover:not(:disabled),
+.book-save-btn:hover:not(:disabled),
+.trust-cancel:hover:not(:disabled),
+.invite-refresh-btn:hover:not(:disabled),
+.settings-body button:not([class]):hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.unattended-disable:hover:not(:disabled),
+.trust-accept:hover:not(:disabled),
+.audit-clear-yes:hover:not(:disabled) {
+  background: var(--red-soft);
+}
+
+.unattended-save:disabled,
+.invite-refresh-btn:disabled,
+.settings-body button:not([class]):disabled {
+  color: var(--text-disabled);
+  cursor: default;
+  box-shadow: none;
+}
+
+/* Submitting the device password is what that dialog is for. */
+.credentials-submit {
+  min-height: 36px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.credentials-submit:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.credentials-submit:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .unattended-disable,
-.trust-accept {
+.trust-accept,
+.audit-clear-yes {
   border-color: var(--red);
   color: var(--red);
 }
@@ -1727,7 +2517,7 @@ button.peer-card-face:disabled {
 .totp-sheet {
   margin: 8px 0;
   padding: 10px 12px;
-  border: 1px dashed var(--border-subtle);
+  border: 1px dashed var(--border);
   border-radius: 7px;
 }
 
@@ -1736,8 +2526,8 @@ button.peer-card-face:disabled {
   margin: 6px 0;
   padding: 8px 10px;
   border-radius: 6px;
-  background: var(--code-bg, #f4f4f5);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
   font-size: var(--fs-micro);
   word-break: break-all;
   user-select: all;
@@ -1761,7 +2551,7 @@ button.peer-card-face:disabled {
   align-items: center;
   gap: 8px;
   padding: 9px 0;
-  border-top: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border);
   font-size: var(--fs-micro);
 }
 
@@ -1771,14 +2561,14 @@ button.peer-card-face:disabled {
 
 .book-tag {
   padding: 2px 7px;
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  color: var(--text-muted);
+  color: var(--text-3);
 }
 
 .book-note {
   flex-basis: 100%;
-  color: var(--text-muted);
+  color: var(--text-3);
 }
 
 .book-forget {
@@ -1793,7 +2583,7 @@ button.peer-card-face:disabled {
   padding: 10px 12px;
   border: 1px solid var(--red);
   border-radius: 8px;
-  background: #fff;
+  background: var(--control-bg);
 }
 
 .trust-confirm h4 {
@@ -1803,7 +2593,7 @@ button.peer-card-face:disabled {
 
 .trust-confirm p {
   margin: 0 0 10px;
-  color: var(--text-muted);
+  color: var(--text-3);
   font-size: var(--fs-micro);
 }
 
@@ -1813,24 +2603,11 @@ button.peer-card-face:disabled {
 }
 
 /* Recordings on this device and their export (§9.2; ADR 0035). Same card as
-   the address book: it is one more thing this machine holds, not a session
-   control. */
-.recordings {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--sidebar-bg);
-}
-
-.recordings h3 {
-  margin: 0 0 4px;
-  font-size: var(--fs-body);
-}
-
+   the address book (see "Settings cards"): it is one more thing this machine
+   holds, not a session control. */
 .recordings-empty {
   margin: 0;
-  color: var(--text-muted);
+  color: var(--text-3);
   font-size: var(--fs-micro);
 }
 
@@ -1846,7 +2623,7 @@ button.peer-card-face:disabled {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
-  border-top: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border);
   font-size: var(--fs-micro);
 }
 
@@ -1863,29 +2640,36 @@ button.peer-card-face:disabled {
 }
 
 .recording-size {
-  color: var(--text-secondary);
+  color: var(--text-2);
 }
 
 .recording-export-btn {
   appearance: none;
-  border: 1px solid var(--border-subtle);
-  border-radius: 7px;
-  background: #fff;
-  color: var(--text-heading);
+  min-height: 30px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--control-bg);
+  color: var(--text);
   font: inherit;
   font-size: var(--fs-micro);
-  padding: 5px 10px;
+  font-weight: 600;
+  padding: 5px 12px;
   cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+
+.recording-export-btn:hover:not(:disabled) {
+  background: var(--surface-2);
 }
 
 .recording-export-btn:disabled {
-  color: var(--text-secondary);
+  color: var(--text-2);
   cursor: progress;
 }
 
 .recording-export-note {
   flex-basis: 100%;
-  color: var(--text-secondary);
+  color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1897,24 +2681,11 @@ button.peer-card-face:disabled {
 }
 
 /* Audit log panel (§15; ADR 0041). Same card as .recordings: it sits next to
-   it in the main column and reads as one more thing this device keeps. */
-.audit {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--sidebar-bg);
-}
-
-.audit h3 {
-  margin: 0 0 4px;
-  font-size: var(--fs-body);
-}
-
+   it and reads as one more thing this device keeps. */
 .audit-disabled,
 .audit-empty {
   margin: 0;
-  color: var(--text-muted);
+  color: var(--text-3);
   font-size: var(--fs-micro);
 }
 
@@ -1945,56 +2716,37 @@ button.peer-card-face:disabled {
 .audit-table td {
   padding: 4px 6px;
   text-align: start;
-  border-top: 1px solid var(--border-subtle);
+  border-top: 1px solid var(--border);
   vertical-align: top;
 }
 
 .audit-table thead th {
   border-top: none;
-  color: var(--text-muted);
+  color: var(--text-3);
   font-weight: 500;
 }
 
+.audit-table td {
+  font-variant-numeric: tabular-nums;
+}
+
 .audit-peer {
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
 }
 
 .audit-confirm,
 .audit-notice {
-  color: var(--text-muted);
+  color: var(--text-3);
 }
 
-/* Autostart and updates (ADR 0042). Same card as .audit and .recordings. */
-.system-settings {
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 9px;
-  background: var(--sidebar-bg);
-}
-
-.system-settings h3 {
-  margin: 0 0 4px;
-  font-size: var(--fs-body);
-}
-
-.system-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: var(--fs-micro);
-}
-
-.system-note {
-  margin: 4px 0 0;
-  color: var(--text-muted);
-  font-size: var(--fs-micro);
-}
-
+/* Autostart, the theme and updates (ADR 0042, ADR 0117). `.system-settings`
+   is only the wrapper around its cards now; the rows are `.setting-row`. */
 .system-error {
   margin: 4px 0 0;
-  color: var(--danger, #c0392b);
+  color: var(--red);
   font-size: var(--fs-micro);
+}
+
+.setting-text .system-error {
+  margin: 0;
 }

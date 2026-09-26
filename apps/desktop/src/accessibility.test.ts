@@ -6,12 +6,12 @@
 // See docs/adr/0009-phase-6-ui-accessibility-and-release-scope.md for why
 // a full-browser audit isn't wired into this repo's CI.
 import * as axe from 'axe-core';
-import { render } from 'lit-html';
+import { html, render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { addressBook, type AddressBookEntry } from './address-book';
 import { auditPanel, resetAuditPanel, type AuditCommands, type AuditRow } from './audit-log';
-import { resetSystemSettings, systemSettings, type SystemCommands } from './system-settings';
+import { resetSystemSettings, systemSettings, updateSettings, type SystemCommands } from './system-settings';
 import { consentDialog } from './consent-dialog';
 import { SUPPORTED_LOCALES } from './i18n';
 import { connectPanel, credentialsPanel, inviteCodePanel, setConnectPhase } from './invite-view';
@@ -232,43 +232,47 @@ describe('accessibility: settings screen', () => {
     autostartSet: () => Promise.resolve(),
     updateCheck: () => Promise.resolve(null),
     updateInstall: () => Promise.resolve(),
+    appVersion: () => Promise.resolve('0.0.23'),
   };
 
   for (const locale of SUPPORTED_LOCALES) {
-    it(`has no axe violations while open (${locale})`, async () => {
-      resetSettingsView();
-      resetAuditPanel();
-      resetSystemSettings();
-      openSettings();
-      render(
-        settingsView({
-          locale,
-          unattended: off,
-          savedDevices: [],
-          recordings: [],
-          recordingsCommands: {
-            list: () => Promise.resolve([]),
-            export: () =>
-              Promise.resolve({
-                dir: '',
-                video: null,
-                audio: null,
-                video_frames: 0,
-                audio_packets: 0,
-                events_skipped: 0,
-              }),
-          },
-          auditCommands: commands,
-          systemCommands,
-          onRefresh: () => {},
-        }),
-        container,
-      );
-      expect(await auditViolations(container)).toEqual([]);
-      resetSettingsView();
-      resetAuditPanel();
-      resetSystemSettings();
-    });
+    it.each(['system', 'access', 'recordings', 'about'] as const)(
+      `has no axe violations while open on %s (${locale})`,
+      async (section) => {
+        resetSettingsView();
+        resetAuditPanel();
+        resetSystemSettings();
+        openSettings(section);
+        render(
+          settingsView({
+            locale,
+            unattended: off,
+            savedDevices: [],
+            recordings: [],
+            recordingsCommands: {
+              list: () => Promise.resolve([]),
+              export: () =>
+                Promise.resolve({
+                  dir: '',
+                  video: null,
+                  audio: null,
+                  video_frames: 0,
+                  audio_packets: 0,
+                  events_skipped: 0,
+                }),
+            },
+            auditCommands: commands,
+            systemCommands,
+            onRefresh: () => {},
+          }),
+          container,
+        );
+        expect(await auditViolations(container)).toEqual([]);
+        resetSettingsView();
+        resetAuditPanel();
+        resetSystemSettings();
+      },
+    );
   }
 });
 
@@ -334,17 +338,25 @@ describe('accessibility: this device', () => {
     autostartSet: () => Promise.resolve(),
     updateCheck: () => Promise.resolve({ version: '0.0.24', current: '0.0.23', notes: '' }),
     updateInstall: () => Promise.resolve(),
+    appVersion: () => Promise.resolve('0.0.23'),
   };
 
   for (const locale of SUPPORTED_LOCALES) {
     it(`has no axe violations, before and after an update is found (${locale})`, async () => {
       resetSystemSettings();
-      render(systemSettings(locale, commands), container);
+      const paint = () => {
+        render(html`${systemSettings(locale, commands)}${updateSettings(locale, commands)}`, container);
+      };
+      paint();
+      await vi.waitFor(() => {
+        paint();
+        expect(container.querySelector('[data-testid="autostart-toggle"]')).not.toBeNull();
+      });
       expect(await auditViolations(container)).toEqual([]);
 
       container.querySelector<HTMLButtonElement>('[data-testid="update-check"]')?.click();
       await vi.waitFor(() => {
-        render(systemSettings(locale, commands), container);
+        paint();
         expect(container.querySelector('[data-testid="update-found"]')).not.toBeNull();
       });
       expect(await auditViolations(container)).toEqual([]);

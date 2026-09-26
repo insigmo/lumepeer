@@ -9,6 +9,7 @@ import { t } from './i18n';
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
+vi.mock('@tauri-apps/api/app', () => ({ getVersion: () => Promise.resolve('0.0.98') }));
 
 /** What `unattended_status` reports for the running test; mutated per case. */
 let unattendedEnabled = false;
@@ -33,6 +34,7 @@ const RESPONSES: Record<string, unknown> = {
   audit_kinds: [],
   audit_list: [],
   autostart_status: false,
+  update_check: null,
 };
 
 function app(): HTMLElement {
@@ -124,7 +126,7 @@ describe('panels moved to settings (task 3)', () => {
     expect(app().querySelector('main.main-panel [data-testid="system-settings"]')).toBeNull();
 
     app().querySelector<HTMLButtonElement>('.settings-btn')?.click();
-    // The panels live under three tabs now, so each one is checked on the tab
+    // The panels live under four tabs now, so each one is checked on the tab
     // that owns it — the point of the test is still "in settings and nowhere
     // else", not "all on one screen".
     const body = () => app().querySelector('.settings-body');
@@ -132,15 +134,17 @@ describe('panels moved to settings (task 3)', () => {
       app().querySelector<HTMLButtonElement>(`#settings-tab-${id}`)?.click();
     };
     expect(body()?.querySelector('[data-testid="system-settings"]')).not.toBeNull();
-    expect(body()?.querySelector('.address-book')).not.toBeNull();
-    expect(body()?.querySelector('.invite-refresh-btn')).not.toBeNull();
     openTab('access');
     expect(body()?.querySelector('.unattended-panel')).not.toBeNull();
+    expect(body()?.querySelector('.address-book')).not.toBeNull();
+    expect(body()?.querySelector('.invite-refresh-btn')).not.toBeNull();
     openTab('recordings');
     expect(body()?.querySelector('.recordings')).not.toBeNull();
+    openTab('about');
+    expect(body()?.querySelector('[data-testid="update-settings"]')).not.toBeNull();
   });
 
-  it('groups the panels under three tabs and shows one section at a time', async () => {
+  it('groups the panels under four tabs and shows one section at a time', async () => {
     await boot();
     app().querySelector<HTMLButtonElement>('.settings-btn')?.click();
 
@@ -149,18 +153,21 @@ describe('panels moved to settings (task 3)', () => {
       'settings-tab-system',
       'settings-tab-access',
       'settings-tab-recordings',
+      'settings-tab-about',
     ]);
-    // System is where an open starts — it absorbed the Devices tab, so the
-    // address book opens with it — and nothing from another section is on
-    // screen alongside.
+    // General is where an open starts, and nothing from another section is
+    // on screen alongside it.
     expect(tabs[0]?.getAttribute('aria-selected')).toBe('true');
-    expect(app().querySelector('.settings-body .address-book')).not.toBeNull();
+    expect(app().querySelector('.settings-body [data-testid="system-settings"]')).not.toBeNull();
+    expect(app().querySelector('.settings-body .address-book')).toBeNull();
     expect(app().querySelector('.settings-body .unattended-panel')).toBeNull();
     expect(app().querySelector('.settings-body .recordings')).toBeNull();
 
+    // Access absorbed the Devices tab: the saved devices sit with the
+    // unattended password they decide who may try.
     app().querySelector<HTMLButtonElement>('#settings-tab-access')?.click();
     expect(app().querySelector('.settings-body .unattended-panel')).not.toBeNull();
-    expect(app().querySelector('.settings-body .address-book')).toBeNull();
+    expect(app().querySelector('.settings-body .address-book')).not.toBeNull();
     expect(app().querySelector('.settings-body [data-testid="system-settings"]')).toBeNull();
     expect(
       app().querySelector('#settings-tab-access')?.getAttribute('aria-selected'),
@@ -172,6 +179,45 @@ describe('panels moved to settings (task 3)', () => {
     const main = app().querySelector('main.main-panel');
     expect(main?.querySelector('.connect-row')).not.toBeNull();
     expect(main?.querySelector('.connections-header')).not.toBeNull();
+  });
+});
+
+describe('version and updates in the sidebar (ADR 0117)', () => {
+  afterEach(() => {
+    RESPONSES.update_check = null;
+  });
+
+  it('shows the running version, which opens About', async () => {
+    await boot();
+    const version = await vi.waitFor(() => {
+      const button = app().querySelector<HTMLButtonElement>('.footer-tag [data-testid="sidebar-version"]');
+      expect(button).not.toBeNull();
+      return button as HTMLButtonElement;
+    });
+    expect(version.textContent?.trim()).toBe('v0.0.98');
+    version.click();
+    expect(app().querySelector('#settings-tab-about')?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('checks once at launch and says when a newer release exists, installing nothing', async () => {
+    RESPONSES.update_check = { version: '0.1.0', current: '0.0.98', notes: '' };
+    await boot();
+    const chip = await vi.waitFor(() => {
+      const button = app().querySelector<HTMLButtonElement>('[data-testid="update-chip"]');
+      expect(button).not.toBeNull();
+      return button as HTMLButtonElement;
+    });
+    expect(chip.textContent).toContain('0.1.0');
+    expect(invoke).toHaveBeenCalledWith('update_check');
+    expect(invoke).not.toHaveBeenCalledWith('update_install');
+
+    chip.click();
+    expect(app().querySelector('[data-testid="update-install"]')).not.toBeNull();
+  });
+
+  it('shows no update notice when the channel has nothing newer', async () => {
+    await boot();
+    expect(app().querySelector('[data-testid="update-chip"]')).toBeNull();
   });
 });
 
