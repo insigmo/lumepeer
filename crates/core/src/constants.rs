@@ -447,11 +447,16 @@ pub const STUN_QUERY_TIMEOUT_MS: u64 = 3_000;
 /// healthy path at ~30 s, which was once mistaken for a DPI drop
 /// (project-lumepeer-quic-vs-relay-transport). Must stay below
 /// [`QUIC_MAX_IDLE_TIMEOUT_SECS`].
-pub const QUIC_KEEPALIVE_SECS: u64 = 15;
+pub const QUIC_KEEPALIVE_SECS: u64 = 5;
 /// Idle timeout on the obfuscated QUIC transport (task 17, ADR 0052). Larger
 /// than twice [`QUIC_KEEPALIVE_SECS`] so a single lost keep-alive never trips
-/// it, but bounded so a truly dead path is eventually released.
-pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 60;
+/// it, but bounded so a truly dead path is released.
+///
+/// Short on purpose since ADR 0116: this is how long a session sits on a
+/// frozen picture before anything notices the path is gone, and the dial that
+/// follows now takes about a second, so a path that died is better given up
+/// quickly and dialed again than waited on for a minute.
+pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 20;
 /// Interval on which a host holding an obfuscated-transport invite open
 /// resends a STUN request, to keep its NAT mapping from expiring before a
 /// guest dials in (task 17 increment 2, ADR 0053).
@@ -521,6 +526,29 @@ pub const RENDEZVOUS_KNOCK_FRESH_SECS: u64 = 120;
 pub const RENDEZVOUS_PUNCH_PACKETS: u32 = 10;
 /// Spacing of a host's punch packets, milliseconds (ADR 0113).
 pub const RENDEZVOUS_PUNCH_INTERVAL_MS: u64 = 1_000;
+/// Longest the TCP connect, TLS handshake and WebSocket upgrade to one
+/// signalling relay may take together, seconds (ADR 0116). A relay an ISP
+/// blackholes never answers at all, and waiting on it would only delay the
+/// reconnect that tries it again.
+pub const SIGNAL_CONNECT_TIMEOUT_SECS: u64 = 8;
+/// How often an idle connection to a signalling relay is pinged, seconds
+/// (ADR 0116). A TSPU-style freeze drops a TCP flow silently, with no RST, so
+/// the only way to notice is to ask for an answer and not get one.
+pub const SIGNAL_PING_SECS: u64 = 20;
+/// Silence after which a signalling relay connection counts as frozen and is
+/// replaced, seconds (ADR 0116). Longer than [`SIGNAL_PING_SECS`], so one
+/// ping always has had its chance to be answered.
+pub const SIGNAL_SILENCE_SECS: u64 = 35;
+/// Ceiling of the pause between two connects to one signalling relay,
+/// seconds (ADR 0116). The pause doubles from one second while the relay
+/// keeps failing, and stays short on purpose: a host whose network was gone
+/// for minutes must be listening again within seconds of it coming back, or
+/// the guest trying to resume knocks on relays nobody reads.
+pub const SIGNAL_RECONNECT_CEILING_SECS: u64 = 15;
+/// A signalling message still waiting for its relay's connection after this
+/// long is dropped instead of sent, seconds (ADR 0116): by then the dial it
+/// belonged to has moved on.
+pub const SIGNAL_OUTBOX_FRESH_SECS: u64 = 20;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).

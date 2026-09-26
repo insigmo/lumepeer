@@ -28,6 +28,11 @@
 //! the only truth: a host that restarted or moved uplinks is somewhere else,
 //! and its record says where. The pinned certificate needs no such help — it
 //! is the same on every bind (see [`identity_certificate`]).
+//!
+//! ADR 0116 makes that exchange immediate: the knock and the host's answer
+//! also travel over public Nostr relays ([`crate::rendezvous::Signals`]), which
+//! push, so a host punches back within a second of the knock instead of at
+//! its next DHT poll.
 
 use std::net::{SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -58,7 +63,7 @@ use crate::endpoint::SUPPORTED_ALPNS;
 use crate::error::{NetError, Result};
 use crate::obfuscate::{ObfuscatedSocket, Obfuscator, StunTap, obfuscated_transport_config};
 use crate::peer_connection::PeerConnection;
-use crate::rendezvous::Rendezvous;
+use crate::rendezvous::{Rendezvous, Signals, Speaker};
 use crate::stun;
 use crate::ticket::INVITE_ID_BYTES;
 
@@ -446,14 +451,24 @@ impl ObfuscatedAcceptor {
     /// [`NetError::Io`] if the QUIC handshake fails, or the peer presented no
     /// usable identity or no ALPN.
     pub async fn accept(&self) -> Option<Result<PeerConnection>> {
-        let incoming = self.endpoint.accept().await?;
-        Some(
-            match incoming.await.map_err(|e| NetError::Io(e.to_string())) {
+        loop {
+            let incoming = self.endpoint.accept().await?;
+            return Some(match incoming.await {
                 Ok(connection) => peer_and_alpn(&connection)
                     .map(|(peer, alpn)| PeerConnection::from_obfuscated(connection, peer, alpn)),
-                Err(error) => Err(error),
-            },
-        )
+                // A guest drops the attempt in flight when this host's answer
+                // reaches it (ADR 0116), and a handshake closed by its own
+                // application arrives as exactly this. That is the guest
+                // moving on to the attempt that gets through, not a failure.
+                Err(noq::ConnectionError::ConnectionClosed(close))
+                    if close.error_code == noq::TransportErrorCode::APPLICATION_ERROR =>
+                {
+                    tracing::debug!("a guest abandoned one of its dial attempts");
+                    continue;
+                }
+                Err(error) => Err(NetError::Io(error.to_string())),
+            });
+        }
     }
 }
 
@@ -538,6 +553,7 @@ async fn bind_host_via(
             *invite_id,
             watched_addr,
             punch_socket,
+            stun_server,
         ))),
         _ => None,
     };
@@ -647,12 +663,21 @@ fn spawn_keepalive(socket: UdpSocket, server: SocketAddr) -> tokio::task::JoinHa
 /// it is recent by its own clock; every knock after that is new by
 /// construction (its sequence number is higher than the last one seen), so no
 /// clock between the two machines has to agree.
+///
+/// Knocks also arrive pushed, over the signalling relays (ADR 0116). Those
+/// are answered at once, with the punch and with this endpoint's current
+/// address said back on the same relays, so a guest that dialed a stale
+/// address is redirected within the same attempt. Each one also asks
+/// `stun_server` again: a host whose uplink changed since the last keep-alive
+/// learns it now, and the moved address goes out on the relays a round trip
+/// later instead of at the next keep-alive.
 async fn serve_rendezvous(
     rendezvous: Rendezvous,
     identity: SigningKey,
     invite_id: [u8; INVITE_ID_BYTES],
     mut addr: tokio::sync::watch::Receiver<Option<SocketAddr>>,
     punch_socket: UdpSocket,
+    stun_server: Option<SocketAddr>,
 ) {
     let punch_socket = Arc::new(punch_socket);
     let mut republish = tokio::time::interval(Duration::from_secs(RENDEZVOUS_REPUBLISH_SECS));
@@ -663,6 +688,7 @@ async fn serve_rendezvous(
     let mut work = tokio::task::JoinSet::new();
     let mut last_knock: Option<i64> = None;
     let mut first_poll = true;
+    let mut signals = rendezvous.host_signals(&invite_id);
     loop {
         tokio::select! {
             _ = republish.tick() => {}
@@ -670,8 +696,23 @@ async fn serve_rendezvous(
                 if changed.is_err() {
                     return;
                 }
-                tracing::info!(addr = ?*addr.borrow(), "the obfuscated endpoint's public address moved");
+                let moved = *addr.borrow();
+                tracing::info!(addr = ?moved, "the obfuscated endpoint's public address moved");
+                if let (Some(signals), Some(moved)) = (&signals, moved) {
+                    signals.say(moved);
+                }
                 republish.reset();
+            }
+            Some(knock) = heard(&mut signals) => {
+                tracing::info!(guest = %knock.addr, "a guest knocked through a relay: punching towards it");
+                work.spawn(punch_towards(Arc::clone(&punch_socket), knock.addr));
+                if let Some(server) = stun_server {
+                    let _ = stun::send_binding_request(&punch_socket, server);
+                }
+                if let (Some(signals), Some(current)) = (&signals, *addr.borrow()) {
+                    signals.say(current);
+                }
+                continue;
             }
             _ = poll.tick() => {
                 let knock = rendezvous.knock_after(&invite_id, last_knock).await;
@@ -712,6 +753,15 @@ async fn serve_rendezvous(
                 }
             }
         });
+    }
+}
+
+/// The next record heard on `signals`, or never when there is no push
+/// channel — so a `select!` arm on it simply never fires.
+async fn heard(signals: &mut Option<Signals>) -> Option<crate::rendezvous::Sighting> {
+    match signals {
+        Some(signals) => signals.heard().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -765,6 +815,24 @@ pub struct GuestObfuscatedEndpoint {
     invite_id: [u8; INVITE_ID_BYTES],
     /// The rendezvous, when the caller gave this endpoint a DHT (ADR 0113).
     rendezvous: Option<GuestRendezvous>,
+    /// The push channel of the rendezvous (ADR 0116), opened by the first
+    /// control attempt and kept for the endpoint's life: it is how this
+    /// guest knocks, and how the host's answer — where it is now — reaches
+    /// the dial while it is still running.
+    signals: Mutex<Option<GuestSignals>>,
+    /// Fired whenever the host answers on the push channel (ADR 0116). The
+    /// host punches before it answers, so from this moment a fresh dial goes
+    /// straight through, while the attempt in flight would sit out QUIC's
+    /// retransmission timer first: [`punch`] starts over at once instead.
+    answered: Arc<tokio::sync::Notify>,
+}
+
+/// A guest endpoint's open push channel (ADR 0116).
+struct GuestSignals {
+    speaker: Speaker,
+    /// The task that owns the channel and moves the dial target to wherever
+    /// the host says it is. Aborting it closes the channel.
+    listener: tokio::task::AbortHandle,
 }
 
 /// What a guest endpoint needs to look up its host and knock (ADR 0113).
@@ -870,6 +938,8 @@ impl GuestObfuscatedEndpoint {
                 reflexive,
                 servers,
             }),
+            signals: Mutex::new(None),
+            answered: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -891,8 +961,48 @@ impl GuestObfuscatedEndpoint {
         self.connect(crate::endpoint::ALPN_CONTROL).await
     }
 
+    /// This endpoint's push channel, opened on first use (ADR 0116). `None`
+    /// when the rendezvous has no relays.
+    fn signal_speaker(&self, rendezvous: &GuestRendezvous) -> Option<Speaker> {
+        let mut slot = self.signals.lock().ok()?;
+        if let Some(open) = slot.as_ref() {
+            return Some(open.speaker.clone());
+        }
+        let mut signals = rendezvous.dht.guest_signals(&self.invite_id)?;
+        let speaker = signals.speaker();
+        let target = Arc::clone(&self.target);
+        let answered = Arc::clone(&self.answered);
+        let listener = tokio::spawn(async move {
+            while let Some(seen) = signals.heard().await {
+                {
+                    let Ok(mut current) = target.lock() else {
+                        return;
+                    };
+                    if *current == seen.addr {
+                        tracing::debug!(addr = %seen.addr, "the host answered through a relay");
+                    } else {
+                        tracing::info!(
+                            from = %*current,
+                            to = %seen.addr,
+                            "the host answered through a relay from somewhere else: dialing it there"
+                        );
+                        *current = seen.addr;
+                    }
+                }
+                answered.notify_waiters();
+            }
+        })
+        .abort_handle();
+        *slot = Some(GuestSignals {
+            speaker: speaker.clone(),
+            listener,
+        });
+        Some(speaker)
+    }
+
     /// Spawns this attempt's lookup and knock (see [`Self::connect_control`]).
     fn start_rendezvous(&self, rendezvous: &GuestRendezvous) {
+        let speaker = self.signal_speaker(rendezvous);
         let dht = rendezvous.dht.clone();
         let host = self.host;
         let invite_id = self.invite_id;
@@ -924,6 +1034,12 @@ impl GuestObfuscatedEndpoint {
                 tracing::warn!("no reflector answered: cannot knock, the host will not punch back");
                 return;
             };
+            // The push first: it reaches a listening host in well under a
+            // second, while the DHT put below takes seconds (ADR 0116).
+            if let Some(speaker) = speaker {
+                speaker.say(own);
+                tracing::info!(addr = %own, "knocked through the signalling relays");
+            }
             match dht.knock(&invite_id, own).await {
                 Ok(()) => {
                     tracing::info!(addr = %own, "knocked: asked the host to punch towards this guest");
@@ -970,19 +1086,22 @@ impl GuestObfuscatedEndpoint {
         let mut client_config = ClientConfig::new(Arc::new(quic_client_config));
         client_config.transport_config(Arc::new(obfuscated_transport_config()));
 
-        let connection = punch(|| async {
-            // Read per attempt: the rendezvous may have moved it since the
-            // last one (ADR 0113).
-            let target = *self
-                .target
-                .lock()
-                .map_err(|_| NetError::Dial("the dial target is poisoned".to_owned()))?;
-            self.endpoint
-                .connect_with(client_config.clone(), target, CERT_SUBJECT)
-                .map_err(|e| NetError::Dial(e.to_string()))?
-                .await
-                .map_err(|e| NetError::Dial(e.to_string()))
-        })
+        let connection = punch_until(
+            || async {
+                // Read per attempt: the rendezvous may have moved it since the
+                // last one (ADR 0113).
+                let target = *self
+                    .target
+                    .lock()
+                    .map_err(|_| NetError::Dial("the dial target is poisoned".to_owned()))?;
+                self.endpoint
+                    .connect_with(client_config.clone(), target, CERT_SUBJECT)
+                    .map_err(|e| NetError::Dial(e.to_string()))?
+                    .await
+                    .map_err(|e| NetError::Dial(e.to_string()))
+            },
+            &self.answered,
+        )
         .await?;
         // Outside the punch on purpose: a host that answered but named itself
         // with a certificate this cannot read will answer the same way every
@@ -995,8 +1114,26 @@ impl GuestObfuscatedEndpoint {
 
     /// Closes the endpoint and every channel it carries.
     pub async fn close(&self) {
+        self.stop_signals();
         self.endpoint.close(noq::VarInt::from_u32(0), b"");
         self.endpoint.wait_idle().await;
+    }
+
+    /// Closes the push channel, if one was opened. Idempotent.
+    fn stop_signals(&self) {
+        if let Ok(mut slot) = self.signals.lock()
+            && let Some(open) = slot.take()
+        {
+            open.listener.abort();
+        }
+    }
+}
+
+impl Drop for GuestObfuscatedEndpoint {
+    /// The push channel holds relay connections open; they go with the
+    /// endpoint however it goes away.
+    fn drop(&mut self) {
+        self.stop_signals();
     }
 }
 
@@ -1060,7 +1197,24 @@ async fn own_reflexive_addr(
 /// # Errors
 /// Whatever the last attempt failed with, or [`NetError::Dial`] if it went
 /// unanswered for its whole budget.
-async fn punch<T, F, Fut>(mut dial: F) -> Result<T>
+#[cfg(test)]
+async fn punch<T, F, Fut>(dial: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    punch_until(dial, &tokio::sync::Notify::new()).await
+}
+
+/// [`punch`], cutting an attempt short the moment `answered` fires (ADR 0116).
+///
+/// An answer from the host means its own packets are already on their way, so
+/// its NAT now lets this side in. The attempt in flight would only get through
+/// on its next retransmission, a second or more away; a fresh attempt gets
+/// through on its first packet. So the attempt is dropped, and the next one
+/// starts without the backoff. It still counts as an attempt, so a stream of
+/// answers cannot keep the punch going for ever.
+async fn punch_until<T, F, Fut>(mut dial: F, answered: &tokio::sync::Notify) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -1068,9 +1222,21 @@ where
     let attempt_timeout = Duration::from_millis(OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS);
     let mut last = NetError::Dial("no attempt was made".to_owned());
     for attempt in 1..=OBFUSCATED_CONNECT_ATTEMPTS {
-        match tokio::time::timeout(attempt_timeout, dial()).await {
-            Ok(Ok(connected)) => return Ok(connected),
-            Ok(Err(error)) => last = error,
+        let interrupted = answered.notified();
+        let attempt_outcome = tokio::time::timeout(attempt_timeout, async {
+            tokio::select! {
+                outcome = dial() => Some(outcome),
+                () = interrupted => None,
+            }
+        })
+        .await;
+        match attempt_outcome {
+            Ok(Some(Ok(connected))) => return Ok(connected),
+            Ok(Some(Err(error))) => last = error,
+            Ok(None) => {
+                last = NetError::Dial("the host answered: dialing again".to_owned());
+                continue;
+            }
             Err(_) => {
                 last = NetError::Dial("the punch went unanswered for its attempt".to_owned());
             }
@@ -1351,6 +1517,44 @@ mod tests {
         })
         .await;
         (result, made.into_inner())
+    }
+
+    /// ADR 0116: the host's answer ends the attempt in flight and the next
+    /// one goes out at that instant — no retransmission timer, no backoff.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_from_the_host_starts_the_next_attempt_at_once() {
+        let answered = Arc::new(tokio::sync::Notify::new());
+        let ringer = Arc::clone(&answered);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            ringer.notify_waiters();
+        });
+        let started = tokio::time::Instant::now();
+        let made = std::cell::RefCell::new(Vec::new());
+        let result: Result<()> = punch_until(
+            || async {
+                let attempt = {
+                    let mut made = made.borrow_mut();
+                    made.push(started.elapsed());
+                    made.len()
+                };
+                if attempt == 1 {
+                    // The first attempt's packets are the ones the host's NAT
+                    // dropped: it would only have got through on a resend.
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            },
+            &answered,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the attempt after the answer connects");
+        assert_eq!(
+            made.into_inner(),
+            vec![Duration::ZERO, Duration::from_millis(700)],
+            "the second attempt must start when the answer came, not after a timeout"
+        );
     }
 
     /// gap-tasks/22 task 3: the punch keeps to its attempt count and its

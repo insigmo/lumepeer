@@ -310,11 +310,18 @@ async fn punch(
 /// Dials the host and exchanges one ping. Success is the reply, not the dial:
 /// a connection that carries nothing proves less than the session needs.
 async fn ping(endpoint: &GuestObfuscatedEndpoint) -> Result<(), String> {
+    // The dial alone: what a person waits for. `landed` also counts the ping
+    // and the endpoint draining on close, which nobody waits for.
+    let dialing = Instant::now();
     let connection = endpoint
         .connect_control()
         .await
         .map_err(|e| format!("dial: {e}"))?;
-    println!("CONNECTED peer={}", connection.peer());
+    println!(
+        "CONNECTED in {}ms peer={}",
+        dialing.elapsed().as_millis(),
+        connection.peer()
+    );
 
     let (mut send, mut recv) = connection
         .open_bi()

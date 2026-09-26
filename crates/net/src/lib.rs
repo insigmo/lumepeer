@@ -14,6 +14,7 @@ pub mod file_transfer;
 pub mod framing;
 pub mod keystore;
 pub mod media;
+pub mod nostr;
 pub mod obfuscate;
 pub mod obfuscated_endpoint;
 pub mod peer_connection;

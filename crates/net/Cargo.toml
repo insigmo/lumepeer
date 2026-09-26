@@ -52,6 +52,21 @@ n0-future = "=0.3.2"
 # Already in the dependency tree via `iroh-mainline-address-lookup`; pinned to
 # the exact version it resolves to, so the process runs one DHT implementation.
 n0-mainline = "=0.6.0"
+# Push signalling for the rendezvous over public Nostr relays (ADR 0116): a
+# WebSocket client and its TLS, both already in the tree via iroh-relay, the
+# web PKI roots the relays' certificates chain to, and the BIP-340 Schnorr
+# signature every Nostr event has to carry.
+tokio-websockets = { version = "0.13", default-features = false, features = [
+    "client",
+    "rustls-bring-your-own-connector",
+    "sha1_smol",
+    "getrandom",
+    "rand",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+webpki-roots = "1"
+k256 = { version = "0.13", default-features = false, features = ["schnorr", "std"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest.workspace = true

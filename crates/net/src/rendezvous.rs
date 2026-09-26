@@ -27,12 +27,20 @@
 //! `put` keep answering with the previous value. So every read here drains the
 //! whole lookup and keeps the highest sequence number, never the first answer
 //! (`n0_mainline`'s own `get_mutable_most_recent` keeps the first).
+//!
+//! The DHT can only be polled, though, and a poll a host can afford is far
+//! too slow for a guest that is dialing *now*. So the same two records also
+//! travel as pushes over public Nostr relays ([`Signals`], ADR 0116): a host
+//! hears a knock a fraction of a second after it was sent, and answers with
+//! where it is. The DHT stays as the path that works when no relay does.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use data_encoding::HEXLOWER;
 use ed25519_dalek::SigningKey;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::RENDEZVOUS_LOOKUP_TIMEOUT_SECS;
@@ -41,6 +49,7 @@ use n0_mainline::{Dht, MutableItem};
 use rand::Rng as _;
 
 use crate::error::{NetError, Result};
+use crate::nostr;
 use crate::ticket::INVITE_ID_BYTES;
 
 /// KDF context for the key both records are sealed with.
@@ -49,6 +58,11 @@ const SEAL_CONTEXT: &str = "lumepeer 2026 ADR 0113 rendezvous record key";
 const HOST_SALT_CONTEXT: &str = "lumepeer 2026 ADR 0113 rendezvous host salt";
 /// KDF context for the signing key every knock is written with.
 const KNOCK_KEY_CONTEXT: &str = "lumepeer 2026 ADR 0113 rendezvous knock signing key";
+/// KDF context for the Nostr topic both records of one invite travel on.
+const TOPIC_CONTEXT: &str = "lumepeer 2026 ADR 0116 rendezvous signal topic";
+/// Bytes of the topic (hex-encoded on the wire): enough that two invites never
+/// share one, short enough to cost nothing in a relay's index.
+const TOPIC_BYTES: usize = 16;
 /// Bytes of the host record's salt (BEP 44 allows up to 64).
 const SALT_BYTES: usize = 16;
 /// Version of the sealed payload below.
@@ -80,13 +94,17 @@ pub struct Sighting {
     pub at: u64,
 }
 
-/// A DHT client node for the rendezvous records (ADR 0113).
+/// A DHT client node for the rendezvous records (ADR 0113), and the Nostr
+/// relays the same records are pushed through (ADR 0116).
 ///
 /// One per process: it is a UDP socket and a routing table, and every host
 /// endpoint and guest dial of the run shares it.
 #[derive(Clone)]
 pub struct Rendezvous {
     dht: Dht,
+    /// Where [`Signals`] connect. Empty means no push channel at all — the
+    /// DHT alone, as before ADR 0116.
+    relays: Arc<[String]>,
 }
 
 impl std::fmt::Debug for Rendezvous {
@@ -103,11 +121,18 @@ impl Rendezvous {
     /// [`NetError::Endpoint`] if the DHT socket cannot be bound.
     pub fn start() -> Result<Self> {
         let dht = Dht::client().map_err(|e| NetError::Endpoint(e.to_string()))?;
-        Ok(Self { dht })
+        Ok(Self {
+            dht,
+            relays: nostr::SIGNAL_RELAYS
+                .iter()
+                .map(|relay| (*relay).to_owned())
+                .collect(),
+        })
     }
 
     /// Starts a DHT client on the network `bootstrap` names instead of the
-    /// public one — a private test network, for instance.
+    /// public one — a private test network, for instance — with no signalling
+    /// relays until [`Self::with_relays`] names some.
     ///
     /// # Errors
     /// [`NetError::Endpoint`] if the DHT socket cannot be bound.
@@ -116,7 +141,55 @@ impl Rendezvous {
             .bootstrap(bootstrap)
             .build()
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
-        Ok(Self { dht })
+        Ok(Self {
+            dht,
+            relays: Arc::from([]),
+        })
+    }
+
+    /// The same rendezvous, signalling through `relays` instead of
+    /// [`nostr::SIGNAL_RELAYS`]; an empty list turns the push channel off.
+    #[must_use]
+    pub fn with_relays(mut self, relays: &[String]) -> Self {
+        self.relays = relays.iter().cloned().collect();
+        self
+    }
+
+    /// Host: the push channel for `invite_id`, on which guests' knocks
+    /// arrive and this host says where it is (ADR 0116). `None` with no
+    /// relays configured. Opens connections: call it inside a tokio runtime.
+    #[must_use]
+    pub fn host_signals(&self, invite_id: &[u8; INVITE_ID_BYTES]) -> Option<Signals> {
+        self.signals(invite_id, Kind::Knock, Kind::Host)
+    }
+
+    /// Guest: the push channel for `invite_id`, on which this guest knocks
+    /// and the host says where it is (ADR 0116). `None` with no relays
+    /// configured. Opens connections: call it inside a tokio runtime.
+    #[must_use]
+    pub fn guest_signals(&self, invite_id: &[u8; INVITE_ID_BYTES]) -> Option<Signals> {
+        self.signals(invite_id, Kind::Host, Kind::Knock)
+    }
+
+    fn signals(
+        &self,
+        invite_id: &[u8; INVITE_ID_BYTES],
+        listen: Kind,
+        speak: Kind,
+    ) -> Option<Signals> {
+        if self.relays.is_empty() {
+            return None;
+        }
+        let channel = nostr::Channel::open(&self.relays, &topic(invite_id));
+        Some(Signals {
+            speaker: Speaker {
+                publisher: channel.publisher(),
+                invite_id: *invite_id,
+                kind: speak,
+            },
+            channel,
+            listen,
+        })
     }
 
     /// Host: publishes that the obfuscated endpoint for `invite_id` is
@@ -218,6 +291,82 @@ impl Rendezvous {
             tokio::time::timeout(Duration::from_secs(RENDEZVOUS_LOOKUP_TIMEOUT_SECS), drain).await;
         best
     }
+}
+
+/// One side's live presence on the signalling relays for one invite (ADR
+/// 0116): it hears the other side's records and says its own.
+///
+/// Dropping it closes every relay connection it opened.
+#[derive(Debug)]
+pub struct Signals {
+    channel: nostr::Channel,
+    speaker: Speaker,
+    /// The record kind the other side speaks.
+    listen: Kind,
+}
+
+impl Signals {
+    /// Tells the other side, over every relay, that this side can be reached
+    /// at `addr`: a guest's knock, or a host's answer.
+    pub fn say(&self, addr: SocketAddr) {
+        self.speaker.say(addr);
+    }
+
+    /// A handle that says things on this channel from another task.
+    #[must_use]
+    pub fn speaker(&self) -> Speaker {
+        self.speaker.clone()
+    }
+
+    /// The next record the other side said. Anything that does not open
+    /// under this invite as the other side's kind — this side's own records
+    /// echoed back, a stranger's junk on the topic — is skipped.
+    ///
+    /// `None` only if the channel's relay tasks have all ended, which does
+    /// not happen while it is alive.
+    pub async fn heard(&mut self) -> Option<Sighting> {
+        loop {
+            let content = self.channel.recv().await?;
+            let Ok(wire) = HEXLOWER.decode(content.as_bytes()) else {
+                continue;
+            };
+            let Some(sighting) = open(&self.speaker.invite_id, self.listen, &wire, 0) else {
+                continue;
+            };
+            return Some(Sighting {
+                seq: i64::try_from(sighting.at).unwrap_or(i64::MAX),
+                ..sighting
+            });
+        }
+    }
+}
+
+/// Says one side's records on a [`Signals`] channel. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct Speaker {
+    publisher: nostr::Publisher,
+    invite_id: [u8; INVITE_ID_BYTES],
+    kind: Kind,
+}
+
+impl Speaker {
+    /// See [`Signals::say`].
+    pub fn say(&self, addr: SocketAddr) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        match seal(&self.invite_id, self.kind, addr, now.as_secs()) {
+            Ok(wire) => self.publisher.publish(&HEXLOWER.encode(&wire)),
+            Err(error) => tracing::warn!(%error, "could not seal a signalling record"),
+        }
+    }
+}
+
+/// The Nostr topic both records of `invite_id` travel on (ADR 0116). Anyone
+/// holding the invite can compute it; to everybody else it is a random tag.
+fn topic(invite_id: &[u8; INVITE_ID_BYTES]) -> String {
+    let full = blake3::derive_key(TOPIC_CONTEXT, invite_id);
+    HEXLOWER.encode(&full[..TOPIC_BYTES])
 }
 
 /// The salt the host record for `invite_id` is stored under.

@@ -4503,14 +4503,52 @@ impl HostDialer {
 /// the only thing tried: a host that has moved onto a network where last
 /// time's answer no longer works still gets the other one, in the same dial,
 /// without the user doing anything.
-fn dial_order(obfuscated_available: bool, remembered: Option<TransportKind>) -> Vec<TransportKind> {
+///
+/// And iroh only leads when it last reached this host *nearby* — on a LAN
+/// address (ADR 0116). A host across the internet is reached fastest and most
+/// reliably by the obfuscated transport now that its rendezvous pushes (about
+/// half a second), while an iroh session over the internet rode either a relay
+/// an ISP may freeze or an overlay network such as a tailnet that comes and
+/// goes; leading with it cost the guest two twenty-second attempts before the
+/// transport that works was even tried. On a LAN, iroh's direct path is the
+/// near one, and the obfuscated transport would need the router to hairpin.
+fn dial_order(
+    obfuscated_available: bool,
+    remembered: Option<TransportKind>,
+    remembered_nearby: bool,
+) -> Vec<TransportKind> {
     if !obfuscated_available {
         return vec![TransportKind::Iroh];
     }
-    if remembered == Some(TransportKind::Iroh) {
+    if remembered == Some(TransportKind::Iroh) && remembered_nearby {
         return vec![TransportKind::Iroh, TransportKind::Obfuscated];
     }
     vec![TransportKind::Obfuscated, TransportKind::Iroh]
+}
+
+/// Whether any of the remembered addresses a session last reached its host on
+/// (ADR 0093) is a nearby one: a private, link-local or loopback address
+/// (ADR 0116).
+///
+/// The carrier-grade NAT range is *not* nearby: it is where overlay networks
+/// such as Tailscale put their peers, which may be anywhere on the internet
+/// and drop in and out of reach.
+fn reached_nearby(addrs: &[String]) -> bool {
+    addrs.iter().any(|addr| {
+        let ip = addr
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip())
+            .or_else(|_| addr.parse::<std::net::IpAddr>());
+        match ip {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_private() || ip.is_link_local() || ip.is_loopback()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// How the [`DIAL_ATTEMPTS`] of one dial are shared out over the transports of
@@ -5267,6 +5305,9 @@ struct ObfuscatedHost {
     /// Whether a bind is in flight, so a second invite request cannot start a
     /// second one racing it.
     binding: bool,
+    /// Whether a rebind of the restored invite's endpoint is in flight, so the
+    /// retry on every ping tick cannot start a second one (ADR 0116).
+    restoring: bool,
     /// The endpoint bound for the live invite, when one could be bound at all.
     ///
     /// Its life is the invite's: issued means bound, replaced means the old
@@ -5475,6 +5516,7 @@ impl Actor {
                 _ = ping.tick() => {
                     self.send_pings();
                     self.log_routes();
+                    self.rebind_restored_obfuscated();
                 }
                 _ = locate.tick() => self.refresh_saved_hosts(),
             }
@@ -11775,8 +11817,17 @@ impl Actor {
     /// findable is its rendezvous record. Only an invite whose ticket carries
     /// an obfuscated address is worth it — a guest only tries this transport
     /// for one.
+    ///
+    /// Retried on every ping tick until it holds (ADR 0116): a host that
+    /// started before its network was up — a laptop on Wi-Fi after a reboot —
+    /// found no reflector, and without the retry it stayed reachable over
+    /// iroh alone for the rest of the run.
     fn rebind_restored_obfuscated(&mut self) {
-        if !self.obfuscated.enabled || self.obfuscated.endpoint.is_some() {
+        if !self.obfuscated.enabled
+            || self.obfuscated.endpoint.is_some()
+            || self.obfuscated.binding
+            || self.obfuscated.restoring
+        {
             return;
         }
         let Some(ticket) = self
@@ -11791,6 +11842,7 @@ impl Actor {
         let identity = self.identity.clone();
         let rendezvous = self.obfuscated.rendezvous.clone();
         let events = self.events_tx.clone();
+        self.obfuscated.restoring = true;
         tokio::spawn(async move {
             let endpoint = match lumepeer_net::obfuscated_endpoint::bind_host(
                 &invite_id, &identity, rendezvous,
@@ -11823,6 +11875,7 @@ impl Actor {
         invite_id: [u8; lumepeer_net::ticket::INVITE_ID_BYTES],
         endpoint: Option<Box<HostObfuscatedEndpoint>>,
     ) {
+        self.obfuscated.restoring = false;
         let Some(endpoint) = endpoint else {
             return;
         };
@@ -14765,7 +14818,11 @@ impl Actor {
     /// caller rather than asserted away.
     fn dial_plan(&self, ticket: &InviteTicket, addr: &iroh::EndpointAddr) -> Option<DialPlan> {
         let mut obfuscated = self.obfuscated_dialer(ticket, addr.id);
-        let order = dial_order(obfuscated.is_some(), self.remembered_transport(&addr.id));
+        let order = dial_order(
+            obfuscated.is_some(),
+            self.remembered_transport(&addr.id),
+            reached_nearby(&self.history.addrs_of(&host_tag(&addr.id))),
+        );
         let dialers = order.into_iter().filter_map(|transport| match transport {
             TransportKind::Iroh => Some(HostDialer::Iroh {
                 endpoint: self.endpoint.clone(),
@@ -16772,28 +16829,63 @@ mod tests {
     #[test]
     fn the_obfuscated_transport_leads_a_plan_that_can_use_it_at_all() {
         assert_eq!(
-            dial_order(true, None),
+            dial_order(true, None, false),
             vec![TransportKind::Obfuscated, TransportKind::Iroh]
         );
         // And iroh is always behind it, never instead of it: a plan with one
         // transport in it is a plan with no fallback.
-        assert_eq!(dial_order(false, None), vec![TransportKind::Iroh]);
+        assert_eq!(dial_order(false, None, false), vec![TransportKind::Iroh]);
     }
 
     /// gap-tasks/23 task 1: what actually worked for this host last time beats
     /// the default order, because it is the only evidence about this pair of
-    /// machines that exists.
+    /// machines that exists — as long as it was a nearby path (ADR 0116).
     #[test]
-    fn a_host_last_reached_over_iroh_is_tried_over_iroh_first() {
+    fn a_host_last_reached_over_iroh_on_the_lan_is_tried_over_iroh_first() {
         assert_eq!(
-            dial_order(true, Some(TransportKind::Iroh)),
+            dial_order(true, Some(TransportKind::Iroh), true),
             vec![TransportKind::Iroh, TransportKind::Obfuscated]
         );
         // Remembering the transport that already leads changes nothing.
+        for nearby in [false, true] {
+            assert_eq!(
+                dial_order(true, Some(TransportKind::Obfuscated), nearby),
+                vec![TransportKind::Obfuscated, TransportKind::Iroh]
+            );
+        }
+    }
+
+    /// ADR 0116: an iroh session that reached the host across the internet —
+    /// over a relay, or a tailnet address — is not evidence that iroh is the
+    /// way to reach it. The 2026-09-26 report was exactly this: the history
+    /// said iroh, the tailnet was down, and the dial spent two twenty-second
+    /// attempts on it before trying the transport that connects in half a
+    /// second.
+    #[test]
+    fn a_host_last_reached_over_iroh_across_the_internet_is_dialed_obfuscated_first() {
         assert_eq!(
-            dial_order(true, Some(TransportKind::Obfuscated)),
+            dial_order(true, Some(TransportKind::Iroh), false),
             vec![TransportKind::Obfuscated, TransportKind::Iroh]
         );
+    }
+
+    /// ADR 0116: which remembered addresses count as nearby.
+    #[test]
+    fn only_private_link_local_and_loopback_addresses_are_nearby() {
+        let nearby = |addrs: &[&str]| {
+            reached_nearby(&addrs.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>())
+        };
+        assert!(nearby(&["192.168.1.97:52052"]));
+        assert!(nearby(&["10.0.0.5:1"]));
+        assert!(nearby(&["172.26.16.1:1"]));
+        assert!(nearby(&["[fe80::1]:1"]));
+        assert!(nearby(&["[fd7a:115c:a1e0::1]:1"]));
+        assert!(nearby(&["85.173.133.45:1", "192.168.1.97:52052"]));
+        // A tailnet peer, a public address, nothing, and junk are not.
+        assert!(!nearby(&["100.96.209.116:52052"]));
+        assert!(!nearby(&["85.173.133.45:18058"]));
+        assert!(!nearby(&[]));
+        assert!(!nearby(&["not an address"]));
     }
 
     /// gap-tasks/23 task 1: a memory reorders what is available and can never
@@ -16803,7 +16895,7 @@ mod tests {
     #[test]
     fn a_remembered_transport_never_adds_one_this_invite_cannot_use() {
         assert_eq!(
-            dial_order(false, Some(TransportKind::Obfuscated)),
+            dial_order(false, Some(TransportKind::Obfuscated), true),
             vec![TransportKind::Iroh]
         );
         for remembered in [
@@ -16811,10 +16903,12 @@ mod tests {
             Some(TransportKind::Iroh),
             Some(TransportKind::Obfuscated),
         ] {
-            let order = dial_order(true, remembered);
-            assert_eq!(order.len(), 2, "a fallback must always be left: {order:?}");
-            assert!(order.contains(&TransportKind::Iroh));
-            assert!(order.contains(&TransportKind::Obfuscated));
+            for nearby in [false, true] {
+                let order = dial_order(true, remembered, nearby);
+                assert_eq!(order.len(), 2, "a fallback must always be left: {order:?}");
+                assert!(order.contains(&TransportKind::Iroh));
+                assert!(order.contains(&TransportKind::Obfuscated));
+            }
         }
     }
 
@@ -17035,7 +17129,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(
-            dial_order(true, history.transport_of(&host_tag(&peer))),
+            dial_order(true, history.transport_of(&host_tag(&peer)), false),
             vec![TransportKind::Obfuscated, TransportKind::Iroh]
         );
         history.record(
