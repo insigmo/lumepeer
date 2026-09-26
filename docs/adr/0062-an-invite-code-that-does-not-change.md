@@ -99,3 +99,24 @@ is now the only thing that revokes.
   own transitive `n0-mainline` and `serde_bencode`).
 - Not addressed here: publishing the obfuscated transport's address (ADR 0053)
   to the DHT. That record still carries only the iroh addressing.
+
+## Amended 2026-09-26: one invite file per host key
+
+A saved connection to a host stopped working after the host auto-updated.
+Every dial was refused with `invalid invite ticket`, over every transport.
+The cause was `invite.json` itself. The e2e rig runs a second instance on the
+same Windows profile, beside the installed app, with its own identity on the
+file keystore (`LUMEPEER_KEYSTORE_PATH`). That instance issued an invite and
+wrote it over the installed host's code in the one shared file. The next
+restart of the installed host parsed the stored code, found it was signed by
+another key, and dropped it without logging anything. After that the registry
+was empty, so every code the host's guests had saved was refused.
+
+The file is now named after the host's key: `invite-<first 8 bytes of the key,
+hex>.json`. Two identities on one profile each keep their own file. If a
+host's own file is missing, it still reads the old `invite.json`. If the code
+there verifies against this host's key, it is restored and written into the
+host's own file, so an upgrade breaks no saved connection. A stored code that
+does not verify is now logged as a warning instead of being dropped silently.
+The machine-store host (`crates/host`) has one identity per directory and
+keeps the old name.

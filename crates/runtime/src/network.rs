@@ -2998,7 +2998,7 @@ fn remembered_password_tags(
         .collect()
 }
 
-fn hex_prefix(hash: &[u8; 32]) -> String {
+pub(crate) fn hex_prefix(hash: &[u8; 32]) -> String {
     hash[..8].iter().fold(String::new(), |mut out, byte| {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
@@ -16293,18 +16293,21 @@ pub fn address_book_path() -> Option<std::path::PathBuf> {
     Some(dir.join("address_book.json"))
 }
 
-/// Where the live invite is remembered across restarts (ADR 0062).
+/// Where the live invite of the host signing with `host` is remembered across
+/// restarts (ADR 0062).
 ///
 /// Next to the address book rather than to the connection history: both belong
 /// to the host's own configuration, and neither is per-machine-install state.
-pub fn invite_path() -> Option<std::path::PathBuf> {
+/// One file per host key, not one per profile — see
+/// [`crate::invite_store::file_name`].
+pub fn invite_path(host: &ed25519_dalek::VerifyingKey) -> Option<std::path::PathBuf> {
     let Some(dir) = crate::config::config_dir() else {
         tracing::warn!(
             "cannot resolve the config directory; the invite code will not survive a restart"
         );
         return None;
     };
-    Some(dir.join("invite.json"))
+    Some(dir.join(crate::invite_store::file_name(host)))
 }
 
 /// Builds the host's media side: the capture controller, whether this platform
@@ -16523,7 +16526,7 @@ pub fn spawn_actor_with(
     // and `InviteStore::live` has already checked it parses and has not
     // expired.
     let mut tickets = TicketRegistry::new();
-    let invite_store = crate::invite_store::InviteStore::open(invite_path);
+    let mut invite_store = crate::invite_store::InviteStore::open(invite_path);
     let live_invite = invite_store
         .live(unix_now())
         // Only this host's own invite. A stored code signed by some other
@@ -16532,9 +16535,23 @@ pub fn spawn_actor_with(
         // answer for, and the registry would be claiming a ticket whose
         // signature is not ours. Verifying against the key that would sign a
         // new one is the whole check.
-        .filter(|(_, ticket)| ticket.verify(&identity.verifying_key(), unix_now()).is_ok())
+        .filter(|(_, ticket)| {
+            let ours = ticket.verify(&identity.verifying_key(), unix_now()).is_ok();
+            if !ours {
+                // Said out loud: every code a guest saved is refused from here
+                // on, and only "invalid invite ticket" on each claim shows it.
+                tracing::warn!(
+                    "the stored invite is not this host's own; the host will issue a new code"
+                );
+            }
+            ours
+        })
         .map(|(code, ticket)| {
             tickets.register(&ticket);
+            // Written back under this host's own file name, so a code that
+            // came from the legacy shared `invite.json` stops depending on a
+            // file another identity on this profile may overwrite.
+            invite_store.set(code.clone());
             tracing::info!(expires_at = ticket.expires_at, "restored the live invite");
             InviteDto {
                 code,
@@ -22089,6 +22106,93 @@ mod tests {
         // role the guest may ask for.
         let elevated = host.invite_create(Role::FullControl, false).await.unwrap();
         assert_ne!(first.code, elevated.code);
+    }
+
+    /// A host actor with `secret` as its identity that keeps its invite in
+    /// `invite_path`, the way the application does — `ActorStores::in_memory`
+    /// keeps nothing, which is the thing these tests are about.
+    async fn host_keeping_its_invite(
+        secret: &iroh::SecretKey,
+        invite_path: std::path::PathBuf,
+    ) -> ActorHandle {
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let endpoint = PeerEndpoint::bind_local(secret.clone()).await.unwrap();
+        let capture = test_capture();
+        spawn_actor_with(
+            endpoint,
+            identity,
+            Arc::new(DetachedViewWindows),
+            test_media(&capture),
+            crate::clipboard_os::no_clipboard(),
+            ActorStores {
+                invite_path: Some(invite_path),
+                ..ActorStores::in_memory()
+            },
+            ActorPolicy::hosting(false),
+        )
+    }
+
+    fn keyed_invite_path(scratch: &Scratch, secret: &iroh::SecretKey) -> std::path::PathBuf {
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        scratch.join(&crate::invite_store::file_name(&identity.verifying_key()))
+    }
+
+    /// Two host identities on one user profile — the installed app and a
+    /// second instance on the file keystore — each keep their own invite. With
+    /// one shared `invite.json` the second instance's code replaced the
+    /// installed host's, which then came back from its next restart refusing
+    /// every code its guests had saved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_identity_on_the_profile_leaves_the_hosts_invite_alone() {
+        let scratch = Scratch::new("invite-two-identities");
+        let installed = iroh::SecretKey::generate();
+        let second = iroh::SecretKey::generate();
+
+        let host =
+            host_keeping_its_invite(&installed, keyed_invite_path(&scratch, &installed)).await;
+        let saved = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        drop(host);
+
+        let other = host_keeping_its_invite(&second, keyed_invite_path(&scratch, &second)).await;
+        let theirs = other.invite_create(Role::ViewOnly, false).await.unwrap();
+        assert_ne!(saved.code, theirs.code);
+        drop(other);
+
+        let restarted =
+            host_keeping_its_invite(&installed, keyed_invite_path(&scratch, &installed)).await;
+        let current = restarted.invite_current().await.unwrap();
+        assert_eq!(current.map(|dto| dto.code), Some(saved.code));
+    }
+
+    /// A host upgraded past the keyed file name still restores the code it
+    /// kept in the old shared `invite.json` — or every saved connection would
+    /// break on the update — and moves it into its own file. Another identity
+    /// finds nothing of its own there and issues fresh, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_legacy_invite_file_is_restored_only_by_the_host_that_signed_it() {
+        let scratch = Scratch::new("invite-legacy");
+        let installed = iroh::SecretKey::generate();
+        let second = iroh::SecretKey::generate();
+
+        let before_upgrade = host_keeping_its_invite(&installed, scratch.join("invite.json")).await;
+        let saved = before_upgrade
+            .invite_create(Role::ViewOnly, false)
+            .await
+            .unwrap();
+        drop(before_upgrade);
+
+        let upgraded =
+            host_keeping_its_invite(&installed, keyed_invite_path(&scratch, &installed)).await;
+        let current = upgraded.invite_current().await.unwrap();
+        assert_eq!(current.map(|dto| dto.code), Some(saved.code.clone()));
+        let moved = std::fs::read_to_string(keyed_invite_path(&scratch, &installed)).unwrap();
+        assert!(
+            moved.contains(&saved.code),
+            "the restored code was not moved into its own file"
+        );
+
+        let other = host_keeping_its_invite(&second, keyed_invite_path(&scratch, &second)).await;
+        assert!(other.invite_current().await.unwrap().is_none());
     }
 
     /// A host that has never issued an invite has none to report, and asking

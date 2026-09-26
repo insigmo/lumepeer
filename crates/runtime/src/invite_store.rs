@@ -22,7 +22,28 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
 use lumepeer_net::ticket::InviteTicket;
+
+/// The one file every host kept its invite in before the name carried the
+/// host's key. Still read, so a host upgraded past that change keeps the code
+/// its guests are holding.
+const LEGACY_FILE_NAME: &str = "invite.json";
+
+/// The file the live invite of the host that signs with `host` is kept in.
+///
+/// Named after the key because one user profile can hold more than one host
+/// identity — a second instance on the file keystore beside the installed app
+/// — and with a single shared file each overwrote the other's invite. The
+/// installed host then came back from its next restart with nothing to
+/// restore, and refused every code its guests had saved.
+#[must_use]
+pub fn file_name(host: &VerifyingKey) -> String {
+    format!(
+        "invite-{}.json",
+        crate::network::hex_prefix(host.as_bytes())
+    )
+}
 
 /// The live invite, as it is written to disk.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -39,10 +60,16 @@ pub struct InviteStore {
 }
 
 impl InviteStore {
-    /// Loads the stored invite from `path`.
+    /// Loads the stored invite from `path`, or from the legacy `invite.json`
+    /// beside it when `path` holds nothing yet.
+    ///
+    /// The legacy file may hold another identity's code; the caller checks the
+    /// signature before it registers anything, as it always did.
     #[must_use]
     pub fn open(path: Option<PathBuf>) -> Self {
-        let code = path.as_deref().and_then(Self::load);
+        let code = path.as_deref().and_then(|path| {
+            Self::load(path).or_else(|| Self::load(&path.with_file_name(LEGACY_FILE_NAME)))
+        });
         Self { path, code }
     }
 
@@ -162,6 +189,55 @@ mod tests {
         store.set(code_valid_at(1_000));
         let past_its_ttl = 1_000 + lumepeer_core::constants::INVITE_TICKET_TTL_SECS + 1;
         assert!(store.live(past_its_ttl).is_none());
+    }
+
+    #[test]
+    fn each_host_key_gets_its_own_file() {
+        let one = SigningKey::from_bytes(&[1u8; 32]).verifying_key();
+        let two = SigningKey::from_bytes(&[2u8; 32]).verifying_key();
+        assert_ne!(file_name(&one), file_name(&two));
+        assert_eq!(file_name(&one), file_name(&one));
+        assert_ne!(file_name(&one), LEGACY_FILE_NAME);
+    }
+
+    /// The legacy file is a fallback only: a keyed file, once there, wins.
+    #[test]
+    fn the_legacy_file_is_read_only_while_the_keyed_one_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumepeer-invite-store-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let keyed = dir.join("invite-0000000000000000.json");
+        let legacy_code = code_valid_at(1_000);
+        InviteStore::open(Some(dir.join(LEGACY_FILE_NAME))).set(legacy_code.clone());
+
+        assert_eq!(
+            InviteStore::open(Some(keyed.clone()))
+                .live(1_000)
+                .unwrap()
+                .0,
+            legacy_code
+        );
+
+        let keyed_code = code_valid_at(2_000);
+        InviteStore::open(Some(keyed.clone())).set(keyed_code.clone());
+        assert_eq!(
+            InviteStore::open(Some(keyed)).live(2_000).unwrap().0,
+            keyed_code
+        );
+        // Writing the keyed file left the legacy one as it was.
+        assert_eq!(
+            InviteStore::open(Some(dir.join(LEGACY_FILE_NAME)))
+                .live(1_000)
+                .unwrap()
+                .0,
+            legacy_code
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

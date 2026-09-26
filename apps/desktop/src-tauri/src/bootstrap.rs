@@ -112,7 +112,7 @@ pub async fn spawn_actor(
     let stores = ActorStores {
         history_path: connection_history_path(&app),
         address_book_path: address_book_path(),
-        invite_path: invite_path(),
+        invite_path: invite_path(&identity.verifying_key()),
         // The same keystore the identity came from: the unattended password
         // hash and TOTP secret are secret material and `CLAUDE.md` keeps
         // secrets out of `config/*.toml` (§11.2; ADR 0033).
