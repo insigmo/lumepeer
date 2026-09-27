@@ -3570,8 +3570,17 @@ pub async fn host_bar_expand(
     // Read the old geometry before resizing: the anchors are the right edge
     // and the vertical middle the bar has right now, and after `set_size`
     // both have already moved.
-    let anchor = bar.outer_position().ok().and_then(|position| {
-        let size = bar.outer_size().ok()?;
+    //
+    // Read in the frame `set_position` writes. On Linux that is the window
+    // itself, while the outer frame Mutter reports for an undecorated window
+    // carries an invisible 37 px band on top, and every collapse and expand
+    // walked the bar half of that up the screen (ADR 0118).
+    #[cfg(target_os = "linux")]
+    let (position, size) = (bar.inner_position(), bar.inner_size());
+    #[cfg(not(target_os = "linux"))]
+    let (position, size) = (bar.outer_position(), bar.outer_size());
+    let anchor = position.ok().and_then(|position| {
+        let size = size.ok()?;
         let scale = bar.scale_factor().ok()?;
         #[allow(
             clippy::cast_possible_truncation,
@@ -3606,10 +3615,34 @@ pub async fn host_bar_expand(
     bar.set_size(LogicalSize::new(width, height))
         .map_err(resize_failed)?;
     if let Some((x, y)) = anchor {
+        #[cfg(target_os = "linux")]
+        wait_for_the_resize(&bar, (width, height)).await;
         let (x, y) = clamp_to_monitor(&bar, (x, y), (width, height));
         let _ = bar.set_position(PhysicalPosition::new(x, y));
     }
     Ok(())
+}
+
+/// Waits, briefly, for the window manager to apply the bar's resize.
+///
+/// An X11 window manager applies a resize when it gets to it, and keeps a
+/// move that arrives first on screen by the size the window still has: Mutter
+/// put the collapsed tab where the open card's left edge had been, 242 px in
+/// from the screen edge, and each expand after that walked the bar further in
+/// (ADR 0118). Windows and macOS have resized by the time `set_size` returns.
+/// Half a second without the new size moves the bar anyway.
+#[cfg(target_os = "linux")]
+async fn wait_for_the_resize(bar: &tauri::WebviewWindow, (width, height): (f64, f64)) {
+    let Ok(scale) = bar.scale_factor() else {
+        return;
+    };
+    let wanted = tauri::LogicalSize::new(width, height).to_physical::<u32>(scale);
+    for _ in 0..50 {
+        if bar.inner_size().is_ok_and(|size| size == wanted) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// Keeps the whole bar on the monitor it is already on.

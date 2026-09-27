@@ -50,7 +50,31 @@ to fall back to, and the window manager has no range to let a person drag the
 window through. Windows and macOS keep `resizable(false)`: their resize
 already worked, and nothing about them changes.
 
-### 2. The process prefers X11, so a Wayland session draws it through XWayland
+### 2. On Linux the collapse moves the bar only after the resize has landed, and measures it without the frame
+
+Once the bar could shrink, a live run on GNOME (Mutter on Xorg) showed two
+more ways the tab missed the screen edge:
+
+- An X11 window manager applies a resize when it gets to it. A move that
+  arrives first is kept on screen by the size the window still has, so Mutter
+  put the 20-pixel tab where the 262-pixel card's left edge had been, 242 px
+  in from the edge, and each expand walked the bar further in.
+  `host_bar_expand` now waits for the window to report its new size (at most
+  half a second) before it calls `set_position`. Measured on that machine,
+  the wait took 48–89 ms.
+- The outer frame Mutter reports for an undecorated window includes an
+  invisible 37 px band on top, while `set_position` places the window itself.
+  Anchoring on `outer_position` and `outer_size` moved the bar up by half of
+  that band on every collapse and every expand. On Linux the anchors are now
+  read from `inner_position` and `inner_size`, the same frame `set_position`
+  writes. Windows and macOS keep the outer frame, which is what their
+  `set_position` writes.
+
+Measured after the change on that machine (1718×920): open 262×188 at
+(1456, 366); collapsed 20×58 at (1698, 431), flush with the right edge and
+centred on the card; expanded again at exactly (1456, 366).
+
+### 3. The process prefers X11, so a Wayland session draws it through XWayland
 
 Before Tauri starts GTK, `main` calls `gdk::set_allowed_backends("x11,wayland")`.
 On an X11 session nothing changes. On a Wayland session the windows become
@@ -82,3 +106,10 @@ starts untouched. The `gdk` crate is the exact version `tao` already links.
   would have left GNOME's bar in the middle of the screen.
 - A user who prefers native Wayland can start the app with
   `GDK_BACKEND=wayland`. The app still works; only the bar does not dock.
+- Measured live on GNOME on Xorg only. On a Wayland session the app was run
+  under WSLg, where its windows came up on XWayland and the tab measured
+  20×58, but WSLg's window manager does not place windows the way a desktop
+  does. Docking on GNOME or KDE under Wayland has not been measured yet.
+- The `pilot` build's capability (`capabilities-pilot/pilot.json`) now covers
+  the `hostbar` window too, so an e2e run can press the bar's buttons and read
+  its size. Release builds never read that directory.
