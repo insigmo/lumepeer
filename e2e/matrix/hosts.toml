@@ -21,6 +21,12 @@ wayland_picture_timeout = 120
 [hosts.win]
 os = "windows"
 app = "target/e2e/win/lumepeer-desktop.exe"
+# A WebView2 browser of its own. The app keeps its webview data in the OS's
+# local-data folder, which the installed client shares, and the installed
+# client runs elevated: the e2e windows' pages then render inside its
+# elevated browser process, where UIPI drops every click the harness makes,
+# and no view ever gets the keyboard or arms the grab.
+env = { WEBVIEW2_USER_DATA_FOLDER = 'C:\Users\beta_win\AppData\Local\lumepeer-e2e\webview2' }
 
 [hosts.beta]
 os = "windows"

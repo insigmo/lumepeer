@@ -199,10 +199,35 @@ fn watch_focus_for_the_keyboard_grab(window: &tauri::WebviewWindow, peer: &str, 
             // A window that is going away takes its grab with it, whether or
             // not a blur arrived first — a revoked session closes the window
             // without one.
-            tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. } => {
+            tauri::WindowEvent::CloseRequested { .. } => grab.window_closed(&peer),
+            tauri::WindowEvent::Destroyed => {
                 grab.window_closed(&peer);
+                end_the_session_of_a_closed_window(&app, &peer);
             }
             _ => {}
+        }
+    });
+}
+
+/// Ends the session of a view window that is gone (ADR 0119).
+///
+/// The page asks for this itself when it is closed, but that request can be
+/// lost: Tauri destroys the window once the page's close handler returns, and
+/// a webview that never loaded or already hung has no handler at all. Asking
+/// again from here costs nothing — a window the actor closed itself, or one
+/// whose page got through, has no session left, and the actor answers with an
+/// unknown peer that is dropped.
+fn end_the_session_of_a_closed_window(app: &tauri::AppHandle, peer: &str) {
+    use tauri::Manager as _;
+
+    let network = app.state::<crate::AppState>().network.clone();
+    let peer = peer.to_owned();
+    // Window events run on the platform's main thread, outside any runtime, so
+    // a bare `tokio::spawn` would panic here.
+    let runtime = app.state::<tokio::runtime::Runtime>().handle().clone();
+    runtime.spawn(async move {
+        if network.leave_view(peer).await.is_ok() {
+            tracing::info!("a closed view window ended its session");
         }
     });
 }

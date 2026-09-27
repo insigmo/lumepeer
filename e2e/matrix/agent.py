@@ -465,7 +465,97 @@ def press_keys(arg):
     return {"pressed": pressed, "foreground": foreground(None)}
 
 
-QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys, "focus_window": focus_window, "press_keys": press_keys}
+def raise_exe(arg):
+    """Puts the largest visible window of image `exe` (`vmware.exe`, say) on
+    top of this desktop, restored if it was minimized, and says where it is
+    in physical screen pixels: `rect` [left, top, right, bottom], or `None`
+    when no such window is up."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # physical pixels
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        if not user32.IsWindowVisible(hwnd) or user32.GetWindow(wintypes.HWND(hwnd), 4):  # GW_OWNER
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        process = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if process:
+            kernel32.QueryFullProcessImageNameW(process, 0, exe, ctypes.byref(size))
+            kernel32.CloseHandle(process)
+        if os.path.basename(exe.value).lower() == arg["exe"].lower():
+            rect = wintypes.RECT()
+            user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+            found.append(((rect.right - rect.left) * (rect.bottom - rect.top), hwnd))
+        return True
+
+    user32.EnumWindows(each, 0)
+    if not found:
+        return {"rect": None}
+    hwnd = wintypes.HWND(max(found)[1])
+    if arg.get("minimize"):
+        # Out of the way again: a VM left in front keeps the keyboard, and the
+        # tests after this one type into the app's own tracker.
+        user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        return {"rect": None, "minimized": True}
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    flags = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    for after in (-1, -2):  # HWND_TOPMOST, then HWND_NOTOPMOST
+        user32.SetWindowPos(hwnd, wintypes.HWND(after), 0, 0, 0, 0, flags)
+    time.sleep(0.3)
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    user32.GetKeyboardLayout.restype = ctypes.c_void_p
+    layout = user32.GetKeyboardLayout(user32.GetWindowThreadProcessId(hwnd, None)) or 0
+    return {"rect": [rect.left, rect.top, rect.right, rect.bottom], "foreground": foreground(None),
+            "layout": "%08x" % (layout & 0xFFFFFFFF)}
+
+
+def keyboard_layout(arg):
+    """Switches the app's view window to keyboard layout `klid` ("00000409"
+    for US English, "00000419" for Russian) and says what it was: the guest's
+    view makes `key` of every plain keystroke by the layout of its own
+    thread, which is whatever the person last switched to."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetKeyboardLayout.restype = ctypes.c_void_p
+    user32.LoadKeyboardLayoutW.restype = ctypes.c_void_p
+    hwnd = app_window(arg["pids"], VIEW_TITLE)
+    if not hwnd:
+        return {"switched": False, "why": "no view window"}
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD), ("hwndActive", wintypes.HWND),
+                    ("hwndFocus", wintypes.HWND), ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                    ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND), ("rcCaret", wintypes.RECT)]
+
+    # The page's keystrokes are made by the thread of the window that has
+    # the keyboard focus, which is WebView2's own, in its own process: that
+    # is the one to switch, not the frame's.
+    info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    user32.GetGUIThreadInfo(0, ctypes.byref(info))
+    target = info.hwndFocus or hwnd
+    thread = user32.GetWindowThreadProcessId(wintypes.HWND(target), None)
+    before = user32.GetKeyboardLayout(thread) or 0
+    layout = user32.LoadKeyboardLayoutW(arg["klid"], 0)
+    user32.PostMessageW(wintypes.HWND(target), 0x0050, 0, ctypes.c_void_p(layout))  # WM_INPUTLANGCHANGEREQUEST
+    time.sleep(0.5)
+    after = user32.GetKeyboardLayout(thread) or 0
+    return {"switched": (after & 0xFFFF) == (layout & 0xFFFF), "before": "%08x" % (before & 0xFFFFFFFF),
+            "after": "%08x" % (after & 0xFFFFFFFF)}
+
+
+QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys, "focus_window": focus_window, "press_keys": press_keys,
+           "raise_exe": raise_exe, "keyboard_layout": keyboard_layout}
 
 
 def on_desktop(name, arg):
@@ -519,6 +609,18 @@ def op_press_keys(req):
     if not WINDOWS:
         return {"pressed": 0}
     return on_desktop("press_keys", {"pids": processes_of(State.exe), "events": req["events"]})
+
+
+def op_raise_exe(req):
+    if not WINDOWS:
+        return {"rect": None}
+    return on_desktop("raise_exe", {"exe": req["exe"], "minimize": bool(req.get("minimize"))})
+
+
+def op_keyboard_layout(req):
+    if not WINDOWS:
+        return {"switched": False, "why": "only on Windows"}
+    return on_desktop("keyboard_layout", {"pids": processes_of(State.exe), "klid": req["klid"]})
 
 
 # ── tauri-pilot ─────────────────────────────────────────────────────────────
@@ -621,7 +723,8 @@ def op_log(req):
 
 OPS = {"hello": op_hello, "start": op_start, "stop": op_stop, "alive": op_alive,
        "foreground": op_foreground, "hotkeys": op_hotkeys, "focus_window": op_focus_window,
-       "press_keys": op_press_keys, "pilot": op_pilot, "log": op_log}
+       "press_keys": op_press_keys, "raise_exe": op_raise_exe, "keyboard_layout": op_keyboard_layout,
+       "pilot": op_pilot, "log": op_log}
 
 
 def main():

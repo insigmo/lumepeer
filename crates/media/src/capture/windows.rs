@@ -68,7 +68,7 @@ mod dxgi {
     use std::time::{Duration, Instant};
 
     use lumepeer_core::constants::{ENCODE_DEFAULT_FPS, SECURE_DESKTOP_RECOVERY_BACKOFF_MS};
-    use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, HMODULE};
+    use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED, E_INVALIDARG, HMODULE};
     #[cfg(all(test, feature = "encode-mf-zero-copy"))]
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
@@ -99,6 +99,10 @@ mod dxgi {
         DeleteObject, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
         SRCCOPY, SelectObject,
     };
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
         KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
@@ -119,7 +123,7 @@ mod dxgi {
         GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
         SM_CYSCREEN,
     };
-    use windows::core::{Interface as _, PCWSTR};
+    use windows::core::{Interface as _, PCWSTR, PWSTR};
 
     use lumepeer_core::protocol::{
         CursorShapeData, InputDetail, InputEventPayload, MODIFIER_SHIFT,
@@ -2270,6 +2274,105 @@ mod dxgi {
         unsafe { GetKeyboardLayout(thread) }
     }
 
+    /// Image names of the programs that hand this machine's keyboard on to
+    /// another machine by scan code: virtual-machine consoles and remote
+    /// desktop clients (ADR 0119). Compared lower-case.
+    const SCAN_CODE_CONSOLES: [&str; 9] = [
+        "vmware.exe",
+        "vmware-vmx.exe",
+        "vmplayer.exe",
+        "vmrc.exe",
+        "virtualboxvm.exe",
+        "virtualbox.exe",
+        "vmconnect.exe",
+        "mstsc.exe",
+        "msrdc.exe",
+    ];
+
+    /// Whether the window in front hands the keyboard on by scan code, so
+    /// that every key has to go as the key under the guest's finger and
+    /// nothing else (ADR 0119).
+    ///
+    /// Such a window reads the keyboard below itself and passes the scan code
+    /// to another machine, which applies *its own* layout. What this host's
+    /// layout would make of the key does not matter there, and a character
+    /// sent as itself (`KEYEVENTF_UNICODE`) is the worst answer of all: its
+    /// code goes where the scan code belongs, so 'h' arrived in a `VMware`
+    /// guest as F6 and 'o' as Page Up whenever the host's layout could not
+    /// type the letter (ADR 0115's fallback) — the stream of stray function
+    /// and navigation keys that read as a Ctrl stuck down.
+    fn foreground_reads_scan_codes() -> bool {
+        // SAFETY: no arguments; answers a window handle, null when nothing is
+        // in the foreground.
+        let window = unsafe { GetForegroundWindow() };
+        let mut pid = 0u32;
+        // SAFETY: a window handle (a null or dead one answers 0) and a stack
+        // slot for the process id.
+        unsafe { GetWindowThreadProcessId(window, Some(&raw mut pid)) };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: opening by id with the narrowest right that names the image;
+        // the handle is closed below on every path.
+        let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+        else {
+            return false;
+        };
+        let mut path = [0u16; 1024];
+        let mut len = u32::try_from(path.len()).unwrap_or(0);
+        // SAFETY: a live process handle, a buffer of `len` UTF-16 units and
+        // the slot the written length comes back in.
+        let named = unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &raw mut len,
+            )
+        };
+        // SAFETY: the handle OpenProcess returned above, closed once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        if named.is_err() {
+            return false;
+        }
+        let path = String::from_utf16_lossy(path.get(..len as usize).unwrap_or_default());
+        let name = path
+            .rsplit('\\')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        is_scan_code_console(&name)
+    }
+
+    /// The lookup half of [`foreground_reads_scan_codes`], on the image name
+    /// alone so it can be tested.
+    fn is_scan_code_console(name: &str) -> bool {
+        SCAN_CODE_CONSOLES.contains(&name) || name.starts_with("qemu-system-")
+    }
+
+    /// The key under the guest's finger as a keyboard's own set-1 scan code
+    /// (ADR 0119).
+    ///
+    /// The evdev codes of the main block, 1 through 88, *are* set-1 scan codes
+    /// with no prefix — Q is 16 in both, `LeftCtrl` 29 — so those go out as
+    /// exactly that, independent of any layout. [`Self::by_position`] goes
+    /// through the host's virtual key instead, which is right for an
+    /// accelerator but asks the host's layout where the key is: on an AZERTY
+    /// host the key a US guest calls Q is the one Windows maps to A. The rest,
+    /// the `E0` block included, have no such identity and go the ordinary way.
+    fn by_hardware_position(scancode: u32, key: PhysicalKey) -> HostKey {
+        match u16::try_from(scancode) {
+            Ok(scan @ 1..=88) if !key.extended => HostKey {
+                vk: VIRTUAL_KEY(0),
+                scan,
+                flags: KEYEVENTF_SCANCODE,
+            },
+            _ => WindowsInjector::by_position(key),
+        }
+    }
+
     /// The key on `layout` that types exactly `ch` at the guest's shift
     /// level, as the scan code a real keyboard would send — or `None`, and
     /// then the character goes as itself (ADR 0115).
@@ -2724,6 +2827,13 @@ mod dxgi {
             }
             let physical = physical_key(scancode);
             let host_key = match physical {
+                // A virtual machine or a remote desktop in front: the key
+                // itself, whatever it is and whatever it types here — the
+                // machine behind that window reads scan codes and applies its
+                // own layout (ADR 0119).
+                Some(key) if foreground_reads_scan_codes() => {
+                    Some(by_hardware_position(scancode, key))
+                }
                 Some(key) if is_chord(modifiers) || names_a_key(logical) => {
                     Some(Self::by_position(key))
                 }
@@ -3000,6 +3110,45 @@ mod dxgi {
         /// of land on the virtual key an accelerator listens for — which is
         /// the whole reason Ctrl+C copied nothing
         /// (docs/bugs/17-remote-hotkeys.md).
+        /// ADR 0119: the consoles that read scan codes are recognised by
+        /// their image name, and an ordinary program is not one of them.
+        #[test]
+        fn virtual_machine_and_remote_desktop_windows_read_scan_codes() {
+            for name in [
+                "vmware.exe",
+                "vmware-vmx.exe",
+                "virtualboxvm.exe",
+                "mstsc.exe",
+            ] {
+                assert!(is_scan_code_console(name), "{name}");
+            }
+            assert!(is_scan_code_console("qemu-system-x86_64.exe"));
+            for name in ["notepad.exe", "lumepeer-desktop.exe", "chrome.exe", ""] {
+                assert!(!is_scan_code_console(name), "{name}");
+            }
+        }
+
+        /// ADR 0119: into a virtual machine a key goes as its own set-1 scan
+        /// code — the evdev code of the main block — whatever the host's
+        /// layout makes of it, and a key with the `E0` prefix goes the
+        /// ordinary way, prefix and all.
+        #[test]
+        fn a_key_for_a_virtual_machine_is_the_key_under_the_finger() {
+            let q = physical_key(16).expect("Q is in the table");
+            let pressed = by_hardware_position(16, q);
+            assert_eq!(pressed.scan, 0x10);
+            assert_eq!(pressed.vk, VIRTUAL_KEY(0));
+            assert_eq!(pressed.flags, KEYEVENTF_SCANCODE);
+            let ctrl = physical_key(29).expect("LeftCtrl is in the table");
+            assert_eq!(by_hardware_position(29, ctrl).scan, 0x1D);
+            let up = physical_key(103).expect("Up is in the table");
+            let arrow = by_hardware_position(103, up);
+            assert_eq!(
+                arrow.flags.0 & KEYEVENTF_EXTENDEDKEY.0,
+                KEYEVENTF_EXTENDEDKEY.0
+            );
+        }
+
         #[test]
         fn physical_keys_land_on_the_virtual_key_an_accelerator_listens_for() {
             let letter = |code| physical_key(code).map(|key| key.vk);

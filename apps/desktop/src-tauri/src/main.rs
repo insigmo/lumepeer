@@ -714,6 +714,13 @@ fn main() {
                     api.prevent_close();
                     return;
                 }
+                // A view window closes for real. Hidden, it would keep its
+                // session running at both ends with nothing on screen to end
+                // it by, which is what the host saw as a guest that never
+                // left (ADR 0119).
+                if window.label().starts_with("view-") {
+                    return;
+                }
                 // Without a tray there is no icon to click and nothing to
                 // restore a hidden window from, so hiding it would leave a
                 // running process the user cannot reach. The close is allowed

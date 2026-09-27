@@ -1032,7 +1032,7 @@ async function main(): Promise<void> {
   // local WebView's native one has no business appearing on top of it.
   suppressContextMenu(document);
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
-  await getCurrentWindow().onCloseRequested(() => {
+  await getCurrentWindow().onCloseRequested(async () => {
     stopped = true;
     input?.setEnabled(false);
     nativeDecoder?.close();
@@ -1041,7 +1041,14 @@ async function main(): Promise<void> {
     // a process left running on somebody else's machine is the one outcome
     // ADR 0079 may not produce.
     terminal?.stop();
-    void endSession();
+    // Awaited: Tauri destroys this window as soon as the handler returns, and
+    // a revoke still on its way out of the page then never arrives — the
+    // session stays up at both ends with no window to show it (ADR 0119).
+    // Bounded, so an actor that does not answer cannot keep the window open.
+    await Promise.race([
+      endSession().catch(() => undefined),
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
   });
   if (terminalOnly) {
     // Neither frame loop starts, which is also what keeps the Rust side from

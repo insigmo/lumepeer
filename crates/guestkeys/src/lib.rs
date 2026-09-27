@@ -477,6 +477,30 @@ pub const fn shared_with_this_machine(scancode: u32) -> bool {
     )
 }
 
+/// Whether the live grab itself sent this transition of the key at evdev
+/// `scancode` to the remote machine: its press while the key is held, its
+/// release once it is up (ADR 0119).
+///
+/// What a view window asks before it drops its own copy of a key the grab
+/// shares with this machine ([`shared_with_this_machine`]). Asking whether the
+/// grab is *live* is not the same question: a hook that is installed can still
+/// miss a key — Windows drops a low-level hook that overran its deadline
+/// without a word, and a keystroke another program synthesized is never
+/// claimed — and the view then dropped the only copy of `Ctrl` there was. The
+/// letter went on alone, and Ctrl+C typed a `c`.
+#[must_use]
+pub fn sent_by_the_grab(scancode: u32, pressed: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_hook::sent(scancode, pressed)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (scancode, pressed);
+        false
+    }
+}
+
 /// The evdev code for a physical key named by its Windows virtual key, or
 /// `None` for one this table does not place.
 ///

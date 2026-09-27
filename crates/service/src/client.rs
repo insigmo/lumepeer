@@ -163,6 +163,77 @@ fn open() -> Option<std::fs::File> {
         .ok()
 }
 
+/// How long one input event waits for the service's pipe to come free before
+/// its caller performs it in-process instead (ADR 0119).
+///
+/// The service answers one client at a time on a single pipe instance, and
+/// between two clients the instance does not exist for a moment. Keystrokes
+/// arrive in bursts — a modifier and its key a few milliseconds apart — so
+/// the second one routinely found the pipe busy, and giving up at once sent
+/// it through the in-process injector instead: out of order with the first,
+/// holding its own idea of which keys are down, and unable to reach a
+/// `VMware` window at all. Ctrl went one way and the letter the other, and
+/// the guest OS saw the letter alone.
+#[cfg(target_os = "windows")]
+const INPUT_PIPE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// After a wait that ran out, how long later events give up at once rather
+/// than each waiting [`INPUT_PIPE_WAIT`] for a service that is plainly gone.
+#[cfg(target_os = "windows")]
+const INPUT_PIPE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`open`] for the input path: waits out a busy or momentarily absent pipe
+/// once this process has seen the service answer, and fails at once where it
+/// never has — a machine with no service must not pay a wait per keystroke.
+#[cfg(target_os = "windows")]
+fn open_for_input() -> Option<std::fs::File> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// `ERROR_FILE_NOT_FOUND`: between two pipe instances.
+    const BETWEEN_INSTANCES: i32 = 2;
+    /// `ERROR_PIPE_BUSY`: the one instance is serving somebody else.
+    const BUSY: i32 = 231;
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    static QUIET_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let cooling = || {
+        QUIET_UNTIL
+            .lock()
+            .is_ok_and(|until| until.is_some_and(|at| Instant::now() < at))
+    };
+    let deadline = Instant::now() + INPUT_PIPE_WAIT;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(crate::protocol::ENDPOINT)
+        {
+            Ok(pipe) => {
+                SEEN.store(true, Ordering::Relaxed);
+                if let Ok(mut until) = QUIET_UNTIL.lock() {
+                    *until = None;
+                }
+                return Some(pipe);
+            }
+            Err(error) => {
+                let transient = matches!(error.raw_os_error(), Some(BETWEEN_INSTANCES | BUSY));
+                if !transient || !SEEN.load(Ordering::Relaxed) || cooling() {
+                    return None;
+                }
+                if Instant::now() >= deadline {
+                    if let Ok(mut until) = QUIET_UNTIL.lock() {
+                        *until = Some(Instant::now() + INPUT_PIPE_COOLDOWN);
+                    }
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn round_trip(op: u8) -> bool {
     use crate::protocol::{FRAME_LEN, request, succeeded};
@@ -224,7 +295,7 @@ fn round_trip_inject_desktop(event: DesktopInjectEvent) -> bool {
     };
     use std::io::{Read as _, Write as _};
 
-    let Some(mut pipe) = open() else {
+    let Some(mut pipe) = open_for_input() else {
         return false;
     };
     let mut message = [0u8; FRAME_LEN + DESKTOP_INJECT_PAYLOAD_LEN];

@@ -57,6 +57,13 @@ struct Grabbing {
     /// ([`Held::of_positions`]): every modifier pressed while it is live is
     /// sent, so this is exactly what the host has down.
     held: BTreeSet<u32>,
+    /// Positions whose last transition this grab sent was a release.
+    ///
+    /// With `held`, this says which transition of a key the grab has itself
+    /// sent, which is what a view window has to know before it drops its own
+    /// copy of a `Ctrl`, `Alt` or `Shift` (ADR 0119). A key the hook never saw
+    /// is in neither set, and its copy is the only one there is.
+    released: BTreeSet<u32>,
 }
 
 /// The one live grab, or `None`.
@@ -105,6 +112,7 @@ pub(crate) fn install(sink: Sink) -> Option<Installed> {
         *grabbing = Some(Grabbing {
             sink,
             held: BTreeSet::new(),
+            released: BTreeSet::new(),
         });
     }
 
@@ -249,8 +257,10 @@ fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
     // The set is what has to be released later, so a repeat only ever adds.
     if pressed {
         grabbing.held.insert(scancode);
+        grabbing.released.remove(&scancode);
     } else {
         grabbing.held.remove(&scancode);
+        grabbing.released.insert(scancode);
     }
     (grabbing.sink)(GrabbedKey {
         scancode,
@@ -261,6 +271,21 @@ fn claim(event: &KBDLLHOOKSTRUCT) -> bool {
         pressed,
     });
     route == Route::There
+}
+
+/// Whether the live grab itself sent this transition of `scancode` — its
+/// press while it is held, its release once it is up (ADR 0119).
+pub(crate) fn sent(scancode: u32, pressed: bool) -> bool {
+    let Ok(slot) = GRABBING.lock() else {
+        return false;
+    };
+    slot.as_ref().is_some_and(|grabbing| {
+        if pressed {
+            grabbing.held.contains(&scancode)
+        } else {
+            grabbing.released.contains(&scancode)
+        }
+    })
 }
 
 /// `dwExtraInfo` of the keystrokes the e2e matrix injects on a guest

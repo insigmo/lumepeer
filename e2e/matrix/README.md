@@ -10,6 +10,7 @@ pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
 | `keys`    | `Hello, lumepeer 42` typed in the guest's view arrives as exactly that text, and 10 chords (Ctrl+A/C/V/Z, Ctrl+Shift+Z, Alt+X, Ctrl+Alt+J, Shift+Left, Ctrl+Home, Ctrl+Enter) arrive with the same modifiers |
 | `hotkeys` | Windows guest only: the same 10 chords pressed on the guest's own keyboard with its keyboard grab live arrive with the same modifiers, and Ctrl+A, Ctrl+C, Ctrl+End, Ctrl+V on `lumepeer` in the host's tracker leave `lumepeerlumepeer` |
 | `terminal` | the guest reconnects to the host for the terminal alone, as the remembered host's terminal button does (ADR 0101); the host's shell shows its prompt before anything is typed, `echo $((4200+37))` (`set /a 4200+37` on a Windows host) typed into it shows `4237`, and Close leaves no shell running on the host |
+| `vmware_typing` | win→beta only (`test_vmware.py`): with the `debian` VM in front in VMware on beta, a line of letters, capitals, digits, Ctrl/Alt chords and letters typed with Ctrl held reaches the VM byte for byte, read back from a raw-mode xterm inside it (`vm_recorder.sh`); once with the guest's grab off and once on, on a US and a Russian guest layout (ADR 0119). Injector changes need beta's LumepeerHelper on the e2e build: `helper-path.ps1 -To e2e`, and `-To installed` after |
 
 `guest->host` means the guest controls the host. The pairs are win↔mac, win↔linux,
 mac↔linux and win↔beta, in both directions.
@@ -83,6 +84,13 @@ How to read it:
   to record its screen"), and a locked guest draws nothing in its windows.
 - `SKIP no session` means `connect` failed for that pair, `SKIP <host> is down`
   means that machine never came up; the `hosts:` line says why.
+
+## Soak
+
+`python e2e/matrix/soak.py --guest win --host beta --minutes 30` holds one session and samples both
+ends every 30 s: the host's encode target, the guest's picture size, the link, and a sharpness figure
+of the picture at the start, middle and end (`target/e2e/matrix/soak.txt`). A pinned preset keeps the
+target still through every redial and resume (ADR 0119).
 
 ## What each machine needs
 

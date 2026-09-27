@@ -369,6 +369,7 @@ def hotkey_of(combo):
 # Set 1 scan codes of the keys the chords use, where a US keyboard has them.
 SCAN = ({c: 0x10 + i for i, c in enumerate("qwertyuiop")} | {c: 0x1E + i for i, c in enumerate("asdfghjkl")}
         | {c: 0x2C + i for i, c in enumerate("zxcvbnm")})
+DIGIT_SCAN = {str((i + 1) % 10): 0x02 + i for i in range(10)}
 SCAN_NAMED = {"ControlLeft": (0x1D, False), "ShiftLeft": (0x2A, False), "AltLeft": (0x38, False),
               "Enter": (0x1C, False), "Tab": (0x0F, False), "Escape": (0x01, False), "Backspace": (0x0E, False),
               "Space": (0x39, False), "ArrowLeft": (0x4B, True), "ArrowRight": (0x4D, True),
@@ -379,7 +380,12 @@ def os_events(combo):
     """`combo` as a keyboard presses it, modifiers first: [scan code, extended, up]."""
     out = []
     for kind, _, code, _ in synthetic_events(combo):
-        scan, extended = (SCAN[code[3:].lower()], False) if code.startswith("Key") else SCAN_NAMED[code]
+        if code.startswith("Key"):
+            scan, extended = SCAN[code[3:].lower()], False
+        elif code.startswith("Digit"):
+            scan, extended = DIGIT_SCAN[code[5:]], False
+        else:
+            scan, extended = SCAN_NAMED[code]
         out.append([scan, extended, kind == "keyup"])
     return out
 

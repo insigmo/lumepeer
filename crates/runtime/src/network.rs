@@ -1204,10 +1204,22 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Guest side only: the view window onto `label` is gone (ADR 0119).
+    LeaveView {
+        label: String,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
     /// Tests only: every connection this node holds drops as a lost link
     /// would, with no session ended on purpose on either side.
     #[cfg(test)]
     SeverLinks { reply: oneshot::Sender<()> },
+    /// Tests only: what this host holds of `label`'s preset and window size
+    /// for the encode loops of its session (ADR 0119), or `None` for none.
+    #[cfg(test)]
+    MediaCaps {
+        label: String,
+        reply: oneshot::Sender<Option<StreamCapsView>>,
+    },
     InviteCreate {
         role: Role,
         /// Retire every code handed out so far and issue a fresh one. `false`
@@ -1828,6 +1840,17 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Tests only: see [`ActorCommand::MediaCaps`].
+    #[cfg(test)]
+    pub async fn media_caps(&self, label: String) -> Option<StreamCapsView> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::MediaCaps { label, reply })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
     /// Tests only: drops every connection like a lost link (ADR 0089).
     #[cfg(test)]
     pub async fn sever_links(&self) {
@@ -1850,6 +1873,25 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::Revoke { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Ends the guest-side session whose view window is onto `label`, and
+    /// nothing else (ADR 0119).
+    ///
+    /// [`Self::revoke`] ends whichever session `label` names, which for a
+    /// peer that is also this node's own guest can be the host-side one. A
+    /// view window that is going away only ever speaks for its own session.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when no view or parked view is onto
+    /// `label`; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn leave_view(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::LeaveView { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -4163,6 +4205,8 @@ enum ActorEvent {
         /// they were tried; empty when the first transport worked
         /// (gap-tasks/23 task 3; ADR 0083).
         fallbacks: Vec<TransportFallback>,
+        /// Which dial this is (ADR 0119), from `dial_seq`.
+        seq: u64,
         result: Result<Box<ControlConnection>, NetError>,
     },
     /// Something happened to a file transfer, on one of its own tasks.
@@ -4878,23 +4922,32 @@ struct Actor {
     /// (ADR 0084). The same shape `display_mode_generation` uses, for the
     /// same reason and with higher stakes.
     reboot_generation: u64,
-    /// Guest side: the host this node is waiting to come back, if it is
-    /// waiting for one (ADR 0084).
+    /// Guest side: every host this node is waiting to come back, one wait
+    /// per host (ADR 0084).
     ///
-    /// One slot, like `connect_peer`, and for the same reason: this node
-    /// makes one outgoing attempt at a time, and the wait is a sequence of
-    /// exactly those attempts.
-    reconnect_wait: Option<ReconnectWait>,
+    /// Per host, not one slot: a guest watching two machines loses both when
+    /// its own link goes, and a single slot let the second drop take the
+    /// first one's wait away, leaving that window on "reconnecting" with
+    /// nothing dialing for it (ADR 0119). Each wait marks its own dial in
+    /// flight, so the connect form's `connect_peer` no longer has to say
+    /// whose result is whose.
+    reconnect_waits: std::collections::HashMap<NodeId, ReconnectWait>,
     /// Monotonic counter naming the most recent wait, so a tick left over
     /// from a cancelled one does not dial a host nobody is waiting for.
     reconnect_wait_generation: u64,
-    /// Guest side: the view window belonging to the session `reconnect_wait`
-    /// is trying to get back (docs/bugs/22 task 2; ADR 0105).
+    /// Guest side: the view window of each session a wait in
+    /// `reconnect_waits` is trying to get back (docs/bugs/22 task 2;
+    /// ADR 0105, ADR 0119).
     ///
-    /// One slot because `reconnect_wait` is one slot: this is that wait's own
-    /// window, held open with its last picture still on it, and it lives and
-    /// dies with the wait.
-    parked_view: Option<ParkedView>,
+    /// Keyed like `reconnect_waits`: each is that wait's own window, held
+    /// open with its last picture still on it, and it lives and dies with
+    /// the wait.
+    parked_views: std::collections::HashMap<NodeId, ParkedView>,
+    /// Guest side: hosts whose parked window the user closed while a resume
+    /// dial was already on its way (ADR 0119). That dial's connection is
+    /// closed as a goodbye when it lands, so the host ends the session
+    /// instead of holding it for the rest of its window.
+    leaving: std::collections::HashMap<NodeId, u64>,
     /// Guest side: the connect the user has open that is still being dialed
     /// after a round of attempts came back with nothing (ADR 0096).
     ///
@@ -4904,10 +4957,22 @@ struct Actor {
     /// Monotonic counter naming the most recent retry, so a tick left over
     /// from a cancelled or superseded connect dials nothing.
     connect_retry_generation: u64,
+    /// Monotonic counter naming every outgoing dial, so its result can be
+    /// matched to whoever started it (ADR 0119).
+    dial_seq: u64,
     /// Host side: per guest whose session dropped while granted, the id of the
     /// connection it dropped on, for as long as [`RECONNECT_WINDOW_SECS`]
     /// lets it come back under that id (§10; ADR 0089).
     parked_sessions: std::collections::HashMap<NodeId, [u8; 16]>,
+    /// Host side: per guest, the picture it last asked for — its preset and
+    /// its window's size — for as long as its session lives, parked or not
+    /// (ADR 0119).
+    ///
+    /// Per session rather than per media connection because the guest's
+    /// window says each of them once, and a session outlives the media
+    /// connections that serve it: a redial, or a resume into the same window,
+    /// starts a new encode loop that was never told.
+    stream_caps: std::collections::HashMap<NodeId, StreamCaps>,
     /// Guest side: per watched host, whether its `HelloAck` minor is at least
     /// [`TERMINAL_MINOR`], so this node may ask it for a shell at all.
     terminal_to_host: std::collections::HashMap<NodeId, bool>,
@@ -4991,6 +5056,11 @@ struct Actor {
     /// Host side: platform input adapter, opened on the first authorized event
     /// so a host that never grants `input` never touches it.
     injector: Option<Box<dyn InputInjector>>,
+    /// Host side: whether the last event went through the service's
+    /// `LocalSystem` desktop injector (ADR 0114), so the log says when input
+    /// moves between it and the in-process injector — once per change, not
+    /// per keystroke (ADR 0119). `None` before the first event.
+    injected_via_service: Option<bool>,
     /// Host side: the last pointer position a guest moved to *on the secure
     /// desktop*, so a click there can be placed without spawning a helper
     /// worker for every intervening move (ADR 0057).
@@ -5207,6 +5277,20 @@ struct PendingReboot {
     generation: u64,
 }
 
+/// Tests only: [`StreamCaps`] as a preset and a window size.
+#[cfg(test)]
+type StreamCapsView = (Option<u32>, Option<(u32, u32)>);
+
+/// Host side: what a guest asked of its picture (§11; ADR 0060, ADR 0064,
+/// ADR 0119).
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamCaps {
+    /// The preset, as a percentage of the captured picture.
+    scale: Option<u32>,
+    /// The box the guest's window draws the picture into.
+    size: Option<(u32, u32)>,
+}
+
 /// Guest side: a host this node is waiting to come back (§10; ADR 0084).
 ///
 /// Holds no credentials and no code: the invite is read out of the history
@@ -5228,10 +5312,15 @@ struct ReconnectWait {
     /// [`RECONNECT_WINDOW_SECS`] lasts and the host has not refused it
     /// (§10; ADR 0089). `None` is ADR 0084's wait for a new session.
     resume: Option<[u8; 16]>,
-    /// A resume dial is in flight. Kept here rather than in `connect_phase`,
-    /// which stays [`ConnectPhase::Resuming`] through every attempt so the
-    /// window does not flicker back to the connect form between them.
+    /// A dial this wait started is in flight. Kept here rather than in
+    /// `connect_phase`, which stays [`ConnectPhase::Resuming`] through every
+    /// attempt so the window does not flicker back to the connect form
+    /// between them — and which, with a wait per host, may be showing
+    /// another host's wait anyway (ADR 0119).
     dialing: bool,
+    /// Which dial that is, so its result is recognised as this wait's
+    /// whatever the connect form is showing by then (ADR 0119).
+    dial_seq: u64,
     /// Whether the session that went away was a shell and nothing else
     /// (ADR 0101).
     ///
@@ -5454,7 +5543,7 @@ impl Actor {
         // And a window that is up but whose session is away, for the same
         // reason (ADR 0105): the one command it can still send is its own
         // close, and that command names this host by label too.
-        if let Some(peer) = self.parked_view.as_ref().map(|parked| parked.peer) {
+        for peer in self.parked_views.keys().copied().collect::<Vec<_>>() {
             let label = peer_tag(&self.install_salt, &peer);
             self.labels.insert(label, peer);
         }
@@ -5862,8 +5951,15 @@ impl Actor {
             tracing::warn!(peer = %tag, "stream scale request without a live view grant; ignored");
             return;
         }
+        // Kept for the peer, not only handed to the encode loop running now:
+        // a guest names its preset once, at mount, and every media connection
+        // after a redial or a resume starts a new loop that has to be told
+        // again. Without this the new loop ran the adaptive controller under a
+        // preset nobody changed, and the picture went back to sharpening and
+        // softening on its own (ADR 0119, docs/bugs/07-video-quality.md).
+        self.stream_caps.entry(peer).or_default().scale = Some(scale_percent);
         let Some(session) = self.media.get(&peer) else {
-            tracing::debug!(peer = %tag, "stream scale request without a media session; ignored");
+            tracing::debug!(peer = %tag, "stream scale request before the media session; kept for it");
             return;
         };
         // A repeated value has nothing new to draw, so it does not spend a
@@ -5903,8 +5999,11 @@ impl Actor {
             tracing::warn!(peer = %tag, "stream size request without a live view grant; ignored");
             return;
         }
+        // Kept for every later media connection of this session, for the
+        // reason the preset is (ADR 0119).
+        self.stream_caps.entry(peer).or_default().size = Some((width, height));
         let Some(session) = self.media.get(&peer) else {
-            tracing::debug!(peer = %tag, "stream size request without a media session; ignored");
+            tracing::debug!(peer = %tag, "stream size request before the media session; kept for it");
             return;
         };
         // A repeated size has nothing new to draw, so it does not spend a
@@ -8411,8 +8510,9 @@ impl Actor {
                 code,
                 dialer,
                 fallbacks,
+                seq,
                 result,
-            } => self.on_dialed(peer, code, *dialer, fallbacks, result),
+            } => self.on_dialed(peer, seq, code, *dialer, fallbacks, result),
             ActorEvent::File(event) => self.on_file_event(event),
             ActorEvent::Tunnel(event) => self.on_tunnel_event(event),
             ActorEvent::Terminal(event) => self.on_terminal_event(event),
@@ -8520,6 +8620,17 @@ impl Actor {
             .contains(&peer)
             .then(|| self.cursors_tx.clone());
         let control = EncodeControl::new(peer, cursors);
+        // What the guest already asked of this session's picture, before this
+        // connection existed (ADR 0119). The window says it once; this loop
+        // may be the second or the tenth to serve it.
+        if let Some(caps) = self.stream_caps.get(&peer) {
+            if let Some(scale_percent) = caps.scale {
+                control.set_manual_cap(Some(scale_percent));
+            }
+            if let Some(size) = caps.size {
+                control.set_size_cap(Some(size));
+            }
+        }
         // The loop's own copy of the `secure_desktop` grant, seeded from what
         // the session actually holds rather than assumed off: a full-control
         // guest carries the grant from the moment consent is given
@@ -8746,7 +8857,7 @@ impl Actor {
         // belongs in. Nothing is opened, nothing is re-laid-out: the picture
         // the user is looking at is the one the next frame draws over
         // (docs/bugs/22 task 2; ADR 0105).
-        if self.parked_view.as_ref().is_some_and(|p| p.peer == peer) {
+        if self.parked_views.contains_key(&peer) {
             self.revive_parked_view(peer, role, grants);
             return;
         }
@@ -8974,7 +9085,7 @@ impl Actor {
                     peer = %self.label_of(&peer),
                     "the view window is waiting for its session to come back"
                 );
-                self.parked_view = Some(ParkedView { peer, state });
+                self.parked_views.insert(peer, ParkedView { peer, state });
             }
         }
         // The last view closing may be the only reason the watcher was on
@@ -8994,7 +9105,7 @@ impl Actor {
     /// and it learns the session is back the same way, by the picture moving
     /// again.
     fn revive_parked_view(&mut self, peer: NodeId, role: Role, grants: Grants) {
-        let Some(mut state) = self.parked_view.take().map(|parked| parked.state) else {
+        let Some(mut state) = self.parked_views.remove(&peer).map(|parked| parked.state) else {
             return;
         };
         let tag = self.label_of(&peer);
@@ -9038,8 +9149,8 @@ impl Actor {
             // saying "reconnecting" over a frozen frame for good would be a
             // lie — the one status the pipeline itself cannot report.
             tracing::warn!(peer = %tag, "no remembered address for this host: the picture cannot come back");
-            self.parked_view = Some(ParkedView { peer, state });
-            self.close_parked_view();
+            self.parked_views.insert(peer, ParkedView { peer, state });
+            self.close_parked_view(peer);
             return;
         }
         if state.terminal_only {
@@ -9069,8 +9180,8 @@ impl Actor {
     /// The history row was already written when it was parked, so there is
     /// nothing to remember here that is not remembered: this is only the
     /// window and the feed behind it.
-    fn close_parked_view(&mut self) {
-        let Some(parked) = self.parked_view.take() else {
+    fn close_parked_view(&mut self, peer: NodeId) {
+        let Some(parked) = self.parked_views.remove(&peer) else {
             return;
         };
         self.view_feeds
@@ -9094,13 +9205,14 @@ impl Actor {
     /// went somewhere else, the host answered and then said nothing — it is a
     /// frozen picture nobody is coming back to, and it closes.
     fn close_parked_view_without_a_wait(&mut self) {
-        let waited_for = self.reconnect_wait.as_ref().map(|wait| wait.peer);
-        if self
-            .parked_view
-            .as_ref()
-            .is_some_and(|parked| waited_for != Some(parked.peer))
-        {
-            self.close_parked_view();
+        let orphans: Vec<NodeId> = self
+            .parked_views
+            .keys()
+            .filter(|peer| !self.reconnect_waits.contains_key(*peer))
+            .copied()
+            .collect();
+        for peer in orphans {
+            self.close_parked_view(peer);
         }
     }
 
@@ -9324,7 +9436,20 @@ impl Actor {
         // performed every event before 0114 and still does when the service
         // cannot (§18; ADR 0114 §3). Off Windows the call is a no-op `false`, so
         // nothing changes there.
-        if lumepeer_service::client::inject_desktop(desktop_inject_event(event)) {
+        let via_service = lumepeer_service::client::inject_desktop(desktop_inject_event(event));
+        // The two injectors keep separate books on which keys are down, and
+        // only one of them reaches a `VMware` guest, so a session whose input
+        // moves between them misbehaves in ways the log should explain
+        // (ADR 0119).
+        if self.injected_via_service != Some(via_service) {
+            if via_service {
+                tracing::info!(peer = %tag, "input goes through the desktop injector (ADR 0114)");
+            } else if self.injected_via_service.is_some() {
+                tracing::warn!(peer = %tag, "the desktop injector did not take an event; performing input in-process");
+            }
+            self.injected_via_service = Some(via_service);
+        }
+        if via_service {
             return;
         }
         if self.injector.is_none() {
@@ -9533,13 +9658,19 @@ impl Actor {
                 // window, and the host's own list, which leaves a parked
                 // session out, would have no row to end it by (ADR 0112).
                 let _ = self.sessions.revoke(peer);
+                self.stream_caps.remove(&peer);
                 tracing::info!(peer = %label, "the guest left on purpose; its session has ended");
             } else if let Some(handle) = closed {
                 // Held for the window, under the id the guest knows it by, so
-                // the same guest can come back to it (§10; ADR 0089).
+                // the same guest can come back to it (§10; ADR 0089). So is
+                // what it asked of the picture: the window a resume comes
+                // back into does not ask again (ADR 0119).
                 self.park_session(peer, handle.session_id);
             }
+            return;
         }
+        // No session came of this connection, or none survives it.
+        self.stream_caps.remove(&peer);
     }
 
     /// Host side: keeps a session that dropped resumable for the window, under
@@ -9562,6 +9693,7 @@ impl Actor {
     /// somebody asks; ending it here is what stops a guest that never came back
     /// from holding a place in the concurrent-guest limit afterwards.
     fn end_parked_session(&mut self, peer: NodeId) {
+        self.stream_caps.remove(&peer);
         if self.parked_sessions.remove(&peer).is_some()
             && self.sessions.state(&peer) == SessionState::Reconnecting
         {
@@ -9785,12 +9917,8 @@ impl Actor {
                 // (ADR 0089). `finish`, not `stop`: `start_view` below is
                 // about to draw this grant into the window that wait parked
                 // (ADR 0105).
-                if self
-                    .reconnect_wait
-                    .as_ref()
-                    .is_some_and(|wait| wait.peer == peer)
-                {
-                    self.finish_reconnect_wait();
+                if self.reconnect_waits.contains_key(&peer) {
+                    self.finish_reconnect_wait(peer);
                 }
                 let _ = self.notify.send(ActorNotification::ConsentGranted { role });
                 // Reacted to here rather than through the notification stream:
@@ -9833,6 +9961,14 @@ impl Actor {
                 // pressing Deny; after a grant it is an ordinary end of
                 // session, and the connect form should just go quiet.
                 let dialed = self.host_dialers.contains_key(&peer);
+                // A refusal of a session a wait dialed for is the host
+                // answering, and the wait ends with it (ADR 0100). Read off
+                // the wait itself rather than the connect form, which may be
+                // showing another host's wait (ADR 0119).
+                if !self.views.contains_key(&peer) && self.reconnect_waits.contains_key(&peer) {
+                    tracing::info!(peer = %tag, "the host said no; the wait for it ends");
+                    self.stop_reconnect_wait(peer);
+                }
                 self.settle_connect(peer, ConnectPhase::Denied);
                 self.stop_view(peer);
                 if dialed {
@@ -10163,10 +10299,7 @@ impl Actor {
                 // and this is the only place that could make it silent. With
                 // it off the challenge still arrives — the person at this
                 // keyboard answers it, which is what they are there for.
-                let unasked = self
-                    .reconnect_wait
-                    .as_ref()
-                    .is_some_and(|wait| wait.peer == peer);
+                let unasked = self.reconnect_waits.contains_key(&peer);
                 if !code_required
                     && (!unasked || self.may_return_without_asking(&host_tag(&peer)))
                     && let Ok(Some(password)) = self.remembered_passwords.load(&host_tag(&peer))
@@ -10446,9 +10579,9 @@ impl Actor {
         // claim it will not honour instead of asking anyone.
         let resuming_over_this = !was_watching
             && self
-                .reconnect_wait
-                .as_ref()
-                .is_some_and(|wait| wait.peer == peer && wait.resume.is_some());
+                .reconnect_waits
+                .get(&peer)
+                .is_some_and(|wait| wait.resume.is_some());
         let resume_refused = resuming_over_this
             && closed.as_ref().is_some_and(|handle| {
                 handle
@@ -10492,8 +10625,7 @@ impl Actor {
         } else if resuming_over_this {
             // The link went again before the host answered: that is not a
             // refusal, and the wait's next tick tries once more.
-            self.connect_phase = ConnectPhase::Resuming;
-            self.connect_peer = Some(peer);
+            self.show_wait_in_form(peer, ConnectPhase::Resuming);
         }
         let label = peer_tag(&self.install_salt, &peer);
         self.end_or_park_session(peer, &label, closed.as_ref());
@@ -10593,6 +10725,15 @@ impl Actor {
                 let _ = reply.send(result);
             }
             #[cfg(test)]
+            ActorCommand::MediaCaps { label, reply } => {
+                let caps = self
+                    .resolve(&label)
+                    .ok()
+                    .and_then(|peer| self.stream_caps.get(&peer))
+                    .map(|caps| (caps.scale, caps.size));
+                let _ = reply.send(caps);
+            }
+            #[cfg(test)]
             ActorCommand::SeverLinks { reply } => {
                 // A code no side reads as a decision: what the far side sees
                 // is a connection that ended, as it would on a lost link.
@@ -10603,6 +10744,17 @@ impl Actor {
             }
             ActorCommand::Revoke { label, reply } => {
                 let result = self.on_revoke(&label);
+                self.rebuild_labels_and_snapshot();
+                let _ = reply.send(result);
+            }
+            ActorCommand::LeaveView { label, reply } => {
+                let result = self.resolve(&label).and_then(|peer| {
+                    if self.leave_view(peer, &label) {
+                        Ok(())
+                    } else {
+                        Err(ActorError::UnknownPeer)
+                    }
+                });
                 self.rebuild_labels_and_snapshot();
                 let _ = reply.send(result);
             }
@@ -13539,35 +13691,7 @@ impl Actor {
     /// as a disconnect and answers with its own `remove_viewer`.
     fn on_revoke(&mut self, label: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
-        // The window is up but its session is away, being waited for
-        // (ADR 0105). Closing it is the user saying they are done waiting,
-        // which is the third of the three ways a parked window ends — and the
-        // only one that comes from the person in front of it.
-        if self
-            .parked_view
-            .as_ref()
-            .is_some_and(|parked| parked.peer == peer)
-        {
-            tracing::info!(peer = %label, "leaving a session that was still coming back");
-            // Takes the wait down and the window with it, in that order.
-            self.stop_reconnect_wait();
-            self.settle_connect(peer, ConnectPhase::Idle);
-            self.drop_file_state(peer);
-            self.host_dialers.remove(&peer);
-            return Ok(());
-        }
-        if self.views.contains_key(&peer) {
-            tracing::info!(peer = %label, "leaving a session from the view window");
-            self.settle_connect(peer, ConnectPhase::Idle);
-            self.drop_file_state(peer);
-            // Records the host into the remembered list on its way out.
-            self.stop_view(peer);
-            self.host_dialers.remove(&peer);
-            // The user closing the window on purpose, not a protocol fault —
-            // the malformed code close_connection sends would otherwise make
-            // an ordinary exit look like an error in the host's own log
-            // (docs/bugs/03-connection-list.md, task 3).
-            self.close_connection_normal(peer);
+        if self.leave_view(peer, label) {
             return Ok(());
         }
         // Nothing is written to the remembered-hosts list here. This branch is
@@ -13926,7 +14050,17 @@ impl Actor {
         // Both run before the early return below, because a wait between
         // attempts has no connection of its own to cancel and would otherwise
         // be the one state this button could not reach.
-        self.stop_reconnect_wait();
+        //
+        // The wait the form is showing, or every wait when it shows none: a
+        // window parked for another host has its own close (ADR 0119).
+        match self.connect_peer {
+            Some(peer) => self.stop_reconnect_wait(peer),
+            None => {
+                for peer in self.reconnect_waits.keys().copied().collect::<Vec<_>>() {
+                    self.stop_reconnect_wait(peer);
+                }
+            }
+        }
         self.stop_connect_retry();
         let Some(peer) = self.connect_peer.take() else {
             return;
@@ -14207,25 +14341,33 @@ impl Actor {
     ) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
-        self.reconnect_wait = Some(ReconnectWait {
+        self.reconnect_waits.insert(
             peer,
-            host_tag,
-            started_at: std::time::Instant::now(),
-            generation,
-            resume,
-            dialing: false,
-            terminal_only,
-        });
-        self.connect_phase = if resume.is_some() {
+            ReconnectWait {
+                peer,
+                host_tag,
+                started_at: std::time::Instant::now(),
+                generation,
+                resume,
+                dialing: false,
+                dial_seq: 0,
+                terminal_only,
+            },
+        );
+        // A goodbye still owed to an earlier session with this host is moot:
+        // this is a new drop, and the next dial at it is this wait's.
+        self.leaving.remove(&peer);
+        let phase = if resume.is_some() {
             ConnectPhase::Resuming
         } else {
             ConnectPhase::WaitingForHost
         };
-        self.connect_peer = Some(peer);
-        self.connect_failure = None;
-        self.connect_code_required = false;
-        self.connect_retry_secs = None;
-        self.connect_credentials_auto = false;
+        if self.show_wait_in_form(peer, phase) {
+            self.connect_failure = None;
+            self.connect_code_required = false;
+            self.connect_retry_secs = None;
+            self.connect_credentials_auto = false;
+        }
         let first_attempt_secs = if resume.is_some() {
             RESUME_RETRY_SECS
         } else {
@@ -14250,7 +14392,7 @@ impl Actor {
     /// host rather than only a trusted one: an ordinary connect, asking
     /// whoever the host asks, carrying nothing of the session that ended.
     fn on_resume_refused(&mut self, peer: NodeId) {
-        let Some(wait) = self.reconnect_wait.as_mut() else {
+        let Some(wait) = self.reconnect_waits.get_mut(&peer) else {
             return;
         };
         wait.resume = None;
@@ -14258,19 +14400,22 @@ impl Actor {
         let host_tag = wait.host_tag.clone();
         tracing::info!(peer = %self.label_of(&peer), "the host did not resume the session");
         if self.history.code_of(&host_tag).is_some() {
-            self.connect_phase = ConnectPhase::WaitingForHost;
-            self.connect_peer = Some(peer);
-            self.connect_failure = None;
+            if self.show_wait_in_form(peer, ConnectPhase::WaitingForHost) {
+                self.connect_failure = None;
+            }
             return;
         }
         // Unless the row the wait reads its invite out of has been removed in
         // the meantime. Then there is nothing left to dial with, and the
         // button really is all there is.
         tracing::info!("the remembered host is gone; nothing is left to dial it with");
-        self.stop_reconnect_wait();
-        self.connect_phase = ConnectPhase::Failed;
-        self.connect_failure = Some("SESSION_NOT_RESUMED");
-        self.connect_peer = None;
+        let shown = self.form_is_free_for_wait(peer);
+        self.stop_reconnect_wait(peer);
+        if shown {
+            self.connect_phase = ConnectPhase::Failed;
+            self.connect_failure = Some("SESSION_NOT_RESUMED");
+            self.connect_peer = None;
+        }
     }
 
     /// Guest side: the resume part of a wait, one tick of it (§10; ADR 0089).
@@ -14281,31 +14426,31 @@ impl Actor {
     /// session (ADR 0106).
     fn resume_tick(&mut self, wait: &ReconnectWait) -> bool {
         if wait.started_at.elapsed() >= Duration::from_secs(RECONNECT_WINDOW_SECS) {
-            if let Some(current) = self.reconnect_wait.as_mut() {
+            if let Some(current) = self.reconnect_waits.get_mut(&wait.peer) {
                 current.resume = None;
             }
             tracing::info!(
                 peer = %self.label_of(&wait.peer),
                 "the session did not come back inside its window"
             );
-            if self.connect_phase == ConnectPhase::Resuming {
+            if self.connect_peer == Some(wait.peer) && self.connect_phase == ConnectPhase::Resuming
+            {
                 self.connect_phase = ConnectPhase::WaitingForHost;
             }
             return false;
         }
-        if self.connect_peer.is_some_and(|peer| peer != wait.peer) {
-            tracing::info!("the connect form moved to another host; the resume ends");
-            self.stop_reconnect_wait();
-            return true;
-        }
+        // The connect form moving to another host does not end this: the
+        // form is shared by every host being waited for, and a resume belongs
+        // to its own window (ADR 0119).
         if wait.dialing || self.connections.contains_key(&wait.peer) {
             self.arm_reconnect_wait(wait.generation, RESUME_RETRY_SECS);
             return true;
         }
         let Some(code) = self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) else {
             tracing::info!("the remembered host is gone; the resume ends");
-            self.stop_reconnect_wait();
-            if self.connect_phase == ConnectPhase::Resuming {
+            self.stop_reconnect_wait(wait.peer);
+            if self.connect_peer == Some(wait.peer) && self.connect_phase == ConnectPhase::Resuming
+            {
                 self.connect_phase = ConnectPhase::Idle;
                 self.connect_peer = None;
             }
@@ -14349,7 +14494,7 @@ impl Actor {
         self.connect_failure.is_none()
             && self.connect_peer == Some(peer)
             && self.connect_phase.is_pending()
-            && self.reconnect_wait.is_none()
+            && !self.reconnect_waits.contains_key(&peer)
             && self
                 .connect_retry
                 .as_ref()
@@ -14371,30 +14516,23 @@ impl Actor {
         // that "again" would mean forty times (ADR 0100). The wait ends here
         // and the failure falls through to the reporting below, the same as
         // it would for a connect the user pressed.
-        if is_verdict(error)
-            && self
-                .reconnect_wait
-                .as_ref()
-                .is_some_and(|wait| wait.peer == peer)
-        {
+        if is_verdict(error) && self.reconnect_waits.contains_key(&peer) {
             tracing::info!(peer = %tag, %error, "the host answered; the wait for it ends");
-            self.stop_reconnect_wait();
+            self.stop_reconnect_wait(peer);
         }
         // An attempt that failed while waiting for a host to come back is what
         // waiting *looks like*, not an outcome to put on screen: the machine is
         // still restarting, and the next tick will try again (ADR 0084).
-        if self
-            .reconnect_wait
-            .as_ref()
-            .is_some_and(|wait| wait.peer == peer)
-        {
+        if self.reconnect_waits.contains_key(&peer) {
             tracing::debug!(peer = %tag, %error, "the host is not back yet");
-            self.connect_phase = if resuming {
-                ConnectPhase::Resuming
-            } else {
-                ConnectPhase::WaitingForHost
-            };
-            self.connect_peer = Some(peer);
+            self.show_wait_in_form(
+                peer,
+                if resuming {
+                    ConnectPhase::Resuming
+                } else {
+                    ConnectPhase::WaitingForHost
+                },
+            );
             return;
         }
         // A round of silence is not an outcome the user can act on, so the
@@ -14553,13 +14691,13 @@ impl Actor {
     /// Bumping the generation is what makes it stick: a tick already armed
     /// still fires, finds a generation that no longer matches, and dials
     /// nothing.
-    fn stop_reconnect_wait(&mut self) {
-        self.end_reconnect_wait();
+    fn stop_reconnect_wait(&mut self, peer: NodeId) {
+        self.end_reconnect_wait(peer);
         // Nothing is going to fill that window now (ADR 0105). This is the
         // "gave up" funnel — the host refused, the user called it off, the
-        // ceiling was reached, the form moved somewhere else — and it is the
-        // one place a parked window has to close.
-        self.close_parked_view();
+        // ceiling was reached — and it is the one place a parked window has
+        // to close.
+        self.close_parked_view(peer);
     }
 
     /// Guest side: ends the wait because it *worked* (ADR 0084, ADR 0089;
@@ -14570,15 +14708,131 @@ impl Actor {
     /// grant, and `start_view` puts that grant back into the very window this
     /// wait parked. Closing it here would close it a few milliseconds before
     /// the picture came back.
-    fn finish_reconnect_wait(&mut self) {
-        self.end_reconnect_wait();
+    fn finish_reconnect_wait(&mut self, peer: NodeId) {
+        self.end_reconnect_wait(peer);
     }
 
-    /// The bookkeeping both share.
-    fn end_reconnect_wait(&mut self) {
-        if self.reconnect_wait.take().is_some() {
-            self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
+    /// The bookkeeping both share. Removing the wait is what makes a tick
+    /// already armed for it find nothing, since ticks look a wait up by its
+    /// own generation.
+    fn end_reconnect_wait(&mut self, peer: NodeId) {
+        self.reconnect_waits.remove(&peer);
+    }
+
+    /// Guest side: whether the connect form may show `peer`'s wait (ADR 0119).
+    ///
+    /// The form is one per node and the waits are one per host. It shows a
+    /// wait when it is showing nothing, is already showing this one, or is
+    /// only showing another wait — never over a connect the user started,
+    /// whose spinner and whose result are still the form's own.
+    fn form_is_free_for_wait(&self, peer: NodeId) -> bool {
+        self.connect_peer.is_none_or(|shown| {
+            shown == peer
+                || (self.reconnect_waits.contains_key(&shown)
+                    && matches!(
+                        self.connect_phase,
+                        ConnectPhase::Resuming | ConnectPhase::WaitingForHost
+                    ))
+        })
+    }
+
+    /// Guest side: puts `peer`'s wait on the connect form when the form is
+    /// free for it, and says whether it did (ADR 0119).
+    fn show_wait_in_form(&mut self, peer: NodeId, phase: ConnectPhase) -> bool {
+        if !self.form_is_free_for_wait(peer) {
+            return false;
         }
+        self.connect_phase = phase;
+        self.connect_peer = Some(peer);
+        true
+    }
+
+    /// Guest side: the person closed the view window onto `peer`, live or
+    /// parked. Returns whether there was one (ADR 0112, ADR 0119).
+    fn leave_view(&mut self, peer: NodeId, label: &str) -> bool {
+        // The window is up but its session is away, being waited for
+        // (ADR 0105). Closing it is the user saying they are done waiting,
+        // which is the third of the three ways a parked window ends — and the
+        // only one that comes from the person in front of it.
+        if self.parked_views.contains_key(&peer) {
+            tracing::info!(peer = %label, "leaving a session that was still coming back");
+            self.say_goodbye(peer);
+            // Takes the wait down and the window with it, in that order.
+            self.stop_reconnect_wait(peer);
+            self.settle_connect(peer, ConnectPhase::Idle);
+            self.drop_file_state(peer);
+            self.host_dialers.remove(&peer);
+            return true;
+        }
+        if self.views.contains_key(&peer) {
+            tracing::info!(peer = %label, "leaving a session from the view window");
+            self.settle_connect(peer, ConnectPhase::Idle);
+            self.drop_file_state(peer);
+            // Records the host into the remembered list on its way out.
+            self.stop_view(peer);
+            self.host_dialers.remove(&peer);
+            // The user closing the window on purpose, not a protocol fault —
+            // the malformed code close_connection sends would otherwise make
+            // an ordinary exit look like an error in the host's own log
+            // (docs/bugs/03-connection-list.md, task 3).
+            self.close_connection_normal(peer);
+            return true;
+        }
+        false
+    }
+
+    /// Guest side: tells a host that the session it is holding for this node
+    /// is over, although the link it ran on is gone (ADR 0119).
+    ///
+    /// A host parks a dropped session for [`RECONNECT_WINDOW_SECS`] and keeps
+    /// the plan's guest place and the controller role for it the whole time
+    /// (ADR 0089), and nobody at the host can end it by hand (ADR 0112). The
+    /// only way to reach it is the way a resume does: claim the session, and
+    /// then close that connection as a person leaving — which the host reads
+    /// as the end of the session. A resume dial already on its way is used
+    /// for that when it lands; otherwise one is sent for it now. Nothing
+    /// waits on either: a host that cannot be reached is holding a session
+    /// its own window will end.
+    fn say_goodbye(&mut self, peer: NodeId) {
+        let Some(wait) = self.reconnect_waits.get(&peer) else {
+            return;
+        };
+        let Some(resume) = wait.resume else {
+            // ADR 0084's wait for a new session: the host has nothing parked.
+            return;
+        };
+        if wait.dialing {
+            self.leaving.insert(peer, wait.dial_seq);
+            return;
+        }
+        if self.connections.contains_key(&peer) {
+            return;
+        }
+        let Some(code) = self.history.code_of(&wait.host_tag).map(ToOwned::to_owned) else {
+            return;
+        };
+        let Ok(ticket) = InviteTicket::from_code(&code) else {
+            return;
+        };
+        let Ok(addr) = ticket.endpoint_addr() else {
+            return;
+        };
+        let Ok(proof) = postcard::to_allocvec(&ticket) else {
+            return;
+        };
+        let Some(plan) = self.dial_plan(&ticket, &addr) else {
+            return;
+        };
+        let tag = self.label_of(&peer);
+        let role = ticket.allowed_request;
+        let codecs = self.own_codec_support;
+        tracing::info!(peer = %tag, "telling the host the session it holds is over");
+        tokio::spawn(async move {
+            let outcome = dial_over_plan(plan, role, proof, &tag, codecs, Some(resume)).await;
+            if let Ok(control) = outcome.result {
+                close_as_leaving(&control);
+            }
+        });
     }
 
     /// Guest side: one attempt at a host that went away (§10; ADR 0084).
@@ -14587,12 +14841,14 @@ impl Actor {
     /// started: the row may have been removed, or the host may have answered
     /// since, and each of those means there is nothing left to dial for.
     fn on_reconnect_wait_tick(&mut self, generation: u64) {
-        let Some(wait) = self.reconnect_wait.clone() else {
+        let Some(wait) = self
+            .reconnect_waits
+            .values()
+            .find(|wait| wait.generation == generation)
+            .cloned()
+        else {
             return;
         };
-        if wait.generation != generation {
-            return;
-        }
         if wait.resume.is_some() && self.resume_tick(&wait) {
             return;
         }
@@ -14602,10 +14858,14 @@ impl Actor {
         // saying something, and dialing again would only collect the same no
         // every fifteen seconds. It matters more since ADR 0106, which runs
         // this wait at hosts that were never marked as ones to come back to.
-        if matches!(
-            self.connect_phase,
-            ConnectPhase::Denied | ConnectPhase::Failed
-        ) || self.connect_failure.is_some()
+        //
+        // Read off the form only while the form is this wait's: with a wait
+        // per host, a refusal on it can be another host's (ADR 0119).
+        if self.connect_peer == Some(wait.peer)
+            && (matches!(
+                self.connect_phase,
+                ConnectPhase::Denied | ConnectPhase::Failed
+            ) || self.connect_failure.is_some())
         {
             tracing::info!(
                 peer = %self.label_of(&wait.peer),
@@ -14613,7 +14873,7 @@ impl Actor {
                 failure = self.connect_failure.unwrap_or("none"),
                 "the host answered; the wait for it ends"
             );
-            self.stop_reconnect_wait();
+            self.stop_reconnect_wait(wait.peer);
             return;
         }
         // A resume the host refused leaves a wait still inside the window,
@@ -14630,8 +14890,10 @@ impl Actor {
                 peer = %self.label_of(&wait.peer),
                 "a host did not come back inside the wait; leaving the reconnect to the user"
             );
-            self.stop_reconnect_wait();
-            if self.connect_phase == ConnectPhase::WaitingForHost {
+            self.stop_reconnect_wait(wait.peer);
+            if self.connect_peer == Some(wait.peer)
+                && self.connect_phase == ConnectPhase::WaitingForHost
+            {
                 self.connect_phase = ConnectPhase::Failed;
                 self.connect_failure = Some("HOST_DID_NOT_RETURN");
                 self.connect_peer = None;
@@ -14645,20 +14907,15 @@ impl Actor {
         // is left to re-read is the row itself, below — a host the user
         // removed has no code to dial with.
         //
-        // The connect form moved to another host. This node makes one outgoing
-        // attempt at a time, so dialing now would take the form away from
-        // whatever the user is doing with it; the wait ends instead.
-        if self.connect_peer.is_some_and(|peer| peer != wait.peer) {
-            tracing::info!("the connect form moved to another host; the wait ends");
-            self.stop_reconnect_wait();
-            return;
-        }
+        //
+        // The connect form moving to another host used to end this wait, back
+        // when there was one wait for the whole node. It is shared by every
+        // host being waited for now, and each wait marks its own dial, so a
+        // connect somewhere else leaves this one alone (ADR 0119).
+        //
         // An attempt is already in flight, or the host is already back and
-        // deciding: leave it alone and look again next tick. Two dials racing
-        // into one `connect_phase` is what `spawn_dial` refuses, and there is
-        // nothing here worth racing it for.
-        if self.connect_phase == ConnectPhase::Dialing || self.connections.contains_key(&wait.peer)
-        {
+        // deciding: leave it alone and look again next tick.
+        if wait.dialing || self.connections.contains_key(&wait.peer) {
             self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
             return;
         }
@@ -14666,8 +14923,10 @@ impl Actor {
             // The row was removed while this was waiting; there is no code
             // left to dial and nothing to wait for.
             tracing::info!("the remembered host is gone; the wait ends");
-            self.stop_reconnect_wait();
-            if self.connect_phase == ConnectPhase::WaitingForHost {
+            self.stop_reconnect_wait(wait.peer);
+            if self.connect_peer == Some(wait.peer)
+                && self.connect_phase == ConnectPhase::WaitingForHost
+            {
                 self.connect_phase = ConnectPhase::Idle;
                 self.connect_peer = None;
             }
@@ -14875,15 +15134,22 @@ impl Actor {
             tracing::info!(peer = %self.label_of(&addr.id), "already connected to this host");
             return Err(ActorError::Net(NetError::AlreadyConnected));
         }
-        // A dial already in flight owns `connect_phase`. Letting a second one
-        // start would leave two tasks racing to report an outcome into one
-        // slot, and the loser would overwrite the winner.
-        if self.connect_phase == ConnectPhase::Dialing
-            || self
-                .reconnect_wait
-                .as_ref()
+        // A dial for a host this node is waiting for belongs to that wait,
+        // which marks it as its own; any other dial is the connect form's
+        // (ADR 0119).
+        let for_wait = self.reconnect_waits.contains_key(&addr.id);
+        // A dial already in flight owns what it reports into — the connect
+        // form for the form's dial, the wait for a wait's. Letting a second
+        // one start into the same place would leave two tasks racing to report
+        // an outcome into one slot, and the loser would overwrite the winner.
+        let busy = if for_wait {
+            self.reconnect_waits
+                .get(&addr.id)
                 .is_some_and(|wait| wait.dialing)
-        {
+        } else {
+            self.connect_phase == ConnectPhase::Dialing
+        };
+        if busy {
             tracing::info!("a connect attempt is already in flight");
             return Err(ActorError::Net(NetError::AlreadyConnected));
         }
@@ -14898,14 +15164,25 @@ impl Actor {
             )));
         };
 
-        if resume.is_some() {
-            if let Some(wait) = self.reconnect_wait.as_mut() {
-                wait.dialing = true;
-            }
-            self.connect_phase = ConnectPhase::Resuming;
-        } else {
-            self.connect_phase = ConnectPhase::Dialing;
+        self.dial_seq = self.dial_seq.wrapping_add(1);
+        let seq = self.dial_seq;
+        if let Some(wait) = self.reconnect_waits.get_mut(&addr.id) {
+            wait.dialing = true;
+            wait.dial_seq = seq;
         }
+        let phase = if resume.is_some() {
+            ConnectPhase::Resuming
+        } else {
+            ConnectPhase::Dialing
+        };
+        // A wait's dial shows on the form only while the form is free for it;
+        // the form's own dial always does (ADR 0119).
+        let on_form = if for_wait {
+            self.show_wait_in_form(addr.id, phase)
+        } else {
+            self.connect_phase = phase;
+            true
+        };
         // The code of the connect now in flight, so every later round of it
         // has something to replay (ADR 0096). A dial at a different host
         // replaces it outright: this node makes one outgoing attempt at a
@@ -14917,7 +15194,7 @@ impl Actor {
         // its own sequence of attempts, with its own ceiling and its own
         // reasons to stop, and two sequences dialing one `connect_phase`
         // would each undo the other's bookkeeping.
-        if resume.is_none() && self.reconnect_wait.is_none() {
+        if !for_wait {
             let rounds = self
                 .connect_retry
                 .as_ref()
@@ -14930,15 +15207,17 @@ impl Actor {
                 rounds,
             });
         }
-        self.connect_peer = Some(addr.id);
-        self.connect_failure = None;
-        // A previous attempt that never reached a grant or a refusal — the
-        // transport dropped mid-credential-exchange, say — could otherwise
-        // leave a stale password or auto-submit flag behind for this new,
-        // possibly different, host to inherit (docs/bugs/02-connect-form.md,
-        // task 6).
-        self.pending_remember = None;
-        self.connect_credentials_auto = false;
+        if on_form {
+            self.connect_peer = Some(addr.id);
+            self.connect_failure = None;
+            // A previous attempt that never reached a grant or a refusal — the
+            // transport dropped mid-credential-exchange, say — could otherwise
+            // leave a stale password or auto-submit flag behind for this new,
+            // possibly different, host to inherit (docs/bugs/02-connect-form.md,
+            // task 6).
+            self.pending_remember = None;
+            self.connect_credentials_auto = false;
+        }
         // What kind of session this dial is asking for, kept until the host
         // grants and `start_view` reads it (ADR 0101). Cleared rather than
         // left alone when it is not set: an ordinary Connect to a host this
@@ -14968,6 +15247,7 @@ impl Actor {
                     code,
                     dialer: Box::new(outcome.dialer),
                     fallbacks: outcome.fallbacks,
+                    seq,
                     result: outcome.result.map(Box::new),
                 })
                 .await;
@@ -14980,28 +15260,42 @@ impl Actor {
     fn on_dialed(
         &mut self,
         peer: NodeId,
+        seq: u64,
         code: String,
         dialer: HostDialer,
         fallbacks: Vec<TransportFallback>,
         result: Result<Box<ControlConnection>, NetError>,
     ) {
         let tag = self.label_of(&peer);
+        // A resume the user walked away from while it was on its way: the
+        // connection it produced is the goodbye `say_goodbye` promised the
+        // host (ADR 0119).
+        if self.leaving.get(&peer) == Some(&seq) {
+            self.leaving.remove(&peer);
+            if let Ok(control) = result {
+                tracing::info!(peer = %tag, "telling the host the session it holds is over");
+                close_as_leaving(&control);
+            }
+            return;
+        }
+        // A dial a wait started is that wait's, whatever the connect form is
+        // showing now (ADR 0119).
+        let for_wait = self
+            .reconnect_waits
+            .get(&peer)
+            .is_some_and(|wait| wait.dialing && wait.dial_seq == seq);
         // The attempt this reports on has been superseded — the user started
         // another one, or the session it belonged to is already gone. Dropping
         // the connection here closes it, which is what we want: nothing is
         // waiting for it.
-        if self.connect_peer != Some(peer) {
+        if !for_wait && self.connect_peer != Some(peer) {
             tracing::info!(peer = %tag, "discarding the result of a superseded dial");
             return;
         }
-        let resuming = self
-            .reconnect_wait
-            .as_mut()
-            .filter(|wait| wait.peer == peer)
-            .is_some_and(|wait| {
-                wait.dialing = false;
-                wait.resume.is_some()
-            });
+        let resuming = self.reconnect_waits.get_mut(&peer).is_some_and(|wait| {
+            wait.dialing = false;
+            wait.resume.is_some()
+        });
         let control = match result {
             Ok(control) => *control,
             Err(NetError::ReconnectRejected) if resuming => {
@@ -15028,16 +15322,14 @@ impl Actor {
         // the one whose picture is frozen on it, and its next `ConsentGrant`
         // goes back into that window; a dial at any *other* host is the user
         // leaving this wait behind, and the window goes with it.
-        if !resuming {
-            if self
-                .reconnect_wait
-                .as_ref()
-                .is_some_and(|wait| wait.peer == peer)
-            {
-                self.finish_reconnect_wait();
-            } else {
-                self.stop_reconnect_wait();
-            }
+        //
+        // A dial at another host used to end the wait too, with its window,
+        // when there was one wait for the whole node. There is one per host
+        // now, and connecting somewhere else leaves the others alone
+        // (ADR 0119).
+        let on_form = !for_wait || self.form_is_free_for_wait(peer);
+        if !resuming && self.reconnect_waits.contains_key(&peer) {
+            self.finish_reconnect_wait(peer);
         }
         tracing::info!(peer = %self.label_of(&peer), "connected to a host, awaiting consent");
         // Remembered for the media dial that follows a `ConsentGrant`: the
@@ -15057,12 +15349,14 @@ impl Actor {
         // Remembered so the history row written when this session ends can dial
         // the same host again (ADR 0016).
         self.host_invites.insert(peer, code);
-        self.connect_phase = if resuming {
-            ConnectPhase::Resuming
-        } else {
-            ConnectPhase::AwaitingConsent
-        };
-        self.connect_peer = Some(peer);
+        if on_form {
+            self.connect_phase = if resuming {
+                ConnectPhase::Resuming
+            } else {
+                ConnectPhase::AwaitingConsent
+            };
+            self.connect_peer = Some(peer);
+        }
         // Guest side: this node is the one that *receives* `MediaUnavailable`,
         // so there is no peer capability to remember here.
         //
@@ -16021,6 +16315,16 @@ async fn classify_incoming(
 /// The transports are tried in the order [`Actor::dial_plan`] fixed before
 /// the first packet, and they share one attempt budget rather than each
 /// having their own ([`attempt_shares`]).
+/// Closes a control connection as a person leaving, which a host reads as
+/// the end of the session rather than a link to hold open for a resume
+/// (ADR 0112, ADR 0119).
+fn close_as_leaving(control: &ControlConnection) {
+    control.connection().close(
+        lumepeer_net::connection::CLOSE_NORMAL.into(),
+        lumepeer_net::error::close_code::NORMAL.as_bytes(),
+    );
+}
+
 async fn dial_over_plan(
     plan: DialPlan,
     role: Role,
@@ -16658,10 +16962,13 @@ pub fn spawn_actor_with(
         reboot_to_host: std::collections::HashMap::new(),
         pending_reboot: None,
         reboot_generation: 0,
-        reconnect_wait: None,
+        stream_caps: std::collections::HashMap::new(),
+        reconnect_waits: std::collections::HashMap::new(),
         reconnect_wait_generation: 0,
-        parked_view: None,
+        parked_views: std::collections::HashMap::new(),
+        leaving: std::collections::HashMap::new(),
         connect_retry: None,
+        dial_seq: 0,
         connect_retry_generation: 0,
         parked_sessions: std::collections::HashMap::new(),
         terminal_to_host: std::collections::HashMap::new(),
@@ -16684,6 +16991,7 @@ pub fn spawn_actor_with(
         record_requests: std::collections::HashSet::new(),
         record_request_rate: ConsentRateLimiter::new(),
         injector,
+        injected_via_service: None,
         secure_desktop_pointer: None,
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
@@ -20156,6 +20464,22 @@ mod tests {
         }
     }
 
+    /// [`wait_until`] for a predicate that has to ask an actor.
+    async fn wait_until_async<F, Fut>(what: &str, mut predicate: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if predicate().await {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     fn viewers(capture: &SharedCapture) -> usize {
         lock_capture(capture).viewer_count()
     }
@@ -21838,6 +22162,177 @@ mod tests {
         assert!(
             granted.is_ok(),
             "a guest that left on purpose still holds the only place: {granted:?}"
+        );
+    }
+
+    /// ADR 0119: a guest watching two hosts loses both links at once — its
+    /// own network went — and both sessions come back, each into the window
+    /// it left. With one wait for the whole node the second drop took the
+    /// first one's wait away, and that window sat on "reconnecting" with
+    /// nothing dialing for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_sessions_that_drop_together_both_come_back() {
+        let (first_host, _first_endpoint, first_capture) = actor().await;
+        let (second_host, _second_endpoint, second_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        for (host, capture, windows) in [
+            (&first_host, &first_capture, 1),
+            (&second_host, &second_capture, 2),
+        ] {
+            let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+            guest.invite_connect(invite.code).await.unwrap();
+            let label = tokio::time::timeout(TIMEOUT, wait_for_pending(host))
+                .await
+                .unwrap();
+            host.grant(label, Role::ViewOnly).await.unwrap();
+            wait_until("a host never saw the guest as a viewer", || {
+                viewers(capture) == 1
+            })
+            .await;
+            wait_until("a view window never opened", || {
+                recorder.opened().len() == windows
+            })
+            .await;
+        }
+
+        guest.sever_links().await;
+        wait_until("the links never dropped", || {
+            viewers(&first_capture) == 0 && viewers(&second_capture) == 0
+        })
+        .await;
+
+        wait_until("both sessions did not come back", || {
+            viewers(&first_capture) == 1 && viewers(&second_capture) == 1
+        })
+        .await;
+        for host in [&first_host, &second_host] {
+            let rows = host.status().await.unwrap();
+            assert!(
+                rows.iter().all(|row| row.state == SessionStateDto::Active),
+                "a resume must not become a consent request: {rows:?}"
+            );
+        }
+        assert_eq!(
+            recorder.opened().len(),
+            2,
+            "each session comes back into its own window, not a new one"
+        );
+        assert!(
+            recorder.closed().is_empty(),
+            "neither window may close while its session is coming back"
+        );
+    }
+
+    /// ADR 0119: the preset and window size a guest named once, at mount,
+    /// still hold for the encode loop a resume starts. They used to be kept
+    /// on the loop alone, and the new one ran the adaptive controller under
+    /// a preset nobody had changed — the picture sharpening and softening on
+    /// its own for the rest of the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_guest_preset_survives_a_resume() {
+        // Not `session_pair`: both endpoints have to outlive the setup, or
+        // the guest cannot dial the resume this is about.
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        guest
+            .set_stream_scale(host_label.clone(), 50)
+            .await
+            .unwrap();
+        wait_until_async("the preset never reached the host", || async {
+            host.media_caps(guest_label.clone())
+                .await
+                .is_some_and(|(scale, _)| scale == Some(50))
+        })
+        .await;
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        assert_eq!(
+            host.media_caps(guest_label.clone())
+                .await
+                .and_then(|(scale, _)| scale),
+            Some(50),
+            "the resumed session forgot the preset its window will not send again"
+        );
+    }
+
+    /// ADR 0119, closing what ADR 0112 left open: a window closed while its
+    /// session is away still ends that session at the host. The guest claims
+    /// the session one last time and leaves it as a person closing a window
+    /// does, so the host frees its only place at once instead of holding it
+    /// for the rest of the resume window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_a_window_that_is_reconnecting_ends_the_session_at_the_host() {
+        assert_eq!(SessionManager::new().plan().max_concurrent_guests(), 1);
+
+        let (host, _host_endpoint, _capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (first, _first_endpoint, _first_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        let (second, _second_endpoint, _second_capture) = actor().await;
+
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        first.invite_connect(invite.code.clone()).await.unwrap();
+        let first_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(first_label.clone(), Role::FullControl)
+            .await
+            .unwrap();
+        wait_for_phase(&first, ConnectPhase::Connected).await;
+        wait_until("the first guest never opened its window", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+
+        first.sever_links().await;
+        wait_for_phase(&first, ConnectPhase::Resuming).await;
+        first.leave_view(host_label).await.unwrap();
+        wait_until("the parked window did not close", || {
+            recorder.closed() == vec![window.clone()]
+        })
+        .await;
+
+        second.invite_connect(invite.code).await.unwrap();
+        let second_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("the second guest's request never reached the host");
+        assert_ne!(second_label, first_label);
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            match host.grant(second_label.clone(), Role::FullControl).await {
+                Ok(()) => break,
+                Err(error) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the host still holds the session of a window that was closed: {error:?}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            recorder.opened().len(),
+            1,
+            "saying goodbye must not bring the closed window back"
         );
     }
 

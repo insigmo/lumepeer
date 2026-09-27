@@ -57,6 +57,10 @@ struct State {
     typing_here: BTreeSet<String>,
     /// The live grab, and the host it is sending to.
     live: Option<Live>,
+    /// Shared keys (`Ctrl`, `Alt`, `Shift`) whose press a view window sent
+    /// itself because the grab had not, so their release goes the same way
+    /// whatever the grab recorded about the key before (ADR 0119).
+    forwarded: BTreeSet<u32>,
 }
 
 impl State {
@@ -109,6 +113,7 @@ impl KeyboardGrab {
                 focused: None,
                 typing_here: BTreeSet::new(),
                 live: None,
+                forwarded: BTreeSet::new(),
             }),
         }
     }
@@ -180,13 +185,32 @@ impl KeyboardGrab {
     /// itself, in order with the chord they are held for, and still lets this
     /// machine see them (`lumepeer_guestkeys::Route::Both`). The webview sees
     /// them as well and would send each one a second time.
+    ///
+    /// Only the transitions the grab really sent count (ADR 0119): a key its
+    /// hook never saw has no other copy than the webview's, and dropping it
+    /// because a grab was merely *live* is what lost Ctrl from every chord.
     #[must_use]
-    pub fn already_sent(&self, peer: &str, scancode: u32) -> bool {
-        lumepeer_guestkeys::shared_with_this_machine(scancode)
-            && self
-                .state
-                .lock()
-                .is_ok_and(|state| state.live.as_ref().is_some_and(|live| live.peer == peer))
+    pub fn already_sent(&self, peer: &str, scancode: u32, pressed: bool) -> bool {
+        if !lumepeer_guestkeys::shared_with_this_machine(scancode) {
+            return false;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let live = state.live.as_ref().is_some_and(|live| live.peer == peer);
+        if pressed {
+            let sent = live && lumepeer_guestkeys::sent_by_the_grab(scancode, true);
+            if !sent {
+                state.forwarded.insert(scancode);
+            }
+            return sent;
+        }
+        // A press this window sent is released by this window: the grab may
+        // hold a release of the same key from before, which is not this one.
+        if state.forwarded.remove(&scancode) {
+            return false;
+        }
+        live && lumepeer_guestkeys::sent_by_the_grab(scancode, false)
     }
 
     /// Makes the live grab match what the state says it should be.
@@ -289,6 +313,7 @@ mod tests {
             focused: None,
             typing_here: BTreeSet::new(),
             live: None,
+            forwarded: BTreeSet::new(),
         };
         assert_eq!(state.holder(), None);
 
@@ -311,6 +336,7 @@ mod tests {
             focused: Some("abc".to_owned()),
             typing_here: BTreeSet::from(["abc".to_owned()]),
             live: None,
+            forwarded: BTreeSet::new(),
         };
         assert_eq!(state.holder(), None);
 

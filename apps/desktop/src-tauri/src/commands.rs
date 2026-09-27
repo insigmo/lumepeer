@@ -721,6 +721,11 @@ pub async fn session_revoke(
 ) -> Result<(), IpcError> {
     if check_host_surface(&window).is_err() {
         check_view_window(&window, &args.peer)?;
+        // A view window only ever speaks for its own session. `revoke` would
+        // end whichever session the label names, which for a peer that is
+        // also this machine's guest can be the host-side one (ADR 0119).
+        state.network.leave_view(args.peer).await?;
+        return Ok(());
     }
     state.network.revoke(args.peer).await?;
     Ok(())
@@ -1681,7 +1686,7 @@ pub async fn input_press(
     use lumepeer_core::protocol::{InputDetail, InputEventPayload};
 
     check_view_window(&window, &args.peer)?;
-    if grab.already_sent(&args.peer, args.scancode) {
+    if grab.already_sent(&args.peer, args.scancode, args.pressed) {
         return Ok(());
     }
     state
@@ -3327,6 +3332,18 @@ pub async fn update_install(
         .await
         .map_err(|error| update_error(&error))?;
     tracing::info!("update installed; restart to run it");
+    // Windows' installer closes this process and starts the new one itself.
+    // On Linux nothing does: the package replaced the binary under a process
+    // that keeps running the old one until somebody quits it. Restarting
+    // here is what the user expected "install" to mean (ADR 0119).
+    // `request_restart`, not `restart`: it lets the exit run first, and
+    // the single-instance plugin gives up its name on the way out, so the
+    // new process is not turned away as a second copy of the old one.
+    #[cfg(target_os = "linux")]
+    {
+        tracing::info!("restarting into the installed update");
+        app.request_restart();
+    }
     Ok(())
 }
 
