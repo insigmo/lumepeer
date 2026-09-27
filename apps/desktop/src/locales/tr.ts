@@ -350,7 +350,7 @@ export const tr: Dictionary = {
   'creds.submit': 'Oturum aç',
   'creds.close': 'İptal et ve bağlantıyı kes',
   'creds.checking': 'Denetleniyor',
-  'creds.remember': 'Bu cihazın parolasını hatırla',
+  'creds.remember': 'Hatırla',
   'creds.badPassword': 'Bu parola kabul edilmedi.',
   'creds.badCode': 'Bu kod kabul edilmedi.',
   'creds.lockedOut': (secs) => `Çok fazla deneme. ${secs} saniye sonra tekrar deneyin.`,

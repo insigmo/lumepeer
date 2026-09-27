@@ -353,7 +353,9 @@ describe('the floating session toolbar', () => {
 
   it('collapsed hides every control but the handle and the expand button', () => {
     const state = stateWith({ collapsed: true });
-    draw(state);
+    // Chat closed and read: the one case the collapsed pill carries nothing
+    // else (the chat's own exception is the test below).
+    draw(state, fakeCommands(), fakeHooks({ chatVisible: () => false }));
     expect(container.querySelector('[data-testid="toolbar-expand"]')).not.toBeNull();
     for (const id of [
       'toolbar-settings',
@@ -387,6 +389,30 @@ describe('the floating session toolbar', () => {
     draw(state, fakeCommands(), hooks);
     expect(button().getAttribute('aria-label')).toBe(t('en', 'toolbar.chat'));
     expect(button().getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('collapsing does not fold away an unread message, nor the chat it opened', () => {
+    const state = stateWith({ collapsed: true });
+    let visible = false;
+    let unread = true;
+    const hooks = fakeHooks({ chatVisible: () => visible, chatUnread: () => unread });
+
+    draw(state, fakeCommands(), hooks);
+    const button = (): HTMLButtonElement | null =>
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-chat"]');
+    expect(button()?.getAttribute('aria-label')).toBe(t('en', 'toolbar.chat.unread'));
+    expect(button()?.querySelector('circle')?.getAttribute('fill')).toBe('#f2b441');
+
+    // Opened from the collapsed pill: still there, so it can be closed again.
+    visible = true;
+    unread = false;
+    draw(state, fakeCommands(), hooks);
+    expect(button()?.getAttribute('aria-pressed')).toBe('true');
+
+    // Closed and read: the pill is back to the way out and nothing else.
+    visible = false;
+    draw(state, fakeCommands(), hooks);
+    expect(button()).toBeNull();
   });
 
   it('the monitors popover lists what the host announced with 1-based numbers', () => {

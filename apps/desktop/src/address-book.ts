@@ -1,10 +1,11 @@
-// Host-side address book: saved devices, tags and trust (§8; ADR 0034).
+// Host-side address book: saved devices, tags and trust (§8; ADR 0034, ADR 0120).
 //
 // Trust is the one control on this screen that widens what a stranger's
-// machine may do, so it is the one control that never moves on a single
-// click: turning it on opens a confirmation that says what the consequence
-// is, in words, before anything is sent. Everything else here is a name, a
-// tag or a note.
+// machine may do, so on this screen it never moves on a single click: turning
+// it back on opens a confirmation that says what the consequence is, in words,
+// before anything is sent. The one other way in is saving a device from its
+// session, which trusts it outright (ADR 0120). Everything else here is a
+// name, a tag or a note.
 //
 // Names, tags and notes are free text the host typed. They are rendered
 // through `lit-html` bindings, which escape; nothing on this screen builds
@@ -243,9 +244,12 @@ export function addressBook(
 /**
  * The "save this device" control that turns a live session into a book entry.
  *
- * Saving is all it does. The new entry is untrusted, and it stays that way
- * until the host goes to the panel above and passes the confirmation: a device
- * must never become trusted as a side effect of having connected once (§2.1).
+ * Saving a device trusts it (ADR 0120): the host pressing this button is the
+ * host naming the device in advance, which is all trust has ever meant, and a
+ * save that still left the device unable to use the password was a second
+ * step nobody expected. Trust still moves only through
+ * `address_book_set_trusted` — audited, and withdrawn with one untick on the
+ * panel above — and never as a side effect of having connected (§2.1).
  */
 export function saveDeviceButton(
   peerLabel: string,
@@ -258,10 +262,12 @@ export function saveDeviceButton(
       class="book-save-btn"
       aria-label=${`${t(locale, 'book.addFromSession')}: ${peerLabel}`}
       @click=${() => {
-        void save(peerLabel, peerLabel, [], '').then(onRefresh, (error: unknown) => {
-          console.error('address_book_upsert failed:', error);
-          onRefresh();
-        });
+        void save(peerLabel, peerLabel, [], '')
+          .then(() => setTrusted(peerLabel, true))
+          .then(onRefresh, (error: unknown) => {
+            console.error('saving a device failed:', error);
+            onRefresh();
+          });
       }}
     >
       ${t(locale, 'book.addFromSession')}

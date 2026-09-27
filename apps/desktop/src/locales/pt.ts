@@ -350,7 +350,7 @@ export const pt: Dictionary = {
   'creds.submit': 'Entrar',
   'creds.close': 'Cancelar e desconectar',
   'creds.checking': 'Verificando',
-  'creds.remember': 'Lembrar a senha deste dispositivo',
+  'creds.remember': 'Lembrar',
   'creds.badPassword': 'Essa senha não foi aceita.',
   'creds.badCode': 'Esse código não foi aceito.',
   'creds.lockedOut': (secs) => `Muitas tentativas. Tente novamente em ${secs} segundos.`,

@@ -61,6 +61,7 @@
     "allow-invite-connect",
     "allow-chat-send",
     "allow-chat-transcript",
+    "allow-chat-mark-read",
     "allow-clipboard-push",
     "allow-clipboard-pull",
     "allow-file-accept",

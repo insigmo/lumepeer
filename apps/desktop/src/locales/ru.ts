@@ -347,7 +347,7 @@ export const ru: Dictionary = {
   'creds.submit': 'Войти',
   'creds.close': 'Отменить и отключиться',
   'creds.checking': 'Проверка',
-  'creds.remember': 'Запомнить пароль этого устройства',
+  'creds.remember': 'Запомнить',
   'creds.badPassword': 'Пароль не был принят.',
   'creds.badCode': 'Код не был принят.',
   'creds.lockedOut': (secs) => `Слишком много попыток. Повторите через ${secs} с.`,

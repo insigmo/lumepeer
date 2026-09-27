@@ -155,6 +155,36 @@ describe('the host session bar', () => {
     );
   });
 
+  it('marks a guest who wrote in the chat, and opens that chat in the main window', async () => {
+    statusRows = [{ ...ACTIVE_GUEST, chat_unread: true }];
+    await boot();
+
+    const mark = bar().querySelector<HTMLButtonElement>('[data-testid="hostbar-chat"]');
+    expect(mark).not.toBeNull();
+    mark?.click();
+
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('host_bar_open_chat', { args: { peer: 'guest-ab12' } }),
+    );
+  });
+
+  it('says nothing about the chat while nothing in it is unread', async () => {
+    statusRows = [{ ...ACTIVE_GUEST, chat_unread: false }];
+    await boot();
+
+    expect(bar().querySelector('[data-testid="hostbar-chat"]')).toBeNull();
+  });
+
+  it('keeps the unread mark on the tab when the bar is collapsed', async () => {
+    statusRows = [{ ...ACTIVE_GUEST, chat_unread: true }];
+    await boot();
+    bar().querySelector<HTMLButtonElement>('[data-testid="hostbar-collapse"]')?.click();
+    await vi.waitFor(() => expect(bar().classList.contains('is-collapsed')).toBe(true));
+
+    expect(bar().querySelector('[data-testid="hostbar-tab-unread"]')).not.toBeNull();
+    expect(bar().querySelectorAll('button')).toHaveLength(1);
+  });
+
   it('offers no permission control of its own: the role decided that', async () => {
     await boot();
 

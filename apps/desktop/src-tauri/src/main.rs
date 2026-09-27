@@ -492,6 +492,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::input_wheel,
         commands::chat_send,
         commands::chat_transcript,
+        commands::chat_mark_read,
         commands::clipboard_push,
         commands::clipboard_pull,
         commands::file_accept,
@@ -539,6 +540,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::autostart_set,
         commands::host_bar_expand,
         commands::host_bar_focus_main,
+        commands::host_bar_open_chat,
     ]
 }
 

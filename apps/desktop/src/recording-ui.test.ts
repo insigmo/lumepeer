@@ -37,6 +37,7 @@ const session: SessionStatus = {
   tunnel: false,
   terminal: false,
   terminal_active: false,
+  chat_unread: false,
 };
 
 let container: HTMLElement;

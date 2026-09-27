@@ -29,6 +29,7 @@ const noGrants = {
   tunnel: false,
   terminal: false,
   terminal_active: false,
+  chat_unread: false,
 } as const;
 
 vi.mock('@tauri-apps/api/core', () => ({

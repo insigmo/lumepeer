@@ -102,6 +102,12 @@ export interface SessionStatus {
    * `recording_active`.
    */
   terminal_active: boolean;
+  /**
+   * Whether this guest wrote in the chat and nobody here has opened it yet.
+   * Kept by the actor rather than by this window, so the session bar and the
+   * main window agree on it and opening the drawer clears it for both.
+   */
+  chat_unread: boolean;
 }
 
 /**
@@ -460,9 +466,10 @@ export function sessionStatus(
    * Renders the "save this device" control for an active session, so a host
    * can put a guest it recognises into the address book (§8; ADR 0034).
    *
-   * Saving only saves. The entry lands untrusted, and trusting it is a
-   * separate, confirmed decision on the address-book panel — having connected
-   * once must never be a path to a permission (§2.1).
+   * Saving trusts the device (ADR 0120): the host pressing it is the host
+   * naming the device in advance. Withdrawing that is one untick on the
+   * address-book panel, and having merely connected is still never a path to
+   * a permission (§2.1).
    */
   saveDevice: (peer: string) => TemplateResult | '' = () => '',
   /**
@@ -545,6 +552,27 @@ export function sessionStatus(
                       title=${t(locale, session.state === 'active' ? 'connections.live' : 'connections.idle')}
                     ></span>
                     <span class="peer-label">${session.peer_label}</span>
+                    ${session.state === 'active' && session.chat_unread
+                      ? html`<button
+                          type="button"
+                          class="chat-unread-btn"
+                          data-testid="chat-unread"
+                          aria-label=${`${t(locale, 'toolbar.chat.unread')}: ${session.peer_label}`}
+                          title=${t(locale, 'toolbar.chat.unread')}
+                          @click=${() => onOpenChat(session.peer_label)}
+                        >
+                          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                            <path
+                              d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.5"
+                              stroke-linejoin="round"
+                            />
+                            <circle class="chat-unread-dot" cx="13" cy="3" r="3" />
+                          </svg>
+                        </button>`
+                      : ''}
                     ${peerMenu(session.peer_label, locale, [
                       session.state === 'active'
                         ? html`

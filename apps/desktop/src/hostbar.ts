@@ -48,6 +48,12 @@ const CHEVRON_START = html`<svg viewBox="0 0 16 16" aria-hidden="true">
   <path d="M10 3l-5 5 5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
 </svg>`;
 
+/** Speech bubble with the unread dot — the same mark the guest's toolbar shows. */
+const CHAT_UNREAD = html`<svg viewBox="0 0 16 16" aria-hidden="true">
+  <path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+  <circle cx="13" cy="3" r="3" fill="#f2b441" />
+</svg>`;
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke: call } = await import('@tauri-apps/api/core');
   return call<T>(command, args);
@@ -79,17 +85,24 @@ function draw(): void {
   root.classList.toggle('is-collapsed', !expanded);
 
   if (!expanded) {
+    // A guest's message must not disappear into a collapsed bar: the tab is
+    // all that is left on screen, so the tab carries the mark.
+    const unread = sessions.some((session) => session.chat_unread);
+    const label = unread
+      ? `${t(locale, 'hostbar.expand')} — ${t(locale, 'toolbar.chat.unread')}`
+      : t(locale, 'hostbar.expand');
     render(
       html`
         <button
           type="button"
           class="tab-btn"
           data-testid="hostbar-expand"
-          aria-label=${t(locale, 'hostbar.expand')}
-          title=${t(locale, 'hostbar.expand')}
+          aria-label=${label}
+          title=${label}
           @click=${() => setExpanded(true)}
         >
           ${CHEVRON_START}
+          ${unread ? html`<span class="tab-dot" data-testid="hostbar-tab-unread" aria-hidden="true"></span>` : ''}
         </button>
       `,
       root,
@@ -133,6 +146,27 @@ function draw(): void {
                     title=${t(locale, 'status.terminal.active')}
                     >${t(locale, 'status.terminal.active')}</span
                   >`
+                : ''}
+              <!-- The guest wrote and nobody here has read it. The chat itself
+                   stays in the main window; this only says there is something
+                   there, and pressing it opens exactly that. -->
+              ${session.chat_unread
+                ? html`<button
+                    type="button"
+                    class="bar-chat"
+                    data-testid="hostbar-chat"
+                    aria-label=${`${t(locale, 'toolbar.chat.unread')}: ${session.peer_label}`}
+                    title=${t(locale, 'toolbar.chat.unread')}
+                    @click=${() => {
+                      void invoke('host_bar_open_chat', { args: { peer: session.peer_label } }).catch(
+                        (error: unknown) => {
+                          console.error('host_bar_open_chat failed:', error);
+                        },
+                      );
+                    }}
+                  >
+                    ${CHAT_UNREAD}
+                  </button>`
                 : ''}
               <button
                 type="button"

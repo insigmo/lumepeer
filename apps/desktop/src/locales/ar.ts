@@ -340,7 +340,7 @@ export const ar: Dictionary = {
   'creds.submit': 'تسجيل الدخول',
   'creds.close': 'إلغاء وقطع الاتصال',
   'creds.checking': 'جارٍ التحقق',
-  'creds.remember': 'تذكّر كلمة مرور هذا الجهاز',
+  'creds.remember': 'تذكّر',
   'creds.badPassword': 'لم تُقبل كلمة المرور.',
   'creds.badCode': 'لم يُقبل الرمز.',
   'creds.lockedOut': (secs) => `محاولات كثيرة. أعد المحاولة بعد ${secs} ثانية.`,

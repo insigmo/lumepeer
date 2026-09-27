@@ -341,7 +341,7 @@ export const ja: Dictionary = {
   'creds.submit': 'サインイン',
   'creds.close': 'キャンセルして切断',
   'creds.checking': '確認中',
-  'creds.remember': 'このデバイスのパスワードを記憶する',
+  'creds.remember': '記憶する',
   'creds.badPassword': 'そのパスワードは承認されませんでした。',
   'creds.badCode': 'そのコードは承認されませんでした。',
   'creds.lockedOut': (secs) => `試行回数が多すぎます。${secs} 秒後に再試行してください。`,

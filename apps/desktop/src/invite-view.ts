@@ -310,13 +310,15 @@ export function credentialsPanel(locale: Locale): TemplateResult {
                 />
               `
             : ''}
-          <label class="credentials-remember" for="remember-password">
-            <input id="remember-password" name="remember-password" type="checkbox" />
-            ${t(locale, 'creds.remember')}
-          </label>
-          <button type="submit" class="credentials-submit" ?disabled=${submitting}>
-            ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
-          </button>
+          <div class="credentials-actions">
+            <label class="credentials-remember" for="remember-password">
+              <input id="remember-password" name="remember-password" type="checkbox" />
+              ${t(locale, 'creds.remember')}
+            </label>
+            <button type="submit" class="credentials-submit" ?disabled=${submitting}>
+              ${submitting ? t(locale, 'creds.checking') : t(locale, 'creds.submit')}
+            </button>
+          </div>
         </form>
         ${message
           ? html`<p class="credentials-error" role="alert" data-testid="credentials-error">${message}</p>`

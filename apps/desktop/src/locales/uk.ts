@@ -349,7 +349,7 @@ export const uk: Dictionary = {
   'creds.submit': 'Увійти',
   'creds.close': "Скасувати й від'єднатися",
   'creds.checking': 'Перевірка',
-  'creds.remember': "Запам'ятати пароль цього пристрою",
+  'creds.remember': "Запам'ятати",
   'creds.badPassword': 'Цей пароль не прийнято.',
   'creds.badCode': 'Цей код не прийнято.',
   'creds.lockedOut': (secs) => `Забагато спроб. Повторіть через ${secs} с.`,

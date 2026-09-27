@@ -9,7 +9,7 @@
 //! because it carries no control over the host; it is content between the
 //! two humans, and revoking the session removes it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::NodeId;
 use crate::constants::CHAT_MAX_BYTES;
@@ -48,6 +48,10 @@ pub struct ChatEntry {
 #[derive(Debug, Default)]
 pub struct ChatLog {
     transcripts: BTreeMap<NodeId, Vec<ChatEntry>>,
+    /// Peers whose last incoming message nobody here has opened yet. A flag
+    /// per peer, not a count: "there is something to read" is all a surface
+    /// that is not the transcript has to say.
+    unread: BTreeSet<NodeId>,
 }
 
 /// Transcript ceiling per peer (§14): a UI shows a window, not an archive;
@@ -60,6 +64,7 @@ impl ChatLog {
     pub const fn new() -> Self {
         Self {
             transcripts: BTreeMap::new(),
+            unread: BTreeSet::new(),
         }
     }
 
@@ -86,6 +91,9 @@ impl ChatLog {
             at_unix,
         };
         transcript.push(entry);
+        if !outgoing {
+            self.unread.insert(peer);
+        }
         // The entry we just pushed is the last one; `push` cannot fail and
         // `last` is `Some` for a non-empty vector, so this is total.
         match transcript.last() {
@@ -100,9 +108,21 @@ impl ChatLog {
         self.transcripts.get(peer).map_or(&[], |t| t.as_slice())
     }
 
-    /// Forgets a peer's transcript (session end).
+    /// Whether `peer` sent something nobody here has opened yet.
+    #[must_use]
+    pub fn is_unread(&self, peer: &NodeId) -> bool {
+        self.unread.contains(peer)
+    }
+
+    /// Clears `peer`'s unread mark: its transcript is on screen now.
+    pub fn mark_read(&mut self, peer: &NodeId) {
+        self.unread.remove(peer);
+    }
+
+    /// Forgets a peer's transcript (session end), and its unread mark with it.
     pub fn drop_transcript(&mut self, peer: &NodeId) {
         self.transcripts.remove(peer);
+        self.unread.remove(peer);
     }
 }
 
@@ -168,5 +188,29 @@ mod tests {
         log.drop_transcript(&a);
         assert!(log.transcript(&a).is_empty());
         assert_eq!(log.transcript(&b).len(), 1);
+    }
+
+    #[test]
+    fn only_an_incoming_message_is_unread_until_marked_read() {
+        let mut log = ChatLog::new();
+        let (a, b) = (peer(5), peer(6));
+        log.record(a, true, "sent by us", 0).unwrap();
+        assert!(!log.is_unread(&a));
+
+        log.record(a, false, "from a", 1).unwrap();
+        log.record(b, false, "from b", 2).unwrap();
+        assert!(log.is_unread(&a));
+        assert!(log.is_unread(&b));
+
+        log.mark_read(&a);
+        assert!(!log.is_unread(&a));
+        assert!(log.is_unread(&b));
+
+        // A refused message is not stored, so it is not something to read.
+        assert!(log.record(a, false, "", 3).is_err());
+        assert!(!log.is_unread(&a));
+
+        log.drop_transcript(&b);
+        assert!(!log.is_unread(&b));
     }
 }

@@ -44,6 +44,7 @@ const COMMANDS: &[&str] = &[
     "input_wheel",
     "chat_send",
     "chat_transcript",
+    "chat_mark_read",
     "clipboard_push",
     "clipboard_pull",
     "file_accept",
@@ -91,6 +92,7 @@ const COMMANDS: &[&str] = &[
     "autostart_set",
     "host_bar_expand",
     "host_bar_focus_main",
+    "host_bar_open_chat",
 ];
 
 /// The Windows application manifest, replacing tauri-build's default.

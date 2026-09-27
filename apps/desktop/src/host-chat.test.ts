@@ -6,6 +6,7 @@
 import { render } from 'lit-html';
 import { describe, expect, it, vi } from 'vitest';
 
+import { t } from './i18n';
 import type { SessionStatus } from './session-status';
 import { sessionStatus } from './session-status';
 
@@ -25,6 +26,7 @@ const noGrants = {
   tunnel: false,
   terminal: false,
   terminal_active: false,
+  chat_unread: false,
 } as const;
 
 const active: SessionStatus[] = [
@@ -60,6 +62,34 @@ describe('host chat entry', () => {
     try {
       render(sessionStatus(pending, 'en'), container);
       expect(container.querySelectorAll('.chat-open-btn')).toHaveLength(0);
+    } finally {
+      container.remove();
+    }
+  });
+
+  it('a guest who wrote gets a mark on its card, outside the menu, that opens the chat', () => {
+    const opened = vi.fn();
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    try {
+      const unread: SessionStatus[] = [{ ...active[0]!, chat_unread: true }];
+      render(sessionStatus(unread, 'en', undefined, [], undefined, false, opened), container);
+
+      const mark = container.querySelector<HTMLButtonElement>('[data-testid="chat-unread"]');
+      expect(mark).not.toBeNull();
+      expect(mark?.closest('details')).toBeNull();
+      expect(mark?.getAttribute('aria-label')).toBe(`${t('en', 'toolbar.chat.unread')}: guest-ab12`);
+      mark?.click();
+      expect(opened).toHaveBeenCalledWith('guest-ab12');
+    } finally {
+      container.remove();
+    }
+  });
+
+  it('no mark while nothing in the chat is unread', () => {
+    const container = renderList();
+    try {
+      expect(container.querySelector('[data-testid="chat-unread"]')).toBeNull();
     } finally {
       container.remove();
     }

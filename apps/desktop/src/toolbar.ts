@@ -491,7 +491,7 @@ const ICONS = {
   // the meaning of.
   terminal: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M5 6.5 7 8l-2 1.5M8.5 10h2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
   chat: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
-  chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="2.5" fill="#9fd0ff" stroke="none"/></svg>`,
+  chatUnread: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="3" fill="#f2b441" stroke="none"/></svg>`,
   mic: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   micOff: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="6" y="2" width="4" height="7" rx="2" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M4 8a4 4 0 0 0 8 0M8 12v2M3 3l10 10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`,
   record: html`<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4" fill="currentColor"/><circle cx="8" cy="8" r="6.25" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>`,
@@ -746,8 +746,27 @@ export function renderToolbar(
         `
       : html``;
 
+  const chatButton: TemplateResult = html`
+    <button
+      type="button"
+      class="toolbar-btn ${chatOn ? 'is-active' : ''}"
+      data-testid="toolbar-chat"
+      aria-label=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
+      title=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
+      aria-pressed=${chatOn ? 'true' : 'false'}
+      @click=${() => hooks.toggleChat()}
+    >
+      ${chatUnread ? ICONS.chatUnread : ICONS.chat}
+    </button>
+  `;
+
   const buttons: TemplateResult = state.collapsed
     ? html`
+        <!-- Collapsed hides every button but the way back — except the chat,
+             while a message nobody has read yet is waiting in it or it is
+             open: an unread message is the one thing that must not be folded
+             away, and a chat opened from here needs a way to close again. -->
+        ${chatUnread || chatOn ? chatButton : ''}
         <button
           type="button"
           class="toolbar-btn"
@@ -786,17 +805,7 @@ export function renderToolbar(
             >
               ${ICONS.monitor(monitorLabel)}
             </button>`}
-        <button
-          type="button"
-          class="toolbar-btn ${chatOn ? 'is-active' : ''}"
-          data-testid="toolbar-chat"
-          aria-label=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
-          title=${t(locale, chatUnread ? 'toolbar.chat.unread' : 'toolbar.chat')}
-          aria-pressed=${chatOn ? 'true' : 'false'}
-          @click=${() => hooks.toggleChat()}
-        >
-          ${chatUnread ? ICONS.chatUnread : ICONS.chat}
-        </button>
+        ${chatButton}
         ${filesAvailable
           ? html`<button
               type="button"

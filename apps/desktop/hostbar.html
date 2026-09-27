@@ -63,6 +63,7 @@
         font-size: 13px;
       }
       .tab-btn {
+        position: relative;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -90,6 +91,18 @@
       .tab-btn svg {
         width: 13px;
         height: 13px;
+      }
+      /* Unread chat, on the collapsed tab: the same yellow as the mark on the
+         row and on the guest's toolbar. */
+      .tab-dot {
+        position: absolute;
+        inset-block-start: 5px;
+        inset-inline-start: 50%;
+        width: 8px;
+        height: 8px;
+        margin-inline-start: -4px;
+        border-radius: 50%;
+        background: #f2b441;
       }
       .bar-heading {
         margin: 8px 0 4px;
@@ -157,7 +170,29 @@
       .bar-revoke:hover {
         background: rgb(255 157 157 / 14%);
       }
+      .bar-chat {
+        flex: none;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 20px;
+        padding: 0;
+        background: rgb(242 180 65 / 14%);
+        color: inherit;
+        border: 1px solid rgb(242 180 65 / 55%);
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      .bar-chat:hover {
+        background: rgb(242 180 65 / 26%);
+      }
+      .bar-chat svg {
+        width: 14px;
+        height: 14px;
+      }
       .bar-revoke:focus-visible,
+      .bar-chat:focus-visible,
       .bar-open:focus-visible {
         outline: 2px solid #9fd0ff;
         outline-offset: 1px;

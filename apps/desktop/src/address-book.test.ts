@@ -1,9 +1,10 @@
-// Host-side address book and the trust switch (§8; ADR 0034).
+// Host-side address book and the trust switch (§8; ADR 0034, ADR 0120).
 //
 // The tests that matter here are the ones about trust: it is the only control
 // on this screen that widens what a remote machine may do, so it must never
-// move on one click, must never move as a side effect of anything else, and
-// must show only what the core last reported.
+// move on one click, must never move as a side effect of anything but the host
+// saving the device (ADR 0120), and must show only what the core last
+// reported.
 import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -211,18 +212,26 @@ describe('address book', () => {
 });
 
 describe('saving a device from a session', () => {
-  it('saves it untrusted, and asks for no permission on the way', async () => {
+  it('saves it and then trusts it, through the same audited command the checkbox uses (ADR 0120)', async () => {
     const onRefresh = vi.fn();
     render(saveDeviceButton('guest-ab12', 'en', onRefresh), container);
 
     container.querySelector<HTMLButtonElement>('.book-save-btn')?.click();
-    await vi.waitFor(() =>
-      expect(invoke).toHaveBeenCalledWith('address_book_upsert', {
-        args: { peer: 'guest-ab12', name: 'guest-ab12', tags: [], notes: '' },
-      }),
-    );
-    // Nothing else was called: connecting once is not a path to trust.
-    expect(invoke).toHaveBeenCalledTimes(1);
     await vi.waitFor(() => expect(onRefresh).toHaveBeenCalled());
+    expect(invoke.mock.calls).toEqual([
+      ['address_book_upsert', { args: { peer: 'guest-ab12', name: 'guest-ab12', tags: [], notes: '' } }],
+      ['address_book_set_trusted', { args: { peer: 'guest-ab12', trusted: true } }],
+    ]);
+  });
+
+  it('does not trust a device whose save was refused', async () => {
+    invoke.mockRejectedValueOnce(new Error('UNKNOWN_PEER'));
+    const onRefresh = vi.fn();
+    render(saveDeviceButton('guest-ab12', 'en', onRefresh), container);
+
+    container.querySelector<HTMLButtonElement>('.book-save-btn')?.click();
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalled());
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).not.toHaveBeenCalledWith('address_book_set_trusted', expect.anything());
   });
 });

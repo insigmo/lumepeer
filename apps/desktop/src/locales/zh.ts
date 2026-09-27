@@ -332,7 +332,7 @@ export const zh: Dictionary = {
   'creds.submit': '登录',
   'creds.close': '取消并断开连接',
   'creds.checking': '正在验证',
-  'creds.remember': '记住此设备的密码',
+  'creds.remember': '记住',
   'creds.badPassword': '该密码未被接受。',
   'creds.badCode': '该验证码未被接受。',
   'creds.lockedOut': (secs) => `尝试次数过多，请在 ${secs} 秒后重试。`,

@@ -180,6 +180,25 @@ function openChat(peer: string): void {
     chatPeer = peer;
   }
   chatPanel.hidden = false;
+  const row = sessions.find((session) => session.peer_label === peer);
+  if (row?.chat_unread) {
+    row.chat_unread = false;
+    renderNow();
+  }
+  void markChatRead(peer);
+}
+
+/**
+ * Tells the actor the drawer is showing `peer`'s chat, which is what clears
+ * the unread mark on the card and on the session bar alike.
+ */
+async function markChatRead(peer: string): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('chat_mark_read', { peer });
+  } catch (error) {
+    console.error('chat_mark_read failed:', error);
+  }
 }
 
 /** Closes the host chat drawer and stops its transcript poll. */
@@ -455,6 +474,15 @@ async function refresh(): Promise<void> {
     if (chatPeer && !sessions.some((s) => s.state === 'active' && s.peer_label === chatPeer)) {
       closeChat();
     }
+    // The drawer is open on this guest and this window is the one in use, so
+    // whatever it just wrote is in front of the host: nothing about it is
+    // unread, here or on the session bar. A drawer left open in a minimized or
+    // background window has shown nobody anything, and the bar keeps its mark.
+    const openRow = chatPeer ? sessions.find((s) => s.peer_label === chatPeer) : undefined;
+    if (openRow?.chat_unread && document.hasFocus()) {
+      openRow.chat_unread = false;
+      void markChatRead(openRow.peer_label);
+    }
     // A recording cannot outlive the session it covers (§8.2), so neither may
     // the path shown for it.
     for (const peer of [...recordingPaths.keys()]) {
@@ -559,6 +587,15 @@ void (async () => {
     const { listen } = await import('@tauri-apps/api/event');
     await listen('lumepeer://actor-changed', () => {
       void refresh();
+    });
+    // The session bar's "new message" mark: the bar has no chat of its own,
+    // so it raises this window and names the guest whose drawer to open.
+    await listen<string>('lumepeer://open-chat', (event) => {
+      void refresh().then(() => {
+        if (sessions.some((s) => s.state === 'active' && s.peer_label === event.payload)) {
+          openChat(event.payload);
+        }
+      });
     });
   } catch (error) {
     // No Tauri host (unit tests, a plain browser): the interval alone is

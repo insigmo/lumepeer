@@ -369,6 +369,9 @@ pub struct SessionStatusDto {
     /// `recording`: the indicator the host cannot switch off hangs off this
     /// one (ADR 0079).
     pub terminal_active: bool,
+    /// Whether this guest wrote in the chat and the host has not opened it
+    /// yet (§9.2). Cleared by [`chat_mark_read`].
+    pub chat_unread: bool,
 }
 
 /// One remembered host this node has connected to (§21 punch-list item 5).
@@ -763,6 +766,7 @@ pub async fn session_status(
             tunnel: s.grants.tunnel,
             terminal: s.grants.terminal,
             terminal_active: s.terminal_active,
+            chat_unread: s.chat_unread,
         })
         .collect())
 }
@@ -1797,6 +1801,22 @@ pub async fn chat_transcript(
             at_unix: e.at_unix,
         })
         .collect())
+}
+
+/// Clears the host's unread mark on the chat with `peer` (§9.2): the drawer
+/// is open on it, so the message is on screen.
+///
+/// # Errors
+/// [`IpcError`] when the window is not the main window.
+#[tauri::command]
+pub async fn chat_mark_read(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.chat_mark_read(peer).await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3708,6 +3728,43 @@ fn clamp_to_monitor(
 pub async fn host_bar_focus_main(window: Window, app: tauri::AppHandle) -> Result<(), IpcError> {
     check_host_bar(&window)?;
     crate::focus_main_window(&app);
+    Ok(())
+}
+
+/// Event that asks the main window to open its chat drawer on one peer.
+pub const OPEN_CHAT_EVENT: &str = "lumepeer://open-chat";
+
+/// Argument of [`host_bar_open_chat`].
+#[derive(Debug, Deserialize)]
+pub struct HostBarOpenChatArgs {
+    /// Pseudonymized label of the session whose chat to open.
+    pub peer: String,
+}
+
+/// Raises the main window with its chat drawer open on `peer` — what the
+/// bar's "new message" mark does when pressed.
+///
+/// The bar still carries no chat of its own: it hands the one label it
+/// already shows to the main window, and only to that window, which opens the
+/// same drawer its own Chat button does.
+///
+/// # Errors
+/// Rejects calls from any window but the bar itself.
+#[tauri::command]
+pub async fn host_bar_open_chat(
+    window: Window,
+    app: tauri::AppHandle,
+    args: HostBarOpenChatArgs,
+) -> Result<(), IpcError> {
+    use tauri::Emitter as _;
+
+    check_host_bar(&window)?;
+    crate::focus_main_window(&app);
+    // The window is up either way; a drawer that did not open is one click on
+    // the card's own chat mark away, not a failure worth an error code.
+    if let Err(error) = app.emit_to(MAIN_WINDOW_LABEL, OPEN_CHAT_EVENT, args.peer) {
+        tracing::warn!(%error, "could not ask the main window to open the chat");
+    }
     Ok(())
 }
 

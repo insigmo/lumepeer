@@ -653,7 +653,7 @@ pub struct ConnectionStats {
 /// One row of the status list the webview polls.
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "mirrors Grants plus three independent activity flags (recording_active, secure_desktop_active, terminal_active); §2.2 requires the grants to stay independent fields rather than folded together"
+    reason = "mirrors Grants plus independent activity flags (recording_active, secure_desktop_active, terminal_active, chat_unread); §2.2 requires the grants to stay independent fields rather than folded together"
 )]
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
@@ -699,6 +699,10 @@ pub struct SessionSnapshot {
     /// not what is worth interrupting somebody for, a running shell is. The
     /// indicator the host cannot switch off hangs off this one.
     pub terminal_active: bool,
+    /// Whether this guest wrote in the chat and nobody here has opened it yet
+    /// (§9.2). The chat drawer opens closed, so without this a guest's message
+    /// is something the host simply never sees.
+    pub chat_unread: bool,
 }
 
 /// Translates one authorized guest event into the helper's secure-desktop
@@ -1252,6 +1256,12 @@ enum ActorCommand {
     ChatTranscript {
         label: String,
         reply: oneshot::Sender<Vec<ChatEntry>>,
+    },
+    /// Host side: the chat with `label` is on screen, so nothing in it is
+    /// unread any more.
+    ChatMarkRead {
+        label: String,
+        reply: oneshot::Sender<()>,
     },
     /// Either side: push the local clipboard text to the peer, gated on the
     /// session's clipboard grants (§8.2).
@@ -2087,6 +2097,20 @@ impl ActorHandle {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::ChatTranscript { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Clears the unread mark on the chat with `label`; a no-op for a label
+    /// that names nothing, for the same reason a transcript poll is.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor task is gone.
+    pub async fn chat_mark_read(&self, label: String) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ChatMarkRead { label, reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -5500,6 +5524,7 @@ impl Actor {
                 record_request: false,
                 secure_desktop_active: false,
                 terminal_active: false,
+                chat_unread: false,
             });
         }
         for (peer, role, grants) in self.sessions.active() {
@@ -5521,6 +5546,7 @@ impl Actor {
                     .get(&peer)
                     .is_some_and(|s| s.control.secure_desktop_active()),
                 terminal_active: self.shells.keys().any(|(p, _)| *p == peer),
+                chat_unread: self.chat.is_unread(&peer),
             });
         }
         // Host side: every saved device gets a label too, whether or not it is
@@ -10790,6 +10816,12 @@ impl Actor {
             }
             ActorCommand::ChatTranscript { label, reply } => {
                 let _ = reply.send(self.on_chat_transcript(&label));
+            }
+            ActorCommand::ChatMarkRead { label, reply } => {
+                if let Ok(peer) = self.resolve(&label) {
+                    self.chat.mark_read(&peer);
+                }
+                let _ = reply.send(());
             }
             ActorCommand::ClipboardPush { label, text, reply } => {
                 let result = self.on_clipboard_push(&label, &text);
@@ -21074,10 +21106,12 @@ mod tests {
         }
     }
 
-    /// Saving a device is not trusting it (§2.1): the entry lands untrusted
-    /// and only `address_book_set_trusted` moves the flag.
+    /// Writing an entry never moves its trust flag (§2.1): the entry lands
+    /// untrusted and only `address_book_set_trusted` moves the flag. The
+    /// desktop's "save this device" trusts by calling that command second
+    /// (ADR 0120), so the change is still the one audited path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn saving_a_device_never_trusts_it() {
+    async fn upserting_a_device_never_moves_its_trust() {
         let (host, _host_endpoint, _host_capture) = actor().await;
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         let label = introduce(&host, &guest).await;

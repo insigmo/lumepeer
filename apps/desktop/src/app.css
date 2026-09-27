@@ -1039,6 +1039,32 @@ button.peer-card-face:disabled {
   font-size: var(--fs-body);
 }
 
+/* The guest wrote and the chat drawer is closed. Out on the card rather than
+   in the three-dot menu, where a mark would sit unseen until the menu opened. */
+.chat-unread-btn {
+  appearance: none;
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  inline-size: 26px;
+  block-size: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: var(--amber-soft);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.chat-unread-btn:hover {
+  background: var(--surface-2);
+}
+
+.chat-unread-dot {
+  fill: var(--amber-dot);
+}
+
 .peer-dot {
   inline-size: 8px;
   block-size: 8px;
@@ -2395,7 +2421,7 @@ input[type='checkbox'].switch:disabled {
 }
 
 .unattended-password input,
-.credentials-form input {
+.credentials-form input:not([type='checkbox']) {
   flex: 1 1 160px;
   min-width: 0;
   min-height: 32px;
@@ -2497,6 +2523,30 @@ input[type='checkbox'].switch:disabled {
   gap: 8px;
   margin: 8px 0;
   font-size: var(--fs-micro);
+}
+
+/* "Remember" belongs to its box, not to the button: the two sit together at
+   the start of the row and the submit button takes the far end. */
+.credentials-actions {
+  display: flex;
+  flex: 1 1 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-block-start: 4px;
+}
+
+.credentials-remember {
+  gap: 6px;
+  margin: 0;
+  cursor: pointer;
+}
+
+.credentials-remember input {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 0;
 }
 
 .unattended-saved,
