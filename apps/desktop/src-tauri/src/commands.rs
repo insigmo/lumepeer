@@ -3589,11 +3589,22 @@ pub async fn host_bar_expand(
         ))
     });
 
+    let resize_failed = |_ignored: tauri::Error| IpcError {
+        code: "HOST_BAR",
+        message: "the session bar could not be resized".to_owned(),
+    };
+    // Linux pins the bar by min = max rather than by `resizable(false)`
+    // (`open_host_bar`, ADR 0118), so the pin moves first: left where it was,
+    // GTK would hold the bar at the shape it has now.
+    #[cfg(target_os = "linux")]
+    {
+        let pinned = Some(LogicalSize::new(width, height));
+        bar.set_min_size(pinned)
+            .and_then(|()| bar.set_max_size(pinned))
+            .map_err(resize_failed)?;
+    }
     bar.set_size(LogicalSize::new(width, height))
-        .map_err(|_ignored| IpcError {
-            code: "HOST_BAR",
-            message: "the session bar could not be resized".to_owned(),
-        })?;
+        .map_err(resize_failed)?;
     if let Some((x, y)) = anchor {
         let (x, y) = clamp_to_monitor(&bar, (x, y), (width, height));
         let _ = bar.set_position(PhysicalPosition::new(x, y));

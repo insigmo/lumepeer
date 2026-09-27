@@ -145,6 +145,11 @@ percent-encoding.workspace = true
 # `#![forbid(unsafe_code)]`; `tao` already pulls this exact version into every
 # Linux build, so no new dependency enters `Cargo.lock`.
 dlopen2 = "0.8"
+# `gdk::set_allowed_backends`, which puts the windows on XWayland on a Wayland
+# desktop so the host's session bar can dock and stay on top (ADR 0118). A
+# safe function where setting `GDK_BACKEND` is not; `tao` already pulls this
+# exact version into every Linux build.
+gdk = "0.18"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `audio-capture-screencapturekit` sits here rather than only in the

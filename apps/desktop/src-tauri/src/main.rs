@@ -199,6 +199,26 @@ fn appindicator_is_loadable() -> bool {
         })
 }
 
+/// Puts this process's windows on X11 — through `XWayland` on a Wayland
+/// desktop — before GTK opens its display (ADR 0118).
+///
+/// The host's session bar (ADR 0055) has to sit at a screen edge and stay
+/// above every other window, and a Wayland client can do neither: nothing in
+/// `xdg-shell` lets a window place itself or keep itself on top, so the
+/// compositor dropped the bar in the middle of the screen like any other
+/// window. An X11 window under `XWayland` can do both, on GNOME and KDE alike,
+/// which is how the comparable tools' own panels get there.
+///
+/// `x11` first and `wayland` second rather than `x11` alone, so a compositor
+/// running without `XWayland` still gets a working app, only with the bar where
+/// the compositor puts it. A `GDK_BACKEND` the user set still wins, as GDK
+/// always lets it. Capture and input do not follow this: they pick the portal
+/// from `XDG_SESSION_TYPE`, which stays whatever the session says it is.
+#[cfg(target_os = "linux")]
+fn prefer_x11_windows() {
+    gdk::set_allowed_backends("x11,wayland");
+}
+
 /// Installs the tray icon and its menu, and answers whether one went up.
 ///
 /// Closing the window must not stop remote sessions: the app keeps running in
@@ -611,6 +631,9 @@ fn main() {
     if let Some(path) = log_file {
         tracing::info!(path = %path.display(), "logging to file");
     }
+    // Before Tauri starts GTK, which is when the choice is made.
+    #[cfg(target_os = "linux")]
+    prefer_x11_windows();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

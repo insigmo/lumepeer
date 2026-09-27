@@ -267,12 +267,23 @@ fn open_host_bar(app: &tauri::AppHandle) {
     .title("Lumepeer")
     .inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT)
     .decorations(false)
-    .resizable(false)
+    // GTK sizes a window the user cannot resize from its content's natural
+    // size, and a webview's natural size is the page it is already showing,
+    // so the collapse to the tab was clamped straight back to the open card
+    // (ADR 0118). On Linux the bar is resizable in name only and pinned by
+    // min = max instead, which `host_bar_expand` moves with each change.
+    .resizable(cfg!(target_os = "linux"))
     .always_on_top(true)
     .skip_taskbar(true)
     .focused(false);
     if let Some((x, y)) = placement {
         builder = builder.position(x, y);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder
+            .min_inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT)
+            .max_inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT);
     }
     match builder.build() {
         Ok(_) => tracing::info!("host session bar opened"),
