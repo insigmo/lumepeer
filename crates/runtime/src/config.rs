@@ -148,12 +148,17 @@ impl Settings {
 
     /// Config files in the order they are read; later ones win.
     fn search_path() -> Vec<PathBuf> {
-        let mut paths = vec![
-            // Development: the repository's own files, relative to the
-            // working directory `cargo run` / `npm run tauri dev` starts in.
-            PathBuf::from("config/default.toml"),
-            PathBuf::from("config/local.toml"),
-        ];
+        let mut paths = Vec::new();
+        // Development: the repository's own files, relative to the working
+        // directory `cargo run` / `npm run tauri dev` starts in. Never in a
+        // release build (ADR 0122): an installed client runs elevated, and a
+        // `config/local.toml` in whatever folder it happened to be started
+        // from — a download folder, a network share — would otherwise choose
+        // its relay and where it writes its logs.
+        if cfg!(debug_assertions) {
+            paths.push(PathBuf::from("config/default.toml"));
+            paths.push(PathBuf::from("config/local.toml"));
+        }
         // Installed: whatever ships next to the executable, then the per-user
         // file, which is the one an operator can actually edit.
         if let Some(dir) = exe_dir() {

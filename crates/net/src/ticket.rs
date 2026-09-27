@@ -178,6 +178,38 @@ impl InviteTicket {
         if self.protocol_major != PROTOCOL_MAJOR || self.is_expired_at(now) {
             return Err(NetError::InvalidTicket);
         }
+        self.verify_signature(verifying_key)
+    }
+
+    /// Guest side: the host this ticket names, after checking that the same
+    /// host signed it (ADR 0122).
+    ///
+    /// A ticket is signed with the key of the endpoint it names, so a guest
+    /// can check it without having met the host: everything the ticket
+    /// carries — the obfuscated transport's address and the certificate
+    /// fingerprint it pins, the role — then provably comes from the endpoint
+    /// the handshake will authenticate. Without this, a code edited on its
+    /// way to the guest could keep the host's identity and swap only the
+    /// pinned fingerprint, and send the guest's first transport to whoever
+    /// holds that certificate instead.
+    ///
+    /// The TTL and the protocol major are the host's to judge and are not
+    /// read here: this answers "who wrote it", not "will it be honoured".
+    ///
+    /// # Errors
+    /// [`NetError::MalformedTicket`] if the address does not decode, and
+    /// [`NetError::InvalidTicket`] if the signature is not the named host's.
+    pub fn verify_issuer(&self) -> Result<iroh::EndpointAddr> {
+        let addr = self.endpoint_addr()?;
+        let key =
+            VerifyingKey::from_bytes(addr.id.as_bytes()).map_err(|_| NetError::InvalidTicket)?;
+        self.verify_signature(&key)?;
+        Ok(addr)
+    }
+
+    /// The signature check both [`Self::verify`] and [`Self::verify_issuer`]
+    /// end in.
+    fn verify_signature(&self, verifying_key: &VerifyingKey) -> Result<()> {
         let signed = postcard::to_allocvec(&SignedFields {
             protocol_major: self.protocol_major,
             node_addr: &self.node_addr,
@@ -436,6 +468,40 @@ mod tests {
         tampered.allowed_request = Role::FullControl;
         assert!(matches!(
             tampered.verify(&key, 1_000),
+            Err(NetError::InvalidTicket)
+        ));
+    }
+
+    /// ADR 0122: a guest can tell who wrote a ticket before it dials. One the
+    /// named host signed yields that host; one signed by anybody else — or
+    /// the host's own with its pinned fingerprint swapped — yields nothing.
+    #[test]
+    fn a_guest_accepts_only_a_ticket_its_named_host_signed() {
+        let host = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let signed_by_host = SigningKey::from_bytes(&host.to_bytes());
+        let (obfuscated_addr, fingerprint) = obfuscated();
+        let issued = InviteTicket::issue(
+            &signed_by_host,
+            &addr(),
+            Role::ViewOnly,
+            1_000,
+            Some(obfuscated_addr),
+            Some(fingerprint),
+        )
+        .unwrap();
+        assert_eq!(issued.verify_issuer().unwrap().id, host.public());
+
+        // The same host named, but somebody else's signature.
+        assert!(matches!(
+            ticket(1_000).verify_issuer(),
+            Err(NetError::InvalidTicket)
+        ));
+
+        // The host's own ticket, pointed at another certificate.
+        let mut swapped = issued;
+        swapped.host_cert_fingerprint = Some([0x99; 32]);
+        assert!(matches!(
+            swapped.verify_issuer(),
             Err(NetError::InvalidTicket)
         ));
     }

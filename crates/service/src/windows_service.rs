@@ -54,18 +54,21 @@ use crate::system_injector_launch::SystemInjector;
 /// Who may open the pipe, in SDDL.
 ///
 /// - `SY` — `LocalSystem`, which is what the service itself runs as.
-/// - `BA` — the built-in administrators group.
-/// - `IU` — **interactive** users: somebody signed in at this machine. This is
-///   the grant that matters, and its narrowness is the point. A network logon,
-///   a service account and a scheduled task running as another user are all
-///   outside it, so the only thing that can ask for a Ctrl+Alt+Del is a
-///   process belonging to the person sitting in front of the screen that would
-///   receive it.
+/// - `BA` — the built-in administrators group, which only an **elevated**
+///   token carries as an enabled group: a filtered (unelevated) administrator
+///   token holds it deny-only, so this entry admits nothing below high
+///   integrity.
 ///
-/// `0x0012019b` is `FILE_GENERIC_READ | FILE_GENERIC_WRITE` for a pipe: read
-/// and write the two frames, and nothing else — no `WRITE_DAC`, so a client
-/// cannot widen this after the fact.
-const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x0012019b;;;IU)";
+/// Nobody else (ADR 0122). This used to admit `IU`, every interactive user,
+/// on the reasoning that the only thing to ask for here was a Ctrl+Alt+Del.
+/// That stopped being true when the pipe learned to inject into the secure
+/// desktop (ADR 0057) and into the interactive one from a `LocalSystem` worker
+/// (ADR 0114): with `IU` on the list, any unelevated process in the console
+/// session could ask this service to click "Yes" on a UAC prompt it had just
+/// raised itself, or to type into an elevated window, which is a UAC bypass
+/// with this service as the tool. The one legitimate caller is the Lumepeer
+/// client, which always runs elevated (ADR 0057), so it loses nothing.
+const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
 /// Buffer sizes of the pipe. Two bytes is the whole protocol; the rest is the
 /// kernel's minimum granularity, not headroom anyone asked for.
@@ -336,10 +339,10 @@ fn accept_and_serve(
 }
 
 /// Carries out one request. The whole authorization story for
-/// [`OP_DELIVER_SAS`] is the pipe's DACL: anything that got this far is an
-/// interactive user or an administrator, and delivering a Ctrl+Alt+Del to
-/// whichever session receives it discloses nothing to a caller who cannot
-/// see that session.
+/// [`OP_DELIVER_SAS`] is the pipe's DACL: anything that got this far is
+/// `LocalSystem` or an elevated administrator (ADR 0122), and delivering a
+/// Ctrl+Alt+Del to whichever session receives it discloses nothing to a caller
+/// who cannot see that session.
 ///
 /// [`OP_CAPTURE_SECURE_DESKTOP`] hands back a picture instead, which is a
 /// disclosure the DACL alone does not bound the way it bounds
@@ -775,27 +778,19 @@ fn wide(text: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
-    /// The access list names exactly three trustees, and grants interactive
-    /// users read/write only — never `WRITE_DAC`, which would let a client
-    /// widen the pipe from under the service.
+    /// ADR 0122: the access list names `LocalSystem` and elevated
+    /// administrators and nobody else. An unelevated process — interactive
+    /// user or not — must not reach an endpoint that injects input into the
+    /// secure desktop, or it can click through its own UAC prompt.
     #[test]
-    fn the_endpoint_admits_only_local_interactive_callers() {
-        assert!(
-            PIPE_SDDL.contains(";;;SY)"),
-            "LocalSystem must be able to own it"
-        );
-        assert!(
-            PIPE_SDDL.contains(";;;BA)"),
-            "administrators must be able to manage it"
-        );
-        assert!(
-            PIPE_SDDL.contains("0x0012019b;;;IU)"),
-            "interactive users get read/write only"
-        );
-        assert!(
-            !PIPE_SDDL.contains(";;;WD)") && !PIPE_SDDL.contains(";;;AU)"),
-            "everyone and authenticated-users are exactly who must not be admitted"
-        );
+    fn the_endpoint_admits_only_system_and_elevated_administrators() {
+        assert_eq!(PIPE_SDDL, "D:(A;;GA;;;SY)(A;;GA;;;BA)");
+        for trustee in [";;;IU)", ";;;BU)", ";;;WD)", ";;;AU)", ";;;IN)"] {
+            assert!(
+                !PIPE_SDDL.contains(trustee),
+                "{trustee} must not be admitted to a pipe that injects input"
+            );
+        }
     }
 
     /// A wide string is null-terminated, or every `W` call reads past it.

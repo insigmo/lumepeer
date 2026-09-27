@@ -10,11 +10,9 @@
 //! this binary is what makes the table true rather than aspirational:
 //!
 //! - It has **no local request endpoint**. Nothing an unprivileged process on
-//!   this machine can open, connect to or write a byte at. The helper's own
-//!   pipe admits interactive users by design, because the one thing they can
-//!   ask for there is a Ctrl+Alt+Del on their own screen; there is no
-//!   equivalently narrow thing to ask a host that holds the network, so it
-//!   answers nobody locally.
+//!   this machine can open, connect to or write a byte at. There is no
+//!   narrow thing to ask a host that holds the network, so it answers nobody
+//!   locally.
 //! - It **draws no pixels and presses no keys**. Not as a promise: this crate
 //!   turns on none of `lumepeer-runtime`'s capture, encode or decode features,
 //!   so there is no backend compiled into it to call. Pictures and keystrokes

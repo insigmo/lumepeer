@@ -35,6 +35,8 @@ pub mod log;
 pub mod logon_screen;
 #[cfg(target_os = "windows")]
 pub mod machine_store;
+#[cfg(target_os = "windows")]
+pub mod program_data;
 pub mod protocol;
 pub mod session_change;
 

@@ -14,9 +14,9 @@
 //! - **No network, no disk, no configuration.** This binary opens one endpoint
 //!   and calls one Win32 function. It never reads a config file, so nothing a
 //!   user can write changes what it does.
-//! - **A DACL, not an honour system.** The pipe admits `LocalSystem`,
-//!   administrators and interactive users. A network logon or a service
-//!   account cannot connect at all.
+//! - **A DACL, not an honour system.** The pipe admits `LocalSystem` and
+//!   elevated administrators, and nobody else (ADR 0122): an unelevated
+//!   process, a network logon or a service account cannot connect at all.
 //! - **Fixed frames.** Two bytes in, two bytes out, so a short read is an
 //!   error rather than a state to reassemble.
 //!

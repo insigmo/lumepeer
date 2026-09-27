@@ -68,11 +68,10 @@ pub const HOST_ROLE_RELEASE_EVENT: &str = r"Global\lumepeer-host-role-release";
 /// - `BA` — administrators, which is what the desktop client runs as
 ///   (ADR 0057 ships it `requireAdministrator`).
 ///
-/// Deliberately **not** `IU`, unlike the helper's request pipe: that pipe
-/// admits interactive users because the one thing they can ask for there is a
-/// Ctrl+Alt+Del on their own screen. Taking the host role, or knocking the
-/// current host off it, is neither narrow nor self-limiting, so it is not
-/// something an ordinary signed-in process gets to do.
+/// Deliberately **not** `IU`, the same as the helper's request pipe since
+/// ADR 0122. Taking the host role, or knocking the current host off it, is
+/// neither narrow nor self-limiting, so it is not something an ordinary
+/// signed-in process gets to do.
 const HOST_ROLE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
 /// A null-terminated UTF-16 copy of `text`, for the `W` entry points.
@@ -638,9 +637,9 @@ mod tests {
         }
     }
 
-    /// The access list admits `LocalSystem` and administrators, and — unlike
-    /// the helper's request pipe — deliberately not interactive users: taking
-    /// the host role is neither narrow nor self-limiting.
+    /// The access list admits `LocalSystem` and administrators, and
+    /// deliberately not interactive users: taking the host role is neither
+    /// narrow nor self-limiting.
     #[test]
     fn the_token_admits_only_system_and_administrators() {
         assert!(HOST_ROLE_SDDL.contains(";;;SY)"));

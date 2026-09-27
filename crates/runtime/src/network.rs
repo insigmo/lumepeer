@@ -3647,11 +3647,33 @@ pub struct WalkedTree {
     pub skipped_links: usize,
 }
 
+/// Which end of the session this node is on, for one connection (ADR 0122).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// This node dialed the peer: it is the guest, the peer is the host.
+    Dialed,
+    /// The peer dialed this node: it is the host, the peer is the guest.
+    Accepted,
+}
+
+impl Origin {
+    /// The direction every message arriving on such a connection travels in.
+    const fn inbound(self) -> lumepeer_core::protocol::Direction {
+        match self {
+            Self::Dialed => lumepeer_core::protocol::Direction::HostToGuest,
+            Self::Accepted => lumepeer_core::protocol::Direction::GuestToHost,
+        }
+    }
+}
+
 /// The actor's end of one live control connection.
 struct ConnectionHandle {
     /// Distinguishes generations of connection to the same peer, so a stale
     /// `Closed` event cannot tear down a freshly established replacement.
     id: u64,
+    /// Whether this node dialed the peer or the peer dialed it, which decides
+    /// the only messages the peer may send on it (ADR 0122).
+    origin: Origin,
     outbound: mpsc::Sender<MessageKind>,
     /// Kept so this side can close the QUIC connection outright. Dropping the
     /// outbound sender alone only ends the writer task; the reader would sit
@@ -8296,6 +8318,7 @@ impl Actor {
         &mut self,
         connection: ControlConnection,
         peer: NodeId,
+        origin: Origin,
         announces_media_faults: bool,
         speaks_remote_sas: bool,
         speaks_unattended: bool,
@@ -8360,6 +8383,7 @@ impl Actor {
             peer,
             ConnectionHandle {
                 id,
+                origin,
                 outbound: outbound_tx,
                 connection: quic,
                 announces_media_faults,
@@ -9617,6 +9641,7 @@ impl Actor {
         self.adopt(
             connection,
             peer,
+            Origin::Accepted,
             announces_media_faults,
             self.speaks_remote_sas.contains(&peer),
             self.speaks_unattended.contains(&peer),
@@ -9809,6 +9834,7 @@ impl Actor {
         self.adopt(
             connection,
             peer,
+            Origin::Accepted,
             announces_media_faults,
             self.speaks_remote_sas.contains(&peer),
             self.speaks_unattended.contains(&peer),
@@ -9925,10 +9951,32 @@ impl Actor {
                   helper fns would scatter the protocol across the file"
     )]
     fn on_inbound(&mut self, peer: NodeId, id: u64, kind: &MessageKind) {
-        if self.connections.get(&peer).is_none_or(|c| c.id != id) {
+        let Some(origin) = self
+            .connections
+            .get(&peer)
+            .filter(|c| c.id == id)
+            .map(|c| c.origin)
+        else {
+            return;
+        };
+        let tag = self.label_of(&peer);
+        // A message only the other end of this session may send is dropped
+        // before any handler sees it (ADR 0122): a guest has no business
+        // granting consent or challenging for credentials, and a host none
+        // asking this node for a shell or a file. Most handlers below would
+        // refuse such a message on their own, but each by a different route;
+        // this is the one that does not depend on any of them.
+        if kind
+            .direction()
+            .is_some_and(|sent| sent != origin.inbound())
+        {
+            tracing::warn!(
+                peer = %tag,
+                kind = ?std::mem::discriminant(kind),
+                "dropping a message this end of the session is never sent"
+            );
             return;
         }
-        let tag = self.label_of(&peer);
         #[allow(
             clippy::too_many_lines,
             reason = "one arm per message kind reads best; splitting arms into \
@@ -10013,6 +10061,19 @@ impl Actor {
             // A refused message is dropped with a log line — it never closes
             // the session (chat is content, not control).
             MessageKind::Chat { ref text } => {
+                // Chat is part of a granted session and of nothing else
+                // (ADR 0023, ADR 0122): a guest the host has not admitted
+                // yet — anybody holding the invite code — must not be able to
+                // put words in front of the person deciding whether to admit
+                // it, and a host must not before it has answered.
+                let in_session = match origin {
+                    Origin::Dialed => self.views.contains_key(&peer),
+                    Origin::Accepted => self.sessions.state(&peer) == SessionState::Active,
+                };
+                if !in_session {
+                    tracing::warn!(peer = %tag, "chat outside a granted session; dropped");
+                    return;
+                }
                 let at = unix_now_secs();
                 match self.chat.record(peer, false, text, at) {
                     Ok(_) => {
@@ -15156,7 +15217,11 @@ impl Actor {
         terminal_only: bool,
     ) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
-        let addr = ticket.endpoint_addr().map_err(ActorError::Net)?;
+        // The host a ticket names is the one that signed it, or the ticket is
+        // not dialed at all (ADR 0122): everything else it carries — the
+        // obfuscated address, the certificate that transport pins — is only
+        // worth trusting as far as that signature goes.
+        let addr = ticket.verify_issuer().map_err(ActorError::Net)?;
         // Dialing a host this node is already talking to would replace the live
         // connection in `connections`, and the replacement's own teardown would
         // then close the session that was working. Refusing here is what makes
@@ -15341,7 +15406,19 @@ impl Actor {
                 return;
             }
         };
-        // The handshake proves who answered; the ticket only claimed it.
+        // The handshake proves who answered; the ticket only claimed it. The
+        // two must agree (ADR 0122): a session with anybody but the host the
+        // invite names — whatever transport found them — is not the session
+        // the user asked for, and nothing it says is worth acting on.
+        if control.peer() != peer {
+            tracing::warn!(
+                peer = %tag,
+                "the endpoint that answered is not the host the invite names; refusing it"
+            );
+            control.close_with(&NetError::InvalidTicket);
+            self.on_dial_failed(peer, &tag, &NetError::InvalidTicket, resuming);
+            return;
+        }
         let peer = control.peer();
         // The host is back, so the wait is over — whatever it decides next is
         // an ordinary consent or an ordinary device password, and this node has
@@ -15453,7 +15530,7 @@ impl Actor {
         // Same reasoning for taking that machine down (ADR 0084).
         self.reboot_to_host
             .insert(peer, control.peer_minor() >= REBOOT_MINOR);
-        self.adopt(control, peer, false, false, false);
+        self.adopt(control, peer, Origin::Dialed, false, false, false);
     }
 }
 
@@ -22084,6 +22161,89 @@ mod tests {
             rows.iter()
                 .any(|row| row.label == label && row.state == SessionStateDto::Active)
         );
+    }
+
+    /// ADR 0122: a guest the host has not admitted cannot write to the person
+    /// deciding about it, and a message only a host sends — here the grant
+    /// itself — is dropped when a guest sends it. Once admitted, chat works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_waiting_for_consent_can_neither_chat_nor_grant_itself() {
+        use lumepeer_core::protocol::MessageKind;
+
+        let (host, _host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let ticket = InviteTicket::from_code(&invite.code).unwrap();
+        let addr = ticket.endpoint_addr().unwrap();
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let control = lumepeer_net::guest_handshake(
+            guest.connect_control(addr).await.unwrap(),
+            Role::ViewOnly,
+            postcard::to_allocvec(&ticket).unwrap(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let (mut reader, mut writer) = control.split();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+
+        writer
+            .send(MessageKind::ConsentGrant(Role::FullControl))
+            .await
+            .unwrap();
+        writer
+            .send(MessageKind::Chat {
+                text: "please click allow".to_owned(),
+            })
+            .await
+            .unwrap();
+        // Behind both on the same ordered stream: once this is answered the
+        // two above have been handled.
+        writer.send(MessageKind::Ping(7)).await.unwrap();
+        tokio::time::timeout(TIMEOUT, async {
+            while reader.recv().await.unwrap().kind != MessageKind::Pong(7) {}
+        })
+        .await
+        .expect("the host answers the ping");
+        assert!(
+            host.chat_transcript(label.clone())
+                .await
+                .unwrap()
+                .is_empty(),
+            "a guest nobody admitted put a message in front of the host"
+        );
+        assert!(
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.label == label && row.state == SessionStateDto::Pending),
+            "the guest's own grant must change nothing"
+        );
+
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        writer
+            .send(MessageKind::Chat {
+                text: "thanks".to_owned(),
+            })
+            .await
+            .unwrap();
+        let transcript = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let transcript = host.chat_transcript(label.clone()).await.unwrap();
+                if !transcript.is_empty() {
+                    return transcript;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("chat in a granted session arrives");
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "thanks");
     }
 
     /// ADR 0089: a guest that stops resuming and connects again gets a new

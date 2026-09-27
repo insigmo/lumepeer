@@ -17,7 +17,13 @@
 //! [`UNATTENDED_MAX_FAILED_ATTEMPTS`] failed [`UnattendedAccess::verify_full`]
 //! calls every further attempt is refused for
 //! [`UNATTENDED_LOCKOUT_DURATION_SECS`], including one with the correct
-//! credentials. A success resets the counter.
+//! credentials, and every lockout after that without a success in between
+//! lasts twice as long, up to [`UNATTENDED_LOCKOUT_MAX_SECS`] (ADR 0122). A
+//! success resets both.
+//!
+//! A one-time code is one-time: a code that has let somebody in cannot let
+//! anybody in again, nor can any code from before it (RFC 6238 §5.2;
+//! ADR 0122).
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,7 +34,7 @@ use sha1::Sha1;
 
 use crate::consent::Role;
 use crate::constants::{
-    UNATTENDED_LOCKOUT_DURATION_SECS, UNATTENDED_MAX_FAILED_ATTEMPTS,
+    UNATTENDED_LOCKOUT_DURATION_SECS, UNATTENDED_LOCKOUT_MAX_SECS, UNATTENDED_MAX_FAILED_ATTEMPTS,
     UNATTENDED_PASSWORD_MAX_BYTES, UNATTENDED_PASSWORD_MIN_BYTES, UNATTENDED_TOTP_STEP_SECS,
 };
 
@@ -160,20 +166,45 @@ impl Totp {
     /// # Errors
     /// [`UnattendedError::BadCode`] unless one of the accepted steps matches.
     pub fn verify(&self, code: &str, unix_secs: u64) -> Result<()> {
+        self.matching_step(code, unix_secs).map(|_| ())
+    }
+
+    /// The time step `code` belongs to, among the one containing `unix_secs`
+    /// and its two neighbours; the step is what makes a code spent once it has
+    /// been used (ADR 0122).
+    ///
+    /// Every candidate is compared, and each comparison looks at every byte,
+    /// so how long this takes says nothing about how close a guess was.
+    ///
+    /// # Errors
+    /// [`UnattendedError::BadCode`] unless one of the accepted steps matches.
+    pub fn matching_step(&self, code: &str, unix_secs: u64) -> Result<u64> {
         if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
             return Err(UnattendedError::BadCode);
         }
         let step = i64::try_from(UNATTENDED_TOTP_STEP_SECS).unwrap_or(30);
+        let mut matched = None;
         for drift in [0i64, -1, 1] {
             let candidate =
                 (i64::try_from(unix_secs).unwrap_or(i64::MAX) + drift * step).clamp(0, i64::MAX);
             let candidate = u64::try_from(candidate).unwrap_or(0);
-            if self.generate(candidate)? == code {
-                return Ok(());
+            if same_code(&self.generate(candidate)?, code) && matched.is_none() {
+                matched = Some(candidate / UNATTENDED_TOTP_STEP_SECS);
             }
         }
-        Err(UnattendedError::BadCode)
+        matched.ok_or(UnattendedError::BadCode)
     }
+}
+
+/// Whether two codes are the same, looking at every byte whatever the first
+/// difference is.
+fn same_code(expected: &str, presented: &str) -> bool {
+    expected.len() == presented.len()
+        && expected
+            .bytes()
+            .zip(presented.bytes())
+            .fold(0u8, |differs, (a, b)| differs | (a ^ b))
+            == 0
 }
 
 /// Unattended-access credentials of this host (§8; ADR 0023 §1-2, ADR 0033).
@@ -196,8 +227,14 @@ pub struct UnattendedAccess {
     role: Role,
     /// Failed [`Self::verify_full`] calls since the last success.
     failed_attempts: u32,
+    /// Lockouts since the last success, which is what each next one's length
+    /// doubles on (ADR 0122).
+    lockouts: u32,
     /// Until when every verification is refused, regardless of credentials.
     locked_until: Option<Instant>,
+    /// The TOTP step of the last code that let somebody in: that code and
+    /// every one before it are spent (RFC 6238 §5.2; ADR 0122).
+    last_code_step: Option<u64>,
 }
 
 impl Default for UnattendedAccess {
@@ -215,7 +252,9 @@ impl UnattendedAccess {
             totp_secret: None,
             role: Role::ViewOnly,
             failed_attempts: 0,
+            lockouts: 0,
             locked_until: None,
+            last_code_step: None,
         }
     }
 
@@ -271,6 +310,8 @@ impl UnattendedAccess {
     /// Enables or replaces the second factor with a 20-byte secret.
     pub fn set_totp_secret(&mut self, secret: [u8; 20]) {
         self.totp_secret = Some(secret);
+        // Steps spent under the old secret say nothing about the new one.
+        self.last_code_step = None;
     }
 
     /// The second factor, for provisioning an authenticator app.
@@ -303,7 +344,9 @@ impl UnattendedAccess {
         self.password_hash = None;
         self.totp_secret = None;
         self.failed_attempts = 0;
+        self.lockouts = 0;
         self.locked_until = None;
+        self.last_code_step = None;
     }
 
     /// Role a successful admission is granted (§8.2).
@@ -359,28 +402,40 @@ impl UnattendedAccess {
             Some(password) => self.check_password(password),
         };
         let code_ok = match (&self.totp_secret, code) {
-            (None, _) => Ok(()),
+            (None, _) => Ok(None),
             (Some(_), None) => Err(UnattendedError::MissingCode),
             (Some(secret), Some(code)) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
-                Totp::new(secret).verify(code, now)
+                match Totp::new(secret).matching_step(code, now) {
+                    // A code already used, or one older than it, is refused
+                    // like a wrong one: somebody who watched it being typed
+                    // must not be able to type it again inside its window.
+                    Ok(step) if self.last_code_step.is_some_and(|spent| step <= spent) => {
+                        Err(UnattendedError::BadCode)
+                    }
+                    other => other.map(Some),
+                }
             }
         };
 
         match (password_ok, code_ok) {
-            (Ok(()), Ok(())) => {
+            (Ok(()), Ok(step)) => {
                 self.failed_attempts = 0;
+                self.lockouts = 0;
                 self.locked_until = None;
+                if step.is_some() {
+                    self.last_code_step = step;
+                }
                 Ok(())
             }
             (Err(e), _) | (_, Err(e)) => {
                 self.failed_attempts = self.failed_attempts.saturating_add(1);
                 if self.failed_attempts >= UNATTENDED_MAX_FAILED_ATTEMPTS {
-                    self.locked_until = Some(
-                        Instant::now() + Duration::from_secs(UNATTENDED_LOCKOUT_DURATION_SECS),
-                    );
+                    self.lockouts = self.lockouts.saturating_add(1);
+                    self.locked_until =
+                        Some(Instant::now() + Duration::from_secs(lockout_secs(self.lockouts)));
                 }
                 Err(e)
             }
@@ -420,6 +475,16 @@ impl UnattendedAccess {
             Err(UnattendedError::BadPassword)
         }
     }
+}
+
+/// How long the `nth` lockout since the last success lasts: the first one
+/// [`UNATTENDED_LOCKOUT_DURATION_SECS`], each after it twice the one before,
+/// never more than [`UNATTENDED_LOCKOUT_MAX_SECS`] (ADR 0122).
+fn lockout_secs(nth: u32) -> u64 {
+    let doublings = nth.saturating_sub(1).min(u64::BITS - 1);
+    UNATTENDED_LOCKOUT_DURATION_SECS
+        .saturating_mul(1u64 << doublings)
+        .min(UNATTENDED_LOCKOUT_MAX_SECS)
 }
 
 #[cfg(test)]
@@ -501,6 +566,89 @@ mod tests {
             access.verify_full(Some("right enough"), None),
             Err(UnattendedError::LockedOut { .. })
         ));
+    }
+
+    /// ADR 0122: every lockout without a success in between is twice the one
+    /// before, up to a day, and a success starts the scale over.
+    #[test]
+    fn each_lockout_is_longer_until_a_success() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            // Fail until locked, then let the lock lapse as time would.
+            while !access.locked_out() {
+                let _ = access.verify_full(Some("nope"), None);
+            }
+            seen.push(access.lockout_remaining_secs().unwrap_or(0));
+            access.locked_until = Some(Instant::now());
+        }
+        assert!(
+            seen[0] <= UNATTENDED_LOCKOUT_DURATION_SECS
+                && seen[0] >= UNATTENDED_LOCKOUT_DURATION_SECS - 1
+        );
+        assert!(
+            seen[1] >= 2 * UNATTENDED_LOCKOUT_DURATION_SECS - 1,
+            "the second lockout must be longer: {seen:?}"
+        );
+        assert!(seen.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert!(
+            seen.iter()
+                .all(|&secs| secs <= crate::constants::UNATTENDED_LOCKOUT_MAX_SECS)
+        );
+        assert!(
+            *seen.last().unwrap() >= crate::constants::UNATTENDED_LOCKOUT_MAX_SECS - 1,
+            "the scale tops out at the ceiling: {seen:?}"
+        );
+
+        assert_eq!(access.verify_full(Some("right enough"), None).unwrap(), ());
+        while !access.locked_out() {
+            let _ = access.verify_full(Some("nope"), None);
+        }
+        assert!(
+            access.lockout_remaining_secs().unwrap_or(0) <= UNATTENDED_LOCKOUT_DURATION_SECS,
+            "a success must start the scale over"
+        );
+    }
+
+    /// ADR 0122 (RFC 6238 §5.2): a code that let somebody in is spent, and so
+    /// is every code before it; the next step's code still works.
+    #[test]
+    fn a_code_that_was_used_cannot_be_used_again() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("passphrase").unwrap();
+        access.set_totp_secret([7u8; 20]);
+        let totp = access.totp().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let code = totp.generate(now).unwrap();
+
+        assert_eq!(
+            access.verify_full(Some("passphrase"), Some(&code)).unwrap(),
+            ()
+        );
+        assert!(matches!(
+            access.verify_full(Some("passphrase"), Some(&code)),
+            Err(UnattendedError::BadCode)
+        ));
+        let earlier = totp
+            .generate(now.saturating_sub(UNATTENDED_TOTP_STEP_SECS))
+            .unwrap();
+        if earlier != code {
+            assert!(matches!(
+                access.verify_full(Some("passphrase"), Some(&earlier)),
+                Err(UnattendedError::BadCode)
+            ));
+        }
+        let next = totp.generate(now + UNATTENDED_TOTP_STEP_SECS).unwrap();
+        if next != code {
+            assert_eq!(
+                access.verify_full(Some("passphrase"), Some(&next)).unwrap(),
+                (),
+                "the code of a later step is still good"
+            );
+        }
     }
 
     #[test]

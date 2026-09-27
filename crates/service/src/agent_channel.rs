@@ -6,7 +6,7 @@
 //!
 //! 1. **The access list.** `LocalSystem`, administrators, and the one signed-in
 //!    user the host started an agent for — named by SID, not by the `IU` alias
-//!    the helper's own request pipe uses. `IU` would admit *every* interactive
+//!    the helper's own request pipe once used. `IU` would admit *every* interactive
 //!    user, and on a machine with a second person signed in that is a way to
 //!    stand in for the agent.
 //! 2. **`PIPE_REJECT_REMOTE_CLIENTS`.** The same flag the helper's pipe

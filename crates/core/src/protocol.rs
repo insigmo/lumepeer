@@ -1257,6 +1257,93 @@ pub enum MessageKind {
     },
 }
 
+impl MessageKind {
+    /// The one direction this message may travel in, or `None` for one either
+    /// side of a session sends (§2.3; ADR 0122).
+    ///
+    /// The frame reader already refuses an envelope whose own `direction`
+    /// field disagrees with the stream it came in on, but that field is the
+    /// sender's to fill in: it says which way the *stream* runs, not that the
+    /// message is one the sender's side may send. A guest that wrote a
+    /// `ConsentGrant` onto its own stream would pass every check below this
+    /// one. So each kind is placed here once, and the receiver drops a message
+    /// that came from the wrong end before any handler sees it.
+    ///
+    /// Exhaustive with no `_` arm on purpose: a new message cannot exist
+    /// without somebody deciding which end may send it.
+    #[must_use]
+    pub const fn direction(&self) -> Option<Direction> {
+        match self {
+            // The host's answers and announcements.
+            Self::HelloAck { .. }
+            | Self::ConsentGrant(_)
+            | Self::ConsentRevoke
+            | Self::LicenseWarn { .. }
+            | Self::LicenseDeny { .. }
+            | Self::RecordAck(_)
+            | Self::CursorShape { .. }
+            | Self::MonitorsList { .. }
+            | Self::PrivacyModeAck { .. }
+            | Self::MediaUnavailable(_)
+            | Self::SasAck { .. }
+            | Self::UnattendedChallenge { .. }
+            | Self::UnattendedReject(_)
+            | Self::DisplayModesList { .. }
+            | Self::MediaCodec { .. }
+            | Self::DirListResponse { .. }
+            | Self::FileFetchRefused { .. }
+            | Self::TunnelOpenResponse { .. }
+            | Self::TerminalOpenResponse { .. } => Some(Direction::HostToGuest),
+            // The guest's requests: everything that asks the host to do
+            // something to its own machine.
+            Self::Hello { .. }
+            | Self::ResumeHello { .. }
+            | Self::ConsentRequest
+            | Self::InputEvent(_)
+            | Self::RecordRequest
+            | Self::KeyframeRequest
+            | Self::MonitorSelect { .. }
+            | Self::PrivacyMode { .. }
+            | Self::SasRequest
+            | Self::UnattendedAuth { .. }
+            | Self::ReceiverReport { .. }
+            | Self::StreamScaleRequest { .. }
+            | Self::DisplaySetMode { .. }
+            | Self::StreamSizeRequest { .. }
+            | Self::DirListRequest { .. }
+            | Self::FileFetchRequest { .. }
+            | Self::FilePutOffer { .. }
+            | Self::TunnelOpenRequest { .. }
+            | Self::TerminalOpenRequest { .. }
+            | Self::TerminalResize { .. }
+            | Self::RebootRequest { .. } => Some(Direction::GuestToHost),
+            // Content between two people, transfers either of them can
+            // start, the keepalive, and the ends of things either side can
+            // end.
+            Self::SessionStart
+            | Self::SessionStop
+            | Self::ClipboardSync { .. }
+            | Self::FileOffer { .. }
+            | Self::FileAccept(_)
+            | Self::QualityAdjust { .. }
+            | Self::Ping(_)
+            | Self::Pong(_)
+            | Self::Chat { .. }
+            | Self::AudioStart { .. }
+            | Self::AudioStop
+            | Self::FileAbort { .. }
+            | Self::FileChunkAck { .. }
+            | Self::FileTransferStart { .. }
+            | Self::ClipboardFileOffer { .. }
+            | Self::ClipboardFileAccept(_)
+            | Self::DirOffer { .. }
+            | Self::DirAccept(_)
+            | Self::TunnelClose { .. }
+            | Self::TerminalClose { .. } => None,
+        }
+    }
+}
+
 /// What a [`MessageKind::RebootRequest`] asks for (§4.1; ADR 0084).
 ///
 /// Two variants and no third, because there is no third answer to "does this
@@ -2065,6 +2152,55 @@ mod tests {
             seq: 0,
             kind,
             body: Vec::new(),
+        }
+    }
+
+    /// ADR 0122: the host's decisions travel only towards the guest, the
+    /// guest's requests only towards the host, and content either way.
+    #[test]
+    fn every_decision_and_every_request_has_one_sender() {
+        for from_host in [
+            MessageKind::ConsentGrant(Role::FullControl),
+            MessageKind::ConsentRevoke,
+            MessageKind::UnattendedChallenge {
+                code_required: false,
+            },
+            MessageKind::RecordAck(true),
+        ] {
+            assert_eq!(
+                from_host.direction(),
+                Some(Direction::HostToGuest),
+                "{from_host:?}"
+            );
+        }
+        for from_guest in [
+            MessageKind::ConsentRequest,
+            MessageKind::SasRequest,
+            MessageKind::KeyframeRequest,
+            MessageKind::DirListRequest {
+                path: "/".to_owned(),
+            },
+            MessageKind::TerminalOpenRequest { cols: 80, rows: 24 },
+            MessageKind::UnattendedAuth {
+                password: "x".to_owned(),
+                code: None,
+            },
+        ] {
+            assert_eq!(
+                from_guest.direction(),
+                Some(Direction::GuestToHost),
+                "{from_guest:?}"
+            );
+        }
+        for either in [
+            MessageKind::Chat {
+                text: "hi".to_owned(),
+            },
+            MessageKind::Ping(1),
+            MessageKind::FileAccept(true),
+            MessageKind::TerminalClose { session_id: 1 },
+        ] {
+            assert_eq!(either.direction(), None, "{either:?}");
         }
     }
 

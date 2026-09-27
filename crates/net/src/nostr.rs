@@ -29,8 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use data_encoding::HEXLOWER;
 use k256::schnorr::SigningKey;
 use lumepeer_core::constants::{
-    SIGNAL_CONNECT_TIMEOUT_SECS, SIGNAL_OUTBOX_FRESH_SECS, SIGNAL_PING_SECS,
-    SIGNAL_RECONNECT_CEILING_SECS, SIGNAL_SILENCE_SECS,
+    SIGNAL_CONNECT_TIMEOUT_SECS, SIGNAL_MAX_MESSAGE_BYTES, SIGNAL_OUTBOX_FRESH_SECS,
+    SIGNAL_PING_SECS, SIGNAL_RECONNECT_CEILING_SECS, SIGNAL_SILENCE_SECS,
 };
 use n0_future::{SinkExt as _, StreamExt as _};
 use noq::rustls;
@@ -38,7 +38,9 @@ use rand::{Rng as _, RngExt as _};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
-use tokio_websockets::{ClientBuilder, Connector, MaybeTlsStream, Message, WebSocketStream};
+use tokio_websockets::{
+    ClientBuilder, Connector, Limits, MaybeTlsStream, Message, WebSocketStream,
+};
 
 /// Public relays the rendezvous signals through (ADR 0116).
 ///
@@ -466,7 +468,12 @@ async fn serve_connection(
 /// with no route to the IPv6 internet is common, ADR 0095), TLS against the
 /// web PKI for a `wss://` relay, then the upgrade.
 async fn connect(relay: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    let builder = ClientBuilder::new().uri(relay).map_err(|e| e.to_string())?;
+    // Bounded well below the library's default (ADR 0122): a relay is a
+    // public server, and what it sends is only ever a small event.
+    let builder = ClientBuilder::new()
+        .uri(relay)
+        .map_err(|e| e.to_string())?
+        .limits(Limits::default().max_payload_len(Some(SIGNAL_MAX_MESSAGE_BYTES)));
     let (tls, host, port) =
         relay_target(relay).ok_or_else(|| format!("not a ws:// or wss:// relay: {relay}"))?;
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))

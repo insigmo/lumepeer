@@ -152,9 +152,10 @@ pub const STATUS_REFUSED: u8 = 0x01;
 
 /// Name of the endpoint the service listens on.
 ///
-/// Windows: a named pipe whose DACL admits `LocalSystem`, administrators and
-/// interactive users, and nobody else — notably not network logons and not
-/// service accounts.
+/// Windows: a named pipe whose DACL admits `LocalSystem` and elevated
+/// administrators, and nobody else — notably not an unelevated process of the
+/// signed-in user, which could otherwise drive the secure desktop through it
+/// (ADR 0122).
 #[cfg(target_os = "windows")]
 pub const ENDPOINT: &str = r"\\.\pipe\lumepeer-service";
 

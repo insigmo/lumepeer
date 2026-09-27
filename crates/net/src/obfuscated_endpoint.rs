@@ -1174,6 +1174,15 @@ impl GuestObfuscatedEndpoint {
         // with a certificate this cannot read will answer the same way every
         // time, so it is a failed connection rather than a failed attempt.
         let (peer, negotiated) = peer_and_alpn(&connection)?;
+        // The pinned certificate has to carry the key the ticket names
+        // (ADR 0122). A fingerprint only says "this certificate"; this is what
+        // says "this certificate belongs to the host being dialed", so a
+        // ticket that paired one host's identity with another's certificate
+        // connects to nobody.
+        if peer != self.host {
+            connection.close(noq::VarInt::from_u32(0), b"");
+            return Err(NetError::InvalidTicket);
+        }
         Ok(PeerConnection::from_obfuscated(
             connection, peer, negotiated,
         ))
@@ -1792,6 +1801,44 @@ mod tests {
             "there is no mapping worth holding open without an address"
         );
         host.close().await;
+    }
+
+    /// ADR 0122: the certificate a guest pinned must also carry the key of
+    /// the host it meant to dial. A guest told to expect one host and handed
+    /// another host's fingerprint reaches that other host's endpoint — and
+    /// refuses the connection there, as a verdict, before a byte of the
+    /// session is spoken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pinned_certificate_of_another_host_is_refused() {
+        let actual = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let target = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            actual.local_addr().unwrap().port(),
+        );
+        let serving = tokio::spawn(async move {
+            let _ = actual.accept().await;
+            actual
+        });
+
+        let expected = NodeId::from_bytes(&identity(3).verifying_key().to_bytes()).unwrap();
+        let guest = GuestObfuscatedEndpoint::bind(
+            &INVITE,
+            &identity(2),
+            expected,
+            target,
+            *blake3::hash(identity_certificate(&identity(1)).unwrap().der.as_ref()).as_bytes(),
+            None,
+        )
+        .unwrap();
+        let outcome = guest.connect(crate::endpoint::ALPN_CONTROL).await;
+        assert!(
+            matches!(outcome, Err(NetError::InvalidTicket)),
+            "a certificate of a host other than the named one must be refused"
+        );
+        guest.close().await;
+        serving.abort();
     }
     /// gap-tasks/21 task 2, and the other half of its definition of done: the
     /// control handshake and a full consent exchange run over the obfuscated

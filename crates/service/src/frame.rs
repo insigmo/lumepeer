@@ -52,18 +52,21 @@ const LOGON_SCREEN_MAPPING_NAME: &str = r"Global\lumepeer-logon-screen-frame";
 
 /// Who may open the logon-screen mapping, in SDDL.
 ///
-/// `LocalSystem` and administrators, and deliberately **not** the `IU`
-/// interactive users [`FRAME_SDDL`] admits to read. Both ends of this mapping
-/// are `LocalSystem` — the host that creates it and the worker that fills it —
-/// so there is nobody else to admit, and what it holds is a picture of the
-/// screen where this machine's passwords are typed.
+/// `LocalSystem` and administrators, and nobody else. Both ends of this
+/// mapping are `LocalSystem` — the host that creates it and the worker that
+/// fills it — so there is nobody else to admit, and what it holds is a picture
+/// of the screen where this machine's passwords are typed.
 const LOGON_SCREEN_FRAME_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
-/// Who may open the secure-desktop mapping, in SDDL — the same three trustees
-/// the pipe's own DACL names (ADR 0043), but asymmetric where the pipe is not:
-/// nothing on the client's side ever writes a frame, so interactive users get
-/// generic *read* only.
-const FRAME_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)";
+/// Who may open the secure-desktop mapping, in SDDL — the same two trustees
+/// the pipe's own DACL names (ADR 0122).
+///
+/// This used to add read for `IU`, every interactive user. What it holds is a
+/// picture of the UAC prompt or the lock screen, which Windows keeps out of
+/// reach of every unelevated process on purpose; the one reader is the
+/// Lumepeer client, which always runs elevated (ADR 0057), and an elevated
+/// token is exactly what `BA` admits.
+const FRAME_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)";
 
 /// Longest string form of a Windows SID this module will put in an access
 /// list.
@@ -563,20 +566,17 @@ mod tests {
 
     use super::*;
 
-    /// The access list names exactly three trustees, with interactive users
-    /// held to read-only — nothing on the client's side ever writes a frame.
+    /// ADR 0122: a picture of the secure desktop is readable by `LocalSystem`
+    /// and elevated administrators only — no unelevated process may read the
+    /// UAC prompt or the lock screen out of this mapping.
     #[test]
-    fn the_mapping_admits_only_local_interactive_readers() {
-        assert!(FRAME_SDDL.contains(";;;SY)"));
-        assert!(FRAME_SDDL.contains(";;;BA)"));
-        assert!(
-            FRAME_SDDL.contains("GR;;;IU)"),
-            "interactive users get read only"
-        );
-        assert!(
-            !FRAME_SDDL.contains("GA;;;IU)"),
-            "interactive users must not get write"
-        );
+    fn the_mapping_admits_only_system_and_elevated_administrators() {
+        for sddl in [FRAME_SDDL, LOGON_SCREEN_FRAME_SDDL] {
+            assert_eq!(sddl, "D:(A;;GA;;;SY)(A;;GA;;;BA)");
+            for trustee in [";;;IU)", ";;;BU)", ";;;WD)", ";;;AU)", ";;;IN)"] {
+                assert!(!sddl.contains(trustee), "{trustee} must not read {sddl}");
+            }
+        }
     }
 
     /// A round trip through the real mapping: create, write one frame,

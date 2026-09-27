@@ -93,7 +93,7 @@ impl FileLog {
     /// starting it over if what is already there is past [`MAX_BYTES`].
     fn open(file_name: &str) -> Option<Self> {
         let path = directory().join(file_name);
-        std::fs::create_dir_all(path.parent()?).ok()?;
+        prepare(&path)?;
         let oversized = std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_BYTES);
         let file = OpenOptions::new()
             .create(true)
@@ -138,6 +138,34 @@ impl Write for Handle {
             .unwrap_or_else(PoisonError::into_inner)
             .flush()
     }
+}
+
+/// Makes the directory `path` goes in safe for `LocalSystem` to write into
+/// (ADR 0122).
+///
+/// `%ProgramData%` lets any user create a folder and own it, and a
+/// `LocalSystem` process that appends to a file inside a folder an ordinary
+/// user controls can be pointed — through a junction, or a file left there in
+/// advance — at a file that user could never write. So the tree is secured
+/// first (administrators own it, ordinary users only read), and whatever was
+/// already at the file's name without this service having written it is
+/// removed. `None` when that cannot be done, which leaves the log on stdout
+/// rather than on a path somebody else chose.
+#[cfg(target_os = "windows")]
+fn prepare(path: &std::path::Path) -> Option<()> {
+    use crate::program_data::{self, Foreign, TREE_SDDL};
+
+    let secured = program_data::secure_directory(&program_data::root(), TREE_SDDL, Foreign::Adopt)
+        && program_data::secure_directory(path.parent()?, TREE_SDDL, Foreign::Adopt)
+        && program_data::discard_untrusted_file(path);
+    secured.then_some(())
+}
+
+/// Creates the directory `path` goes in. Off Windows this crate runs no
+/// service, and the directory is only ever a developer's.
+#[cfg(not(target_os = "windows"))]
+fn prepare(path: &std::path::Path) -> Option<()> {
+    std::fs::create_dir_all(path.parent()?).ok()
 }
 
 /// The machine-wide directory the file lives in.

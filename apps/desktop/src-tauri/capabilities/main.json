@@ -1,12 +1,9 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries. Every application command it may call is named here one by one; a command that is not listed cannot be invoked from this window at all.",
+  "description": "Per-window capability of the main window. Design doc §13: no filesystem, shell, network or arbitrary command permissions, and no wildcard entries. Every application command it may call is named here one by one; a command that is not listed cannot be invoked from this window at all. The app's own origin only: no remote URL, localhost included, may call any of these, so nothing the window could ever be navigated to can set a device password or trust a device (ADR 0122); the pilot build's copy keeps its localhost origins for UI automation.",
   "windows": ["main"],
   "local": true,
-  "remote": {
-    "urls": ["http://localhost:*", "http://127.0.0.1:*"]
-  },
   "permissions": [
     "core:default",
     {

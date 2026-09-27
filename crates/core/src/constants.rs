@@ -549,6 +549,14 @@ pub const SIGNAL_RECONNECT_CEILING_SECS: u64 = 15;
 /// long is dropped instead of sent, seconds (ADR 0116): by then the dial it
 /// belonged to has moved on.
 pub const SIGNAL_OUTBOX_FRESH_SECS: u64 = 20;
+/// Largest WebSocket message this node takes from a signalling relay, bytes
+/// (ADR 0122).
+///
+/// The relays are public servers nobody here runs, and the library's own
+/// default would let each of the eight make this process buffer 64 MiB. A
+/// rendezvous event is a few hundred bytes, and nothing a relay says about
+/// one comes near this.
+pub const SIGNAL_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Short-link creation rate limit per IP (§7).
 pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 /// Short-link resolution rate limit per IP (§7).
@@ -889,8 +897,18 @@ pub const UNATTENDED_TOTP_STEP_SECS: u64 = 30;
 /// brute force (§18).
 pub const UNATTENDED_MAX_FAILED_ATTEMPTS: u32 = 5;
 /// How long the host refuses every unattended verification once the failure
-/// limit is reached (§18).
+/// limit is reached (§18). The first lockout; every one after it without a
+/// success in between is twice the one before (ADR 0122).
 pub const UNATTENDED_LOCKOUT_DURATION_SECS: u64 = 300;
+/// The longest a lockout grows to (ADR 0122).
+///
+/// A lockout that stayed at [`UNATTENDED_LOCKOUT_DURATION_SECS`] let a patient
+/// attacker guess five passwords every five minutes for as long as it liked —
+/// well over a thousand a day, which is a common-password list inside a year.
+/// Doubling up to a day leaves that at a handful a day, while the owner who
+/// mistyped a few times is locked out for minutes and back to nothing on the
+/// first success.
+pub const UNATTENDED_LOCKOUT_MAX_SECS: u64 = 24 * 60 * 60;
 
 /// Shortest device password the host will accept when setting one (§8).
 ///
