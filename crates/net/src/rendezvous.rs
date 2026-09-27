@@ -33,6 +33,13 @@
 //! travel as pushes over public Nostr relays ([`Signals`], ADR 0116): a host
 //! hears a knock a fraction of a second after it was sent, and answers with
 //! where it is. The DHT stays as the path that works when no relay does.
+//!
+//! A relay checks nobody's signature, so a host's answer there carries its
+//! own: the host's endpoint key over the record, inside the seal (ADR 0123).
+//! Without it anybody holding the invite could say where the host is, and a
+//! guest would dial there for the rest of the session. A guest takes a host
+//! record off a relay only if that signature verifies; the DHT's copy is
+//! already signed by the same key, by BEP 44.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -41,7 +48,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use data_encoding::HEXLOWER;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::RENDEZVOUS_LOOKUP_TIMEOUT_SECS;
 use n0_future::StreamExt as _;
@@ -69,6 +76,10 @@ const SALT_BYTES: usize = 16;
 const FORMAT_VERSION: u8 = 1;
 /// Bytes of the `XChaCha20-Poly1305` nonce that prefixes a sealed record.
 const NONCE_BYTES: usize = 24;
+/// Domain separator of a host record's signature (ADR 0123).
+const HOST_SIGNATURE_CONTEXT: &[u8] = b"lumepeer 2026 ADR 0123 rendezvous host record";
+/// Bytes of an ed25519 signature.
+const SIGNATURE_BYTES: usize = 64;
 /// Longest a `put` may take before it is given up on. A put walks to the
 /// closest nodes and stores on each; one that has not finished by now is
 /// stuck on unanswering nodes, and the next publish replaces it anyway.
@@ -156,19 +167,35 @@ impl Rendezvous {
     }
 
     /// Host: the push channel for `invite_id`, on which guests' knocks
-    /// arrive and this host says where it is (ADR 0116). `None` with no
+    /// arrive and this host says where it is (ADR 0116), signing what it
+    /// says with its endpoint key `identity` (ADR 0123). `None` with no
     /// relays configured. Opens connections: call it inside a tokio runtime.
     #[must_use]
-    pub fn host_signals(&self, invite_id: &[u8; INVITE_ID_BYTES]) -> Option<Signals> {
-        self.signals(invite_id, Kind::Knock, Kind::Host)
+    pub fn host_signals(
+        &self,
+        invite_id: &[u8; INVITE_ID_BYTES],
+        identity: &SigningKey,
+    ) -> Option<Signals> {
+        self.signals(
+            invite_id,
+            Kind::Knock,
+            Kind::Host,
+            Some(identity.clone()),
+            None,
+        )
     }
 
     /// Guest: the push channel for `invite_id`, on which this guest knocks
-    /// and the host says where it is (ADR 0116). `None` with no relays
-    /// configured. Opens connections: call it inside a tokio runtime.
+    /// and the host says where it is (ADR 0116) — heard only when `host`
+    /// signed it (ADR 0123). `None` with no relays configured. Opens
+    /// connections: call it inside a tokio runtime.
     #[must_use]
-    pub fn guest_signals(&self, invite_id: &[u8; INVITE_ID_BYTES]) -> Option<Signals> {
-        self.signals(invite_id, Kind::Host, Kind::Knock)
+    pub fn guest_signals(
+        &self,
+        invite_id: &[u8; INVITE_ID_BYTES],
+        host: NodeId,
+    ) -> Option<Signals> {
+        self.signals(invite_id, Kind::Host, Kind::Knock, None, Some(host))
     }
 
     fn signals(
@@ -176,6 +203,8 @@ impl Rendezvous {
         invite_id: &[u8; INVITE_ID_BYTES],
         listen: Kind,
         speak: Kind,
+        signer: Option<SigningKey>,
+        signed_by: Option<NodeId>,
     ) -> Option<Signals> {
         if self.relays.is_empty() {
             return None;
@@ -186,9 +215,11 @@ impl Rendezvous {
                 publisher: channel.publisher(),
                 invite_id: *invite_id,
                 kind: speak,
+                signer: signer.map(Arc::new),
             },
             channel,
             listen,
+            signed_by,
         })
     }
 
@@ -256,7 +287,7 @@ impl Rendezvous {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let seq = i64::try_from(now.as_micros()).unwrap_or(i64::MAX);
-        let value = seal(invite_id, kind, addr, now.as_secs())?;
+        let value = seal(invite_id, kind, addr, now.as_secs(), None)?;
         let item = MutableItem::new(signer, &value, seq, salt);
         match tokio::time::timeout(PUT_TIMEOUT, self.dht.put_mutable(item, None)).await {
             Ok(Ok(_)) => Ok(()),
@@ -303,6 +334,9 @@ pub struct Signals {
     speaker: Speaker,
     /// The record kind the other side speaks.
     listen: Kind,
+    /// The key the other side's records must be signed with, when they are
+    /// the host's (ADR 0123). `None` on the host, which hears knocks.
+    signed_by: Option<NodeId>,
 }
 
 impl Signals {
@@ -333,6 +367,15 @@ impl Signals {
             let Some(sighting) = open(&self.speaker.invite_id, self.listen, &wire, 0) else {
                 continue;
             };
+            if let Some(host) = &self.signed_by
+                && !signed_by(&self.speaker.invite_id, &wire, host)
+            {
+                // Sealed under the invite, so written by somebody holding it
+                // — and not signed by the host, so not the host's word on
+                // where it is (ADR 0123).
+                tracing::debug!("an unsigned host record on the signalling relays; skipped");
+                continue;
+            }
             return Some(Sighting {
                 seq: i64::try_from(sighting.at).unwrap_or(i64::MAX),
                 ..sighting
@@ -347,6 +390,8 @@ pub struct Speaker {
     publisher: nostr::Publisher,
     invite_id: [u8; INVITE_ID_BYTES],
     kind: Kind,
+    /// The host's endpoint key, which signs what a host says (ADR 0123).
+    signer: Option<Arc<SigningKey>>,
 }
 
 impl Speaker {
@@ -355,7 +400,13 @@ impl Speaker {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        match seal(&self.invite_id, self.kind, addr, now.as_secs()) {
+        match seal(
+            &self.invite_id,
+            self.kind,
+            addr,
+            now.as_secs(),
+            self.signer.as_deref(),
+        ) {
             Ok(wire) => self.publisher.publish(&HEXLOWER.encode(&wire)),
             Err(error) => tracing::warn!(%error, "could not seal a signalling record"),
         }
@@ -386,13 +437,19 @@ fn cipher(invite_id: &[u8; INVITE_ID_BYTES]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(&Key::from(blake3::derive_key(SEAL_CONTEXT, invite_id)))
 }
 
-/// `nonce || AEAD(version || family || ip || port || at)`, with `kind` as the
-/// associated data.
+/// `nonce || AEAD(version || family || ip || port || at [|| signature])`,
+/// with `kind` as the associated data.
+///
+/// The signature, when there is a `signer`, is its ed25519 signature over
+/// [`HOST_SIGNATURE_CONTEXT`], the invite id and everything before it in the
+/// plaintext (ADR 0123). It goes last, so a reader built before it — which
+/// takes the fields it knows and ignores the rest — still reads the record.
 fn seal(
     invite_id: &[u8; INVITE_ID_BYTES],
     kind: Kind,
     addr: SocketAddr,
     at: u64,
+    signer: Option<&SigningKey>,
 ) -> Result<Vec<u8>> {
     let mut plain = vec![FORMAT_VERSION];
     match addr.ip() {
@@ -407,6 +464,10 @@ fn seal(
     }
     plain.extend_from_slice(&addr.port().to_be_bytes());
     plain.extend_from_slice(&at.to_be_bytes());
+    if let Some(signer) = signer {
+        let signature = signer.sign(&signed_message(invite_id, &plain));
+        plain.extend_from_slice(&signature.to_bytes());
+    }
 
     let mut nonce = [0u8; NONCE_BYTES];
     rand::rng().fill_bytes(&mut nonce);
@@ -424,12 +485,51 @@ fn seal(
     Ok(wire)
 }
 
-/// Reverses [`seal`]. `None` for anything this invite did not seal as `kind`:
-/// every record is untrusted input from the DHT, so nothing here panics or
-/// trusts a length (§2.4).
-fn open(invite_id: &[u8; INVITE_ID_BYTES], kind: Kind, wire: &[u8], seq: i64) -> Option<Sighting> {
+/// What a host record's signature covers (ADR 0123).
+fn signed_message(invite_id: &[u8; INVITE_ID_BYTES], fields: &[u8]) -> Vec<u8> {
+    let mut message = HOST_SIGNATURE_CONTEXT.to_vec();
+    message.extend_from_slice(invite_id);
+    message.extend_from_slice(fields);
+    message
+}
+
+/// Whether the host record `wire` is signed by `host` (ADR 0123).
+fn signed_by(invite_id: &[u8; INVITE_ID_BYTES], wire: &[u8], host: &NodeId) -> bool {
+    let Some(plain) = unseal(invite_id, Kind::Host, wire) else {
+        return false;
+    };
+    let Some(fields) = fields_len(&plain) else {
+        return false;
+    };
+    let (Some(signed), Some(signature)) = (plain.get(..fields), plain.get(fields..)) else {
+        return false;
+    };
+    let Ok(signature) = <[u8; SIGNATURE_BYTES]>::try_from(signature) else {
+        return false;
+    };
+    VerifyingKey::from_bytes(host.as_bytes()).is_ok_and(|key| {
+        key.verify(
+            &signed_message(invite_id, signed),
+            &Signature::from_bytes(&signature),
+        )
+        .is_ok()
+    })
+}
+
+/// Bytes of a record's fields before any signature: version, family, the
+/// address, port and time.
+fn fields_len(plain: &[u8]) -> Option<usize> {
+    match *plain.get(1)? {
+        4 => Some(2 + 4 + 2 + 8),
+        6 => Some(2 + 16 + 2 + 8),
+        _ => None,
+    }
+}
+
+/// Removes the seal of a record this invite wrote as `kind`.
+fn unseal(invite_id: &[u8; INVITE_ID_BYTES], kind: Kind, wire: &[u8]) -> Option<Vec<u8>> {
     let nonce: [u8; NONCE_BYTES] = wire.get(..NONCE_BYTES)?.try_into().ok()?;
-    let plain = cipher(invite_id)
+    cipher(invite_id)
         .decrypt(
             &XNonce::from(nonce),
             Payload {
@@ -437,7 +537,14 @@ fn open(invite_id: &[u8; INVITE_ID_BYTES], kind: Kind, wire: &[u8], seq: i64) ->
                 aad: &[kind as u8],
             },
         )
-        .ok()?;
+        .ok()
+}
+
+/// Reverses [`seal`]. `None` for anything this invite did not seal as `kind`:
+/// every record is untrusted input from the DHT, so nothing here panics or
+/// trusts a length (§2.4).
+fn open(invite_id: &[u8; INVITE_ID_BYTES], kind: Kind, wire: &[u8], seq: i64) -> Option<Sighting> {
+    let plain = unseal(invite_id, kind, wire)?;
     if *plain.first()? != FORMAT_VERSION {
         return None;
     }
@@ -468,11 +575,72 @@ mod tests {
     use super::*;
 
     const INVITE: [u8; INVITE_ID_BYTES] = [0x42; INVITE_ID_BYTES];
+    fn host_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x31; 32])
+    }
+
+    fn host_id() -> NodeId {
+        NodeId::from_bytes(&host_key().verifying_key().to_bytes()).unwrap()
+    }
+
+    /// ADR 0123: a host record heard on a relay is taken only when the host
+    /// signed it. One sealed under the invite by anybody else — which is
+    /// everybody holding the invite — is skipped, and the host's own record
+    /// right behind it still arrives.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_hears_only_the_host_record_the_host_signed() {
+        let relay = crate::nostr::test_relay::Relay::start().await;
+        let dht = Rendezvous::with_bootstrap(&[])
+            .unwrap()
+            .with_relays(std::slice::from_ref(&relay.url));
+        let mut guest = dht.guest_signals(&INVITE, host_id()).unwrap();
+        let forger = crate::nostr::Channel::open(&[&relay.url], &topic(&INVITE));
+        let impostor = dht
+            .host_signals(&INVITE, &SigningKey::from_bytes(&[0x77; 32]))
+            .unwrap();
+        let host = dht.host_signals(&INVITE, &host_key()).unwrap();
+        relay
+            .wait_for("every subscription", |seen| seen.filters.len() == 4)
+            .await;
+
+        let elsewhere: SocketAddr = "192.0.2.66:6666".parse().unwrap();
+        forger.publish(
+            &HEXLOWER.encode(&seal(&INVITE, Kind::Host, elsewhere, u64::MAX / 2, None).unwrap()),
+        );
+        impostor.say(elsewhere);
+        let host_at: SocketAddr = "203.0.113.7:4115".parse().unwrap();
+        host.say(host_at);
+
+        let heard = next(&mut guest, "the host's own record").await;
+        assert_eq!(
+            heard.addr, host_at,
+            "a record the host never signed was taken"
+        );
+    }
+
+    /// ADR 0123: the signature goes after the fields a reader built before
+    /// it knows, so that reader still takes the record.
+    #[test]
+    fn a_signed_record_still_opens_for_a_reader_that_ignores_the_signature() {
+        let addr: SocketAddr = "203.0.113.7:4115".parse().unwrap();
+        let wire = seal(&INVITE, Kind::Host, addr, 7, Some(&host_key())).unwrap();
+        assert_eq!(open(&INVITE, Kind::Host, &wire, 1).unwrap().addr, addr);
+        assert!(signed_by(&INVITE, &wire, &host_id()));
+        let other =
+            NodeId::from_bytes(&SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes())
+                .unwrap();
+        assert!(!signed_by(&INVITE, &wire, &other));
+        assert!(!signed_by(
+            &INVITE,
+            &seal(&INVITE, Kind::Host, addr, 7, None).unwrap(),
+            &host_id()
+        ));
+    }
 
     #[test]
     fn a_record_opens_under_its_own_invite_and_kind_only() {
         let addr: SocketAddr = "85.173.133.255:4115".parse().unwrap();
-        let wire = seal(&INVITE, Kind::Host, addr, 1_790_000_000).unwrap();
+        let wire = seal(&INVITE, Kind::Host, addr, 1_790_000_000, None).unwrap();
 
         let sighting = open(&INVITE, Kind::Host, &wire, 7).unwrap();
         assert_eq!(sighting.addr, addr);
@@ -489,13 +657,13 @@ mod tests {
     #[test]
     fn a_v6_address_round_trips() {
         let addr: SocketAddr = "[2001:db8::7]:443".parse().unwrap();
-        let wire = seal(&INVITE, Kind::Knock, addr, 1).unwrap();
+        let wire = seal(&INVITE, Kind::Knock, addr, 1, None).unwrap();
         assert_eq!(open(&INVITE, Kind::Knock, &wire, 1).unwrap().addr, addr);
     }
 
     #[test]
     fn tampered_and_truncated_records_never_open_or_panic() {
-        let wire = seal(&INVITE, Kind::Host, "1.2.3.4:5".parse().unwrap(), 1).unwrap();
+        let wire = seal(&INVITE, Kind::Host, "1.2.3.4:5".parse().unwrap(), 1, None).unwrap();
         for len in 0..wire.len() {
             assert!(open(&INVITE, Kind::Host, &wire[..len], 1).is_none());
         }
@@ -539,11 +707,11 @@ mod tests {
     #[tokio::test]
     async fn without_relays_there_is_no_push_channel() {
         let dht = Rendezvous::with_bootstrap(&[]).unwrap();
-        assert!(dht.host_signals(&INVITE).is_none());
-        assert!(dht.guest_signals(&INVITE).is_none());
+        assert!(dht.host_signals(&INVITE, &host_key()).is_none());
+        assert!(dht.guest_signals(&INVITE, host_id()).is_none());
         let off = dht.with_relays(&[]);
-        assert!(off.host_signals(&INVITE).is_none());
-        assert!(off.guest_signals(&INVITE).is_none());
+        assert!(off.host_signals(&INVITE, &host_key()).is_none());
+        assert!(off.guest_signals(&INVITE, host_id()).is_none());
     }
 
     /// The next record `signals` hears, or a failure naming `what`.
@@ -563,8 +731,8 @@ mod tests {
         let dht = Rendezvous::with_bootstrap(&[])
             .unwrap()
             .with_relays(std::slice::from_ref(&relay.url));
-        let mut host = dht.host_signals(&INVITE).unwrap();
-        let mut guest = dht.guest_signals(&INVITE).unwrap();
+        let mut host = dht.host_signals(&INVITE, &host_key()).unwrap();
+        let mut guest = dht.guest_signals(&INVITE, host_id()).unwrap();
         relay
             .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
             .await;
@@ -591,15 +759,15 @@ mod tests {
         let dht = Rendezvous::with_bootstrap(&[])
             .unwrap()
             .with_relays(std::slice::from_ref(&relay.url));
-        let mut host = dht.host_signals(&INVITE).unwrap();
+        let mut host = dht.host_signals(&INVITE, &host_key()).unwrap();
         let stranger = crate::nostr::Channel::open(&[&relay.url], &topic(&INVITE));
         relay
             .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
             .await;
 
         let somewhere: SocketAddr = "192.0.2.1:1".parse().unwrap();
-        let other_invite = seal(&[0x43; INVITE_ID_BYTES], Kind::Knock, somewhere, 1).unwrap();
-        let host_kind = seal(&INVITE, Kind::Host, somewhere, 1).unwrap();
+        let other_invite = seal(&[0x43; INVITE_ID_BYTES], Kind::Knock, somewhere, 1, None).unwrap();
+        let host_kind = seal(&INVITE, Kind::Host, somewhere, 1, None).unwrap();
         for junk in [
             "not hex at all".to_owned(),
             "00ff".to_owned(),
@@ -609,7 +777,7 @@ mod tests {
             stranger.publish(&junk);
         }
         let knock: SocketAddr = "198.51.100.9:51515".parse().unwrap();
-        stranger.publish(&HEXLOWER.encode(&seal(&INVITE, Kind::Knock, knock, 2).unwrap()));
+        stranger.publish(&HEXLOWER.encode(&seal(&INVITE, Kind::Knock, knock, 2, None).unwrap()));
 
         assert_eq!(next(&mut host, "the real knock").await.addr, knock);
     }

@@ -44,10 +44,11 @@ use lumepeer_core::protocol::{
     DisplayModeUnavailableReason, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1, FEATURE_CODEC_VP9,
     FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
-    FEATURE_RECEIVER_REPORT, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TERMINAL,
-    FEATURE_TUNNEL, FEATURE_UNATTENDED, FileFetchRefusal, InputDetail, InputEventPayload,
-    ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, RebootMode,
-    TerminalRefusal, TunnelRefusal, UnattendedRejection,
+    FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
+    FEATURE_TERMINAL, FEATURE_TUNNEL, FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF,
+    FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
+    MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode, TerminalRefusal,
+    TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
@@ -77,7 +78,7 @@ use lumepeer_net::{
 use lumepeer_terminal::{Shell, ShellControl, ShellError, ShellSize};
 use rand::Rng as _;
 use rand::RngExt as _;
-use tokio::sync::{Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::address_book_store::AddressBookStore;
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
@@ -3647,6 +3648,37 @@ pub struct WalkedTree {
     pub skipped_links: usize,
 }
 
+/// The handshakes of peers not authenticated yet, oldest first (§3.2;
+/// ADR 0123).
+///
+/// Bounded at [`MAX_INFLIGHT_HANDSHAKES`], and full means the **oldest** one
+/// goes, not the newest. A slot used to be held until its handshake finished
+/// or timed out, and a full set refused everybody after it: anybody who knew
+/// this host's identity could keep it unreachable by opening a few
+/// connections every few seconds and never sending a `Hello`. A genuine guest
+/// finishes within a round trip or two of arriving, so it is through before a
+/// slot it holds becomes the oldest; a stalled one is what gets pushed out.
+#[derive(Debug, Default)]
+struct Handshakes(std::collections::VecDeque<tokio::task::AbortHandle>);
+
+impl Handshakes {
+    /// Takes on the handshake `task` runs, making room by ending the oldest
+    /// one still running when there is none.
+    fn admit(&mut self, task: &tokio::task::JoinHandle<()>) {
+        self.0.retain(|handshake| !handshake.is_finished());
+        if self.0.len() >= MAX_INFLIGHT_HANDSHAKES
+            && let Some(oldest) = self.0.pop_front()
+        {
+            tracing::warn!(
+                limit = MAX_INFLIGHT_HANDSHAKES,
+                "handshake slots full: dropping the one that has waited longest"
+            );
+            oldest.abort();
+        }
+        self.0.push_back(task.abort_handle());
+    }
+}
+
 /// Which end of the session this node is on, for one connection (ADR 0122).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
@@ -4198,6 +4230,12 @@ enum ActorEvent {
         /// (ADR 0084), so a request to take this machine down is one it
         /// actually meant to send.
         speaks_reboot: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_SESSION_GRANTS`
+        /// (ADR 0123), so it may be told what its session may take.
+        speaks_session_grants: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED_PROOF`
+        /// (ADR 0123), so it is challenged for a proof, never a password.
+        speaks_unattended_proof: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -4440,6 +4478,12 @@ enum Accepted {
         /// (ADR 0084), so a request to take this machine down is one it
         /// actually meant to send.
         speaks_reboot: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_SESSION_GRANTS`
+        /// (ADR 0123), so it may be told what its session may take.
+        speaks_session_grants: bool,
+        /// Whether the guest's `Hello` advertised `FEATURE_UNATTENDED_PROOF`
+        /// (ADR 0123), so it is challenged for a proof, never a password.
+        speaks_unattended_proof: bool,
         /// Whether the guest's `Hello` advertised `FEATURE_CLIPBOARD_FILES`
         /// (docs/bugs/14-clipboard-files.md #2; ADR 0047).
         speaks_clipboard_files: bool,
@@ -4808,8 +4852,11 @@ struct Actor {
     connections: std::collections::HashMap<NodeId, ConnectionHandle>,
     next_connection_id: u64,
     /// Caps concurrent handshakes so a flood of half-open connections cannot
-    /// spawn unbounded tasks (§3.2).
-    handshake_slots: Arc<Semaphore>,
+    /// spawn unbounded tasks (§3.2) — and cannot hold every slot either
+    /// (ADR 0123). One budget across both transports, because it bounds what
+    /// this host does for peers it has not authenticated yet, and that is a
+    /// property of the host rather than of a wire.
+    handshakes: Handshakes,
     /// Handshake results, inbound messages and stream-closed notifications
     /// from the per-connection tasks.
     events_tx: mpsc::Sender<ActorEvent>,
@@ -5229,6 +5276,27 @@ struct Actor {
     /// Whether this peer's `Hello` advertised `FEATURE_UNATTENDED` (§9.1;
     /// ADR 0033), recorded before `on_handshaked` runs.
     speaks_unattended: std::collections::HashSet<NodeId>,
+    /// Host side: peers whose `Hello` advertised `FEATURE_UNATTENDED_PROOF`,
+    /// who are challenged for a proof and never for the password itself
+    /// (ADR 0123).
+    speaks_unattended_proof: std::collections::HashSet<NodeId>,
+    /// Host side: the proof each challenged peer has to answer, one exchange
+    /// at a time (ADR 0123). A peer here is also in `unattended_pending`.
+    unattended_proofs: std::collections::HashMap<NodeId, lumepeer_core::unattended::PendingProof>,
+    /// Host side: peers whose `Hello` advertised `FEATURE_SESSION_GRANTS`
+    /// (ADR 0123).
+    speaks_session_grants: std::collections::HashSet<NodeId>,
+    /// Guest side: the password-proof challenge the host this node is
+    /// dialing sent last, answered once (ADR 0123).
+    proof_challenge: Option<(NodeId, ProofKdf, Vec<u8>)>,
+    /// Guest side: the host that asked this node for a proof rather than a
+    /// password, on the connection still open to it (ADR 0123). From such a
+    /// host the password itself is never sent, not even while its next
+    /// challenge is still on the way.
+    proof_host: Option<NodeId>,
+    /// Guest side: a submission made between one proof challenge being spent
+    /// and the host's next one arriving, answered when it does (ADR 0123).
+    queued_proof: Option<(String, Option<String>, bool)>,
     /// Host side: saved devices and which of them are trusted (§8; ADR 0034).
     address_book: AddressBookStore,
     /// Guest side: whether the challenge this node is answering asked for a
@@ -8235,16 +8303,11 @@ impl Actor {
 
     /// Finishes the QUIC handshake, checks the ALPN and runs the control
     /// handshake, all on its own task and under one deadline (§9.1, §18).
-    fn spawn_handshake(&self, incoming: iroh::endpoint::Incoming) {
-        let Some(permit) = self.handshake_permit() else {
-            drop(incoming);
-            return;
-        };
+    fn spawn_handshake(&mut self, incoming: iroh::endpoint::Incoming) {
         let tx = self.events_tx.clone();
         let verifying_key = self.identity.verifying_key();
         let salt = self.install_salt;
-        tokio::spawn(async move {
-            let _permit = permit;
+        self.handshakes.admit(&tokio::spawn(async move {
             // Two deadlines, not one. Finishing the QUIC handshake is a
             // network wait whose length is the far side's hole punching, and
             // it used to share the ten seconds meant for a single control
@@ -8264,7 +8327,7 @@ impl Actor {
                 return;
             };
             handshake_and_dispatch(connection, &verifying_key, &salt, &tx).await;
-        });
+        }));
     }
 
     /// The same, for a connection accepted on the obfuscated transport
@@ -8276,35 +8339,13 @@ impl Actor {
     /// that is the same code, on purpose: a second copy of the classify-and-
     /// dispatch path under a second transport would be a second place for an
     /// authorization decision to drift (§2.3).
-    fn spawn_obfuscated_incoming(&self, connection: PeerConnection) {
-        let Some(permit) = self.handshake_permit() else {
-            return;
-        };
+    fn spawn_obfuscated_incoming(&mut self, connection: PeerConnection) {
         let tx = self.events_tx.clone();
         let verifying_key = self.identity.verifying_key();
         let salt = self.install_salt;
-        tokio::spawn(async move {
-            let _permit = permit;
+        self.handshakes.admit(&tokio::spawn(async move {
             handshake_and_dispatch(Some(connection), &verifying_key, &salt, &tx).await;
-        });
-    }
-
-    /// One of the [`MAX_INFLIGHT_HANDSHAKES`] slots an incoming connection has
-    /// to hold to be worked on at all, or `None` when they are all taken.
-    ///
-    /// One budget across both transports, because it bounds what this host
-    /// will do for peers it has not authenticated yet, and that is a property
-    /// of the host rather than of a wire.
-    fn handshake_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        Arc::clone(&self.handshake_slots)
-            .try_acquire_owned()
-            .inspect_err(|_| {
-                tracing::warn!(
-                    limit = MAX_INFLIGHT_HANDSHAKES,
-                    "refusing an incoming connection: handshake slots exhausted"
-                );
-            })
-            .ok()
+        }));
     }
 
     /// Takes ownership of an authenticated connection: the reader half runs as
@@ -8434,6 +8475,8 @@ impl Actor {
                 speaks_tunnel,
                 speaks_terminal,
                 speaks_reboot,
+                speaks_session_grants,
+                speaks_unattended_proof,
                 speaks_clipboard_files,
                 speaks_display_mode,
                 guest_codec_support,
@@ -8509,6 +8552,18 @@ impl Actor {
                     self.speaks_reboot.insert(peer);
                 } else {
                     self.speaks_reboot.remove(&peer);
+                }
+                // What the session may take, and how it proves a password
+                // (ADR 0123). Neither is a grant.
+                if speaks_session_grants {
+                    self.speaks_session_grants.insert(peer);
+                } else {
+                    self.speaks_session_grants.remove(&peer);
+                }
+                if speaks_unattended_proof {
+                    self.speaks_unattended_proof.insert(peer);
+                } else {
+                    self.speaks_unattended_proof.remove(&peer);
                 }
                 if speaks_cursor_shape {
                     self.speaks_cursor_shape.insert(peer);
@@ -8901,6 +8956,8 @@ impl Actor {
             // input on the very next poll (§8.1).
             state.input.store(grants.input, Ordering::Relaxed);
             tracing::info!(peer = %tag, input = grants.input, "view grants updated");
+            // What this node offers the host follows the role (ADR 0123).
+            self.refresh_clipboard_watch();
             return;
         }
         // A window parked while its session was away is the window this grant
@@ -9647,14 +9704,7 @@ impl Actor {
             self.speaks_unattended.contains(&peer),
         );
         if challenge {
-            let code_required = self.unattended.code_required();
-            self.unattended_pending.insert(peer);
-            self.send_to(&peer, MessageKind::UnattendedChallenge { code_required });
-            tracing::info!(
-                peer = %tag,
-                code_required,
-                "unattended challenge offered to a trusted device"
-            );
+            self.offer_credential_challenge(peer);
         }
         if consent {
             tracing::info!(peer = %tag, "consent request queued");
@@ -9848,6 +9898,186 @@ impl Actor {
         self.rebuild_labels_and_snapshot();
     }
 
+    /// Host side: asks `peer` for the device password — as a proof when it
+    /// can give one, as the password itself only when it is too old to
+    /// (ADR 0033, ADR 0123).
+    ///
+    /// Also how a proof is asked for again after a wrong one: an exchange is
+    /// single-use, so a retry needs a fresh one.
+    fn offer_credential_challenge(&mut self, peer: NodeId) {
+        let tag = self.label_of(&peer);
+        let code_required = self.unattended.code_required();
+        self.unattended_pending.insert(peer);
+        if self.speaks_unattended_proof.contains(&peer) {
+            let host = self.endpoint.node_id();
+            let session_id = self
+                .connections
+                .get(&peer)
+                .map_or([0u8; 16], |c| c.session_id);
+            match self.unattended.begin_proof(&host, &peer, session_id) {
+                Ok((pending, kdf, host_message)) => {
+                    self.unattended_proofs.insert(peer, pending);
+                    self.send_to(
+                        &peer,
+                        MessageKind::UnattendedProofChallenge {
+                            code_required,
+                            kdf,
+                            host_message,
+                        },
+                    );
+                    tracing::info!(
+                        peer = %tag,
+                        code_required,
+                        "unattended proof challenge offered to a trusted device"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    // A stored hash this build cannot run a proof against
+                    // cannot be checked the plaintext way either; the guest
+                    // is refused rather than asked for a password it would
+                    // only be sending for nothing.
+                    tracing::warn!(peer = %tag, %error, "cannot challenge for a password proof");
+                    self.unattended_pending.remove(&peer);
+                    self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
+                    return;
+                }
+            }
+        }
+        self.send_to(&peer, MessageKind::UnattendedChallenge { code_required });
+        tracing::info!(
+            peer = %tag,
+            code_required,
+            "unattended challenge offered to a trusted device"
+        );
+    }
+
+    /// Host side: one guest's password proof (ADR 0123).
+    ///
+    /// The same decision as [`Self::on_unattended_auth`], reached without the
+    /// password ever crossing the wire: `lumepeer-core` checks the proof,
+    /// counts a failure, and hands back the configured role.
+    fn on_unattended_proof(
+        &mut self,
+        peer: NodeId,
+        answer: &lumepeer_core::unattended::ProofAnswer,
+    ) {
+        let tag = self.label_of(&peer);
+        let Some(pending) = self.unattended_proofs.remove(&peer) else {
+            tracing::warn!(peer = %tag, "a password proof nobody asked for; ignored");
+            return;
+        };
+        if !self.unattended_pending.remove(&peer) {
+            return;
+        }
+        if !self.may_try_unattended(&peer) {
+            tracing::warn!(peer = %tag, "unattended access withdrawn mid-login; refusing");
+            self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
+            return;
+        }
+        match self.unattended.admit_proof(pending, answer) {
+            Ok(role) => {
+                tracing::info!(peer = %tag, ?role, "unattended login accepted by proof");
+                let event = unattended_login_event(self.windows.nobody_signed_in(), true);
+                self.audit(&peer, event);
+                if let Err(error) = self.grant_role(peer, role) {
+                    tracing::warn!(peer = %tag, ?error, "cannot start the admitted session");
+                    self.send_unattended_reject(peer, UnattendedRejection::Unavailable);
+                    return;
+                }
+                self.rebuild_labels_and_snapshot();
+            }
+            Err(error) => {
+                tracing::warn!(peer = %tag, "unattended proof refused");
+                let event = unattended_login_event(self.windows.nobody_signed_in(), false);
+                self.audit(&peer, event);
+                let rejection = rejection_of(&error);
+                self.send_unattended_reject(peer, rejection);
+                // A wrong password or code may be typed again without a
+                // redial, exactly as on the plaintext path; the lockout
+                // inside `admit_proof` is what bounds that.
+                if rejection != UnattendedRejection::Unavailable {
+                    self.offer_credential_challenge(peer);
+                }
+            }
+        }
+    }
+
+    /// Drops everything either side kept about a credential exchange with
+    /// `peer` once its connection is gone (§8; ADR 0033, ADR 0123).
+    fn forget_credential_exchange(&mut self, peer: NodeId) {
+        self.unattended_pending.remove(&peer);
+        self.unattended_proofs.remove(&peer);
+        self.speaks_unattended.remove(&peer);
+        self.speaks_unattended_proof.remove(&peer);
+        self.speaks_session_grants.remove(&peer);
+        if self
+            .proof_challenge
+            .as_ref()
+            .is_some_and(|(host, _, _)| *host == peer)
+        {
+            self.proof_challenge = None;
+        }
+        if self.proof_host == Some(peer) {
+            self.proof_host = None;
+            self.queued_proof = None;
+        }
+    }
+
+    /// Host side: tells a guest that understands it which of its grants decide
+    /// what its own machine may send without being asked (ADR 0123).
+    fn announce_session_grants(&mut self, peer: NodeId) {
+        if !self.speaks_session_grants.contains(&peer) {
+            return;
+        }
+        let Some(grants) = self.sessions.grants(&peer) else {
+            return;
+        };
+        self.send_to(
+            &peer,
+            MessageKind::SessionGrants {
+                clipboard_write: grants.clipboard_write,
+                file_transfer: grants.file_transfer,
+            },
+        );
+    }
+
+    /// Guest side: the host this node is dialing wants device credentials
+    /// rather than a dialog (§8; ADR 0033), as a password or as a proof
+    /// (ADR 0123).
+    fn on_credential_challenge(&mut self, peer: NodeId, code_required: bool) {
+        let tag = self.label_of(&peer);
+        tracing::info!(peer = %tag, code_required, "the host asked for device credentials");
+        self.connect_phase = ConnectPhase::AwaitingCredentials;
+        self.connect_code_required = code_required;
+        self.connect_failure = None;
+        self.connect_retry_secs = None;
+        self.connect_credentials_auto = false;
+        let _ = self.notify.send(ActorNotification::UnattendedChallenge);
+        // A remembered password is tried once, automatically, without
+        // ever showing the modal — but never when a second factor is
+        // also required: that one is never saved, so there would be
+        // nothing to answer with anyway (docs/bugs/02-connect-form.md,
+        // task 6; docs/bugs/DECISIONS.md D2).
+        //
+        // And never for a dial nobody pressed at a host nobody marked
+        // (docs/bugs/22 task 3; ADR 0106). ADR 0106 keeps this node
+        // dialing a host whose session it was in whether or not that
+        // host is trusted; "reconnect on its own" is the switch that
+        // says whether the return may then happen with nobody asked,
+        // and this is the only place that could make it silent. With
+        // it off the challenge still arrives — the person at this
+        // keyboard answers it, which is what they are there for.
+        let unasked = self.reconnect_waits.contains_key(&peer);
+        if !code_required
+            && (!unasked || self.may_return_without_asking(&host_tag(&peer)))
+            && let Ok(Some(password)) = self.remembered_passwords.load(&host_tag(&peer))
+        {
+            self.connect_credentials_auto = true;
+            let _ = self.on_unattended_submit(&password, None, false);
+        }
+    }
+
     /// Sends `UnattendedReject` to `peer`, but only if its `Hello` advertised
     /// [`FEATURE_UNATTENDED`] — an older guest would decode the unknown
     /// discriminant as malformed and drop the connection (§9.1).
@@ -9900,6 +10130,12 @@ impl Actor {
     /// a verdict out (§2.1, §2.3).
     fn on_unattended_auth(&mut self, peer: NodeId, password: &str, code: Option<&str>) {
         let tag = self.label_of(&peer);
+        if self.unattended_proofs.contains_key(&peer) {
+            // Asked for a proof, answered with the password: not the exchange
+            // this host offered (ADR 0123), and nothing it should reply to.
+            tracing::warn!(peer = %tag, "a password where a proof was asked for; ignored");
+            return;
+        }
         if !self.unattended_pending.remove(&peer) {
             // No challenge was offered on this connection, so there is nothing
             // to answer. Silence rather than a rejection: an unsolicited
@@ -10365,41 +10601,67 @@ impl Actor {
                     tracing::warn!(peer = %tag, "unsolicited credential challenge; ignored");
                     return;
                 }
-                tracing::info!(peer = %tag, code_required, "the host asked for device credentials");
-                self.connect_phase = ConnectPhase::AwaitingCredentials;
-                self.connect_code_required = code_required;
-                self.connect_failure = None;
-                self.connect_retry_secs = None;
-                self.connect_credentials_auto = false;
-                let _ = self.notify.send(ActorNotification::UnattendedChallenge);
-                // A remembered password is tried once, automatically, without
-                // ever showing the modal — but never when a second factor is
-                // also required: that one is never saved, so there would be
-                // nothing to answer with anyway (docs/bugs/02-connect-form.md,
-                // task 6; docs/bugs/DECISIONS.md D2).
-                //
-                // And never for a dial nobody pressed at a host nobody marked
-                // (docs/bugs/22 task 3; ADR 0106). ADR 0106 keeps this node
-                // dialing a host whose session it was in whether or not that
-                // host is trusted; "reconnect on its own" is the switch that
-                // says whether the return may then happen with nobody asked,
-                // and this is the only place that could make it silent. With
-                // it off the challenge still arrives — the person at this
-                // keyboard answers it, which is what they are there for.
-                let unasked = self.reconnect_waits.contains_key(&peer);
-                if !code_required
-                    && (!unasked || self.may_return_without_asking(&host_tag(&peer)))
-                    && let Ok(Some(password)) = self.remembered_passwords.load(&host_tag(&peer))
-                {
-                    self.connect_credentials_auto = true;
-                    let _ = self.on_unattended_submit(&password, None, false);
-                }
+                // Only the plaintext exchange is on offer from this host.
+                self.proof_challenge = None;
+                self.proof_host = None;
+                self.queued_proof = None;
+                self.on_credential_challenge(peer, code_required);
             }
             // Host side: a guest answered the challenge.
             MessageKind::UnattendedAuth {
                 ref password,
                 ref code,
             } => self.on_unattended_auth(peer, password, code.as_deref()),
+            // Host side: a guest proved the password instead (ADR 0123).
+            MessageKind::UnattendedProof {
+                ref guest_message,
+                ref sealed_code,
+                confirm,
+            } => self.on_unattended_proof(
+                peer,
+                &lumepeer_core::unattended::ProofAnswer {
+                    guest_message: guest_message.clone(),
+                    sealed_code: sealed_code.clone(),
+                    confirm,
+                },
+            ),
+            // Guest side: the host asks for a proof (ADR 0123). Kept for the
+            // next submission, which answers it once.
+            MessageKind::UnattendedProofChallenge {
+                code_required,
+                ref kdf,
+                ref host_message,
+            } => {
+                if self.connect_peer != Some(peer) {
+                    tracing::warn!(peer = %tag, "unsolicited proof challenge; ignored");
+                    return;
+                }
+                self.proof_challenge = Some((peer, kdf.clone(), host_message.clone()));
+                self.proof_host = Some(peer);
+                if self.connect_phase == ConnectPhase::AwaitingCredentials {
+                    // The fresh exchange a host sends after a wrong answer:
+                    // the refusal just shown stays on the form, and a retry
+                    // typed before this arrived is answered now.
+                    self.connect_code_required = code_required;
+                    if let Some((password, code, remember)) = self.queued_proof.take() {
+                        let _ = self.on_unattended_submit(&password, code, remember);
+                    }
+                    return;
+                }
+                self.on_credential_challenge(peer, code_required);
+            }
+            // Guest side: what the host lets this session take without
+            // asking (ADR 0123).
+            MessageKind::SessionGrants {
+                clipboard_write,
+                file_transfer,
+            } => {
+                if let Some(view) = self.views.get_mut(&peer) {
+                    view.grants.clipboard_write = clipboard_write;
+                    view.grants.file_transfer = file_transfer;
+                }
+                self.refresh_clipboard_watch();
+            }
             // Guest side: the credentials were refused (§8, §18). The phase
             // stays on the credential form so the user can try again — except
             // when the host says it cannot decide at all, which no retry
@@ -10586,8 +10848,7 @@ impl Actor {
         // carried it: a later connection from the same device gets a fresh
         // challenge, and its `UnattendedAuth` is never accepted against a
         // pending flag left over from an older one (§8; ADR 0033).
-        self.unattended_pending.remove(&peer);
-        self.speaks_unattended.remove(&peer);
+        self.forget_credential_exchange(peer);
         self.speaks_cursor_shape.remove(&peer);
         self.speaks_file_browse.remove(&peer);
         self.file_browse_to_host.remove(&peer);
@@ -12166,23 +12427,34 @@ impl Actor {
     fn spawn_obfuscated_accept_loop(&self, acceptor: ObfuscatedAcceptor) {
         let events = self.events_tx.clone();
         tokio::spawn(async move {
-            while let Some(incoming) = acceptor.accept().await {
-                match incoming {
-                    Ok(connection) => {
-                        if events
-                            .send(ActorEvent::ObfuscatedIncoming {
-                                connection: Box::new(connection),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return;
+            // Each handshake runs on a task of its own, bounded in time and
+            // in number the way the iroh path's are (ADR 0123): awaited here,
+            // one peer that started a handshake and never finished it held
+            // every guest behind it until its idle timeout.
+            let mut handshakes = Handshakes::default();
+            while let Some(incoming) = acceptor.accept_incoming().await {
+                let events = events.clone();
+                handshakes.admit(&tokio::spawn(async move {
+                    let deadline = Duration::from_secs(INCOMING_ACCEPT_TIMEOUT_SECS);
+                    match tokio::time::timeout(deadline, ObfuscatedAcceptor::finish(incoming)).await
+                    {
+                        Ok(Some(Ok(connection))) => {
+                            let _ = events
+                                .send(ActorEvent::ObfuscatedIncoming {
+                                    connection: Box::new(connection),
+                                })
+                                .await;
                         }
+                        Ok(Some(Err(error))) => {
+                            tracing::warn!(%error, "an obfuscated connection did not come up");
+                        }
+                        Ok(None) => {}
+                        Err(_) => tracing::warn!(
+                            timeout_secs = INCOMING_ACCEPT_TIMEOUT_SECS,
+                            "dropping an obfuscated connection that did not finish its handshake in time"
+                        ),
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "an obfuscated connection did not come up");
-                    }
-                }
+                }));
             }
             tracing::debug!("the obfuscated endpoint stopped accepting");
         });
@@ -12243,8 +12515,8 @@ impl Actor {
     /// `clipboard_write`, by the only core entitled to decide it.
     fn on_clipboard_push(&mut self, label: &str, text: &str) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
-        let permitted = if self.views.contains_key(&peer) {
-            true
+        let permitted = if let Some(view) = self.views.get(&peer) {
+            view.grants.clipboard_write
         } else {
             self.sessions
                 .grants(&peer)
@@ -12282,9 +12554,10 @@ impl Actor {
     ///   session that does not carry it is skipped without a word, the
     ///   change is not an error, it simply is not that session's to receive.
     /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). Every host this
-    ///   node currently has an open view onto. There is no grant to check
-    ///   here — this side may always *offer* — so every one of them is a
-    ///   recipient; the host's own core is what decides on arrival.
+    ///   node has an open view onto *under full control* — the role that
+    ///   carries `clipboard_write` (ADR 0123). A host that only lets this node
+    ///   watch is not sent this machine's clipboard at all; the host's own
+    ///   core still decides on arrival for the rest.
     fn on_local_clipboard(&mut self, text: &str) {
         let mut recipients: Vec<NodeId> = self
             .sessions
@@ -12296,7 +12569,7 @@ impl Actor {
             })
             .map(|(peer, _, _)| peer)
             .collect();
-        recipients.extend(self.views.keys().copied());
+        recipients.extend(self.hosts_taking_the_clipboard());
         for peer in recipients {
             let label = self.label_of(&peer);
             if let Err(error) = self.on_clipboard_push(&label, text) {
@@ -12328,13 +12601,27 @@ impl Actor {
             .into_iter()
             .map(|(peer, _, _)| peer)
             .collect();
-        recipients.extend(self.views.keys().copied());
+        recipients.extend(
+            self.views
+                .iter()
+                .filter(|(_, view)| view.grants.file_transfer)
+                .map(|(peer, _)| *peer),
+        );
         recipients.sort_unstable();
         recipients.dedup();
         for peer in recipients {
             // A peer too old to understand a clipboard file offer is skipped
             // rather than sent one it would decode as malformed (§9.1).
             if !self.may_transfer_files(&peer) || !self.speaks_clipboard_files.contains(&peer) {
+                continue;
+            }
+            // A host this node only watches is not offered what is on this
+            // machine's clipboard, even by name (ADR 0123).
+            if self
+                .views
+                .get(&peer)
+                .is_some_and(|view| !view.grants.file_transfer)
+            {
                 continue;
             }
             self.spawn_clipboard_offer(peer, paths.to_vec());
@@ -13660,22 +13947,42 @@ impl Actor {
     ///   are read from the same poll, so leaving the second one out is what
     ///   would make copying a file on a host that shares files but not text
     ///   do nothing at all.
-    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). `self.views` is
-    ///   non-empty: this node is watching at least one host, and its own
+    /// - **Guest side** (docs/bugs/10-clipboard-auto.md #1). This node has a
+    ///   view onto at least one host that gave it full control, and its own
     ///   clipboard changes are worth *offering* there the moment they
     ///   happen — the same offer a manual toolbar press used to make, now
     ///   made automatically. The host decides on arrival whether to accept
-    ///   it, against its own `clipboard_write`; this side holds no grant to
-    ///   consult (ADR 0029, ADR 0030), so an open view is the only local
-    ///   fact that can gate the read at all.
+    ///   it, against its own `clipboard_write`; the role the host granted is
+    ///   the only local fact this side has, and a view-only role keeps this
+    ///   machine's clipboard unread (ADR 0123).
     fn refresh_clipboard_watch(&self) {
         let host_side = self.sessions.active().into_iter().any(|(peer, _, grants)| {
             self.sessions.state(&peer) == SessionState::Active
                 && (clip::permits(grants, ClipboardFlow::HostToGuest)
                     || clip::permits_files(grants))
         });
-        let guest_side = !self.views.is_empty();
+        let guest_side = self
+            .views
+            .values()
+            .any(|view| view.grants.clipboard_write || view.grants.file_transfer);
         self.clipboard_worker.set_watching(host_side || guest_side);
+    }
+
+    /// Guest side: the hosts this node's own clipboard is sent to when it
+    /// changes (ADR 0046, ADR 0123).
+    ///
+    /// Only a host that gave this guest full control — the role that carries
+    /// `clipboard_write` — is one. A host that only lets this node watch has
+    /// no use for what is copied on this machine, and a host that is not what
+    /// it seems would otherwise receive every password copied here for as
+    /// long as the window stays open. The host still decides on arrival
+    /// against its own grant; this is the guest deciding what leaves at all.
+    fn hosts_taking_the_clipboard(&self) -> Vec<NodeId> {
+        self.views
+            .iter()
+            .filter(|(_, view)| view.grants.clipboard_write)
+            .map(|(peer, _)| *peer)
+            .collect()
     }
 
     /// Host side: grants `role` and, if it carries `view`, registers the peer
@@ -13705,6 +14012,7 @@ impl Actor {
         // somebody at this machine instead, and a password arriving after it
         // must not be able to grant a second, different role.
         self.unattended_pending.remove(&peer);
+        self.unattended_proofs.remove(&peer);
         self.start_granted_session(peer, role);
         tracing::info!(peer = %label, ?role, "consent granted");
         self.audit(
@@ -13729,6 +14037,9 @@ impl Actor {
         let label = self.label_of(&peer);
         let label = label.as_str();
         self.send_to(&peer, MessageKind::ConsentGrant(role));
+        // Right behind the grant, so the guest's window never acts on the
+        // role alone for longer than one message (ADR 0123).
+        self.announce_session_grants(peer);
         if self.sessions.grants(&peer).is_some_and(|g| g.view) {
             let added = lock_capture(&self.capture).add_viewer(peer);
             match added {
@@ -13796,6 +14107,7 @@ impl Actor {
         // together (`on_handshaked`), a peer left on this list could still
         // type the device password and let itself in past a refusal.
         self.unattended_pending.remove(&peer);
+        self.unattended_proofs.remove(&peer);
         self.send_to(&peer, MessageKind::ConsentRevoke);
         self.stop_media(peer);
         // A revoked session cannot be one of the reasons the clipboard is
@@ -13852,6 +14164,14 @@ impl Actor {
         // one, or back (docs/bugs/16-host-display-mode.md #2; ADR 0048).
         if grant == IndependentGrant::DisplayMode {
             self.announce_display_modes(peer);
+        }
+        // The two grants a guest spends on its own, without asking: it has to
+        // know when they move (ADR 0123).
+        if matches!(
+            grant,
+            IndependentGrant::ClipboardWrite | IndependentGrant::FileTransfer
+        ) {
+            self.announce_session_grants(peer);
         }
         // `secure_desktop` moves both on and off here, unlike the others
         // below: the encode loop's own `EncodeControl` copy is the "one
@@ -14060,6 +14380,7 @@ impl Actor {
     fn on_unattended_disable(&mut self) -> Result<(), ActorError> {
         self.unattended.disable();
         self.unattended_pending.clear();
+        self.unattended_proofs.clear();
         self.unattended_store.clear().map_err(ActorError::Net)?;
         tracing::info!("unattended access turned off");
         Ok(())
@@ -14194,6 +14515,70 @@ impl Actor {
         let peer = self.connect_peer.ok_or(ActorError::UnknownPeer)?;
         self.connect_failure = None;
         self.connect_retry_secs = None;
+        let challenge = self
+            .proof_challenge
+            .take()
+            .filter(|(host, _, _)| *host == peer);
+        if let Some((_, kdf, host_message)) = challenge {
+            // The password stays on this machine (ADR 0123): what goes out
+            // is a proof bound to this host's identity and this session.
+            let session_id = self
+                .connections
+                .get(&peer)
+                .map(|c| c.session_id)
+                .ok_or(ActorError::UnknownPeer)?;
+            let answer = match lumepeer_core::unattended::answer_proof(
+                password,
+                code.as_deref(),
+                &kdf,
+                &host_message,
+                &peer,
+                &self.endpoint.node_id(),
+                session_id,
+            ) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    tracing::warn!(peer = %self.label_of(&peer), %error, "cannot answer the host's proof challenge");
+                    self.connect_failure = Some("UNATTENDED_UNAVAILABLE");
+                    self.connect_phase = ConnectPhase::Failed;
+                    self.connect_peer = None;
+                    return Ok(());
+                }
+            };
+            self.pending_remember = remember.then(|| password.to_owned());
+            self.send_to(
+                &peer,
+                MessageKind::UnattendedProof {
+                    guest_message: answer.guest_message,
+                    sealed_code: answer.sealed_code,
+                    confirm: answer.confirm,
+                },
+            );
+            return Ok(());
+        }
+        if self.proof_host == Some(peer) {
+            // This host proves passwords; its next challenge is on the way.
+            self.queued_proof = Some((password.to_owned(), code, remember));
+            return Ok(());
+        }
+        // A host that only takes the password itself is either one built
+        // before ADR 0123 or one pretending to be. The password goes only to
+        // a machine this node has already had a session with — the same
+        // endpoint key, so the same machine — and never to one it is meeting
+        // for the first time, which is exactly where somebody who handed out
+        // their own invite code would be asking for it.
+        if self.history.code_of(&host_tag(&peer)).is_none() {
+            tracing::warn!(
+                peer = %self.label_of(&peer),
+                "refusing to send the device password to a host this node has never had a session with"
+            );
+            // The form stays up with the reason on it: the connection is
+            // still open, and a person at that machine can still let this
+            // node in through the ordinary dialog.
+            self.pending_remember = None;
+            self.connect_failure = Some("UNATTENDED_HOST_OUTDATED");
+            return Ok(());
+        }
         self.pending_remember = remember.then(|| password.to_owned());
         self.send_to(
             &peer,
@@ -16149,6 +16534,7 @@ const fn rejection_of(error: &UnattendedError) -> UnattendedRejection {
         // catch-all so a new variant has to be thought about.
         UnattendedError::NotConfigured
         | UnattendedError::CorruptStore
+        | UnattendedError::BadChallenge
         | UnattendedError::SaltGeneration
         | UnattendedError::PasswordPolicy { .. } => UnattendedRejection::Unavailable,
     }
@@ -16198,6 +16584,8 @@ async fn handshake_and_dispatch(
             speaks_tunnel,
             speaks_terminal,
             speaks_reboot,
+            speaks_session_grants,
+            speaks_unattended_proof,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -16219,6 +16607,8 @@ async fn handshake_and_dispatch(
             speaks_tunnel,
             speaks_terminal,
             speaks_reboot,
+            speaks_session_grants,
+            speaks_unattended_proof,
             speaks_clipboard_files,
             speaks_display_mode,
             guest_codec_support,
@@ -16389,6 +16779,14 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_REBOOT),
+        speaks_session_grants: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_SESSION_GRANTS),
+        speaks_unattended_proof: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_UNATTENDED_PROOF),
         speaks_clipboard_files: hello
             .features
             .iter()
@@ -16681,6 +17079,8 @@ async fn connect_once(
         FEATURE_TUNNEL.to_owned(),
         FEATURE_TERMINAL.to_owned(),
         FEATURE_REBOOT.to_owned(),
+        FEATURE_SESSION_GRANTS.to_owned(),
+        FEATURE_UNATTENDED_PROOF.to_owned(),
     ];
     // The codec strings, and only the ones this process's own `WebView`
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
@@ -17025,7 +17425,7 @@ pub fn spawn_actor_with(
         tickets,
         connections: std::collections::HashMap::new(),
         next_connection_id: 0,
-        handshake_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES)),
+        handshakes: Handshakes::default(),
         events_tx,
         events_rx,
         faults_tx,
@@ -17139,6 +17539,12 @@ pub fn spawn_actor_with(
         unattended_store,
         unattended_pending: std::collections::HashSet::new(),
         speaks_unattended: std::collections::HashSet::new(),
+        speaks_unattended_proof: std::collections::HashSet::new(),
+        unattended_proofs: std::collections::HashMap::new(),
+        speaks_session_grants: std::collections::HashSet::new(),
+        proof_challenge: None,
+        proof_host: None,
+        queued_proof: None,
         address_book: AddressBookStore::open(address_book_path),
         connect_code_required: false,
         connect_retry_secs: None,
@@ -20177,9 +20583,10 @@ mod tests {
         );
     }
 
-    /// The guest-to-host direction: the guest may always *offer*, and the
-    /// host's core is what decides. Without `clipboard_write` the payload is
-    /// dropped on arrival; with it, it reaches the host's real clipboard.
+    /// The guest-to-host direction: `clipboard_write` decides. Without it the
+    /// guest does not even send — it knows the grant since ADR 0123 — and
+    /// nothing reaches the host; with it, the payload reaches the host's real
+    /// clipboard.
     ///
     /// This is the check that used to be reversed: the host was reading
     /// `clipboard_read` for a payload written *to* it, so a host that had
@@ -20188,10 +20595,15 @@ mod tests {
     async fn the_write_grant_is_what_lets_a_guest_change_the_hosts_clipboard() {
         let pair = clipboard_pair().await;
 
-        pair.guest
-            .clipboard_push(pair.host_label.clone(), "from the guest".to_owned())
-            .await
-            .unwrap();
+        assert!(
+            matches!(
+                pair.guest
+                    .clipboard_push(pair.host_label.clone(), "from the guest".to_owned())
+                    .await,
+                Err(ActorError::Core(CoreError::NotPermitted))
+            ),
+            "a view-only guest offered its clipboard"
+        );
         a_few_poll_rounds().await;
         assert!(
             clipboard_writes(&pair.host_clipboard).is_empty(),
@@ -20213,10 +20625,20 @@ mod tests {
             )
             .await
             .unwrap();
-        pair.guest
+        // The guest learns the grant from the host's next message.
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while pair
+            .guest
             .clipboard_push(pair.host_label.clone(), "now allowed".to_owned())
             .await
-            .unwrap();
+            .is_err()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the guest never learned it may send its clipboard"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         wait_until("the host clipboard never changed", || {
             clipboard_writes(&pair.host_clipboard) == vec!["now allowed".to_owned()]
         })
@@ -20326,9 +20748,54 @@ mod tests {
             )
             .await
             .unwrap();
+        // A view-only guest does not watch its clipboard at all (ADR 0123);
+        // the grant is what starts the watcher, and its first look is a
+        // baseline rather than a change.
+        wait_until("the guest never started watching its clipboard", || {
+            pair.guest_clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reads
+                > 0
+        })
+        .await;
+        a_few_poll_rounds().await;
         set_clipboard(&pair.guest_clipboard, "typed after the grant");
         wait_until("the host never received the guest's clipboard", || {
             clipboard_writes(&pair.host_clipboard) == vec!["typed after the grant".to_owned()]
+        })
+        .await;
+    }
+
+    /// ADR 0123: a guest that is only watching does not read its own
+    /// clipboard at all, and starts to the moment the host says it would take
+    /// what is copied there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_only_guest_keeps_its_clipboard_to_itself() {
+        let pair = clipboard_pair().await;
+        a_few_poll_rounds().await;
+        let reads = |clipboard: &SharedTestClipboard| {
+            clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reads
+        };
+        assert_eq!(
+            reads(&pair.guest_clipboard),
+            0,
+            "a view-only guest read its own clipboard"
+        );
+
+        pair.host
+            .set_grant(
+                pair.guest_label.clone(),
+                IndependentGrant::ClipboardWrite,
+                true,
+            )
+            .await
+            .unwrap();
+        wait_until("the guest never started watching its clipboard", || {
+            reads(&pair.guest_clipboard) > 0
         })
         .await;
     }
@@ -21089,6 +21556,187 @@ mod tests {
                 .iter()
                 .all(|row| row.label != label || row.state != SessionStateDto::Active),
             "the right password must not admit anyone during a lockout"
+        );
+    }
+
+    /// Reads `session` until a message `pick` accepts arrives.
+    async fn next_matching<T>(
+        reader: &mut lumepeer_net::ControlReader,
+        mut pick: impl FnMut(MessageKind) -> Option<T>,
+    ) -> T {
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                if let Some(found) = pick(reader.recv().await.unwrap().kind) {
+                    return found;
+                }
+            }
+        })
+        .await
+        .expect("the message never arrived")
+    }
+
+    /// ADR 0123: a host challenges a guest that can prove the password for a
+    /// proof, never for the password itself, and the proof — made from the
+    /// password on the guest's side only — is what admits it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_that_can_prove_the_password_is_never_asked_for_it() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        host.unattended_set_password(DEVICE_PASSWORD.to_owned())
+            .await
+            .unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let ticket = InviteTicket::from_code(&invite.code).unwrap();
+        let addr = ticket.endpoint_addr().unwrap();
+        let proof = postcard::to_allocvec(&ticket).unwrap();
+        let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let features = vec![
+            FEATURE_UNATTENDED.to_owned(),
+            FEATURE_UNATTENDED_PROOF.to_owned(),
+        ];
+
+        // Met once through the dialog, then saved and trusted (ADR 0034).
+        let first = lumepeer_net::guest_handshake(
+            guest.connect_control(addr.clone()).await.unwrap(),
+            Role::ViewOnly,
+            proof.clone(),
+            features.clone(),
+        )
+        .await
+        .unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        host.address_book_upsert(label.clone(), "raw".to_owned(), Vec::new(), String::new())
+            .await
+            .unwrap();
+        host.address_book_set_trusted(label.clone(), true)
+            .await
+            .unwrap();
+        host.revoke(label.clone()).await.unwrap();
+        drop(first);
+
+        let second = lumepeer_net::guest_handshake(
+            guest.connect_control(addr).await.unwrap(),
+            Role::ViewOnly,
+            proof,
+            features,
+        )
+        .await
+        .unwrap();
+        let session_id = second.session_id();
+        let host_id = ticket.endpoint_addr().unwrap().id;
+        let (mut reader, mut writer) = second.split();
+        let (kdf, host_message) = next_matching(&mut reader, |kind| match kind {
+            MessageKind::UnattendedProofChallenge {
+                kdf, host_message, ..
+            } => Some((kdf, host_message)),
+            MessageKind::UnattendedChallenge { .. } => {
+                panic!("a guest that can prove the password was asked for it")
+            }
+            _ => None,
+        })
+        .await;
+
+        let answer = lumepeer_core::unattended::answer_proof(
+            DEVICE_PASSWORD,
+            None,
+            &kdf,
+            &host_message,
+            &host_id,
+            &guest.node_id(),
+            session_id,
+        )
+        .unwrap();
+        writer
+            .send(MessageKind::UnattendedProof {
+                guest_message: answer.guest_message,
+                sealed_code: answer.sealed_code,
+                confirm: answer.confirm,
+            })
+            .await
+            .unwrap();
+        let role = next_matching(&mut reader, |kind| match kind {
+            MessageKind::ConsentGrant(role) => Some(role),
+            _ => None,
+        })
+        .await;
+        assert_eq!(role, Role::ViewOnly, "the proof admitted the guest");
+    }
+
+    /// ADR 0123: a host that only takes the password itself — built before
+    /// ADR 0123, or pretending to be — does not get it from a guest that has
+    /// never had a session with it. The form says why and stays up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_never_sends_the_password_to_a_host_it_has_not_met() {
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::ViewOnly,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+
+        let (session, hello) = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let incoming = host.accept().await.unwrap().unwrap();
+                if incoming.alpn() == lumepeer_net::ALPN_CONTROL {
+                    return lumepeer_net::host_handshake(incoming).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            hello.features.iter().any(|f| f == FEATURE_UNATTENDED_PROOF),
+            "the guest advertises that it can prove the password"
+        );
+        let (mut reader, mut writer) = session.split();
+        writer
+            .send(MessageKind::UnattendedChallenge {
+                code_required: false,
+            })
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::AwaitingCredentials).await;
+        guest
+            .unattended_submit(DEVICE_PASSWORD.to_owned(), None, false)
+            .await
+            .unwrap();
+        let state = wait_for_refusal(&guest, "UNATTENDED_HOST_OUTDATED").await;
+        assert_eq!(
+            state.phase,
+            ConnectPhase::AwaitingCredentials,
+            "the form stays up: the host can still let this guest in"
+        );
+
+        // Whatever the guest sends from here on, the password is not in it.
+        let heard = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if matches!(
+                    reader.recv().await.map(|envelope| envelope.kind),
+                    Ok(MessageKind::UnattendedAuth { .. })
+                ) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(
+            heard.is_err(),
+            "the password went to a host this guest never met"
         );
     }
 
@@ -22161,6 +22809,75 @@ mod tests {
             rows.iter()
                 .any(|row| row.label == label && row.state == SessionStateDto::Active)
         );
+    }
+
+    /// ADR 0123: a full set of handshakes makes room by ending the one that
+    /// has waited longest, never by turning the newest away.
+    #[tokio::test]
+    async fn a_full_set_of_handshakes_drops_its_oldest() {
+        let mut handshakes = Handshakes::default();
+        let oldest = tokio::spawn(std::future::pending::<()>());
+        let oldest_handle = oldest.abort_handle();
+        handshakes.admit(&oldest);
+        let mut rest = Vec::new();
+        for _ in 1..MAX_INFLIGHT_HANDSHAKES {
+            let task = tokio::spawn(std::future::pending::<()>());
+            rest.push(task.abort_handle());
+            handshakes.admit(&task);
+        }
+        let newest = tokio::spawn(std::future::pending::<()>());
+        let newest_handle = newest.abort_handle();
+        handshakes.admit(&newest);
+        for _ in 0..100 {
+            if oldest_handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            oldest_handle.is_finished(),
+            "the oldest handshake kept its slot"
+        );
+        assert!(
+            !newest_handle.is_finished(),
+            "the newest handshake was turned away"
+        );
+        assert!(rest.iter().all(|task| !task.is_finished()));
+        for task in rest.into_iter().chain([newest_handle]) {
+            task.abort();
+        }
+    }
+
+    /// ADR 0123: connections that finish QUIC and then never say `Hello`
+    /// cannot lock a host away from a guest that does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_handshakes_do_not_lock_a_guest_out() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let addr = InviteTicket::from_code(&invite.code)
+            .unwrap()
+            .endpoint_addr()
+            .unwrap();
+
+        let flooder = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_INFLIGHT_HANDSHAKES {
+            stalled.push(flooder.connect_control(addr.clone()).await.unwrap());
+        }
+
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        guest.invite_connect(invite.code).await.unwrap();
+        // Well inside the time a stalled handshake is allowed, so the guest
+        // got in by pushing one out rather than by waiting for one to expire.
+        let pending = tokio::time::timeout(
+            Duration::from_secs(CONTROL_HANDSHAKE_TIMEOUT_SECS / 2),
+            wait_for_pending(&host),
+        )
+        .await;
+        assert!(pending.is_ok(), "stalled handshakes locked the guest out");
+        drop(stalled);
     }
 
     /// ADR 0122: a guest the host has not admitted cannot write to the person

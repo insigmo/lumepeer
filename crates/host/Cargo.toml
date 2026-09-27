@@ -35,7 +35,6 @@ lumepeer-net.workspace = true
 lumepeer-media.workspace = true
 lumepeer-core.workspace = true
 ed25519-dalek.workspace = true
-rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

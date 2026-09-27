@@ -13,6 +13,10 @@ use crate::constants::{
     MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
     STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX,
     TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    UNATTENDED_PROOF_MAX_ITERATIONS, UNATTENDED_PROOF_MAX_LANES, UNATTENDED_PROOF_MAX_MEMORY_KIB,
+    UNATTENDED_PROOF_MAX_MESSAGE_BYTES, UNATTENDED_PROOF_MAX_OUTPUT_BYTES,
+    UNATTENDED_PROOF_MAX_SALT_BYTES, UNATTENDED_PROOF_MIN_OUTPUT_BYTES,
+    UNATTENDED_PROOF_MIN_SALT_BYTES,
 };
 use crate::error::{CoreError, Result};
 
@@ -531,6 +535,24 @@ pub const FEATURE_CODEC_AV1: &str = "codec-av1";
 /// `Hello.features` string a guest sends to say it can actually decode VP9
 /// (ADR 0067). Same compatibility shape as [`FEATURE_CODEC_AV1`].
 pub const FEATURE_CODEC_VP9: &str = "codec-vp9";
+
+/// `Hello.features` string a guest sends to say it understands
+/// [`MessageKind::SessionGrants`] (ADR 0123).
+///
+/// Host to guest, so the guest advertises it and the host reads it off the
+/// guest's `Hello`. A host that never saw it sends nothing, and the guest
+/// goes by the role it was granted — the conservative reading, since the
+/// grants it cannot see are ones it then does not act on.
+pub const FEATURE_SESSION_GRANTS: &str = "session-grants";
+
+/// `Hello.features` string a guest sends to say it can prove it knows the
+/// device password without sending it ([`MessageKind::UnattendedProofChallenge`]
+/// and [`MessageKind::UnattendedProof`]; ADR 0123).
+///
+/// A host that sees it challenges with a proof, never with the plaintext
+/// exchange of [`FEATURE_UNATTENDED`], which stays only for guests too old to
+/// advertise this.
+pub const FEATURE_UNATTENDED_PROOF: &str = "unattended-proof";
 
 /// Direction of a control message, part of the anti-replay tuple (§9.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1255,6 +1277,88 @@ pub enum MessageKind {
         /// Whether the machine is meant to come back.
         mode: RebootMode,
     },
+    /// Host to guest: the grants of this guest's session that decide what the
+    /// guest's own machine may send on its own (ADR 0123).
+    ///
+    /// Sent when a session starts and whenever the host flips one of them, and
+    /// only to a guest that advertised [`FEATURE_SESSION_GRANTS`]. The guest's
+    /// clipboard leaves its machine automatically only while
+    /// `clipboard_write` is on, and its clipboard's file list only while
+    /// `file_transfer` is: a host that only lets a guest watch receives
+    /// neither.
+    SessionGrants {
+        /// The host would write what the guest copies onto its clipboard.
+        clipboard_write: bool,
+        /// The host takes files from this guest.
+        file_transfer: bool,
+    },
+    /// Host to guest: prove you know the device password, without sending it
+    /// (§8; ADR 0123).
+    ///
+    /// The stand-in for [`Self::UnattendedChallenge`] towards a guest that
+    /// advertised [`FEATURE_UNATTENDED_PROOF`]. The guest runs the same
+    /// Argon2id the host stored the password with, and uses the result as the
+    /// password of a SPAKE2 exchange bound to both endpoint identities: a
+    /// host that is not the one the password was set on learns nothing it
+    /// can test a guess against, and a wrong password costs one attempt.
+    UnattendedProofChallenge {
+        /// Whether a one-time code must come with the proof.
+        code_required: bool,
+        /// The key derivation the host's stored password was made with.
+        kdf: ProofKdf,
+        /// The host's SPAKE2 message.
+        host_message: Vec<u8>,
+    },
+    /// Guest to host: the answer to [`Self::UnattendedProofChallenge`]
+    /// (ADR 0123).
+    UnattendedProof {
+        /// The guest's SPAKE2 message.
+        guest_message: Vec<u8>,
+        /// The one-time code, sealed under the exchange's key, when one is
+        /// required.
+        sealed_code: Option<Vec<u8>>,
+        /// HMAC under the exchange's key over the session and the sealed
+        /// code: what shows the host both sides derived the same key.
+        confirm: [u8; 32],
+    },
+}
+
+/// The key derivation of a device password, as a host hands it to a guest
+/// that has to repeat it (ADR 0123): Argon2id, version 0x13, with the salt and
+/// costs the host's stored hash was made with.
+///
+/// Every field is chosen by the host, which may not be the host the guest
+/// believes it is, so a guest only runs a derivation that is within the
+/// bounds [`Self::within_bounds`] names — a host must not be able to make a
+/// guest spend a gigabyte and a minute on one login.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofKdf {
+    /// The salt, raw.
+    pub salt: Vec<u8>,
+    /// Memory cost in KiB.
+    pub memory_kib: u32,
+    /// Time cost.
+    pub iterations: u32,
+    /// Parallelism.
+    pub lanes: u32,
+    /// Length of the derived key in bytes.
+    pub output_len: u32,
+}
+
+impl ProofKdf {
+    /// Whether this derivation is one a guest will run.
+    #[must_use]
+    pub fn within_bounds(&self) -> bool {
+        (UNATTENDED_PROOF_MIN_SALT_BYTES..=UNATTENDED_PROOF_MAX_SALT_BYTES)
+            .contains(&self.salt.len())
+            && (1..=UNATTENDED_PROOF_MAX_MEMORY_KIB).contains(&self.memory_kib)
+            && (1..=UNATTENDED_PROOF_MAX_ITERATIONS).contains(&self.iterations)
+            && (1..=UNATTENDED_PROOF_MAX_LANES).contains(&self.lanes)
+            && usize::try_from(self.output_len).is_ok_and(|len| {
+                (UNATTENDED_PROOF_MIN_OUTPUT_BYTES..=UNATTENDED_PROOF_MAX_OUTPUT_BYTES)
+                    .contains(&len)
+            })
+    }
 }
 
 impl MessageKind {
@@ -1293,7 +1397,9 @@ impl MessageKind {
             | Self::DirListResponse { .. }
             | Self::FileFetchRefused { .. }
             | Self::TunnelOpenResponse { .. }
-            | Self::TerminalOpenResponse { .. } => Some(Direction::HostToGuest),
+            | Self::TerminalOpenResponse { .. }
+            | Self::SessionGrants { .. }
+            | Self::UnattendedProofChallenge { .. } => Some(Direction::HostToGuest),
             // The guest's requests: everything that asks the host to do
             // something to its own machine.
             Self::Hello { .. }
@@ -1316,7 +1422,8 @@ impl MessageKind {
             | Self::TunnelOpenRequest { .. }
             | Self::TerminalOpenRequest { .. }
             | Self::TerminalResize { .. }
-            | Self::RebootRequest { .. } => Some(Direction::GuestToHost),
+            | Self::RebootRequest { .. }
+            | Self::UnattendedProof { .. } => Some(Direction::GuestToHost),
             // Content between two people, transfers either of them can
             // start, the keepalive, and the ends of things either side can
             // end.
@@ -2064,6 +2171,30 @@ impl MessageEnvelope {
             }
             MessageKind::TerminalOpenRequest { cols, rows }
             | MessageKind::TerminalResize { cols, rows, .. } => check_terminal_size(*cols, *rows)?,
+            // Chosen by a host this guest has not proven anything about yet,
+            // and run as an Argon2id on the guest's own CPU and memory, so
+            // it is bounded before anything reads it (ADR 0123).
+            MessageKind::UnattendedProofChallenge {
+                kdf, host_message, ..
+            } if !kdf.within_bounds()
+                || host_message.is_empty()
+                || host_message.len() > UNATTENDED_PROOF_MAX_MESSAGE_BYTES =>
+            {
+                return Err(CoreError::Malformed);
+            }
+            // From a peer not admitted yet, like `UnattendedAuth`.
+            MessageKind::UnattendedProof {
+                guest_message,
+                sealed_code,
+                ..
+            } if guest_message.is_empty()
+                || guest_message.len() > UNATTENDED_PROOF_MAX_MESSAGE_BYTES
+                || sealed_code
+                    .as_ref()
+                    .is_some_and(|code| code.len() > UNATTENDED_CODE_MAX_BYTES) =>
+            {
+                return Err(CoreError::Malformed);
+            }
             // An unassigned codec byte is a peer claiming something this
             // build has never heard of, refused here rather than guessed at
             // by whichever encoder or decoder would otherwise have to decide

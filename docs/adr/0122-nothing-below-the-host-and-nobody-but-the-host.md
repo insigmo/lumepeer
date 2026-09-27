@@ -1,6 +1,7 @@
 # ADR 0122 — Nothing below the host, and nobody but the host
 
-Status: accepted
+Status: accepted; its "What this does not change" is closed by
+[ADR 0123](0123-the-password-stays-home-and-so-does-the-policy.md)
 Date: 2026-09-27
 
 A security review of the whole tree, asked for as "nobody may get into the

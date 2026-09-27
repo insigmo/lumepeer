@@ -25,6 +25,10 @@ sha1.workspace = true
 data-encoding.workspace = true
 serde_json.workspace = true
 rand_core = "0.10.1"
+# The device-password proof of ADR 0123: SPAKE2 over the Argon2id key, and the
+# HMAC-SHA256 that confirms both sides derived the same session key.
+spake2 = "0.4"
+sha2 = "0.11"
 
 [dev-dependencies]
 proptest.workspace = true

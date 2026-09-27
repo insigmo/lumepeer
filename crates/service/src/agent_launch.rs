@@ -172,7 +172,7 @@ fn query_user_token(session: u32) -> Option<HANDLE> {
 }
 
 /// Reads a token's user SID as a string.
-fn sid_of_token(token: HANDLE) -> Option<String> {
+pub(crate) fn sid_of_token(token: HANDLE) -> Option<String> {
     let mut needed = 0u32;
     // First call sizes the buffer. It is expected to fail with
     // `ERROR_INSUFFICIENT_BUFFER`; the size it writes is what matters.

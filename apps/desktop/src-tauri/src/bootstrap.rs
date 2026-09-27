@@ -19,9 +19,10 @@ use lumepeer_net::NetError;
 use lumepeer_net::PeerEndpoint;
 use lumepeer_net::keystore::{Keystore, load_or_create};
 use lumepeer_runtime::network::{
-    ActorHandle, ActorPolicy, ActorStores, address_book_path, default_capture, invite_path,
-    spawn_actor_with,
+    ActorHandle, ActorPolicy, ActorStores, address_book_path, default_capture, spawn_actor_with,
 };
+
+use crate::placement::{self, Placement, Profile};
 
 /// Binds the endpoint from the OS keystore identity and spawns the actor.
 ///
@@ -84,7 +85,16 @@ pub async fn spawn_actor(
     settings: &lumepeer_runtime::config::Settings,
     policy: ActorPolicy,
 ) -> Result<ActorHandle, NetError> {
-    let store = open_keystore()?;
+    // Where every store lives this run: the profile, or — for an elevated
+    // Windows client — a directory only administrators can write (ADR 0123).
+    let Placement {
+        keystore: store,
+        remembered: remembered_password_keystore,
+        address_book,
+        invite_dir,
+        history,
+        audit,
+    } = placement::choose(profile(&app), &open_keystore)?;
     let secret_key = load_or_create(store.as_ref())?;
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let relay = settings.relay_url();
@@ -101,18 +111,22 @@ pub async fn spawn_actor(
         tracing::info!("transport: direct IP paths preferred, relay as the fallback");
         PeerEndpoint::bind_with_lan(secret_key, relay, relay_cache).await?
     };
-    let audit = open_audit_log(&app, store.as_ref()).await;
-    // A second, independent handle on the same keystore: every native backend
-    // opens its own connection per operation rather than holding one open
-    // (see e.g. `SecretServiceKeystore`'s own doc comment), so this costs
-    // nothing beyond what `UnattendedStore` below already pays, and it is
-    // what lets the two stores own their `Box<dyn Keystore>` outright instead
-    // of sharing one behind an `Arc` (docs/bugs/02-connect-form.md, task 6).
-    let remembered_password_keystore = open_keystore()?;
+    let audit = open_audit_log(audit, store.as_ref()).await;
+    // `remembered_password_keystore` is a second, independent handle on the
+    // same keystore: every backend opens its own connection per operation
+    // rather than holding one open (see e.g. `SecretServiceKeystore`'s own
+    // doc comment), so it costs nothing beyond what `UnattendedStore` below
+    // already pays, and it is what lets the two stores own their
+    // `Box<dyn Keystore>` outright instead of sharing one behind an `Arc`
+    // (docs/bugs/02-connect-form.md, task 6).
     let stores = ActorStores {
-        history_path: connection_history_path(&app),
-        address_book_path: address_book_path(),
-        invite_path: invite_path(&identity.verifying_key()),
+        history_path: history,
+        address_book_path: address_book,
+        invite_path: invite_dir.map(|dir| {
+            dir.join(lumepeer_runtime::invite_store::file_name(
+                &identity.verifying_key(),
+            ))
+        }),
         // The same keystore the identity came from: the unattended password
         // hash and TOTP secret are secret material and `CLAUDE.md` keeps
         // secrets out of `config/*.toml` (§11.2; ADR 0033).
@@ -154,17 +168,12 @@ pub async fn spawn_actor(
 /// non-empty log: minting a new one would silently split every peer's history
 /// in two, so the log is left untouched and unwritten instead.
 async fn open_audit_log(
-    app: &tauri::AppHandle,
+    path: Option<std::path::PathBuf>,
     keystore: &dyn Keystore,
 ) -> Option<lumepeer_runtime::audit_store::AuditStore> {
-    use tauri::Manager as _;
-
-    let path = match app.path().app_local_data_dir() {
-        Ok(dir) => dir.join("audit.db"),
-        Err(error) => {
-            tracing::warn!(%error, "cannot resolve the app data directory; no audit log this run");
-            return None;
-        }
+    let Some(path) = path else {
+        tracing::warn!("cannot resolve the app data directory; no audit log this run");
+        return None;
     };
     let store = match lumepeer_runtime::audit_store::AuditStore::open(path, keystore).await {
         Ok(store) => store,
@@ -192,9 +201,20 @@ async fn open_audit_log(
     Some(store)
 }
 
-/// Where the connection history file lives, if the app data directory can be
-/// resolved at all. `None` degrades the feature to in-memory-only for this
-/// run rather than failing startup over a convenience list (§18).
+/// Where every store lived before ADR 0123, and where it still lives for a
+/// run that keeps the profile (see [`placement`]).
+fn profile(app: &tauri::AppHandle) -> Profile {
+    use tauri::Manager as _;
+
+    let local = app.path().app_local_data_dir().ok();
+    Profile {
+        address_book: address_book_path(),
+        invite_dir: lumepeer_runtime::config::config_dir(),
+        history: connection_history_path(app),
+        audit: local.map(|dir| dir.join("audit.db")),
+    }
+}
+
 /// Where the relay measurement of ADR 0098 is kept between runs.
 ///
 /// Beside the connection history rather than in the config directory: it is
@@ -213,6 +233,10 @@ fn relay_cache_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Where the connection history file lives in the profile, if the app data
+/// directory can be resolved at all. `None` degrades the feature to
+/// in-memory-only for this run rather than failing startup over a
+/// convenience list (§18).
 fn connection_history_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     use tauri::Manager as _;
     match app.path().app_local_data_dir() {

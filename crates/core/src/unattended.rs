@@ -24,6 +24,13 @@
 //! A one-time code is one-time: a code that has let somebody in cannot let
 //! anybody in again, nor can any code from before it (RFC 6238 §5.2;
 //! ADR 0122).
+//!
+//! A guest that can proves it knows the password instead of sending it
+//! (ADR 0123): it repeats the Argon2id the host stored the password with and
+//! uses the result as the password of a SPAKE2 exchange bound to both
+//! endpoint identities and the session. A host that is not the one the
+//! password was set on — somebody who handed the guest their own invite code
+//! and asked for the password — learns nothing it can test a guess against.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,12 +38,16 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
+use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 
+use crate::NodeId;
 use crate::consent::Role;
 use crate::constants::{
     UNATTENDED_LOCKOUT_DURATION_SECS, UNATTENDED_LOCKOUT_MAX_SECS, UNATTENDED_MAX_FAILED_ATTEMPTS,
     UNATTENDED_PASSWORD_MAX_BYTES, UNATTENDED_PASSWORD_MIN_BYTES, UNATTENDED_TOTP_STEP_SECS,
 };
+use crate::protocol::ProofKdf;
 
 /// Everything that can go wrong while verifying unattended credentials (§18).
 ///
@@ -69,6 +80,11 @@ pub enum UnattendedError {
     /// The stored hash could not be parsed; the password must be re-set.
     #[error("stored password hash is corrupt")]
     CorruptStore,
+    /// A host's password-proof challenge is not one this build will answer:
+    /// its key derivation is out of bounds or its message does not decode
+    /// (ADR 0123). Raised on the guest, never sent anywhere.
+    #[error("the host's challenge cannot be answered")]
+    BadChallenge,
     /// The platform random generator failed while salting a new hash.
     #[error("cannot generate password salt")]
     SaltGeneration,
@@ -387,6 +403,19 @@ impl UnattendedAccess {
     /// The union of [`UnattendedError`]; a missing factor is
     /// `MissingPassword`/`MissingCode`, never a silent pass.
     pub fn verify_full(&mut self, password: Option<&str>, code: Option<&str>) -> Result<()> {
+        self.check_open()?;
+        // Take both verdicts first so neither factor leaks information about
+        // the other through timing ordering; only then bookkeep.
+        let password_ok = match password {
+            None => Err(UnattendedError::MissingPassword),
+            Some(password) => self.check_password(password),
+        };
+        self.conclude(password_ok, code)
+    }
+
+    /// Refuses before any factor is looked at: nothing configured, or locked
+    /// out.
+    fn check_open(&self) -> Result<()> {
         if !self.enabled() {
             return Err(UnattendedError::NotConfigured);
         }
@@ -395,12 +424,12 @@ impl UnattendedAccess {
                 remaining_secs: remaining,
             });
         }
-        // Take both verdicts first so neither factor leaks information about
-        // the other through timing ordering; only then bookkeep.
-        let password_ok = match password {
-            None => Err(UnattendedError::MissingPassword),
-            Some(password) => self.check_password(password),
-        };
+        Ok(())
+    }
+
+    /// The second factor and the bookkeeping, for a password verdict already
+    /// taken — by comparing a password, or by a proof (ADR 0123).
+    fn conclude(&mut self, password_ok: Result<()>, code: Option<&str>) -> Result<()> {
         let code_ok = match (&self.totp_secret, code) {
             (None, _) => Ok(None),
             (Some(_), None) => Err(UnattendedError::MissingCode),
@@ -442,6 +471,70 @@ impl UnattendedAccess {
         }
     }
 
+    /// Host side: starts a password proof with `guest`, as `host`, on the
+    /// session `session_id` (ADR 0123).
+    ///
+    /// Needs no password: the host's side of the exchange is the key its own
+    /// stored hash already holds. What comes back is the state to keep until
+    /// the guest answers, the derivation the guest has to repeat, and the
+    /// message to send it.
+    ///
+    /// # Errors
+    /// [`UnattendedError::NotConfigured`] with no password set, and
+    /// [`UnattendedError::CorruptStore`] for a stored hash this build cannot
+    /// run a proof against.
+    pub fn begin_proof(
+        &self,
+        host: &NodeId,
+        guest: &NodeId,
+        session_id: [u8; 16],
+    ) -> Result<(PendingProof, ProofKdf, Vec<u8>)> {
+        let phc = self
+            .password_hash
+            .as_deref()
+            .ok_or(UnattendedError::NotConfigured)?;
+        let (kdf, key) = stored_key(phc)?;
+        let (spake, message) = Spake2::<Ed25519Group>::start_b(
+            &Password::new(&key),
+            &Identity::new(guest.as_bytes()),
+            &Identity::new(host.as_bytes()),
+        );
+        Ok((PendingProof { spake, session_id }, kdf, message))
+    }
+
+    /// Host side: the admission decision for a guest's proof, with exactly
+    /// the lockout and second-factor rules of [`Self::admit`] (ADR 0123).
+    ///
+    /// A proof that does not confirm is a wrong password, whatever made it
+    /// wrong: a different password, a message that does not decode, or an
+    /// answer made for another host or another session.
+    ///
+    /// # Errors
+    /// As [`Self::admit`].
+    pub fn admit_proof(&mut self, pending: PendingProof, answer: &ProofAnswer) -> Result<Role> {
+        self.check_open()?;
+        let opened = pending
+            .spake
+            .finish(&answer.guest_message)
+            .ok()
+            .filter(|key| {
+                confirm_mac(key, &pending.session_id, answer.sealed_code.as_deref())
+                    .is_ok_and(|mac| mac.verify_slice(&answer.confirm).is_ok())
+            })
+            .map(|key| {
+                answer
+                    .sealed_code
+                    .as_deref()
+                    .map(|sealed| open_code(&key, &pending.session_id, sealed))
+            });
+        let (password_ok, code) = match opened {
+            Some(code) => (Ok(()), code.flatten()),
+            None => (Err(UnattendedError::BadPassword), None),
+        };
+        self.conclude(password_ok, code.as_deref())?;
+        Ok(self.role)
+    }
+
     /// The whole unattended admission decision, in one call (§8, §2.1).
     ///
     /// Verifies both factors and, only on success, hands back the role the
@@ -475,6 +568,174 @@ impl UnattendedAccess {
             Err(UnattendedError::BadPassword)
         }
     }
+}
+
+/// Host side: one password proof waiting for the guest's answer (ADR 0123).
+pub struct PendingProof {
+    spake: Spake2<Ed25519Group>,
+    session_id: [u8; 16],
+}
+
+impl std::fmt::Debug for PendingProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The exchange's secret scalar never reaches a log line.
+        f.debug_struct("PendingProof").finish_non_exhaustive()
+    }
+}
+
+/// A guest's answer to a password-proof challenge (ADR 0123), as it travels
+/// in [`crate::protocol::MessageKind::UnattendedProof`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofAnswer {
+    /// The guest's SPAKE2 message.
+    pub guest_message: Vec<u8>,
+    /// The one-time code, sealed under the exchange's key.
+    pub sealed_code: Option<Vec<u8>>,
+    /// HMAC under the exchange's key over the session and the sealed code.
+    pub confirm: [u8; 32],
+}
+
+/// Guest side: proves `password` (and hands over `code`) to the host `host`
+/// that challenged this guest `guest` on the session `session_id`
+/// (ADR 0123).
+///
+/// The password never leaves this function: what does is a SPAKE2 message
+/// made from the Argon2id of it, and a confirmation under the key that
+/// exchange agrees on. A host that does not hold that same Argon2id — any
+/// host other than the one the password was set on — gets one guess at it
+/// per answer and nothing to test further guesses against.
+///
+/// # Errors
+/// [`UnattendedError::BadChallenge`] for a derivation outside the bounds a
+/// guest runs, or a host message that does not decode.
+pub fn answer_proof(
+    password: &str,
+    code: Option<&str>,
+    kdf: &ProofKdf,
+    host_message: &[u8],
+    host: &NodeId,
+    guest: &NodeId,
+    session_id: [u8; 16],
+) -> Result<ProofAnswer> {
+    let key = derive_key(password.as_bytes(), kdf)?;
+    let (spake, guest_message) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(&key),
+        &Identity::new(guest.as_bytes()),
+        &Identity::new(host.as_bytes()),
+    );
+    let shared = spake
+        .finish(host_message)
+        .map_err(|_| UnattendedError::BadChallenge)?;
+    let sealed_code = code.map(|code| seal_code(&shared, &session_id, code));
+    let confirm = confirm_mac(&shared, &session_id, sealed_code.as_deref())
+        .map_err(|_| UnattendedError::BadChallenge)?
+        .finalize()
+        .into_bytes()
+        .into();
+    Ok(ProofAnswer {
+        guest_message,
+        sealed_code,
+        confirm,
+    })
+}
+
+/// KDF context of the proof's confirmation (ADR 0123).
+const PROOF_CONFIRM_CONTEXT: &[u8] = b"lumepeer 2026 ADR 0123 unattended proof confirm";
+/// KDF context of the pad a one-time code is sealed with (ADR 0123).
+const PROOF_CODE_CONTEXT: &[u8] = b"lumepeer 2026 ADR 0123 unattended proof code";
+
+/// The derivation and key of a stored PHC string, for the host's side of a
+/// proof. Only Argon2id at version 0x13 is one — the only kind this build
+/// writes.
+fn stored_key(phc: &str) -> Result<(ProofKdf, Vec<u8>)> {
+    let parsed = PasswordHash::new(phc).map_err(|_| UnattendedError::CorruptStore)?;
+    if parsed.algorithm.as_str() != "argon2id" || parsed.version != Some(0x13) {
+        return Err(UnattendedError::CorruptStore);
+    }
+    let params = argon2::Params::try_from(&parsed).map_err(|_| UnattendedError::CorruptStore)?;
+    let salt = parsed.salt.ok_or(UnattendedError::CorruptStore)?;
+    let key = parsed
+        .hash
+        .ok_or(UnattendedError::CorruptStore)?
+        .as_bytes()
+        .to_vec();
+    let kdf = ProofKdf {
+        salt: salt.as_ref().to_vec(),
+        memory_kib: params.m_cost(),
+        iterations: params.t_cost(),
+        lanes: params.p_cost(),
+        output_len: u32::try_from(key.len()).map_err(|_| UnattendedError::CorruptStore)?,
+    };
+    if !kdf.within_bounds() {
+        return Err(UnattendedError::CorruptStore);
+    }
+    Ok((kdf, key))
+}
+
+/// Repeats the host's Argon2id over `password` (ADR 0123).
+fn derive_key(password: &[u8], kdf: &ProofKdf) -> Result<Vec<u8>> {
+    if !kdf.within_bounds() {
+        return Err(UnattendedError::BadChallenge);
+    }
+    let len = usize::try_from(kdf.output_len).map_err(|_| UnattendedError::BadChallenge)?;
+    let params = argon2::Params::new(kdf.memory_kib, kdf.iterations, kdf.lanes, Some(len))
+        .map_err(|_| UnattendedError::BadChallenge)?;
+    let mut key = vec![0u8; len];
+    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(password, &kdf.salt, &mut key)
+        .map_err(|_| UnattendedError::BadChallenge)?;
+    Ok(key)
+}
+
+/// HMAC-SHA256 under the exchange's key over the session and the sealed code.
+fn confirm_mac(
+    shared: &[u8],
+    session_id: &[u8; 16],
+    sealed_code: Option<&[u8]>,
+) -> core::result::Result<Hmac<Sha256>, hmac::digest::InvalidLength> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(shared)?;
+    mac.update(PROOF_CONFIRM_CONTEXT);
+    mac.update(session_id);
+    match sealed_code {
+        Some(sealed) => {
+            mac.update(&[1]);
+            mac.update(sealed);
+        }
+        None => mac.update(&[0]),
+    }
+    Ok(mac)
+}
+
+/// The pad a one-time code is sealed with: fresh per exchange, since the key
+/// is, so an XOR is a one-time pad (ADR 0123).
+fn code_pad(shared: &[u8], session_id: &[u8; 16]) -> [u8; 32] {
+    <Hmac<Sha256> as KeyInit>::new_from_slice(shared).map_or([0u8; 32], |mut mac| {
+        mac.update(PROOF_CODE_CONTEXT);
+        mac.update(session_id);
+        mac.finalize().into_bytes().into()
+    })
+}
+
+fn seal_code(shared: &[u8], session_id: &[u8; 16], code: &str) -> Vec<u8> {
+    let pad = code_pad(shared, session_id);
+    code.bytes()
+        .zip(pad)
+        .map(|(byte, key)| byte ^ key)
+        .collect()
+}
+
+/// `None` for a sealed code that does not open into text, which the second
+/// factor then refuses like any other wrong code.
+fn open_code(shared: &[u8], session_id: &[u8; 16], sealed: &[u8]) -> Option<String> {
+    let pad = code_pad(shared, session_id);
+    String::from_utf8(
+        sealed
+            .iter()
+            .zip(pad)
+            .map(|(byte, key)| byte ^ key)
+            .collect(),
+    )
+    .ok()
 }
 
 /// How long the `nth` lockout since the last success lasts: the first one
@@ -805,6 +1066,188 @@ mod tests {
             access.admit(Some("passphrase"), None).unwrap(),
             Role::ViewOnly
         );
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    const SESSION: [u8; 16] = [0x5a; 16];
+
+    /// Runs one whole proof exchange: the host challenges, the guest answers
+    /// with `password` believing it is talking to `believed_host`, the host
+    /// decides.
+    fn prove(
+        access: &mut UnattendedAccess,
+        password: &str,
+        code: Option<&str>,
+        believed_host: &NodeId,
+    ) -> Result<Role> {
+        let (host, guest) = (node(1), node(2));
+        let (pending, kdf, host_message) = access.begin_proof(&host, &guest, SESSION).unwrap();
+        let answer = answer_proof(
+            password,
+            code,
+            &kdf,
+            &host_message,
+            believed_host,
+            &guest,
+            SESSION,
+        )?;
+        access.admit_proof(pending, &answer)
+    }
+
+    /// ADR 0123: the right password proves itself and gets the configured
+    /// role, a wrong one is a wrong password and counts towards the lockout,
+    /// and nothing the guest sends contains the password.
+    #[test]
+    fn a_password_proof_admits_the_right_password_and_nothing_else() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        access.set_role(Role::FullControl);
+
+        assert_eq!(
+            prove(&mut access, "right enough", None, &node(1)).unwrap(),
+            Role::FullControl
+        );
+        assert!(matches!(
+            prove(&mut access, "wrong enough", None, &node(1)),
+            Err(UnattendedError::BadPassword)
+        ));
+        assert_eq!(access.failed_attempts, 1);
+
+        let (pending, kdf, host_message) = access.begin_proof(&node(1), &node(2), SESSION).unwrap();
+        let answer = answer_proof(
+            "right enough",
+            None,
+            &kdf,
+            &host_message,
+            &node(1),
+            &node(2),
+            SESSION,
+        )
+        .unwrap();
+        for bytes in [&answer.guest_message[..], &answer.confirm[..]] {
+            assert!(
+                !bytes
+                    .windows("right enough".len())
+                    .any(|window| window == b"right enough"),
+                "the password crossed the wire"
+            );
+        }
+        drop(pending);
+    }
+
+    /// ADR 0123: a guest that proves its password to a host other than the one
+    /// the password was set on — it was handed that host's code — does not
+    /// get in there either, and the host it meant never sees an answer it
+    /// could use: the proof is bound to the identity the guest believed.
+    #[test]
+    fn a_proof_made_for_another_host_does_not_admit() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        assert!(matches!(
+            prove(&mut access, "right enough", None, &node(9)),
+            Err(UnattendedError::BadPassword)
+        ));
+    }
+
+    /// ADR 0123: an answer made for one session is refused on another, even
+    /// with the right password behind it.
+    #[test]
+    fn a_proof_answer_is_bound_to_its_session() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        let (host, guest) = (node(1), node(2));
+        let (pending, kdf, host_message) = access.begin_proof(&host, &guest, SESSION).unwrap();
+        let answer = answer_proof(
+            "right enough",
+            None,
+            &kdf,
+            &host_message,
+            &host,
+            &guest,
+            [0x11; 16],
+        )
+        .unwrap();
+        assert!(matches!(
+            access.admit_proof(pending, &answer),
+            Err(UnattendedError::BadPassword)
+        ));
+    }
+
+    /// ADR 0123: the one-time code travels sealed and is checked like every
+    /// other code — missing, wrong and right all mean what they mean for
+    /// `verify_full`.
+    #[test]
+    fn a_proof_carries_the_one_time_code_sealed() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("passphrase").unwrap();
+        access.set_totp_secret([7u8; 20]);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let code = access.totp().unwrap().generate(now).unwrap();
+
+        assert!(matches!(
+            prove(&mut access, "passphrase", None, &node(1)),
+            Err(UnattendedError::MissingCode)
+        ));
+        let wrong = if code == "000000" { "111111" } else { "000000" };
+        assert!(matches!(
+            prove(&mut access, "passphrase", Some(wrong), &node(1)),
+            Err(UnattendedError::BadCode)
+        ));
+        assert_eq!(
+            prove(&mut access, "passphrase", Some(&code), &node(1)).unwrap(),
+            Role::ViewOnly
+        );
+    }
+
+    /// ADR 0123: the derivation a guest repeats is the one the host stored
+    /// the password with — the same key `verify_full` checks against.
+    #[test]
+    fn the_guest_derives_exactly_the_stored_key() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        let (kdf, stored) = stored_key(access.stored_secret().unwrap()).unwrap();
+        assert_eq!(derive_key(b"right enough", &kdf).unwrap(), stored);
+        assert_ne!(derive_key(b"wrong enough", &kdf).unwrap(), stored);
+    }
+
+    /// ADR 0123: a host cannot make a guest run an unbounded derivation.
+    #[test]
+    fn an_unbounded_derivation_is_refused_before_it_runs() {
+        let mut access = UnattendedAccess::new();
+        access.set_password("right enough").unwrap();
+        let (_, kdf, host_message) = access.begin_proof(&node(1), &node(2), SESSION).unwrap();
+        for greedy in [
+            ProofKdf {
+                memory_kib: 4 * 1024 * 1024,
+                ..kdf.clone()
+            },
+            ProofKdf {
+                iterations: 1_000,
+                ..kdf.clone()
+            },
+            ProofKdf {
+                salt: vec![1; 3],
+                ..kdf.clone()
+            },
+        ] {
+            assert!(matches!(
+                answer_proof(
+                    "right enough",
+                    None,
+                    &greedy,
+                    &host_message,
+                    &node(1),
+                    &node(2),
+                    SESSION
+                ),
+                Err(UnattendedError::BadChallenge)
+            ));
+        }
     }
 
     #[test]

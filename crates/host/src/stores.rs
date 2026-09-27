@@ -26,22 +26,6 @@ use std::path::{Path, PathBuf};
 
 use lumepeer_net::keystore::{FileKeystore, Keystore};
 use lumepeer_runtime::network::ActorStores;
-use rand::Rng as _;
-
-/// File the machine keystore's encryption secret lives in.
-///
-/// Beside the keystore, inside the same protected directory. Generated once
-/// on first run and never regenerated: a new secret would not "rotate" the
-/// keystore, it would make every slot in it unreadable, which on this store
-/// means the machine's identity key and its device password at once.
-const SECRET_FILE: &str = "keystore.secret";
-
-/// Bytes of that secret.
-///
-/// Thirty-two because [`FileKeystore`] runs it through a key-derivation step
-/// whose output is thirty-two, so more would be thrown away and less would be
-/// the only weak link in a chain that is otherwise not the weak link at all.
-const SECRET_BYTES: usize = 32;
 
 /// The machine-wide address book (§8; ADR 0034).
 fn address_book_path(directory: &Path) -> PathBuf {
@@ -78,44 +62,6 @@ pub fn relay_cache_path(directory: &Path) -> PathBuf {
     directory.join("relays.json")
 }
 
-/// Reads the keystore secret, creating it on first run.
-///
-/// `None` when it can be neither read nor written, which the caller must treat
-/// as "there is no keystore": deriving a key from a fallback constant would
-/// mean every machine that hit this path shared one, and a host that cannot
-/// keep a secret should not be holding a device password.
-fn keystore_secret(directory: &Path) -> Option<Vec<u8>> {
-    let path = directory.join(SECRET_FILE);
-    match std::fs::read(&path) {
-        // A short file is a truncated one — a crash between create and write,
-        // a disk that filled. Refusing beats padding it out to length, which
-        // would silently weaken every key derived from it afterwards.
-        Ok(secret) if secret.len() == SECRET_BYTES => return Some(secret),
-        Ok(secret) => {
-            tracing::error!(
-                path = %path.display(),
-                len = secret.len(),
-                "the machine keystore secret is the wrong length; refusing to use it"
-            );
-            return None;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::error!(path = %path.display(), %error, "cannot read the machine keystore secret");
-            return None;
-        }
-    }
-
-    let mut secret = vec![0u8; SECRET_BYTES];
-    rand::rng().fill_bytes(&mut secret);
-    if let Err(error) = std::fs::write(&path, &secret) {
-        tracing::error!(path = %path.display(), %error, "cannot write the machine keystore secret");
-        return None;
-    }
-    tracing::info!(path = %path.display(), "minted this machine's keystore secret");
-    Some(secret)
-}
-
 /// Opens a keystore over the machine store's identity slot.
 ///
 /// Two of these are opened per run, which costs nothing: a `FileKeystore` is a
@@ -136,7 +82,7 @@ fn open_keystore(secret: &[u8]) -> FileKeystore {
 /// caller's only correct answer is to not host.
 pub async fn open() -> Option<(ActorStores, PathBuf)> {
     let directory = lumepeer_service::machine_store::ensure_directory()?;
-    let secret = keystore_secret(&directory)?;
+    let secret = lumepeer_service::program_data::keystore_secret(&directory)?;
 
     let keystore = open_keystore(&secret);
     let audit = open_audit_log(&audit_path(&directory), &keystore).await;
@@ -216,7 +162,7 @@ mod tests {
             invite_path(&directory),
             history_path(&directory),
             audit_path(&directory),
-            directory.join(SECRET_FILE),
+            directory.join(lumepeer_service::program_data::SECRET_FILE),
         ] {
             let shown = path.to_string_lossy().to_lowercase();
             assert!(

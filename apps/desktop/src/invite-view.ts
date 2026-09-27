@@ -61,12 +61,14 @@ const FAILURE_TEXT: Record<string, TranslationKey> = {
  *
  * The host tells this side which factor to retype and nothing more — never
  * how close a guess was, and never that one factor was right while the other
- * was not. These four are the whole vocabulary.
+ * was not. These are the whole vocabulary; `UNATTENDED_HOST_OUTDATED` is this
+ * side refusing to send a password to a host it has never met (ADR 0123).
  */
 const CREDENTIAL_ERROR_TEXT: Record<string, TranslationKey> = {
   UNATTENDED_BAD_PASSWORD: 'creds.badPassword',
   UNATTENDED_BAD_CODE: 'creds.badCode',
   UNATTENDED_UNAVAILABLE: 'creds.unavailable',
+  UNATTENDED_HOST_OUTDATED: 'creds.hostOutdated',
 };
 
 let lastCode: string | undefined;

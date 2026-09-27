@@ -345,6 +345,8 @@ export const ar: Dictionary = {
   'creds.badCode': 'لم يُقبل الرمز.',
   'creds.lockedOut': (secs) => `محاولات كثيرة. أعد المحاولة بعد ${secs} ثانية.`,
   'creds.unavailable': 'لا يستطيع هذا الجهاز تسجيل دخولك بهذه الطريقة الآن.',
+  'creds.hostOutdated':
+    'يعمل هذا الجهاز بإصدار قديم من Lumepeer سيستلم كلمة المرور بنص واضح، ولم تتصل به من قبل. اطلب من مالكه تحديثه، أو انتظر حتى يُسمح لك بالدخول.',
   'quality.path.direct': 'اتصال مباشر',
   'quality.path.relay': 'عبر خادم ترحيل',
   'quality.path.mixed': 'مباشر وعبر ترحيل',

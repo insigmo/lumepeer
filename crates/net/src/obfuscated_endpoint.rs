@@ -43,8 +43,8 @@ use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     NAT_MAPPING_KEEPALIVE_SECS, OBFUSCATED_CONNECT_ATTEMPTS, OBFUSCATED_CONNECT_RETRY_BACKOFF_MS,
     OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS, RENDEZVOUS_KNOCK_FRESH_SECS, RENDEZVOUS_POLL_SECS,
-    RENDEZVOUS_PUNCH_INTERVAL_MS, RENDEZVOUS_PUNCH_PACKETS, RENDEZVOUS_REPUBLISH_SECS,
-    STUN_QUERY_TIMEOUT_MS,
+    RENDEZVOUS_PUNCH_INTERVAL_MS, RENDEZVOUS_PUNCH_PACKETS, RENDEZVOUS_PUNCHES_PER_MINUTE,
+    RENDEZVOUS_REPUBLISH_SECS, RENDEZVOUS_REPUNCH_SECS, STUN_QUERY_TIMEOUT_MS,
 };
 use noq::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -452,22 +452,48 @@ impl ObfuscatedAcceptor {
     /// usable identity or no ALPN.
     pub async fn accept(&self) -> Option<Result<PeerConnection>> {
         loop {
-            let incoming = self.endpoint.accept().await?;
-            return Some(match incoming.await {
-                Ok(connection) => peer_and_alpn(&connection)
+            let incoming = self.accept_incoming().await?;
+            if let Some(outcome) = Self::finish(incoming).await {
+                return Some(outcome);
+            }
+        }
+    }
+
+    /// The next connection attempt, before its handshake has run, or `None`
+    /// once the endpoint is closed (ADR 0123).
+    ///
+    /// Split from [`Self::finish`] so an accept loop can hand each handshake
+    /// to a task of its own: awaited inline, one peer that starts a
+    /// handshake and never finishes it holds every guest behind it until its
+    /// idle timeout.
+    pub async fn accept_incoming(&self) -> Option<noq::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// Runs the handshake of an attempt from [`Self::accept_incoming`].
+    ///
+    /// `None` for an attempt the guest itself abandoned, which is not a
+    /// failure: a guest drops the attempt in flight when this host's answer
+    /// reaches it (ADR 0116), and a handshake closed by its own application
+    /// arrives as exactly this — the guest moving on to the attempt that gets
+    /// through.
+    ///
+    /// # Errors
+    /// [`NetError::Io`] if the handshake fails, or the peer presented no
+    /// usable identity or no ALPN.
+    pub async fn finish(incoming: noq::Incoming) -> Option<Result<PeerConnection>> {
+        match incoming.await {
+            Ok(connection) => Some(
+                peer_and_alpn(&connection)
                     .map(|(peer, alpn)| PeerConnection::from_obfuscated(connection, peer, alpn)),
-                // A guest drops the attempt in flight when this host's answer
-                // reaches it (ADR 0116), and a handshake closed by its own
-                // application arrives as exactly this. That is the guest
-                // moving on to the attempt that gets through, not a failure.
-                Err(noq::ConnectionError::ConnectionClosed(close))
-                    if close.error_code == noq::TransportErrorCode::APPLICATION_ERROR =>
-                {
-                    tracing::debug!("a guest abandoned one of its dial attempts");
-                    continue;
-                }
-                Err(error) => Err(NetError::Io(error.to_string())),
-            });
+            ),
+            Err(noq::ConnectionError::ConnectionClosed(close))
+                if close.error_code == noq::TransportErrorCode::APPLICATION_ERROR =>
+            {
+                tracing::debug!("a guest abandoned one of its dial attempts");
+                None
+            }
+            Err(error) => Some(Err(NetError::Io(error.to_string()))),
         }
     }
 }
@@ -678,12 +704,15 @@ async fn serve_rendezvous(
     // Owned here so an endpoint that closes takes its punches, publishes and
     // DHT poll with it.
     let mut work = tokio::task::JoinSet::new();
+    // One budget for the knocks both paths hear (ADR 0123).
+    let budget = Arc::new(Mutex::new(PunchBudget::default()));
     work.spawn(poll_knocks(
         rendezvous.clone(),
         invite_id,
         Arc::clone(&punch_socket),
+        Arc::clone(&budget),
     ));
-    let mut signals = rendezvous.host_signals(&invite_id);
+    let mut signals = rendezvous.host_signals(&invite_id, &identity);
     loop {
         tokio::select! {
             _ = republish.tick() => {}
@@ -699,6 +728,9 @@ async fn serve_rendezvous(
                 republish.reset();
             }
             Some(knock) = heard(&mut signals) => {
+                if !allowed(&budget, knock.addr) {
+                    continue;
+                }
                 tracing::info!(guest = %knock.addr, "a guest knocked through a relay: punching towards it");
                 work.spawn(punch_towards(Arc::clone(&punch_socket), knock.addr));
                 if let Some(server) = stun_server {
@@ -750,6 +782,7 @@ async fn poll_knocks(
     rendezvous: Rendezvous,
     invite_id: [u8; INVITE_ID_BYTES],
     punch_socket: Arc<UdpSocket>,
+    budget: Arc<Mutex<PunchBudget>>,
 ) {
     let mut poll = tokio::time::interval(Duration::from_secs(RENDEZVOUS_POLL_SECS));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -773,11 +806,60 @@ async fn poll_knocks(
         let fresh =
             !first_poll || unix_now().saturating_sub(knock.at) <= RENDEZVOUS_KNOCK_FRESH_SECS;
         first_poll = false;
-        if fresh {
+        if fresh && allowed(&budget, knock.addr) {
             tracing::info!(guest = %knock.addr, "a guest knocked: punching towards it");
             punches.spawn(punch_towards(Arc::clone(&punch_socket), knock.addr));
         }
     }
+}
+
+/// How many trains of punch packets a host sends, and where (ADR 0123).
+///
+/// A knock is sealed under the invite and signed by nobody in particular —
+/// the host cannot know its guests in advance — so anybody holding the invite
+/// can knock with any address in it, and each knock used to be a train of
+/// packets from this host to that address. Bounded here: one train per
+/// address per [`RENDEZVOUS_REPUNCH_SECS`], which is what a guest's own dial
+/// knocks at, and no more than [`RENDEZVOUS_PUNCHES_PER_MINUTE`] in all.
+#[derive(Debug, Default)]
+struct PunchBudget {
+    recent: std::collections::VecDeque<(std::time::Instant, SocketAddr)>,
+}
+
+impl PunchBudget {
+    fn take(&mut self, to: SocketAddr, now: std::time::Instant) -> bool {
+        let minute = Duration::from_mins(1);
+        while self
+            .recent
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= minute)
+        {
+            self.recent.pop_front();
+        }
+        let repunch = Duration::from_secs(RENDEZVOUS_REPUNCH_SECS);
+        let again_too_soon = self
+            .recent
+            .iter()
+            .any(|(at, addr)| *addr == to && now.saturating_duration_since(*at) < repunch);
+        let full = self.recent.len()
+            >= usize::try_from(RENDEZVOUS_PUNCHES_PER_MINUTE).unwrap_or(usize::MAX);
+        if again_too_soon || full {
+            return false;
+        }
+        self.recent.push_back((now, to));
+        true
+    }
+}
+
+/// Whether `budget` lets this host punch towards `to` now.
+fn allowed(budget: &Mutex<PunchBudget>, to: SocketAddr) -> bool {
+    let granted = budget
+        .lock()
+        .is_ok_and(|mut budget| budget.take(to, std::time::Instant::now()));
+    if !granted {
+        tracing::debug!(guest = %to, "a knock over the punch budget; not answered");
+    }
+    granted
 }
 
 /// The next record heard on `signals`, or never when there is no push
@@ -1029,7 +1111,7 @@ impl GuestObfuscatedEndpoint {
         if let Some(open) = slot.as_ref() {
             return Some(open.speaker.clone());
         }
-        let mut signals = rendezvous.dht.guest_signals(&self.invite_id)?;
+        let mut signals = rendezvous.dht.guest_signals(&self.invite_id, self.host)?;
         let speaker = signals.speaker();
         let target = Arc::clone(&self.target);
         let answered = Arc::clone(&self.answered);
@@ -1673,6 +1755,41 @@ mod tests {
         );
     }
 
+    /// ADR 0123: an address gets one train of punches per re-punch window,
+    /// and the host sends only so many trains a minute whoever asks.
+    #[test]
+    fn knocks_cannot_make_the_host_punch_without_limit() {
+        let mut budget = PunchBudget::default();
+        let start = std::time::Instant::now();
+        let guest: SocketAddr = "198.51.100.9:51515".parse().unwrap();
+        assert!(budget.take(guest, start));
+        assert!(
+            !budget.take(guest, start + Duration::from_millis(500)),
+            "the same address was punched again at once"
+        );
+        assert!(budget.take(guest, start + Duration::from_secs(RENDEZVOUS_REPUNCH_SECS)));
+
+        let mut budget = PunchBudget::default();
+        let per_minute = usize::try_from(RENDEZVOUS_PUNCHES_PER_MINUTE).unwrap();
+        let taken = (0..per_minute * 3)
+            .filter(|n| {
+                let port = u16::try_from(*n).unwrap() + 1;
+                budget.take(SocketAddr::from(([192, 0, 2, 1], port)), start)
+            })
+            .count();
+        assert_eq!(
+            taken, per_minute,
+            "a flood of knocks punched past the budget"
+        );
+        assert!(
+            budget.take(
+                "192.0.2.200:1".parse().unwrap(),
+                start + Duration::from_secs(61)
+            ),
+            "the budget comes back a minute later"
+        );
+    }
+
     /// ADR 0116: the dial target only moves forward in the host's own time.
     /// The relays' answer lands first; the DHT lookup lands seconds later
     /// with a record from before the host moved, and must not send the
@@ -2071,7 +2188,12 @@ mod tests {
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             None,
         ));
-        let mut guest = rendezvous.guest_signals(&INVITE).unwrap();
+        let mut guest = rendezvous
+            .guest_signals(
+                &INVITE,
+                NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap(),
+            )
+            .unwrap();
         relay
             .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
             .await;
@@ -2113,7 +2235,12 @@ mod tests {
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             None,
         ));
-        let mut guest = rendezvous.guest_signals(&INVITE).unwrap();
+        let mut guest = rendezvous
+            .guest_signals(
+                &INVITE,
+                NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap(),
+            )
+            .unwrap();
         relay
             .wait_for("both subscriptions", |seen| seen.filters.len() == 2)
             .await;

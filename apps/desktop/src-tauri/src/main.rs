@@ -17,6 +17,9 @@ mod commands;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
 mod logging;
+// Where the stores live: the profile, or where only administrators can write
+// (ADR 0123).
+mod placement;
 mod service_control;
 // This same binary, run as a machine's session agent (ADR 0085 §1). Windows
 // only: there is no session-0 host on the other platforms to launch one.

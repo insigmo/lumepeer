@@ -1574,6 +1574,7 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto 0.2.9",
+ "rand_core 0.6.4",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -4230,7 +4231,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "anyhow",
  "axum",
@@ -4250,7 +4251,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "argon2",
  "blake3",
@@ -4265,6 +4266,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.11.0",
+ "sha2 0.11.0",
+ "spake2",
  "thiserror 2.0.20",
  "toml 0.8.2",
  "tracing",
@@ -4272,7 +4275,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "anyhow",
  "libc",
@@ -4285,7 +4288,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4328,7 +4331,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-guestkeys"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "lumepeer-core",
  "tracing",
@@ -4339,7 +4342,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-host"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "lumepeer-core",
@@ -4347,7 +4350,6 @@ dependencies = [
  "lumepeer-net",
  "lumepeer-runtime",
  "lumepeer-service",
- "rand 0.10.2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4356,7 +4358,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -4374,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "ashpd",
  "blake3",
@@ -4409,7 +4411,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -4446,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-runtime"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4477,8 +4479,9 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-service"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
+ "rand 0.10.2",
  "tracing",
  "tracing-subscriber",
  "windows 0.61.3",
@@ -4486,7 +4489,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-terminal"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
@@ -4496,7 +4499,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-terminal-worker"
-version = "0.0.101"
+version = "0.0.104"
 dependencies = [
  "lumepeer-terminal",
  "windows 0.61.3",
@@ -7559,6 +7562,18 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "spake2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
 ]
 
 [[package]]

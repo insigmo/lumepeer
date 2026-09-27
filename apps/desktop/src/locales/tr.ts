@@ -355,6 +355,8 @@ export const tr: Dictionary = {
   'creds.badCode': 'Bu kod kabul edilmedi.',
   'creds.lockedOut': (secs) => `Çok fazla deneme. ${secs} saniye sonra tekrar deneyin.`,
   'creds.unavailable': 'Bu cihaz şu anda sizi bu şekilde oturum açtıramıyor.',
+  'creds.hostOutdated':
+    'Bu cihazda parolanızı açık metin olarak alacak eski bir Lumepeer sürümü var ve ona daha önce hiç bağlanmadınız. Sahibinden güncellemesini isteyin ya da içeri alınmayı bekleyin.',
   'quality.path.direct': 'Doğrudan',
   'quality.path.relay': 'Aktarıcı üzerinden',
   'quality.path.mixed': 'Doğrudan ve aktarıcı üzerinden',

@@ -355,6 +355,8 @@ export const pl: Dictionary = {
   'creds.badCode': 'Ten kod nie został zaakceptowany.',
   'creds.lockedOut': (secs) => `Zbyt wiele prób. Spróbuj ponownie za ${secs} s.`,
   'creds.unavailable': 'To urządzenie nie może teraz zalogować cię w ten sposób.',
+  'creds.hostOutdated':
+    'To urządzenie ma starszą wersję Lumepeer, która otrzymałaby twoje hasło jawnym tekstem, a nigdy się z nim nie łączyłeś. Poproś właściciela o aktualizację lub poczekaj, aż ktoś cię wpuści.',
   'quality.path.direct': 'Bezpośrednio',
   'quality.path.relay': 'Przez przekaźnik',
   'quality.path.mixed': 'Bezpośrednio i przez przekaźnik',

@@ -25,6 +25,12 @@
 //!   ordinary users read — the logs are for whoever is debugging this
 //!   machine — and nothing more, so no ordinary user can put a file or a
 //!   folder anywhere beneath it once it has been secured.
+//!
+//! The elevated desktop client keeps its own stores here too, one directory
+//! per Windows account under `users` ([`user_directory`], ADR 0123): the
+//! device password, the trusted devices and the endpoint identity are what
+//! decide who gets into this machine, and in a profile any program the same
+//! account runs — elevated or not — could have rewritten them.
 
 #![allow(
     unsafe_code,
@@ -58,6 +64,26 @@ use windows::core::PCWSTR;
 /// The tree's root, under `%ProgramData%`.
 const ROOT: &str = "Lumepeer";
 
+/// The per-account stores of the elevated desktop client, under the root
+/// (ADR 0123).
+const USERS: &str = "users";
+
+/// How many names [`user_directory`] tries for one account before it gives
+/// up: the SID, then the SID with a numbered suffix. A folder under one of
+/// those names that an ordinary user made before the tree was secured is
+/// skipped rather than trusted, and the next name is used instead.
+const USER_DIRECTORY_CANDIDATES: u32 = 8;
+
+/// Access list of a directory whose contents decide who gets in:
+/// `LocalSystem` and administrators, nobody else, protected, inherited.
+const PRIVATE_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";
+
+/// File a store's encryption secret lives in, beside the store.
+pub const SECRET_FILE: &str = "keystore.secret";
+
+/// Bytes of that secret.
+const SECRET_BYTES: usize = 32;
+
 /// The root's access list, and the log folder's: `LocalSystem` and
 /// administrators in full, ordinary users read and list only.
 ///
@@ -84,6 +110,111 @@ pub fn root() -> PathBuf {
     std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
         .join(ROOT)
+}
+
+/// The account this process runs as, by SID, and whether its token is
+/// elevated; `None` when the token cannot be read.
+#[must_use]
+pub fn this_process() -> Option<(String, bool)> {
+    use windows::Win32::Security::{
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: the pseudo-handle of this process and a local the call writes.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }.ok()?;
+    let token = OwnedHandle(token);
+    let sid = crate::agent_launch::sid_of_token(token.raw())?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut returned = 0u32;
+    // SAFETY: a live token handle and a struct of exactly the size named.
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut elevation).cast()),
+            u32::try_from(size_of::<TOKEN_ELEVATION>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    }
+    .ok()?;
+    Some((sid, elevation.TokenIsElevated != 0))
+}
+
+/// The elevated desktop client's own directory for the account `sid`,
+/// secured, or `None` when no such directory can be established (ADR 0123).
+///
+/// The root and `users` are taken over if somebody else made them — they
+/// hold nothing read as a decision — and the account's own directory is the
+/// first of [`USER_DIRECTORY_CANDIDATES`] names that is either new or
+/// already this machine's administrators': one an ordinary user made in
+/// advance is skipped, never used, since anything could have been put in it.
+/// Only an elevated process gets `Some`: securing the tree is what it takes.
+#[must_use]
+pub fn user_directory(sid: &str) -> Option<PathBuf> {
+    if !crate::frame::is_sid_string(sid) {
+        return None;
+    }
+    let root = root();
+    if !secure_directory(&root, TREE_SDDL, Foreign::Adopt) {
+        return None;
+    }
+    let users = root.join(USERS);
+    if !secure_directory(&users, PRIVATE_SDDL, Foreign::Adopt) {
+        return None;
+    }
+    (0..USER_DIRECTORY_CANDIDATES)
+        .map(|n| {
+            if n == 0 {
+                users.join(sid)
+            } else {
+                users.join(format!("{sid}.{n}"))
+            }
+        })
+        .find(|candidate| secure_directory(candidate, PRIVATE_SDDL, Foreign::Refuse))
+}
+
+/// Reads the store secret in `directory`, creating it on first use.
+///
+/// `None` when it can be neither read nor written, which the caller must
+/// treat as "there is no keystore": deriving a key from a fallback constant
+/// would mean every machine that hit this path shared one. The secret lives
+/// in the same protected directory as the store it keys, so it protects a
+/// file carried off on its own — a backup, a support bundle — and nothing
+/// more; the directory's access list is the real boundary.
+#[must_use]
+pub fn keystore_secret(directory: &Path) -> Option<Vec<u8>> {
+    use rand::Rng as _;
+
+    let path = directory.join(SECRET_FILE);
+    match std::fs::read(&path) {
+        // A short file is a truncated one — a crash between create and write,
+        // a disk that filled. Refusing beats padding it out to length, which
+        // would silently weaken every key derived from it afterwards.
+        Ok(secret) if secret.len() == SECRET_BYTES => return Some(secret),
+        Ok(secret) => {
+            tracing::error!(
+                path = %path.display(),
+                len = secret.len(),
+                "the keystore secret is the wrong length; refusing to use it"
+            );
+            return None;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(path = %path.display(), %error, "cannot read the keystore secret");
+            return None;
+        }
+    }
+    let mut secret = vec![0u8; SECRET_BYTES];
+    rand::rng().fill_bytes(&mut secret);
+    if let Err(error) = std::fs::write(&path, &secret) {
+        tracing::error!(path = %path.display(), %error, "cannot write the keystore secret");
+        return None;
+    }
+    tracing::info!(path = %path.display(), "minted a keystore secret");
+    Some(secret)
 }
 
 /// What to do with a directory whose owner is neither `LocalSystem` nor
@@ -417,11 +548,79 @@ mod tests {
     /// reach a machine as a service that silently secures nothing.
     #[test]
     fn every_list_parses_with_an_owner_and_a_dacl() {
-        for dacl in [TREE_SDDL, crate::machine_store::STORE_SDDL] {
+        for dacl in [TREE_SDDL, PRIVATE_SDDL, crate::machine_store::STORE_SDDL] {
             let descriptor = Descriptor::parse(&format!("{OWNER_SDDL}{dacl}")).unwrap();
             assert!(descriptor.owner().is_some(), "{dacl} has no owner");
             assert!(descriptor.dacl().is_some(), "{dacl} has no dacl");
         }
+    }
+
+    /// ADR 0123: the account directory's name comes from a SID and nothing
+    /// else, and an unelevated process — which cannot secure the tree — gets
+    /// no directory rather than an unprotected one.
+    #[test]
+    fn only_an_elevated_process_gets_an_account_directory() {
+        assert!(user_directory("..\\..\\Windows").is_none());
+        assert!(user_directory("S-1-5-21-1)(A;;GA;;;WD").is_none());
+        let Some((sid, elevated)) = this_process() else {
+            panic!("this process's own token must be readable");
+        };
+        assert!(sid.starts_with("S-1-"));
+        if !elevated {
+            assert!(
+                user_directory(&sid).is_none(),
+                "an unelevated process was handed an account directory"
+            );
+        }
+    }
+
+    /// ADR 0123, elevated only: an account directory is administrators',
+    /// and one an ordinary user made under the account's name in advance is
+    /// passed over for the next name rather than used.
+    #[test]
+    fn an_account_directory_skips_a_folder_an_ordinary_user_made() {
+        if !this_process().is_some_and(|(_, elevated)| elevated) {
+            eprintln!("skipping: account directories need an elevated run");
+            return;
+        }
+        let sid = format!("S-1-5-21-0-0-0-{}", std::process::id());
+        let users = root().join(USERS);
+        let first = users.join(&sid);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(users.join(format!("{sid}.1")));
+
+        let chosen = user_directory(&sid).expect("an elevated run gets its directory");
+        assert_eq!(chosen, first);
+        assert_eq!(
+            open_without_following(&chosen, READ_CONTROL)
+                .unwrap()
+                .owner_is_trusted(),
+            Some(true)
+        );
+        assert_eq!(
+            user_directory(&sid),
+            Some(first.clone()),
+            "the same one next time"
+        );
+
+        // What a folder made by somebody else looks like: owned by an
+        // ordinary account.
+        let (Ok(domain), Ok(user)) = (std::env::var("USERDOMAIN"), std::env::var("USERNAME"))
+        else {
+            let _ = std::fs::remove_dir_all(&first);
+            return;
+        };
+        assert!(
+            std::process::Command::new(r"C:\Windows\System32\icacls.exe")
+                .arg(&first)
+                .args(["/setowner", &format!("{domain}\\{user}")])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        );
+        let next = user_directory(&sid).expect("a second name is used");
+        assert_eq!(next, users.join(format!("{sid}.1")));
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&next);
     }
 
     /// A junction in place of a directory is refused rather than followed:

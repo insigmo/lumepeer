@@ -394,6 +394,7 @@ export type TranslationKey =
   | 'creds.badCode'
   | 'creds.lockedOut'
   | 'creds.unavailable'
+  | 'creds.hostOutdated'
   | 'quality.path.direct'
   | 'quality.path.relay'
   | 'quality.path.mixed'

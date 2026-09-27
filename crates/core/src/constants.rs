@@ -297,9 +297,12 @@ pub const SAVED_HOSTS_PER_REFRESH: usize = 8;
 /// is a host with an IPv4 and an IPv6 address on two interfaces, which is the
 /// widest real machine this has met.
 pub const SAVED_HOST_ADDRS: usize = 4;
-/// Handshakes the host will run concurrently. Beyond this, further incoming
-/// connections are closed immediately rather than queued (§3.2).
-pub const MAX_INFLIGHT_HANDSHAKES: usize = 8;
+/// Handshakes the host will run concurrently (§3.2). Beyond this the one that
+/// has waited longest is dropped to make room (ADR 0123), so the bound caps
+/// the work a flood can cause without letting a few stalled connections
+/// lock everybody else out. Raised from 8 with that change: the slots are a
+/// task and a buffer each, and a larger set is a flood that has to be larger.
+pub const MAX_INFLIGHT_HANDSHAKES: usize = 32;
 /// Cumulative active session time granted to the trial plan (§12.3).
 pub const TRIAL_SESSION_LIMIT_SECS: u64 = 30 * 60;
 /// Thresholds before license expiry at which `LicenseWarn` is sent (§9.1).
@@ -526,6 +529,15 @@ pub const RENDEZVOUS_KNOCK_FRESH_SECS: u64 = 120;
 pub const RENDEZVOUS_PUNCH_PACKETS: u32 = 10;
 /// Spacing of a host's punch packets, milliseconds (ADR 0113).
 pub const RENDEZVOUS_PUNCH_INTERVAL_MS: u64 = 1_000;
+/// Shortest time between two trains of punches towards one address, seconds
+/// (ADR 0123). A guest's dial knocks about this often; anything faster is
+/// somebody using the host's punches as a packet source.
+pub const RENDEZVOUS_REPUNCH_SECS: u64 = 3;
+/// Most trains of punches a host sends in a minute, towards any addresses
+/// (ADR 0123). Knocks are sealed under the invite and signed by nobody, so
+/// this is what keeps a holder of the invite from aiming the host's packets
+/// at a machine of its choice for as long as it likes.
+pub const RENDEZVOUS_PUNCHES_PER_MINUTE: u32 = 12;
 /// Longest the TCP connect, TLS handshake and WebSocket upgrade to one
 /// signalling relay may take together, seconds (ADR 0116). A relay an ISP
 /// blackholes never answers at all, and waiting on it would only delay the
@@ -929,6 +941,32 @@ pub const UNATTENDED_PASSWORD_MAX_BYTES: usize = 1024;
 /// sending a longer code fails verification with a coarse `BadCode` instead of
 /// having its connection torn down as a malformed frame.
 pub const UNATTENDED_CODE_MAX_BYTES: usize = 8;
+
+/// Shortest salt a guest accepts in a password-proof challenge, bytes
+/// (ADR 0123). Argon2's own floor.
+pub const UNATTENDED_PROOF_MIN_SALT_BYTES: usize = 8;
+/// Longest salt a guest accepts in a password-proof challenge, bytes
+/// (ADR 0123). The hashes this build writes carry 16.
+pub const UNATTENDED_PROOF_MAX_SALT_BYTES: usize = 64;
+/// Most memory a host may ask a guest's Argon2id to use, KiB (ADR 0123).
+///
+/// The hashes this build writes use 19 MiB. The host naming the cost may not
+/// be the host the guest thinks it is, and this is what keeps one login from
+/// costing the guest a quarter of a gigabyte or more.
+pub const UNATTENDED_PROOF_MAX_MEMORY_KIB: u32 = 256 * 1024;
+/// Most passes a host may ask a guest's Argon2id to make (ADR 0123). The
+/// hashes this build writes use 2.
+pub const UNATTENDED_PROOF_MAX_ITERATIONS: u32 = 16;
+/// Most lanes a host may ask a guest's Argon2id to run (ADR 0123). The
+/// hashes this build writes use 1.
+pub const UNATTENDED_PROOF_MAX_LANES: u32 = 16;
+/// Shortest derived key a password proof may use, bytes (ADR 0123).
+pub const UNATTENDED_PROOF_MIN_OUTPUT_BYTES: usize = 16;
+/// Longest derived key a password proof may use, bytes (ADR 0123).
+pub const UNATTENDED_PROOF_MAX_OUTPUT_BYTES: usize = 64;
+/// Longest SPAKE2 message either side of a password proof may send, bytes
+/// (ADR 0123). An Ed25519-group message is 33.
+pub const UNATTENDED_PROOF_MAX_MESSAGE_BYTES: usize = 64;
 
 /// How long the host keeps an audit record before deleting it (§15).
 ///

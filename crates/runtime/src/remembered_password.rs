@@ -20,7 +20,8 @@ use lumepeer_net::keystore::Keystore;
 /// restarts and does not collide with the unattended-access slots of
 /// `crates/net::keystore`, which name *this* host's own credentials, not a
 /// remote one's.
-fn entry_name(host_tag: &str) -> String {
+#[must_use]
+pub fn entry_name(host_tag: &str) -> String {
     format!("lumepeer.guest.password.{host_tag}")
 }
 

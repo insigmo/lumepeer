@@ -346,6 +346,8 @@ export const ja: Dictionary = {
   'creds.badCode': 'そのコードは承認されませんでした。',
   'creds.lockedOut': (secs) => `試行回数が多すぎます。${secs} 秒後に再試行してください。`,
   'creds.unavailable': 'このデバイスは現在その方法でサインインさせることができません。',
+  'creds.hostOutdated':
+    'このデバイスはパスワードを平文で受け取る古い Lumepeer を使っており、これまでに接続したこともありません。所有者に更新を依頼するか、入室が許可されるまでお待ちください。',
   'quality.path.direct': '直接接続',
   'quality.path.relay': 'リレー経由',
   'quality.path.mixed': '直接接続とリレーの併用',

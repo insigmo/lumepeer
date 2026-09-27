@@ -377,6 +377,8 @@ export const en: Dictionary = {
   'creds.badCode': 'That code was not accepted.',
   'creds.lockedOut': (secs) => `Too many attempts. Try again in ${secs} seconds.`,
   'creds.unavailable': 'This device cannot sign you in that way right now.',
+  'creds.hostOutdated':
+    'This device runs an older Lumepeer that would receive your password in the clear, and you have never connected to it before. Ask its owner to update it, or wait to be let in.',
   // Named for what is happening, not for the transport that makes it happen:
   // "via relay" is something a person can act on, "DERP" is not (§18).
   'quality.path.direct': 'Direct',

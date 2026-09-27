@@ -337,6 +337,8 @@ export const zh: Dictionary = {
   'creds.badCode': '该验证码未被接受。',
   'creds.lockedOut': (secs) => `尝试次数过多，请在 ${secs} 秒后重试。`,
   'creds.unavailable': '此设备目前无法以这种方式为您登录。',
+  'creds.hostOutdated':
+    '此设备运行的是旧版 Lumepeer，会以明文接收您的密码，而且您从未连接过它。请让其所有者更新，或等待对方允许您进入。',
   'quality.path.direct': '直连',
   'quality.path.relay': '经由中继',
   'quality.path.mixed': '直连与中继混合',
