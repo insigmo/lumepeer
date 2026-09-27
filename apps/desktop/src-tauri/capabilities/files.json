@@ -1,0 +1,29 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "files-window",
+  "description": "Per-window capability of a file manager opened beside a remote-view window (ADR 0124). It is one session's files and nothing else: the two listings, the transfers between them, the three changes a file manager makes (make a folder, rename, delete) and the list of local drives to start from. Every file command still checks that the window's label names the session it acts on, and every remote one is re-authorized by the host when it lands. `core:event:default` is what lets the page hear a file dragged in from the desktop, which arrives as a Tauri event carrying the dropped paths; its own close and destroy are scoped to its own label. No screen, input, keyboard, shell, tunnel, grant or settings command, no filesystem plugin, and no wildcard entries.",
+  "windows": ["files-*"],
+  "local": true,
+  "permissions": [
+    "core:event:default",
+    {
+      "identifier": "core:window:allow-close",
+      "allow": [{ "label": "files-*" }]
+    },
+    {
+      "identifier": "core:window:allow-destroy",
+      "allow": [{ "label": "files-*" }]
+    },
+    "allow-file-accept",
+    "allow-file-abort",
+    "allow-file-transfers",
+    "allow-local-dir-list",
+    "allow-remote-dir-list",
+    "allow-remote-dir-status",
+    "allow-remote-download",
+    "allow-remote-upload",
+    "allow-remote-file-op",
+    "allow-local-file-op",
+    "allow-local-roots"
+  ]
+}

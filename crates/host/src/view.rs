@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_runtime::session_agent::{ScreenState, SessionScreen};
-use lumepeer_runtime::view::ViewWindows;
+use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::agent_protocol::AgentCommand;
 
 /// The machine's screen, as the host believes it to be, and the way to reach it.
@@ -145,7 +145,7 @@ impl ViewWindows for AgentViewWindows {
         _peer_label: &str,
         _host_label: &str,
         _input: bool,
-        _terminal_only: bool,
+        _surface: ViewSurface,
     ) {
         tracing::warn!(
             window = %label,

@@ -317,7 +317,23 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// at least this one; an older guest decodes the unknown variant as malformed
 /// and closes the connection (§9.1), so it is told nothing, as before. See
 /// `docs/adr/0110-a-host-the-os-refused-capture-says-so.md`.
-pub const PROTOCOL_MINOR: u16 = 19;
+///
+/// 20: appended [`MessageKind::FileOpRequest`] and
+/// [`MessageKind::FileOpResult`] after `UnattendedProof`. The file manager
+/// could list the host's directories and move files both ways (minors 12 to
+/// 14), and could not make a folder to put an upload in, fix a name, or take
+/// away what it had just copied there by mistake. The three operations ride
+/// one request and one answer: make a directory, rename an entry inside its
+/// own directory, delete a file or a whole directory. The host acts on them
+/// only for a guest holding both `file_browse` and `file_transfer` — the same
+/// intersection a put already needs, since a guest that can write any file
+/// into any directory it can see can already fill that directory with
+/// whatever it likes. A guest sends the request only to a host whose
+/// `HelloAck` minor is at least this one; there is no feature string, because
+/// the answer only ever follows a request, and a peer that can encode the
+/// request can decode the answer. See
+/// `docs/adr/0124-the-file-manager-is-its-own-window-and-can-change-the-host.md`.
+pub const PROTOCOL_MINOR: u16 = 20;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -1321,6 +1337,97 @@ pub enum MessageKind {
         /// code: what shows the host both sides derived the same key.
         confirm: [u8; 32],
     },
+    /// Guest to host: change something on the host's disk (§9.2; ADR 0124).
+    /// New in minor 20.
+    ///
+    /// Acted on only for a guest holding `file_browse` *and*
+    /// `file_transfer`, re-read when it lands, exactly as a put is: the
+    /// three operations are what a guest that can already write any file into
+    /// any directory it can see needs to keep that directory tidy, and none
+    /// of them reaches anything a put could not. Every path in `op` is
+    /// untrusted input, bounded here and parsed by
+    /// `lumepeer_core::remote_path` before anything touches the disk.
+    ///
+    /// `id` is the guest's own, echoed back in [`Self::FileOpResult`] so a
+    /// guest with several in flight can tell the answers apart.
+    FileOpRequest {
+        /// Chosen by the guest; means nothing to the host.
+        id: u32,
+        /// What to do.
+        op: FileOp,
+    },
+    /// Host to guest: how a [`Self::FileOpRequest`] went (§18; ADR 0124).
+    /// New in minor 20.
+    ///
+    /// Always sent, success included: a guest that asked to delete something
+    /// and heard nothing would have to guess whether it is gone.
+    FileOpResult {
+        /// The request's own `id`.
+        id: u32,
+        /// Why nothing happened, or `None` when it did.
+        refused: Option<FileOpRefusal>,
+    },
+}
+
+/// One change a guest may ask a host to make to its own disk
+/// (§9.2; ADR 0124).
+///
+/// Three and no more. There is no copy and no move between directories: a
+/// copy on the host is a download and an upload, and a move is a copy and a
+/// delete, each authorized on its own. Every path is absolute and passes
+/// `remote_path::safe_browse_path`; a new name passes
+/// `remote_path::is_safe_component`, so a rename never leaves the directory
+/// it happened in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOp {
+    /// Create the directory `path`. Its parent must already exist; nothing
+    /// above it is created on the guest's say-so.
+    MakeDir {
+        /// Absolute path of the directory to create.
+        path: String,
+    },
+    /// Give the file or directory at `path` the basename `name`, in the
+    /// directory it is already in.
+    Rename {
+        /// Absolute path of the entry to rename.
+        path: String,
+        /// Its new basename, never a path.
+        name: String,
+    },
+    /// Delete the file at `path`, or the directory at `path` with everything
+    /// in it. A symbolic link is removed as a link; what it points to is not
+    /// touched.
+    Delete {
+        /// Absolute path of the entry to delete.
+        path: String,
+    },
+}
+
+/// Why a host did not carry out a [`MessageKind::FileOpRequest`]
+/// (§18; ADR 0124).
+///
+/// A closed set, like [`FileFetchRefusal`]. The two a guest can act on get
+/// their own variants — a name that is taken, a thing that is not there any
+/// more — and every other failure of the disk is [`Self::Failed`], because
+/// the host's own error text is a fact about its filesystem the guest has no
+/// business reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileOpRefusal {
+    /// This session does not hold both `file_browse` and `file_transfer`, or
+    /// it is no longer active.
+    NotGranted,
+    /// A path or a name this build will not act on: relative, climbing,
+    /// naming a device, or a drive or filesystem root.
+    BadPath,
+    /// Something with that name is already there.
+    Exists,
+    /// There is nothing at that path.
+    NotFound,
+    /// This session already has
+    /// [`crate::constants::MAX_FILE_OPS_IN_FLIGHT`] operations running.
+    Busy,
+    /// The host's disk refused: permissions, a file in use, anything else.
+    Failed,
 }
 
 /// The key derivation of a device password, as a host hands it to a guest
@@ -1399,7 +1506,8 @@ impl MessageKind {
             | Self::TunnelOpenResponse { .. }
             | Self::TerminalOpenResponse { .. }
             | Self::SessionGrants { .. }
-            | Self::UnattendedProofChallenge { .. } => Some(Direction::HostToGuest),
+            | Self::UnattendedProofChallenge { .. }
+            | Self::FileOpResult { .. } => Some(Direction::HostToGuest),
             // The guest's requests: everything that asks the host to do
             // something to its own machine.
             Self::Hello { .. }
@@ -1423,7 +1531,8 @@ impl MessageKind {
             | Self::TerminalOpenRequest { .. }
             | Self::TerminalResize { .. }
             | Self::RebootRequest { .. }
-            | Self::UnattendedProof { .. } => Some(Direction::GuestToHost),
+            | Self::UnattendedProof { .. }
+            | Self::FileOpRequest { .. } => Some(Direction::GuestToHost),
             // Content between two people, transfers either of them can
             // start, the keepalive, and the ends of things either side can
             // end.
@@ -1997,6 +2106,31 @@ fn check_put_offer(dir: &str, name: &str, size: u64) -> Result<()> {
     Ok(())
 }
 
+/// Bounds the strings a file operation carries (§9.1; ADR 0124).
+///
+/// As strings only, like every other path on this wire: whether one is a path
+/// this host will act on is `remote_path`'s decision, made where the path is
+/// used.
+///
+/// # Errors
+/// [`CoreError::Malformed`] for an empty or overlong path, or an empty or
+/// overlong new name.
+fn check_file_op(op: &FileOp) -> Result<()> {
+    let path = match op {
+        FileOp::MakeDir { path } | FileOp::Delete { path } => path,
+        FileOp::Rename { path, name } => {
+            if name.is_empty() || name.len() > FILE_NAME_MAX_BYTES {
+                return Err(CoreError::Malformed);
+            }
+            path
+        }
+    };
+    if path.is_empty() || path.len() > DIR_PATH_MAX_BYTES {
+        return Err(CoreError::Malformed);
+    }
+    Ok(())
+}
+
 impl MessageEnvelope {
     /// Serializes the envelope.
     ///
@@ -2166,6 +2300,7 @@ impl MessageEnvelope {
             MessageKind::DirOffer { name, dir, entries } => {
                 check_manifest(name, dir.as_deref(), entries)?;
             }
+            MessageKind::FileOpRequest { op, .. } => check_file_op(op)?,
             MessageKind::TunnelOpenRequest { host, port, .. } => {
                 check_tunnel_target(host, *port)?;
             }
@@ -2491,6 +2626,92 @@ mod tests {
                 "a malformed put offer was accepted"
             );
         }
+    }
+
+    /// ADR 0124: every path and name a file operation carries is bounded as a
+    /// string before anything parses it, and the answer round-trips with and
+    /// without a refusal.
+    #[test]
+    fn a_file_operation_is_bounded_on_every_string_it_carries() {
+        let request = |op: FileOp| MessageKind::FileOpRequest { id: 7, op };
+        let long_path = "a".repeat(DIR_PATH_MAX_BYTES + 1);
+        let long_name = "a".repeat(FILE_NAME_MAX_BYTES + 1);
+
+        for kind in [
+            request(FileOp::MakeDir {
+                path: "/home/beta/new".to_owned(),
+            }),
+            request(FileOp::Rename {
+                path: "C:\\Users\\beta\\old.txt".to_owned(),
+                name: "new.txt".to_owned(),
+            }),
+            request(FileOp::Delete {
+                path: "/home/beta/old".to_owned(),
+            }),
+            MessageKind::FileOpResult {
+                id: 7,
+                refused: None,
+            },
+            MessageKind::FileOpResult {
+                id: 8,
+                refused: Some(FileOpRefusal::Exists),
+            },
+        ] {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+
+        for kind in [
+            request(FileOp::MakeDir {
+                path: String::new(),
+            }),
+            request(FileOp::MakeDir {
+                path: long_path.clone(),
+            }),
+            request(FileOp::Delete {
+                path: String::new(),
+            }),
+            request(FileOp::Delete {
+                path: long_path.clone(),
+            }),
+            request(FileOp::Rename {
+                path: long_path,
+                name: "new.txt".to_owned(),
+            }),
+            request(FileOp::Rename {
+                path: "/home/beta/old.txt".to_owned(),
+                name: String::new(),
+            }),
+            request(FileOp::Rename {
+                path: "/home/beta/old.txt".to_owned(),
+                name: long_name,
+            }),
+        ] {
+            let bytes = envelope(kind).encode().unwrap();
+            assert!(
+                matches!(MessageEnvelope::decode(&bytes), Err(CoreError::Malformed)),
+                "a malformed file operation was accepted"
+            );
+        }
+    }
+
+    /// ADR 0122 and ADR 0124: the request only ever travels from the guest,
+    /// the answer only ever from the host.
+    #[test]
+    fn a_file_operation_travels_guest_to_host_and_its_answer_back() {
+        let request = MessageKind::FileOpRequest {
+            id: 1,
+            op: FileOp::Delete {
+                path: "/tmp/x".to_owned(),
+            },
+        };
+        let result = MessageKind::FileOpResult {
+            id: 1,
+            refused: None,
+        };
+        assert_eq!(request.direction(), Some(Direction::GuestToHost));
+        assert_eq!(result.direction(), Some(Direction::HostToGuest));
     }
 
     /// ADR 0077: a manifest is bounded on its count, its name, its

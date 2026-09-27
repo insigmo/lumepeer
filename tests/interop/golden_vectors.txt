@@ -246,3 +246,31 @@ invalid minor17_reboot_request_unknown_mode abababababababababababababababab0106
 # --- is coming back to, and a first connection names none (all zeroes).
 valid minor18_hello_first_connection 000000000000000000000000000000000100000100000104636f72650301020300
 valid minor18_hello_resume_claim 1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d0100000100000104636f72650301020300
+
+# --- Frozen for PROTOCOL_MINOR 19: the host's operating system refused this
+# --- app screen capture (ADR 0110). No new message: CaptureDenied is appended
+# --- to MediaUnavailableReason after SecureDesktopActive, so the minor 2
+# --- vectors above keep their bytes. SecureDesktopActive went on the wire
+# --- earlier (docs/bugs/11-uac-degradation.md) without a vector of its own;
+# --- it is frozen here, with the reason appended after it. The host sends
+# --- CaptureDenied only to a guest whose Hello minor is at least this one,
+# --- because the set is closed: a reason byte a build has never heard of is
+# --- malformed, which is also what an older guest makes of this one.
+valid minor19_media_unavailable_secure_desktop_active abababababababababababababababab00001e0200
+valid minor19_media_unavailable_capture_denied abababababababababababababababab00001e0300
+invalid minor19_media_unavailable_unknown_reason abababababababababababababababab00001e0400
+
+# --- Frozen for PROTOCOL_MINOR 20: the file manager changes the host's disk
+# --- (ADR 0124). FileOpRequest and FileOpResult are appended after
+# --- UnattendedProof. Three operations and no fourth; an operation or a
+# --- refusal byte outside the closed sets is malformed, and so is a path of
+# --- no length.
+valid minor20_file_op_make_dir abababababababababababababababab01003f0100022f6100
+valid minor20_file_op_rename abababababababababababababababab01003f0201022f61016200
+valid minor20_file_op_delete abababababababababababababababab01003f0302022f6100
+valid minor20_file_op_result_done abababababababababababababababab000040010000
+valid minor20_file_op_result_exists abababababababababababababababab00004002010200
+valid minor20_file_op_result_failed abababababababababababababababab00004003010500
+invalid minor20_file_op_unknown_operation abababababababababababababababab01003f0103022f6100
+invalid minor20_file_op_result_unknown_refusal abababababababababababababababab00004001010600
+invalid minor20_file_op_empty_path abababababababababababababababab01003f01000000

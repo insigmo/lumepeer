@@ -395,6 +395,14 @@ pub const STAGING_SWEEP_TIMESTAMP_SLACK_SECS: u64 = 2;
 pub const FILE_NAME_MAX_BYTES: usize = 255;
 /// Maximum number of pending file offers per session (§9.2).
 pub const MAX_PENDING_FILE_OFFERS: usize = 3;
+/// Maximum number of file operations (make a directory, rename, delete) a
+/// host runs for one session at a time (ADR 0124).
+///
+/// A delete of a large tree is a real amount of the host's disk, and each one
+/// runs on a blocking thread of its own; a guest past this is answered `Busy`
+/// rather than queued, so a flood of requests costs the host one refusal each
+/// and nothing more.
+pub const MAX_FILE_OPS_IN_FLIGHT: usize = 4;
 /// How many times a sender picks a file up again after its stream ended
 /// early, before calling the transfer failed (§10; ADR 0077).
 ///

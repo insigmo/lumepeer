@@ -979,6 +979,34 @@ pub fn window_label(peer_label: &str) -> String {
     format!("view-{peer_label}")
 }
 
+/// What a view window has in it (ADR 0101, ADR 0124).
+///
+/// The session and the role are the same whichever it is; what changes is
+/// whether the guest dials `rd/media/1` at all, and which page the window
+/// loads. Only [`Self::Screen`] has a picture, and only a window with a
+/// picture ever has input or the keyboard grab of ADR 0090 behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewSurface {
+    /// The host's screen, with the toolbar and everything it opens.
+    #[default]
+    Screen,
+    /// A shell and nothing else (ADR 0101).
+    Terminal,
+    /// The file manager and nothing else (ADR 0124).
+    Files,
+}
+
+impl ViewSurface {
+    /// Whether this window shows the host's picture, which is the same
+    /// question as whether the guest dials `rd/media/1` for it: a host starts
+    /// its encode loop when it accepts that connection and at no other
+    /// moment, so a surface without a picture is a host that encodes nothing.
+    #[must_use]
+    pub const fn has_picture(self) -> bool {
+        matches!(self, Self::Screen)
+    }
+}
+
 /// How the actor opens and closes the guest's remote-view window.
 ///
 /// The seam that keeps this crate free of any idea what a window is
@@ -997,19 +1025,19 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// `peer_label`, and the picture it keeps for the connection list has to
     /// be findable tomorrow, under the only name that survives a restart.
     ///
-    /// `terminal_only` is a window with a shell in it and no picture at all
-    /// (ADR 0101) — the same session and the same role, opened by a guest
-    /// that never dialled `rd/media/1`. It arrives here rather than being
-    /// inferred from `input` because the two are independent: a screen
-    /// session may be granted no input, and a terminal one is never given
-    /// any.
+    /// `surface` is what the window has in it: the host's screen, or a shell
+    /// (ADR 0101) or the file manager (ADR 0124) with no picture at all — the
+    /// same session and the same role, opened by a guest that never dialled
+    /// `rd/media/1`. It arrives here rather than being inferred from `input`
+    /// because the two are independent: a screen session may be granted no
+    /// input, and a window without a picture is never given any.
     fn open(
         &self,
         label: &str,
         peer_label: &str,
         host_label: &str,
         input: bool,
-        terminal_only: bool,
+        surface: ViewSurface,
     );
     /// Closes the view window `label`, if it is open.
     fn close(&self, label: &str);
@@ -1072,7 +1100,7 @@ impl ViewWindows for DetachedViewWindows {
         _peer_label: &str,
         _host_label: &str,
         _input: bool,
-        _terminal_only: bool,
+        _surface: ViewSurface,
     ) {
         tracing::debug!(window = %label, "no webview attached: not opening a view window");
     }

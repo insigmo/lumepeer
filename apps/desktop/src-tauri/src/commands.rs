@@ -27,6 +27,15 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// window this build ever creates.
 const VIEW_WINDOW_PREFIX: &str = "view-";
 
+/// Label prefix of a file manager opened beside a screen session (ADR 0124).
+///
+/// A file manager that *is* the session — "File manager" on a remembered host,
+/// with no picture behind it — is a view window like a terminal one is, under
+/// [`VIEW_WINDOW_PREFIX`]. This is the other kind: a second window onto a
+/// session that already has its screen open, which closes without ending
+/// anything.
+pub const FILES_WINDOW_PREFIX: &str = "files-";
+
 /// Error returned to the webview. Carries a code and a short message, never
 /// secrets, tickets, tokens or raw peer identities (§15).
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +208,20 @@ fn check_view_window(window: &Window, peer: &str) -> Result<(), IpcError> {
         Ok(())
     } else {
         Err(IpcError::denied())
+    }
+}
+
+/// [`check_view_window`], or the file manager opened beside that view
+/// (ADR 0124).
+///
+/// Only for the file commands: the file manager window is the same session's
+/// files and nothing else, so it may do what the view may do with files and
+/// none of what the view may do with the screen, the keyboard or a shell.
+fn check_file_window(window: &Window, peer: &str) -> Result<(), IpcError> {
+    if window.label().strip_prefix(FILES_WINDOW_PREFIX) == Some(peer) {
+        Ok(())
+    } else {
+        check_view_window(window, peer)
     }
 }
 
@@ -417,6 +440,13 @@ pub struct HistoryConnectArgs {
     /// sending `{ peer }` alone.
     #[serde(default)]
     pub terminal_only: bool,
+    /// Whether to open the file manager and nothing else (ADR 0124).
+    ///
+    /// No picture either, for the same reason as `terminal_only`. When this
+    /// node already has a session open onto that host, no second one is
+    /// dialled: the file manager opens beside the one that is running.
+    #[serde(default)]
+    pub files_only: bool,
 }
 
 /// Argument of [`history_remove`].
@@ -844,15 +874,35 @@ pub async fn connection_history(
 /// Rejects calls from other windows; propagates [`ActorError`].
 #[tauri::command]
 pub async fn history_connect(
+    app: tauri::AppHandle,
     window: Window,
     state: tauri::State<'_, AppState>,
     args: HistoryConnectArgs,
 ) -> Result<(), IpcError> {
+    use lumepeer_runtime::view::ViewSurface;
+
     check_window(&window)?;
-    state
-        .network
-        .history_connect(args.peer, args.terminal_only)
-        .await?;
+    let surface = match (args.terminal_only, args.files_only) {
+        (false, false) => ViewSurface::Screen,
+        (true, false) => ViewSurface::Terminal,
+        (false, true) => ViewSurface::Files,
+        (true, true) => {
+            return Err(IpcError {
+                code: "BAD_ARGS",
+                message: "a connect is for a terminal or for files, not both".to_owned(),
+            });
+        }
+    };
+    // A session already running onto that host gets its file manager opened
+    // beside it rather than a second connect, which the actor would refuse
+    // as a duplicate of the live one (ADR 0124).
+    if surface == ViewSurface::Files
+        && let Some(peer) = state.network.watching_host(args.peer.clone()).await?
+    {
+        crate::view_windows::open_files_window(&app, &peer);
+        return Ok(());
+    }
+    state.network.history_connect(args.peer, surface).await?;
     Ok(())
 }
 
@@ -1897,7 +1947,7 @@ pub async fn file_accept(
     state: tauri::State<'_, AppState>,
     args: FileAcceptArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    check_file_window(&window, &args.peer).or_else(|_| check_window(&window))?;
     let directory = if args.accept && !args.from_clipboard {
         let Some(directory) = pick_directory(&app).await else {
             // The picker was dismissed: nothing has been answered yet, so the
@@ -1934,7 +1984,7 @@ pub async fn file_abort(
     state: tauri::State<'_, AppState>,
     args: FileAbortArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    check_file_window(&window, &args.peer).or_else(|_| check_window(&window))?;
     state
         .network
         .file_abort(args.peer, args.transfer_id)
@@ -1954,7 +2004,10 @@ pub async fn file_transfers(
     // Readable from either window: a guest watching its own transfer list is
     // reading its own side of the session, and every row it can see is one it
     // is already a party to.
-    if check_window(&window).is_err() && !window.label().starts_with(VIEW_WINDOW_PREFIX) {
+    if check_window(&window).is_err()
+        && !window.label().starts_with(VIEW_WINDOW_PREFIX)
+        && !window.label().starts_with(FILES_WINDOW_PREFIX)
+    {
         return Err(IpcError::denied());
     }
     Ok(state.network.file_transfers().await?)
@@ -2064,6 +2117,53 @@ pub struct RemoteDirDto {
     pub fetch_refused: Option<FetchRefusalDto>,
     /// Whether an answer has arrived at all yet.
     pub answered: bool,
+    /// How many downloads the host has refused in this session (ADR 0124).
+    pub fetches_refused: u32,
+    /// How many uploads went nowhere in this session (ADR 0124).
+    pub uploads_refused: u32,
+    /// The answers to this window's file operations, oldest first (ADR 0124).
+    pub op_results: Vec<FileOpResultDto>,
+    /// How many listings the host has answered in this session, so a window
+    /// can tell the answer to its own request from the one before (ADR 0124).
+    pub listings_answered: u32,
+}
+
+/// Why a file operation did not happen, on either machine (§18; ADR 0124).
+///
+/// One set for both panes: the local pane runs the same plan the host runs,
+/// so the window has one sentence per reason whichever side said it.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOpRefusalDto {
+    NotGranted,
+    BadPath,
+    Exists,
+    NotFound,
+    Busy,
+    Failed,
+}
+
+impl From<lumepeer_core::protocol::FileOpRefusal> for FileOpRefusalDto {
+    fn from(refusal: lumepeer_core::protocol::FileOpRefusal) -> Self {
+        use lumepeer_core::protocol::FileOpRefusal;
+        match refusal {
+            FileOpRefusal::NotGranted => Self::NotGranted,
+            FileOpRefusal::BadPath => Self::BadPath,
+            FileOpRefusal::Exists => Self::Exists,
+            FileOpRefusal::NotFound => Self::NotFound,
+            FileOpRefusal::Busy => Self::Busy,
+            FileOpRefusal::Failed => Self::Failed,
+        }
+    }
+}
+
+/// How one remote file operation went (ADR 0124).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileOpResultDto {
+    /// The id `remote_file_op` returned.
+    pub id: u32,
+    /// Why it did not happen, or `None` when it did.
+    pub refused: Option<FileOpRefusalDto>,
 }
 
 /// The directory above `path`, or `None` when `path` is already a root.
@@ -2117,7 +2217,7 @@ pub async fn local_dir_list(
     window: Window,
     args: LocalDirListArgs,
 ) -> Result<LocalDirDto, IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_file_window(&window, &args.peer)?;
     let path = match args.path {
         Some(path) => path,
         None => lumepeer_runtime::config::home()
@@ -2170,7 +2270,7 @@ pub async fn remote_dir_list(
     state: tauri::State<'_, AppState>,
     args: RemoteDirListArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_file_window(&window, &args.peer)?;
     state.network.request_dir_list(args.peer, args.path).await?;
     Ok(())
 }
@@ -2186,9 +2286,17 @@ pub async fn remote_dir_status(
     state: tauri::State<'_, AppState>,
     peer: String,
 ) -> Result<RemoteDirDto, IpcError> {
-    check_view_window(&window, &peer)?;
+    check_file_window(&window, &peer)?;
     let status = state.network.dir_listing(peer).await?;
     let fetch_refused = status.fetch_refused.map(FetchRefusalDto::from);
+    let op_results = status
+        .op_results
+        .iter()
+        .map(|outcome| FileOpResultDto {
+            id: outcome.id,
+            refused: outcome.refused.map(FileOpRefusalDto::from),
+        })
+        .collect();
     let Some(listing) = status.listing else {
         return Ok(RemoteDirDto {
             path: String::new(),
@@ -2198,6 +2306,10 @@ pub async fn remote_dir_status(
             refused: None,
             fetch_refused,
             answered: false,
+            fetches_refused: status.fetches_refused,
+            uploads_refused: status.uploads_refused,
+            op_results,
+            listings_answered: status.listings_answered,
         });
     };
     Ok(RemoteDirDto {
@@ -2208,6 +2320,10 @@ pub async fn remote_dir_status(
         refused: listing.refused.map(DirRefusalDto::from),
         fetch_refused,
         answered: true,
+        fetches_refused: status.fetches_refused,
+        uploads_refused: status.uploads_refused,
+        op_results,
+        listings_answered: status.listings_answered,
     })
 }
 
@@ -2234,7 +2350,7 @@ pub async fn remote_download(
     state: tauri::State<'_, AppState>,
     args: RemoteDownloadArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_file_window(&window, &args.peer)?;
     state
         .network
         .remote_download(args.peer, args.path, args.into)
@@ -2264,12 +2380,164 @@ pub async fn remote_upload(
     state: tauri::State<'_, AppState>,
     args: RemoteUploadArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_file_window(&window, &args.peer)?;
     state
         .network
         .remote_upload(args.peer, args.local_path, args.remote_dir)
         .await?;
     Ok(())
+}
+
+/// Guest side: opens the file manager beside this view window, or raises it
+/// if it is already open (ADR 0124).
+///
+/// A window of its own rather than a panel over the picture: moving files is
+/// work somebody does next to the remote screen, not instead of it, and a
+/// panel over the picture hid exactly what the person was copying from.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's view.
+#[tauri::command]
+pub async fn files_window_open(
+    app: tauri::AppHandle,
+    window: Window,
+    peer: String,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &peer)?;
+    crate::view_windows::open_files_window(&app, &peer);
+    Ok(())
+}
+
+/// One change to a file or directory, as the file manager names it
+/// (ADR 0124).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileOpDto {
+    /// Create the directory `path`.
+    MakeDir { path: String },
+    /// Give the entry at `path` the basename `name`, in the same directory.
+    Rename { path: String, name: String },
+    /// Delete the entry at `path`, a directory with everything in it.
+    Delete { path: String },
+}
+
+impl From<FileOpDto> for lumepeer_core::protocol::FileOp {
+    fn from(op: FileOpDto) -> Self {
+        match op {
+            FileOpDto::MakeDir { path } => Self::MakeDir { path },
+            FileOpDto::Rename { path, name } => Self::Rename { path, name },
+            FileOpDto::Delete { path } => Self::Delete { path },
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FileOpArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// What to do.
+    pub op: FileOpDto,
+}
+
+/// Guest side: asks the watched host to make a directory, rename an entry or
+/// delete one (ADR 0124).
+///
+/// Authorizes nothing: the host re-reads `file_browse` and `file_transfer`
+/// when the request lands. The answer is read back with
+/// [`remote_dir_status`], under the id this returns.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, the host is too old, or a
+/// path or name is not one the host would accept.
+#[tauri::command]
+pub async fn remote_file_op(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: FileOpArgs,
+) -> Result<u32, IpcError> {
+    check_file_window(&window, &args.peer)?;
+    Ok(state
+        .network
+        .remote_file_op(args.peer, args.op.into())
+        .await?)
+}
+
+/// Guest side: makes a directory, renames an entry or deletes one on *this*
+/// machine, for the local pane of the file manager (ADR 0124).
+///
+/// Through the same plan the host runs for a guest — the same parser, the
+/// same refusal of a root, the same treatment of links — so the two panes
+/// behave alike. Only ever reachable from a window onto a live session, like
+/// `local_dir_list`: this is the file manager's local half, not a general
+/// filesystem command.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's, with the refusal's own
+/// code (`BAD_PATH`, `EXISTS`, `NOT_FOUND`, `FAILED`) when nothing happened.
+#[tauri::command]
+pub async fn local_file_op(window: Window, args: FileOpArgs) -> Result<(), IpcError> {
+    use lumepeer_core::protocol::FileOpRefusal;
+
+    check_file_window(&window, &args.peer)?;
+    let op: lumepeer_core::protocol::FileOp = args.op.into();
+    let plan = lumepeer_runtime::network::FileOpPlan::from_wire(&op).ok_or(IpcError {
+        code: "BAD_PATH",
+        message: "that is not a path this build will change".to_owned(),
+    })?;
+    let refused = tokio::task::spawn_blocking(move || plan.run())
+        .await
+        .unwrap_or(Some(FileOpRefusal::Failed));
+    match refused {
+        None => Ok(()),
+        Some(refusal) => Err(IpcError {
+            code: match refusal {
+                FileOpRefusal::BadPath => "BAD_PATH",
+                FileOpRefusal::Exists => "EXISTS",
+                FileOpRefusal::NotFound => "NOT_FOUND",
+                FileOpRefusal::NotGranted | FileOpRefusal::Busy | FileOpRefusal::Failed => {
+                    "FAILED"
+                }
+            },
+            message: "the change could not be made".to_owned(),
+        }),
+    }
+}
+
+/// Guest side: the places the local pane can start from — the home directory
+/// first, then every drive or the filesystem root (ADR 0124).
+///
+/// `parent_of` stops at a drive's root, so without this a local pane that
+/// started in the home directory on `C:` could never reach `D:`.
+///
+/// # Errors
+/// [`IpcError`] when the window is not this peer's.
+#[tauri::command]
+pub async fn local_roots(window: Window, peer: String) -> Result<Vec<String>, IpcError> {
+    check_file_window(&window, &peer)?;
+    let mut roots: Vec<String> = lumepeer_runtime::config::home()
+        .map(|home| home.to_string_lossy().into_owned())
+        .into_iter()
+        .collect();
+    roots.extend(tokio::task::spawn_blocking(drive_roots).await.unwrap_or_default());
+    Ok(roots)
+}
+
+/// Every drive letter with something mounted on it, as `X:\`.
+#[cfg(target_os = "windows")]
+fn drive_roots() -> Vec<String> {
+    // `exists` on a drive root is a metadata call, and an empty card reader
+    // or optical drive answers it with "not ready" at once, which reads as
+    // absent — the drive with nothing in it is not a place to browse.
+    ('A'..='Z')
+        .map(|letter| format!("{letter}:\\"))
+        .filter(|root| std::path::Path::new(root).exists())
+        .collect()
+}
+
+/// The one root a Unix filesystem has.
+#[cfg(not(target_os = "windows"))]
+fn drive_roots() -> Vec<String> {
+    vec!["/".to_owned()]
 }
 
 // -------------------------------------------------------------------------

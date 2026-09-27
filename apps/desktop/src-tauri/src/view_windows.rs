@@ -7,12 +7,26 @@
 //! carries it out on the platform's main thread.
 
 use lumepeer_core::consent::HostAttendance;
-use lumepeer_runtime::view::ViewWindows;
+use lumepeer_runtime::view::{ViewSurface, ViewWindows};
+
+use crate::commands::FILES_WINDOW_PREFIX;
 
 /// Default width of a freshly opened view window.
 const VIEW_WINDOW_WIDTH: f64 = 1280.0;
 /// Default height of a freshly opened view window.
 const VIEW_WINDOW_HEIGHT: f64 = 720.0;
+/// Default width of a file manager window (ADR 0124): two panes of a name, a
+/// size and a date side by side, with room for a real file name in each.
+const FILES_WINDOW_WIDTH: f64 = 1180.0;
+/// Default height of a file manager window.
+const FILES_WINDOW_HEIGHT: f64 = 720.0;
+/// Smallest a file manager window may be made before its two panes stop
+/// being two panes.
+const FILES_WINDOW_MIN_WIDTH: f64 = 760.0;
+/// Smallest height, with room for the transfer list under the panes.
+const FILES_WINDOW_MIN_HEIGHT: f64 = 460.0;
+/// The page a file manager window loads.
+const FILES_PAGE: &str = "files.html";
 
 /// Label of the host's always-on-top session bar.
 pub const HOST_BAR_LABEL: &str = "hostbar";
@@ -48,8 +62,24 @@ impl ViewWindows for TauriViewWindows {
         peer_label: &str,
         host_label: &str,
         input: bool,
-        terminal_only: bool,
+        surface: ViewSurface,
     ) {
+        // A file manager that is the whole session is the same window a
+        // screen or a terminal would be — same label, same close that ends
+        // the session — with the file manager's own page in it (ADR 0124).
+        if surface == ViewSurface::Files {
+            let url = files_url(peer_label, host_label, true);
+            let label = label.to_owned();
+            let app = self.app.clone();
+            let queued = self
+                .app
+                .run_on_main_thread(move || build_files_window(&app, &label, url));
+            if let Err(error) = queued {
+                tracing::warn!(%error, "cannot reach the main thread to open a file manager");
+            }
+            return;
+        }
+        let terminal_only = surface == ViewSurface::Terminal;
         // Only pseudonymized labels ever reach a URL (§15), and both are hex
         // — `peer_tag` for the session, `host_tag` for the remembered host —
         // so there is nothing to escape.
@@ -113,6 +143,15 @@ impl ViewWindows for TauriViewWindows {
             {
                 tracing::warn!(window = %label, %error, "cannot close the view window");
             }
+            // The file manager opened beside this view is the same session's
+            // files, and goes with it (ADR 0124): left open, it would poll a
+            // session that no longer exists and show a host nobody is
+            // connected to.
+            if let Some(peer) = label.strip_prefix("view-")
+                && let Some(files) = app.get_webview_window(&format!("{FILES_WINDOW_PREFIX}{peer}"))
+            {
+                let _ = files.destroy();
+            }
         });
         if let Err(error) = queued {
             tracing::warn!(%error, "cannot reach the main thread to close a view window");
@@ -175,6 +214,74 @@ impl ViewWindows for TauriViewWindows {
     /// is always somebody signed in (ADR 0088 §3).
     fn nobody_signed_in(&self) -> bool {
         false
+    }
+}
+
+/// Opens the file manager beside the session `peer`, or raises the one that
+/// is already open (ADR 0124).
+///
+/// A session that *is* a file manager — dialled from "File manager" on a
+/// remembered host — already has one in its view window, and that one is
+/// raised rather than a second opened next to it.
+pub fn open_files_window(app: &tauri::AppHandle, peer: &str) {
+    let app_for_thread = app.clone();
+    let peer = peer.to_owned();
+    let queued = app.run_on_main_thread(move || {
+        use tauri::Manager as _;
+
+        let label = format!("{FILES_WINDOW_PREFIX}{peer}");
+        if let Some(window) = app_for_thread.get_webview_window(&label) {
+            let _ = window.unminimize();
+            crate::raise_window(&window);
+            return;
+        }
+        if let Some(view) = app_for_thread.get_webview_window(&format!("view-{peer}"))
+            && view
+                .url()
+                .is_ok_and(|url| url.path().ends_with(FILES_PAGE))
+        {
+            let _ = view.unminimize();
+            crate::raise_window(&view);
+            return;
+        }
+        build_files_window(&app_for_thread, &label, files_url(&peer, "", false));
+    });
+    if let Err(error) = queued {
+        tracing::warn!(%error, "cannot reach the main thread to open a file manager");
+    }
+}
+
+/// The file manager page for one session. `standalone` is a window that is
+/// the whole session, whose close ends it; otherwise it sits beside a view.
+fn files_url(peer_label: &str, host_label: &str, standalone: bool) -> String {
+    // Hex labels only, as for the view window: nothing to escape (§15).
+    format!(
+        "{FILES_PAGE}?peer={peer_label}&host={host_label}&standalone={}",
+        u8::from(standalone)
+    )
+}
+
+/// Builds one file manager window. Called on the main thread.
+///
+/// Native drag and drop stays on — it is Tauri's default and what lets a file
+/// dragged in from the desktop arrive with its path — which is also why the
+/// page moves entries between its own panes with pointer events rather than
+/// the HTML drag events that handler swallows on Windows.
+fn build_files_window(app: &tauri::AppHandle, label: &str, url: String) {
+    let built = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
+        .title("Lumepeer — files")
+        .inner_size(FILES_WINDOW_WIDTH, FILES_WINDOW_HEIGHT)
+        .min_inner_size(FILES_WINDOW_MIN_WIDTH, FILES_WINDOW_MIN_HEIGHT)
+        .resizable(true)
+        .build();
+    match built {
+        Ok(window) => {
+            crate::raise_window(&window);
+            tracing::info!(window = %label, "file manager window opened");
+        }
+        Err(error) => {
+            tracing::warn!(window = %label, %error, "cannot open the file manager window");
+        }
     }
 }
 

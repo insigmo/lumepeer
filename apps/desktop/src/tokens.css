@@ -1,0 +1,175 @@
+/* Design tokens shared by every window that follows the app's theme: the
+   main window (app.css) and the file manager (files.css; ADR 0124). Light on
+   :root, dark under `prefers-color-scheme: dark`, and `data-theme` on <html>
+   (theme.ts) overriding the system either way (ADR 0117). A colour written
+   anywhere else is a colour that will be wrong in one of the two themes. */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces, from the back of the window to the front. */
+  --bg: #ffffff;
+  --surface-1: #f6f7f9;
+  --surface-2: #eff1f5;
+  --surface-3: #e6e9ef;
+  --raised: #ffffff;
+  --group-bg: #f8f9fb;
+  --control-bg: #ffffff;
+  --hover: rgb(15 23 42 / 5%);
+  --hover-strong: rgb(15 23 42 / 9%);
+
+  --border: #e3e7ed;
+  --border-strong: #cdd3dc;
+
+  --text: #0b1220;
+  --text-2: #4b5568;
+  --text-3: #667085;
+  --text-disabled: #9aa1b1;
+
+  --accent: #3564e4;
+  --accent-hover: #2b55d0;
+  --accent-text: #2b55d0;
+  --accent-soft: #edf2fe;
+  --accent-soft-strong: #dfe8fd;
+  --accent-ring: rgb(53 100 228 / 26%);
+  --on-accent: #ffffff;
+  --selection: rgb(53 100 228 / 20%);
+
+  --green: #2fb57a;
+  --green-soft: #e8f7f0;
+  --green-text: #11774c;
+  --red: #d63345;
+  --red-soft: #fdeef0;
+  --danger-solid: #d63345;
+  --amber: #9a5b00;
+  --amber-dot: #e39b17;
+  --amber-soft: #fdf4e3;
+
+  --switch-off: #cdd3dc;
+  --scrollbar: rgb(15 23 42 / 18%);
+  --logo-ring: transparent;
+
+  --shadow-sm: 0 1px 2px rgb(16 24 40 / 6%);
+  --shadow-md: 0 6px 16px -4px rgb(16 24 40 / 12%), 0 2px 4px -2px rgb(16 24 40 / 6%);
+  --shadow-lg: 0 28px 56px -12px rgb(16 24 40 / 30%), 0 0 0 1px rgb(16 24 40 / 4%);
+  --scrim: rgb(11 18 32 / 42%);
+
+  --radius-sm: 6px;
+  --radius: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --font-ui:
+    'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, 'Helvetica Neue',
+    Arial, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  --fs-micro: 12px;
+  --fs-body: 13px;
+  --fs-emphasis: 15px;
+  --fs-display: 22px;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* The dark palette, twice: once for "follow the system" and once for an
+   explicit choice. CSS has no way to share a declaration block between a
+   media query and a selector, and the duplication is the price of needing no
+   script to track the system's setting. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --bg: #13161c;
+    --surface-1: #0e1115;
+    --surface-2: #1b1f27;
+    --surface-3: #242a34;
+    --raised: #191d25;
+    --group-bg: #1d2129;
+    --control-bg: #20252e;
+    --hover: rgb(255 255 255 / 6%);
+    --hover-strong: rgb(255 255 255 / 10%);
+
+    --border: #272c36;
+    --border-strong: #373e4b;
+
+    --text: #e9ecf2;
+    --text-2: #aab1bf;
+    --text-3: #8d95a5;
+    --text-disabled: #5e6676;
+
+    --accent: #3d6be6;
+    --accent-hover: #4a77ee;
+    --accent-text: #8aa9ff;
+    --accent-soft: rgb(79 123 240 / 15%);
+    --accent-soft-strong: rgb(79 123 240 / 24%);
+    --accent-ring: rgb(110 145 245 / 40%);
+    --selection: rgb(110 145 245 / 35%);
+
+    --green: #3ccf8e;
+    --green-soft: rgb(60 207 142 / 13%);
+    --green-text: #62dca5;
+    --red: #ff6d7b;
+    --red-soft: rgb(255 109 123 / 13%);
+    --amber: #f2b441;
+    --amber-dot: #f2b441;
+    --amber-soft: rgb(242 180 65 / 13%);
+
+    --switch-off: #3a414e;
+    --scrollbar: rgb(255 255 255 / 16%);
+    --logo-ring: rgb(255 255 255 / 9%);
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+    --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
+    --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
+    --scrim: rgb(3 5 9 / 62%);
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #13161c;
+  --surface-1: #0e1115;
+  --surface-2: #1b1f27;
+  --surface-3: #242a34;
+  --raised: #191d25;
+  --group-bg: #1d2129;
+  --control-bg: #20252e;
+  --hover: rgb(255 255 255 / 6%);
+  --hover-strong: rgb(255 255 255 / 10%);
+
+  --border: #272c36;
+  --border-strong: #373e4b;
+
+  --text: #e9ecf2;
+  --text-2: #aab1bf;
+  --text-3: #8d95a5;
+  --text-disabled: #5e6676;
+
+  --accent: #3d6be6;
+  --accent-hover: #4a77ee;
+  --accent-text: #8aa9ff;
+  --accent-soft: rgb(79 123 240 / 15%);
+  --accent-soft-strong: rgb(79 123 240 / 24%);
+  --accent-ring: rgb(110 145 245 / 40%);
+  --selection: rgb(110 145 245 / 35%);
+
+  --green: #3ccf8e;
+  --green-soft: rgb(60 207 142 / 13%);
+  --green-text: #62dca5;
+  --red: #ff6d7b;
+  --red-soft: rgb(255 109 123 / 13%);
+  --amber: #f2b441;
+  --amber-dot: #f2b441;
+  --amber-soft: rgb(242 180 65 / 13%);
+
+  --switch-off: #3a414e;
+  --scrollbar: rgb(255 255 255 / 16%);
+  --logo-ring: rgb(255 255 255 / 9%);
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
+  --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
+  --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
+  --scrim: rgb(3 5 9 / 62%);
+}

@@ -30,7 +30,7 @@ use lumepeer_core::constants::{
     FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS,
     FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
     MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
-    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
+    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
     MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, REBOOT_WAIT_CEILING_SECS,
     REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
     RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
@@ -46,12 +46,13 @@ use lumepeer_core::protocol::{
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
     FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
     FEATURE_TERMINAL, FEATURE_TUNNEL, FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF,
-    FileFetchRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
+    FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
     MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode, TerminalRefusal,
     TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path,
+    split_entry_path,
 };
 use lumepeer_core::session::{ReconnectDecision, SessionManager, SessionState, TunnelTarget};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -87,7 +88,7 @@ use crate::unattended_store::UnattendedStore;
 use crate::view::{
     BITSTREAM_POLL_TIMEOUT_MS, BitstreamFeed, CursorFeed, DecodePath, EncodeControl, HostMedia,
     MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
-    ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response, lock_capture,
+    ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response, lock_capture,
     slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
@@ -170,6 +171,15 @@ const FILE_MANAGE_MINOR: u16 = 13;
 /// guest to read; a minor is announced by both sides, and the size ceiling is
 /// a thing each side has to know about the other before it offers anything.
 const DIR_TRANSFER_MINOR: u16 = 14;
+
+/// First `PROTOCOL_MINOR` that carries `MessageKind::FileOpRequest` and
+/// `MessageKind::FileOpResult` (ADR 0124).
+///
+/// Guest side only. The host needs no feature string to answer: the result
+/// only ever follows a request, and a guest that could encode the request can
+/// decode the answer. The guest is the side that must not send what the far
+/// side cannot read, and a minor is all `HelloAck` gives it to go on.
+const FILE_OPS_MINOR: u16 = 20;
 
 /// First `PROTOCOL_MINOR` that carries the three tunnel messages (ADR 0078).
 ///
@@ -1120,7 +1130,45 @@ pub struct RemoteFileStatus {
     pub listing: Option<DirListing>,
     /// Why the last download was refused, if one was.
     pub fetch_refused: Option<FileFetchRefusal>,
+    /// How many downloads the host has refused in this session (ADR 0124).
+    ///
+    /// A count rather than the last reason alone, because a file manager
+    /// queueing several downloads has to tell a refusal of the one it just
+    /// asked for from the refusal before it that is still on the view.
+    pub fetches_refused: u32,
+    /// How many uploads went nowhere in this session: declined by the host,
+    /// or never offered because the local file could not be read or was too
+    /// large (ADR 0124). Counted for the same reason `fetches_refused` is —
+    /// an upload that fails has no row of its own to say so.
+    pub uploads_refused: u32,
+    /// The answers to this view's file operations, oldest first, at most
+    /// [`FILE_OP_RESULTS_KEPT`] of them (ADR 0124).
+    pub op_results: Vec<FileOpOutcome>,
+    /// How many listings the host has answered in this session (ADR 0124).
+    ///
+    /// `listing` alone cannot say whether it is the answer to the request a
+    /// window just made or the one before it — a refresh asks for the same
+    /// path again — so a window notes this before it asks and waits for it
+    /// to move.
+    pub listings_answered: u32,
 }
+
+/// How one file operation this node asked a host for went (ADR 0124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileOpOutcome {
+    /// The id [`ActorHandle::remote_file_op`] returned for it.
+    pub id: u32,
+    /// Why it did not happen, or `None` when it did.
+    pub refused: Option<FileOpRefusal>,
+}
+
+/// How many file-operation answers a view keeps for its window to read
+/// (ADR 0124).
+///
+/// The window polls once a second and asks for at most a handful at a time,
+/// so this is headroom, not a queue: an answer older than the last
+/// sixty-four is one nothing is still waiting for.
+pub const FILE_OP_RESULTS_KEPT: usize = 64;
 
 /// Reply type of [`ActorCommand::DisplayModesList`] (docs/bugs/
 /// 16-host-display-mode.md #2; ADR 0048): the modes, empty exactly when the
@@ -1133,6 +1181,19 @@ enum ActorCommand {
     Status {
         reply: oneshot::Sender<Vec<SessionSnapshot>>,
     },
+    /// Guest side: ask the watched host to change something on its disk
+    /// (ADR 0124). Answers with the id the result will carry.
+    RemoteFileOp {
+        label: String,
+        op: FileOp,
+        reply: oneshot::Sender<Result<u32, ActorError>>,
+    },
+    /// Guest side: the session label of the window this node has open onto
+    /// the remembered host `host`, if it has one (ADR 0124).
+    WatchingHost {
+        host: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
     /// Hosts this node has connected to before (§21 punch-list item 5).
     History {
         reply: oneshot::Sender<Vec<HistoryEntry>>,
@@ -1141,11 +1202,12 @@ enum ActorCommand {
     /// history row kept. The code never leaves the Rust side (§13).
     HistoryConnect {
         label: String,
-        /// Whether this connect is for a shell and nothing else (ADR 0101).
-        /// The session and the role are the ordinary ones; what changes is
-        /// that the guest never dials `rd/media/1`, so the host never builds
-        /// an encoder, reads a frame or puts a picture on the wire.
-        terminal_only: bool,
+        /// What the window this connect opens will have in it (ADR 0101,
+        /// ADR 0124). The session and the role are the ordinary ones; for a
+        /// shell or the file manager what changes is that the guest never
+        /// dials `rd/media/1`, so the host never builds an encoder, reads a
+        /// frame or puts a picture on the wire.
+        surface: ViewSurface,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Guest side: forget a remembered host (docs/bugs/03-connection-list.md,
@@ -1652,13 +1714,13 @@ impl ActorHandle {
     pub async fn history_connect(
         &self,
         label: String,
-        terminal_only: bool,
+        surface: ViewSurface,
     ) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::HistoryConnect {
                 label,
-                terminal_only,
+                surface,
                 reply,
             })
             .await
@@ -2714,6 +2776,47 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: asks the watched host to make a directory, rename an
+    /// entry or delete one (ADR 0124).
+    ///
+    /// Fire and forget like [`Self::remote_download`]: the answer arrives as
+    /// a `FileOpResult` and is read back through [`Self::dir_listing`], under
+    /// the id this returns.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
+    /// [`ActorError::Unsupported`] towards a host too old to understand the
+    /// message; [`ActorError::Core`] with `Malformed` when a path or a name
+    /// is not one the host would accept; [`ActorError::ChannelClosed`] if the
+    /// actor is gone.
+    pub async fn remote_file_op(&self, label: String, op: FileOp) -> Result<u32, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::RemoteFileOp { label, op, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: the session label of the window this node has open onto
+    /// the remembered host `host`, or `None` when it is not watching that
+    /// host right now (ADR 0124).
+    ///
+    /// What lets "File manager" on a remembered host open a window onto the
+    /// session that is already running instead of dialling a second one,
+    /// which the host would refuse as a duplicate anyway.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn watching_host(&self, host: String) -> Result<Option<String>, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::WatchingHost { host, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
     }
 
     /// Guest side: the watched host's own physical display modes, as it last
@@ -4136,6 +4239,15 @@ struct ViewState {
     /// (ADR 0076). Cleared when the next download is asked for, so the panel
     /// never shows a refusal from two directories ago.
     fetch_refused: Option<FileFetchRefusal>,
+    /// How many downloads the host has refused in this session (ADR 0124).
+    fetches_refused: u32,
+    /// How many uploads went nowhere in this session (ADR 0124).
+    uploads_refused: u32,
+    /// The answers to this view's file operations, oldest first, at most
+    /// [`FILE_OP_RESULTS_KEPT`] (ADR 0124).
+    file_op_results: VecDeque<FileOpOutcome>,
+    /// How many listings the host has answered in this session (ADR 0124).
+    listings_answered: u32,
     /// Single-slot newest picture plus pipeline health. Dropping this receiver
     /// is also how the media task learns the view is gone.
     slot: watch::Receiver<ViewSlot>,
@@ -4149,10 +4261,10 @@ struct ViewState {
     /// The `rd/media/1` receive task, or `None` for a terminal session, which
     /// has no media connection to receive over (ADR 0101).
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Whether this window is a shell and nothing else (ADR 0101). Read by
-    /// the reconnect wait, so a session that drops comes back as the kind it
-    /// was rather than as a screen one.
-    terminal_only: bool,
+    /// What this window has in it (ADR 0101, ADR 0124). Read by the
+    /// reconnect wait, so a session that drops comes back as the kind it was
+    /// rather than as a screen one.
+    surface: ViewSurface,
     /// The media connection the picture rides. Written by the media task
     /// once dialed, read by the mic toggle; `None` until the first dial
     /// lands and after the media task ends.
@@ -4309,6 +4421,13 @@ enum ActorEvent {
         /// sent on the wire (§15), kept so an accept can be traced back to
         /// the file it named.
         paths: Vec<std::path::PathBuf>,
+    },
+    /// Host side: a file operation a guest asked for ran off the actor loop
+    /// (ADR 0124).
+    FileOpDone {
+        peer: NodeId,
+        id: u32,
+        refused: Option<FileOpRefusal>,
     },
     /// Host side: a file a guest asked for was measured and hashed off the
     /// actor loop, and can now be offered back to it (ADR 0076).
@@ -5097,6 +5216,13 @@ struct Actor {
     /// three times before the first offer exists and put three full disk
     /// passes on the host (ADR 0076).
     fetch_preparing: std::collections::HashMap<NodeId, usize>,
+    /// Host side: file operations running for each guest right now, bounded
+    /// by `MAX_FILE_OPS_IN_FLIGHT` (ADR 0124).
+    file_ops_in_flight: std::collections::HashMap<NodeId, usize>,
+    /// Guest side: the id the next file operation this node asks for gets
+    /// (ADR 0124). One counter for every host: an id only has to be unique
+    /// among the answers one view keeps.
+    next_file_op_id: u32,
     /// Host side: peers whose `Hello` advertised `FEATURE_FILE_BROWSE`, and
     /// which may therefore be answered with a `DirListResponse` (ADR 0075).
     speaks_file_browse: std::collections::HashSet<NodeId>,
@@ -5355,8 +5481,9 @@ struct Actor {
     /// flight and a session being resumed are two different peers as far as
     /// this is concerned; emptied by `stop_view` and by a connect that ends
     /// without a session, so a later ordinary Connect to the same host is an
-    /// ordinary one.
-    pending_terminal_only: std::collections::HashSet<NodeId>,
+    /// ordinary one. Only ever holds a surface without a picture: a screen
+    /// session is what a peer missing from here means (ADR 0124).
+    pending_surface: std::collections::HashMap<NodeId, ViewSurface>,
     /// Whether this process holds the machine's host role and may admit
     /// guests at all (ADR 0085 §4).
     ///
@@ -5435,14 +5562,14 @@ struct ReconnectWait {
     /// Which dial that is, so its result is recognised as this wait's
     /// whatever the connect form is showing by then (ADR 0119).
     dial_seq: u64,
-    /// Whether the session that went away was a shell and nothing else
-    /// (ADR 0101).
+    /// What the session that went away had in its window (ADR 0101,
+    /// ADR 0124).
     ///
     /// Carried here because `stop_view` has already taken the intent out of
-    /// `pending_terminal_only` by the time this wait is armed, and a session
-    /// that came back as a screen one would start an encode loop on the host
-    /// that nobody asked for.
-    terminal_only: bool,
+    /// `pending_surface` by the time this wait is armed, and a session that
+    /// came back as a screen one would start an encode loop on the host that
+    /// nobody asked for.
+    surface: ViewSurface,
 }
 
 /// Guest side: the view window of a session that lost its link, held open
@@ -6348,6 +6475,127 @@ impl Actor {
         self.send_to(&peer, MessageKind::FileFetchRefused { reason });
     }
 
+    /// Guest side: one more upload to `peer` went nowhere (ADR 0124).
+    ///
+    /// Counted on the view rather than reported per upload, because the
+    /// messages that carry the refusal — `FileAccept(false)`,
+    /// `DirAccept(false)` — name no file, and neither does a local file that
+    /// could not be read. The window only needs to know that the upload it is
+    /// waiting on is not coming.
+    fn count_upload_refused(&mut self, peer: &NodeId) {
+        if let Some(view) = self.views.get_mut(peer) {
+            view.uploads_refused = view.uploads_refused.wrapping_add(1);
+        }
+    }
+
+    /// Host side: a guest asked to make a directory, rename an entry or
+    /// delete one on this machine (§9.2; ADR 0124).
+    ///
+    /// The same authorization a put has — `file_browse` and `file_transfer`,
+    /// both re-read here — and the same path parser, with one more refusal:
+    /// a root is not an entry of anything, so it can be neither renamed nor
+    /// deleted. The disk is touched on a blocking thread, never on this one:
+    /// a delete of a large tree is seconds of the host's disk, and the answer
+    /// lands back as [`ActorEvent::FileOpDone`].
+    fn on_file_op_request(&mut self, peer: NodeId, id: u32, op: FileOp) {
+        let tag = self.label_of(&peer);
+        let action = match op {
+            FileOp::MakeDir { .. } => "file_make_dir",
+            FileOp::Rename { .. } => "file_rename",
+            FileOp::Delete { .. } => "file_delete",
+        };
+        // Audited before the grants are read, exactly as a fetch is: what §15
+        // wants recorded is that this peer asked to change this machine's
+        // disk, and a refused request is as much of that as a served one.
+        tracing::info!(peer = %tag, action, "a guest asked the host to change a file");
+        self.audit(
+            &peer,
+            lumepeer_core::audit::AuditEvent::FileAction { action },
+        );
+        if !self.may_fetch_or_put(&peer) {
+            tracing::warn!(peer = %tag, "a file operation without live browse and transfer grants; refused");
+            self.send_file_op_result(peer, id, Some(FileOpRefusal::NotGranted));
+            return;
+        }
+        let in_flight = self.file_ops_in_flight.get(&peer).copied().unwrap_or(0);
+        if in_flight >= MAX_FILE_OPS_IN_FLIGHT {
+            tracing::warn!(peer = %tag, "a file operation past the in-flight bound; refused");
+            self.send_file_op_result(peer, id, Some(FileOpRefusal::Busy));
+            return;
+        }
+        let Some(plan) = FileOpPlan::from_wire(&op) else {
+            tracing::warn!(peer = %tag, "a file operation on a path that is not one; refused");
+            self.send_file_op_result(peer, id, Some(FileOpRefusal::BadPath));
+            return;
+        };
+        *self.file_ops_in_flight.entry(peer).or_default() += 1;
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let refused = tokio::task::spawn_blocking(move || plan.run())
+                .await
+                .unwrap_or(Some(FileOpRefusal::Failed));
+            let _ = events
+                .send(ActorEvent::FileOpDone { peer, id, refused })
+                .await;
+        });
+    }
+
+    /// Host side: a file operation finished, one way or the other
+    /// (ADR 0124).
+    fn on_file_op_done(&mut self, peer: NodeId, id: u32, refused: Option<FileOpRefusal>) {
+        if let Some(count) = self.file_ops_in_flight.get_mut(&peer) {
+            *count = count.saturating_sub(1);
+        }
+        if refused.is_some() {
+            tracing::info!(peer = %self.label_of(&peer), ?refused, "a file operation did not happen");
+        }
+        self.send_file_op_result(peer, id, refused);
+    }
+
+    /// Host side: the one answer every file operation gets (§18; ADR 0124).
+    fn send_file_op_result(&mut self, peer: NodeId, id: u32, refused: Option<FileOpRefusal>) {
+        self.send_to(&peer, MessageKind::FileOpResult { id, refused });
+    }
+
+    /// Guest side: asks the watched host for a file operation (ADR 0124).
+    ///
+    /// Everything the host is certain to refuse is refused here instead, the
+    /// way [`Self::on_remote_download`] refuses a path before it is sent —
+    /// never as a substitute for the host's own checks, which run again when
+    /// the request lands.
+    fn on_remote_file_op(&mut self, label: &str, op: FileOp) -> Result<u32, ActorError> {
+        let peer = self.resolve(label)?;
+        if !self.views.contains_key(&peer) {
+            return Err(ActorError::UnknownPeer);
+        }
+        if !self
+            .connections
+            .get(&peer)
+            .is_some_and(|c| c.peer_minor >= FILE_OPS_MINOR)
+        {
+            return Err(ActorError::Unsupported);
+        }
+        if FileOpPlan::from_wire(&op).is_none() {
+            return Err(ActorError::Core(CoreError::Malformed));
+        }
+        let id = self.next_file_op_id;
+        self.next_file_op_id = self.next_file_op_id.wrapping_add(1).max(1);
+        self.send_to(&peer, MessageKind::FileOpRequest { id, op });
+        Ok(id)
+    }
+
+    /// Guest side: the host answered a file operation (ADR 0124).
+    fn on_file_op_result(&mut self, peer: NodeId, id: u32, refused: Option<FileOpRefusal>) {
+        let Some(view) = self.views.get_mut(&peer) else {
+            return;
+        };
+        if view.file_op_results.len() >= FILE_OP_RESULTS_KEPT {
+            view.file_op_results.pop_front();
+        }
+        view.file_op_results.push_back(FileOpOutcome { id, refused });
+        let _ = self.notify.send(ActorNotification::FileTransferChanged);
+    }
+
     /// Host side: a fetched file finished being measured and hashed, and can
     /// now be offered to the guest that asked for it (ADR 0076).
     fn on_fetch_prepared(
@@ -6484,6 +6732,7 @@ impl Actor {
         }
         if let Some(view) = self.views.get_mut(&peer) {
             view.fetch_refused = Some(reason);
+            view.fetches_refused = view.fetches_refused.wrapping_add(1);
         }
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
@@ -6508,16 +6757,19 @@ impl Actor {
                 .unwrap_or(false)
         {
             tracing::warn!(peer = %tag, "dropping a prepared upload");
+            self.count_upload_refused(&peer);
             return;
         }
         let Ok((name, size, hash)) = prepared else {
             // The path is this machine's own and stays out of the log, like
             // every other file name (§15).
             tracing::warn!(peer = %tag, "a local file could not be offered for upload");
+            self.count_upload_refused(&peer);
             return;
         };
         if size > self.offer_ceiling_for(&peer) {
             tracing::warn!(peer = %tag, "an upload is larger than that host accepts; not offered");
+            self.count_upload_refused(&peer);
             return;
         }
         self.file_offers_out
@@ -6599,11 +6851,17 @@ impl Actor {
         // grant to be withdrawn in the middle of it (§2.3).
         if !self.may_transfer_files(&peer) || !self.may_offer_directory(&peer) {
             tracing::warn!(peer = %tag, "dropping a walked directory");
+            if dir.is_some() {
+                self.count_upload_refused(&peer);
+            }
             return;
         }
         let Ok(walked) = walked else {
             // The path is this machine's own and stays out of the log (§15).
             tracing::warn!(peer = %tag, "a directory could not be walked and was not offered");
+            if dir.is_some() {
+                self.count_upload_refused(&peer);
+            }
             return;
         };
         if walked.skipped_links > 0 {
@@ -6616,6 +6874,9 @@ impl Actor {
         let ceiling = self.offer_ceiling_for(&peer);
         if walked.entries.iter().any(|entry| entry.size > ceiling) {
             tracing::warn!(peer = %tag, "a file in that directory is larger than the peer accepts");
+            if dir.is_some() {
+                self.count_upload_refused(&peer);
+            }
             return;
         }
         self.dir_offers_out.insert(
@@ -6828,6 +7089,7 @@ impl Actor {
         };
         if !accepted {
             self.audit_file(&peer, "directory-offer-refused");
+            self.count_upload_refused(&peer);
             let _ = self.notify.send(ActorNotification::FileTransferChanged);
             return;
         }
@@ -8624,6 +8886,9 @@ impl Actor {
             ActorEvent::ClipboardFilesRead { peer, files, paths } => {
                 self.on_clipboard_files_read(peer, files, paths);
             }
+            ActorEvent::FileOpDone { peer, id, refused } => {
+                self.on_file_op_done(peer, id, refused);
+            }
             ActorEvent::FetchPrepared {
                 peer,
                 path,
@@ -8971,9 +9236,9 @@ impl Actor {
         // The one read of what the dial asked for (ADR 0101). Taken rather
         // than copied: the intent belongs to this window from here on, and a
         // later Connect to the same host must start from nothing.
-        let terminal_only = self.pending_terminal_only.remove(&peer);
+        let surface = self.pending_surface.remove(&peer).unwrap_or_default();
         let dialer = self.host_dialers.get(&peer).cloned();
-        if dialer.is_none() && !terminal_only {
+        if dialer.is_none() && surface.has_picture() {
             tracing::warn!(peer = %tag, "no remembered address for this host: cannot open media");
             return;
         }
@@ -8998,7 +9263,7 @@ impl Actor {
         // `ViewSlot::waiting()` for the life of the window, which the frame
         // poll answers with no picture.
         let task = match dialer {
-            Some(dialer) if !terminal_only => Some(spawn_media_receiver(
+            Some(dialer) if surface.has_picture() => Some(spawn_media_receiver(
                 MediaTarget {
                     dialer,
                     peer,
@@ -9061,24 +9326,29 @@ impl Actor {
                 display_modes_reason: None,
                 dir_list_asked: None,
                 fetch_refused: None,
+                fetches_refused: 0,
+                uploads_refused: 0,
+                file_op_results: VecDeque::new(),
+                listings_answered: 0,
                 dir_listing: None,
                 slot: slot_rx,
                 slot_tx,
                 task,
                 media_connection,
-                terminal_only,
+                surface,
             },
         );
-        // `input: false` for a terminal session even under full control: the
-        // window has no picture to map a pointer onto, and the grab of
-        // ADR 0090 would take this desktop's chords away from the person
-        // using it for a window that has nothing to send them to (ADR 0101).
+        // `input: false` for a terminal or file-manager session even under
+        // full control: the window has no picture to map a pointer onto, and
+        // the grab of ADR 0090 would take this desktop's chords away from the
+        // person using it for a window that has nothing to send them to
+        // (ADR 0101, ADR 0124).
         self.windows.open(
             &label,
             &tag,
             &host_tag(&peer),
-            grants.input && !terminal_only,
-            terminal_only,
+            grants.input && surface.has_picture(),
+            surface,
         );
         self.rebuild_labels_and_snapshot();
         // A fresh entry in `self.views` is one of the two reasons the
@@ -9118,7 +9388,7 @@ impl Actor {
         // Whether or not a view was open: a dial that never reached one has
         // an intent recorded against it, and this is one of the two places
         // that ends (ADR 0101).
-        self.pending_terminal_only.remove(&peer);
+        self.pending_surface.remove(&peer);
         let Some(mut state) = self.views.remove(&peer) else {
             return;
         };
@@ -9220,7 +9490,7 @@ impl Actor {
         // (ADR 0101), and it is answered here rather than acted on: this
         // window was built for one kind of session and its URL cannot change,
         // so the window is what decides which kind came back.
-        self.pending_terminal_only.remove(&peer);
+        self.pending_surface.remove(&peer);
         // The feed's own bitstream, not a new one: this window has been
         // polling that queue all along, and `park_view` already told it the
         // stream broke, so it is waiting for exactly the intra frame the
@@ -9236,7 +9506,7 @@ impl Actor {
         state.grants = grants;
         state.input.store(grants.input, Ordering::Relaxed);
         state.task = match (dialer, bitstream) {
-            (Some(dialer), Some(bitstream)) if !state.terminal_only => Some(spawn_media_receiver(
+            (Some(dialer), Some(bitstream)) if state.surface.has_picture() => Some(spawn_media_receiver(
                 MediaTarget {
                     dialer,
                     peer,
@@ -9250,7 +9520,7 @@ impl Actor {
             )),
             _ => None,
         };
-        if state.task.is_none() && !state.terminal_only {
+        if state.task.is_none() && state.surface.has_picture() {
             // No address to dial media over, and no feed to dial it into.
             // The session is back but its picture is not, and the window
             // saying "reconnecting" over a frozen frame for good would be a
@@ -9260,10 +9530,10 @@ impl Actor {
             self.close_parked_view(peer);
             return;
         }
-        if state.terminal_only {
-            // Nothing will ever move a terminal window's status off
-            // `Reconnecting`: it has no media task, and never had one
-            // (ADR 0101).
+        if !state.surface.has_picture() {
+            // Nothing will ever move a terminal or file-manager window's
+            // status off `Reconnecting`: it has no media task, and never had
+            // one (ADR 0101, ADR 0124).
             state
                 .slot_tx
                 .send_modify(|slot| slot.status = ViewStatus::Waiting);
@@ -9386,7 +9656,7 @@ impl Actor {
         }
         // No session came of this dial, so neither does the kind of session it
         // was asking for (ADR 0101).
-        self.pending_terminal_only.remove(&peer);
+        self.pending_surface.remove(&peer);
         self.connect_phase = if self.connect_phase.is_pending() {
             outcome
         } else {
@@ -10477,6 +10747,7 @@ impl Actor {
                         truncated,
                         refused,
                     });
+                    view.listings_answered = view.listings_answered.wrapping_add(1);
                 }
             }
             // Host side: the guest named a file on this machine and asked
@@ -10513,6 +10784,16 @@ impl Actor {
             }
             // Either side: the answer to a directory this node offered.
             MessageKind::DirAccept(accepted) => self.on_dir_accept_inbound(peer, accepted),
+            // Host side: the guest asked for a change to this machine's disk
+            // (ADR 0124).
+            MessageKind::FileOpRequest { id, ref op } => {
+                let op = op.clone();
+                self.on_file_op_request(peer, id, op);
+            }
+            // Guest side: how one of those went.
+            MessageKind::FileOpResult { id, refused } => {
+                self.on_file_op_result(peer, id, refused);
+            }
             // Host side: the guest asked for a connection to an address
             // (ADR 0078).
             MessageKind::TunnelOpenRequest {
@@ -10873,6 +11154,7 @@ impl Actor {
         self.close_terminal(peer, "terminal-closed-session-ended");
         self.fetches_out.remove(&peer);
         self.fetch_preparing.remove(&peer);
+        self.file_ops_in_flight.remove(&peer);
         // Link measurements belong to the connection that produced them: a
         // later connection to the same device measures its own path, and must
         // not inherit a round trip taken over one that no longer exists.
@@ -10918,10 +11200,10 @@ impl Actor {
         // Read here for the same reason `was_watching` is: `stop_view` below
         // takes the view away, and the wait armed after it has to know which
         // kind of session to bring back (ADR 0101).
-        let was_terminal_only = self
+        let was_surface = self
             .views
             .get(&peer)
-            .is_some_and(|state| state.terminal_only);
+            .map_or(ViewSurface::Screen, |state| state.surface);
         // A connection that ends before it was ever granted, while this node
         // was resuming over it, is the host saying no (ADR 0089): it closes a
         // claim it will not honour instead of asking anyone.
@@ -10967,7 +11249,7 @@ impl Actor {
             self.stop_view(peer);
         }
         if was_watching {
-            self.start_reconnect_wait(peer, host_tag(&peer), resume, was_terminal_only);
+            self.start_reconnect_wait(peer, host_tag(&peer), resume, was_surface);
         } else if resume_refused {
             self.on_resume_refused(peer);
         } else if resuming_over_this {
@@ -11016,11 +11298,11 @@ impl Actor {
             }
             ActorCommand::HistoryConnect {
                 label,
-                terminal_only,
+                surface,
                 reply,
             } => {
                 let result = match self.history.code_of(&label).map(ToOwned::to_owned) {
-                    Some(code) => self.spawn_dial_as(&code, None, terminal_only),
+                    Some(code) => self.spawn_dial_as(&code, None, surface),
                     None => Err(ActorError::UnknownPeer),
                 };
                 if let Err(ActorError::Net(ref error)) = result {
@@ -11323,6 +11605,17 @@ impl Actor {
                 reply,
             } => {
                 let _ = reply.send(self.on_remote_upload(&label, &local_path, &remote_dir));
+            }
+            ActorCommand::RemoteFileOp { label, op, reply } => {
+                let _ = reply.send(self.on_remote_file_op(&label, op));
+            }
+            ActorCommand::WatchingHost { host, reply } => {
+                let watching = self
+                    .views
+                    .keys()
+                    .find(|peer| host_tag(peer) == host)
+                    .map(|peer| self.label_of(peer));
+                let _ = reply.send(watching);
             }
             ActorCommand::DisplaySetMode {
                 label,
@@ -11840,6 +12133,10 @@ impl Actor {
         Ok(RemoteFileStatus {
             listing: view.dir_listing.clone(),
             fetch_refused: view.fetch_refused,
+            fetches_refused: view.fetches_refused,
+            uploads_refused: view.uploads_refused,
+            op_results: view.file_op_results.iter().copied().collect(),
+            listings_answered: view.listings_answered,
         })
     }
 
@@ -13539,6 +13836,7 @@ impl Actor {
         };
         if !accepted {
             self.audit_file(&peer, "offer-refused");
+            self.count_upload_refused(&peer);
             let _ = self.notify.send(ActorNotification::FileTransferChanged);
             return;
         }
@@ -14493,7 +14791,7 @@ impl Actor {
         self.connect_retry_secs = None;
         self.pending_remember = None;
         self.connect_credentials_auto = false;
-        self.pending_terminal_only.remove(&peer);
+        self.pending_surface.remove(&peer);
     }
 
     /// Guest side: answers the host's credential challenge (§8; ADR 0033).
@@ -14815,7 +15113,7 @@ impl Actor {
         peer: NodeId,
         host_tag: String,
         resume: Option<[u8; 16]>,
-        terminal_only: bool,
+        surface: ViewSurface,
     ) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
@@ -14829,7 +15127,7 @@ impl Actor {
                 resume,
                 dialing: false,
                 dial_seq: 0,
-                terminal_only,
+                surface,
             },
         );
         // A goodbye still owed to an earlier session with this host is moot:
@@ -14935,7 +15233,7 @@ impl Actor {
             return true;
         };
         if let Err(ActorError::Net(ref error)) =
-            self.spawn_dial_as(&code, wait.resume, wait.terminal_only)
+            self.spawn_dial_as(&code, wait.resume, wait.surface)
         {
             tracing::debug!(%error, "the host is not reachable yet");
         }
@@ -15137,11 +15435,15 @@ impl Actor {
         // `Dialing` again — set by `spawn_dial` or by `retry_connect_soon` —
         // before anything else can read it.
         self.connect_phase = ConnectPhase::Idle;
-        // The round before it asked for a shell, so this one does too: the
-        // rounds of ADR 0096 are one connect, not several (ADR 0101).
-        let terminal_only = self.pending_terminal_only.contains(&retry.peer);
-        if let Err(ActorError::Net(ref error)) =
-            self.spawn_dial_as(&retry.code, None, terminal_only)
+        // The round before it asked for a shell or the file manager, so this
+        // one does too: the rounds of ADR 0096 are one connect, not several
+        // (ADR 0101, ADR 0124).
+        let surface = self
+            .pending_surface
+            .get(&retry.peer)
+            .copied()
+            .unwrap_or_default();
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&retry.code, None, surface)
         {
             // Nothing to escalate: a dial that will not start now is one this
             // tick's successor starts instead.
@@ -15412,7 +15714,7 @@ impl Actor {
         };
         // A dial that fails here is the ordinary case, not an error: the host
         // is mid-restart and not listening yet. The next tick tries again.
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, None, wait.terminal_only)
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, None, wait.surface)
         {
             tracing::debug!(%error, "the host is still away");
         }
@@ -15589,17 +15891,17 @@ impl Actor {
     /// window's frame poll. That is the "the app freezes and then says it
     /// could not connect" report this fixes.
     fn spawn_dial(&mut self, raw: &str) -> Result<(), ActorError> {
-        self.spawn_dial_as(raw, None, false)
+        self.spawn_dial_as(raw, None, ViewSurface::Screen)
     }
 
     /// [`Self::spawn_dial`], resuming the session `resume` names when it names
-    /// one (§10; ADR 0089), and asking for a shell rather than a screen when
-    /// `terminal_only` is set (ADR 0101).
+    /// one (§10; ADR 0089), and asking for a shell (ADR 0101) or the file
+    /// manager (ADR 0124) rather than a screen when `surface` says so.
     fn spawn_dial_as(
         &mut self,
         raw: &str,
         resume: Option<[u8; 16]>,
-        terminal_only: bool,
+        surface: ViewSurface,
     ) -> Result<(), ActorError> {
         let ticket = InviteTicket::from_code(raw).map_err(ActorError::Net)?;
         // The host a ticket names is the one that signed it, or the ticket is
@@ -15702,12 +16004,13 @@ impl Actor {
         }
         // What kind of session this dial is asking for, kept until the host
         // grants and `start_view` reads it (ADR 0101). Cleared rather than
-        // left alone when it is not set: an ordinary Connect to a host this
-        // node opened a shell on earlier must be an ordinary session.
-        if terminal_only {
-            self.pending_terminal_only.insert(addr.id);
+        // left alone for a screen: an ordinary Connect to a host this node
+        // opened a shell or the file manager on earlier must be an ordinary
+        // session.
+        if surface.has_picture() {
+            self.pending_surface.remove(&addr.id);
         } else {
-            self.pending_terminal_only.remove(&addr.id);
+            self.pending_surface.insert(addr.id, surface);
         }
 
         let tx = self.events_tx.clone();
@@ -16333,6 +16636,156 @@ pub fn read_directory(path: &std::path::Path) -> std::io::Result<(Vec<DirEntry>,
         });
     }
     Ok((entries, truncated))
+}
+
+/// A file operation whose paths passed the parser, ready to run on this
+/// machine's disk (ADR 0124).
+///
+/// Built by [`Self::from_wire`], which is the one place the three
+/// operations' paths are judged. The host runs one for a guest that asked,
+/// and the guest's own file manager runs one on its own disk for the local
+/// pane — so a path one pane refuses, the other refuses too, which is the
+/// same reason `local_dir_list` goes through `safe_browse_path` (ADR 0076).
+#[derive(Debug)]
+pub struct FileOpPlan(PlannedOp);
+
+#[derive(Debug)]
+enum PlannedOp {
+    MakeDir(std::path::PathBuf),
+    Rename {
+        from: std::path::PathBuf,
+        to: std::path::PathBuf,
+    },
+    Delete(std::path::PathBuf),
+}
+
+impl FileOpPlan {
+    /// Judges every path and name `op` carries, or refuses the whole thing.
+    ///
+    /// Refused: anything [`safe_browse_path`] refuses; a root, which is not
+    /// an entry of any directory and so can be neither made, renamed nor
+    /// deleted; a new name that is not one plain component. Nothing is
+    /// rewritten into something acceptable — a repaired path is a change to a
+    /// file neither side named.
+    #[must_use]
+    pub fn from_wire(op: &FileOp) -> Option<Self> {
+        let planned = match op {
+            FileOp::MakeDir { path } => {
+                split_entry_path(path)?;
+                PlannedOp::MakeDir(std::path::PathBuf::from(path))
+            }
+            FileOp::Rename { path, name } => {
+                let (directory, _) = split_entry_path(path)?;
+                // `is_safe_component` judges one component someone else
+                // already split out, so a separator is not its to refuse: a
+                // new name carrying one would move the entry, not rename it.
+                if name.contains(['/', '\\']) || !is_safe_component(name) {
+                    return None;
+                }
+                PlannedOp::Rename {
+                    from: std::path::PathBuf::from(path),
+                    to: std::path::Path::new(directory).join(name),
+                }
+            }
+            FileOp::Delete { path } => {
+                split_entry_path(path)?;
+                PlannedOp::Delete(std::path::PathBuf::from(path))
+            }
+        };
+        Some(Self(planned))
+    }
+
+    /// Carries the operation out, and says why not when it could not.
+    ///
+    /// Blocking, and possibly for a long time — a delete of a large tree —
+    /// so the actor only ever calls it from `spawn_blocking`. Nothing here
+    /// follows a symbolic link: a link is renamed or removed as the link it
+    /// is, `remove_dir_all` does not descend through one, and a new directory
+    /// is not made inside a directory that is itself a link, for the reason a
+    /// listing does not open one (ADR 0075).
+    #[must_use]
+    pub fn run(self) -> Option<FileOpRefusal> {
+        match self.0 {
+            PlannedOp::MakeDir(path) => {
+                if std::fs::symlink_metadata(&path).is_ok() {
+                    return Some(FileOpRefusal::Exists);
+                }
+                if path
+                    .parent()
+                    .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+                    .is_some_and(|meta| meta.is_symlink())
+                {
+                    return Some(FileOpRefusal::BadPath);
+                }
+                std::fs::create_dir(&path).err().map(|error| refusal_of(&error))
+            }
+            PlannedOp::Rename { from, to } => {
+                if std::fs::symlink_metadata(&from).is_err() {
+                    return Some(FileOpRefusal::NotFound);
+                }
+                if from == to {
+                    return None;
+                }
+                // `rename` replaces what is already at `to` on every platform
+                // this ships on, so a taken name is refused before it runs —
+                // except for the one case that is not a different entry at
+                // all: a change of case on a filesystem that ignores case.
+                if std::fs::symlink_metadata(&to).is_ok() && !same_entry_other_case(&from, &to) {
+                    return Some(FileOpRefusal::Exists);
+                }
+                std::fs::rename(&from, &to).err().map(|error| refusal_of(&error))
+            }
+            PlannedOp::Delete(path) => {
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    return Some(FileOpRefusal::NotFound);
+                };
+                let removed = if meta.is_symlink() {
+                    // A link to a directory is a directory entry on Windows
+                    // and a file on Unix; either way only the link goes.
+                    std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))
+                } else if meta.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                removed.err().map(|error| refusal_of(&error))
+            }
+        }
+    }
+}
+
+/// Whether `to` is `from` spelled with a different case, on a filesystem that
+/// treats the two as one entry (ADR 0124).
+///
+/// Both names in the same directory, equal ignoring case, resolving to the
+/// same place — and `to` not a link of its own, since a link resolves to
+/// wherever it points and would pass the last test for a different entry.
+fn same_entry_other_case(from: &std::path::Path, to: &std::path::Path) -> bool {
+    let same_directory = from.parent() == to.parent();
+    let same_name = match (from.file_name(), to.file_name()) {
+        (Some(a), Some(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
+        _ => false,
+    };
+    let to_is_link = std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_symlink());
+    same_directory
+        && same_name
+        && !to_is_link
+        && matches!(
+            (std::fs::canonicalize(from), std::fs::canonicalize(to)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// The refusal a failed filesystem call is reported as (§18; ADR 0124).
+///
+/// Two a guest can act on, and everything else as `Failed`: the host's own
+/// error text describes its filesystem, and stays on the host.
+fn refusal_of(error: &std::io::Error) -> FileOpRefusal {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => FileOpRefusal::NotFound,
+        std::io::ErrorKind::AlreadyExists => FileOpRefusal::Exists,
+        _ => FileOpRefusal::Failed,
+    }
 }
 
 fn unique_destination(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -17451,6 +17904,8 @@ pub fn spawn_actor_with(
         file_manage_to_host: std::collections::HashMap::new(),
         fetches_out: std::collections::HashMap::new(),
         fetch_preparing: std::collections::HashMap::new(),
+        file_ops_in_flight: std::collections::HashMap::new(),
+        next_file_op_id: 1,
         file_resumable: std::collections::HashMap::new(),
         dir_offers_out: std::collections::HashMap::new(),
         dir_offers_in: std::collections::HashMap::new(),
@@ -17557,7 +18012,7 @@ pub fn spawn_actor_with(
         remembered_passwords,
         pending_remember: None,
         connect_credentials_auto: false,
-        pending_terminal_only: std::collections::HashSet::new(),
+        pending_surface: std::collections::HashMap::new(),
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -18542,7 +18997,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, applied)
     }
 
@@ -18574,7 +19029,9 @@ mod tests {
     /// of a grant can be asserted without a Tauri runtime.
     #[derive(Debug, Default)]
     struct RecordingWindows {
-        opened: std::sync::Mutex<Vec<(String, String, bool, bool)>>,
+        opened: std::sync::Mutex<Vec<(String, String, bool, ViewSurface)>>,
+        /// The stable host label of every `open`, in the same order.
+        hosts: std::sync::Mutex<Vec<String>>,
         closed: std::sync::Mutex<Vec<String>>,
         host_bar: std::sync::atomic::AtomicBool,
         /// Whether this stand-in claims somebody is in front of the host
@@ -18602,8 +19059,13 @@ mod tests {
         /// Every `open` this stand-in was asked for: window label, peer
         /// label, whether the window was armed for input, and whether it is a
         /// terminal-only window (ADR 0101).
-        fn opened(&self) -> Vec<(String, String, bool, bool)> {
+        fn opened(&self) -> Vec<(String, String, bool, ViewSurface)> {
             self.opened.lock().unwrap().clone()
+        }
+
+        /// The stable host label of every `open`, in the order `opened` has.
+        fn hosts(&self) -> Vec<String> {
+            self.hosts.lock().unwrap().clone()
         }
 
         fn closed(&self) -> Vec<String> {
@@ -18620,15 +19082,16 @@ mod tests {
             &self,
             label: &str,
             peer_label: &str,
-            _host_label: &str,
+            host_label: &str,
             input: bool,
-            terminal_only: bool,
+            surface: ViewSurface,
         ) {
+            self.hosts.lock().unwrap().push(host_label.to_owned());
             self.opened.lock().unwrap().push((
                 label.to_owned(),
                 peer_label.to_owned(),
                 input,
-                terminal_only,
+                surface,
             ));
         }
 
@@ -18790,7 +19253,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
 
         ClipboardPair {
             host,
@@ -19724,6 +20187,223 @@ mod tests {
         records
     }
 
+    /// Polls for the answer to the file operation `id`.
+    async fn wait_for_file_op(guest: &ActorHandle, host_label: &str, id: u32) -> Option<FileOpRefusal> {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            if let Ok(status) = guest.dir_listing(host_label.to_owned()).await
+                && let Some(outcome) = status.op_results.iter().find(|outcome| outcome.id == id)
+            {
+                return outcome.refused;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the host never answered file operation {id}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0124: a file operation needs `file_browse` *and* `file_transfer`,
+    /// like a put, and with both it changes the host's disk — make, rename,
+    /// delete — and says so every time, success included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_operation_needs_both_grants_and_then_changes_the_host() {
+        let scratch = Scratch::new("file-ops");
+        std::fs::write(scratch.join("old.txt"), b"x").unwrap();
+        std::fs::write(scratch.join("taken.txt"), b"y").unwrap();
+        std::fs::create_dir_all(scratch.join("tree").join("deeper")).unwrap();
+        std::fs::write(scratch.join("tree").join("deeper").join("f.bin"), b"z").unwrap();
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        let at = |name: &str| scratch.join(name).to_string_lossy().into_owned();
+
+        // `file_transfer` alone: the guest named a path on the host, which is
+        // the browse half.
+        host.set_grant(guest_label.clone(), IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::MakeDir { path: at("new") })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_file_op(&guest, &host_label, id).await,
+            Some(FileOpRefusal::NotGranted)
+        );
+        assert!(!scratch.join("new").exists(), "a refused operation changed the disk");
+
+        host.set_grant(guest_label, IndependentGrant::FileBrowse, true)
+            .await
+            .unwrap();
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::MakeDir { path: at("new") })
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_op(&guest, &host_label, id).await, None);
+        assert!(scratch.join("new").is_dir());
+
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::MakeDir { path: at("new") })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_file_op(&guest, &host_label, id).await,
+            Some(FileOpRefusal::Exists)
+        );
+
+        let id = guest
+            .remote_file_op(
+                host_label.clone(),
+                FileOp::Rename {
+                    path: at("old.txt"),
+                    name: "taken.txt".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_file_op(&guest, &host_label, id).await,
+            Some(FileOpRefusal::Exists),
+            "a rename replaced a file that was already there"
+        );
+        assert_eq!(std::fs::read(scratch.join("taken.txt")).unwrap(), b"y");
+
+        let id = guest
+            .remote_file_op(
+                host_label.clone(),
+                FileOp::Rename {
+                    path: at("old.txt"),
+                    name: "renamed.txt".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_op(&guest, &host_label, id).await, None);
+        assert!(!scratch.join("old.txt").exists());
+        assert_eq!(std::fs::read(scratch.join("renamed.txt")).unwrap(), b"x");
+
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::Delete { path: at("tree") })
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_op(&guest, &host_label, id).await, None);
+        assert!(!scratch.join("tree").exists(), "a directory delete left the tree behind");
+
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::Delete { path: at("tree") })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_file_op(&guest, &host_label, id).await,
+            Some(FileOpRefusal::NotFound)
+        );
+    }
+
+    /// ADR 0124: a root is not an entry of anything, and a traversal or a new
+    /// name that is a path is refused on this side before the host is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_operation_on_a_root_or_a_traversal_never_leaves_the_guest() {
+        let pair = clipboard_pair().await;
+        for op in [
+            FileOp::Delete { path: "/".to_owned() },
+            FileOp::Delete { path: "C:\\".to_owned() },
+            FileOp::MakeDir { path: "D:/".to_owned() },
+            FileOp::Delete { path: "/home/../etc".to_owned() },
+            FileOp::Delete { path: "relative/file".to_owned() },
+            FileOp::Rename {
+                path: "/".to_owned(),
+                name: "x".to_owned(),
+            },
+            FileOp::Rename {
+                path: "/home/beta/a.txt".to_owned(),
+                name: "../b.txt".to_owned(),
+            },
+            FileOp::Rename {
+                path: "/home/beta/a.txt".to_owned(),
+                name: "sub/b.txt".to_owned(),
+            },
+        ] {
+            let refused = pair
+                .guest
+                .remote_file_op(pair.host_label.clone(), op.clone())
+                .await;
+            assert!(
+                matches!(refused, Err(ActorError::Core(CoreError::Malformed))),
+                "{op:?} was sent to the host"
+            );
+        }
+    }
+
+    /// ADR 0124: an upload the host declines and a download it refuses each
+    /// leave a count on the view, since neither has a transfer row to say so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_upload_and_a_refused_download_are_counted() {
+        let scratch = Scratch::new("refusal-counts");
+        let source = scratch.join("notes.txt");
+        std::fs::write(&source, b"twelve bytes").unwrap();
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.set_grant(guest_label, IndependentGrant::FileTransfer, true)
+            .await
+            .unwrap();
+
+        guest
+            .remote_upload(
+                host_label.clone(),
+                source.to_string_lossy().into_owned(),
+                scratch.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+        guest
+            .remote_download(
+                host_label.clone(),
+                source.to_string_lossy().into_owned(),
+                scratch.0.to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let status = guest.dir_listing(host_label.clone()).await.unwrap();
+            if status.uploads_refused == 1 && status.fetches_refused == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the refusals were never counted: {} up, {} down",
+                status.uploads_refused,
+                status.fetches_refused
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0124: "File manager" on a remembered host finds the session this
+    /// node already has open onto it, under the label its window uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_session_open_onto_a_remembered_host_is_found_by_its_stable_label() {
+        let (host, _host_endpoint, _host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label, Role::ViewOnly).await.unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
+        let stable = recorder.hosts().remove(0);
+
+        assert_eq!(guest.watching_host("no-such-host".to_owned()).await.unwrap(), None);
+        assert_eq!(guest.watching_host(stable).await.unwrap(), Some(host_label));
+    }
+
     /// Polls for the refusal a download is about to produce.
     async fn wait_for_fetch_refusal(guest: &ActorHandle, host_label: &str) -> FileFetchRefusal {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
@@ -19796,7 +20476,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, host_clipboard)
     }
 
@@ -19833,7 +20513,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, host_capture)
     }
 
@@ -22254,7 +22934,7 @@ mod tests {
         // Nothing is retyped: the row carries the code, and the code stays in
         // Rust — the caller only names the host.
         guest
-            .history_connect(remembered[0].peer_label.clone(), false)
+            .history_connect(remembered[0].peer_label.clone(), ViewSurface::Screen)
             .await
             .unwrap();
 
@@ -22273,7 +22953,7 @@ mod tests {
         assert!(
             matches!(
                 guest
-                    .history_connect("no-such-host".to_owned(), false)
+                    .history_connect("no-such-host".to_owned(), ViewSurface::Screen)
                     .await,
                 Err(ActorError::UnknownPeer)
             ),
@@ -22319,7 +22999,7 @@ mod tests {
         .await;
 
         guest
-            .history_connect(remembered[0].peer_label.clone(), true)
+            .history_connect(remembered[0].peer_label.clone(), ViewSurface::Terminal)
             .await
             .unwrap();
         let again = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -22331,9 +23011,10 @@ mod tests {
             recorder.opened().len() == 2
         })
         .await;
-        let (_window, peer_label, input, terminal_only) = recorder.opened().remove(1);
-        assert!(
-            terminal_only,
+        let (_window, peer_label, input, surface) = recorder.opened().remove(1);
+        assert_eq!(
+            surface,
+            ViewSurface::Terminal,
             "the window the actor asked for is the terminal one"
         );
         assert!(
@@ -23043,7 +23724,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
 
         // Close, in the window: the guest's `on_revoke`, which ends in
         // `close_connection_normal`.
@@ -23162,7 +23843,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         guest
             .set_stream_scale(host_label.clone(), 50)
             .await
@@ -23214,7 +23895,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (window, host_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (window, host_label, _input, _surface) = recorder.opened().remove(0);
 
         first.sever_links().await;
         wait_for_phase(&first, ConnectPhase::Resuming).await;
@@ -23653,7 +24334,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (window_label, peer_label, input, _terminal_only) = recorder.opened().remove(0);
+        let (window_label, peer_label, input, _surface) = recorder.opened().remove(0);
         assert_eq!(window_label, crate::view::window_label(&peer_label));
         assert!(input, "FullControl carries a live input grant");
 
@@ -23717,7 +24398,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
 
         // Well inside `RECONNECT_WINDOW_SECS`, which is what the guest used to
         // spend waiting before being told the wrong thing.
@@ -23783,7 +24464,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
 
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
@@ -23855,7 +24536,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, peer_label, input, _surface) = recorder.opened().remove(0);
         assert!(input, "FullControl carries a live input grant");
 
         // The same grant that carries an ordinary keystroke carries this one.
@@ -23886,7 +24567,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, _input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
         assert!(matches!(
             guest.sas_request(peer_label).await,
             Err(ActorError::Core(CoreError::NotPermitted))
@@ -23913,7 +24594,7 @@ mod tests {
             !recorder.opened().is_empty()
         })
         .await;
-        let (_window, peer_label, input, _terminal_only) = recorder.opened().remove(0);
+        let (_window, peer_label, input, _surface) = recorder.opened().remove(0);
         assert!(!input, "ViewOnly must never imply input (§2.2, §8.2)");
         assert!(matches!(
             guest.input(peer_label.clone(), pointer_event(3, 4)).await,

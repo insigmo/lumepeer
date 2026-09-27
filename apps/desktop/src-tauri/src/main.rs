@@ -506,6 +506,10 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::remote_dir_status,
         commands::remote_download,
         commands::remote_upload,
+        commands::files_window_open,
+        commands::remote_file_op,
+        commands::local_file_op,
+        commands::local_roots,
         commands::tunnel_open,
         commands::tunnel_close_all,
         commands::tunnel_set_target,
@@ -724,6 +728,12 @@ fn main() {
                 // it by, which is what the host saw as a guest that never
                 // left (ADR 0119).
                 if window.label().starts_with("view-") {
+                    return;
+                }
+                // So does a file manager beside one (ADR 0124): it is that
+                // session's files, and hidden it would keep polling a session
+                // with nothing on screen to show for it.
+                if window.label().starts_with(commands::FILES_WINDOW_PREFIX) {
                     return;
                 }
                 // Without a tray there is no icon to click and nothing to

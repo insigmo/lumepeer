@@ -190,6 +190,34 @@ pub fn relative_components(path: &str) -> Option<Vec<&str>> {
     Some(safe_relative_path(path)?.split(['/', '\\']).collect())
 }
 
+/// Splits an absolute path a peer named into the directory it is in and its
+/// last component, for a change to that entry (ADR 0124).
+///
+/// Returns `None` for anything [`safe_browse_path`] refuses, and for a root
+/// (`/`, `C:\`): a root is not an entry of any directory, so there is nothing
+/// to rename and nothing a delete should be allowed to reach. The directory
+/// keeps its separator when it is a root itself, because `C:` on its own is
+/// drive-relative rather than the drive's top directory.
+#[must_use]
+pub fn split_entry_path(path: &str) -> Option<(&str, &str)> {
+    let path = safe_browse_path(path)?;
+    let trimmed = path.strip_suffix(['/', '\\']).unwrap_or(path);
+    let cut = trimmed.rfind(['/', '\\'])?;
+    let name = &trimmed[cut + 1..];
+    if name.is_empty() {
+        return None;
+    }
+    let directory = &trimmed[..cut];
+    // `/a` sits under `/` and `C:\a` under `C:\`; everything deeper sits under
+    // a directory that needs no separator of its own.
+    let directory = if directory.is_empty() || (directory.len() == 2 && directory.ends_with(':')) {
+        &trimmed[..=cut]
+    } else {
+        directory
+    };
+    Some((directory, name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +420,23 @@ mod tests {
         assert!(!is_safe_component("notes.txt:stream"));
         assert!(!is_safe_component("trailing."));
         assert!(!is_safe_component("trailing "));
+    }
+
+    /// ADR 0124: an entry splits into the directory it is in and its name,
+    /// in either dialect, and a root is not an entry of anything.
+    #[test]
+    fn an_entry_path_splits_into_its_directory_and_its_name() {
+        assert_eq!(split_entry_path("/home/beta/notes.txt"), Some(("/home/beta", "notes.txt")));
+        assert_eq!(split_entry_path("/home/beta/dir/"), Some(("/home/beta", "dir")));
+        assert_eq!(split_entry_path("/tmp"), Some(("/", "tmp")));
+        assert_eq!(split_entry_path("C:\\Users\\beta"), Some(("C:\\Users", "beta")));
+        assert_eq!(split_entry_path("C:\\Users"), Some(("C:\\", "Users")));
+        assert_eq!(split_entry_path("D:/data/a.bin"), Some(("D:/data", "a.bin")));
+        for root in ["/", "C:\\", "C:/"] {
+            assert_eq!(split_entry_path(root), None, "{root} is a root, not an entry");
+        }
+        for bad in ["", "relative/a", "/home/../etc", "\\\\server\\share\\a"] {
+            assert_eq!(split_entry_path(bad), None, "{bad} was split");
+        }
     }
 }
