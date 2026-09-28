@@ -296,6 +296,7 @@ export const fr: Dictionary = {
   'toolbar.terminal': 'Terminal',
   'status.terminal.active': 'Terminal ouvert',
   'toolbar.files': 'Fichiers',
+  'toolbar.files.pending': 'Fichiers — un fichier vous est proposé',
   'toolbar.mic': 'Microphone',
   'toolbar.cad': "Envoyer Ctrl+Alt+Suppr à l'hôte",
   'toolbar.record': "Demander à l'hôte d'enregistrer cette session",

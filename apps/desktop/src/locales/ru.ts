@@ -295,6 +295,7 @@ export const ru: Dictionary = {
   'toolbar.terminal': 'Терминал',
   'status.terminal.active': 'Открыт терминал',
   'toolbar.files': 'Файлы',
+  'toolbar.files.pending': 'Файлы — вам предлагают файл',
   'toolbar.mic': 'Микрофон',
   'toolbar.cad': 'Отправить Ctrl+Alt+Del на хост',
   'toolbar.record': 'Попросить хост записать эту сессию',

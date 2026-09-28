@@ -296,6 +296,7 @@ export const tr: Dictionary = {
   'toolbar.terminal': 'Terminal',
   'status.terminal.active': 'Terminal açık',
   'toolbar.files': 'Dosyalar',
+  'toolbar.files.pending': 'Dosyalar — size bir dosya sunuluyor',
   'toolbar.mic': 'Mikrofon',
   'toolbar.cad': 'Ana bilgisayara Ctrl+Alt+Del gönder',
   'toolbar.record': 'Ana bilgisayardan bu oturumu kaydetmesini iste',

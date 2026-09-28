@@ -409,19 +409,21 @@ export interface ToolbarHooks {
   toggleChat(): boolean;
   /** Whether the chat panel is visible right now. */
   chatVisible(): boolean;
-  /** Show or hide the file manager; returns the new visible state. */
-  toggleFiles(): boolean;
-  /** Whether the file manager is visible right now. */
-  filesVisible(): boolean;
   /**
-   * Whether the file manager can be used at all (ADR 0076).
+   * Opens the file manager beside this window, or raises it (ADR 0124).
    *
-   * `false` while the host has not granted `file_browse`, or has withdrawn
-   * it mid-session, and the button is then absent rather than present and
-   * inert: a control that does nothing when pressed is worse than no control
-   * (§18).
+   * A window of its own, so there is no open or closed state for the button
+   * to show; a host that has not granted `file_browse` is explained inside it
+   * rather than by the button going away.
    */
-  filesAvailable(): boolean;
+  openFiles(): void;
+  /**
+   * Whether the host has offered this guest a file nobody here has answered
+   * yet (ADR 0124). Offers are answered in the file manager, so without a
+   * mark on its button one could wait there unseen for as long as the
+   * session lasts.
+   */
+  filesPending(): boolean;
   /** Show or hide the terminal; returns the new visible state. */
   toggleTerminal(): boolean;
   /** Whether the terminal panel is visible right now. */
@@ -487,6 +489,7 @@ const ICONS = {
   settings: SETTINGS_ICON,
   monitor: (n: string) => html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="9" rx="1" stroke="currentColor" stroke-width="1.5" fill="none"/><text x="8" y="10" text-anchor="middle" font-size="7" fill="currentColor" stroke="none" font-family="system-ui">${n}</text></svg>`,
   files: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.4l1.2 1.5h5.4A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/></svg>`,
+  filesPending: html`<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.4l1.2 1.5h5.4A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5v-7Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" fill="none"/><circle cx="13" cy="3" r="3" fill="#f2b441" stroke="none"/></svg>`,
   // A prompt and a caret: the one drawing of a terminal nobody has to be told
   // the meaning of.
   terminal: html`<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M5 6.5 7 8l-2 1.5M8.5 10h2.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>`,
@@ -537,8 +540,7 @@ export function renderToolbar(
   },
 ): void {
   const chatOn = hooks.chatVisible();
-  const filesOn = hooks.filesVisible();
-  const filesAvailable = hooks.filesAvailable();
+  const filesPending = hooks.filesPending();
   const terminalOn = hooks.terminalVisible();
   // A shell-only window has no picture and no media connection (ADR 0101).
   const terminalOnly = hooks.terminalOnly();
@@ -760,13 +762,27 @@ export function renderToolbar(
     </button>
   `;
 
+  const filesButton: TemplateResult = html`
+    <button
+      type="button"
+      class="toolbar-btn"
+      data-testid="toolbar-files"
+      aria-label=${t(locale, filesPending ? 'toolbar.files.pending' : 'toolbar.files')}
+      title=${t(locale, filesPending ? 'toolbar.files.pending' : 'toolbar.files')}
+      @click=${() => hooks.openFiles()}
+    >
+      ${filesPending ? ICONS.filesPending : ICONS.files}
+    </button>
+  `;
+
   const buttons: TemplateResult = state.collapsed
     ? html`
         <!-- Collapsed hides every button but the way back — except the chat,
              while a message nobody has read yet is waiting in it or it is
              open: an unread message is the one thing that must not be folded
-             away, and a chat opened from here needs a way to close again. -->
-        ${chatUnread || chatOn ? chatButton : ''}
+             away, and a chat opened from here needs a way to close again.
+             A file the host offered is the same kind of thing waiting. -->
+        ${chatUnread || chatOn ? chatButton : ''} ${filesPending ? filesButton : ''}
         <button
           type="button"
           class="toolbar-btn"
@@ -806,19 +822,7 @@ export function renderToolbar(
               ${ICONS.monitor(monitorLabel)}
             </button>`}
         ${chatButton}
-        ${filesAvailable
-          ? html`<button
-              type="button"
-              class="toolbar-btn ${filesOn ? 'is-active' : ''}"
-              data-testid="toolbar-files"
-              aria-label=${t(locale, 'toolbar.files')}
-              title=${t(locale, 'toolbar.files')}
-              aria-pressed=${filesOn ? 'true' : 'false'}
-              @click=${() => hooks.toggleFiles()}
-            >
-              ${ICONS.files}
-            </button>`
-          : ''}
+        ${filesButton}
         <button
           type="button"
           class="toolbar-btn ${terminalOn ? 'is-active' : ''}"

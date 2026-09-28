@@ -285,6 +285,7 @@ export const zh: Dictionary = {
   'toolbar.terminal': '终端',
   'status.terminal.active': '终端已打开',
   'toolbar.files': '文件',
+  'toolbar.files.pending': '文件 — 有文件等待你接收',
   'toolbar.mic': '麦克风',
   'toolbar.cad': '向主机发送 Ctrl+Alt+Del',
   'toolbar.record': '请求主机录制此会话',

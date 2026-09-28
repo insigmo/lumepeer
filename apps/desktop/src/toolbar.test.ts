@@ -91,9 +91,8 @@ function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
     toggleChat: () => true,
     chatVisible: () => true,
     chatUnread: () => false,
-    toggleFiles: () => true,
-    filesVisible: () => false,
-    filesAvailable: () => true,
+    openFiles: () => {},
+    filesPending: () => false,
     toggleTerminal: () => false,
     terminalVisible: () => false,
     terminalOnly: () => false,
@@ -412,6 +411,32 @@ describe('the floating session toolbar', () => {
     // Closed and read: the pill is back to the way out and nothing else.
     visible = false;
     draw(state, fakeCommands(), hooks);
+    expect(button()).toBeNull();
+  });
+
+  it('the files button opens the file manager window, and marks a file the host offered', () => {
+    let pending = false;
+    const openFiles = vi.fn();
+    const hooks = fakeHooks({ openFiles, filesPending: () => pending });
+    const button = (): HTMLButtonElement | null =>
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-files"]');
+
+    draw(stateWith(), fakeCommands(), hooks);
+    expect(button()?.getAttribute('aria-label')).toBe(t('en', 'toolbar.files'));
+    button()?.click();
+    expect(openFiles).toHaveBeenCalledTimes(1);
+
+    pending = true;
+    draw(stateWith(), fakeCommands(), hooks);
+    expect(button()?.getAttribute('aria-label')).toBe(t('en', 'toolbar.files.pending'));
+    expect(button()?.querySelector('circle')?.getAttribute('fill')).toBe('#f2b441');
+
+    // Collapsed, an offer waiting is not folded away either; without one the
+    // pill is the way out and nothing else.
+    draw(stateWith({ collapsed: true }), fakeCommands(), hooks);
+    expect(button()).not.toBeNull();
+    pending = false;
+    draw(stateWith({ collapsed: true }), fakeCommands(), hooks);
     expect(button()).toBeNull();
   });
 

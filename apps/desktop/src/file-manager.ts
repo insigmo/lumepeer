@@ -871,7 +871,11 @@ export class FileManager {
     for (const name of confirming.names) {
       await this.change(confirming.side, { kind: 'delete', path: joinPath(directory, name) }, false);
     }
-    this.refresh(confirming.side);
+    // The remote pane re-reads itself once the host has answered the last of
+    // them (`applyOpResults`); asking now would list the folder before it.
+    if (confirming.side === 'local') {
+      this.refresh('local');
+    }
   }
 
   /** Runs one change on the side it belongs to, and re-reads that side. */
@@ -1485,6 +1489,7 @@ function renderPane(fm: FileManager, side: Side, locale: Locale): TemplateResult
           class="fm-path"
           data-testid=${`fm-${side}-path`}
           aria-label=${t(locale, 'fm.path')}
+          dir="ltr"
           spellcheck="false"
           autocomplete="off"
           .value=${pane.path}
@@ -1673,7 +1678,7 @@ function renderRow(fm: FileManager, side: Side, entry: FileEntry, locale: Locale
       <td class="fm-col-name">
         <span class="fm-name">
           ${entry.is_dir ? ICON.folder : ICON.file}
-          <span class="fm-name-text" title=${entry.name}>${entry.name}</span>
+          <span class="fm-name-text" dir="auto" title=${entry.name}>${entry.name}</span>
         </span>
       </td>
       <td class="fm-col-size">${entry.is_dir ? '' : formatSize(entry.size)}</td>
@@ -1706,6 +1711,7 @@ function renderNameRow(
           <input
             class="fm-name-input"
             data-testid=${`fm-${side}-name-input`}
+            dir="auto"
             aria-label=${t(locale, entry ? 'fm.rename' : 'fm.newFolder')}
             spellcheck="false"
             autocomplete="off"
@@ -1775,7 +1781,7 @@ function renderTransfers(fm: FileManager, locale: Locale): TemplateResult {
                 (offer) => html`
                   <li class="fm-xfer is-offer" data-testid="file-offer">
                     <span class="fm-xfer-dir" aria-hidden="true">${ICON.arrowDown}</span>
-                    <span class="fm-xfer-name" title=${offer.name}>${offer.name}</span>
+                    <span class="fm-xfer-name" dir="auto" title=${offer.name}>${offer.name}</span>
                     <span class="fm-xfer-meta">${t(locale, 'fm.incoming')} · ${formatSize(offer.size)}</span>
                     <span class="fm-xfer-actions">
                       <button
@@ -1826,7 +1832,7 @@ function renderJob(fm: FileManager, job: Job, locale: Locale): TemplateResult {
       <span class="fm-xfer-dir" aria-label=${t(locale, job.direction === 'upload' ? 'files.outgoing' : 'files.incoming')}
         >${job.direction === 'upload' ? ICON.arrowUp : ICON.arrowDown}</span
       >
-      <span class="fm-xfer-name" title=${job.source}>
+      <span class="fm-xfer-name" dir="auto" title=${job.source}>
         ${job.isDir ? ICON.folder : nothing}${job.name}
       </span>
       <span class="fm-xfer-meta">${job.size > 0 ? formatSize(job.size) : ''}</span>
@@ -1858,7 +1864,7 @@ function renderTransferRow(fm: FileManager, row: TransferRow, locale: Locale): T
       <span class="fm-xfer-dir" aria-label=${t(locale, row.incoming ? 'files.incoming' : 'files.outgoing')}
         >${row.incoming ? ICON.arrowDown : ICON.arrowUp}</span
       >
-      <span class="fm-xfer-name" title=${row.name}>
+      <span class="fm-xfer-name" dir="auto" title=${row.name}>
         ${row.directory ? ICON.folder : nothing}${row.name}
       </span>
       ${row.state === 'running'

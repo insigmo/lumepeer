@@ -345,6 +345,7 @@ export type TranslationKey =
   | 'toolbar.terminal'
   | 'status.terminal.active'
   | 'toolbar.files'
+  | 'toolbar.files.pending'
   | 'toolbar.mic'
   | 'toolbar.cad'
   | 'toolbar.record'

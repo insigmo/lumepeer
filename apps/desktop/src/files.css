@@ -49,9 +49,12 @@ input {
 
 /* ---------- Frame ---------- */
 
+/* A column rather than a grid of fixed rows: the connection banner is only
+   there while the session is away, and a grid row reserved for it would hand
+   the panes' share of the height to whatever came after them. */
 .fm {
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   height: 100%;
   padding: 12px;
   gap: 10px;
@@ -118,6 +121,7 @@ input {
 }
 
 .fm-panes {
+  flex: 1;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 10px;
@@ -694,6 +698,7 @@ input {
 /* ---------- Transfers ---------- */
 
 .fm-transfers {
+  flex: none;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   max-height: 34vh;

@@ -296,6 +296,7 @@ export const uk: Dictionary = {
   'toolbar.terminal': 'Термінал',
   'status.terminal.active': 'Термінал відкрито',
   'toolbar.files': 'Файли',
+  'toolbar.files.pending': 'Файли — вам пропонують файл',
   'toolbar.mic': 'Мікрофон',
   'toolbar.cad': 'Надіслати Ctrl+Alt+Del на хост',
   'toolbar.record': 'Попросити хост записати цей сеанс',

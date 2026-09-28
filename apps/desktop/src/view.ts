@@ -21,6 +21,7 @@ import {
   type ChatCommands,
   type ChatRow,
 } from './chat';
+import { tauriFileCommands } from './file-transfers';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { rememberThumbnail, thumbnailFrom } from './peer-thumbnails';
 import { mountTerminal, type TerminalControls } from './terminal';
@@ -183,6 +184,10 @@ let chatUnread = false;
 // knows what arrived.
 let chatSeenIncoming = 0;
 const chatState = new ChatState();
+// Whether the host has offered this guest a file nobody here has answered
+// yet (ADR 0124). Offers are answered in the file manager, a window of its
+// own; this is what marks its button until somebody opens it and does.
+let filesPending = false;
 // The last pointer position inside the window, which is where the cursor is
 // drawn. Local by design: a cursor that moved with the video would lag by the
 // round trip, and removing that lag is the whole reason for the channel.
@@ -226,6 +231,26 @@ const chatCommands: ChatCommands = {
     return tauriChatCommands.chatSend(label, text);
   },
 };
+
+/** How often the window checks for a file the host offered, in milliseconds. */
+const FILE_OFFER_POLL_MS = 1500;
+
+/** Re-reads whether an offer is waiting, and redraws the toolbar if that changed. */
+async function pollFileOffers(): Promise<void> {
+  let pending: boolean;
+  try {
+    const files = await tauriFileCommands.list();
+    pending = files.offers.some((offer) => offer.peer_label === peer);
+  } catch {
+    // The session ended, or the actor is gone: the window closes through its
+    // own path, and nothing here claims otherwise.
+    return;
+  }
+  if (pending !== filesPending) {
+    filesPending = pending;
+    toolbar?.redraw();
+  }
+}
 
 /**
  * Opens the file manager beside this window, or raises it (ADR 0124).
@@ -801,15 +826,11 @@ async function main(): Promise<void> {
       chatUnread(): boolean {
         return chatUnread;
       },
-      toggleFiles(): boolean {
+      openFiles(): void {
         openFileManager();
-        return false;
       },
-      filesVisible(): boolean {
-        return false;
-      },
-      filesAvailable(): boolean {
-        return true;
+      filesPending(): boolean {
+        return filesPending;
       },
       toggleTerminal(): boolean {
         if (!terminalPanel) {
@@ -897,6 +918,9 @@ async function main(): Promise<void> {
       void pollCursor();
     }, CURSOR_POLL_INTERVAL_MS);
   }
+  setInterval(() => {
+    void pollFileOffers();
+  }, FILE_OFFER_POLL_MS);
   // Installed before the input forwarder attaches, and in the capture phase,
   // so a matched chord is marked before it can be sent to the host (§11).
   installHotkeys(document, {

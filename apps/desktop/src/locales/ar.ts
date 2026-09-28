@@ -294,6 +294,7 @@ export const ar: Dictionary = {
   'toolbar.terminal': 'الطرفية',
   'status.terminal.active': 'الطرفية مفتوحة',
   'toolbar.files': 'الملفات',
+  'toolbar.files.pending': 'الملفات — يُعرض عليك ملف',
   'toolbar.mic': 'الميكروفون',
   'toolbar.cad': 'إرسال Ctrl+Alt+Del إلى المضيف',
   'toolbar.record': 'اطلب من المضيف تسجيل هذه الجلسة',

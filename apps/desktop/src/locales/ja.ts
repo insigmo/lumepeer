@@ -294,6 +294,7 @@ export const ja: Dictionary = {
   'toolbar.terminal': 'ターミナル',
   'status.terminal.active': 'ターミナルが開いています',
   'toolbar.files': 'ファイル',
+  'toolbar.files.pending': 'ファイル — ファイルが届いています',
   'toolbar.mic': 'マイク',
   'toolbar.cad': 'ホストに Ctrl+Alt+Del を送信',
   'toolbar.record': 'ホストにこのセッションの録画を依頼',
