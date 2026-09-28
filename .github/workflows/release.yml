@@ -53,7 +53,7 @@ jobs:
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: check
         run: |
           set -uo pipefail
@@ -77,7 +77,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       channel: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'stable' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -201,7 +201,7 @@ jobs:
             features: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.version.outputs.tag }}
       - name: Install Linux system dependencies
@@ -213,9 +213,9 @@ jobs:
           # with bindgen, so both the library and libclang have to be here or
           # the Linux rows of this matrix fail to build (ADR 0039).
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -476,7 +476,7 @@ jobs:
     if: needs.guard.outputs.proceed == 'true' && needs.version.outputs.channel == 'beta'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Publish the manifest to the beta channel
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -504,7 +504,7 @@ jobs:
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Append downloads table to release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
