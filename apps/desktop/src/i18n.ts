@@ -402,6 +402,8 @@ export type TranslationKey =
   | 'unattended.totp.done'
   | 'unattended.role.label'
   | 'unattended.needsTrust'
+  | 'unattended.logonScreen.label'
+  | 'unattended.logonScreen.note'
   | 'book.heading'
   | 'book.explain'
   | 'book.empty'

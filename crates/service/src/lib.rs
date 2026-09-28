@@ -118,3 +118,28 @@ pub const SECURE_DESKTOP_INPUT_WORKER_ARG: &str = "--secure-desktop-input-worker
 /// "the injector is `LocalSystem`, the agent is not" stays a fact a reader can
 /// see rather than a flag they must trace (ADR 0114 §1).
 pub const SYSTEM_INPUT_WORKER_ARG: &str = "--system-input-worker";
+
+/// The single argument that starts the desktop application as this machine's
+/// host on the logon screen (ADR 0126).
+///
+/// The service launches the desktop binary with exactly this argument into the
+/// console session's `Winsta0\Winlogon` desktop, as `LocalSystem`, whenever
+/// nobody is signed in there. It hosts with the identity and the device
+/// password of the account that turned the feature on, so a guest reaches the
+/// same saved host before anybody signs in as after; it is stopped the moment
+/// somebody does, and the ordinary client takes over.
+pub const LOGON_HOST_ARG: &str = "--logon-host";
+
+/// Exit code of a logon host that found the feature off, the owner's store
+/// empty, or no device password to admit anybody with (ADR 0126).
+///
+/// Not a failure to relaunch after: nothing about it changes until somebody
+/// signs in and changes a setting, so the service waits for the console to
+/// change rather than starting the same refusal again on every tick.
+pub const LOGON_HOST_EXIT_NOT_ENABLED: u32 = 3;
+
+/// Exit code of a logon host that found the host role already held — most
+/// likely by a client still running in a disconnected session after a fast
+/// user switch (ADR 0085 §4, ADR 0126). Waited out like
+/// [`LOGON_HOST_EXIT_NOT_ENABLED`], for the same reason.
+pub const LOGON_HOST_EXIT_ROLE_TAKEN: u32 = 4;

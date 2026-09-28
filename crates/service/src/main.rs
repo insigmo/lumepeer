@@ -33,6 +33,8 @@
 #[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
+mod logon_host_launch;
+#[cfg(target_os = "windows")]
 mod logon_screen_worker;
 #[cfg(target_os = "windows")]
 mod secure_desktop;

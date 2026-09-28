@@ -353,6 +353,9 @@ export const ja: Dictionary = {
   'unattended.totp.done': '完了',
   'unattended.role.label': 'この方法でサインインしたデバイスが得る権限',
   'unattended.needsTrust': '先にデバイスパスワードを設定してください。',
+  'unattended.logonScreen.label': 'Windows のサインイン画面でも',
+  'unattended.logonScreen.note':
+    '再起動やサインアウトの後、デバイスパスワードを持つゲストはサインイン画面を見て、サインインできます。その画面には接続中であることは表示されません。',
   'book.heading': '保存済みのデバイス',
   'book.explain': 'デバイスを信頼しても、それだけで自動的に入室できるわけではありません。デバイスパスワードを試す資格があるかどうかを決めるだけです。',
   'book.empty': 'まだ保存されたデバイスはありません。接続からデバイスを保存すると、ここに表示されます。',

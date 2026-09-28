@@ -17,6 +17,10 @@ mod commands;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
 mod logging;
+// This same binary, run as `LocalSystem` on the logon screen while nobody is
+// signed in (ADR 0126). Windows only: the logon screen it hosts is Windows'.
+#[cfg(target_os = "windows")]
+mod logon_host;
 // Where the stores live: the profile, or where only administrators can write
 // (ADR 0123).
 mod placement;
@@ -83,6 +87,16 @@ pub type HostRoleGuard = lumepeer_service::host_role::HostRole;
 #[cfg(not(target_os = "windows"))]
 pub type HostRoleGuard = std::convert::Infallible;
 
+/// How long a starting client waits for the process that holds the host role
+/// to hand it over once asked (ADR 0085 §4, ADR 0126).
+///
+/// Longer than the service's own wait for the logon host
+/// (`logon_host_launch::LOGON_HOST_STOP_TIMEOUT_MS`), which terminates it at
+/// the end of that: a client that gave up first would be a non-host for its
+/// whole run on a machine whose role came free a second later.
+#[cfg(target_os = "windows")]
+const HOST_ROLE_HANDOVER_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Takes this machine's host role, if there is one to take.
 ///
 /// Returns the guard to hold and whether this process may host. The two are
@@ -95,7 +109,20 @@ fn claim_host_role() -> (Option<HostRoleGuard>, bool) {
     {
         use lumepeer_service::host_role::HostRoleClaim;
 
-        match lumepeer_service::host_role::claim() {
+        // The person at the machine wins the tie (ADR 0085 §4): whoever holds
+        // the role — the logon host, still leaving after a sign-in (ADR 0126) —
+        // is asked to give it up, and it is waited for before this run settles
+        // on not hosting at all.
+        let mut claim = lumepeer_service::host_role::claim();
+        if matches!(claim, HostRoleClaim::Taken) && lumepeer_service::host_role::request_release() {
+            tracing::info!("asked the process hosting this machine to hand the role over");
+            let deadline = std::time::Instant::now() + HOST_ROLE_HANDOVER_WAIT;
+            while matches!(claim, HostRoleClaim::Taken) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                claim = lumepeer_service::host_role::claim();
+            }
+        }
+        match claim {
             HostRoleClaim::Held(role) => (Some(role), true),
             HostRoleClaim::Taken => {
                 tracing::warn!(
@@ -523,6 +550,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::unattended_disable,
         commands::unattended_set_totp,
         commands::unattended_set_role,
+        commands::unattended_set_logon_screen,
         commands::unattended_submit,
         commands::connection_history,
         commands::history_connect,
@@ -670,6 +698,16 @@ fn main() {
         .any(|arg| arg == lumepeer_service::SYSTEM_INPUT_WORKER_ARG)
     {
         system_input_worker::run();
+    }
+    // Before everything, for the same reason again (ADR 0126): this process is
+    // the logon screen's host, launched by the service while nobody is signed
+    // in, and owns no tray, no window and no single-instance lock.
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::LOGON_HOST_ARG)
+    {
+        logon_host::run();
     }
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {

@@ -47,7 +47,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+    ProcessIdToSessionId, WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSGetActiveConsoleSessionId,
+    WTSQuerySessionInformationW, WTSQueryUserToken, WTSUserName,
 };
 use windows::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcessId,
@@ -136,6 +137,40 @@ pub fn current_session() -> Option<u32> {
     read.inspect_err(|error| tracing::warn!(%error, "cannot read this process's session"))
         .ok()?;
     Some(session)
+}
+
+/// Whether anybody is signed in at `session`; `None` when the kernel will not
+/// say (ADR 0126).
+///
+/// Asks for the session's user name rather than its token: the logon-host
+/// supervisor asks this on every tick while the machine sits at its logon
+/// screen, and the token query logs a warning each time it finds nobody. A
+/// locked session has somebody signed in; only the logon screen of an empty
+/// console answers `false`.
+#[must_use]
+pub fn anybody_signed_in(session: u32) -> Option<bool> {
+    let mut buffer = PWSTR::null();
+    let mut bytes = 0u32;
+    // SAFETY: the local server handle, and two locals the call writes; the
+    // buffer it allocates is freed below and not read past its terminator.
+    unsafe {
+        WTSQuerySessionInformationW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            session,
+            WTSUserName,
+            &raw mut buffer,
+            &raw mut bytes,
+        )
+    }
+    .ok()?;
+    if buffer.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null, null-terminated string the call allocated.
+    let name = unsafe { buffer.to_string() }.unwrap_or_default();
+    // SAFETY: allocated by `WTSQuerySessionInformationW` and freed only here.
+    unsafe { WTSFreeMemory(buffer.as_ptr().cast()) };
+    Some(!name.is_empty())
 }
 
 /// The string form of the SID of whoever is signed in at `session`.

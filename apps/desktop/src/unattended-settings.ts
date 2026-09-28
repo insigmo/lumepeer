@@ -22,6 +22,11 @@ export interface UnattendedStatus {
   enabled: boolean;
   totp_enabled: boolean;
   role: Role;
+  /**
+   * Whether this machine is also hosted at its Windows sign-in screen with
+   * these credentials (ADR 0126); `null` where it cannot be.
+   */
+  logon_screen?: boolean | null;
 }
 
 /** The one-time payload `unattended_set_totp` returns when turning it on. */
@@ -238,6 +243,8 @@ export function unattendedSettings(
         )}
       </select>
 
+      ${logonScreenToggle(status, locale, onRefresh)}
+
       ${status.enabled
         ? html`
             <button
@@ -264,6 +271,38 @@ export function unattendedSettings(
         ? html`<p class="unattended-error" role="alert" data-testid="unattended-error">${errorMessage}</p>`
         : ''}
     </section>
+  `;
+}
+
+/**
+ * "Also at the sign-in screen" (ADR 0126): only where the platform and this
+ * run can host it, and only with a device password to admit anybody by.
+ */
+function logonScreenToggle(
+  status: UnattendedStatus,
+  locale: Locale,
+  onRefresh: () => void,
+): TemplateResult | typeof nothing {
+  if (status.logon_screen === null || status.logon_screen === undefined) {
+    return nothing;
+  }
+  return html`
+    <label class="unattended-logon-screen">
+      <input
+        type="checkbox"
+        data-testid="unattended-logon-screen"
+        .checked=${status.logon_screen}
+        ?disabled=${busy || !status.enabled}
+        @change=${(event: Event) => {
+          const enabled = (event.target as HTMLInputElement).checked;
+          void run(async (invoke) => {
+            await invoke('unattended_set_logon_screen', { args: { enabled } });
+          }, onRefresh);
+        }}
+      />
+      <span>${t(locale, 'unattended.logonScreen.label')}</span>
+    </label>
+    <p class="unattended-hint">${t(locale, 'unattended.logonScreen.note')}</p>
   `;
 }
 

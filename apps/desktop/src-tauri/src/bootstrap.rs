@@ -167,7 +167,7 @@ pub async fn spawn_actor(
 /// The one failure worth its own message is a lost install salt over a
 /// non-empty log: minting a new one would silently split every peer's history
 /// in two, so the log is left untouched and unwritten instead.
-async fn open_audit_log(
+pub(crate) async fn open_audit_log(
     path: Option<std::path::PathBuf>,
     keystore: &dyn Keystore,
 ) -> Option<lumepeer_runtime::audit_store::AuditStore> {

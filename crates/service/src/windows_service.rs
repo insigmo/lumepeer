@@ -134,7 +134,20 @@ extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     report(handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP);
     tracing::info!("lumepeer helper service running");
 
+    // The logon screen's host (ADR 0126), supervised for the service's whole
+    // run on a thread of its own. Here rather than in `serve_until_stopped`:
+    // `--console` shares that function, and an unelevated console run can
+    // launch nothing onto `Winlogon`.
+    let logon_host = std::thread::spawn(|| crate::logon_host_launch::supervise(&STOPPING));
+
     serve_until_stopped(&STOPPING);
+
+    // Joined, so no logon host outlives the service that started it. The flag
+    // is set here too because the accept loop can also give up on its own.
+    STOPPING.store(true, Ordering::SeqCst);
+    if logon_host.join().is_err() {
+        tracing::warn!("the logon host supervisor panicked on its way out");
+    }
 
     report(handle, SERVICE_STOPPED, 0);
     tracing::info!("lumepeer helper service stopped");

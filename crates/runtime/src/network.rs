@@ -8952,9 +8952,16 @@ impl Actor {
     /// authorize itself.
     fn on_media_accepted(&mut self, connection: PeerConnection, peer: NodeId) {
         let tag = self.label_of(&peer);
+        // A host whose whole screen is the secure desktop — the logon host
+        // (ADR 0126) — also wants `secure_desktop`, the grant every frame of
+        // that desktop takes on a client (ADR 0056, ADR 0088 "Not built").
+        let secure_screen = self.windows.on_secure_desktop();
         let granted = self.connections.contains_key(&peer)
             && self.sessions.state(&peer) == SessionState::Active
-            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+            && self
+                .sessions
+                .grants(&peer)
+                .is_some_and(|g| g.view && (g.secure_desktop || !secure_screen));
         if !granted {
             tracing::warn!(peer = %tag, "refusing a media connection without a granted view session");
             connection.close(
@@ -9815,7 +9822,12 @@ impl Actor {
         // performed every event before 0114 and still does when the service
         // cannot (§18; ADR 0114 §3). Off Windows the call is a no-op `false`, so
         // nothing changes there.
-        let via_service = lumepeer_service::client::inject_desktop(desktop_inject_event(event));
+        //
+        // Not when this host's own screen is the secure desktop (ADR 0126): that
+        // injector lives on `Default`, so an event it took would land on a
+        // desktop nobody is looking at while the logon screen waited for it.
+        let via_service = !self.windows.on_secure_desktop()
+            && lumepeer_service::client::inject_desktop(desktop_inject_event(event));
         // The two injectors keep separate books on which keys are down, and
         // only one of them reaches a `VMware` guest, so a session whose input
         // moves between them misbehaves in ways the log should explain

@@ -359,6 +359,9 @@ export const es: Dictionary = {
   'unattended.totp.done': 'Hecho',
   'unattended.role.label': 'Un dispositivo que inicia sesión así obtiene',
   'unattended.needsTrust': 'Establezca primero una contraseña de dispositivo.',
+  'unattended.logonScreen.label': 'También en la pantalla de inicio de sesión de Windows',
+  'unattended.logonScreen.note':
+    'Tras un reinicio o un cierre de sesión, un invitado con la contraseña del dispositivo ve la pantalla de inicio de sesión y puede iniciar sesión. En esa pantalla no se indica que haya alguien conectado.',
   'book.heading': 'Dispositivos guardados',
   'book.explain':
     'Confiar en un dispositivo no le permite entrar por sí solo. Determina quién puede intentar la contraseña del dispositivo.',

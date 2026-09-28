@@ -359,6 +359,9 @@ export const fr: Dictionary = {
   'unattended.totp.done': 'Terminé',
   'unattended.role.label': 'Un appareil se connectant ainsi obtient',
   'unattended.needsTrust': "Définissez d'abord un mot de passe pour l'appareil.",
+  'unattended.logonScreen.label': "Aussi sur l'écran de connexion Windows",
+  'unattended.logonScreen.note':
+    "Après un redémarrage ou une déconnexion, un invité disposant du mot de passe de l'appareil voit l'écran de connexion et peut ouvrir une session. Rien sur cet écran n'indique qu'une personne est connectée.",
   'book.heading': 'Appareils enregistrés',
   'book.explain':
     "Faire confiance à un appareil ne le laisse pas entrer de lui-même. Cela détermine simplement qui est autorisé à essayer le mot de passe de l'appareil.",

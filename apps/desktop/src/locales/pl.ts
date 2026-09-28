@@ -359,6 +359,9 @@ export const pl: Dictionary = {
   'unattended.totp.done': 'Gotowe',
   'unattended.role.label': 'Urządzenie logujące się w ten sposób otrzymuje',
   'unattended.needsTrust': 'Najpierw ustaw hasło urządzenia.',
+  'unattended.logonScreen.label': 'Także na ekranie logowania Windows',
+  'unattended.logonScreen.note':
+    'Po ponownym uruchomieniu lub wylogowaniu gość znający hasło urządzenia widzi ekran logowania i może się zalogować. Na tym ekranie nic nie wskazuje, że ktoś jest połączony.',
   'book.heading': 'Zapisane urządzenia',
   'book.explain':
     'Uznanie urządzenia za zaufane samo w sobie go nie wpuszcza. Decyduje jedynie o tym, kto w ogóle może próbować hasła urządzenia.',

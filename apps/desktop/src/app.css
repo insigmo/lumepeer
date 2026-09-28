@@ -2349,6 +2349,7 @@ input[type='checkbox'].switch:disabled {
 }
 
 .unattended-totp,
+.unattended-logon-screen,
 .book-trust,
 .credentials-remember {
   display: flex;

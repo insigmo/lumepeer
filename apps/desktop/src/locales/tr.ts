@@ -359,6 +359,9 @@ export const tr: Dictionary = {
   'unattended.totp.done': 'Tamam',
   'unattended.role.label': 'Bu şekilde oturum açan bir cihaz şunu alır:',
   'unattended.needsTrust': 'Önce bir cihaz parolası belirleyin.',
+  'unattended.logonScreen.label': 'Windows oturum açma ekranında da',
+  'unattended.logonScreen.note':
+    'Yeniden başlatma veya oturum kapatmadan sonra cihaz parolasını bilen bir konuk oturum açma ekranını görür ve oturum açabilir. Bu ekranda birinin bağlı olduğunu gösteren bir şey yoktur.',
   'book.heading': 'Kayıtlı cihazlar',
   'book.explain':
     'Bir cihaza güvenmek onun kendiliğinden girmesini sağlamaz. Yalnızca cihaz parolasını denemesine kimin izinli olduğunu belirler.',

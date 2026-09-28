@@ -160,6 +160,29 @@ second machine. All manual, once per release.
       0056's honest "respond to it there" message and the picture, and nothing
       the guest does reaches the prompt — the ADR 0011/0056 fallback is intact.
 
+### Hosting the sign-in screen (ADR 0126)
+
+Needs a host you can reboot and a second machine as the guest. The host has a
+device password set, a full-control unattended role, and "Also at the Windows
+sign-in screen" on.
+
+- [ ] Reboot the host. Before anybody signs in,
+      `%ProgramData%\Lumepeer\logs\lumepeer-logon-host.log` says "hosting the
+      logon screen", and the guest's saved host connects with the remembered
+      device password.
+- [ ] The guest sees the sign-in screen, moves the pointer, types the Windows
+      password and signs in. The audit log records an `EmptyMachineLogin`.
+- [ ] At sign-in the logon host leaves ("asked to give the host role up") and
+      the guest reconnects to the client within a few seconds. If the client
+      did not start on its own, write that down: it is ADR 0126's open
+      autostart question.
+- [ ] With the checkbox off, or with no device password, the logon host log
+      says so and nothing listens; the helper does not relaunch it until the
+      console changes.
+- [ ] Sign out: the logon host comes back and the guest can connect again.
+- [ ] A guest whose unattended role is view-only sees the sign-in screen and
+      cannot type into it.
+
 ### The guest decodes for itself (ADR 0058, ADR 0059)
 
 The whole picture path changed, and the part that cannot be gated

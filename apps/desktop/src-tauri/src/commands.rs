@@ -562,6 +562,11 @@ pub struct UnattendedStatusDto {
     pub totp_enabled: bool,
     /// Role a successful unattended login is granted.
     pub role: RoleDto,
+    /// Whether this machine is also hosted at its logon screen, with this
+    /// account's identity and device password (ADR 0126). `None` where that
+    /// cannot be: off Windows, or a run that does not keep its stores where
+    /// only administrators can write.
+    pub logon_screen: Option<bool>,
 }
 
 /// Argument of [`unattended_set_password`].
@@ -1399,7 +1404,81 @@ pub async fn unattended_status(
         enabled: settings.enabled,
         totp_enabled: settings.totp_enabled,
         role: settings.role.into(),
+        logon_screen: logon_screen_status(),
     })
+}
+
+/// Whether the logon screen is hosted with this account's stores (ADR 0126),
+/// or `None` where it cannot be.
+fn logon_screen_status() -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        let account = crate::placement::protected_account()?;
+        Some(lumepeer_service::program_data::logon_host_owner().as_deref() == Some(&*account))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// Argument of [`unattended_set_logon_screen`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogonScreenArgs {
+    /// `true` hosts the logon screen with this account's stores.
+    pub enabled: bool,
+}
+
+/// Turns hosting the logon screen on or off for this account (ADR 0126).
+///
+/// On, the helper service keeps this application on the logon screen whenever
+/// nobody is signed in, answering as this machine with this account's
+/// identity, and admitting only a guest with the device password. Turning it
+/// off here only undoes this account's own choice: another account's is left
+/// as it is.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; `UNATTENDED` where the
+/// feature cannot be (see [`logon_screen_status`]) or the choice cannot be
+/// written.
+#[tauri::command]
+pub fn unattended_set_logon_screen(window: Window, args: LogonScreenArgs) -> Result<(), IpcError> {
+    check_window(&window)?;
+    set_logon_screen(args.enabled).map_err(|message| IpcError {
+        code: "UNATTENDED",
+        message,
+    })?;
+    tracing::info!(enabled = args.enabled, "hosting the logon screen changed");
+    Ok(())
+}
+
+/// The platform half of [`unattended_set_logon_screen`].
+fn set_logon_screen(enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use lumepeer_service::program_data::{logon_host_owner, set_logon_host_owner};
+
+        let Some(account) = crate::placement::protected_account() else {
+            return Err("the sign-in screen can only be hosted by the installed app".to_owned());
+        };
+        let owner = if enabled {
+            Some(account.as_str())
+        } else if logon_host_owner().as_deref() == Some(&*account) {
+            None
+        } else {
+            return Ok(());
+        };
+        if set_logon_host_owner(owner) {
+            Ok(())
+        } else {
+            Err("cannot save the sign-in screen setting".to_owned())
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        Err("the sign-in screen is hosted on Windows only".to_owned())
+    }
 }
 
 /// Sets or replaces the device password, turning unattended access on (§8).

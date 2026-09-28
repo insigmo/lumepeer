@@ -50,6 +50,11 @@ pub const HELPER_LOG_FILE: &str = "lumepeer-service.log";
 /// The session-0 host service's own file (ADR 0085).
 pub const HOST_LOG_FILE: &str = "lumepeer-host.log";
 
+/// The logon host's own file (ADR 0126): the desktop binary run as
+/// `LocalSystem` on the logon screen, which has no profile of its own to log
+/// into.
+pub const LOGON_HOST_LOG_FILE: &str = "lumepeer-logon-host.log";
+
 /// Size at which the next process to open the file starts it over, in bytes.
 ///
 /// The cheapest bound that still cannot grow without limit. Truncating on open

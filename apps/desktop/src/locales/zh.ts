@@ -344,6 +344,9 @@ export const zh: Dictionary = {
   'unattended.totp.done': '完成',
   'unattended.role.label': '以此方式登录的设备将获得',
   'unattended.needsTrust': '请先设置设备密码。',
+  'unattended.logonScreen.label': '在 Windows 登录屏幕上也可访问',
+  'unattended.logonScreen.note':
+    '重启或注销后，拥有设备密码的访客可以看到登录屏幕并登录。该屏幕上不会显示有人已连接。',
   'book.heading': '已保存的设备',
   'book.explain': '信任某设备并不会让它自行进入，而是决定谁一开始就有资格尝试输入设备密码。',
   'book.empty': '尚无已保存的设备。从某次连接中保存设备后，它就会显示在此处。',

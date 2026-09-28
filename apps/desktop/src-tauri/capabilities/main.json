@@ -39,6 +39,7 @@
     "allow-unattended-disable",
     "allow-unattended-set-totp",
     "allow-unattended-set-role",
+    "allow-unattended-set-logon-screen",
     "allow-unattended-submit",
     "allow-connection-history",
     "allow-history-connect",

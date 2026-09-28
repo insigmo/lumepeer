@@ -109,6 +109,29 @@ pub fn choose(
     })
 }
 
+/// The account whose protected stores this run keeps, or `None` when it keeps
+/// the profile (ADR 0123) — the same conditions [`choose`] reads.
+#[cfg(target_os = "windows")]
+pub fn protected_account() -> Option<String> {
+    if std::env::var("LUMEPEER_KEYSTORE").as_deref() == Ok("file") {
+        return None;
+    }
+    match lumepeer_service::program_data::this_process()? {
+        (sid, true) => Some(sid),
+        (_, false) => None,
+    }
+}
+
+/// The stores of the account `sid`, where its elevated client keeps them, for
+/// the logon host (ADR 0126); `None` when that directory cannot be opened.
+///
+/// Nothing is moved out of a profile here: the logon host runs as
+/// `LocalSystem` and has no profile of the owner's to move from.
+#[cfg(target_os = "windows")]
+pub fn for_logon_host(sid: &str) -> Option<Placement> {
+    protected::existing(sid)
+}
+
 /// A profile keystore with the unattended credentials taken out of it: read
 /// as absent, and refused on write (ADR 0123).
 ///
@@ -185,20 +208,31 @@ mod protected {
         open_profile_keystore: &dyn Fn() -> Result<Box<dyn Keystore>, NetError>,
     ) -> Option<Placement> {
         let directory = lumepeer_service::program_data::user_directory(sid)?;
-        let secret = lumepeer_service::program_data::keystore_secret(&directory)?;
-        let keystore = || Box::new(FileKeystore::new(directory.join("identity.key"), &secret));
-        let placement = Placement {
-            keystore: keystore(),
-            remembered: keystore(),
-            address_book: Some(directory.join("address_book.json")),
-            invite_dir: Some(directory.clone()),
-            history: Some(directory.join("connection_history.json")),
-            audit: Some(directory.join("audit.db")),
-        };
+        let placement = placement_in(&directory)?;
         if !directory.join(MOVED_MARKER).exists() {
             move_from_profile(&directory, profile, &placement, open_profile_keystore);
         }
         Some(placement)
+    }
+
+    /// The placement for the account `sid` as it stands, moving nothing
+    /// (ADR 0126).
+    pub(super) fn existing(sid: &str) -> Option<Placement> {
+        placement_in(&lumepeer_service::program_data::user_directory(sid)?)
+    }
+
+    /// Every store of the protected `directory`.
+    fn placement_in(directory: &Path) -> Option<Placement> {
+        let secret = lumepeer_service::program_data::keystore_secret(directory)?;
+        let keystore = || Box::new(FileKeystore::new(directory.join("identity.key"), &secret));
+        Some(Placement {
+            keystore: keystore(),
+            remembered: keystore(),
+            address_book: Some(directory.join("address_book.json")),
+            invite_dir: Some(directory.to_path_buf()),
+            history: Some(directory.join("connection_history.json")),
+            audit: Some(directory.join("audit.db")),
+        })
     }
 
     /// Moves what the profile held into `placement`, once.

@@ -359,6 +359,9 @@ export const it: Dictionary = {
   'unattended.totp.done': 'Fatto',
   'unattended.role.label': 'Un dispositivo che accede in questo modo ottiene',
   'unattended.needsTrust': 'Imposta prima una password del dispositivo.',
+  'unattended.logonScreen.label': 'Anche nella schermata di accesso di Windows',
+  'unattended.logonScreen.note':
+    'Dopo un riavvio o una disconnessione, un ospite con la password del dispositivo vede la schermata di accesso e può accedere. Su quella schermata nulla indica che qualcuno è connesso.',
   'book.heading': 'Dispositivi salvati',
   'book.explain':
     "Contrassegnare un dispositivo come attendibile non lo lascia entrare da solo. Decide chi ha il permesso di provare la password del dispositivo.",

@@ -359,6 +359,9 @@ export const pt: Dictionary = {
   'unattended.totp.done': 'Concluído',
   'unattended.role.label': 'Um dispositivo que entra dessa forma recebe',
   'unattended.needsTrust': 'Defina primeiro uma senha de dispositivo.',
+  'unattended.logonScreen.label': 'Também na tela de entrada do Windows',
+  'unattended.logonScreen.note':
+    'Após reiniciar ou encerrar a sessão, um convidado com a senha do dispositivo vê a tela de entrada e pode entrar. Nada nessa tela mostra que alguém está conectado.',
   'book.heading': 'Dispositivos salvos',
   'book.explain':
     'Confiar em um dispositivo não o deixa entrar por conta própria. Isso decide quem tem permissão para sequer tentar a senha do dispositivo.',

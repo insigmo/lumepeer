@@ -21,6 +21,7 @@ const COMMANDS: &[&str] = &[
     "unattended_disable",
     "unattended_set_totp",
     "unattended_set_role",
+    "unattended_set_logon_screen",
     "unattended_submit",
     "connection_history",
     "history_connect",

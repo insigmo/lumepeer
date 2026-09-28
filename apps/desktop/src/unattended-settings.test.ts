@@ -156,6 +156,34 @@ describe('unattended settings', () => {
     );
   });
 
+  it('offers the sign-in screen only where the core says it can be hosted', () => {
+    render(unattendedSettings({ ...on, logon_screen: null }, 'en'), container);
+    expect(container.querySelector('[data-testid="unattended-logon-screen"]')).toBeNull();
+    render(unattendedSettings(on, 'en'), container);
+    expect(container.querySelector('[data-testid="unattended-logon-screen"]')).toBeNull();
+  });
+
+  it('the sign-in screen cannot be turned on before a password exists', () => {
+    render(unattendedSettings({ ...off, logon_screen: false }, 'en'), container);
+    const toggle = container.querySelector<HTMLInputElement>('[data-testid="unattended-logon-screen"]');
+    expect(toggle?.disabled).toBe(true);
+  });
+
+  it('the sign-in screen toggle shows what the core holds and asks it to change', async () => {
+    render(unattendedSettings({ ...on, logon_screen: false }, 'en'), container);
+    const toggle = container.querySelector<HTMLInputElement>('[data-testid="unattended-logon-screen"]');
+    expect(toggle?.checked).toBe(false);
+    expect(toggle?.disabled).toBe(false);
+
+    if (toggle) {
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event('change'));
+    }
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('unattended_set_logon_screen', { args: { enabled: true } }),
+    );
+  });
+
   it('the password field is a password field, and never renders a value', () => {
     render(unattendedSettings(on, 'en'), container);
     const field = passwordField();

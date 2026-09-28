@@ -359,6 +359,9 @@ export const de: Dictionary = {
   'unattended.totp.done': 'Fertig',
   'unattended.role.label': 'Ein Gerät, das sich so anmeldet, erhält',
   'unattended.needsTrust': 'Legen Sie zuerst ein Gerätepasswort fest.',
+  'unattended.logonScreen.label': 'Auch am Windows-Anmeldebildschirm',
+  'unattended.logonScreen.note':
+    'Nach einem Neustart oder einer Abmeldung sieht ein Gast mit dem Gerätepasswort den Anmeldebildschirm und kann sich anmelden. Auf diesem Bildschirm ist nicht zu sehen, dass jemand verbunden ist.',
   'book.heading': 'Gespeicherte Geräte',
   'book.explain':
     'Ein Gerät als vertrauenswürdig einzustufen, lässt es nicht von selbst herein. Es entscheidet, wer überhaupt versuchen darf, das Gerätepasswort einzugeben.',

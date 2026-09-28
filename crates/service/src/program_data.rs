@@ -217,6 +217,66 @@ pub fn keystore_secret(directory: &Path) -> Option<Vec<u8>> {
     Some(secret)
 }
 
+/// Name of the file under `users` that says whose identity the logon screen
+/// is hosted with (ADR 0126). It holds one SID and nothing else.
+const LOGON_HOST_OWNER_FILE: &str = "logon-host-owner";
+
+/// The account whose identity and device password host the logon screen, or
+/// `None` when the feature is off (ADR 0126).
+///
+/// The file sits in `users`, which only `LocalSystem` and administrators can
+/// open at all; one somebody else put there before the tree was secured is
+/// removed rather than believed, because it names whose policy admits a guest
+/// to this machine with nobody signed in.
+#[must_use]
+pub fn logon_host_owner() -> Option<String> {
+    logon_host_owner_in(&root())
+}
+
+/// [`logon_host_owner`], under the tree rooted at `root`.
+fn logon_host_owner_in(root: &Path) -> Option<String> {
+    let path = root.join(USERS).join(LOGON_HOST_OWNER_FILE);
+    if !discard_untrusted_file(&path) {
+        return None;
+    }
+    let sid = std::fs::read_to_string(&path).ok()?;
+    let sid = sid.trim();
+    crate::frame::is_sid_string(sid).then(|| sid.to_owned())
+}
+
+/// Turns hosting the logon screen on for the account `sid`, or off with
+/// `None` (ADR 0126); `false` when that could not be written.
+///
+/// One owner per machine: turning it on from a second account moves it there.
+/// Only an elevated process gets `true`, since securing the tree is what it
+/// takes.
+#[must_use]
+pub fn set_logon_host_owner(sid: Option<&str>) -> bool {
+    set_logon_host_owner_in(&root(), sid)
+}
+
+/// [`set_logon_host_owner`], under the tree rooted at `root`.
+fn set_logon_host_owner_in(root: &Path, sid: Option<&str>) -> bool {
+    let users = root.join(USERS);
+    if !secure_directory(root, TREE_SDDL, Foreign::Adopt)
+        || !secure_directory(&users, PRIVATE_SDDL, Foreign::Adopt)
+    {
+        return false;
+    }
+    let path = users.join(LOGON_HOST_OWNER_FILE);
+    if !discard_untrusted_file(&path) {
+        return false;
+    }
+    match sid {
+        Some(sid) if crate::frame::is_sid_string(sid) => std::fs::write(&path, sid).is_ok(),
+        Some(_) => false,
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        },
+    }
+}
+
 /// What to do with a directory whose owner is neither `LocalSystem` nor
 /// administrators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,6 +722,47 @@ mod tests {
             .args(["/setowner", &format!("{domain}\\{user}")])
             .output()
             .is_ok_and(|output| output.status.success())
+    }
+
+    /// ADR 0126: the logon host's owner is one SID, off until written, and a
+    /// file an ordinary user left in its place is removed rather than read.
+    /// Only runs elevated, like the test below.
+    #[test]
+    fn the_logon_host_owner_is_one_sid_and_a_planted_one_is_not_believed() {
+        let base = std::env::temp_dir().join(format!(
+            "lumepeer-program-data-logon-host-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        if !set_logon_host_owner_in(&base, None) {
+            eprintln!("skipping: securing a directory needs an elevated run");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert_eq!(logon_host_owner_in(&base), None, "off until turned on");
+
+        let sid = "S-1-5-21-1111111111-2222222222-3333333333-1001";
+        assert!(set_logon_host_owner_in(&base, Some(sid)));
+        assert_eq!(logon_host_owner_in(&base).as_deref(), Some(sid));
+        assert!(
+            !set_logon_host_owner_in(&base, Some("../elsewhere")),
+            "only a SID is written"
+        );
+        assert_eq!(logon_host_owner_in(&base).as_deref(), Some(sid));
+
+        let file = base.join(USERS).join(LOGON_HOST_OWNER_FILE);
+        assert!(give_to_this_user(&file));
+        assert_eq!(
+            logon_host_owner_in(&base),
+            None,
+            "a file an ordinary user owns does not name whose policy admits a guest"
+        );
+        assert!(!file.exists());
+
+        assert!(set_logon_host_owner_in(&base, Some(sid)));
+        assert!(set_logon_host_owner_in(&base, None));
+        assert_eq!(logon_host_owner_in(&base), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ADR 0122: a folder an ordinary user owns is taken over where nothing in

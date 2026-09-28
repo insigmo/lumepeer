@@ -4,6 +4,9 @@ Status: proposed — §5 reverses one sentence of ADR 0085 and waits for a human
 to accept that
 Date: 2026-09-16
 
+The logon screen is served instead by [ADR 0126](0126-the-logon-screen-is-hosted-by-the-same-host.md),
+without the session-0 host this ADR builds on.
+
 Pack `26` (`docs/gap-tasks/26-session-zero-logon-screen.md`). Builds on
 [ADR 0085](0085-the-host-can-be-a-service-and-the-screen-belongs-to-an-agent.md)
 and [ADR 0087](0087-assembling-the-session-zero-host.md). ADR 0085 left out
