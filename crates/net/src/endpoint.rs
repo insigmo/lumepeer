@@ -104,11 +104,18 @@ pub fn relay_only_enabled() -> bool {
 /// A DHT node that cannot be built is a warning, never a failed bind: it is an
 /// additional way to be found, and losing it must not cost the endpoint the
 /// ways it already had (§18).
+///
+/// Started on addresses rather than names (ADR 0125): the caller resolves the
+/// bootstrap nodes first, because a DHT that resolves them itself blocks the
+/// bind on the system resolver.
 fn with_dht_lookup(builder: EndpointBuilder, secret_key: &iroh::SecretKey) -> EndpointBuilder {
     use iroh::address_lookup::AddrFilter;
     use iroh_mainline_address_lookup::DhtAddressLookup;
 
+    let mut dht = n0_mainline::DhtBuilder::default();
+    dht.bootstrap(&crate::dns::mainline_bootstrap());
     match DhtAddressLookup::builder()
+        .dht_builder(dht)
         .secret_key(secret_key.clone())
         .addr_filter(AddrFilter::unfiltered())
         .build()
@@ -227,7 +234,10 @@ impl PeerEndpoint {
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
         let fleet;
-        (builder, fleet) = with_relay(builder, relay_url, relay_cache).await;
+        ((builder, fleet), ()) = tokio::join!(
+            with_relay(builder, relay_url, relay_cache),
+            crate::dns::resolve_mainline_bootstrap()
+        );
         builder = with_dht_lookup(builder, &secret_key);
         builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder
@@ -265,7 +275,10 @@ impl PeerEndpoint {
             .secret_key(secret_key.clone())
             .alpns(alpn_list());
         let fleet;
-        (builder, fleet) = with_relay(builder, relay_url, relay_cache).await;
+        ((builder, fleet), ()) = tokio::join!(
+            with_relay(builder, relay_url, relay_cache),
+            crate::dns::resolve_mainline_bootstrap()
+        );
         builder = with_dht_lookup(builder, &secret_key);
         builder = builder.dns_resolver(crate::dns::resolver());
         let inner = builder

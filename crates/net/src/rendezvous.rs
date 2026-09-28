@@ -128,10 +128,17 @@ impl Rendezvous {
     /// Starts a DHT client on the public Mainline network. Must be called
     /// inside a tokio runtime.
     ///
+    /// On the bootstrap addresses the endpoint's bind already looked up, when
+    /// it has (ADR 0125): handed names, the DHT would resolve them again on
+    /// the caller's thread, which on a slow resolver is the whole start.
+    ///
     /// # Errors
     /// [`NetError::Endpoint`] if the DHT socket cannot be bound.
     pub fn start() -> Result<Self> {
-        let dht = Dht::client().map_err(|e| NetError::Endpoint(e.to_string()))?;
+        let dht = Dht::builder()
+            .bootstrap(&crate::dns::mainline_bootstrap())
+            .build()
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
         Ok(Self {
             dht,
             relays: nostr::SIGNAL_RELAYS

@@ -222,6 +222,57 @@ fn prefer_x11_windows() {
     gdk::set_allowed_backends("x11,wayland");
 }
 
+/// The display driver of a virtual machine, when this is one (ADR 0125).
+///
+/// Read from the kernel's own record of which driver took each display
+/// device, rather than from what the machine calls itself: what breaks is the
+/// GPU, and a VM given a real GPU passed through draws like any other machine.
+#[cfg(target_os = "linux")]
+fn virtual_gpu() -> Option<String> {
+    const VIRTUAL_GPU_DRIVERS: [&str; 7] = [
+        // VMware's SVGA, and VirtualBox's VMSVGA, which uses the same driver.
+        "vmwgfx",
+        "vboxvideo",
+        "virtio_gpu",
+        "qxl",
+        "bochs-drm",
+        "cirrus",
+        "hyperv_drm",
+    ];
+    std::fs::read_dir("/sys/class/drm")
+        .ok()?
+        .flatten()
+        .find_map(|card| {
+            let driver = std::fs::read_link(card.path().join("device/driver")).ok()?;
+            let driver = driver.file_name()?.to_str()?;
+            VIRTUAL_GPU_DRIVERS
+                .contains(&driver)
+                .then(|| driver.to_owned())
+        })
+}
+
+/// Turns one webview's GPU drawing off, so `WebKitGTK` paints it in software
+/// (ADR 0125).
+///
+/// For a virtual GPU only. `WebKitGTK` composites pages on the GPU and hands
+/// the frames to GTK as DMA-BUFs; `VMware`'s 3D acceleration accepts the first
+/// half and not the second, and every window came up white. The same setting
+/// `WEBKIT_DISABLE_COMPOSITING_MODE` makes, set through the API because this
+/// crate forbids the `unsafe` that setting an environment variable now is.
+#[cfg(target_os = "linux")]
+fn draw_in_software(webview: &tauri::Webview) {
+    use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt as _, WebViewExt as _};
+
+    let queued = webview.with_webview(|platform| {
+        if let Some(settings) = platform.inner().settings() {
+            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
+        }
+    });
+    if let Err(error) = queued {
+        tracing::warn!(%error, "cannot reach a webview to turn its GPU drawing off");
+    }
+}
+
 /// Installs the tray icon and its menu, and answers whether one went up.
 ///
 /// Closing the window must not stop remote sessions: the app keeps running in
@@ -702,6 +753,18 @@ fn main() {
     #[cfg(all(debug_assertions, feature = "pilot"))]
     {
         builder = builder.plugin(tauri_plugin_pilot::init());
+    }
+
+    // Every webview, as its page starts loading and before it has drawn
+    // anything: the main window, each view and file manager, the two bars.
+    #[cfg(target_os = "linux")]
+    if let Some(driver) = virtual_gpu() {
+        tracing::info!(%driver, "a virtual GPU: the windows are drawn in software (ADR 0125)");
+        builder = builder.on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
+                draw_in_software(webview);
+            }
+        });
     }
 
     builder

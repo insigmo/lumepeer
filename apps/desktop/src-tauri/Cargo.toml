@@ -150,6 +150,11 @@ dlopen2 = "0.8"
 # safe function where setting `GDK_BACKEND` is not; `tao` already pulls this
 # exact version into every Linux build.
 gdk = "0.18"
+# `webkit_settings_set_hardware_acceleration_policy`, which draws a webview in
+# software on a virtual GPU, where WebKit's GPU path leaves every window white
+# (ADR 0125). A safe method where setting `WEBKIT_DISABLE_COMPOSITING_MODE` is
+# not; `wry` already pulls this exact version into every Linux build.
+webkit2gtk = { version = "2.0", features = ["v2_16"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `audio-capture-screencapturekit` sits here rather than only in the

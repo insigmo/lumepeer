@@ -34,6 +34,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use iroh::dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData};
 
@@ -182,6 +183,90 @@ pub fn resolver() -> DnsResolver {
     DnsResolver::custom(SingleStackResolver::new(DnsResolver::new()))
 }
 
+/// The public Mainline DHT's bootstrap nodes, exactly as `n0_mainline` names
+/// them in its `DEFAULT_BOOTSTRAP_NODES`, which it does not export.
+const MAINLINE_BOOTSTRAP: [(&str, u16); 4] = [
+    ("router.bittorrent.com", 6881),
+    ("dht.transmissionbt.com", 6881),
+    ("dht.libtorrent.org", 25401),
+    ("relay.pkarr.org", 6881),
+];
+
+/// How long looking the bootstrap nodes up may take, all four together.
+const MAINLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The bootstrap nodes' addresses, once [`resolve_mainline_bootstrap`] has
+/// found any.
+static MAINLINE_BOOTSTRAP_ADDRS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Looks the Mainline DHT's bootstrap nodes up — `A` records only, all at
+/// once — so every DHT this process starts is handed addresses rather than
+/// names (ADR 0125).
+///
+/// A DHT handed names resolves them itself while it is being built, one after
+/// another, through the blocking system resolver, which asks for `A` and
+/// `AAAA` together and waits for both. A DNS server that never answers `AAAA`
+/// — the one behind a `VMware` NAT is such a server — holds every name for its whole
+/// timeout: on the Linux VM this was measured on, each DHT took 17–22 s to
+/// start, two of them start before the app's setup returns, and the window
+/// stayed blank the whole time. The DHT's socket is IPv4-only and throws every
+/// `AAAA` answer away anyway, so asking for `A` alone loses nothing.
+///
+/// Nothing found is not an error: [`mainline_bootstrap`] then hands out the
+/// names, and the DHT resolves them itself as it always did.
+pub async fn resolve_mainline_bootstrap() {
+    if MAINLINE_BOOTSTRAP_ADDRS.get().is_some() {
+        return;
+    }
+    let resolver = DnsResolver::new();
+    let lookup = |(host, port): (&'static str, u16)| {
+        let resolver = resolver.clone();
+        async move {
+            match resolver.lookup_ipv4(host, MAINLINE_BOOTSTRAP_TIMEOUT).await {
+                Ok(addrs) => addrs
+                    .map(|ip| SocketAddr::new(ip, port).to_string())
+                    .collect(),
+                Err(error) => {
+                    tracing::debug!(host, %error, "a Mainline DHT bootstrap node did not resolve");
+                    Vec::new()
+                }
+            }
+        }
+    };
+    // All four at once, as the relay measurement does: the whole lookup costs
+    // one timeout, not four.
+    let [a, b, c, d] = MAINLINE_BOOTSTRAP;
+    let found: (Vec<String>, Vec<String>, Vec<String>, Vec<String>) =
+        tokio::join!(lookup(a), lookup(b), lookup(c), lookup(d));
+    let found: Vec<String> = [found.0, found.1, found.2, found.3]
+        .into_iter()
+        .flatten()
+        .collect();
+    if found.is_empty() {
+        tracing::warn!("no Mainline DHT bootstrap node resolved; the DHT will look them up itself");
+        return;
+    }
+    let _ = MAINLINE_BOOTSTRAP_ADDRS.set(found);
+}
+
+/// The bootstrap nodes to start a Mainline DHT with: their addresses once
+/// [`resolve_mainline_bootstrap`] has found them, their names before that or
+/// when it found none (ADR 0125).
+#[must_use]
+pub fn mainline_bootstrap() -> Vec<String> {
+    resolved_or_names(MAINLINE_BOOTSTRAP_ADDRS.get())
+}
+
+/// `resolved` when there is such a list, the bootstrap nodes' names otherwise.
+fn resolved_or_names(resolved: Option<&Vec<String>>) -> Vec<String> {
+    resolved.cloned().unwrap_or_else(|| {
+        MAINLINE_BOOTSTRAP
+            .iter()
+            .map(|(host, port)| format!("{host}:{port}"))
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
@@ -235,5 +320,38 @@ mod tests {
         let _ = resolver.ipv6.set(false);
         let answer = resolver.lookup_ipv6("example.invalid".to_owned()).await;
         assert_eq!(answer.unwrap().count(), 0);
+    }
+
+    /// Before anything was resolved — or when nothing could be — a DHT still
+    /// gets every bootstrap node, by name, exactly as `n0_mainline` would have
+    /// used them on its own.
+    #[test]
+    fn the_bootstrap_falls_back_to_the_names() {
+        assert_eq!(
+            resolved_or_names(None),
+            [
+                "router.bittorrent.com:6881",
+                "dht.transmissionbt.com:6881",
+                "dht.libtorrent.org:25401",
+                "relay.pkarr.org:6881",
+            ]
+        );
+        let resolved = vec!["67.215.246.10:6881".to_owned()];
+        assert_eq!(resolved_or_names(Some(&resolved)), resolved);
+    }
+
+    /// Whatever the lookup finds is a list of addresses a DHT can parse
+    /// without asking a resolver again, which is the whole point: a name in
+    /// it would put the blocking lookup back on the start. Offline, nothing is
+    /// found and there is nothing to check.
+    #[tokio::test]
+    async fn a_resolved_bootstrap_is_addresses_only() {
+        resolve_mainline_bootstrap().await;
+        for node in MAINLINE_BOOTSTRAP_ADDRS.get().into_iter().flatten() {
+            assert!(
+                node.parse::<SocketAddr>().is_ok(),
+                "{node} is not an address"
+            );
+        }
     }
 }
