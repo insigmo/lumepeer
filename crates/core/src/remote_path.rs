@@ -426,14 +426,30 @@ mod tests {
     /// in either dialect, and a root is not an entry of anything.
     #[test]
     fn an_entry_path_splits_into_its_directory_and_its_name() {
-        assert_eq!(split_entry_path("/home/beta/notes.txt"), Some(("/home/beta", "notes.txt")));
-        assert_eq!(split_entry_path("/home/beta/dir/"), Some(("/home/beta", "dir")));
+        assert_eq!(
+            split_entry_path("/home/beta/notes.txt"),
+            Some(("/home/beta", "notes.txt"))
+        );
+        assert_eq!(
+            split_entry_path("/home/beta/dir/"),
+            Some(("/home/beta", "dir"))
+        );
         assert_eq!(split_entry_path("/tmp"), Some(("/", "tmp")));
-        assert_eq!(split_entry_path("C:\\Users\\beta"), Some(("C:\\Users", "beta")));
+        assert_eq!(
+            split_entry_path("C:\\Users\\beta"),
+            Some(("C:\\Users", "beta"))
+        );
         assert_eq!(split_entry_path("C:\\Users"), Some(("C:\\", "Users")));
-        assert_eq!(split_entry_path("D:/data/a.bin"), Some(("D:/data", "a.bin")));
+        assert_eq!(
+            split_entry_path("D:/data/a.bin"),
+            Some(("D:/data", "a.bin"))
+        );
         for root in ["/", "C:\\", "C:/"] {
-            assert_eq!(split_entry_path(root), None, "{root} is a root, not an entry");
+            assert_eq!(
+                split_entry_path(root),
+                None,
+                "{root} is a root, not an entry"
+            );
         }
         for bad in ["", "relative/a", "/home/../etc", "\\\\server\\share\\a"] {
             assert_eq!(split_entry_path(bad), None, "{bad} was split");

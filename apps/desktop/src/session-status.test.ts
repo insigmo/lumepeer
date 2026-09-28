@@ -255,7 +255,19 @@ describe('remembered-host row', () => {
     item?.click();
     // The second argument is the whole difference from "Connect again": the
     // same host, the same role, dialled without the media connection.
-    expect(onReconnect).toHaveBeenCalledWith('host-ab12', true);
+    expect(onReconnect).toHaveBeenCalledWith('host-ab12', 'terminal');
+  });
+
+  // ADR 0124. File browsing is a grant of its own that a host can give any
+  // role, so the item is not tied to full control the way the shell is; a
+  // host that did not give it says so in the file manager itself.
+  it('offers the file manager on every remembered host and asks for its files', () => {
+    const onReconnect = vi.fn();
+    render_(() => {}, onReconnect);
+    const item = container.querySelector<HTMLButtonElement>('[data-testid="history-open-files"]');
+    expect(item?.disabled).toBe(false);
+    item?.click();
+    expect(onReconnect).toHaveBeenCalledWith('host-ab12', 'files');
   });
 
   it('keeps the terminal item out of reach while a connect is already in flight', () => {

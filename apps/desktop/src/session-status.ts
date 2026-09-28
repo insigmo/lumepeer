@@ -427,17 +427,20 @@ function peerMenu(label: string, locale: Locale, items: (TemplateResult | '')[])
   `;
 }
 
+/**
+ * What a dial to a remembered host opens: its screen, a shell and nothing
+ * else (ADR 0101), or its files and nothing else (ADR 0124). The last two
+ * never open the media connection, so the host encodes nothing.
+ */
+export type ConnectSurface = 'screen' | 'terminal' | 'files';
+
 export function sessionStatus(
   sessions: SessionStatus[],
   locale: Locale,
   onRefresh: () => void = () => {},
   history: HistoryEntry[] = [],
-  /**
-   * Dials a remembered host again. `terminalOnly` asks for a shell and
-   * nothing else — the same session and the same role, but the guest never
-   * opens the media connection, so the host encodes nothing (ADR 0101).
-   */
-  onReconnect: (peer: string, terminalOnly?: boolean) => void = () => {},
+  /** Dials a remembered host again, for the surface named. */
+  onReconnect: (peer: string, surface?: ConnectSurface) => void = () => {},
   reconnectDisabled = false,
   onOpenChat: (peer: string) => void = () => {},
   /**
@@ -689,10 +692,29 @@ export function sessionStatus(
                             : t(locale, 'status.reconnectTerminal.needsFullControl')}
                           @click=${(event: Event) => {
                             closeMenu(event);
-                            onReconnect(entry.peer_label, true);
+                            onReconnect(entry.peer_label, 'terminal');
                           }}
                         >
                           ${t(locale, 'status.reconnectTerminal')}
+                        </button>
+                      `,
+                      // Not gated on the role, unlike the terminal: file
+                      // browsing is a grant of its own the host can give any
+                      // role, and the file manager says so itself when it
+                      // was not given (ADR 0124).
+                      html`
+                        <button
+                          type="button"
+                          class="peer-menu-item peer-menu-open-files"
+                          role="menuitem"
+                          data-testid="history-open-files"
+                          ?disabled=${reconnectDisabled}
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            onReconnect(entry.peer_label, 'files');
+                          }}
+                        >
+                          ${t(locale, 'fileManager.heading')}
                         </button>
                       `,
                       html`

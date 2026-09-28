@@ -2494,9 +2494,7 @@ pub async fn local_file_op(window: Window, args: FileOpArgs) -> Result<(), IpcEr
                 FileOpRefusal::BadPath => "BAD_PATH",
                 FileOpRefusal::Exists => "EXISTS",
                 FileOpRefusal::NotFound => "NOT_FOUND",
-                FileOpRefusal::NotGranted | FileOpRefusal::Busy | FileOpRefusal::Failed => {
-                    "FAILED"
-                }
+                FileOpRefusal::NotGranted | FileOpRefusal::Busy | FileOpRefusal::Failed => "FAILED",
             },
             message: "the change could not be made".to_owned(),
         }),
@@ -2518,7 +2516,11 @@ pub async fn local_roots(window: Window, peer: String) -> Result<Vec<String>, Ip
         .map(|home| home.to_string_lossy().into_owned())
         .into_iter()
         .collect();
-    roots.extend(tokio::task::spawn_blocking(drive_roots).await.unwrap_or_default());
+    roots.extend(
+        tokio::task::spawn_blocking(drive_roots)
+            .await
+            .unwrap_or_default(),
+    );
     Ok(roots)
 }
 

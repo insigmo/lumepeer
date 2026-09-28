@@ -30,9 +30,9 @@ use lumepeer_core::constants::{
     FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS,
     FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
     MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
-    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
-    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, REBOOT_WAIT_CEILING_SECS,
-    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
+    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
+    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
     RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
     RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
     SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
@@ -46,13 +46,12 @@ use lumepeer_core::protocol::{
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
     FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
     FEATURE_TERMINAL, FEATURE_TUNNEL, FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF,
-    FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
-    MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode, TerminalRefusal,
-    TunnelRefusal, UnattendedRejection,
+    FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry,
+    MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode,
+    TerminalRefusal, TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
-    is_safe_component, relative_components, safe_browse_path, safe_relative_path,
-    split_entry_path,
+    is_safe_component, relative_components, safe_browse_path, safe_relative_path, split_entry_path,
 };
 use lumepeer_core::session::{ReconnectDecision, SessionManager, SessionState, TunnelTarget};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
@@ -88,8 +87,8 @@ use crate::unattended_store::UnattendedStore;
 use crate::view::{
     BITSTREAM_POLL_TIMEOUT_MS, BitstreamFeed, CursorFeed, DecodePath, EncodeControl, HostMedia,
     MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
-    ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response, lock_capture,
-    slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
+    ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response,
+    lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
 /// First `PROTOCOL_MINOR` that carries `MessageKind::FileTransferStart`, and
@@ -6592,7 +6591,8 @@ impl Actor {
         if view.file_op_results.len() >= FILE_OP_RESULTS_KEPT {
             view.file_op_results.pop_front();
         }
-        view.file_op_results.push_back(FileOpOutcome { id, refused });
+        view.file_op_results
+            .push_back(FileOpOutcome { id, refused });
         let _ = self.notify.send(ActorNotification::FileTransferChanged);
     }
 
@@ -9506,18 +9506,20 @@ impl Actor {
         state.grants = grants;
         state.input.store(grants.input, Ordering::Relaxed);
         state.task = match (dialer, bitstream) {
-            (Some(dialer), Some(bitstream)) if state.surface.has_picture() => Some(spawn_media_receiver(
-                MediaTarget {
-                    dialer,
-                    peer,
-                    reports: self.reports_tx.clone(),
-                    tag: tag.clone(),
-                    worker: None,
-                    bitstream,
-                    connection_cell: Arc::clone(&state.media_connection),
-                },
-                Arc::clone(&state.slot_tx),
-            )),
+            (Some(dialer), Some(bitstream)) if state.surface.has_picture() => {
+                Some(spawn_media_receiver(
+                    MediaTarget {
+                        dialer,
+                        peer,
+                        reports: self.reports_tx.clone(),
+                        tag: tag.clone(),
+                        worker: None,
+                        bitstream,
+                        connection_cell: Arc::clone(&state.media_connection),
+                    },
+                    Arc::clone(&state.slot_tx),
+                ))
+            }
             _ => None,
         };
         if state.task.is_none() && state.surface.has_picture() {
@@ -15443,8 +15445,7 @@ impl Actor {
             .get(&retry.peer)
             .copied()
             .unwrap_or_default();
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&retry.code, None, surface)
-        {
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&retry.code, None, surface) {
             // Nothing to escalate: a dial that will not start now is one this
             // tick's successor starts instead.
             tracing::debug!(%error, "the connect could not be dialed again yet");
@@ -15714,8 +15715,7 @@ impl Actor {
         };
         // A dial that fails here is the ordinary case, not an error: the host
         // is mid-restart and not listening yet. The next tick tries again.
-        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, None, wait.surface)
-        {
+        if let Err(ActorError::Net(ref error)) = self.spawn_dial_as(&code, None, wait.surface) {
             tracing::debug!(%error, "the host is still away");
         }
         self.arm_reconnect_wait(generation, REBOOT_WAIT_RETRY_SECS);
@@ -16717,7 +16717,9 @@ impl FileOpPlan {
                 {
                     return Some(FileOpRefusal::BadPath);
                 }
-                std::fs::create_dir(&path).err().map(|error| refusal_of(&error))
+                std::fs::create_dir(&path)
+                    .err()
+                    .map(|error| refusal_of(&error))
             }
             PlannedOp::Rename { from, to } => {
                 if std::fs::symlink_metadata(&from).is_err() {
@@ -16733,7 +16735,9 @@ impl FileOpPlan {
                 if std::fs::symlink_metadata(&to).is_ok() && !same_entry_other_case(&from, &to) {
                     return Some(FileOpRefusal::Exists);
                 }
-                std::fs::rename(&from, &to).err().map(|error| refusal_of(&error))
+                std::fs::rename(&from, &to)
+                    .err()
+                    .map(|error| refusal_of(&error))
             }
             PlannedOp::Delete(path) => {
                 let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -16763,7 +16767,9 @@ impl FileOpPlan {
 fn same_entry_other_case(from: &std::path::Path, to: &std::path::Path) -> bool {
     let same_directory = from.parent() == to.parent();
     let same_name = match (from.file_name(), to.file_name()) {
-        (Some(a), Some(b)) => a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase(),
+        (Some(a), Some(b)) => {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        }
         _ => false,
     };
     let to_is_link = std::fs::symlink_metadata(to).is_ok_and(|meta| meta.is_symlink());
@@ -20188,7 +20194,11 @@ mod tests {
     }
 
     /// Polls for the answer to the file operation `id`.
-    async fn wait_for_file_op(guest: &ActorHandle, host_label: &str, id: u32) -> Option<FileOpRefusal> {
+    async fn wait_for_file_op(
+        guest: &ActorHandle,
+        host_label: &str,
+        id: u32,
+    ) -> Option<FileOpRefusal> {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
             if let Ok(status) = guest.dir_listing(host_label.to_owned()).await
@@ -20230,7 +20240,10 @@ mod tests {
             wait_for_file_op(&guest, &host_label, id).await,
             Some(FileOpRefusal::NotGranted)
         );
-        assert!(!scratch.join("new").exists(), "a refused operation changed the disk");
+        assert!(
+            !scratch.join("new").exists(),
+            "a refused operation changed the disk"
+        );
 
         host.set_grant(guest_label, IndependentGrant::FileBrowse, true)
             .await
@@ -20287,7 +20300,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wait_for_file_op(&guest, &host_label, id).await, None);
-        assert!(!scratch.join("tree").exists(), "a directory delete left the tree behind");
+        assert!(
+            !scratch.join("tree").exists(),
+            "a directory delete left the tree behind"
+        );
 
         let id = guest
             .remote_file_op(host_label.clone(), FileOp::Delete { path: at("tree") })
@@ -20305,11 +20321,21 @@ mod tests {
     async fn a_file_operation_on_a_root_or_a_traversal_never_leaves_the_guest() {
         let pair = clipboard_pair().await;
         for op in [
-            FileOp::Delete { path: "/".to_owned() },
-            FileOp::Delete { path: "C:\\".to_owned() },
-            FileOp::MakeDir { path: "D:/".to_owned() },
-            FileOp::Delete { path: "/home/../etc".to_owned() },
-            FileOp::Delete { path: "relative/file".to_owned() },
+            FileOp::Delete {
+                path: "/".to_owned(),
+            },
+            FileOp::Delete {
+                path: "C:\\".to_owned(),
+            },
+            FileOp::MakeDir {
+                path: "D:/".to_owned(),
+            },
+            FileOp::Delete {
+                path: "/home/../etc".to_owned(),
+            },
+            FileOp::Delete {
+                path: "relative/file".to_owned(),
+            },
             FileOp::Rename {
                 path: "/".to_owned(),
                 name: "x".to_owned(),
@@ -20400,7 +20426,13 @@ mod tests {
         let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         let stable = recorder.hosts().remove(0);
 
-        assert_eq!(guest.watching_host("no-such-host".to_owned()).await.unwrap(), None);
+        assert_eq!(
+            guest
+                .watching_host("no-such-host".to_owned())
+                .await
+                .unwrap(),
+            None
+        );
         assert_eq!(guest.watching_host(stable).await.unwrap(), Some(host_label));
     }
 

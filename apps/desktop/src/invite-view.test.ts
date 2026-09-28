@@ -454,7 +454,16 @@ describe('remembered hosts', () => {
     const view = await load();
     await view.reconnect('host-ab12');
     expect(invoke).toHaveBeenCalledWith('history_connect', {
-      args: { peer: 'host-ab12', terminal_only: false },
+      args: { peer: 'host-ab12', terminal_only: false, files_only: false },
+    });
+    view.setConnectPhase('connected');
+  });
+
+  it('asks for the files alone when the file manager is what was picked', async () => {
+    const view = await load();
+    await view.reconnect('host-ab12', 'files');
+    expect(invoke).toHaveBeenCalledWith('history_connect', {
+      args: { peer: 'host-ab12', terminal_only: false, files_only: true },
     });
     view.setConnectPhase('connected');
   });

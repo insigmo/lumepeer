@@ -15,16 +15,6 @@ import { render } from 'lit-html';
 import '@xterm/xterm/css/xterm.css';
 
 import {
-  browseDenied,
-  emptyState,
-  fileManagerPanel,
-  refresh as refreshFileManager,
-  tauriFileManagerCommands,
-  type FileManagerState,
-} from './file-manager';
-import { tauriFileCommands, type FileTransfers } from './file-transfers';
-
-import {
   ChatState,
   startChatPolling,
   tauriChatCommands,
@@ -123,7 +113,6 @@ const toolbarRootElement = document.querySelector<HTMLElement>('#toolbar-root');
 const overlay = document.querySelector<HTMLElement>('#overlay');
 const recordingIndicator = document.querySelector<HTMLElement>('#recording-indicator');
 const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
-const filePanel = document.querySelector<HTMLElement>('#file-panel');
 const terminalPanel = document.querySelector<HTMLElement>('#terminal-panel');
 const terminalChrome = document.querySelector<HTMLElement>('#terminal-chrome');
 const terminalScreen = document.querySelector<HTMLElement>('#terminal-screen');
@@ -194,12 +183,6 @@ let chatUnread = false;
 // knows what arrived.
 let chatSeenIncoming = 0;
 const chatState = new ChatState();
-// The file manager's own two listings, polled while its panel exists (ADR
-// 0076). Held here rather than inside the panel because the toolbar button
-// has to know whether the host allows it at all, and that answer arrives on
-// the same poll.
-const fileState: FileManagerState = emptyState();
-let fileTransfers: FileTransfers = { offers: [], transfers: [] };
 // The last pointer position inside the window, which is where the cursor is
 // drawn. Local by design: a cursor that moved with the video would lag by the
 // round trip, and removing that lag is the whole reason for the channel.
@@ -244,36 +227,19 @@ const chatCommands: ChatCommands = {
   },
 };
 
-/** How often the file manager re-reads both of its panes, in milliseconds. */
-const FILE_MANAGER_POLL_MS = 1000;
-
-const fileManagerCommands = tauriFileManagerCommands(peer);
-
-/** Draws the file manager panel from whatever the last poll left behind. */
-function renderFileManager(): void {
-  if (!filePanel) {
-    return;
-  }
-  // A withdrawn grant takes the panel with it, not just its contents (ADR
-  // 0076): the toolbar button disappears on the same condition, so a guest
-  // is never left pressing something that cannot work.
-  if (browseDenied(fileState)) {
-    filePanel.hidden = true;
-    toolbar?.redraw();
-    return;
-  }
-  render(
-    fileManagerPanel(
-      peer,
-      fileState,
-      fileTransfers,
-      locale,
-      fileManagerCommands,
-      tauriFileCommands,
-      renderFileManager,
-    ),
-    filePanel,
-  );
+/**
+ * Opens the file manager beside this window, or raises it (ADR 0124).
+ *
+ * A window of its own now rather than a panel over the picture, so there is
+ * nothing here to show or hide: the file manager polls its own session and
+ * explains a refusal itself.
+ */
+function openFileManager(): void {
+  void invoker()
+    .then((invoke) => invoke('files_window_open', { peer }))
+    .catch((error: unknown) => {
+      console.error('the file manager could not be opened:', error);
+    });
 }
 
 /**
@@ -319,19 +285,6 @@ function closeTerminal(): void {
     terminalPanel.hidden = true;
     toolbar?.redraw();
   }
-}
-
-/** Re-reads both panes and the transfer list, then draws them. */
-async function pollFileManager(): Promise<void> {
-  try {
-    await refreshFileManager(fileState, fileManagerCommands);
-    fileTransfers = await tauriFileCommands.list();
-  } catch {
-    // The session ended, or the host is not answering; the window closes
-    // through its own path and nothing here claims otherwise.
-    return;
-  }
-  renderFileManager();
 }
 
 function viewportBox(): Box {
@@ -849,21 +802,14 @@ async function main(): Promise<void> {
         return chatUnread;
       },
       toggleFiles(): boolean {
-        if (!filePanel) {
-          return false;
-        }
-        filePanel.hidden = !filePanel.hidden;
-        if (!filePanel.hidden) {
-          renderFileManager();
-        }
-        toolbar?.redraw();
-        return !filePanel.hidden;
+        openFileManager();
+        return false;
       },
       filesVisible(): boolean {
-        return filePanel !== null && !filePanel.hidden;
+        return false;
       },
       filesAvailable(): boolean {
-        return !browseDenied(fileState);
+        return true;
       },
       toggleTerminal(): boolean {
         if (!terminalPanel) {
@@ -950,16 +896,6 @@ async function main(): Promise<void> {
     setInterval(() => {
       void pollCursor();
     }, CURSOR_POLL_INTERVAL_MS);
-  }
-  // The file manager polls whether or not its panel is open: the answer that
-  // says whether the host allows it at all is the same one that fills the
-  // panes, and the toolbar button is drawn from it (ADR 0076).
-  if (filePanel) {
-    filePanel.hidden = true;
-    void pollFileManager();
-    setInterval(() => {
-      void pollFileManager();
-    }, FILE_MANAGER_POLL_MS);
   }
   // Installed before the input forwarder attaches, and in the capture phase,
   // so a matched chord is marked before it can be sent to the host (§11).

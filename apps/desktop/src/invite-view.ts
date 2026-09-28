@@ -11,6 +11,7 @@ import { html, type TemplateResult } from 'lit-html';
 
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
+import type { ConnectSurface } from './session-status';
 
 const COPIED_FEEDBACK_MS = 1500;
 const CONNECTING_DOT_INTERVAL_MS = 400;
@@ -488,12 +489,16 @@ async function connect(ticket: string): Promise<void> {
 /**
  * Dials a host the app already remembers, by its history label (§21 item 5).
  *
- * `terminalOnly` asks that host for a shell and nothing else (ADR 0101): the
- * same session and the same role, dialled without the media connection, so
- * nothing on the far side encodes or sends a picture.
+ * `terminal` asks that host for a shell and nothing else (ADR 0101), `files`
+ * for its files and nothing else (ADR 0124): the same session and the same
+ * role, dialled without the media connection, so nothing on the far side
+ * encodes or sends a picture. A host already connected gets its file manager
+ * opened beside the running session instead of a second dial.
  */
-export async function reconnect(peer: string, terminalOnly = false): Promise<void> {
-  await attempt('history_connect', { args: { peer, terminal_only: terminalOnly } });
+export async function reconnect(peer: string, surface: ConnectSurface = 'screen'): Promise<void> {
+  await attempt('history_connect', {
+    args: { peer, terminal_only: surface === 'terminal', files_only: surface === 'files' },
+  });
 }
 
 /**

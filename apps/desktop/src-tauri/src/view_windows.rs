@@ -236,9 +236,7 @@ pub fn open_files_window(app: &tauri::AppHandle, peer: &str) {
             return;
         }
         if let Some(view) = app_for_thread.get_webview_window(&format!("view-{peer}"))
-            && view
-                .url()
-                .is_ok_and(|url| url.path().ends_with(FILES_PAGE))
+            && view.url().is_ok_and(|url| url.path().ends_with(FILES_PAGE))
         {
             let _ = view.unminimize();
             crate::raise_window(&view);

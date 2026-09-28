@@ -105,25 +105,6 @@
       #chat-panel[hidden] {
         display: none;
       }
-      /* The file manager sits on the other side of the picture from the
-         chat, so opening both at once still leaves the middle of the remote
-         screen visible. Wider than the chat because it has two panes in it. */
-      #file-panel {
-        position: absolute;
-        inset-block-end: 0;
-        inset-inline-start: 0;
-        width: min(34rem, 60vw);
-        max-height: 55%;
-        overflow-y: auto;
-        background: rgb(0 0 0 / 72%);
-        border-start-end-radius: 0.5rem;
-        font-size: 0.85rem;
-        padding: 0.5rem;
-      }
-      /* Same specificity problem `#chat-panel[hidden]` has, same answer. */
-      #file-panel[hidden] {
-        display: none;
-      }
       /* The terminal takes the bottom of the picture across its whole width:
          a shell wrapped into a narrow column is a shell whose output is wrong
          (ADR 0079). */
@@ -176,56 +157,6 @@
       .term-state {
         flex: 1;
         opacity: 0.8;
-      }
-      .fm-panes {
-        display: flex;
-        gap: 0.5rem;
-      }
-      .fm-pane {
-        flex: 1;
-        min-width: 0;
-      }
-      .fm-path {
-        margin: 0.25rem 0;
-        overflow-wrap: anywhere;
-        opacity: 0.8;
-      }
-      .fm-list {
-        margin: 0.25rem 0;
-        padding: 0;
-        list-style: none;
-        max-height: 12rem;
-        overflow-y: auto;
-      }
-      .fm-entry {
-        display: flex;
-        justify-content: space-between;
-        gap: 0.5rem;
-        width: 100%;
-        background: none;
-        border: 0;
-        color: inherit;
-        font: inherit;
-        text-align: start;
-        padding: 0.15rem 0.25rem;
-        cursor: pointer;
-      }
-      .fm-entry.is-selected {
-        background: rgb(255 255 255 / 18%);
-      }
-      .fm-name {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .fm-size {
-        opacity: 0.7;
-        flex: none;
-      }
-      .fm-actions {
-        display: flex;
-        gap: 0.5rem;
-        margin-block-start: 0.5rem;
       }
       .chat-log {
         flex: 1;
@@ -516,7 +447,6 @@
       <div id="overlay"></div>
       <div id="recording-indicator"></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>
-      <aside id="file-panel" hidden></aside>
       <!-- The terminal (ADR 0079). Two elements rather than one: `xterm.js`
            owns `#terminal-screen` outright and a re-render would destroy it,
            so the chrome around it is drawn into its own sibling. -->
