@@ -21,7 +21,9 @@
 //! Everything else — an unelevated development run, `LUMEPEER_KEYSTORE=file`
 //! for the headless end-to-end rigs, Linux and macOS — keeps the profile, as
 //! before: there is no account boundary below this process to put anything
-//! behind.
+//! behind. macOS keeps its secrets in files of that profile rather than in the
+//! login keychain, which asked for the password after every update
+//! (ADR 0127).
 
 use std::path::PathBuf;
 
@@ -98,6 +100,34 @@ pub fn choose(
             history: profile.history,
             audit: profile.audit,
         });
+    }
+    // The login keychain binds an item to the exact build that wrote it when
+    // the app carries no Apple team id, so every update asked for the login
+    // password before the first window, and a Deny ended the start (ADR 0127).
+    #[cfg(target_os = "macos")]
+    if std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file") {
+        let directory = lumepeer_runtime::config::data_dir()
+            .map(|dir| dir.join(from_keychain::DIRECTORY))
+            .ok_or_else(|| {
+                NetError::Keystore("no data directory to keep the keystore in".to_owned())
+            })?;
+        let secret = from_keychain::secret(&directory)?;
+        let keystore = || {
+            Box::new(lumepeer_net::keystore::FileKeystore::new(
+                directory.join("identity.key"),
+                &secret,
+            ))
+        };
+        let placement = Placement {
+            keystore: keystore(),
+            remembered: keystore(),
+            address_book: profile.address_book,
+            invite_dir: profile.invite_dir,
+            history: profile.history,
+            audit: profile.audit,
+        };
+        from_keychain::move_once(&directory, &placement, open_profile_keystore()?.as_ref())?;
+        return Ok(placement);
     }
     Ok(Placement {
         keystore: open_profile_keystore()?,
@@ -446,6 +476,393 @@ mod protected {
             }
             assert!(new.load_secret(UNATTENDED_TOTP_ENTRY).unwrap().is_none());
             let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+}
+
+/// The macOS store of ADR 0127: the secrets in files of their own under the
+/// data directory, moved there once out of the login keychain.
+///
+/// The login keychain gives an item to the build that wrote it. For an app
+/// with an Apple team id that means every build of the team; Lumepeer is
+/// signed by a certificate of its own (ADR 0127), has no team id, and so every
+/// update was a stranger to its own identity: macOS asked for the login
+/// password before the first window, and a Deny ended the start. A file under
+/// the user's data directory is what the other two platforms already give
+/// the same secrets — any program of this user can read them there as well —
+/// and it asks nobody anything.
+#[cfg(any(target_os = "macos", test))]
+mod from_keychain {
+    use std::io::Write as _;
+    use std::path::Path;
+
+    use lumepeer_net::NetError;
+    use lumepeer_net::keystore::{
+        AUDIT_SALT_ENTRY, IDENTITY_ENTRY, Keystore, UNATTENDED_PASSWORD_ENTRY,
+        UNATTENDED_ROLE_ENTRY, UNATTENDED_TOTP_ENTRY,
+    };
+
+    use super::Placement;
+
+    /// Under the data directory: the files, the secret that keys them, the
+    /// marker.
+    #[cfg(target_os = "macos")]
+    pub(super) const DIRECTORY: &str = "keystore";
+
+    /// Written once the keychain has given up everything it held, after
+    /// which it is never read again.
+    const MOVED_MARKER: &str = "moved-from-keychain";
+
+    /// The key-derivation secret beside the store, as on Windows (ADR 0123):
+    /// it protects a file carried off on its own, and nothing more; the
+    /// directory's mode is the real boundary.
+    const SECRET_FILE: &str = "keystore.secret";
+    const SECRET_BYTES: usize = 32;
+
+    fn keystore_error(what: &str, path: &Path, error: impl std::fmt::Display) -> NetError {
+        NetError::Keystore(format!("{what} {}: {error}", path.display()))
+    }
+
+    /// Reads the store secret in `directory`, creating both on first use.
+    ///
+    /// # Errors
+    /// When the directory or the secret can be neither read nor written, or
+    /// the secret is not [`SECRET_BYTES`] long: a truncated secret would key
+    /// the store with something weaker, and a fresh one could not open what
+    /// the old one wrote.
+    pub(super) fn secret(directory: &Path) -> Result<Vec<u8>, NetError> {
+        use rand::Rng as _;
+
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder
+            .create(directory)
+            .map_err(|e| keystore_error("cannot create", directory, e))?;
+
+        let path = directory.join(SECRET_FILE);
+        match std::fs::read(&path) {
+            Ok(secret) if secret.len() == SECRET_BYTES => return Ok(secret),
+            Ok(secret) => {
+                return Err(keystore_error(
+                    "refusing a keystore secret of the wrong length in",
+                    &path,
+                    secret.len(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(keystore_error("cannot read", &path, error)),
+        }
+        let mut secret = vec![0u8; SECRET_BYTES];
+        rand::rng().fill_bytes(&mut secret);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .map_err(|e| keystore_error("cannot create", &path, e))?;
+        file.write_all(&secret)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| keystore_error("cannot write", &path, e))?;
+        tracing::info!(path = %path.display(), "minted a keystore secret");
+        Ok(secret)
+    }
+
+    /// Copies what the login keychain holds into `placement`, once.
+    ///
+    /// An entry already in the files is never read from the keychain again,
+    /// so each keychain item asks at most once. Nothing is deleted from the
+    /// keychain: a delete may ask as well, and what stays there is read by
+    /// nothing once the marker is written.
+    ///
+    /// # Errors
+    /// When the keychain holds an identity it will not give up — a Deny at
+    /// its prompt. Going on would mint a new identity over it, and every
+    /// device paired with this one would stop recognising it. The next start
+    /// asks again. Any other entry that cannot be moved only leaves the
+    /// marker unwritten, and the next start tries that one again.
+    pub(super) fn move_once(
+        directory: &Path,
+        placement: &Placement,
+        keychain: &dyn Keystore,
+    ) -> Result<(), NetError> {
+        if directory.join(MOVED_MARKER).exists() {
+            return Ok(());
+        }
+        let mut entries: Vec<String> = [
+            IDENTITY_ENTRY,
+            UNATTENDED_PASSWORD_ENTRY,
+            UNATTENDED_ROLE_ENTRY,
+            UNATTENDED_TOTP_ENTRY,
+            AUDIT_SALT_ENTRY,
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        entries.extend(
+            lumepeer_runtime::connection_history::ConnectionHistory::open(
+                placement.history.clone(),
+            )
+            .entries()
+            .iter()
+            .map(|entry| lumepeer_runtime::remembered_password::entry_name(&entry.peer_label)),
+        );
+        let mut complete = true;
+        let mut moved = 0_usize;
+        for entry in entries {
+            let identity = entry == IDENTITY_ENTRY;
+            match placement.keystore.load_secret(&entry) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) if identity => return Err(error),
+                Err(error) => {
+                    tracing::warn!(entry, %error, "cannot read the keystore file");
+                    complete = false;
+                    continue;
+                }
+            }
+            match keychain.load_secret(&entry) {
+                Ok(Some(bytes)) => match placement.keystore.store_secret(&entry, &bytes) {
+                    Ok(()) => moved += 1,
+                    Err(error) if identity => return Err(error),
+                    Err(error) => {
+                        tracing::warn!(entry, %error, "cannot write a secret moved out of the keychain");
+                        complete = false;
+                    }
+                },
+                Ok(None) => {}
+                Err(error) if identity => {
+                    tracing::error!(
+                        %error,
+                        "the login keychain would not give up this device's identity; \
+                         not starting rather than replacing it"
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    tracing::warn!(entry, %error, "the keychain would not give up a secret; asking again next start");
+                    complete = false;
+                }
+            }
+        }
+        if moved > 0 {
+            tracing::info!(
+                moved,
+                "moved this device's secrets out of the login keychain"
+            );
+        }
+        if complete {
+            let marker = directory.join(MOVED_MARKER);
+            if let Err(error) = std::fs::write(&marker, b"") {
+                tracing::warn!(path = %marker.display(), %error, "cannot mark the keychain move done");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        use lumepeer_core::consent::Role;
+        use lumepeer_net::keystore::MemoryKeystore;
+        use lumepeer_runtime::connection_history::ConnectionHistory;
+
+        use super::*;
+
+        /// A keychain that answers like a Deny for the entries in `refused`
+        /// ("*" for all), and like `inner` for the rest.
+        #[derive(Debug, Clone, Default)]
+        struct Keychain {
+            inner: Arc<MemoryKeystore>,
+            refused: Vec<&'static str>,
+        }
+
+        impl Keystore for Keychain {
+            fn load_secret(&self, entry: &str) -> lumepeer_net::Result<Option<Vec<u8>>> {
+                if self.refused.iter().any(|r| *r == "*" || *r == entry) {
+                    return Err(NetError::Keystore(
+                        "User canceled the operation.".to_owned(),
+                    ));
+                }
+                self.inner.load_secret(entry)
+            }
+            fn store_secret(&self, entry: &str, bytes: &[u8]) -> lumepeer_net::Result<()> {
+                self.inner.store_secret(entry, bytes)
+            }
+            fn delete_secret(&self, entry: &str) -> lumepeer_net::Result<()> {
+                self.inner.delete_secret(entry)
+            }
+        }
+
+        fn fresh(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "lumepeer-keychain-move-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        fn placement_in(dir: &Path) -> Placement {
+            let secret = secret(dir).unwrap();
+            let keystore = || {
+                Box::new(lumepeer_net::keystore::FileKeystore::new(
+                    dir.join("identity.key"),
+                    &secret,
+                ))
+            };
+            Placement {
+                keystore: keystore(),
+                remembered: keystore(),
+                address_book: None,
+                invite_dir: None,
+                history: Some(dir.join("connection_history.json")),
+                audit: None,
+            }
+        }
+
+        /// ADR 0127: the identity, the device password and a remembered
+        /// password move into the files, the marker is written, and after
+        /// that the keychain is not read at all.
+        #[test]
+        fn every_secret_moves_once() {
+            let dir = fresh("once");
+            let placement = placement_in(&dir);
+            ConnectionHistory::open(placement.history.clone()).record(
+                "host-ab12".to_owned(),
+                Role::ViewOnly,
+                "lumepeer1:code".to_owned(),
+                None,
+                Vec::new(),
+            );
+            let remembered = lumepeer_runtime::remembered_password::entry_name("host-ab12");
+            let keychain = Keychain::default();
+            keychain.store_secret(IDENTITY_ENTRY, &[7; 32]).unwrap();
+            keychain
+                .store_secret(UNATTENDED_PASSWORD_ENTRY, b"$argon2id$hash")
+                .unwrap();
+            keychain
+                .store_secret(&remembered, b"device password")
+                .unwrap();
+
+            move_once(&dir, &placement, &keychain).unwrap();
+            assert_eq!(
+                placement.keystore.load_secret(IDENTITY_ENTRY).unwrap(),
+                Some(vec![7; 32])
+            );
+            assert_eq!(
+                placement
+                    .keystore
+                    .load_secret(UNATTENDED_PASSWORD_ENTRY)
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"$argon2id$hash"[..])
+            );
+            assert!(
+                placement
+                    .remembered
+                    .load_secret(&remembered)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(dir.join(MOVED_MARKER).is_file());
+
+            // Once: a keychain that would refuse everything is not asked.
+            let refusing = Keychain {
+                refused: vec!["*"],
+                ..keychain
+            };
+            move_once(&dir, &placement, &refusing).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A Deny on the identity ends the start and mints nothing: a new
+        /// identity would orphan every device paired with this one.
+        #[test]
+        fn a_refused_identity_is_never_replaced() {
+            let dir = fresh("refused");
+            let placement = placement_in(&dir);
+            let keychain = Keychain {
+                refused: vec![IDENTITY_ENTRY],
+                ..Keychain::default()
+            };
+            keychain.store_secret(IDENTITY_ENTRY, &[7; 32]).unwrap();
+
+            assert!(move_once(&dir, &placement, &keychain).is_err());
+            assert!(
+                placement
+                    .keystore
+                    .load_secret(IDENTITY_ENTRY)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!dir.join(MOVED_MARKER).exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A Deny on anything else starts anyway and asks for just that one
+        /// again next time; what already moved is not read from the keychain
+        /// a second time.
+        #[test]
+        fn a_refused_secret_is_asked_for_again_and_only_it() {
+            let dir = fresh("again");
+            let placement = placement_in(&dir);
+            let keychain = Keychain {
+                refused: vec![AUDIT_SALT_ENTRY],
+                ..Keychain::default()
+            };
+            keychain.store_secret(IDENTITY_ENTRY, &[7; 32]).unwrap();
+            keychain.store_secret(AUDIT_SALT_ENTRY, b"salt").unwrap();
+
+            move_once(&dir, &placement, &keychain).unwrap();
+            assert!(
+                placement
+                    .keystore
+                    .load_secret(IDENTITY_ENTRY)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!dir.join(MOVED_MARKER).exists());
+
+            let second = Keychain {
+                refused: vec![IDENTITY_ENTRY],
+                ..keychain
+            };
+            move_once(&dir, &placement, &second).unwrap();
+            assert_eq!(
+                placement
+                    .keystore
+                    .load_secret(AUDIT_SALT_ENTRY)
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"salt"[..])
+            );
+            assert!(dir.join(MOVED_MARKER).is_file());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The secret is minted once and read back unchanged; a truncated one
+        /// is refused rather than used.
+        #[test]
+        fn the_secret_is_stable_and_whole() {
+            let dir = fresh("secret");
+            let first = secret(&dir).unwrap();
+            assert_eq!(first.len(), SECRET_BYTES);
+            assert_eq!(secret(&dir).unwrap(), first);
+            std::fs::write(dir.join(SECRET_FILE), &first[..8]).unwrap();
+            assert!(secret(&dir).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
