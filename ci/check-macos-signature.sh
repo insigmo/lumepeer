@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fails unless a macOS bundle is signed the way a Screen Recording grant can
-# outlive an update (ADR 0127).
+# outlive an update (ADR 0128).
 #
 #     bash ci/check-macos-signature.sh path/to/Lumepeer.app
 #

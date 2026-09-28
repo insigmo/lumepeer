@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Puts the macOS release signing identity where codesign finds it and hands it
-# to the Tauri build (ADR 0127).
+# to the Tauri build (ADR 0128).
 #
 #     P12=<base64 .p12> P12_PASSWORD=<password> bash ci/import-macos-signing-cert.sh
 #
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 if [[ -z "${P12:-}" || -z "${P12_PASSWORD:-}" ]]; then
-  echo "::error::MACOS_SIGNING_P12 / MACOS_SIGNING_P12_PASSWORD are not set; an unsigned Mac build loses its Screen Recording grant on every update (ADR 0127)" >&2
+  echo "::error::MACOS_SIGNING_P12 / MACOS_SIGNING_P12_PASSWORD are not set; an unsigned Mac build loses its Screen Recording grant on every update (ADR 0128)" >&2
   exit 1
 fi
 

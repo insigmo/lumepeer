@@ -1,4 +1,4 @@
-# ADR 0127 — The Mac release is signed by one certificate and keeps its secrets in files
+# ADR 0128 — The Mac release is signed by one certificate and keeps its secrets in files
 
 Status: accepted
 Date: 2026-09-28

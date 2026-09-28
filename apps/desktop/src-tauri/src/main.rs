@@ -413,7 +413,7 @@ fn setup_app(
             // Into the log file as well: a GUI start has nowhere to show
             // stderr, and this is where a refused keychain read ends up — a
             // Mac user who pressed Deny saw the app vanish and the log said
-            // nothing (ADR 0127).
+            // nothing (ADR 0128).
             tracing::error!(%error, "fatal: failed to bind the network endpoint");
             eprintln!("fatal: failed to bind the network endpoint: {error}");
             std::process::exit(1);

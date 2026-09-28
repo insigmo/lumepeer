@@ -23,7 +23,7 @@
 //! before: there is no account boundary below this process to put anything
 //! behind. macOS keeps its secrets in files of that profile rather than in the
 //! login keychain, which asked for the password after every update
-//! (ADR 0127).
+//! (ADR 0128).
 
 use std::path::PathBuf;
 
@@ -103,7 +103,7 @@ pub fn choose(
     }
     // The login keychain binds an item to the exact build that wrote it when
     // the app carries no Apple team id, so every update asked for the login
-    // password before the first window, and a Deny ended the start (ADR 0127).
+    // password before the first window, and a Deny ended the start (ADR 0128).
     #[cfg(target_os = "macos")]
     if std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file") {
         let directory = lumepeer_runtime::config::data_dir()
@@ -480,12 +480,12 @@ mod protected {
     }
 }
 
-/// The macOS store of ADR 0127: the secrets in files of their own under the
+/// The macOS store of ADR 0128: the secrets in files of their own under the
 /// data directory, moved there once out of the login keychain.
 ///
 /// The login keychain gives an item to the build that wrote it. For an app
 /// with an Apple team id that means every build of the team; Lumepeer is
-/// signed by a certificate of its own (ADR 0127), has no team id, and so every
+/// signed by a certificate of its own (ADR 0128), has no team id, and so every
 /// update was a stranger to its own identity: macOS asked for the login
 /// password before the first window, and a Deny ended the start. A file under
 /// the user's data directory is what the other two platforms already give
@@ -732,7 +732,7 @@ mod from_keychain {
             }
         }
 
-        /// ADR 0127: the identity, the device password and a remembered
+        /// ADR 0128: the identity, the device password and a remembered
         /// password move into the files, the marker is written, and after
         /// that the keychain is not read at all.
         #[test]

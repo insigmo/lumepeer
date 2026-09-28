@@ -259,7 +259,7 @@ jobs:
       # bundle's designated requirement. An unsigned bundle (x86_64) or a
       # linker-signed one (arm64) has none that outlives the build, so after
       # every update "Lumepeer" stayed switched on in System Settings while
-      # macOS refused the new binary and asked again (ADR 0127). Every release
+      # macOS refused the new binary and asked again (ADR 0128). Every release
       # is signed by the same self-signed certificate from the repository
       # secrets instead; see ci/import-macos-signing-cert.sh.
       - name: Import the macOS signing certificate
@@ -385,7 +385,7 @@ jobs:
           done
       # The build signs silently or not at all, so the row says which it was:
       # a bundle whose requirement names no certificate would lose every
-      # grant again on the next update (ADR 0127).
+      # grant again on the next update (ADR 0128).
       - name: Check the macOS signature
         if: runner.os == 'macOS'
         shell: bash
