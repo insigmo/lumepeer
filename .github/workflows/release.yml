@@ -255,6 +255,20 @@ jobs:
             cargo build --release -p "${BIN}" --target ${{ matrix.target }}
             cp "target/${{ matrix.target }}/release/${BIN}${EXE}"                "apps/desktop/src-tauri/binaries/${BIN}-${{ matrix.target }}${EXE}"
           done
+      # macOS files a Screen Recording or Accessibility grant against the
+      # bundle's designated requirement. An unsigned bundle (x86_64) or a
+      # linker-signed one (arm64) has none that outlives the build, so after
+      # every update "Lumepeer" stayed switched on in System Settings while
+      # macOS refused the new binary and asked again (ADR 0127). Every release
+      # is signed by the same self-signed certificate from the repository
+      # secrets instead; see ci/import-macos-signing-cert.sh.
+      - name: Import the macOS signing certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: bash ci/import-macos-signing-cert.sh
       # `retryAttempts` below is what keeps a flaky release API from throwing
       # away a 15-minute build: without it tauri-action uploads every asset
       # exactly once, so a single 5xx (the upload endpoint answers either with
@@ -369,6 +383,13 @@ jobs:
               sleep "${DELAY}"
             done
           done
+      # The build signs silently or not at all, so the row says which it was:
+      # a bundle whose requirement names no certificate would lose every
+      # grant again on the next update (ADR 0127).
+      - name: Check the macOS signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash ci/check-macos-signature.sh "target/${{ matrix.target }}/release/bundle/macos/Lumepeer.app"
 
   # The updater manifest of ADR 0042, written once by one job rather than
   # merged into by all six build rows — see the `includeUpdaterJson: false`
