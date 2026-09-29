@@ -938,6 +938,16 @@ button.peer-card-face:disabled {
   box-shadow: 0 0 0 3px var(--amber-soft);
 }
 
+/* A remembered host that answered, or did not, when last reached for
+   (ADR 0127). No halo: that is a live session's, and this is only "it is there". */
+.peer-dot[data-state='online'] {
+  background: var(--green);
+}
+
+.peer-dot[data-state='offline'] {
+  background: var(--red);
+}
+
 /* The three dots. `<details>` keeps its own openness, which is what lets this
    panel re-render every second without shutting a menu somebody is reading. */
 .peer-menu {

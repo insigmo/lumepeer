@@ -32,7 +32,8 @@ use lumepeer_core::constants::{
     MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
     MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
-    REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    PRESENCE_ATTEMPT_TIMEOUT_SECS, PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS,
+    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
     RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
     RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
     SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
@@ -1269,6 +1270,10 @@ enum ActorCommand {
         trusted: bool,
         reply: oneshot::Sender<bool>,
     },
+    /// Guest side: check which remembered hosts are there, without asking any
+    /// of them for a session (ADR 0127). Answers once the checks are started;
+    /// what they find arrives in the history rows.
+    HistoryProbe { reply: oneshot::Sender<()> },
     /// Guest side: ask the watched host to restart or shut down (ADR 0084).
     RebootRequest {
         label: String,
@@ -1837,6 +1842,23 @@ impl ActorHandle {
                 trusted,
                 reply,
             })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Guest side: checks which remembered hosts are there, without asking
+    /// any of them for a session (ADR 0127).
+    ///
+    /// Returns once the checks are started. What they find is in the `online`
+    /// of the next [`Self::history`].
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn history_probe(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryProbe { reply })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
@@ -4584,6 +4606,15 @@ enum ActorEvent {
         /// order they were found.
         addrs: Vec<String>,
     },
+    /// Guest side: one presence check of a saved host finished (ADR 0127).
+    ///
+    /// Keyed by label for the same reason as [`Self::HostLocated`].
+    HostProbed {
+        /// The row of the remembered-hosts list this is about.
+        host_tag: String,
+        /// Whether the host finished a QUIC handshake on any transport.
+        online: bool,
+    },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -5537,6 +5568,16 @@ struct Actor {
     /// ordinary one. Only ever holds a surface without a picture: a screen
     /// session is what a peer missing from here means (ADR 0124).
     pending_surface: std::collections::HashMap<NodeId, ViewSurface>,
+    /// Guest side: whether each remembered host answered the last time this
+    /// node reached for it, by history label (ADR 0127).
+    ///
+    /// Memory only, and only ever this run's evidence: written by a presence
+    /// check and by every connect's outcome, read when the list is answered.
+    presence: std::collections::HashMap<String, bool>,
+    /// Guest side: remembered hosts a presence check is still dialing, so a
+    /// second check does not start another dial at the same machine before
+    /// the first has answered (ADR 0127).
+    presence_probing: std::collections::HashSet<String>,
     /// Whether this process holds the machine's host role and may admit
     /// guests at all (ADR 0085 §4).
     ///
@@ -6026,6 +6067,63 @@ impl Actor {
                 }
             }
         });
+    }
+
+    /// Guest side: checks which saved hosts are there, without asking any of
+    /// them for anything (ADR 0127).
+    ///
+    /// Unlike [`Self::refresh_saved_hosts`], this does reach those machines:
+    /// "is it on" has no answer short of the host itself answering. Each check
+    /// is the first half of a connect — the same plan, the same transports in
+    /// the same order — as far as a finished QUIC handshake, and then
+    /// [`probe_host`] closes the connection before any `Hello`. The host never
+    /// has a request to decide, so nothing appears on its screen and nothing
+    /// is audited.
+    ///
+    /// A host this node is connected to, or already dialing, is left out: the
+    /// live connection or that dial's own outcome is the answer, and a second
+    /// dial at the same machine would only race the first one's punch.
+    fn probe_saved_hosts(&mut self) {
+        let rows: Vec<(String, String)> = self
+            .history
+            .entries()
+            .iter()
+            .map(|entry| (entry.peer_label.clone(), entry.code.clone()))
+            .collect();
+        let at_once = Arc::new(tokio::sync::Semaphore::new(PRESENCE_PROBES_AT_ONCE));
+        for (host_tag, code) in rows {
+            if self.presence_probing.contains(&host_tag) {
+                continue;
+            }
+            // Verified exactly as a connect verifies it: the obfuscated
+            // transport pins the certificate the ticket names, and that is
+            // only worth dialing as far as the signature goes (ADR 0122).
+            let Ok(ticket) = InviteTicket::from_code(&code) else {
+                continue;
+            };
+            let Ok(addr) = ticket.verify_issuer() else {
+                continue;
+            };
+            if self.connections.contains_key(&addr.id)
+                || self.connect_peer == Some(addr.id)
+                || self.reconnect_waits.contains_key(&addr.id)
+            {
+                continue;
+            }
+            let Some(plan) = self.dial_plan(&ticket, &addr) else {
+                continue;
+            };
+            self.presence_probing.insert(host_tag.clone());
+            let at_once = Arc::clone(&at_once);
+            let events = self.events_tx.clone();
+            tokio::spawn(async move {
+                let _turn = at_once.acquire().await;
+                let online = probe_host(plan).await;
+                let _ = events
+                    .send(ActorEvent::HostProbed { host_tag, online })
+                    .await;
+            });
+        }
     }
 
     /// Says in the log how each live session is actually reaching its peer —
@@ -9018,6 +9116,11 @@ impl Actor {
                     );
                 }
             }
+            ActorEvent::HostProbed { host_tag, online } => {
+                self.presence_probing.remove(&host_tag);
+                tracing::debug!(peer = %host_tag, online, "checked whether a saved host is there");
+                self.presence.insert(host_tag, online);
+            }
         }
     }
 
@@ -11399,16 +11502,29 @@ impl Actor {
                 let _ = reply.send(snapshot);
             }
             ActorCommand::History { reply } => {
+                // A host this node holds a connection to is there, whatever an
+                // older check said about it (ADR 0127).
+                let live: std::collections::HashSet<String> =
+                    self.connections.keys().map(host_tag).collect();
                 let rows = self
                     .history
                     .entries()
                     .iter()
                     .map(|entry| HistoryEntry {
                         has_password: self.remembered_password_tags.contains(&entry.peer_label),
+                        online: if live.contains(&entry.peer_label) {
+                            Some(true)
+                        } else {
+                            self.presence.get(&entry.peer_label).copied()
+                        },
                         ..entry.clone()
                     })
                     .collect();
                 let _ = reply.send(rows);
+            }
+            ActorCommand::HistoryProbe { reply } => {
+                self.probe_saved_hosts();
+                let _ = reply.send(());
             }
             ActorCommand::HistoryConnect {
                 label,
@@ -16157,6 +16273,14 @@ impl Actor {
         Ok(())
     }
 
+    /// Guest side: records whether a dial's host answered at all (ADR 0127). A
+    /// session or a [verdict](is_verdict) came from a host that is on; only
+    /// silence did not.
+    fn note_presence(&mut self, peer: &NodeId, result: &Result<Box<ControlConnection>, NetError>) {
+        let answered = result.as_ref().map_or_else(is_verdict, |_| true);
+        self.presence.insert(host_tag(peer), answered);
+    }
+
     /// Guest side: takes the outcome of [`Self::spawn_dial`] on the actor's own
     /// thread, which is the only one allowed to store a connection.
     fn on_dialed(
@@ -16169,6 +16293,7 @@ impl Actor {
         result: Result<Box<ControlConnection>, NetError>,
     ) {
         let tag = self.label_of(&peer);
+        self.note_presence(&peer, &result);
         // A resume the user walked away from while it was on its way: the
         // connection it produced is the goodbye `say_goodbye` promised the
         // host (ADR 0119).
@@ -17285,8 +17410,16 @@ async fn classify_incoming(
             return None;
         }
     }
+    // Kept to read how the connection ended if no `Hello` comes: a guest that
+    // only checked this host is there closes before sending one, and that is
+    // not a failed handshake worth a warning (ADR 0127).
+    let ending = connection.clone();
     let (control, hello) = match lumepeer_net::host_handshake(connection).await {
         Ok(pair) => pair,
+        Err(_) if ending.closed_by_peer_with(lumepeer_net::connection::CLOSE_PRESENCE) => {
+            tracing::debug!(peer = %tag, "a guest checked this host is there");
+            return None;
+        }
         Err(error) => {
             tracing::warn!(peer = %tag, %error, "control handshake failed");
             return None;
@@ -17410,6 +17543,36 @@ fn close_as_leaving(control: &ControlConnection) {
         lumepeer_net::connection::CLOSE_NORMAL.into(),
         lumepeer_net::error::close_code::NORMAL.as_bytes(),
     );
+}
+
+/// One presence check: the transports of `plan` in order, until one of them
+/// finishes a QUIC handshake with the host (ADR 0127).
+///
+/// The connection is closed the moment it exists, with
+/// [`CLOSE_PRESENCE`](lumepeer_net::connection::CLOSE_PRESENCE) and before any
+/// stream is opened, so the host never reads a `Hello`. Each transport gets
+/// the [`TRANSPORT_PROBE_ATTEMPTS`] a connect would give it before falling
+/// back, alternating ticket addresses and lookup the same way, at
+/// [`PRESENCE_ATTEMPT_TIMEOUT_SECS`] each: a single lost packet is no more
+/// evidence that a host is off than it is against a transport.
+async fn probe_host(plan: DialPlan) -> bool {
+    for stage in std::iter::once(plan.first).chain(plan.rest) {
+        for attempt in 1..=TRANSPORT_PROBE_ATTEMPTS {
+            let dialed = tokio::time::timeout(
+                Duration::from_secs(PRESENCE_ATTEMPT_TIMEOUT_SECS),
+                stage.dialer.connect_control(attempt.is_multiple_of(2)),
+            )
+            .await;
+            if let Ok(Ok(connection)) = dialed {
+                connection.close(
+                    lumepeer_net::connection::CLOSE_PRESENCE.into(),
+                    lumepeer_net::error::close_code::PRESENCE.as_bytes(),
+                );
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn dial_over_plan(
@@ -18142,6 +18305,8 @@ pub fn spawn_actor_with(
         pending_remember: None,
         connect_credentials_auto: false,
         pending_surface: std::collections::HashMap::new(),
+        presence: std::collections::HashMap::new(),
+        presence_probing: std::collections::HashSet::new(),
     };
     tokio::spawn(actor.run());
     ActorHandle {
@@ -23153,6 +23318,103 @@ mod tests {
             ),
             "a label that names no remembered host must dial nothing"
         );
+    }
+
+    /// Polls the remembered-hosts list until the only row says `want` about
+    /// its host, or `within` runs out.
+    async fn wait_for_presence(handle: &ActorHandle, want: Option<bool>, within: Duration) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let rows = handle.history().await.unwrap();
+            if rows.first().and_then(|row| row.online) == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for online = {want:?}; the row says {:?}",
+                rows.first().map(|row| row.online)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// ADR 0127: a presence check finds a remembered host there without
+    /// asking it for anything — no consent request, no session on the host —
+    /// and finds it gone once it has gone.
+    ///
+    /// The guest starts with the row already on disk and has never dialed the
+    /// host this run, so the only thing that can turn its `online` from "not
+    /// asked" into an answer is the check itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_presence_check_finds_a_saved_host_without_asking_it_for_a_session() {
+        let (host, host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+
+        let scratch = Scratch::new("presence-check");
+        let history_path = scratch.join("history.json");
+        ConnectionHistory::open(Some(history_path.clone())).record(
+            host_tag(&host_endpoint.addr().id),
+            Role::ViewOnly,
+            invite.code,
+            None,
+            Vec::new(),
+        );
+        let secret = iroh::SecretKey::generate();
+        let guest_endpoint = PeerEndpoint::bind_local(secret.clone()).await.unwrap();
+        let guest_capture = test_capture();
+        let guest = spawn_actor_with(
+            guest_endpoint,
+            SigningKey::from_bytes(&secret.to_bytes()),
+            Arc::new(DetachedViewWindows),
+            test_media(&guest_capture),
+            crate::clipboard_os::no_clipboard(),
+            ActorStores {
+                history_path: Some(history_path),
+                ..ActorStores::in_memory()
+            },
+            ActorPolicy::hosting(false),
+        );
+        wait_for_presence(&guest, None, TIMEOUT).await;
+
+        guest.history_probe().await.unwrap();
+        wait_for_presence(&guest, Some(true), TIMEOUT).await;
+        assert!(
+            host.status().await.unwrap().is_empty(),
+            "a presence check must never become a consent request or a session"
+        );
+        assert_eq!(
+            guest.connect_state().await.unwrap().phase,
+            ConnectPhase::Idle
+        );
+
+        host_endpoint.close().await;
+        guest.history_probe().await.unwrap();
+        // Every attempt of both halves of the plan, plus room to answer.
+        let whole_check = Duration::from_secs(
+            PRESENCE_ATTEMPT_TIMEOUT_SECS * u64::from(TRANSPORT_PROBE_ATTEMPTS) * 2,
+        ) + TIMEOUT;
+        wait_for_presence(&guest, Some(false), whole_check).await;
+    }
+
+    /// ADR 0127: a connect answers the question too, and the answer outlives
+    /// the session it came from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_marks_its_host_as_there() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        wait_for_presence(&guest, Some(true), TIMEOUT).await;
+
+        host.revoke(label).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+        wait_for_presence(&guest, Some(true), TIMEOUT).await;
     }
 
     /// ADR 0101: connecting to a remembered host "for the terminal" is the

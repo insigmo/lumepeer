@@ -85,6 +85,16 @@ pub struct HistoryEntry {
     /// starts `false`.
     #[serde(skip)]
     pub has_password: bool,
+    /// Whether that host answered the last time this node reached for it:
+    /// a presence check, or a connect (ADR 0127). `None` until something has
+    /// asked.
+    ///
+    /// `#[serde(skip)]` like `has_password`: it is a fact about this run's
+    /// network, and one read back after a restart would claim a machine is on
+    /// because it was on yesterday. The actor fills it in when it answers
+    /// `ActorCommand::History`.
+    #[serde(skip)]
+    pub online: Option<bool>,
     /// Whether this node may raise a **new** session with that host by itself
     /// after the link goes away — a machine restarting, most of the time
     /// (ADR 0084).
@@ -248,6 +258,9 @@ impl ConnectionHistory {
                 // Answered by the keystore when the actor reads the list, not
                 // by whatever wrote this row.
                 has_password: false,
+                // Answered by the actor from this run's own evidence, for the
+                // same reason.
+                online: None,
                 trusted,
                 device,
             },

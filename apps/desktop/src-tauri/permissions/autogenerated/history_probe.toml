@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-history-probe"
+description = "Enables the history_probe command without any pre-configured scope."
+commands.allow = ["history_probe"]
+
+[[permission]]
+identifier = "deny-history-probe"
+description = "Denies the history_probe command without any pre-configured scope."
+commands.deny = ["history_probe"]

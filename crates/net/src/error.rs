@@ -132,4 +132,6 @@ pub mod close_code {
     pub const NORMAL: &str = "NORMAL";
     /// The host has no session of this peer to resume under that id (§10).
     pub const RESUME_REFUSED: &str = "RESUME_REFUSED";
+    /// A guest checked the host is there and asked for nothing (ADR 0127).
+    pub const PRESENCE: &str = "PRESENCE";
 }

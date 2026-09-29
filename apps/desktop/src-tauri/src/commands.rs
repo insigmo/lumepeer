@@ -437,6 +437,10 @@ pub struct HistoryEntryDto {
     /// also the honest answer to "will this one come back on its own": both
     /// halves or neither.
     pub trusted: bool,
+    /// Whether that host answered the last time this node reached for it —
+    /// a presence check or a connect — and `None` until something has asked
+    /// (ADR 0127).
+    pub online: Option<bool>,
 }
 
 /// Argument of [`history_connect`].
@@ -879,6 +883,7 @@ pub async fn connection_history(
             last_seen_at: e.last_seen_at,
             has_password: e.has_password,
             trusted: e.trusted,
+            online: e.online,
         })
         .collect())
 }
@@ -1000,6 +1005,26 @@ pub async fn history_set_trusted(
         .network
         .history_set_trusted(args.peer, args.trusted)
         .await?)
+}
+
+/// Checks which remembered hosts are there, without asking any of them for a
+/// session (ADR 0127).
+///
+/// Answers once the checks are started; each host's answer arrives in the
+/// `online` of a later `connection_history`. The webview decides *when* —
+/// while its window is the one in front — and never *what*: which hosts are
+/// dialed, and how, is the actor's.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] if the actor is gone.
+#[tauri::command]
+pub async fn history_probe(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    state.network.history_probe().await?;
+    Ok(())
 }
 
 /// What a `RebootRequest` asks for, as the webview names it (ADR 0084).

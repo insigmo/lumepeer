@@ -28,6 +28,7 @@ const COMMANDS: &[&str] = &[
     "history_remove",
     "history_forget_password",
     "history_set_trusted",
+    "history_probe",
     "connect_status",
     "connect_cancel",
     "report_decoder_codecs",

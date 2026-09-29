@@ -165,6 +165,8 @@ export const ja: Dictionary = {
   'connections.preview': 'リモートデスクトップのプレビュー',
   'connections.live': '接続中',
   'connections.idle': '未接続',
+  'connections.online': 'オンライン',
+  'connections.offline': 'オフライン',
   'connections.emptyTitle': 'まだ接続はありません',
   'connections.emptySubtext': '接続されたデバイスはここに表示されます。',
   'connections.peerId': (id) => `ID: ${id}`,

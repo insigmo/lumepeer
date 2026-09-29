@@ -39,6 +39,7 @@ import {
   tauriSystemCommands,
 } from './system-settings';
 import { logoMark } from './logo';
+import { PresenceSchedule, probeSavedHosts } from './presence';
 import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
 import { rebootBanner, type RebootPending } from './reboot-banner';
 import { onSettingsStateChange, openSettings, settingsView } from './settings-view';
@@ -562,8 +563,18 @@ void (async () => {
 // here (ADR 0062): a code that survives restarts is only useful if the host
 // can see it without pressing anything.
 void loadLiveInvite();
+// Which remembered hosts are there (ADR 0127): asked when this window comes to
+// the front and every five minutes while it stays there, never while it sits
+// behind other windows. Not before this node has reached the network either,
+// or every host would be painted off for a fault that is this machine's own.
+const presence = new PresenceSchedule(
+  () => void probeSavedHosts(),
+  () => document.hasFocus() && networkReady,
+);
+window.addEventListener('focus', () => presence.focused());
 setInterval(() => {
   void refresh();
+  presence.tick();
 }, 1000);
 
 // The poll above is the floor, not the latency budget. A consent request or a

@@ -46,6 +46,7 @@
     "allow-history-remove",
     "allow-history-forget-password",
     "allow-history-set-trusted",
+    "allow-history-probe",
     "allow-reboot-pending",
     "allow-reboot-cancel",
     "allow-connect-status",

@@ -297,6 +297,21 @@ pub const SAVED_HOSTS_PER_REFRESH: usize = 8;
 /// is a host with an IPv4 and an IPv6 address on two interfaces, which is the
 /// widest real machine this has met.
 pub const SAVED_HOST_ADDRS: usize = 4;
+/// Bound on one attempt of checking whether a saved host is there (ADR 0127).
+///
+/// A host that is up finishes a QUIC handshake within a second or two on
+/// either transport — about half a second through the obfuscated
+/// rendezvous's push (ADR 0116). Half of [`CONNECT_ATTEMPT_TIMEOUT_SECS`]:
+/// the check only needs the handshake, never the `Hello` after it, and a host
+/// that takes longer than this is found by the next attempt or the next check.
+pub const PRESENCE_ATTEMPT_TIMEOUT_SECS: u64 = 10;
+/// How many saved hosts one presence check dials at the same time (ADR 0127).
+///
+/// Every check is a real dial — a knock over the signalling relays, a DHT
+/// write and a punch on its own socket — so fifty saved hosts are not fifty
+/// of those in one breath. Four keeps a short list instant and a long one to
+/// a few rounds of [`PRESENCE_ATTEMPT_TIMEOUT_SECS`].
+pub const PRESENCE_PROBES_AT_ONCE: usize = 4;
 /// Handshakes the host will run concurrently (§3.2). Beyond this the one that
 /// has waited longest is dropped to make room (ADR 0123), so the bound caps
 /// the work a flood can cause without letting a few stalled connections

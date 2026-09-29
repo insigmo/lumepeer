@@ -165,6 +165,8 @@ export const ar: Dictionary = {
   'connections.preview': 'معاينة سطح المكتب البعيد',
   'connections.live': 'متصل',
   'connections.idle': 'غير متصل',
+  'connections.online': 'متصل بالإنترنت',
+  'connections.offline': 'غير متصل بالإنترنت',
   'connections.emptyTitle': 'لا توجد اتصالات بعد',
   'connections.emptySubtext': 'ستظهر الأجهزة المتصلة هنا.',
   'connections.peerId': (id) => `المعرّف: ${id}`,

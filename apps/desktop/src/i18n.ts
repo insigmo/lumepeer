@@ -219,6 +219,8 @@ export type TranslationKey =
   | 'connections.preview'
   | 'connections.live'
   | 'connections.idle'
+  | 'connections.online'
+  | 'connections.offline'
   | 'connections.emptyTitle'
   | 'connections.emptySubtext'
   // The tooltip on a peer shown by its machine name: the label it is still

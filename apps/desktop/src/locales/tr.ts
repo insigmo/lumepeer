@@ -166,6 +166,8 @@ export const tr: Dictionary = {
   'connections.preview': 'Uzak masaüstü önizlemesi',
   'connections.live': 'Bağlı',
   'connections.idle': 'Bağlı değil',
+  'connections.online': 'Çevrimiçi',
+  'connections.offline': 'Çevrimdışı',
   'connections.emptyTitle': 'Henüz bağlantı yok',
   'connections.emptySubtext': 'Bağlanan cihazlar burada görünecek.',
   'connections.peerId': (id) => `ID: ${id}`,

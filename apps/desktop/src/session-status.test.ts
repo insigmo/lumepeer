@@ -407,3 +407,47 @@ describe('a session card', () => {
     expect(request?.textContent).toContain('BETA-PC');
   });
 });
+
+// ADR 0127. The dot beside a remembered host's name answers "did this host
+// answer the last time we reached for it", so it takes a colour only once
+// something has asked.
+describe('remembered-host presence dot', () => {
+  function renderWith(online: boolean | null | undefined): void {
+    render(sessionStatus([], 'en', () => {}, [{ ...ENTRY, online }], () => {}), container);
+  }
+
+  function dot(): HTMLElement | null {
+    return container.querySelector<HTMLElement>('[data-testid="history-card"] [data-testid="presence-dot"]');
+  }
+
+  it('is green for a host that answered', () => {
+    renderWith(true);
+    expect(dot()?.dataset['state']).toBe('online');
+    expect(dot()?.title).toBe('Online');
+    // The one dot of the card, beside the name, not a second one on the picture.
+    expect(dot()?.closest('.peer-card-foot')).not.toBeNull();
+    expect(container.querySelectorAll('[data-testid="history-card"] .peer-dot')).toHaveLength(1);
+  });
+
+  it('is red for a host that did not answer', () => {
+    renderWith(false);
+    expect(dot()?.dataset['state']).toBe('offline');
+    expect(dot()?.title).toBe('Offline');
+  });
+
+  it('stays the grey of "not connected" until something has asked, and for an older answer without the field', () => {
+    renderWith(null);
+    expect(dot()?.dataset['state']).toBe('idle');
+    expect(dot()?.title).toBe('Not connected');
+    renderWith(undefined);
+    expect(dot()?.dataset['state']).toBe('idle');
+  });
+
+  it('is said in words on the card face, since the dot itself is only colour', () => {
+    renderWith(false);
+    const face = container.querySelector<HTMLButtonElement>('button.history-reconnect');
+    expect(face?.getAttribute('aria-label')).toBe('Connect again: host-ab12, Offline');
+    renderWith(null);
+    expect(face?.getAttribute('aria-label')).toBe('Connect again: host-ab12');
+  });
+});

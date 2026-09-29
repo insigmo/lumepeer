@@ -169,6 +169,13 @@ export interface HistoryEntry {
    * row from an older answer reads as "no", which is the safe direction.
    */
   trusted?: boolean;
+  /**
+   * Whether that host answered the last time this node reached for it — a
+   * presence check or a connect (ADR 0127). `null` until something has
+   * asked, and optional so an older answer draws no dot rather than a wrong
+   * one.
+   */
+  online?: boolean | null;
 }
 
 async function revoke(peer: string): Promise<void> {
@@ -454,6 +461,30 @@ function peerThumbnail(host: string, locale: Locale): TemplateResult {
   `;
 }
 
+/** The words for a remembered host's presence, or `null` while nothing has asked (ADR 0127). */
+function presenceLabel(online: boolean | null | undefined, locale: Locale): string | null {
+  if (online === null || online === undefined) {
+    return null;
+  }
+  return t(locale, online ? 'connections.online' : 'connections.offline');
+}
+
+/**
+ * The dot beside a remembered host's name: green when the host answered the
+ * last time this node reached for it, red when it did not, and the grey of
+ * "not connected" before anything has asked (ADR 0127) — a red dot on a host
+ * nobody has checked would be a claim with no evidence.
+ */
+function presenceDot(online: boolean | null | undefined, locale: Locale): TemplateResult {
+  const state = online === true ? 'online' : online === false ? 'offline' : 'idle';
+  return html`<span
+    class="peer-dot"
+    data-testid="presence-dot"
+    data-state=${state}
+    title=${presenceLabel(online, locale) ?? t(locale, 'connections.idle')}
+  ></span>`;
+}
+
 /** Closes the menu the pressed item belongs to, whatever the item then does. */
 function closeMenu(event: Event): void {
   (event.currentTarget as HTMLElement | null)?.closest('details.peer-menu')?.removeAttribute('open');
@@ -708,7 +739,9 @@ export function sessionStatus(
                     class="peer-card-face history-reconnect"
                     ?disabled=${reconnectDisabled}
                     title=${t(locale, 'status.reconnect')}
-                    aria-label=${`${t(locale, 'status.reconnect')}: ${name}`}
+                    aria-label=${[`${t(locale, 'status.reconnect')}: ${name}`, presenceLabel(entry.online, locale)]
+                      .filter((part) => part !== null)
+                      .join(', ')}
                     @click=${() => onReconnect(entry.peer_label)}
                   >
                     ${peerThumbnail(entry.peer_label, locale)}
@@ -718,12 +751,7 @@ export function sessionStatus(
                     </span>
                   </button>
                   <div class="peer-card-foot">
-                    <span
-                      class="peer-dot"
-                      data-state="idle"
-                      title=${t(locale, 'connections.idle')}
-                    ></span>
-                    ${peerName(entry, locale)}
+                    ${presenceDot(entry.online, locale)} ${peerName(entry, locale)}
                     ${peerMenu(name, locale, [
                       html`
                         <button

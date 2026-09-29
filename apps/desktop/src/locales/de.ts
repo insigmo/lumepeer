@@ -166,6 +166,8 @@ export const de: Dictionary = {
   'connections.preview': 'Vorschau des entfernten Bildschirms',
   'connections.live': 'Verbunden',
   'connections.idle': 'Nicht verbunden',
+  'connections.online': 'Online',
+  'connections.offline': 'Offline',
   'connections.emptyTitle': 'Noch keine Verbindungen',
   'connections.emptySubtext': 'Verbundene Geräte erscheinen hier.',
   'connections.peerId': (id) => `ID: ${id}`,

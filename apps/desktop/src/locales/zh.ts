@@ -158,6 +158,8 @@ export const zh: Dictionary = {
   'connections.preview': '远程桌面预览',
   'connections.live': '已连接',
   'connections.idle': '未连接',
+  'connections.online': '在线',
+  'connections.offline': '离线',
   'connections.emptyTitle': '暂无连接',
   'connections.emptySubtext': '已连接的设备将显示在此处。',
   'connections.peerId': (id) => `ID：${id}`,

@@ -496,6 +496,10 @@ pub const CLOSE_NORMAL: u32 = 6;
 /// session of this peer is waiting in its reconnect window under that id
 /// (§10). Never followed by a consent request on the same connection.
 pub const CLOSE_RESUME_REFUSED: u32 = 7;
+/// QUIC application close code for a guest that only checked the host is
+/// there: it closes the control connection before any `Hello`, so no session
+/// and no consent request ever follow (ADR 0127).
+pub const CLOSE_PRESENCE: u32 = 8;
 
 /// Close code and reason string that a framing error must close the stream
 /// with (§9.1, §18).

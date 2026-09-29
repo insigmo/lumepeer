@@ -166,6 +166,8 @@ export const ru: Dictionary = {
   'connections.preview': 'Снимок удалённого рабочего стола',
   'connections.live': 'Подключено',
   'connections.idle': 'Нет подключения',
+  'connections.online': 'В сети',
+  'connections.offline': 'Не в сети',
   'connections.emptyTitle': 'Пока нет подключений',
   'connections.emptySubtext': 'Подключённые устройства появятся здесь.',
   'connections.peerId': (id) => `ID: ${id}`,

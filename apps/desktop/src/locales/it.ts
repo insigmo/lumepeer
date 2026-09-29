@@ -166,6 +166,8 @@ export const it: Dictionary = {
   'connections.preview': 'Anteprima del desktop remoto',
   'connections.live': 'Connesso',
   'connections.idle': 'Non connesso',
+  'connections.online': 'Online',
+  'connections.offline': 'Offline',
   'connections.emptyTitle': 'Ancora nessuna connessione',
   'connections.emptySubtext': 'I dispositivi connessi appariranno qui.',
   'connections.peerId': (id) => `ID: ${id}`,

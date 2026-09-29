@@ -166,6 +166,8 @@ export const pl: Dictionary = {
   'connections.preview': 'Podgląd zdalnego pulpitu',
   'connections.live': 'Połączono',
   'connections.idle': 'Brak połączenia',
+  'connections.online': 'Online',
+  'connections.offline': 'Offline',
   'connections.emptyTitle': 'Brak połączeń',
   'connections.emptySubtext': 'Połączone urządzenia pojawią się tutaj.',
   'connections.peerId': (id) => `ID: ${id}`,

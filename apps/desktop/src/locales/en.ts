@@ -172,6 +172,8 @@ export const en: Dictionary = {
   'connections.preview': 'Remote desktop preview',
   'connections.live': 'Connected',
   'connections.idle': 'Not connected',
+  'connections.online': 'Online',
+  'connections.offline': 'Offline',
   'connections.emptyTitle': 'No connections yet',
   'connections.emptySubtext': 'Connected devices will appear here.',
   'connections.peerId': (id) => `ID: ${id}`,
