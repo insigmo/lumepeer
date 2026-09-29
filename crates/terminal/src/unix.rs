@@ -12,7 +12,7 @@
 //! than guessed at, because "drop to whom" is a decision nobody made and a
 //! wrong guess hands a guest a root shell.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +32,71 @@ pub(crate) fn host_shell() -> OsString {
         Some(shell) if !shell.is_empty() => shell,
         _ => OsString::from(FALLBACK_SHELL),
     }
+}
+
+/// The character set a shell is given when this process has none (ADR 0130).
+///
+/// Only the character handling: messages, dates and sorting stay whatever the
+/// host already had. Every macOS has `en_US.UTF-8`; `C.UTF-8` is the one a
+/// Linux is surest to have, built into glibc since 2.35 and packaged by
+/// Debian long before.
+#[cfg(target_os = "macos")]
+const UTF8_CTYPE: &str = "en_US.UTF-8";
+#[cfg(not(target_os = "macos"))]
+const UTF8_CTYPE: &str = "C.UTF-8";
+
+/// The `LC_CTYPE` a shell needs on top of the environment it inherits, if any
+/// (ADR 0130).
+///
+/// A Lumepeer started from the Dock, Finder or a launch agent carries no
+/// `LANG` at all — Terminal.app sets one for its own shells, nothing sets one
+/// for ours — so the shell ran in the C locale, took each byte of a Cyrillic
+/// letter for a character of its own and drew the half it could not print as
+/// `<0084>`. What was typed was fine; the shell could not read it.
+///
+/// Locale variables resolve `LC_ALL`, then `LC_CTYPE`, then `LANG`, an empty
+/// one counting as unset. A UTF-8 answer is left alone. A set `LC_ALL` is too:
+/// it overrides every category, so it was put there on purpose by whoever
+/// owns the machine, and it is theirs to change.
+fn ctype_override(
+    lc_all: Option<&OsStr>,
+    lc_ctype: Option<&OsStr>,
+    lang: Option<&OsStr>,
+) -> Option<&'static str> {
+    fn set(value: Option<&OsStr>) -> Option<&OsStr> {
+        value.filter(|value| !value.is_empty())
+    }
+    if set(lc_all).is_some() {
+        return None;
+    }
+    match set(lc_ctype).or(set(lang)) {
+        Some(locale) if is_utf8(locale) => None,
+        _ => Some(UTF8_CTYPE),
+    }
+}
+
+/// Whether a locale name says UTF-8, in any of the spellings in use
+/// (`UTF-8`, `utf8`, with or without a language in front).
+fn is_utf8(locale: &OsStr) -> bool {
+    let locale = locale.to_string_lossy().to_ascii_lowercase();
+    locale.contains("utf-8") || locale.contains("utf8")
+}
+
+/// The host's shell with the host's environment, plus the one variable
+/// [`ctype_override`] says it lacks.
+fn shell_command() -> CommandBuilder {
+    // No arguments, and the program is this machine's own (ADR 0079).
+    // `CommandBuilder::new` inherits this process's environment, which is
+    // the interactive user's, so the shell starts where they would.
+    let mut command = CommandBuilder::new(host_shell());
+    if let Some(ctype) = ctype_override(
+        std::env::var_os("LC_ALL").as_deref(),
+        std::env::var_os("LC_CTYPE").as_deref(),
+        std::env::var_os("LANG").as_deref(),
+    ) {
+        command.env("LC_CTYPE", ctype);
+    }
+    command
 }
 
 /// Whether this process may hand its own privileges to a shell.
@@ -123,16 +188,10 @@ impl Shell {
                 ShellError::Unavailable
             })?;
 
-        // No arguments, and the program is this machine's own (ADR 0079).
-        // `CommandBuilder::new` inherits this process's environment, which is
-        // the interactive user's, so the shell starts where they would.
-        let mut child = pair
-            .slave
-            .spawn_command(CommandBuilder::new(host_shell()))
-            .map_err(|error| {
-                tracing::warn!(%error, "the host's shell could not be started");
-                ShellError::Unavailable
-            })?;
+        let mut child = pair.slave.spawn_command(shell_command()).map_err(|error| {
+            tracing::warn!(%error, "the host's shell could not be started");
+            ShellError::Unavailable
+        })?;
         // The slave fd is the child's now. Keeping a copy would hold the pty
         // open after the shell exits, so the reader below would block for ever
         // instead of seeing EOF — which is one of the two ways an orphan is
@@ -228,6 +287,76 @@ mod tests {
             Some(from_env) if !from_env.is_empty() => assert_eq!(shell, from_env),
             _ => assert_eq!(shell, OsString::from(FALLBACK_SHELL)),
         }
+    }
+
+    /// Which environments get a UTF-8 `LC_CTYPE` added, and which are left as
+    /// they are (ADR 0130).
+    #[test]
+    fn a_utf8_ctype_is_added_only_where_the_locale_has_none() {
+        let os = |value: &'static str| Some(OsStr::new(value));
+
+        // Nothing set at all: what a Mac app started from the Dock has.
+        assert_eq!(ctype_override(None, None, None), Some(UTF8_CTYPE));
+        assert_eq!(ctype_override(None, None, os("C")), Some(UTF8_CTYPE));
+        assert_eq!(ctype_override(None, None, os("POSIX")), Some(UTF8_CTYPE));
+        // Empty is unset, so the next variable down decides.
+        assert_eq!(ctype_override(os(""), os(""), os("C")), Some(UTF8_CTYPE));
+        assert_eq!(ctype_override(None, os(""), os("en_US.UTF-8")), None);
+        // `LC_CTYPE` outranks `LANG`, in both directions.
+        assert_eq!(
+            ctype_override(None, os("C"), os("en_US.UTF-8")),
+            Some(UTF8_CTYPE)
+        );
+        assert_eq!(ctype_override(None, os("UTF-8"), None), None);
+
+        // Already UTF-8, however it is spelled.
+        for locale in ["en_US.UTF-8", "ru_RU.utf8", "C.UTF-8", "de_DE.UTF-8@euro"] {
+            assert_eq!(ctype_override(None, None, os(locale)), None, "{locale}");
+        }
+
+        // `LC_ALL` is the machine owner's word on every category.
+        assert_eq!(ctype_override(os("C"), None, None), None);
+        assert_eq!(ctype_override(os("ru_RU.UTF-8"), None, None), None);
+    }
+
+    /// The shell itself reports UTF-8, which is what makes a Cyrillic letter
+    /// one character to it rather than two bytes drawn as `<0084>`
+    /// (ADR 0130).
+    ///
+    /// Only proves the fix when the test runs with no UTF-8 locale of its
+    /// own — `env -u LANG -u LC_ALL -u LC_CTYPE cargo test` — which is what a
+    /// Lumepeer started from the Dock has; under a UTF-8 terminal it would
+    /// pass without it.
+    #[test]
+    fn the_shell_speaks_utf8() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let shell = Shell::spawn(ShellSize { cols: 80, rows: 24 }).expect("a shell");
+        let (mut reader, mut writer, _control) = shell.into_parts();
+        // The quotes split the marker so the terminal's echo of this line
+        // never contains it; only the printed answer does. The `exit` is what
+        // ends the read below even if `locale` answers nothing.
+        writer
+            .write_all(b"printf 'char''map=%s\\n' \"$(locale charmap)\"; exit\n")
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => seen.extend_from_slice(&buffer[..read]),
+            }
+        }
+        let seen = String::from_utf8_lossy(&seen);
+        let charmap = seen
+            .split("charmap=")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(str::trim);
+        assert_eq!(charmap, Some("UTF-8"), "the shell said: {seen}");
     }
 
     /// A shell really starts, really echoes, and is really gone afterwards.

@@ -429,16 +429,6 @@ export interface ToolbarHooks {
   /** Whether the terminal panel is visible right now. */
   terminalVisible(): boolean;
   /**
-   * Whether this window is a shell and nothing else (ADR 0101).
-   *
-   * Such a window never dialled the media connection, so everything the
-   * toolbar offers about a picture — the quality and monitor popovers, the
-   * zoom, the microphone, Ctrl+Alt+Del, the recording request, full screen —
-   * has nothing on the other end to act on. They are left out rather than
-   * disabled: a control that cannot work is worse than no control (§18).
-   */
-  terminalOnly(): boolean;
-  /**
    * Whether a message arrived while the panel was closed.
    *
    * The panel starts hidden, so without a mark on the button a message from
@@ -542,8 +532,6 @@ export function renderToolbar(
   const chatOn = hooks.chatVisible();
   const filesPending = hooks.filesPending();
   const terminalOn = hooks.terminalVisible();
-  // A shell-only window has no picture and no media connection (ADR 0101).
-  const terminalOnly = hooks.terminalOnly();
   // Only worth showing while the panel is closed: with it open the message is
   // already on screen, and a mark next to it would be a second claim about the
   // same thing.
@@ -795,32 +783,28 @@ export function renderToolbar(
         </button>
       `
     : html`
-        ${terminalOnly
-          ? html``
-          : html`<button
-              type="button"
-              class="toolbar-btn"
-              data-testid="toolbar-settings"
+        <button
+          type="button"
+          class="toolbar-btn"
+          data-testid="toolbar-settings"
           aria-label=${t(locale, 'toolbar.settings')}
           title=${t(locale, 'toolbar.settings')}
           aria-expanded=${state.openPopover === 'settings' ? 'true' : 'false'}
-              @click=${() =>
-                actions.openPopover(state.openPopover === 'settings' ? null : 'settings')}
-            >
-              ${ICONS.settings}
-            </button>
-            <button
-              type="button"
-              class="toolbar-btn"
-              data-testid="toolbar-monitors"
-              aria-label=${t(locale, 'toolbar.monitors')}
-              title=${t(locale, 'toolbar.monitors')}
-              aria-expanded=${state.openPopover === 'monitors' ? 'true' : 'false'}
-              @click=${() =>
-                actions.openPopover(state.openPopover === 'monitors' ? null : 'monitors')}
-            >
-              ${ICONS.monitor(monitorLabel)}
-            </button>`}
+          @click=${() => actions.openPopover(state.openPopover === 'settings' ? null : 'settings')}
+        >
+          ${ICONS.settings}
+        </button>
+        <button
+          type="button"
+          class="toolbar-btn"
+          data-testid="toolbar-monitors"
+          aria-label=${t(locale, 'toolbar.monitors')}
+          title=${t(locale, 'toolbar.monitors')}
+          aria-expanded=${state.openPopover === 'monitors' ? 'true' : 'false'}
+          @click=${() => actions.openPopover(state.openPopover === 'monitors' ? null : 'monitors')}
+        >
+          ${ICONS.monitor(monitorLabel)}
+        </button>
         ${chatButton}
         ${filesButton}
         <button
@@ -834,19 +818,17 @@ export function renderToolbar(
         >
           ${ICONS.terminal}
         </button>
-        ${terminalOnly
-          ? html``
-          : html`<button
-              type="button"
-              class="toolbar-btn ${state.micOn ? 'is-active' : ''}"
-              data-testid="toolbar-mic"
-              aria-label=${t(locale, 'toolbar.mic')}
-              title=${t(locale, 'toolbar.mic')}
-              aria-pressed=${state.micOn ? 'true' : 'false'}
-              @click=${actions.toggleMic}
-            >
-              ${state.micOn ? ICONS.mic : ICONS.micOff}
-            </button>`}
+        <button
+          type="button"
+          class="toolbar-btn ${state.micOn ? 'is-active' : ''}"
+          data-testid="toolbar-mic"
+          aria-label=${t(locale, 'toolbar.mic')}
+          title=${t(locale, 'toolbar.mic')}
+          aria-pressed=${state.micOn ? 'true' : 'false'}
+          @click=${actions.toggleMic}
+        >
+          ${state.micOn ? ICONS.mic : ICONS.micOff}
+        </button>
         <!-- No file button and no clipboard indicator: both were doors onto
              something that now happens by itself. Files travel on the
              ordinary Ctrl+C/Ctrl+V a person already uses (ADR 0047), and
@@ -859,53 +841,43 @@ export function renderToolbar(
               ${t(locale, 'status.clipboardSynced')}
             </span>`
           : html``}
-        ${terminalOnly
-          ? html``
-          : html`<button
-              type="button"
-              class="toolbar-btn ${state.recordAsked ? 'is-active' : ''}"
-              data-testid="toolbar-record"
-              aria-label=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
-              title=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
-              ?disabled=${state.recordAsked}
-              @click=${actions.askToRecord}
-            >
-              ${ICONS.record}
-            </button>`}
+        <button
+          type="button"
+          class="toolbar-btn ${state.recordAsked ? 'is-active' : ''}"
+          data-testid="toolbar-record"
+          aria-label=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
+          title=${t(locale, state.recordAsked ? 'toolbar.record.asked' : 'toolbar.record')}
+          ?disabled=${state.recordAsked}
+          @click=${actions.askToRecord}
+        >
+          ${ICONS.record}
+        </button>
         <!-- Never disabled. It used to gray itself out on the sas_available
              command, which answered "is *this* machine Windows?" about the
              guest's own computer — a fact about the wrong end of the session,
              since the sequence is delivered on the host. The honest answer
              only exists after asking, and it comes back as SasAck. -->
-        ${terminalOnly
-          ? html``
-          : html`<button
-                type="button"
-                class="toolbar-btn"
-                data-testid="toolbar-cad"
-                aria-label=${t(locale, 'toolbar.cad')}
-                title=${t(locale, 'toolbar.cad')}
-                @click=${actions.sendCad}
-              >
-                ${ICONS.cad}
-              </button>
-              <button
-                type="button"
-                class="toolbar-btn ${hooks.fullscreen() ? 'is-active' : ''}"
-                data-testid="toolbar-fullscreen"
-                aria-label=${t(
-                  locale,
-                  hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen',
-                )}
-                title=${t(
-                  locale,
-                  hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen',
-                )}
-                aria-pressed=${hooks.fullscreen() ? 'true' : 'false'}
-                @click=${actions.toggleFullscreen}
-              >
-                ${hooks.fullscreen() ? ICONS.fullscreenExit : ICONS.fullscreen}
-              </button>`}
+        <button
+          type="button"
+          class="toolbar-btn"
+          data-testid="toolbar-cad"
+          aria-label=${t(locale, 'toolbar.cad')}
+          title=${t(locale, 'toolbar.cad')}
+          @click=${actions.sendCad}
+        >
+          ${ICONS.cad}
+        </button>
+        <button
+          type="button"
+          class="toolbar-btn ${hooks.fullscreen() ? 'is-active' : ''}"
+          data-testid="toolbar-fullscreen"
+          aria-label=${t(locale, hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen')}
+          title=${t(locale, hooks.fullscreen() ? 'toolbar.fullscreen.exit' : 'toolbar.fullscreen')}
+          aria-pressed=${hooks.fullscreen() ? 'true' : 'false'}
+          @click=${actions.toggleFullscreen}
+        >
+          ${hooks.fullscreen() ? ICONS.fullscreenExit : ICONS.fullscreen}
+        </button>
         <button
           type="button"
           class="toolbar-btn"
@@ -1313,24 +1285,18 @@ export function mountToolbar(
   // it is asked for here rather than only when a popover opens: the answer
   // decides what the host is told to hold the picture at, and a preset the
   // host never hears is a preset that does nothing.
-  //
-  // Skipped outright for a shell-only window (ADR 0101): there is no picture
-  // to hold at anything, and asking would be this window telling a host that
-  // is not capturing what size to capture at.
-  if (!hooks.terminalOnly()) {
-    void commands
-      .monitorsList(peer)
-      .then((monitors) => {
-        state.monitors = monitors;
-        draw();
-      })
-      .catch(() => {
-        // The host refused or speaks an older protocol. The preset still goes
-        // out — on an unknown screen it is the uncapped picture, which is what
-        // a session with no preset at all already looked like.
-      })
-      .finally(sendQuality);
-  }
+  void commands
+    .monitorsList(peer)
+    .then((monitors) => {
+      state.monitors = monitors;
+      draw();
+    })
+    .catch(() => {
+      // The host refused or speaks an older protocol. The preset still goes
+      // out — on an unknown screen it is the uncapped picture, which is what
+      // a session with no preset at all already looked like.
+    })
+    .finally(sendQuality);
 
   draw();
 

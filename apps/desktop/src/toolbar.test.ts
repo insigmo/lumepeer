@@ -95,7 +95,6 @@ function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
     filesPending: () => false,
     toggleTerminal: () => false,
     terminalVisible: () => false,
-    terminalOnly: () => false,
     displayMode: () => hooks.mode,
     setDisplayMode: (mode) => {
       hooks.mode = mode;

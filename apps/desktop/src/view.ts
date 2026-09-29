@@ -808,7 +808,10 @@ async function main(): Promise<void> {
   // The floating session toolbar (§11): drag handle, settings, monitor
   // picker, chat toggle, microphone, Ctrl+Alt+Del, full screen, collapse. It
   // stops with the window; nothing here outlives the session.
-  if (toolbarRootElement && chatPanel) {
+  //
+  // Not on a terminal window (ADR 0130): what it had left there sat on top of
+  // the shell's own lines, and the shell is the whole of that window.
+  if (toolbarRootElement && chatPanel && !terminalOnly) {
     mountToolbar(toolbarRootElement, locale, peer, tauriToolbarCommands, {
       toggleChat(): boolean {
         chatPanel.hidden = !chatPanel.hidden;
@@ -845,9 +848,6 @@ async function main(): Promise<void> {
       },
       terminalVisible(): boolean {
         return terminalPanel !== null && !terminalPanel.hidden;
-      },
-      terminalOnly(): boolean {
-        return terminalOnly;
       },
       displayMode: () => layout.mode,
       setDisplayMode,
