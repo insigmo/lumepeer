@@ -160,6 +160,7 @@ export const zh: Dictionary = {
   'connections.idle': '未连接',
   'connections.emptyTitle': '暂无连接',
   'connections.emptySubtext': '已连接的设备将显示在此处。',
+  'connections.peerId': (id) => `ID：${id}`,
   'hostbar.expand': '显示 Lumepeer 会话栏',
   'hostbar.collapse': '隐藏 Lumepeer 会话栏',
   'hostbar.openApp': '打开 Lumepeer',

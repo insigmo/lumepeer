@@ -8,7 +8,7 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 import { rememberThumbnail, thumbnailOf } from './peer-thumbnails';
-import { sessionStatus, type HistoryEntry } from './session-status';
+import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 
 let container: HTMLElement;
 
@@ -286,5 +286,124 @@ describe('remembered-host row', () => {
       container.querySelector<HTMLButtonElement>('[data-testid="history-connect-terminal"]')
         ?.disabled,
     ).toBe(true);
+  });
+});
+
+const GUEST: SessionStatus = {
+  peer_label: 'guest-ab12',
+  role: 'full_control',
+  input: true,
+  state: 'active',
+  clipboard_read: true,
+  clipboard_write: true,
+  file_transfer: true,
+  recording: true,
+  display_mode: true,
+  recording_active: false,
+  record_request: false,
+  secure_desktop: true,
+  secure_desktop_input: false,
+  secure_desktop_active: false,
+  tunnel: true,
+  terminal: true,
+  terminal_active: false,
+  chat_unread: false,
+};
+
+// ADR 0121: a peer is shown by what its machine is called, with the label
+// every command still names it by one hover away.
+describe('a peer that named its machine', () => {
+  it('is shown by that name and its operating system, the label in the tooltip', () => {
+    render(
+      sessionStatus(
+        [{ ...GUEST, device_name: 'BETA-PC', device_os: 'windows' }],
+        'en',
+        () => {},
+        [{ ...ENTRY, device_name: 'MacBook Pro', device_os: 'macos' }],
+      ),
+      container,
+    );
+
+    const [session, host] = [...container.querySelectorAll('[data-testid="peer-name"]')];
+    expect(session?.querySelector('.peer-label')?.textContent).toBe('BETA-PC');
+    expect(session?.querySelector('.peer-os')?.getAttribute('aria-label')).toBe('Windows');
+    expect(session?.getAttribute('title')).toContain('guest-ab12');
+    expect(host?.querySelector('.peer-label')?.textContent).toBe('MacBook Pro');
+    expect(host?.querySelector('.peer-os')?.getAttribute('aria-label')).toBe('macOS');
+    expect(host?.getAttribute('title')).toContain('host-ab12');
+  });
+
+  it('falls back to the label, with a generic screen, when the peer said nothing', () => {
+    render(sessionStatus([GUEST], 'en'), container);
+
+    const name = container.querySelector('[data-testid="peer-name"]');
+    expect(name?.querySelector('.peer-label')?.textContent).toBe('guest-ab12');
+    expect(name?.querySelector('.peer-os')?.getAttribute('data-os')).toBe('other');
+    expect(name?.querySelector('.peer-os')?.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('is still acted on by label, whatever it is called', () => {
+    const onReconnect = vi.fn();
+    render(
+      sessionStatus([], 'en', () => {}, [{ ...ENTRY, device_name: 'BETA-PC', device_os: 'linux' }], onReconnect),
+      container,
+    );
+    container.querySelector<HTMLButtonElement>('.history-reconnect')?.click();
+    expect(onReconnect).toHaveBeenCalledWith('host-ab12');
+  });
+});
+
+// ADR 0121: what can be done to a session is in its menu; what is true about
+// it, and what a person has to answer, is on the card.
+describe('a session card', () => {
+  function menu(): HTMLElement | null {
+    return container.querySelector('[data-testid="session-card"] details.peer-menu');
+  }
+
+  it('keeps every action in the menu', () => {
+    render(sessionStatus([GUEST], 'en'), container);
+
+    const actions = menu();
+    expect(actions?.querySelector('[data-testid="record-toggle"]')).not.toBeNull();
+    expect(actions?.querySelector('.chat-open-btn')).not.toBeNull();
+    expect(actions?.querySelector('.revoke-btn')).not.toBeNull();
+    // Nothing clickable is left on the card outside the menu; the quality
+    // pill is a summary that only opens onto what was measured.
+    const loose = [...container.querySelectorAll('[data-testid="session-card"] button')].filter(
+      (button) => !button.closest('details.peer-menu'),
+    );
+    expect(loose).toEqual([]);
+  });
+
+  // ADR 0120: an unread chat is a mark, not a setting — the one control that
+  // stays out on the card, and only while there is something to read.
+  it('keeps the unread-chat mark out on the card', () => {
+    render(sessionStatus([{ ...GUEST, chat_unread: true }], 'en'), container);
+    const mark = container.querySelector('[data-testid="chat-unread"]');
+    expect(mark).not.toBeNull();
+    expect(mark?.closest('details.peer-menu')).toBeNull();
+  });
+
+  it('shows no port forwarding, even for a session that holds the grant', () => {
+    render(sessionStatus([{ ...GUEST, tunnel: true }], 'en'), container);
+    expect(container.querySelector('[data-testid="tunnel-panel"], .tunnel-panel')).toBeNull();
+  });
+
+  it('is quiet when nothing is happening, and says so in one row when something is', () => {
+    render(sessionStatus([GUEST], 'en'), container);
+    expect(container.querySelector('[data-testid="session-status-row"]')).toBeNull();
+
+    render(sessionStatus([{ ...GUEST, recording_active: true, terminal_active: true }], 'en'), container);
+    const row = container.querySelector('[data-testid="session-status-row"]');
+    expect(row?.querySelector('[data-testid="recording-indicator"]')).not.toBeNull();
+    expect(row?.querySelector('[data-testid="terminal-indicator"]')).not.toBeNull();
+  });
+
+  it('keeps a guest asking to be recorded on the card, where it cannot be missed', () => {
+    render(sessionStatus([{ ...GUEST, record_request: true, device_name: 'BETA-PC' }], 'en'), container);
+    const request = container.querySelector('[data-testid="record-request"]');
+    expect(request).not.toBeNull();
+    expect(request?.closest('details.peer-menu')).toBeNull();
+    expect(request?.textContent).toContain('BETA-PC');
   });
 });

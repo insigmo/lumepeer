@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::consent::Role;
 use crate::constants::{
     ABR_MIN_SCALE_PERCENT, CHAT_MAX_BYTES, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-    DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
-    MAX_CONTROL_FRAME_BYTES, MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE,
-    MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
-    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX,
-    TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
-    UNATTENDED_PROOF_MAX_ITERATIONS, UNATTENDED_PROOF_MAX_LANES, UNATTENDED_PROOF_MAX_MEMORY_KIB,
+    DEVICE_NAME_MAX_BYTES, DEVICE_OS_MAX_BYTES, DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES,
+    FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
+    MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
+    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT,
+    STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
+    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES, UNATTENDED_PROOF_MAX_ITERATIONS,
+    UNATTENDED_PROOF_MAX_LANES, UNATTENDED_PROOF_MAX_MEMORY_KIB,
     UNATTENDED_PROOF_MAX_MESSAGE_BYTES, UNATTENDED_PROOF_MAX_OUTPUT_BYTES,
     UNATTENDED_PROOF_MAX_SALT_BYTES, UNATTENDED_PROOF_MIN_OUTPUT_BYTES,
     UNATTENDED_PROOF_MIN_SALT_BYTES,
@@ -333,7 +334,15 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// the answer only ever follows a request, and a peer that can encode the
 /// request can decode the answer. See
 /// `docs/adr/0124-the-file-manager-is-its-own-window-and-can-change-the-host.md`.
-pub const PROTOCOL_MINOR: u16 = 20;
+///
+/// 21: appended [`MessageKind::DeviceInfo`] after `FileOpResult`: a machine
+/// name and an operating-system tag, so the connections list can say "BETA-PC,
+/// Windows" instead of a hex pseudonym. Gated on the minor alone, in both
+/// directions — both sides announce one, and the message is the same either
+/// way — so there is no feature string for it. A guest sends it right after
+/// the handshake, a host with the `ConsentGrant` that admits a guest. See
+/// `docs/adr/0121-a-peer-is-shown-by-its-machine-name.md`.
+pub const PROTOCOL_MINOR: u16 = 21;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -1367,6 +1376,28 @@ pub enum MessageKind {
         /// Why nothing happened, or `None` when it did.
         refused: Option<FileOpRefusal>,
     },
+    /// Either side: what this machine is called and which operating system it
+    /// runs, so the other side can show a name instead of a pseudonym
+    /// (ADR 0121). New in minor 21.
+    ///
+    /// For people, not for decisions. Both fields are the sender's own claim,
+    /// unverified, and nothing on the receiving side keys anything on them:
+    /// sessions, remembered hosts and every command still name a peer by its
+    /// pseudonymous label, which stays one hover away wherever the name is
+    /// shown. A guest sends it right after the handshake; a host sends it only
+    /// with the `ConsentGrant` that admits a guest, so an invite alone never
+    /// learns what the machine behind it is called.
+    DeviceInfo {
+        /// The machine's own name as its operating system reports it, at most
+        /// [`crate::constants::DEVICE_NAME_MAX_BYTES`] bytes.
+        name: String,
+        /// `std::env::consts::OS` of the sender (`windows`, `macos`, `linux`,
+        /// …), at most [`crate::constants::DEVICE_OS_MAX_BYTES`] bytes. A
+        /// string rather than an enum so that an operating system this build
+        /// has never heard of is a value to draw a generic icon for, not a
+        /// malformed frame that closes the connection (§9.1).
+        os: String,
+    },
 }
 
 /// One change a guest may ask a host to make to its own disk
@@ -1555,7 +1586,10 @@ impl MessageKind {
             | Self::DirOffer { .. }
             | Self::DirAccept(_)
             | Self::TunnelClose { .. }
-            | Self::TerminalClose { .. } => None,
+            | Self::TerminalClose { .. }
+            // What each machine is called: both ends say it about themselves
+            // (ADR 0121).
+            | Self::DeviceInfo { .. } => None,
         }
     }
 }
@@ -2301,6 +2335,11 @@ impl MessageEnvelope {
                 check_manifest(name, dir.as_deref(), entries)?;
             }
             MessageKind::FileOpRequest { op, .. } => check_file_op(op)?,
+            MessageKind::DeviceInfo { name, os } => {
+                if name.len() > DEVICE_NAME_MAX_BYTES || os.len() > DEVICE_OS_MAX_BYTES {
+                    return Err(CoreError::Malformed);
+                }
+            }
             MessageKind::TunnelOpenRequest { host, port, .. } => {
                 check_tunnel_target(host, *port)?;
             }
@@ -2366,9 +2405,9 @@ mod tests {
     use super::*;
     use crate::constants::{
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
-        FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES,
-        MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST, STREAM_SIZE_MIN_PX,
-        TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
+        DEVICE_NAME_MAX_BYTES, DEVICE_OS_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES,
+        MANIFEST_PATH_MAX_BYTES, MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST,
+        STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
         UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
@@ -2465,6 +2504,10 @@ mod tests {
             MessageKind::Ping(1),
             MessageKind::FileAccept(true),
             MessageKind::TerminalClose { session_id: 1 },
+            MessageKind::DeviceInfo {
+                name: "BETA-PC".to_owned(),
+                os: "windows".to_owned(),
+            },
         ] {
             assert_eq!(either.direction(), None, "{either:?}");
         }
@@ -2923,6 +2966,39 @@ mod tests {
         let original = envelope(MessageKind::ConsentGrant(Role::ViewOnly));
         let bytes = original.encode().unwrap();
         assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+    }
+
+    /// ADR 0121: the name and the tag cross as they are, up to their bounds,
+    /// and a peer past either bound is refused before anything is shown.
+    #[test]
+    fn device_info_roundtrips_within_its_bounds_and_not_past_them() {
+        for (name, os) in [
+            ("BETA-PC", "windows"),
+            ("", ""),
+            (
+                &*"я".repeat(DEVICE_NAME_MAX_BYTES / 2),
+                &*"x".repeat(DEVICE_OS_MAX_BYTES),
+            ),
+        ] {
+            let original = envelope(MessageKind::DeviceInfo {
+                name: name.to_owned(),
+                os: os.to_owned(),
+            });
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+        for (name, os) in [
+            ("n".repeat(DEVICE_NAME_MAX_BYTES + 1), "linux".to_owned()),
+            ("n".to_owned(), "o".repeat(DEVICE_OS_MAX_BYTES + 1)),
+        ] {
+            let bytes = envelope(MessageKind::DeviceInfo { name, os })
+                .encode()
+                .unwrap();
+            assert!(matches!(
+                MessageEnvelope::decode(&bytes),
+                Err(CoreError::Malformed)
+            ));
+        }
     }
 
     #[test]

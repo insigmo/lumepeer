@@ -274,3 +274,16 @@ valid minor20_file_op_result_failed abababababababababababababababab000040030105
 invalid minor20_file_op_unknown_operation abababababababababababababababab01003f0103022f6100
 invalid minor20_file_op_result_unknown_refusal abababababababababababababababab00004001010600
 invalid minor20_file_op_empty_path abababababababababababababababab01003f01000000
+
+# --- Frozen for PROTOCOL_MINOR 21: a peer names its machine (ADR 0121). Both
+# --- directions carry the same message - a guest right after the handshake, a
+# --- host with the grant. Two strings and nothing else: the operating system
+# --- is a tag rather than an enum, so one this build has never heard of
+# --- ("haiku") still parses and is drawn with a generic icon; an empty name
+# --- parses too and is simply not shown. The bounds are 256 bytes of name and
+# --- 16 of tag, and a peer past either is refused at the parse boundary.
+valid minor21_device_info_guest abababababababababababababababab01074107424554412d50430777696e646f777300
+valid minor21_device_info_host abababababababababababababababab0003410b4d6163426f6f6b2050726f056d61636f7300
+valid minor21_device_info_unknown_os abababababababababababababababab0108410141056861696b7500
+valid minor21_device_info_empty abababababababababababababababab010941000000
+invalid minor21_device_info_os_too_long abababababababababababababababab010a41014111787878787878787878787878787878787800

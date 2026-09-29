@@ -167,6 +167,7 @@ export const ar: Dictionary = {
   'connections.idle': 'غير متصل',
   'connections.emptyTitle': 'لا توجد اتصالات بعد',
   'connections.emptySubtext': 'ستظهر الأجهزة المتصلة هنا.',
+  'connections.peerId': (id) => `المعرّف: ${id}`,
   'hostbar.expand': 'إظهار شريط جلسة Lumepeer',
   'hostbar.collapse': 'إخفاء شريط جلسة Lumepeer',
   'hostbar.openApp': 'فتح Lumepeer',

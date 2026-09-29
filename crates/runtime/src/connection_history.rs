@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lumepeer_core::consent::Role;
 use serde::{Deserialize, Serialize};
 
-use crate::network::TransportKind;
+use crate::network::{PeerDevice, TransportKind};
 
 /// How many remembered hosts the list keeps. Older entries fall off as new
 /// ones arrive; this is a convenience list, not the audit trail, so a bound
@@ -103,6 +103,15 @@ pub struct HistoryEntry {
     /// *asking*, on this side, without a human pressing the button.
     #[serde(default)]
     pub trusted: bool,
+    /// What the host said its machine is, the last time it admitted this node
+    /// (ADR 0121).
+    ///
+    /// Shown instead of the label, never used in its place: every command
+    /// still names the host by `peer_label`. `None` for a host too old to say
+    /// and for a row written before this existed, which is what
+    /// `#[serde(default)]` reads a missing field as.
+    #[serde(default)]
+    pub device: Option<PeerDevice>,
 }
 
 /// In-memory list backed by a best-effort-persisted JSON file.
@@ -219,6 +228,13 @@ impl ConnectionHistory {
         } else {
             addrs
         };
+        // A visit says nothing about the machine's name — the host says that
+        // itself, through `set_device` — so the one the row has stays.
+        let device = self
+            .entries
+            .iter()
+            .find(|entry| entry.peer_label == peer_label)
+            .and_then(|entry| entry.device.clone());
         self.entries.retain(|entry| entry.peer_label != peer_label);
         self.entries.insert(
             0,
@@ -233,10 +249,32 @@ impl ConnectionHistory {
                 // by whatever wrote this row.
                 has_password: false,
                 trusted,
+                device,
             },
         );
         self.entries.truncate(MAX_ENTRIES);
         self.save();
+    }
+
+    /// Writes what the host behind `peer_label` said its machine is
+    /// (ADR 0121), and persists the list when that changed anything.
+    ///
+    /// Nothing is created, for the reason [`Self::remember_addrs`] gives: a
+    /// name for a host that is not in the list has no row to belong to.
+    /// Returns whether a row was there to write to.
+    pub fn set_device(&mut self, peer_label: &str, device: PeerDevice) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.peer_label == peer_label)
+        else {
+            return false;
+        };
+        if entry.device.as_ref() != Some(&device) {
+            entry.device = Some(device);
+            self.save();
+        }
+        true
     }
 
     /// Replaces the addresses remembered for `peer_label` with what a
@@ -818,6 +856,50 @@ mod tests {
         assert_eq!(history.entries().len(), 1);
         assert_eq!(history.entries()[0].last_seen_at, 1234);
         assert_eq!(history.code_of("host-ab12"), Some("code-1"));
+        // Written before hosts named themselves (ADR 0121): no name, not an
+        // unreadable file.
+        assert_eq!(history.entries()[0].device, None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// ADR 0121: the host's name is the host's to say. A visit, at connect or
+    /// at disconnect, leaves it alone, it outlives a restart, and it lands on
+    /// no row that is not already there.
+    #[test]
+    fn a_host_name_survives_visits_and_restarts_and_invents_no_row() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-device-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connection_history.json");
+        let beta = PeerDevice {
+            name: "BETA-PC".to_owned(),
+            os: Some("windows".to_owned()),
+        };
+
+        let mut history = ConnectionHistory::open(Some(path.clone()));
+        assert!(!history.set_device("host-ab12", beta.clone()));
+        assert!(history.entries().is_empty());
+
+        history.record(
+            "host-ab12".to_owned(),
+            Role::FullControl,
+            "code-1".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert!(history.set_device("host-ab12", beta.clone()));
+        history.record(
+            "host-ab12".to_owned(),
+            Role::ViewOnly,
+            "code-2".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(history.entries()[0].device.as_ref(), Some(&beta));
+
+        let reopened = ConnectionHistory::open(Some(path));
+        assert_eq!(reopened.entries()[0].device.as_ref(), Some(&beta));
 
         let _ = fs::remove_dir_all(dir);
     }

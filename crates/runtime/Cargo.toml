@@ -54,6 +54,11 @@ anyhow.workspace = true
 # `unsafe`, which this crate forbids crate-wide; this carries that unsafe in
 # its own compiled crate, exactly as `keyring` does for the Windows keystore.
 fs4 = "0.13"
+# This machine's own name for the other side of a session to show (ADR 0121):
+# the pretty computer name on macOS, the DNS host name on Windows,
+# PRETTY_HOSTNAME or the host name on Linux. Already in the tree through sqlx,
+# and it carries the FFI this crate forbids, the same way fs4 does.
+whoami = "1.6"
 thiserror.workspace = true
 tracing.workspace = true
 

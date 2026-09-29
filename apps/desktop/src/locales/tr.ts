@@ -168,6 +168,7 @@ export const tr: Dictionary = {
   'connections.idle': 'Bağlı değil',
   'connections.emptyTitle': 'Henüz bağlantı yok',
   'connections.emptySubtext': 'Bağlanan cihazlar burada görünecek.',
+  'connections.peerId': (id) => `ID: ${id}`,
   'hostbar.expand': 'Lumepeer oturum çubuğunu göster',
   'hostbar.collapse': 'Lumepeer oturum çubuğunu gizle',
   'hostbar.openApp': 'Lumepeer\'i aç',

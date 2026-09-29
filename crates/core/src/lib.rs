@@ -16,6 +16,7 @@ pub mod chat;
 pub mod clipboard;
 pub mod consent;
 pub mod constants;
+pub mod device;
 pub mod error;
 pub mod license;
 pub mod protocol;

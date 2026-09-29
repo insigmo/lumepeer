@@ -139,6 +139,10 @@
         white-space: nowrap;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       }
+      /* A machine name is words, not an identifier (ADR 0121). */
+      .bar-peer[data-named='true'] {
+        font-family: inherit;
+      }
       .bar-role {
         flex: none;
         color: #a9b7c2;

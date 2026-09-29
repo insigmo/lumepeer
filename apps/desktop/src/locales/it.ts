@@ -168,6 +168,7 @@ export const it: Dictionary = {
   'connections.idle': 'Non connesso',
   'connections.emptyTitle': 'Ancora nessuna connessione',
   'connections.emptySubtext': 'I dispositivi connessi appariranno qui.',
+  'connections.peerId': (id) => `ID: ${id}`,
   'hostbar.expand': 'Mostra la barra di sessione di Lumepeer',
   'hostbar.collapse': 'Nascondi la barra di sessione di Lumepeer',
   'hostbar.openApp': 'Apri Lumepeer',

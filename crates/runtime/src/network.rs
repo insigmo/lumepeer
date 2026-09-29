@@ -218,6 +218,14 @@ const SESSION_RESUME_MINOR: u16 = 18;
 /// unknown variant as malformed and close the connection (§9.1).
 const CAPTURE_DENIED_MINOR: u16 = 19;
 
+/// First `PROTOCOL_MINOR` that decodes `MessageKind::DeviceInfo` (ADR 0121).
+///
+/// Both sides, and the minor alone: each side announces one, and the message
+/// is the same in either direction, so there is no feature string to read
+/// instead. A peer below it would read the unknown discriminant as malformed
+/// and close the connection (§9.1).
+const DEVICE_INFO_MINOR: u16 = 21;
+
 /// Whether a guest can decode `MediaUnavailable(reason)`: it advertised
 /// `FEATURE_MEDIA_UNAVAILABLE`, and for `CaptureDenied` it is also at
 /// [`CAPTURE_DENIED_MINOR`] or later.
@@ -660,6 +668,36 @@ pub struct ConnectionStats {
     pub codec: Option<MediaCodec>,
 }
 
+/// What a peer said its machine is (ADR 0121), cleaned by
+/// [`lumepeer_core::device`] before anything keeps it.
+///
+/// The peer's own claim and nothing more: it is shown beside the label, and
+/// no decision anywhere is keyed on it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerDevice {
+    /// Machine name, fit to show.
+    pub name: String,
+    /// Operating-system tag (`windows`, `macos`, `linux`, …), when the peer
+    /// sent one that survived cleaning.
+    pub os: Option<String>,
+}
+
+impl PeerDevice {
+    /// A `DeviceInfo` from the wire, or `None` when no showable name is left.
+    #[must_use]
+    pub fn from_wire(name: &str, os: &str) -> Option<Self> {
+        Some(Self {
+            name: lumepeer_core::device::clean_name(name)?,
+            os: lumepeer_core::device::clean_os(os),
+        })
+    }
+
+    /// This machine, as it describes itself to a peer.
+    fn local() -> Option<Self> {
+        Self::from_wire(&whoami::devicename(), std::env::consts::OS)
+    }
+}
+
 /// One row of the status list the webview polls.
 #[allow(
     clippy::struct_excessive_bools,
@@ -667,9 +705,12 @@ pub struct ConnectionStats {
 )]
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
-    /// Pseudonymized label; the only peer-identifying string that ever
-    /// crosses the IPC boundary in either direction.
+    /// Pseudonymized label; the only string the webview names a peer by
+    /// when it asks the actor for anything.
     pub label: String,
+    /// What the guest said its machine is (ADR 0121), once it has said so.
+    /// Shown instead of the label, never used in its place.
+    pub device: Option<PeerDevice>,
     /// Pending or active.
     pub state: SessionStateDto,
     /// Requested role if pending, granted role if active.
@@ -4962,6 +5003,19 @@ struct Actor {
     audit: Option<AuditContext>,
     /// label -> `NodeId`, rebuilt on every command that changes session state.
     labels: std::collections::HashMap<String, NodeId>,
+    /// What this machine tells a peer it is called (ADR 0121), read once at
+    /// start: a rename mid-run is picked up by the next start, which is also
+    /// when the operating system itself finishes applying one. `None` when
+    /// the operating system answered nothing showable, and then nothing is
+    /// sent.
+    local_device: Option<PeerDevice>,
+    /// What each connected peer said its machine is, cleaned (ADR 0121).
+    ///
+    /// Held for the connection that said it and shown next to the peer's
+    /// label, never instead of it anywhere a decision is made. A guest's
+    /// entry for a host it dialed is also copied onto that host's history
+    /// row when the host admits it.
+    peer_devices: std::collections::HashMap<NodeId, PeerDevice>,
     endpoint: PeerEndpoint,
     identity: SigningKey,
     tickets: TicketRegistry,
@@ -5732,6 +5786,7 @@ impl Actor {
             self.labels.insert(label.clone(), ticket.peer);
             out.push(SessionSnapshot {
                 label,
+                device: self.peer_devices.get(&ticket.peer).cloned(),
                 state: SessionStateDto::Pending,
                 role: ticket.requested_role,
                 input: false,
@@ -5751,6 +5806,7 @@ impl Actor {
             self.labels.insert(label.clone(), peer);
             out.push(SessionSnapshot {
                 label,
+                device: self.peer_devices.get(&peer).cloned(),
                 state: SessionStateDto::Active,
                 role,
                 input: grants.input,
@@ -8699,6 +8755,29 @@ impl Actor {
         );
     }
 
+    /// Tells `peer` what this machine is called (ADR 0121), when its build can
+    /// decode the message at all — an older one reads the unknown
+    /// discriminant as malformed and closes the connection (§9.1).
+    fn announce_device(&mut self, peer: NodeId) {
+        let Some(device) = self.local_device.clone() else {
+            return;
+        };
+        if self
+            .connections
+            .get(&peer)
+            .is_none_or(|c| c.peer_minor < DEVICE_INFO_MINOR)
+        {
+            return;
+        }
+        self.send_to(
+            &peer,
+            MessageKind::DeviceInfo {
+                name: device.name,
+                os: device.os.unwrap_or_default(),
+            },
+        );
+    }
+
     /// Queues one message on a peer's connection without ever blocking the
     /// actor loop on a slow or stalled writer.
     fn send_to(&mut self, peer: &NodeId, kind: MessageKind) {
@@ -10537,6 +10616,12 @@ impl Actor {
                         self.host_dialers.get(&peer).map(HostDialer::kind),
                         addrs,
                     );
+                    // The host named itself just ahead of this grant
+                    // (ADR 0121); an older one never does, and its row keeps
+                    // whatever name it had.
+                    if let Some(device) = self.peer_devices.get(&peer).cloned() {
+                        self.history.set_device(&host_tag(&peer), device);
+                    }
                 }
                 // Only set when this grant followed a credential submission
                 // with "remember" checked (§8; ADR 0033; docs/bugs/02-connect-
@@ -11109,6 +11194,18 @@ impl Actor {
             }
             // Everything else belongs to a phase this build does not run yet.
             // Nothing a peer sends may ever grant itself consent (§2.3).
+            // Either side: what the peer says its machine is (ADR 0121). Kept
+            // for the list to show beside the label; nothing decides on it, so
+            // a name that does not survive cleaning is simply not shown.
+            MessageKind::DeviceInfo { ref name, ref os } => match PeerDevice::from_wire(name, os) {
+                Some(device) => {
+                    tracing::debug!(peer = %tag, os = ?device.os, "peer named its machine");
+                    self.peer_devices.insert(peer, device);
+                }
+                None => {
+                    self.peer_devices.remove(&peer);
+                }
+            },
             ref other => tracing::debug!(peer = %tag, ?other, "ignoring a control message"),
         }
     }
@@ -11139,6 +11236,9 @@ impl Actor {
             return;
         }
         let closed = self.connections.remove(&peer);
+        // A name belongs to the connection that said it; the next one says
+        // its own (ADR 0121). A host's lives on in its history row.
+        self.peer_devices.remove(&peer);
         // An unanswered credential challenge dies with the connection that
         // carried it: a later connection from the same device gets a fresh
         // challenge, and its `UnattendedAuth` is never accepted against a
@@ -14348,6 +14448,11 @@ impl Actor {
     fn start_granted_session(&mut self, peer: NodeId, role: Role) {
         let label = self.label_of(&peer);
         let label = label.as_str();
+        // Ahead of the grant, on the same ordered stream, so the guest knows
+        // this machine's name by the time it writes its history row — and
+        // not a moment before this host admitted it: an invite alone does
+        // not say what the machine behind it is called (ADR 0121).
+        self.announce_device(peer);
         self.send_to(&peer, MessageKind::ConsentGrant(role));
         // Right behind the grant, so the guest's window never acts on the
         // role alone for longer than one message (ADR 0123).
@@ -16231,6 +16336,10 @@ impl Actor {
         self.reboot_to_host
             .insert(peer, control.peer_minor() >= REBOOT_MINOR);
         self.adopt(control, peer, Origin::Dialed, false, false, false);
+        // Who is asking, said while the host still decides: this node chose
+        // to dial, so there is nothing about its name left to protect from
+        // the machine it dialed (ADR 0121).
+        self.announce_device(peer);
     }
 }
 
@@ -17891,6 +18000,8 @@ pub fn spawn_actor_with(
         install_salt,
         audit,
         labels: std::collections::HashMap::new(),
+        local_device: PeerDevice::local(),
+        peer_devices: std::collections::HashMap::new(),
         endpoint,
         identity,
         tickets,
@@ -22894,6 +23005,45 @@ mod tests {
             host.history().await.unwrap().is_empty(),
             "a host must not build a record of the guests it let in"
         );
+    }
+
+    /// ADR 0121: each side learns what the other machine is called. The
+    /// guest's name is on the host's row while the host still decides; the
+    /// host's reaches the guest with the grant and stays on the history row
+    /// after the session is over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_side_learns_what_the_other_machine_is_called() {
+        let (host, _host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+        // Both actors run on this machine, so both say the same thing.
+        let this_machine = PeerDevice::local().expect("the test machine has a name");
+
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        let pending = wait_for_row(&host, &label, "the guest never named itself", |row| {
+            row.device.is_some()
+        })
+        .await;
+        assert_eq!(pending.state, SessionStateDto::Pending);
+        assert_eq!(pending.device.as_ref(), Some(&this_machine));
+        assert_eq!(
+            pending.label, label,
+            "the name is shown beside the label, not instead of it"
+        );
+
+        host.grant(label.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        assert_eq!(
+            guest.history().await.unwrap()[0].device.as_ref(),
+            Some(&this_machine)
+        );
+
+        host.revoke(label).await.unwrap();
+        let remembered = wait_for_history(&guest, "the guest forgot the host").await;
+        assert_eq!(remembered[0].device.as_ref(), Some(&this_machine));
     }
 
     /// §21 punch-list item 5 / ADR 0016: an ended session is remembered by the

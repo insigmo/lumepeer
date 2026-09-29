@@ -14,6 +14,7 @@ import { html, render } from 'lit-html';
 
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { logoMark } from './logo';
+import { peerDisplayName } from './peer-name';
 import type { SessionStatus } from './session-status';
 
 const root = document.querySelector<HTMLElement>('#hostbar');
@@ -132,7 +133,14 @@ function draw(): void {
           (session) => html`
             <li class="bar-row">
               <span class="bar-dot" aria-hidden="true"></span>
-              <span class="bar-peer">${session.peer_label}</span>
+              <!-- The guest's machine name when it gave one (ADR 0121); the
+                   label it is known by to the actor stays in the tooltip. -->
+              <span
+                class="bar-peer"
+                data-named=${session.device_name ? 'true' : 'false'}
+                title=${t(locale, 'connections.peerId', session.peer_label)}
+                >${peerDisplayName(session)}</span
+              >
               <span class="bar-role">${t(locale, ROLE_KEY[session.role])}</span>
               <!-- A shell running on this machine, said on the surface that
                    stays visible while the operator works in something else

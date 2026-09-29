@@ -864,8 +864,30 @@ button.peer-card-face:disabled {
   padding: 9px 10px 9px 12px;
 }
 
+/* The machine's own name after its operating system's icon (ADR 0121). The
+   pair shrinks as one, so a long name ellipsizes and the icon stays. */
+.peer-name {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-inline-size: 0;
+}
+
+.peer-os {
+  display: flex;
+  flex: none;
+  color: var(--text-2);
+}
+
+.peer-os svg {
+  inline-size: 14px;
+  block-size: 14px;
+}
+
 .peer-card-foot .peer-label {
   flex: 1;
+  min-inline-size: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -994,6 +1016,11 @@ button.peer-card-face:disabled {
   color: var(--red);
 }
 
+/* "Stop recording" reads as the red of the indicator it ends. */
+.peer-menu-item.peer-menu-record.is-recording {
+  color: var(--red);
+}
+
 .peer-menu-item.history-autoreconnect {
   cursor: pointer;
 }
@@ -1004,16 +1031,105 @@ button.peer-card-face:disabled {
   padding: 0;
 }
 
-/* The live panels of a session card sit under its footer, full width. */
-.peer-card > .quality,
-.peer-card > .session-recording,
-.peer-card > .record-request,
-.peer-card > .file-panel,
-.peer-card > .tunnel-panel,
-.peer-card > .clipboard-note,
-.peer-card > .secure-desktop-indicator,
-.peer-card > .terminal-indicator {
+/* The address book's own "save" control keeps its shape everywhere else; in
+   the menu it reads as one more item, starting where the others start. */
+.peer-menu-item > .book-save-btn {
+  justify-content: flex-start;
+  min-height: 0;
+  box-shadow: none;
+}
+
+/* What is true about a session right now — the link, a recording, a secure
+   desktop, a shell, a clipboard that just synced — as one wrapping row of
+   small marks under the name, rather than a stack of full-width lines. */
+.peer-card-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
   margin: 0 12px 12px;
+  min-inline-size: 0;
+}
+
+.connections-list .peer-card-status > * {
+  flex-basis: auto;
+  margin: 0;
+  min-inline-size: 0;
+}
+
+/* An opened quality pill shows what was measured, and that wants the row. */
+.connections-list .peer-card-status > .quality[open] {
+  flex-basis: 100%;
+}
+
+/* The pill never breaks inside "Direct and relay" or "327 ms"; on the
+   narrowest card it breaks between them instead of running out of it. */
+.connections-list .peer-card-status .quality-pill {
+  flex-wrap: wrap;
+  row-gap: 0;
+  max-inline-size: 100%;
+}
+
+.connections-list .peer-card-status .quality-pill > * {
+  white-space: nowrap;
+}
+
+/* The questions a person has to answer sit under the status row, full
+   width, and nothing else does. */
+.peer-card > .record-request,
+.peer-card > .file-panel {
+  margin: 0 12px 12px;
+}
+
+/* A card is too narrow for the question and its two answers on one line:
+   the question takes the line, the answers go under it at the end. */
+.connections-list .peer-card > .record-request {
+  flex-wrap: wrap;
+  margin-block-start: 0;
+}
+
+.connections-list .peer-card > .record-request > span {
+  flex: 1 1 100%;
+  overflow-wrap: anywhere;
+}
+
+/* Two answers share the line when the card is wide enough and stack, each
+   the full width, when it is not — never one of each. */
+.connections-list .peer-card > .record-request > button {
+  flex: 1 1 auto;
+  margin-inline-start: 0;
+}
+
+/* Accept, decline and cancel on a card, drawn like every other answer on it
+   rather than as the browser's default grey buttons. */
+.connections-list .peer-card .file-panel button {
+  appearance: none;
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--control-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.connections-list .peer-card .file-panel button:hover {
+  background: var(--surface-2);
+}
+
+.connections-list .peer-card .file-offers li,
+.connections-list .peer-card .file-transfers li {
+  flex-wrap: wrap;
+}
+
+/* Where a file came from is a line of its own, so the answers under it stay
+   side by side. */
+.connections-list .peer-card .file-clipboard-tag,
+.connections-list .peer-card .file-directory-tag {
+  flex: 1 1 100%;
 }
 
 @keyframes pop-in {
@@ -1177,7 +1293,9 @@ button.peer-card-face:disabled {
   gap: 3px;
 }
 
-.peer-card .file-panel-hint {
+/* Scoped under the list as well: the general hint rule below is, and at the
+   same specificity it came later and set this back to the end (ADR 0121). */
+.connections-list .peer-card .file-panel-hint {
   text-align: start;
   line-height: 1.45;
 }
@@ -2071,37 +2189,6 @@ input[type='checkbox'].switch:disabled {
   flex: none;
   border-radius: 50%;
   background: var(--red);
-}
-
-.connections-list .session-recording {
-  flex-basis: 100%;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 6px;
-}
-
-.connections-list .record-btn {
-  appearance: none;
-  border: 1px solid var(--border);
-  background: var(--control-bg);
-  color: var(--text);
-  font: inherit;
-  font-size: var(--fs-micro);
-  font-weight: 600;
-  padding: 6px 10px;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.connections-list .record-btn:disabled {
-  color: var(--text-2);
-  cursor: not-allowed;
-}
-
-.connections-list .record-btn.is-recording {
-  border-color: var(--red);
-  color: var(--red);
 }
 
 .connections-list .recording-indicator {

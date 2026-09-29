@@ -825,6 +825,23 @@ pub const TUNNEL_IDLE_TIMEOUT_SECS: u64 = 300;
 /// that; the bound exists because this is untrusted input that becomes a
 /// resolver call.
 pub const TUNNEL_HOST_MAX_BYTES: usize = 253;
+/// Longest machine name a `DeviceInfo` may carry (ADR 0121).
+///
+/// Windows caps a DNS host name at 63 characters and macOS a computer name at
+/// 63 as well; four bytes a character covers either in any script. The bound
+/// is there because the name is untrusted text a peer puts on this machine's
+/// screen, not because a real one comes near it.
+pub const DEVICE_NAME_MAX_BYTES: usize = 256;
+/// Longest operating-system tag a `DeviceInfo` may carry (ADR 0121).
+///
+/// The tag is `std::env::consts::OS` of the sender, the longest of which is
+/// eleven bytes.
+pub const DEVICE_OS_MAX_BYTES: usize = 16;
+/// How many characters of a peer's machine name are ever shown (ADR 0121).
+///
+/// What a name is for is telling two machines apart at a glance; a longer one
+/// is a peer taking up the room every other row needs.
+pub const DEVICE_NAME_MAX_CHARS: usize = 64;
 /// Most targets a host may put on one session's tunnel allowlist (§8.2;
 /// ADR 0078).
 ///

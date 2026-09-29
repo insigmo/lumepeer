@@ -167,6 +167,7 @@ export const ja: Dictionary = {
   'connections.idle': '未接続',
   'connections.emptyTitle': 'まだ接続はありません',
   'connections.emptySubtext': '接続されたデバイスはここに表示されます。',
+  'connections.peerId': (id) => `ID: ${id}`,
   'hostbar.expand': 'Lumepeer セッションバーを表示',
   'hostbar.collapse': 'Lumepeer セッションバーを隠す',
   'hostbar.openApp': 'Lumepeer を開く',

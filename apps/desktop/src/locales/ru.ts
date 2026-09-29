@@ -168,6 +168,7 @@ export const ru: Dictionary = {
   'connections.idle': 'Нет подключения',
   'connections.emptyTitle': 'Пока нет подключений',
   'connections.emptySubtext': 'Подключённые устройства появятся здесь.',
+  'connections.peerId': (id) => `ID: ${id}`,
   'hostbar.expand': 'Показать панель сессии Lumepeer',
   'hostbar.collapse': 'Скрыть панель сессии Lumepeer',
   'hostbar.openApp': 'Открыть Lumepeer',

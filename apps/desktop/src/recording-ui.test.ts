@@ -106,7 +106,11 @@ describe('the host-side recording control', () => {
     const indicator = container.querySelector('[data-testid="recording-indicator"]');
     expect(indicator?.textContent?.trim()).toContain(t('en', 'status.recording.on'));
     expect(indicator?.getAttribute('role')).toBe('status');
-    expect(recordButton(container)?.getAttribute('aria-pressed')).toBe('true');
+    // The control that ends it sits in the card's menu and says so; the
+    // indicator is out on the card, where no menu can fold it away.
+    expect(recordButton(container)?.textContent?.trim()).toBe(t('en', 'status.recording.stop'));
+    expect(recordButton(container)?.closest('details.peer-menu')).not.toBeNull();
+    expect(indicator?.closest('details.peer-menu')).toBeNull();
     // The name, not the path: §15 keeps paths off a panel that stays on screen.
     const path = container.querySelector('[data-testid="recording-path"]');
     expect(path?.textContent?.trim()).toBe('session-1-ab12.lmrc');

@@ -332,6 +332,12 @@ pub struct InviteConnectArgs {
 pub struct SessionStatusDto {
     /// Pseudonymized peer label; never a raw `NodeId` (§15).
     pub peer_label: String,
+    /// What the guest said its machine is called (ADR 0121), once it said
+    /// so. Shown instead of the label; every command still takes the label.
+    pub device_name: Option<String>,
+    /// The guest's operating-system tag (`windows`, `macos`, `linux`, …)
+    /// for the icon beside that name (ADR 0121).
+    pub device_os: Option<String>,
     /// Pending or active.
     pub state: SessionStateDtoWire,
     /// Role requested (pending) or granted (active).
@@ -406,6 +412,12 @@ pub struct HistoryEntryDto {
     /// Pseudonymized host label, stable across restarts; never a raw `NodeId`
     /// (§15).
     pub peer_label: String,
+    /// What the host said its machine is called the last time it admitted
+    /// this node (ADR 0121); `None` for a host too old to say.
+    pub device_name: Option<String>,
+    /// The host's operating-system tag, for the icon beside that name
+    /// (ADR 0121).
+    pub device_os: Option<String>,
     /// Role the host last granted.
     pub role: RoleDto,
     /// Unix seconds this row was last written — a connect or a disconnect,
@@ -785,6 +797,8 @@ pub async fn session_status(
         .into_iter()
         .map(|s| SessionStatusDto {
             peer_label: s.label,
+            device_os: s.device.as_ref().and_then(|d| d.os.clone()),
+            device_name: s.device.map(|d| d.name),
             state: s.state.into(),
             role: s.role.into(),
             input: s.input,
@@ -859,6 +873,8 @@ pub async fn connection_history(
         .into_iter()
         .map(|e| HistoryEntryDto {
             peer_label: e.peer_label,
+            device_os: e.device.as_ref().and_then(|d| d.os.clone()),
+            device_name: e.device.map(|d| d.name),
             role: e.role.into(),
             last_seen_at: e.last_seen_at,
             has_password: e.has_password,

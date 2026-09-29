@@ -174,6 +174,7 @@ export const en: Dictionary = {
   'connections.idle': 'Not connected',
   'connections.emptyTitle': 'No connections yet',
   'connections.emptySubtext': 'Connected devices will appear here.',
+  'connections.peerId': (id) => `ID: ${id}`,
   // The always-on-top session bar (ADR 0055). Its two chevrons are named for
   // what they do to the bar, not for the direction they point: which way the
   // arrow faces depends on `dir`, and a screen reader must not be told

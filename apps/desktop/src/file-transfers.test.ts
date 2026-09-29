@@ -200,40 +200,37 @@ describe('sending', () => {
 });
 
 describe('the session row', () => {
-  it('has no file panel until the host grants file transfer', () => {
+  function drawRow(row: SessionStatus, data: FileTransfers): void {
     render(
-      sessionStatus(
-        [{ ...session, file_transfer: false }],
-        'en',
-        () => {},
-        [],
-        () => {},
-        false,
-        () => {},
-        new Map(),
-        { offers: [], transfers: [] },
-        commands(),
-      ),
+      sessionStatus([row], 'en', () => {}, [], () => {}, false, () => {}, new Map(), data, commands()),
       container,
     );
+  }
+
+  it('has no file panel until the host grants file transfer', () => {
+    const busy = { offers: [], transfers: [running] };
+    drawRow({ ...session, file_transfer: false }, busy);
     expect(container.querySelector('[data-testid="file-panel"]')).toBeNull();
 
-    render(
-      sessionStatus(
-        [session],
-        'en',
-        () => {},
-        [],
-        () => {},
-        false,
-        () => {},
-        new Map(),
-        { offers: [], transfers: [] },
-        commands(),
-      ),
-      container,
-    );
+    drawRow(session, busy);
     expect(container.querySelector('[data-testid="file-panel"]')).not.toBeNull();
+  });
+
+  // ADR 0121: the card says what is happening, and with nothing to accept or
+  // to watch there is nothing to say — sending needs no control of its own.
+  it('shows the panel only while there is something to accept or to watch', () => {
+    drawRow(session, { offers: [], transfers: [] });
+    expect(container.querySelector('[data-testid="file-panel"]')).toBeNull();
+
+    drawRow(session, {
+      offers: [{ peer_label: PEER, name: 'a.txt', size: 3, from_clipboard: false }],
+      transfers: [],
+    });
+    expect(container.querySelector('[data-testid="file-offer"]')).not.toBeNull();
+
+    // Another guest's transfer is not this card's business.
+    drawRow(session, { offers: [], transfers: [{ ...running, peer_label: 'guest-cd34' }] });
+    expect(container.querySelector('[data-testid="file-panel"]')).toBeNull();
   });
 });
 

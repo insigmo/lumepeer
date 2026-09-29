@@ -79,6 +79,17 @@ describe('the host session bar', () => {
     expect(rows[0]?.querySelector('.bar-peer')?.textContent).toBe('guest-ab12');
   });
 
+  // ADR 0121: a guest that said what its machine is called is listed by that
+  // name, and the label every command still uses is one hover away.
+  it('lists a guest that named its machine by that name, label in the tooltip', async () => {
+    statusRows = [{ ...ACTIVE_GUEST, device_name: 'BETA-PC', device_os: 'windows' }];
+    await boot();
+
+    const peer = bar().querySelector('.bar-peer');
+    expect(peer?.textContent).toBe('BETA-PC');
+    expect(peer?.getAttribute('title')).toContain('guest-ab12');
+  });
+
   // ADR 0079 decision 3: a terminal is the one capability with no picture
   // attached to it, so while a shell is running the host is told on the
   // surface that stays visible while they work in something else — and there

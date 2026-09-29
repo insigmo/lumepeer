@@ -221,6 +221,9 @@ export type TranslationKey =
   | 'connections.idle'
   | 'connections.emptyTitle'
   | 'connections.emptySubtext'
+  // The tooltip on a peer shown by its machine name: the label it is still
+  // known by to everything that decides anything (ADR 0121).
+  | 'connections.peerId'
   | 'hostbar.expand'
   | 'hostbar.collapse'
   | 'hostbar.openApp'

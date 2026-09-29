@@ -1,8 +1,15 @@
 // Active session indicator (design doc §15, §21).
 //
 // While anyone is connected this must stay visible, and revoke must be one
-// click away. Peers are shown by pseudonymized label: raw identities never
-// reach the UI.
+// click away. Peers are shown by the machine name they gave (ADR 0121) with
+// the pseudonymized label as its tooltip, or by the label alone when they gave
+// none: raw identities never reach the UI.
+//
+// A card holds what is true about a session; what can be done to it is in the
+// card's menu. The exceptions are the questions a person has to answer — a
+// guest asking to be recorded, a file waiting to be accepted — and the mark
+// that a guest wrote something (ADR 0120), which are not settings and must
+// not be one click out of sight.
 
 import { html, type TemplateResult } from 'lit-html';
 
@@ -14,7 +21,7 @@ import { connectionQuality } from './connection-quality';
 import type { FileCommands, FileTransfers } from './file-transfers';
 import { forgetThumbnail, thumbnailOf } from './peer-thumbnails';
 import { fileTransferPanel, tauriFileCommands } from './file-transfers';
-import { tauriTunnelCommands, tunnelPanel, type TunnelCommands, type TunnelRow } from './tunnels';
+import { peerDisplayName, peerName } from './peer-name';
 
 export type SessionState = 'pending' | 'active';
 
@@ -41,6 +48,13 @@ export type IndependentGrant =
 
 export interface SessionStatus {
   peer_label: string;
+  /**
+   * What the guest said its machine is called, and the operating system it
+   * runs (ADR 0121). Absent until it has said so, and from a guest too old
+   * to: the card then shows the label, as it always did.
+   */
+  device_name?: string | null;
+  device_os?: string | null;
   role: Role;
   input: boolean;
   state: SessionState;
@@ -127,6 +141,13 @@ export const CLIPBOARD_NOTE_MS = 4000;
  */
 export interface HistoryEntry {
   peer_label: string;
+  /**
+   * What the host said its machine is called the last time it admitted this
+   * device, and its operating system (ADR 0121); absent for a host too old to
+   * say.
+   */
+  device_name?: string | null;
+  device_os?: string | null;
   role: Role;
   /**
    * Unix seconds this row was last written — a connect or a disconnect,
@@ -212,91 +233,129 @@ async function toggleRecording(peer: string, on: boolean): Promise<string | null
 }
 
 /**
- * The recording row of one active session (§17).
+ * Runs one recording change and re-polls, whatever the core answered.
  *
- * Three things in one place, because they are one decision: whether recording
- * is permitted at all (the grant switch above), whether it is running, and —
- * while a guest is waiting — whether to say yes. The button is unreachable
- * without the `recording` grant: the host turns the permission on first and
- * records second, and nothing here can skip that order.
+ * Refused, or the session ended between poll and press: the re-poll is what
+ * keeps a control from claiming something the core did not do.
  */
-function recordingRow(
-  session: SessionStatus,
-  locale: Locale,
+function recordingChange(
+  peer: string,
   onChange: () => void,
-  path: string | undefined,
   onPath: (peer: string, path: string | null) => void,
-): TemplateResult {
-  const peer = session.peer_label;
-  const running = session.recording_active;
-  const change = (promise: Promise<string | null>): void => {
+): (promise: Promise<string | null>) => void {
+  return (promise) => {
     void promise.then(
       (next) => {
         onPath(peer, next);
         onChange();
       },
       (error: unknown) => {
-        // Refused, or the session ended between poll and press: re-poll rather
-        // than leave a button claiming something the core did not do.
         console.error('recording_toggle failed:', error);
         onChange();
       },
     );
   };
+}
+
+/**
+ * Starting and stopping the recording of one active session (§17), as an item
+ * of the card's menu.
+ *
+ * Unreachable without the `recording` grant: the host turns the permission on
+ * first and records second, and nothing here can skip that order. Whether a
+ * recording is running is not said here but on the card, where the indicator
+ * both sides must see cannot be folded away.
+ */
+function recordingMenuItem(
+  session: SessionStatus,
+  locale: Locale,
+  onChange: () => void,
+  onPath: (peer: string, path: string | null) => void,
+): TemplateResult {
+  const peer = session.peer_label;
+  const running = session.recording_active;
+  const change = recordingChange(peer, onChange, onPath);
   return html`
-    <div class="session-recording">
-      <button
-        type="button"
-        class="record-btn ${running ? 'is-recording' : ''}"
-        data-testid="record-toggle"
-        ?disabled=${!session.recording}
-        aria-pressed=${running ? 'true' : 'false'}
-        title=${session.recording ? '' : t(locale, 'status.recording.needsGrant')}
-        @click=${() => change(toggleRecording(peer, !running))}
-      >
-        ${t(locale, running ? 'status.recording.stop' : 'status.recording.start')}
-      </button>
-      ${running
-        ? html`<span class="recording-indicator" role="status" data-testid="recording-indicator">
-            <span class="recording-dot" aria-hidden="true"></span>${t(locale, 'status.recording.on')}
-          </span>`
-        : ''}
-      ${running && path
-        ? html`<span class="recording-path" data-testid="recording-path" title=${path}
-            >${path.split(/[\\/]/).pop() ?? path}</span
-          >`
-        : ''}
-    </div>
-    ${session.record_request
-      ? html`
-          <div class="record-request" role="status" data-testid="record-request">
-            <span>${t(locale, 'status.recording.requested', peer)}</span>
-            <button
-              type="button"
-              class="record-allow"
-              data-testid="record-allow"
-              @click=${() =>
-                change(
-                  (session.recording
-                    ? Promise.resolve()
-                    : setGrant(peer, 'recording', true)
-                  ).then(() => toggleRecording(peer, true)),
-                )}
-            >
-              ${t(locale, 'status.recording.allow')}
-            </button>
-            <button
-              type="button"
-              class="record-deny"
-              data-testid="record-deny"
-              @click=${() => change(toggleRecording(peer, false))}
-            >
-              ${t(locale, 'status.recording.decline')}
-            </button>
-          </div>
-        `
+    <button
+      type="button"
+      class="peer-menu-item peer-menu-record ${running ? 'is-recording' : ''}"
+      role="menuitem"
+      data-testid="record-toggle"
+      ?disabled=${!session.recording}
+      title=${session.recording ? '' : t(locale, 'status.recording.needsGrant')}
+      @click=${(event: Event) => {
+        closeMenu(event);
+        change(toggleRecording(peer, !running));
+      }}
+    >
+      ${t(locale, running ? 'status.recording.stop' : 'status.recording.start')}
+    </button>
+  `;
+}
+
+/** The recording indicator (§17): on while the core says a recording runs. */
+function recordingIndicator(
+  session: SessionStatus,
+  locale: Locale,
+  path: string | undefined,
+): TemplateResult | '' {
+  if (!session.recording_active) {
+    return '';
+  }
+  return html`
+    <span class="recording-indicator" role="status" data-testid="recording-indicator">
+      <span class="recording-dot" aria-hidden="true"></span>${t(locale, 'status.recording.on')}
+    </span>
+    ${path
+      ? html`<span class="recording-path" data-testid="recording-path" title=${path}
+          >${path.split(/[\\/]/).pop() ?? path}</span
+        >`
       : ''}
   `;
+}
+
+/**
+ * A guest waiting to be recorded (§17): a question for the person at this
+ * machine, so it sits on the card rather than in the menu. Saying yes grants
+ * `recording` and starts it in the same press; never auto-answered.
+ */
+function recordRequest(
+  session: SessionStatus,
+  locale: Locale,
+  onChange: () => void,
+  onPath: (peer: string, path: string | null) => void,
+): TemplateResult | '' {
+  const peer = session.peer_label;
+  const change = recordingChange(peer, onChange, onPath);
+  return session.record_request
+    ? html`
+        <div class="record-request" role="status" data-testid="record-request">
+          <span>${t(locale, 'status.recording.requested', peerDisplayName(session))}</span>
+          <button
+            type="button"
+            class="record-allow"
+            data-testid="record-allow"
+            @click=${() =>
+              change(
+                (session.recording
+                  ? Promise.resolve()
+                  : setGrant(peer, 'recording', true)
+                ).then(() => toggleRecording(peer, true)),
+              )}
+          >
+            ${t(locale, 'status.recording.allow')}
+          </button>
+          <button
+            type="button"
+            class="record-deny"
+            data-testid="record-deny"
+            @click=${() => change(toggleRecording(peer, false))}
+          >
+            ${t(locale, 'status.recording.decline')}
+          </button>
+        </div>
+      `
+    : '';
 }
 
 /**
@@ -375,7 +434,8 @@ const roleKey: Record<Role, 'status.role.viewOnly' | 'status.role.controlLimited
  *
  * A screen rather than an operating-system logo on purpose: which machine
  * this is, is a thing people recognize by what was on it, and the logo of an
- * OS is the one fact every row would have in common.
+ * OS is the one fact every row would have in common. The OS goes beside the
+ * name instead (ADR 0121).
  */
 function peerThumbnail(host: string, locale: Locale): TemplateResult {
   const image = thumbnailOf(host);
@@ -483,18 +543,6 @@ export function sessionStatus(
    * has measured it: a session with no row here simply shows no pill.
    */
   connectionStats: ReadonlyMap<string, ConnectionStats> = new Map(),
-  /**
-   * Which addresses each session's tunnel may reach, and what is going
-   * through them, as the last `tunnel_status` poll reported (ADR 0078).
-   *
-   * On the session's own row on purpose: a tunnel reaches past this machine
-   * into the network around it, and "something is being forwarded" belongs
-   * next to the switch that ends the session rather than on a panel somebody
-   * has to go and find (§2.2).
-   */
-  tunnels: readonly TunnelRow[] = [],
-  /** How the tunnel panel reaches the actor; injectable for tests. */
-  tunnelCommands: TunnelCommands = tauriTunnelCommands,
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -536,8 +584,27 @@ export function sessionStatus(
         `
       : html`
           <ul class="connections-list connections-grid" aria-live="polite">
-            ${sessions.map(
-              (session) => html`
+            ${sessions.map((session) => {
+              const peer = session.peer_label;
+              const name = peerDisplayName(session);
+              const active = session.state === 'active';
+              const clipboardSynced = Date.now() - (clipboardSyncedAt.get(peer) ?? 0) < CLIPBOARD_NOTE_MS;
+              // What is true about the session right now, in one wrapping row
+              // under its name; the row is left out when there is nothing to
+              // say, so a quiet session is a quiet card.
+              const hasStatus =
+                clipboardSynced ||
+                (active &&
+                  (connectionStats.has(peer) ||
+                    session.recording_active ||
+                    session.secure_desktop_active ||
+                    session.terminal_active));
+              // Files appear once there is something to accept or to watch;
+              // sending needs no control of its own (copying is sending).
+              const hasFiles =
+                files.offers.some((offer) => offer.peer_label === peer) ||
+                files.transfers.some((row) => row.peer_label === peer);
+              return html`
                 <li class="peer-card" data-testid="session-card">
                   <div class="peer-card-face">
                     ${peerThumbnail('', locale)}
@@ -551,18 +618,18 @@ export function sessionStatus(
                   <div class="peer-card-foot">
                     <span
                       class="peer-dot"
-                      data-state=${session.state === 'active' ? 'live' : 'pending'}
-                      title=${t(locale, session.state === 'active' ? 'connections.live' : 'connections.idle')}
+                      data-state=${active ? 'live' : 'pending'}
+                      title=${t(locale, active ? 'connections.live' : 'connections.idle')}
                     ></span>
-                    <span class="peer-label">${session.peer_label}</span>
-                    ${session.state === 'active' && session.chat_unread
+                    ${peerName(session, locale)}
+                    ${active && session.chat_unread
                       ? html`<button
                           type="button"
                           class="chat-unread-btn"
                           data-testid="chat-unread"
-                          aria-label=${`${t(locale, 'toolbar.chat.unread')}: ${session.peer_label}`}
+                          aria-label=${`${t(locale, 'toolbar.chat.unread')}: ${name}`}
                           title=${t(locale, 'toolbar.chat.unread')}
-                          @click=${() => onOpenChat(session.peer_label)}
+                          @click=${() => onOpenChat(peer)}
                         >
                           <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
                             <path
@@ -576,28 +643,25 @@ export function sessionStatus(
                           </svg>
                         </button>`
                       : ''}
-                    ${peerMenu(session.peer_label, locale, [
-                      session.state === 'active'
+                    ${peerMenu(name, locale, [
+                      active
                         ? html`
                             <button
                               type="button"
                               class="peer-menu-item chat-open-btn"
                               role="menuitem"
-                              aria-label=${`${t(locale, 'chat.open')}: ${session.peer_label}`}
+                              aria-label=${`${t(locale, 'chat.open')}: ${name}`}
                               @click=${(event: Event) => {
                                 closeMenu(event);
-                                onOpenChat(session.peer_label);
+                                onOpenChat(peer);
                               }}
                             >
                               ${t(locale, 'chat.open')}
                             </button>
                           `
                         : '',
-                      session.state === 'active'
-                        ? html`<span class="peer-menu-item" role="menuitem"
-                            >${saveDevice(session.peer_label)}</span
-                          >`
-                        : '',
+                      active ? recordingMenuItem(session, locale, onRefresh, onRecordingPath) : '',
+                      active ? html`<span class="peer-menu-item" role="menuitem">${saveDevice(peer)}</span>` : '',
                       html`
                         <button
                           type="button"
@@ -605,7 +669,7 @@ export function sessionStatus(
                           role="menuitem"
                           @click=${(event: Event) => {
                             closeMenu(event);
-                            void revoke(session.peer_label);
+                            void revoke(peer);
                           }}
                         >
                           ${t(locale, 'status.revoke')}
@@ -613,43 +677,38 @@ export function sessionStatus(
                       `,
                     ])}
                   </div>
-                  ${Date.now() - (clipboardSyncedAt.get(session.peer_label) ?? 0) < CLIPBOARD_NOTE_MS
-                    ? html`<span class="clipboard-note" role="status" data-testid="clipboard-note"
-                        >${t(locale, 'status.clipboardSynced')}</span
-                      >`
+                  ${hasStatus
+                    ? html`
+                        <div class="peer-card-status" data-testid="session-status-row">
+                          ${active ? connectionQuality(connectionStats.get(peer), locale) : ''}
+                          ${active ? recordingIndicator(session, locale, recordingPaths.get(peer)) : ''}
+                          ${active ? secureDesktopIndicator(session, locale) : ''}
+                          ${active ? terminalIndicator(session, locale) : ''}
+                          ${clipboardSynced
+                            ? html`<span class="clipboard-note" role="status" data-testid="clipboard-note"
+                                >${t(locale, 'status.clipboardSynced')}</span
+                              >`
+                            : ''}
+                        </div>
+                      `
                     : ''}
-                  ${session.state === 'active'
-                    ? connectionQuality(connectionStats.get(session.peer_label), locale)
-                    : ''}
-                  ${session.state === 'active'
-                    ? recordingRow(
-                        session,
-                        locale,
-                        onRefresh,
-                        recordingPaths.get(session.peer_label),
-                        onRecordingPath,
-                      )
-                    : ''}
-                  ${session.state === 'active' ? secureDesktopIndicator(session, locale) : ''}
-                  ${session.state === 'active' ? terminalIndicator(session, locale) : ''}
-                  ${session.state === 'active' && session.file_transfer
-                    ? fileTransferPanel(session.peer_label, files, locale, fileCommands, onRefresh)
-                    : ''}
-                  ${session.state === 'active' && session.tunnel
-                    ? tunnelPanel(session.peer_label, tunnels, locale, tunnelCommands, onRefresh)
+                  ${active ? recordRequest(session, locale, onRefresh, onRecordingPath) : ''}
+                  ${active && session.file_transfer && hasFiles
+                    ? fileTransferPanel(peer, files, locale, fileCommands, onRefresh)
                     : ''}
                 </li>
-              `,
-            )}
-            ${history.map(
-              (entry) => html`
+              `;
+            })}
+            ${history.map((entry) => {
+              const name = peerDisplayName(entry);
+              return html`
                 <li class="peer-card history-row" data-testid="history-card">
                   <button
                     type="button"
                     class="peer-card-face history-reconnect"
                     ?disabled=${reconnectDisabled}
                     title=${t(locale, 'status.reconnect')}
-                    aria-label=${`${t(locale, 'status.reconnect')}: ${entry.peer_label}`}
+                    aria-label=${`${t(locale, 'status.reconnect')}: ${name}`}
                     @click=${() => onReconnect(entry.peer_label)}
                   >
                     ${peerThumbnail(entry.peer_label, locale)}
@@ -664,8 +723,8 @@ export function sessionStatus(
                       data-state="idle"
                       title=${t(locale, 'connections.idle')}
                     ></span>
-                    <span class="peer-label">${entry.peer_label}</span>
-                    ${peerMenu(entry.peer_label, locale, [
+                    ${peerName(entry, locale)}
+                    ${peerMenu(name, locale, [
                       html`
                         <button
                           type="button"
@@ -727,7 +786,7 @@ export function sessionStatus(
                           <input
                             type="checkbox"
                             .checked=${entry.trusted === true}
-                            aria-label=${`${t(locale, 'history.autoReconnect')}: ${entry.peer_label}`}
+                            aria-label=${`${t(locale, 'history.autoReconnect')}: ${name}`}
                             @change=${(event: Event) => {
                               const on = (event.target as HTMLInputElement).checked;
                               void setAutoReconnect(entry.peer_label, on).then(onRefresh, (error: unknown) => {
@@ -745,14 +804,10 @@ export function sessionStatus(
                             class="peer-menu-item history-forget-password"
                             role="menuitem"
                             title=${t(locale, 'history.forgetPassword.hint')}
-                            aria-label=${`${t(locale, 'history.forgetPassword')}: ${entry.peer_label}`}
+                            aria-label=${`${t(locale, 'history.forgetPassword')}: ${name}`}
                             @click=${(event: Event) => {
                               closeMenu(event);
-                              if (
-                                !globalThis.confirm(
-                                  t(locale, 'history.forgetPassword.confirm', entry.peer_label),
-                                )
-                              ) {
+                              if (!globalThis.confirm(t(locale, 'history.forgetPassword.confirm', name))) {
                                 return;
                               }
                               void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
@@ -769,10 +824,10 @@ export function sessionStatus(
                           type="button"
                           class="peer-menu-item is-destructive history-remove"
                           role="menuitem"
-                          aria-label=${`${t(locale, 'history.remove')}: ${entry.peer_label}`}
+                          aria-label=${`${t(locale, 'history.remove')}: ${name}`}
                           @click=${(event: Event) => {
                             closeMenu(event);
-                            if (!globalThis.confirm(t(locale, 'history.remove.confirm', entry.peer_label))) {
+                            if (!globalThis.confirm(t(locale, 'history.remove.confirm', name))) {
                               return;
                             }
                             forgetThumbnail(entry.peer_label);
@@ -788,8 +843,8 @@ export function sessionStatus(
                     ])}
                   </div>
                 </li>
-              `,
-            )}
+              `;
+            })}
           </ul>
         `}
   `;
