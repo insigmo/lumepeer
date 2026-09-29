@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-28
+Amended: 2026-09-29 by [ADR 0129](0129-a-virtual-gpu-composites-on-mesas-software-renderer.md), which found that section 2's fix alone left the windows white on VMware.
 
 Two reports from the Debian VM, both about the first seconds of a run.
 

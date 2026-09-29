@@ -278,14 +278,50 @@ fn virtual_gpu() -> Option<String> {
         })
 }
 
+/// Mesa's switch to its software renderer (ADR 0129).
+#[cfg(target_os = "linux")]
+const SOFTWARE_GL: &str = "LIBGL_ALWAYS_SOFTWARE";
+
+/// Starts this process over on Mesa's software renderer when the display is a
+/// virtual GPU and nobody has chosen a renderer (ADR 0129).
+///
+/// `WebKitGTK` composites every page through EGL whatever its hardware
+/// acceleration policy says ([`draw_in_software`]), and on `VMware`'s `vmwgfx`
+/// creating the fence it asks for after a frame never returns: Mesa resubmits
+/// for as long as the kernel answers busy, the page's thread waits on the
+/// compositor, and the window stays white. Only an environment variable reaches the web
+/// processes `WebKit` starts, and this crate forbids the `unsafe` that setting
+/// one in a running process now is, so the variable goes to a fresh image of
+/// the same process instead, before anything else has started. Returns when
+/// there is nothing to do, or when the restart failed, and the run goes on.
+#[cfg(target_os = "linux")]
+fn restart_on_software_gl() {
+    use std::os::unix::process::CommandExt as _;
+
+    if std::env::var_os(SOFTWARE_GL).is_some() || virtual_gpu().is_none() {
+        return;
+    }
+    let mut argv = std::env::args_os();
+    let name = argv.next().unwrap_or_default();
+    // `/proc/self/exe` rather than a path: it still names this binary after a
+    // package upgrade has replaced the file on disk.
+    let error = std::process::Command::new("/proc/self/exe")
+        .arg0(name)
+        .args(argv)
+        .env(SOFTWARE_GL, "1")
+        .exec();
+    eprintln!("cannot restart on Mesa's software renderer: {error}");
+}
+
 /// Turns one webview's GPU drawing off, so `WebKitGTK` paints it in software
 /// (ADR 0125).
 ///
-/// For a virtual GPU only. `WebKitGTK` composites pages on the GPU and hands
-/// the frames to GTK as DMA-BUFs; `VMware`'s 3D acceleration accepts the first
-/// half and not the second, and every window came up white. The same setting
-/// `WEBKIT_DISABLE_COMPOSITING_MODE` makes, set through the API because this
-/// crate forbids the `unsafe` that setting an environment variable now is.
+/// For a virtual GPU only. The same setting `WEBKIT_DISABLE_COMPOSITING_MODE`
+/// makes, set through the API because this crate forbids the `unsafe` that
+/// setting an environment variable now is. It moves the painting of the page
+/// to the CPU but not its compositing, which still goes through EGL; on
+/// `vmwgfx` that alone left every window white, and what keeps the windows
+/// drawn is [`restart_on_software_gl`] (ADR 0129).
 #[cfg(target_os = "linux")]
 fn draw_in_software(webview: &tauri::Webview) {
     use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt as _, WebViewExt as _};
@@ -724,6 +760,9 @@ fn main() {
             }
         }
     }
+    // Before the log file is opened, so a restarted run writes one log, not two.
+    #[cfg(target_os = "linux")]
+    restart_on_software_gl();
 
     // Configuration first: it decides where the log file goes, and tracing has
     // to be installed before anything worth logging happens (§5.1, §16.1).
@@ -803,7 +842,11 @@ fn main() {
     // anything: the main window, each view and file manager, the two bars.
     #[cfg(target_os = "linux")]
     if let Some(driver) = virtual_gpu() {
-        tracing::info!(%driver, "a virtual GPU: the windows are drawn in software (ADR 0125)");
+        tracing::info!(
+            %driver,
+            software_gl = %std::env::var(SOFTWARE_GL).unwrap_or_default(),
+            "a virtual GPU: the windows are drawn in software (ADR 0125, ADR 0129)"
+        );
         builder = builder.on_page_load(|webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
                 draw_in_software(webview);
