@@ -39,7 +39,7 @@ image.
 
 The workspace's own release pipeline (`.github/workflows/release.yml`)
 already publishes a `linux-arm64 (deb/rpm)` row built on `ubuntu-24.04-arm`
-with `capture-x11,capture-portal,encode-openh264`. Rather than cross-compile
+with `capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264`. Rather than cross-compile
 locally under this session's own disk constraints, the **prebuilt release
 artifact** was used: `Lumepeer_0.0.62_arm64.deb` from
 [release v0.0.62](https://github.com/insigmo/lumepeer/releases/tag/v0.0.62),

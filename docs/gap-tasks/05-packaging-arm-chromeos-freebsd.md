@@ -12,7 +12,7 @@
 - `.github/workflows/release.yml`, матрица `build`: шесть строк —
   linux amd64/arm64 (`.deb` и `.rpm` за один проход, `bundle.targets = "all"`),
   windows amd64/arm64, macos arm64/amd64. Фичи Linux:
-  `capture-x11,capture-portal,encode-openh264`.
+  `capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264`.
 - ADR 0017 — минимальная glibc для Linux-сборок.
 - ADR 0039 — Linux-клиент везёт оба типа сессии (X11 и портал) и своё аудио.
 - Runtime-зависимости `.deb`/`.rpm`: `libpipewire-0.3-0`
@@ -73,7 +73,7 @@
 
 - Не добавлять строки в релизную матрицу под платформы, которые нечем
   проверять: непроверенный артефакт хуже отсутствующего.
-- Не менять фичи Linux-сборки (`capture-x11,capture-portal,encode-openh264`)
+- Не менять фичи Linux-сборки (`capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264`)
   ради одного устройства.
 - Не браться за аппаратный энкодер Raspberry Pi (V4L2 M2M) — это отдельный
   бэкенд и отдельная пачка.

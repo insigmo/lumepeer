@@ -32,7 +32,7 @@ for bin in lumepeer-decoder-worker lumepeer-service lumepeer-terminal-worker; do
 done
 
 cargo build -p lumepeer-desktop \
-  --features pilot,tauri/custom-protocol,capture-x11,capture-portal,encode-openh264,decode-openh264
+  --features pilot,tauri/custom-protocol,capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,decode-openh264
 cp "$CARGO_TARGET_DIR/debug/lumepeer-desktop" "$OUT/"
 # A debug binary is ~800 MB, mostly DWARF; the symbols stay for backtraces.
 strip --strip-debug "$OUT"/lumepeer-*

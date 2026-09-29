@@ -178,11 +178,11 @@ jobs:
           - name: linux-amd64 (deb/rpm)
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            features: capture-x11,capture-portal,encode-openh264
+            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
           - name: linux-arm64 (deb/rpm)
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            features: capture-x11,capture-portal,encode-openh264
+            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc

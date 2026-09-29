@@ -14,7 +14,7 @@ vars:
   # runtime, so a single .deb has to carry X11 and the Wayland portal (ADR
   # 0010, ADR 0039). Dropping either one leaves half the Linux desktops with
   # no picture.
-  LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-openh264
+  LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
   # Both encoders: Media Foundation needs hardware support the host may not
   # have, and without the openh264 software fallback such a host reports
   # "no usable encoder" and the guest never gets a picture.

@@ -63,7 +63,7 @@ X11-путь остаётся программным. Не пытайся тян
 
 ## Definition of done
 
-- `cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings` — чисто.
+- `cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings` — чисто.
 - Та же команда с добавленной `encode-vaapi` и новой фичей — чисто.
 - `cargo test --workspace` не хуже базового прогона.
 - На Wayland-машине с VA-API: сессия идёт, картинка есть, замер CPU «до/после».
