@@ -20,7 +20,7 @@
 
 ### Сборка
 - Локальная сборка `lumepeer-desktop` со встроенным фронтендом:
-  `npx tauri build --debug --no-bundle --features pilot,capture-windows,encode-openh264,encode-mf,decode-openh264`.
+  `npx tauri build --debug --no-bundle --features pilot,capture-windows,encode-openh264,encode-mf,encode-mf-zero-copy,decode-openh264`.
   Важно: обычный `cargo build` даёт бинарник, смотрящий на vite devUrl
   (`localhost:5173`) — это и были «таймауты eval» из questions.md п.1.
 - Починен билд: `audiopus_sys` (vendored libopus) против CMake 4 — нужен
@@ -96,7 +96,7 @@
 ### Проверено
 
 - `cargo fmt --all -- --check` — чисто.
-- `cargo clippy -p lumepeer-desktop --all-targets --features pilot,capture-windows,encode-openh264,encode-mf,decode-openh264 -- -D warnings` — чисто.
+- `cargo clippy -p lumepeer-desktop --all-targets --features pilot,capture-windows,encode-openh264,encode-mf,encode-mf-zero-copy,decode-openh264 -- -D warnings` — чисто.
 - `cargo clippy -p lumepeer-media --all-targets --features capture-windows,encode-openh264,decode-openh264 -- -D warnings` — чисто.
 - `cargo test -p lumepeer-desktop` — 15/15 в `view::` (с новым тестом).
 - `cargo test -p lumepeer-media --features capture-windows` — 49/49
@@ -172,7 +172,7 @@ NAT без привязки к адресату, DERP 91–96 мс. Рвёт с�
 2. Релизная сборка пишет JSON-лог в файл с ротацией (§16.1) — до этого stdout
    у `windows_subsystem = "windows"` вёл в никуда, и диагностика была невозможна.
 3. `NetError::Io` → отдельный IPC-код `TRANSPORT_LOST` вместо `REJECTED`.
-4. Windows-релиз собирается с обоими кодерами (`encode-mf,encode-openh264`).
+4. Windows-релиз собирается с обоими кодерами (`encode-mf,encode-mf-zero-copy,encode-openh264`).
    Именно этого не хватало: после починки транспорта сессия поднялась, а
    картинки не было — `no hardware encoder and the openh264 fallback is not
    built in`, раз в секунду в течение всего окна восстановления гостя.

@@ -19,7 +19,7 @@ cd "$(dirname "$0")/../.."
 BETA=${E2E_BETA_SSH:-bberb@beta}
 MAC=${E2E_MAC_SSH:-betal@betals-mac}
 LINUX=${E2E_LINUX_SSH:-beta@debian}
-WIN_FEATURES=pilot,capture-windows,encode-mf,encode-openh264,decode-openh264
+WIN_FEATURES=pilot,capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264,decode-openh264
 MAC_FEATURES=pilot,capture-screencapturekit,encode-videotoolbox,encode-openh264,decode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
 SIDECARS="lumepeer-decoder-worker lumepeer-service lumepeer-terminal-worker"
 PY=$(command -v python3 || command -v python)

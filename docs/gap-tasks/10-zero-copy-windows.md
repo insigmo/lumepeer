@@ -85,7 +85,7 @@ ADR, дополняющий 0011/0012/0059: что именно изменило
 
 ## Definition of done
 
-- `cargo clippy -p lumepeer-media --all-targets --features capture-windows,encode-mf,encode-openh264 -- -D warnings` — чисто.
+- `cargo clippy -p lumepeer-media --all-targets --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 -- -D warnings` — чисто.
 - `cargo test --workspace` не хуже базового прогона; новые тесты — на
   `as_cpu()` readback и на откат при несовместимых устройствах.
 - Числа «до» и «после» на одной машине и одной сцене: загрузка CPU, задержка

@@ -18,7 +18,7 @@ vars:
   # Both encoders: Media Foundation needs hardware support the host may not
   # have, and without the openh264 software fallback such a host reports
   # "no usable encoder" and the guest never gets a picture.
-  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-openh264
+  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
   # Both encoders, for the same reason Windows carries both: VideoToolbox
   # (ADR 0066) is what an Apple host should encode with, but its probe opens
   # a real session and pushes a frame through it before it says so, and a Mac

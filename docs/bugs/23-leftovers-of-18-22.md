@@ -143,7 +143,7 @@ grep -rn "ADR 0104" crates apps docs
    починку проверенной нельзя.
 
 Кроме обычного прогона нужны `cargo clippy -p lumepeer-media --all-targets
---features capture-windows,encode-mf,encode-openh264 -- -D warnings` и тесты
+--features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 -- -D warnings` и тесты
 `lumepeer-media` с `--features capture-windows`: без фичи бэкенда тесты молча
 идут по деградированной ветке (`project_lumepeer_windows_default_features_tests`).
 
@@ -357,7 +357,7 @@ macOS-хосте. Автозапуск из `19`: путь маркера
       пунктом с причиной.
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test
       --workspace` (сверено с базой из А5), `cargo clippy -p lumepeer-media
-      --all-targets --features capture-windows,encode-mf,encode-openh264 -- -D
+      --all-targets --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 -- -D
       warnings`.
 - [ ] `cd apps/desktop && npm run typecheck && npm test`.
 

@@ -186,11 +186,11 @@ jobs:
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: capture-windows,encode-mf,encode-openh264
+            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
           - name: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            features: capture-windows,encode-mf,encode-openh264
+            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin

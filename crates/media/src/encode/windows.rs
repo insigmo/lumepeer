@@ -2462,7 +2462,7 @@ mod tests {
     ///
     /// ```text
     /// cargo test -p lumepeer-media \
-    ///   --features capture-windows,encode-mf,encode-openh264 \
+    ///   --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 \
     ///   -- --ignored --nocapture what_a_picture_above_4k_costs
     /// ```
     ///
@@ -2688,7 +2688,7 @@ mod tests {
     ///
     /// ```text
     /// cargo test -p lumepeer-media \
-    ///   --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 \
+    ///   --features capture-windows,encode-mf,encode-mf-zero-copy,encode-mf-zero-copy,encode-openh264 \
     ///   -- --ignored --nocapture zero_copy_costs_less_per_frame
     /// ```
     ///

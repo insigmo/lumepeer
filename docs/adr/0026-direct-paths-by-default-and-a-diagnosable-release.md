@@ -88,7 +88,7 @@ Five changes, one per failure above plus the config layer they all needed.
    that is a decision.
 
 4. **Windows release builds carry both encoders**
-   (`capture-windows,encode-mf,encode-openh264`), in `release.yml` and
+   (`capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264`), in `release.yml` and
    `Taskfile.yml` alike. Media Foundation stays preferred; openh264 is what a
    machine without a hardware encoder falls back to instead of staying blank.
 

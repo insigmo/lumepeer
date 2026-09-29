@@ -370,7 +370,7 @@ switch) is in the foreground"` при отсутствии всякого UAC). 
       расхождение `fmt` — в `crates/net/src/dns.rs`, файле этой пачкой не
       тронутом: упомянуто, не тронуто.
 - [x] `cargo clippy -p lumepeer-media --all-targets --features
-      capture-windows,encode-mf,encode-openh264 -- -D warnings`.
+      capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 -- -D warnings`.
 - [x] `cd apps/desktop && npm run typecheck && npm test`. — 775 тестов.
 
 ## Что осталось

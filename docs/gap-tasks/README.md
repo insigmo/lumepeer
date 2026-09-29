@@ -93,7 +93,7 @@ cd apps/desktop && npm run typecheck && npm test && cd -
 
 ```sh
 cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
-cargo clippy -p lumepeer-media --all-targets --features capture-windows,encode-mf,encode-openh264 -- -D warnings
+cargo clippy -p lumepeer-media --all-targets --features capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264 -- -D warnings
 cargo clippy -p lumepeer-media --all-targets --features capture-screencapturekit,encode-openh264 -- -D warnings
 ```
 
