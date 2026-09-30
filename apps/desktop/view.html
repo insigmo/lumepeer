@@ -115,7 +115,9 @@
         height: min(22rem, 50%);
         display: flex;
         flex-direction: column;
-        background: rgb(0 0 0 / 88%);
+        /* The emulator's own background (`TERMINAL_THEME`, ADR 0132), so the
+           chrome and the shell read as one surface. */
+        background: rgb(14 17 21 / 94%);
         font-size: 0.85rem;
       }
       /* Same specificity problem `#chat-panel[hidden]` has, same answer. */
@@ -129,7 +131,7 @@
       #view.is-terminal-only #terminal-panel {
         inset: 0;
         height: auto;
-        background: rgb(0 0 0 / 100%);
+        background: rgb(14 17 21 / 100%);
       }
       /* The "reconnecting" banner of a terminal window. The panel fills the
          window and comes later in the document, so without this it would
@@ -143,6 +145,7 @@
       #terminal-screen {
         flex: 1;
         min-height: 0;
+        padding: 0.25rem 0.5rem;
       }
       .term-head {
         display: flex;
@@ -157,6 +160,77 @@
       .term-state {
         flex: 1;
         opacity: 0.8;
+      }
+      /* What the shell is doing, at a glance: amber while the host is asked,
+         green while it runs, red when it was refused, grey once it is over
+         (ADR 0132). The words beside it stay the whole message. */
+      .term-state::before {
+        content: '';
+        display: inline-block;
+        width: 0.5rem;
+        height: 0.5rem;
+        margin-inline-end: 0.4rem;
+        border-radius: 50%;
+        background: #7a8293;
+      }
+      .term-state[data-status='opening']::before {
+        background: #f2b441;
+        animation: term-pulse 0.9s ease-in-out infinite alternate;
+      }
+      .term-state[data-status='open']::before {
+        background: #3ccf8e;
+      }
+      .term-state[data-status='refused']::before {
+        background: #ff6d7b;
+      }
+      /* The terminal's right-click menu (ADR 0132): fixed, because it opens
+         at the pointer, and in the terminal's own palette. */
+      .term-menu {
+        position: fixed;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        min-width: 11rem;
+        padding: 0.25rem;
+        background: #1b1f27;
+        border: 1px solid #373e4b;
+        border-radius: 8px;
+        box-shadow: 0 8px 20px -6px rgb(0 0 0 / 55%);
+        font-size: 0.85rem;
+      }
+      .term-menu-item {
+        display: flex;
+        justify-content: space-between;
+        gap: 1.5rem;
+        padding: 0.35rem 0.6rem;
+        border: 0;
+        border-radius: 5px;
+        background: none;
+        color: #e9ecf2;
+        font: inherit;
+        text-align: start;
+      }
+      .term-menu-item:hover:not(:disabled),
+      .term-menu-item:focus-visible {
+        background: rgb(255 255 255 / 8%);
+        outline: none;
+      }
+      .term-menu-item:disabled {
+        color: #5e6676;
+      }
+      .term-menu-item kbd {
+        font: inherit;
+        color: #8d95a5;
+      }
+      @keyframes term-pulse {
+        to {
+          opacity: 0.3;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .term-state[data-status='opening']::before {
+          animation: none;
+        }
       }
       .chat-log {
         flex: 1;
