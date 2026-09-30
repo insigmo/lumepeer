@@ -6650,7 +6650,7 @@ impl Actor {
     /// deleted. The disk is touched on a blocking thread, never on this one:
     /// a delete of a large tree is seconds of the host's disk, and the answer
     /// lands back as [`ActorEvent::FileOpDone`].
-    fn on_file_op_request(&mut self, peer: NodeId, id: u32, op: FileOp) {
+    fn on_file_op_request(&mut self, peer: NodeId, id: u32, op: &FileOp) {
         let tag = self.label_of(&peer);
         let action = match op {
             FileOp::MakeDir { .. } => "file_make_dir",
@@ -6676,7 +6676,7 @@ impl Actor {
             self.send_file_op_result(peer, id, Some(FileOpRefusal::Busy));
             return;
         }
-        let Some(plan) = FileOpPlan::from_wire(&op) else {
+        let Some(plan) = FileOpPlan::from_wire(op) else {
             tracing::warn!(peer = %tag, "a file operation on a path that is not one; refused");
             self.send_file_op_result(peer, id, Some(FileOpRefusal::BadPath));
             return;
@@ -6721,10 +6721,10 @@ impl Actor {
         if !self.views.contains_key(&peer) {
             return Err(ActorError::UnknownPeer);
         }
-        if !self
+        if self
             .connections
             .get(&peer)
-            .is_some_and(|c| c.peer_minor >= FILE_OPS_MINOR)
+            .is_none_or(|c| c.peer_minor < FILE_OPS_MINOR)
         {
             return Err(ActorError::Unsupported);
         }
@@ -9402,16 +9402,8 @@ impl Actor {
         }
         // A second `ConsentGrant` on a live view is a role change, not a new
         // window: keep the pipeline, update what the window may do.
-        if let Some(state) = self.views.get_mut(&peer) {
-            state.grants = grants;
-            state.role = role;
-            // The feed carries the live grant, so a role change has to reach it
-            // before the next frame is served — the window stops accepting
-            // input on the very next poll (§8.1).
-            state.input.store(grants.input, Ordering::Relaxed);
-            tracing::info!(peer = %tag, input = grants.input, "view grants updated");
-            // What this node offers the host follows the role (ADR 0123).
-            self.refresh_clipboard_watch();
+        if self.views.contains_key(&peer) {
+            self.update_view_grants(peer, role, grants);
             return;
         }
         // A window parked while its session was away is the window this grant
@@ -9544,6 +9536,23 @@ impl Actor {
         // watcher can be on (docs/bugs/10-clipboard-auto.md #1): this node
         // now has something worth offering the host it just started
         // watching.
+        self.refresh_clipboard_watch();
+    }
+
+    /// Guest side: a role change on a view already open — the window and its
+    /// pipeline stay, only what the window may do changes.
+    fn update_view_grants(&mut self, peer: NodeId, role: Role, grants: Grants) {
+        let Some(state) = self.views.get_mut(&peer) else {
+            return;
+        };
+        state.grants = grants;
+        state.role = role;
+        // The feed carries the live grant, so a role change has to reach it
+        // before the next frame is served — the window stops accepting
+        // input on the very next poll (§8.1).
+        state.input.store(grants.input, Ordering::Relaxed);
+        tracing::info!(peer = %self.label_of(&peer), input = grants.input, "view grants updated");
+        // What this node offers the host follows the role (ADR 0123).
         self.refresh_clipboard_watch();
     }
 
@@ -10990,7 +10999,7 @@ impl Actor {
             // (ADR 0124).
             MessageKind::FileOpRequest { id, ref op } => {
                 let op = op.clone();
-                self.on_file_op_request(peer, id, op);
+                self.on_file_op_request(peer, id, &op);
             }
             // Guest side: how one of those went.
             MessageKind::FileOpResult { id, refused } => {
