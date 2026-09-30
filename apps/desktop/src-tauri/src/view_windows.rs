@@ -7,9 +7,9 @@
 //! carries it out on the platform's main thread.
 
 use lumepeer_core::consent::HostAttendance;
-use lumepeer_runtime::view::{ViewSurface, ViewWindows};
+use lumepeer_runtime::view::{TerminalWindow, ViewSurface, ViewWindows};
 
-use crate::commands::FILES_WINDOW_PREFIX;
+use crate::commands::{FILES_WINDOW_PREFIX, TERMINAL_WINDOW_PREFIX};
 
 /// Default width of a freshly opened view window.
 const VIEW_WINDOW_WIDTH: f64 = 1280.0;
@@ -27,6 +27,13 @@ const FILES_WINDOW_MIN_WIDTH: f64 = 760.0;
 const FILES_WINDOW_MIN_HEIGHT: f64 = 460.0;
 /// The page a file manager window loads.
 const FILES_PAGE: &str = "files.html";
+/// Default width of a terminal window beside a session (ADR 0131): room for
+/// a hundred-odd columns of a shell.
+const TERMINAL_WINDOW_WIDTH: f64 = 960.0;
+/// Default height of a terminal window beside a session.
+const TERMINAL_WINDOW_HEIGHT: f64 = 600.0;
+/// The page a terminal window beside a session loads.
+const TERMINAL_PAGE: &str = "terminal.html";
 
 /// Label of the host's always-on-top session bar.
 pub const HOST_BAR_LABEL: &str = "hostbar";
@@ -152,6 +159,14 @@ impl ViewWindows for TauriViewWindows {
             {
                 let _ = files.destroy();
             }
+            // And the terminal window beside it, for the same reason
+            // (ADR 0131): its shells ended with the session.
+            if let Some(peer) = label.strip_prefix("view-")
+                && let Some(terminal) =
+                    app.get_webview_window(&format!("{TERMINAL_WINDOW_PREFIX}{peer}"))
+            {
+                let _ = terminal.destroy();
+            }
         });
         if let Err(error) = queued {
             tracing::warn!(%error, "cannot reach the main thread to close a view window");
@@ -247,6 +262,88 @@ pub fn open_files_window(app: &tauri::AppHandle, peer: &str) {
     if let Err(error) = queued {
         tracing::warn!(%error, "cannot reach the main thread to open a file manager");
     }
+}
+
+/// Opens a terminal window beside the session `peer`, or raises the one that
+/// is already open (ADR 0131).
+///
+/// One per session: its shells ride that session, and a second click on
+/// "Connect to terminal" is somebody looking for the window they already
+/// have. A session that is itself a shell still gets one — that click asked
+/// for another shell, and its own window has room for only the one.
+pub fn open_terminal_window(app: &tauri::AppHandle, peer: &str) {
+    let app_for_thread = app.clone();
+    let peer = peer.to_owned();
+    let queued = app.run_on_main_thread(move || {
+        use tauri::Manager as _;
+
+        let label = format!("{TERMINAL_WINDOW_PREFIX}{peer}");
+        if let Some(window) = app_for_thread.get_webview_window(&label) {
+            let _ = window.unminimize();
+            crate::raise_window(&window);
+            return;
+        }
+        build_terminal_window(&app_for_thread, &label, &peer);
+    });
+    if let Err(error) = queued {
+        tracing::warn!(%error, "cannot reach the main thread to open a terminal window");
+    }
+}
+
+/// Builds one terminal window beside a session. Called on the main thread.
+fn build_terminal_window(app: &tauri::AppHandle, label: &str, peer: &str) {
+    // A hex label only, as for the view window: nothing to escape (§15).
+    let url = format!("{TERMINAL_PAGE}?peer={peer}");
+    let built = tauri::WebviewWindowBuilder::new(app, label, tauri::WebviewUrl::App(url.into()))
+        .title("Lumepeer — remote terminal")
+        .inner_size(TERMINAL_WINDOW_WIDTH, TERMINAL_WINDOW_HEIGHT)
+        .resizable(true)
+        .build();
+    match built {
+        Ok(window) => {
+            crate::raise_window(&window);
+            // A shell needs Ctrl+R and the rest as much as a remote screen
+            // does, and a webview that answers Ctrl+R itself reloads the page
+            // the shell is drawn on (ADR 0090).
+            give_the_chords_to_the_remote_machine(&window);
+            end_the_shells_of_a_closed_window(&window, peer);
+            tracing::info!(window = %label, "terminal window opened");
+        }
+        Err(error) => {
+            tracing::warn!(window = %label, %error, "cannot open the terminal window");
+        }
+    }
+}
+
+/// Ends the shells of a terminal window beside a session once it is gone
+/// (ADR 0131), and leaves the session alone.
+///
+/// The page closes its own shell when it is closed, but that request can be
+/// lost for the reason [`end_the_session_of_a_closed_window`] gives, and a
+/// shell nobody can see is still a process on somebody else's machine.
+fn end_the_shells_of_a_closed_window(window: &tauri::WebviewWindow, peer: &str) {
+    use tauri::Manager as _;
+
+    let app = window.app_handle().clone();
+    let peer = peer.to_owned();
+    window.on_window_event(move |event| {
+        if !matches!(event, tauri::WindowEvent::Destroyed) {
+            return;
+        }
+        let network = app.state::<crate::AppState>().network.clone();
+        let peer = peer.clone();
+        // Outside any runtime here too, like every window event.
+        let runtime = app.state::<tokio::runtime::Runtime>().handle().clone();
+        runtime.spawn(async move {
+            if network
+                .terminal_window_closed(peer, TerminalWindow::Beside)
+                .await
+                .is_ok()
+            {
+                tracing::info!("a closed terminal window ended its shells");
+            }
+        });
+    });
 }
 
 /// The file manager page for one session. `standalone` is a window that is

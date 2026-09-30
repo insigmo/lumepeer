@@ -9,6 +9,9 @@ export const tr: Dictionary = {
   'consent.action.deny': 'Reddet',
   'consent.action.allowView': 'Yalnızca görüntülemeye izin ver',
   'consent.action.allowFull': 'Tam kontrole izin ver',
+  'consent.action.allowTerminal': 'Terminale izin ver',
+  'consent.request.terminalBody':
+    'Yalnızca terminal istiyor: bu bilgisayarda bir kabuk; ekranı göremez, klavye ve fare kullanamaz. Kontrolü elinde tutan oturumun yanında çalışabilir.',
   'invite.heading': 'Davet et ve bağlan',
   'invite.create': 'Davet oluştur',
   'invite.refresh': 'Geçerli kodu iptal et ve yenisini oluştur',
@@ -134,6 +137,7 @@ export const tr: Dictionary = {
   'status.role.viewOnly': 'yalnızca görüntüleme',
   'status.role.controlLimited': 'sınırlı kontrol',
   'status.role.fullControl': 'tam kontrol',
+  'status.role.terminal': 'yalnızca terminal',
   'status.ready': 'Bağlanmaya hazır',
   'status.notReady': 'Bağlanmaya hazır değil',
   'status.noCapture':

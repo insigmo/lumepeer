@@ -1663,13 +1663,17 @@ button.peer-card-face:disabled {
   background: var(--accent-soft);
 }
 
-.consent-actions .consent-action-full {
+/* The one "yes" a terminal request has (ADR 0131) looks like the one a
+   screen request has. */
+.consent-actions .consent-action-full,
+.consent-actions .consent-action-terminal {
   border-color: var(--accent);
   background: var(--accent);
   color: var(--on-accent);
 }
 
-.consent-actions .consent-action-full:hover {
+.consent-actions .consent-action-full:hover,
+.consent-actions .consent-action-terminal:hover {
   background: var(--accent-hover);
 }
 

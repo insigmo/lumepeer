@@ -22,7 +22,9 @@ use lumepeer_core::address_book::AddressEntry;
 use lumepeer_core::audit::{AuditEvent, RebootOutcome};
 use lumepeer_core::chat::{ChatEntry, ChatLog};
 use lumepeer_core::clipboard::{self as clip, ClipboardFlow, ClipboardSync};
-use lumepeer_core::consent::{Admission, ConsentRateLimiter, Grants, IndependentGrant, Role};
+use lumepeer_core::consent::{
+    Admission, ConsentRateLimiter, Grants, IndependentGrant, Role, SessionKind,
+};
 use lumepeer_core::constants::{
     ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONNECT_RETRY_BACKOFF_CEILING_SECS,
     CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
@@ -46,8 +48,8 @@ use lumepeer_core::protocol::{
     FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE,
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
     FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
-    FEATURE_TERMINAL, FEATURE_TUNNEL, FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF,
-    FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry,
+    FEATURE_TERMINAL, FEATURE_TERMINAL_ONLY, FEATURE_TUNNEL, FEATURE_UNATTENDED,
+    FEATURE_UNATTENDED_PROOF, FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry,
     MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode,
     TerminalRefusal, TunnelRefusal, UnattendedRejection,
 };
@@ -87,8 +89,8 @@ use crate::remembered_password::RememberedPasswordStore;
 use crate::unattended_store::UnattendedStore;
 use crate::view::{
     BITSTREAM_POLL_TIMEOUT_MS, BitstreamFeed, CursorFeed, DecodePath, EncodeControl, HostMedia,
-    MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, ViewSlot, ViewStatus,
-    ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response,
+    MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, TerminalWindow, ViewSlot,
+    ViewStatus, ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response,
     lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
 };
 
@@ -751,6 +753,12 @@ pub struct SessionSnapshot {
     /// not what is worth interrupting somebody for, a running shell is. The
     /// indicator the host cannot switch off hangs off this one.
     pub terminal_active: bool,
+    /// What this guest came for (ADR 0131): the screen, or a shell alone.
+    ///
+    /// On a pending row it is what the dialog asks the person here to allow;
+    /// on an active one it is why this guest holds no picture and no input
+    /// although its role is the one an invite for control carries.
+    pub kind: SessionKind,
     /// Whether this guest wrote in the chat and nobody here has opened it yet
     /// (§9.2). The chat drawer opens closed, so without this a guest's message
     /// is something the host simply never sees.
@@ -1514,9 +1522,11 @@ enum ActorCommand {
     TunnelStatus {
         reply: oneshot::Sender<Vec<TunnelRow>>,
     },
-    /// Guest side: ask the watched host to start a shell (ADR 0079).
+    /// Guest side: ask the watched host to start a shell (ADR 0079), for
+    /// `window` (ADR 0131).
     TerminalOpen {
         label: String,
+        window: TerminalWindow,
         cols: u16,
         rows: u16,
         reply: oneshot::Sender<Result<(), ActorError>>,
@@ -1542,10 +1552,18 @@ enum ActorCommand {
         shell: ShellId,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
-    /// Guest side: everything this peer's terminal window has not seen yet.
+    /// Guest side: everything `window` onto this peer has not seen yet.
     TerminalPoll {
         label: String,
+        window: TerminalWindow,
         reply: oneshot::Sender<Result<Vec<u8>, ActorError>>,
+    },
+    /// Guest side: `window` onto this peer is gone, and its shells with it
+    /// (ADR 0131).
+    TerminalWindowClosed {
+        label: String,
+        window: TerminalWindow,
+        reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Guest side: ask the watched host to send the file at `path`, into
     /// `into` on this machine (ADR 0076).
@@ -2679,6 +2697,7 @@ impl ActorHandle {
     pub async fn terminal_open(
         &self,
         label: String,
+        window: TerminalWindow,
         cols: u16,
         rows: u16,
     ) -> Result<(), ActorError> {
@@ -2686,6 +2705,7 @@ impl ActorHandle {
         self.tx
             .send(ActorCommand::TerminalOpen {
                 label,
+                window,
                 cols,
                 rows,
                 reply,
@@ -2765,15 +2785,52 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
-    /// Guest side: everything this peer's terminal window has not seen yet,
-    /// in the order it happened (ADR 0079).
+    /// Guest side: everything `window` onto this peer has not seen yet, in
+    /// the order it happened (ADR 0079, ADR 0131).
     ///
     /// # Errors
     /// [`ActorError::UnknownPeer`] when this node is not watching `label`.
-    pub async fn terminal_poll(&self, label: String) -> Result<Vec<u8>, ActorError> {
+    pub async fn terminal_poll(
+        &self,
+        label: String,
+        window: TerminalWindow,
+    ) -> Result<Vec<u8>, ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(ActorCommand::TerminalPoll { label, reply })
+            .send(ActorCommand::TerminalPoll {
+                label,
+                window,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Guest side: `window` onto this host has closed, so every shell it
+    /// opened is ended, and one it is still waiting for is ended the moment
+    /// it arrives (ADR 0131).
+    ///
+    /// Asked by the window's own owner rather than the page, which may never
+    /// get to say it: Tauri destroys a window once its close handler returns,
+    /// and a shell left running on somebody else's machine for a window that
+    /// is gone is the one outcome ADR 0079 may not produce.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when this node is no longer watching
+    /// `label` — its session, and every shell in it, already ended.
+    pub async fn terminal_window_closed(
+        &self,
+        label: String,
+        window: TerminalWindow,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::TerminalWindowClosed {
+                label,
+                window,
+                reply,
+            })
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
@@ -4036,6 +4093,32 @@ impl GuestCodecSupport {
     }
 }
 
+/// Guest side: what one dial's `Hello` says beyond the strings every build
+/// advertises.
+///
+/// Settled on the actor's own thread when the dial starts, like the codecs it
+/// carries, so the task that talks to the network reads nothing the actor
+/// still owns.
+#[derive(Debug, Clone, Copy, Default)]
+struct HelloExtras {
+    /// What this process's own `WebView` decodes (§11; ADR 0067).
+    codecs: GuestCodecSupport,
+    /// This connect is for a shell and nothing else, which the host admits as
+    /// a terminal session beside whoever is in control (ADR 0131).
+    terminal_only: bool,
+}
+
+impl HelloExtras {
+    /// The `Hello.features` strings these add.
+    fn features(self) -> Vec<String> {
+        let mut features = self.codecs.features();
+        if self.terminal_only {
+            features.push(FEATURE_TERMINAL_ONLY.to_owned());
+        }
+        features
+    }
+}
+
 /// Host side: what this host could show as `MediaCodec.codec` to a guest with
 /// `support`, given what this host can actually encode right now (§11; ADR
 /// 0067).
@@ -4416,6 +4499,9 @@ enum ActorEvent {
         /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
+        /// Whether the guest's `Hello` said it came for a shell and nothing
+        /// else (`FEATURE_TERMINAL_ONLY`; ADR 0131).
+        asks_terminal_only: bool,
         /// Which optional codecs the guest's `Hello` advertised understanding
         /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
@@ -4680,6 +4766,9 @@ enum Accepted {
         /// Whether the guest's `Hello` advertised `FEATURE_DISPLAY_MODE`
         /// (docs/bugs/16-host-display-mode.md; ADR 0048).
         speaks_display_mode: bool,
+        /// Whether the guest's `Hello` said it came for a shell and nothing
+        /// else (`FEATURE_TERMINAL_ONLY`; ADR 0131).
+        asks_terminal_only: bool,
         /// Which optional codecs the guest's `Hello` advertised understanding
         /// of (§11; ADR 0067).
         guest_codec_support: GuestCodecSupport,
@@ -5195,6 +5284,10 @@ struct Actor {
     /// Peers whose `Hello` advertised `FEATURE_TERMINAL`, and which may
     /// therefore be answered with a `TerminalOpenResponse` (ADR 0079).
     speaks_terminal: std::collections::HashSet<NodeId>,
+    /// Host side: guests whose `Hello` said they came for a shell alone, and
+    /// whose session is therefore asked for and granted as a terminal session
+    /// (`FEATURE_TERMINAL_ONLY`; ADR 0131).
+    terminal_only_guests: std::collections::HashSet<NodeId>,
     /// Peers whose `Hello` advertised `FEATURE_REBOOT`, and whose
     /// `RebootRequest` this host will therefore look at at all (ADR 0084).
     ///
@@ -5291,8 +5384,23 @@ struct Actor {
     /// process, so the guest never names one (ADR 0079).
     next_shell: ShellId,
     /// Guest side: what each terminal window has not been told yet, in the
-    /// order it happened (ADR 0079).
-    terminal_pending: std::collections::HashMap<NodeId, std::collections::VecDeque<TerminalRecord>>,
+    /// order it happened (ADR 0079), kept apart per window onto the same host
+    /// (ADR 0131).
+    terminal_pending: std::collections::HashMap<
+        (NodeId, TerminalWindow),
+        std::collections::VecDeque<TerminalRecord>,
+    >,
+    /// Guest side: which window asked for each shell still waiting for the
+    /// host's answer, oldest first (ADR 0131); `None` for a window that has
+    /// closed since it asked.
+    ///
+    /// The host answers opens in the order they were sent and names no ask in
+    /// its answer (ADR 0079), so the order is the whole of the pairing — and
+    /// an ask whose window is gone keeps its place in it rather than leaving.
+    terminal_asks:
+        std::collections::HashMap<NodeId, std::collections::VecDeque<Option<TerminalWindow>>>,
+    /// Guest side: the window each running shell belongs to (ADR 0131).
+    shell_windows: std::collections::HashMap<(NodeId, ShellId), TerminalWindow>,
     /// Host side: how many fetches from each peer are being hashed right now.
     ///
     /// Counted separately from `file_offers_out` because a hash pass is where
@@ -5845,6 +5953,7 @@ impl Actor {
                 record_request: false,
                 secure_desktop_active: false,
                 terminal_active: false,
+                kind: ticket.kind,
                 chat_unread: false,
             });
         }
@@ -5868,6 +5977,7 @@ impl Actor {
                     .get(&peer)
                     .is_some_and(|s| s.control.secure_desktop_active()),
                 terminal_active: self.shells.keys().any(|(p, _)| *p == peer),
+                kind: self.sessions.kind(&peer).unwrap_or_default(),
                 chat_unread: self.chat.is_unread(&peer),
             });
         }
@@ -8325,7 +8435,8 @@ impl Actor {
             return;
         }
         if self.views.contains_key(&peer) {
-            self.queue_terminal(peer, shell, TERMINAL_EVENT_OUTPUT, payload);
+            let window = self.window_of_shell(peer, shell);
+            self.queue_terminal(peer, window, shell, TERMINAL_EVENT_OUTPUT, payload);
         }
     }
 
@@ -8339,16 +8450,31 @@ impl Actor {
         if !self.views.contains_key(&peer) {
             return;
         }
+        // The window whose ask this answers: the oldest one still waiting.
+        let Some(window) = self
+            .terminal_asks
+            .get_mut(&peer)
+            .and_then(std::collections::VecDeque::pop_front)
+            .unwrap_or(Some(TerminalWindow::Session))
+        else {
+            // Asked for by a window that has closed since: nobody will ever
+            // read this shell, so it is ended before it can print anything.
+            if refused.is_none() {
+                self.send_to(&peer, MessageKind::TerminalClose { session_id });
+            }
+            return;
+        };
         if let Some(reason) = refused {
             tracing::info!(peer = %self.label_of(&peer), ?reason, "a shell was refused");
-            self.queue_terminal(peer, 0, terminal_refusal_event(reason), Vec::new());
+            self.queue_terminal(peer, window, 0, terminal_refusal_event(reason), Vec::new());
             let _ = self.notify.send(ActorNotification::TerminalChanged);
             return;
         }
         // Dialled only now, which is the lazy half of ADR 0032: a channel
         // exists once there is something to carry, never before.
         self.ensure_terminal_connection(peer);
-        self.queue_terminal(peer, session_id, TERMINAL_EVENT_OPENED, Vec::new());
+        self.shell_windows.insert((peer, session_id), window);
+        self.queue_terminal(peer, window, session_id, TERMINAL_EVENT_OPENED, Vec::new());
         let _ = self.notify.send(ActorNotification::TerminalChanged);
     }
 
@@ -8359,8 +8485,15 @@ impl Actor {
     /// [`MAX_TERMINALS_PER_SESSION`] of each. Output past
     /// [`TERMINAL_SCROLLBACK_BYTES`] drops the **oldest** bytes of that shell,
     /// which is what a terminal scrolling off the top does (ADR 0079).
-    fn queue_terminal(&mut self, peer: NodeId, shell: ShellId, event: u8, payload: Vec<u8>) {
-        let queue = self.terminal_pending.entry(peer).or_default();
+    fn queue_terminal(
+        &mut self,
+        peer: NodeId,
+        window: TerminalWindow,
+        shell: ShellId,
+        event: u8,
+        payload: Vec<u8>,
+    ) {
+        let queue = self.terminal_pending.entry((peer, window)).or_default();
         queue.push_back(TerminalRecord {
             shell,
             event,
@@ -8388,9 +8521,16 @@ impl Actor {
     /// `count:u16`, then `count` records of `shell:u32 | event:u8 |
     /// length:u32 | payload`. The queue is emptied by the call, so nothing is
     /// delivered twice and nothing is held once it has been read (§15).
-    fn terminal_drain(&mut self, label: &str) -> Result<Vec<u8>, ActorError> {
+    fn terminal_drain(
+        &mut self,
+        label: &str,
+        window: TerminalWindow,
+    ) -> Result<Vec<u8>, ActorError> {
         let peer = self.resolve(label)?;
-        let queue = self.terminal_pending.remove(&peer).unwrap_or_default();
+        let queue = self
+            .terminal_pending
+            .remove(&(peer, window))
+            .unwrap_or_default();
         let count = u16::try_from(queue.len()).unwrap_or(u16::MAX);
         let mut out = Vec::new();
         out.extend_from_slice(&count.to_le_bytes());
@@ -8402,6 +8542,26 @@ impl Actor {
             out.extend_from_slice(&record.payload);
         }
         Ok(out)
+    }
+
+    /// Guest side: the window `shell` was opened for (ADR 0131). A shell this
+    /// side has no record of is the session's own window's, which is where
+    /// every shell went before there could be a second one.
+    fn window_of_shell(&self, peer: NodeId, shell: ShellId) -> TerminalWindow {
+        self.shell_windows
+            .get(&(peer, shell))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Guest side: one shell is over, and the window it belonged to is told
+    /// (ADR 0079, ADR 0131).
+    fn queue_terminal_closed(&mut self, peer: NodeId, shell: ShellId) {
+        let window = self
+            .shell_windows
+            .remove(&(peer, shell))
+            .unwrap_or_default();
+        self.queue_terminal(peer, window, shell, TERMINAL_EVENT_CLOSED, Vec::new());
     }
 
     /// Sends the one answer a refused shell gets (§18; ADR 0079).
@@ -8483,7 +8643,13 @@ impl Actor {
     }
 
     /// Guest side: asks the watched host to start a shell (§4.1; ADR 0079).
-    fn on_terminal_open(&mut self, label: &str, cols: u16, rows: u16) -> Result<(), ActorError> {
+    fn on_terminal_open(
+        &mut self,
+        label: &str,
+        window: TerminalWindow,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
         if !self.terminal_to_host.get(&peer).copied().unwrap_or(false) {
             return Err(ActorError::Unsupported);
@@ -8499,6 +8665,10 @@ impl Actor {
             return Err(ActorError::Core(CoreError::Malformed));
         }
         self.send_to(&peer, MessageKind::TerminalOpenRequest { cols, rows });
+        self.terminal_asks
+            .entry(peer)
+            .or_default()
+            .push_back(Some(window));
         Ok(())
     }
 
@@ -8558,11 +8728,39 @@ impl Actor {
         Ok(())
     }
 
+    /// Guest side: `window` onto this host is gone (ADR 0131). Every shell it
+    /// opened is ended at the host, and every ask it still has in flight is
+    /// marked, so the shell it answers is ended the moment it arrives.
+    fn on_terminal_window_closed(
+        &mut self,
+        label: &str,
+        window: TerminalWindow,
+    ) -> Result<(), ActorError> {
+        let peer = self.resolve(label)?;
+        let open: Vec<ShellId> = self
+            .shell_windows
+            .iter()
+            .filter(|((holder, _), owner)| *holder == peer && **owner == window)
+            .map(|((_, shell), _)| *shell)
+            .collect();
+        for shell in open {
+            self.shell_windows.remove(&(peer, shell));
+            self.send_to(&peer, MessageKind::TerminalClose { session_id: shell });
+        }
+        if let Some(asks) = self.terminal_asks.get_mut(&peer) {
+            for ask in asks.iter_mut().filter(|ask| **ask == Some(window)) {
+                *ask = None;
+            }
+        }
+        self.terminal_pending.remove(&(peer, window));
+        Ok(())
+    }
+
     /// Guest side: this window is finished with one shell (ADR 0079).
     fn on_terminal_close(&mut self, label: &str, shell: ShellId) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
         self.send_to(&peer, MessageKind::TerminalClose { session_id: shell });
-        self.queue_terminal(peer, shell, TERMINAL_EVENT_CLOSED, Vec::new());
+        self.queue_terminal_closed(peer, shell);
         Ok(())
     }
 
@@ -8963,6 +9161,7 @@ impl Actor {
                 speaks_unattended_proof,
                 speaks_clipboard_files,
                 speaks_display_mode,
+                asks_terminal_only,
                 guest_codec_support,
                 resume_claim,
             } => {
@@ -9027,6 +9226,14 @@ impl Actor {
                     self.speaks_terminal.insert(peer);
                 } else {
                     self.speaks_terminal.remove(&peer);
+                }
+                // What the guest came for (ADR 0131). Not a grant either, and
+                // never a widening: it is read where the session is asked for
+                // and granted, and all it can do is make that session smaller.
+                if asks_terminal_only {
+                    self.terminal_only_guests.insert(peer);
+                } else {
+                    self.terminal_only_guests.remove(&peer);
                 }
                 // And for taking this machine down (ADR 0084). Also not a
                 // grant: `reboot` is the host's decision and is re-read when
@@ -10217,10 +10424,11 @@ impl Actor {
         let challenge = admission.offer_credentials;
         // Every connection, first time or reconnect, gets a fresh decision.
         let consent = if admission.ask_the_person {
-            match self
-                .sessions
-                .request_consent_as(peer, ticket.allowed_request)
-            {
+            match self.sessions.request_consent_for(
+                peer,
+                ticket.allowed_request,
+                self.session_kind_asked(&peer),
+            ) {
                 Ok(_) => true,
                 Err(error) => {
                     tracing::warn!(peer = %tag, %error, "cannot queue a consent request");
@@ -11131,7 +11339,7 @@ impl Actor {
             MessageKind::TerminalClose { session_id } => {
                 self.end_shell(peer, session_id, "terminal-closed-by-guest", false);
                 if self.views.contains_key(&peer) {
-                    self.queue_terminal(peer, session_id, TERMINAL_EVENT_CLOSED, Vec::new());
+                    self.queue_terminal_closed(peer, session_id);
                     let _ = self.notify.send(ActorNotification::TerminalChanged);
                 }
             }
@@ -11458,8 +11666,11 @@ impl Actor {
         // nothing (ADR 0078).
         self.close_tunnel(peer, "the connection ended");
         self.speaks_terminal.remove(&peer);
+        self.terminal_only_guests.remove(&peer);
         self.terminal_to_host.remove(&peer);
-        self.terminal_pending.remove(&peer);
+        self.terminal_pending.retain(|(holder, _), _| *holder != peer);
+        self.terminal_asks.remove(&peer);
+        self.shell_windows.retain(|(holder, _), _| *holder != peer);
         self.speaks_reboot.remove(&peer);
         self.reboot_to_host.remove(&peer);
         // And its shells, for the sharper version of the same reason: a
@@ -11859,11 +12070,12 @@ impl Actor {
             }
             ActorCommand::TerminalOpen {
                 label,
+                window,
                 cols,
                 rows,
                 reply,
             } => {
-                let _ = reply.send(self.on_terminal_open(&label, cols, rows));
+                let _ = reply.send(self.on_terminal_open(&label, window, cols, rows));
             }
             ActorCommand::TerminalInput {
                 label,
@@ -11889,8 +12101,19 @@ impl Actor {
             } => {
                 let _ = reply.send(self.on_terminal_close(&label, shell));
             }
-            ActorCommand::TerminalPoll { label, reply } => {
-                let _ = reply.send(self.terminal_drain(&label));
+            ActorCommand::TerminalPoll {
+                label,
+                window,
+                reply,
+            } => {
+                let _ = reply.send(self.terminal_drain(&label, window));
+            }
+            ActorCommand::TerminalWindowClosed {
+                label,
+                window,
+                reply,
+            } => {
+                let _ = reply.send(self.on_terminal_window_closed(&label, window));
             }
             ActorCommand::HistorySetTrusted {
                 label,
@@ -14631,7 +14854,9 @@ impl Actor {
     fn grant_role(&mut self, peer: NodeId, role: Role) -> Result<(), ActorError> {
         let label = self.label_of(&peer);
         let label = label.as_str();
-        self.sessions.grant(peer, role).map_err(ActorError::Core)?;
+        self.sessions
+            .grant_as(peer, role, self.session_kind_asked(&peer))
+            .map_err(ActorError::Core)?;
         // This peer is in. A credential challenge it was also holding — both
         // are offered together in `on_handshaked` — has been answered by
         // somebody at this machine instead, and a password arriving after it
@@ -14653,6 +14878,15 @@ impl Actor {
             lumepeer_core::audit::AuditEvent::InputToggled { enabled: input },
         );
         Ok(())
+    }
+
+    /// Host side: what `peer`'s `Hello` said it came for (ADR 0131).
+    fn session_kind_asked(&self, peer: &NodeId) -> SessionKind {
+        if self.terminal_only_guests.contains(peer) {
+            SessionKind::Terminal
+        } else {
+            SessionKind::Screen
+        }
     }
 
     /// What a session that holds `role` starts with on its connection, whether
@@ -15936,10 +16170,13 @@ impl Actor {
         };
         let tag = self.label_of(&peer);
         let role = ticket.allowed_request;
-        let codecs = self.own_codec_support;
+        let says = HelloExtras {
+            codecs: self.own_codec_support,
+            terminal_only: false,
+        };
         tracing::info!(peer = %tag, "telling the host the session it holds is over");
         tokio::spawn(async move {
-            let outcome = dial_over_plan(plan, role, proof, &tag, codecs, Some(resume)).await;
+            let outcome = dial_over_plan(plan, role, proof, &tag, says, Some(resume)).await;
             if let Ok(control) = outcome.result {
                 close_as_leaving(&control);
             }
@@ -16352,10 +16589,13 @@ impl Actor {
         // the dial task: the dial outlives this call and the actor keeps
         // running, so reading it later would be reading a field two threads
         // own. What a `Hello` advertises is settled when the dial starts.
-        let codecs = self.own_codec_support;
+        let says = HelloExtras {
+            codecs: self.own_codec_support,
+            terminal_only: surface == ViewSurface::Terminal,
+        };
         tracing::info!(peer = %tag, plan = ?plan.kinds(), "dialing the host");
         tokio::spawn(async move {
-            let outcome = dial_over_plan(plan, role, proof, &tag, codecs, resume).await;
+            let outcome = dial_over_plan(plan, role, proof, &tag, says, resume).await;
             let _ = tx
                 .send(ActorEvent::Dialed {
                     peer,
@@ -17390,6 +17630,7 @@ async fn handshake_and_dispatch(
             speaks_unattended_proof,
             speaks_clipboard_files,
             speaks_display_mode,
+            asks_terminal_only,
             guest_codec_support,
             resume_claim,
         }) => ActorEvent::Handshaked {
@@ -17413,6 +17654,7 @@ async fn handshake_and_dispatch(
             speaks_unattended_proof,
             speaks_clipboard_files,
             speaks_display_mode,
+            asks_terminal_only,
             guest_codec_support,
             resume_claim,
             ticket: *ticket,
@@ -17605,6 +17847,10 @@ async fn classify_incoming(
             .features
             .iter()
             .any(|feature| feature == FEATURE_DISPLAY_MODE),
+        asks_terminal_only: hello
+            .features
+            .iter()
+            .any(|feature| feature == FEATURE_TERMINAL_ONLY),
         guest_codec_support: GuestCodecSupport::from_features(&hello.features),
         resume_claim: hello.resume_claim,
         connection: Box::new(control),
@@ -17677,7 +17923,7 @@ async fn dial_over_plan(
     role: Role,
     proof: Vec<u8>,
     tag: &str,
-    codecs: GuestCodecSupport,
+    says: HelloExtras,
     resume: Option<[u8; 16]>,
 ) -> DialOutcome {
     let mut stage = plan.first;
@@ -17690,7 +17936,7 @@ async fn dial_over_plan(
             role,
             proof.clone(),
             tag,
-            codecs,
+            says,
             resume,
         )
         .await
@@ -17830,7 +18076,7 @@ async fn dial_with_retries(
     role: Role,
     proof: Vec<u8>,
     tag: &str,
-    codecs: GuestCodecSupport,
+    says: HelloExtras,
     resume: Option<[u8; 16]>,
 ) -> Result<ControlConnection, NetError> {
     let DialPace {
@@ -17848,7 +18094,7 @@ async fn dial_with_retries(
         let by_lookup = attempt.is_multiple_of(2);
         let outcome = tokio::time::timeout(
             attempt_budget,
-            connect_once(dialer, by_lookup, role, proof.clone(), codecs, resume),
+            connect_once(dialer, by_lookup, role, proof.clone(), says, resume),
         )
         .await
         .unwrap_or_else(|_| {
@@ -17896,7 +18142,7 @@ async fn connect_once(
     by_lookup: bool,
     role: Role,
     proof: Vec<u8>,
-    codecs: GuestCodecSupport,
+    says: HelloExtras,
     resume: Option<[u8; 16]>,
 ) -> Result<ControlConnection, NetError> {
     let connection = dialer.connect_control(by_lookup).await?;
@@ -17926,8 +18172,9 @@ async fn connect_once(
     // actually answered yes to (§11; ADR 0067, ADR 0070). Empty when nothing
     // has reported yet, which leaves this guest exactly where every guest
     // built before ADR 0067 is: H.264, with no `MediaCodec` message sent to
-    // it at all.
-    features.extend(codecs.features());
+    // it at all. And, for a connect that asked for a shell, that it asked for
+    // nothing else (ADR 0131).
+    features.extend(says.features());
     lumepeer_net::guest_resume_handshake(connection, role, proof, features, resume).await
 }
 
@@ -18311,6 +18558,7 @@ pub fn spawn_actor_with(
         tunnel_wanted: std::collections::HashMap::new(),
         tunnel_refusals: std::collections::HashMap::new(),
         speaks_terminal: std::collections::HashSet::new(),
+        terminal_only_guests: std::collections::HashSet::new(),
         speaks_reboot: std::collections::HashSet::new(),
         reboot_to_host: std::collections::HashMap::new(),
         pending_reboot: None,
@@ -18331,6 +18579,8 @@ pub fn spawn_actor_with(
         shells: std::collections::HashMap::new(),
         next_shell: 1,
         terminal_pending: std::collections::HashMap::new(),
+        terminal_asks: std::collections::HashMap::new(),
+        shell_windows: std::collections::HashMap::new(),
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
@@ -20412,7 +20662,7 @@ mod tests {
         let (_host, guest, _guest_label, host_label, _clipboard) = file_pair().await;
 
         guest
-            .terminal_open(host_label.clone(), 80, 24)
+            .terminal_open(host_label.clone(), TerminalWindow::Session, 80, 24)
             .await
             .unwrap();
         let records =
@@ -20433,6 +20683,54 @@ mod tests {
         );
     }
 
+    /// ADR 0131: two windows onto one host each hear only about the shells
+    /// they asked for. Refusals show it best: they name no shell, so the order
+    /// of the asks is the only thing that pairs an answer with its window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_window_onto_a_host_hears_only_about_its_own_asks() {
+        let (_host, guest, _guest_label, host_label, _clipboard) = file_pair().await;
+
+        for window in [
+            TerminalWindow::Beside,
+            TerminalWindow::Session,
+            TerminalWindow::Beside,
+        ] {
+            guest
+                .terminal_open(host_label.clone(), window, 80, 24)
+                .await
+                .unwrap();
+        }
+
+        let refused = |records: &[(ShellId, u8, Vec<u8>)]| {
+            records
+                .iter()
+                .filter(|(_, event, _)| *event == TERMINAL_EVENT_REFUSED_NOT_GRANTED)
+                .count()
+        };
+        let mut beside = Vec::new();
+        let mut session = Vec::new();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while refused(&beside) + refused(&session) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not every ask was answered: beside {beside:?}, session {session:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            for (window, seen) in [
+                (TerminalWindow::Beside, &mut beside),
+                (TerminalWindow::Session, &mut session),
+            ] {
+                let polled = guest
+                    .terminal_poll(host_label.clone(), window)
+                    .await
+                    .unwrap();
+                seen.extend(terminal_records(&polled));
+            }
+        }
+        assert_eq!(refused(&beside), 2, "the window beside got {beside:?}");
+        assert_eq!(refused(&session), 1, "the session's own window got {session:?}");
+    }
+
     /// ADR 0079 end to end, on a platform whose test process can start a
     /// shell as itself: with the grant a shell really runs and answers; the
     /// moment the grant is withdrawn the guest is told it is closed; and the
@@ -20450,7 +20748,7 @@ mod tests {
             .unwrap();
 
         guest
-            .terminal_open(host_label.clone(), 80, 24)
+            .terminal_open(host_label.clone(), TerminalWindow::Session, 80, 24)
             .await
             .unwrap();
         let records =
@@ -20481,7 +20779,7 @@ mod tests {
                 "the shell's prompt never reached the guest before anything was typed"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-            polled = terminal_records(&guest.terminal_poll(host_label.clone()).await.unwrap());
+            polled = terminal_records(&guest.terminal_poll(host_label.clone(), TerminalWindow::Session).await.unwrap());
         }
 
         // What comes back is computed by the shell, not echoed from the
@@ -20502,7 +20800,7 @@ mod tests {
                 "the shell never answered: {}",
                 String::from_utf8_lossy(&output)
             );
-            let polled = guest.terminal_poll(host_label.clone()).await.unwrap();
+            let polled = guest.terminal_poll(host_label.clone(), TerminalWindow::Session).await.unwrap();
             for (id, event, payload) in terminal_records(&polled) {
                 if id == shell && event == TERMINAL_EVENT_OUTPUT {
                     output.extend_from_slice(&payload);
@@ -20525,7 +20823,7 @@ mod tests {
         );
 
         guest
-            .terminal_open(host_label.clone(), 80, 24)
+            .terminal_open(host_label.clone(), TerminalWindow::Session, 80, 24)
             .await
             .unwrap();
         let records =
@@ -20539,6 +20837,55 @@ mod tests {
         );
     }
 
+    /// ADR 0131: a terminal window beside a session that closes takes its
+    /// shells with it — at the host, where the process runs — and leaves the
+    /// session alone. Unix only, for the reason the test above gives.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_window_beside_ends_its_shells_and_not_the_session() {
+        let (host, guest, guest_label, host_label, _clipboard) = file_pair().await;
+        host.set_grant(guest_label.clone(), IndependentGrant::Terminal, true)
+            .await
+            .unwrap();
+
+        guest
+            .terminal_open(host_label.clone(), TerminalWindow::Beside, 80, 24)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let polled = guest
+                .terminal_poll(host_label.clone(), TerminalWindow::Beside)
+                .await
+                .unwrap();
+            if terminal_records(&polled)
+                .iter()
+                .any(|(_, event, _)| *event == TERMINAL_EVENT_OPENED)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the shell for the window beside never opened"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        wait_for_row(&host, &guest_label, "the host never ran the shell", |row| {
+            row.terminal_active
+        })
+        .await;
+
+        guest
+            .terminal_window_closed(host_label.clone(), TerminalWindow::Beside)
+            .await
+            .unwrap();
+        let row = wait_for_row(&host, &guest_label, "the shell outlived its window", |row| {
+            !row.terminal_active
+        })
+        .await;
+        assert_eq!(row.state, SessionStateDto::Active, "the session is still there");
+    }
+
     /// Polls a guest's terminal queue until one record's event satisfies
     /// `wanted`, returning every record seen on the way (the queue is drained
     /// by each poll, so nothing is seen twice).
@@ -20550,7 +20897,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let mut seen = Vec::new();
         loop {
-            let polled = guest.terminal_poll(host_label.to_owned()).await.unwrap();
+            let polled = guest.terminal_poll(host_label.to_owned(), TerminalWindow::Session).await.unwrap();
             let records = terminal_records(&polled);
             let found = records.iter().any(|(_, event, _)| wanted(*event));
             seen.extend(records);
@@ -23562,7 +23909,25 @@ mod tests {
         let again = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .expect("a terminal connect asks for consent like any other");
-        host.grant(again, Role::FullControl).await.unwrap();
+        // …and the host's dialog is told what it is for (ADR 0131).
+        wait_for_row(&host, &again, "the request never said it was for a shell", |row| {
+            row.kind == SessionKind::Terminal
+        })
+        .await;
+        host.grant(again.clone(), Role::FullControl).await.unwrap();
+        let granted = wait_for_row(&host, &again, "the terminal session never started", |row| {
+            row.state == SessionStateDto::Active
+        })
+        .await;
+        assert_eq!(granted.kind, SessionKind::Terminal);
+        assert_eq!(
+            granted.grants,
+            Grants {
+                terminal: true,
+                ..Grants::default()
+            },
+            "a terminal session holds the shell and nothing else (ADR 0131)"
+        );
 
         wait_until("the terminal window was never opened", || {
             recorder.opened().len() == 2
@@ -23583,17 +23948,11 @@ mod tests {
         // dialled: the ordinary session above landed its own well inside this.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // The session itself is an ordinary full-control one — this side's
-        // own input gate reads the session's grant and lets an event through…
-        guest
-            .input(peer_label.clone(), pointer_event(1, 2))
-            .await
-            .unwrap();
-        // …and yet there is no media connection under it, which is the whole
-        // of the feature. The guest's microphone rides the connection the
-        // picture dialled (§4.1; ADR 0028), so "no connection to ride" is
-        // exactly what a refused mic press reports here, and nothing will
-        // ever open one: this view has no media task at all (ADR 0101).
+        // There is no media connection under it, which is the whole of ADR
+        // 0101. The guest's microphone rides the connection the picture
+        // dialled (§4.1; ADR 0028), so "no connection to ride" is exactly what
+        // a refused mic press reports here, and nothing will ever open one:
+        // this view has no media task at all.
         assert!(
             matches!(
                 guest.mic_toggle(peer_label, true).await,
@@ -23601,18 +23960,79 @@ mod tests {
             ),
             "a terminal session has no media connection for anything to ride"
         );
+        // Nor any input: a terminal window arms none on this side (above),
+        // and the host holds none for the session (`granted.grants`), so an
+        // event that did arrive would be refused where it is injected.
 
-        // What is *not* claimed, written down where it cannot rot: the host
-        // still registers a viewer at the grant, because a guest's intent
-        // never reaches the wire and adding a message for it would be a
-        // protocol change (ADR 0101). Its capture backend is therefore
-        // started — but nothing reads a frame out of it, because only the
-        // encode loop does and only an accepted `rd/media/1` starts one.
+        // And the host never started a capture for it. Under ADR 0101 alone
+        // the grant registered a viewer — the guest's intent never reached the
+        // wire — so a terminal session still woke the capture backend up;
+        // the session is told apart now, holds no `view`, and nothing is
+        // captured for it at all (ADR 0131).
         assert_eq!(
             viewers(&host_capture),
-            1,
-            "the grant is what registers a viewer, terminal session or not"
+            0,
+            "a terminal session starts no capture on the host"
         );
+    }
+
+    /// ADR 0131: one guest in control, and a shell for another beside it —
+    /// on the trial plan, which admits a single guest.
+    ///
+    /// Guest B's ordinary session first exists only to leave a remembered row
+    /// to connect "for the terminal" from, as in the ADR 0101 test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_session_runs_beside_the_guest_in_control() {
+        let (host, _host_endpoint, host_capture) = actor().await;
+        let (a, _a_endpoint, _a_capture) = actor().await;
+        let (b, _b_endpoint, _b_capture) = actor().await;
+
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        b.invite_connect(invite.code.clone()).await.unwrap();
+        let first = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(first.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&b, ConnectPhase::Connected).await;
+        host.revoke(first).await.unwrap();
+        let remembered = wait_for_history(&b, "nothing to reconnect to").await;
+        wait_for_phase(&b, ConnectPhase::Idle).await;
+
+        // A takes the screen, and with it the one place the plan has.
+        a.invite_connect(invite.code).await.unwrap();
+        let controller = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(controller.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&a, ConnectPhase::Connected).await;
+        wait_until("the controller never became a viewer", || {
+            viewers(&host_capture) == 1
+        })
+        .await;
+
+        // B asks for a shell. Under ADR 0101 this was a second controller on
+        // a one-guest plan, refused at the grant; now it is let in.
+        b.history_connect(remembered[0].peer_label.clone(), ViewSurface::Terminal)
+            .await
+            .unwrap();
+        let shell = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        wait_for_row(&host, &shell, "the request never said it was for a shell", |row| {
+            row.kind == SessionKind::Terminal
+        })
+        .await;
+        host.grant(shell.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&b, ConnectPhase::Connected).await;
+
+        let rows = host.status().await.unwrap();
+        let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
+        assert_eq!(row(&controller).state, SessionStateDto::Active);
+        assert!(row(&controller).grants.input, "the controller keeps the keyboard");
+        assert_eq!(row(&shell).state, SessionStateDto::Active);
+        assert_eq!(row(&shell).kind, SessionKind::Terminal);
+        assert!(row(&shell).grants.terminal && !row(&shell).grants.input);
+        assert_eq!(viewers(&host_capture), 1, "only the controller is captured for");
     }
 
     /// §10, ADR 0089: a link that drops mid-session comes back as the same

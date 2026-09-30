@@ -13,7 +13,7 @@
 
 import { html, type TemplateResult } from 'lit-html';
 
-import type { Locale } from './i18n';
+import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
 import type { Role } from './consent-dialog';
 import type { ConnectionStats } from './connection-quality';
@@ -116,6 +116,13 @@ export interface SessionStatus {
    * `recording_active`.
    */
   terminal_active: boolean;
+  /**
+   * Whether this guest came for a shell and nothing else (ADR 0131): a
+   * terminal session, which holds no picture and no input whatever `role`
+   * says and runs beside the one guest in control. On a pending row it is
+   * what the consent dialog asks about.
+   */
+  terminal_only: boolean;
   /**
    * Whether this guest wrote in the chat and nobody here has opened it yet.
    * Kept by the actor rather than by this window, so the session bar and the
@@ -435,6 +442,15 @@ const roleKey: Record<Role, 'status.role.viewOnly' | 'status.role.controlLimited
 };
 
 /**
+ * What a session's row calls it: its role, or — for a guest that came for a
+ * shell alone (ADR 0131) — that, since the role its invite named is not what
+ * it holds.
+ */
+export function sessionRoleKey(session: SessionStatus): TranslationKey {
+  return session.terminal_only ? 'status.role.terminal' : roleKey[session.role];
+}
+
+/**
  * The picture of a remembered host, or the glyph that stands in until a
  * session has been watched long enough to take one (ADR 0094;
  * `peer-thumbnails.ts`).
@@ -640,7 +656,7 @@ export function sessionStatus(
                   <div class="peer-card-face">
                     ${peerThumbnail('', locale)}
                     <span class="peer-card-caption">
-                      <span class="peer-meta">${t(locale, roleKey[session.role])}</span>
+                      <span class="peer-meta">${t(locale, sessionRoleKey(session))}</span>
                       <span class="peer-meta"
                         >${session.input ? t(locale, 'status.inputOn') : t(locale, 'status.inputOff')}</span
                       >

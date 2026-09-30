@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumepeer — remote terminal</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        color: #f2f2f5;
+        font-family: system-ui, sans-serif;
+      }
+      /* The shell is the window (ADR 0131), laid out like the terminal-only
+         view window of ADR 0101: its own header on top, the emulator below
+         taking everything that is left. */
+      #terminal {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        font-size: 0.85rem;
+      }
+      #terminal-screen {
+        flex: 1;
+        min-height: 0;
+      }
+      .term-head {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 0.5rem;
+      }
+      .term-head h3 {
+        margin: 0;
+        font-size: 0.9rem;
+      }
+      .term-state {
+        flex: 1;
+        opacity: 0.8;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- A terminal window beside a session that already has a window of its
+         own (ADR 0131). Two elements, as in view.html: `xterm.js` owns
+         `#terminal-screen` outright and a re-render would destroy it, so the
+         header is drawn into its own element. Filled by terminal-window.ts. -->
+    <main id="terminal" aria-labelledby="term-heading">
+      <div id="terminal-chrome"></div>
+      <div id="terminal-screen"></div>
+    </main>
+    <script type="module" src="/src/terminal-window.ts"></script>
+  </body>
+</html>

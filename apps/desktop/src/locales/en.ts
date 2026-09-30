@@ -9,6 +9,9 @@ export const en: Dictionary = {
   'consent.action.deny': 'Deny',
   'consent.action.allowView': 'Allow view only',
   'consent.action.allowFull': 'Allow full control',
+  'consent.action.allowTerminal': 'Allow terminal',
+  'consent.request.terminalBody':
+    'They are asking for a terminal only: a shell on this computer, with no view of the screen and no keyboard or mouse. It can run beside the session that is in control.',
   'invite.heading': 'Invite and connect',
   'invite.create': 'Create invite',
   // Used by the settings window (docs/bugs/05); the sidebar no longer offers
@@ -140,6 +143,7 @@ export const en: Dictionary = {
   'status.role.viewOnly': 'view only',
   'status.role.controlLimited': 'limited control',
   'status.role.fullControl': 'full control',
+  'status.role.terminal': 'terminal only',
   'status.ready': 'Ready to connect',
   'status.notReady': 'Not ready to connect',
   'status.noCapture':

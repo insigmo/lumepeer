@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "terminal-window",
+  "description": "Per-window capability of a terminal window opened beside a session that already has a window of its own (ADR 0131). It is that session's shells and nothing else: the five terminal commands, its own close and destroy scoped to its own label, and the close-request event it ends its shell on. Every terminal command still checks that the window's label names the session it acts on, and the host re-reads its own `terminal` grant for every shell. No screen, input, keyboard, file, tunnel, grant or settings command, and no wildcard entries.",
+  "windows": ["term-*"],
+  "local": true,
+  "permissions": [
+    "core:event:default",
+    {
+      "identifier": "core:window:allow-close",
+      "allow": [{ "label": "term-*" }]
+    },
+    {
+      "identifier": "core:window:allow-destroy",
+      "allow": [{ "label": "term-*" }]
+    },
+    "allow-terminal-open",
+    "allow-terminal-input",
+    "allow-terminal-resize",
+    "allow-terminal-close",
+    "allow-terminal-poll"
+  ]
+}

@@ -141,7 +141,11 @@ function draw(): void {
                 title=${t(locale, 'connections.peerId', session.peer_label)}
                 >${peerDisplayName(session)}</span
               >
-              <span class="bar-role">${t(locale, ROLE_KEY[session.role])}</span>
+              <!-- A terminal session holds a shell and nothing else, whatever
+                   role its invite named (ADR 0131). -->
+              <span class="bar-role"
+                >${t(locale, session.terminal_only ? 'status.role.terminal' : ROLE_KEY[session.role])}</span
+              >
               <!-- A shell running on this machine, said on the surface that
                    stays visible while the operator works in something else
                    (ADR 0079 decision 3, ADR 0055). Nothing switches it off

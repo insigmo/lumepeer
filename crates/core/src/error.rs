@@ -28,6 +28,14 @@ pub enum CoreError {
     #[error("another peer already holds the controller role")]
     ControllerAlreadyGranted,
 
+    /// The host already runs as many terminal sessions as it takes at once
+    /// (ADR 0131).
+    #[error("terminal session limit reached: {limit}")]
+    TerminalSessionLimit {
+        /// [`crate::constants::MAX_TERMINAL_SESSIONS`].
+        limit: usize,
+    },
+
     /// The peer has no pending or active session entry.
     #[error("unknown peer")]
     UnknownPeer,

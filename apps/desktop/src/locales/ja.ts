@@ -9,6 +9,9 @@ export const ja: Dictionary = {
   'consent.action.deny': '拒否',
   'consent.action.allowView': '閲覧のみ許可',
   'consent.action.allowFull': 'フルコントロールを許可',
+  'consent.action.allowTerminal': 'ターミナルを許可',
+  'consent.request.terminalBody':
+    'ターミナルのみを求めています。このコンピューター上のシェルで、画面は見えず、キーボードやマウスも使えません。操作中のセッションと並行して使えます。',
   'invite.heading': '招待して接続',
   'invite.create': '招待を作成',
   'invite.refresh': '現在のコードを無効化して新しく発行する',
@@ -133,6 +136,7 @@ export const ja: Dictionary = {
   'status.role.viewOnly': '閲覧のみ',
   'status.role.controlLimited': '限定的な操作',
   'status.role.fullControl': 'フルコントロール',
+  'status.role.terminal': 'ターミナルのみ',
   'status.ready': '接続の準備ができています',
   'status.notReady': '接続の準備ができていません',
   'status.noCapture':

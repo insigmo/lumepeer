@@ -9,6 +9,9 @@ export const es: Dictionary = {
   'consent.action.deny': 'Denegar',
   'consent.action.allowView': 'Permitir solo ver',
   'consent.action.allowFull': 'Permitir control total',
+  'consent.action.allowTerminal': 'Permitir terminal',
+  'consent.request.terminalBody':
+    'Solo pide un terminal: una shell en este equipo, sin ver la pantalla y sin teclado ni ratón. Puede funcionar junto a la sesión que tiene el control.',
   'invite.heading': 'Invitar y conectar',
   'invite.create': 'Crear invitación',
   'invite.refresh': 'Revocar el código actual y emitir uno nuevo',
@@ -134,6 +137,7 @@ export const es: Dictionary = {
   'status.role.viewOnly': 'solo ver',
   'status.role.controlLimited': 'control limitado',
   'status.role.fullControl': 'control total',
+  'status.role.terminal': 'solo terminal',
   'status.ready': 'Listo para conectar',
   'status.notReady': 'No listo para conectar',
   'status.noCapture':

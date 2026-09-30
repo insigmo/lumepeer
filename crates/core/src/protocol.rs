@@ -533,6 +533,25 @@ pub const FEATURE_TUNNEL: &str = "tunnel";
 /// refused with [`TerminalRefusal::NotGranted`].
 pub const FEATURE_TERMINAL: &str = "terminal";
 
+/// `Hello.features` string a guest sends when it came for a shell and nothing
+/// else (ADR 0131).
+///
+/// Not a capability like its neighbours but the one intent a `Hello` carries,
+/// and still ignorable in the §9.1 sense: a host that does not know it admits
+/// the guest as it always has, for the screen, and refuses it the same way
+/// when somebody else is in control. A host that does know it admits the guest
+/// to a terminal session — `terminal` and nothing else — which does not hold
+/// the controller role and takes no place under the plan's guest limit. It is
+/// never taken on trust: the only thing it can do for a guest is give it less
+/// than its role would have.
+///
+/// No new message and no minor bump: the guest needs no answer about it. Its
+/// terminal window already sends no input and dials no picture (ADR 0101),
+/// and the two grants a guest acts on by itself — the clipboard it offers and
+/// the files it sends — arrive narrowed in the `SessionGrants` every session
+/// already gets.
+pub const FEATURE_TERMINAL_ONLY: &str = "terminal-only";
+
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::RebootRequest`] (ADR 0084).
 ///

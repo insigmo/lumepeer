@@ -5,12 +5,13 @@ import { defineConfig } from 'vite';
 // Tauri serves this build from disk: no remote origins, fixed dev port so the
 // CSP and devUrl in tauri.conf.json stay exact (design doc §13).
 //
-// Five entries, because each Tauri window loads its own page: `index.html`
+// Six entries, because each Tauri window loads its own page: `index.html`
 // is the consent/invite/status screen of the main window, `view.html` is one
 // remote-view window per watched host, `hostbar.html` is the host's
 // always-on-top session bar (ADR 0055), `agentbar.html` is the session
-// agent's indicator (ADR 0085 §3b), and `files.html` is the file manager
-// (ADR 0124). Keeping them separate is also what keeps
+// agent's indicator (ADR 0085 §3b), `files.html` is the file manager
+// (ADR 0124), and `terminal.html` is a terminal window beside a session
+// (ADR 0131). Keeping them separate is also what keeps
 // the view window's bundle free of the main screen's code, and the two bars'
 // — which are on screen over everything else while a session runs — free of
 // both. The agent's page matters most here: it loads in a process with no
@@ -34,6 +35,7 @@ export default defineConfig({
         hostbar: resolve(import.meta.dirname, 'hostbar.html'),
         agentbar: resolve(import.meta.dirname, 'agentbar.html'),
         files: resolve(import.meta.dirname, 'files.html'),
+        terminal: resolve(import.meta.dirname, 'terminal.html'),
       },
     },
   },

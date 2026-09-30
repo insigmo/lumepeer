@@ -14,11 +14,11 @@ use crate::NodeId;
 use crate::audit::AuditEvent;
 pub use serde::{Deserialize, Serialize};
 
-use crate::constants::MAX_TUNNEL_TARGETS_PER_SESSION;
+use crate::constants::{MAX_TERMINAL_SESSIONS, MAX_TUNNEL_TARGETS_PER_SESSION};
 
 use crate::consent::{
     ConsentQueue, ConsentRateLimiter, ConsentTicket, ControlAction, ControlPolicy, Grants,
-    IndependentGrant, Role,
+    IndependentGrant, Role, SessionKind,
 };
 use crate::constants::RECONNECT_WINDOW_SECS;
 use crate::error::{CoreError, Result};
@@ -90,6 +90,10 @@ pub enum RejectReason {
 struct ActiveSession {
     session_id: [u8; 16],
     role: Role,
+    /// What the guest came for (ADR 0131). A [`SessionKind::Terminal`]
+    /// session is not the controller and holds no place under the plan's
+    /// guest limit, whatever its role says.
+    kind: SessionKind,
     grants: Grants,
     /// Allowlist captured when consent was granted. §8.2: a later policy edit
     /// applies to future grants only and never widens a running session.
@@ -246,8 +250,22 @@ impl SessionManager {
     ///   flooding peer cannot fill it.
     /// - [`CoreError::PendingConsentQueueFull`] as in [`Self::request_consent`].
     pub fn request_consent_as(&mut self, peer: NodeId, role: Role) -> Result<ConsentTicket> {
+        self.request_consent_for(peer, role, SessionKind::Screen)
+    }
+
+    /// [`Self::request_consent_as`], for a guest that said what it came for
+    /// (ADR 0131), so the host's dialog can say it too.
+    ///
+    /// # Errors
+    /// As [`Self::request_consent_as`].
+    pub fn request_consent_for(
+        &mut self,
+        peer: NodeId,
+        role: Role,
+        kind: SessionKind,
+    ) -> Result<ConsentTicket> {
         self.limiter.check(peer)?;
-        self.queue.push(peer, role)
+        self.queue.push_as(peer, role, kind)
     }
 
     /// Forgets `peer`'s consent-request history, e.g. after a session with it
@@ -261,7 +279,8 @@ impl SessionManager {
         self.limiter.forget(peer);
     }
 
-    /// Grants `role` to `peer`, moving it to `Active`.
+    /// Grants `role` to `peer` for a session onto the screen, moving it to
+    /// `Active`.
     ///
     /// # Errors
     /// - [`CoreError::ConcurrentGuestLimit`] if the plan ceiling would be
@@ -269,13 +288,56 @@ impl SessionManager {
     /// - [`CoreError::ControllerAlreadyGranted`] if another peer already holds
     ///   a controller role; the old controller must be revoked first (§8.2).
     pub fn grant(&mut self, peer: NodeId, role: Role) -> Result<()> {
-        let limit = self.plan.max_concurrent_guests();
-        let already_active = self.sessions.contains_key(&peer);
-        if !already_active && self.active_guest_count() >= usize::from(limit) {
-            return Err(CoreError::ConcurrentGuestLimit { limit });
-        }
-        if role.is_controller() && self.controller().is_some_and(|holder| holder != peer) {
-            return Err(CoreError::ControllerAlreadyGranted);
+        self.grant_as(peer, role, SessionKind::Screen)
+    }
+
+    /// Grants `role` to `peer` for what it came for, moving it to `Active`
+    /// (ADR 0131).
+    ///
+    /// A [`SessionKind::Screen`] session is held to the plan's guest limit and
+    /// to the single controller of §8.2, exactly as before. A
+    /// [`SessionKind::Terminal`] one is held to neither: it starts with
+    /// [`Grants::for_terminal`], which has no picture and no input in it, so
+    /// it takes nothing from the guest in control. It is held to
+    /// [`MAX_TERMINAL_SESSIONS`] instead.
+    ///
+    /// # Errors
+    /// - [`CoreError::ConcurrentGuestLimit`] and
+    ///   [`CoreError::ControllerAlreadyGranted`], for a screen session, as in
+    ///   [`Self::grant`].
+    /// - [`CoreError::TerminalSessionLimit`] if that many other terminal
+    ///   sessions are already running.
+    pub fn grant_as(&mut self, peer: NodeId, role: Role, kind: SessionKind) -> Result<()> {
+        // A re-grant of the session this peer already holds is not a new
+        // guest. One of the other kind is: it takes a place of this kind,
+        // which is exactly what the count below has to see.
+        let already_active = self
+            .sessions
+            .get(&peer)
+            .is_some_and(|session| session.kind == kind);
+        let others = self
+            .sessions
+            .iter()
+            .filter(|(holder, session)| **holder != peer && session.kind == kind)
+            .count();
+        match kind {
+            SessionKind::Screen => {
+                let limit = self.plan.max_concurrent_guests();
+                if !already_active && others >= usize::from(limit) {
+                    return Err(CoreError::ConcurrentGuestLimit { limit });
+                }
+                if role.is_controller() && self.controller().is_some_and(|holder| holder != peer)
+                {
+                    return Err(CoreError::ControllerAlreadyGranted);
+                }
+            }
+            SessionKind::Terminal => {
+                if !already_active && others >= MAX_TERMINAL_SESSIONS {
+                    return Err(CoreError::TerminalSessionLimit {
+                        limit: MAX_TERMINAL_SESSIONS,
+                    });
+                }
+            }
         }
 
         self.queue.remove(&peer);
@@ -283,7 +345,9 @@ impl SessionManager {
             .sessions
             .get(&peer)
             .map_or_else(Self::new_session_id, |s| s.session_id);
-        let allowed_actions = if role == Role::ControlLimited {
+        // Never for a terminal session: an allowlisted action is input, and
+        // input is exactly what that session does not get.
+        let allowed_actions = if role == Role::ControlLimited && kind == SessionKind::Screen {
             self.policy.allowed_for(&peer)
         } else {
             Vec::new()
@@ -304,7 +368,11 @@ impl SessionManager {
             ActiveSession {
                 session_id,
                 role,
-                grants: Grants::from_role(role),
+                kind,
+                grants: match kind {
+                    SessionKind::Screen => Grants::from_role(role),
+                    SessionKind::Terminal => Grants::for_terminal(role),
+                },
                 allowed_actions,
                 state: SessionState::Active,
                 disconnected_at: None,
@@ -532,11 +600,15 @@ impl SessionManager {
     }
 
     /// Peer holding a controller role, if any (§8.2: at most one).
+    ///
+    /// Only a session onto the screen can be it: a terminal session keeps the
+    /// role its invite named, but holds neither the picture nor the input the
+    /// role is about (ADR 0131).
     #[must_use]
     pub fn controller(&self) -> Option<NodeId> {
         self.sessions
             .iter()
-            .find(|(_, s)| s.role.is_controller())
+            .find(|(_, s)| s.kind == SessionKind::Screen && s.role.is_controller())
             .map(|(peer, _)| *peer)
     }
 
@@ -611,6 +683,12 @@ impl SessionManager {
     #[must_use]
     pub fn role(&self, peer: &NodeId) -> Option<Role> {
         self.sessions.get(peer).map(|s| s.role)
+    }
+
+    /// What `peer`'s session is for, if it has one (ADR 0131).
+    #[must_use]
+    pub fn kind(&self, peer: &NodeId) -> Option<SessionKind> {
+        self.sessions.get(peer).map(|s| s.kind)
     }
 
     /// Ends every session and drops the queue: screen lock, user switch,
@@ -1142,6 +1220,127 @@ mod tests {
         let mut lesser = SessionManager::new();
         lesser.grant(peer(3), Role::ControlLimited).unwrap();
         assert!(!lesser.terminal_allows(&peer(3)));
+    }
+
+    /// ADR 0131: one guest in control, and terminal sessions beside it —
+    /// on the plans that admit a single guest, where it matters most.
+    #[test]
+    fn terminal_sessions_sit_beside_the_controller_and_outside_the_plan() {
+        for plan in [Plan::Trial, Plan::Pro] {
+            let mut manager = SessionManager::with_plan(plan);
+            manager.grant(peer(1), Role::FullControl).unwrap();
+            for n in 2..=3 {
+                manager
+                    .grant_as(peer(n), Role::FullControl, SessionKind::Terminal)
+                    .unwrap();
+            }
+            assert_eq!(manager.controller(), Some(peer(1)));
+            assert_eq!(manager.kind(&peer(2)), Some(SessionKind::Terminal));
+            assert!(manager.terminal_allows(&peer(2)));
+
+            // The screen is still one guest's, and the plan still one guest's.
+            assert!(matches!(
+                manager.grant(peer(9), Role::ViewOnly),
+                Err(CoreError::ConcurrentGuestLimit { limit: 1 })
+            ));
+        }
+    }
+
+    /// ADR 0131: a terminal session holds a shell and nothing that reaches
+    /// the screen, the keyboard or the machine itself — whatever its role.
+    #[test]
+    fn a_terminal_session_holds_the_shell_and_nothing_else() {
+        let key = InputEventPayload {
+            logical: 0x41,
+            scancode: 0x1e,
+            modifiers: 0,
+            detail: crate::protocol::InputDetail::Press,
+        };
+        let mut manager = SessionManager::new();
+        manager
+            .grant_as(peer(1), Role::FullControl, SessionKind::Terminal)
+            .unwrap();
+        assert_eq!(
+            manager.grants(&peer(1)),
+            Some(Grants {
+                terminal: true,
+                ..Grants::default()
+            })
+        );
+        assert!(manager.authorize_input(&peer(1), &key).is_err());
+        assert_eq!(manager.controller(), None);
+
+        // A limited role whose allowlist names every action still injects
+        // nothing: the allowlist is input, and input belongs to the screen.
+        let mut limited = SessionManager::new();
+        limited.set_control_policy(
+            ControlPolicy::from_toml(
+                "[defaults]\nallow = [\"pointer_move\", \"pointer_click\", \"scroll\", \"key_press\"]\n",
+            )
+            .unwrap(),
+        );
+        limited
+            .grant_as(peer(2), Role::ControlLimited, SessionKind::Terminal)
+            .unwrap();
+        assert!(limited.allowed_actions(&peer(2)).is_empty());
+        assert!(limited.authorize_input(&peer(2), &key).is_err());
+        // And that role never carried a shell in the first place.
+        assert!(!limited.terminal_allows(&peer(2)));
+    }
+
+    /// ADR 0131: terminal sessions have a ceiling of their own.
+    #[test]
+    fn terminal_sessions_stop_at_their_own_limit() {
+        let mut manager = SessionManager::new();
+        for n in 1..=MAX_TERMINAL_SESSIONS {
+            manager
+                .grant_as(
+                    peer(u8::try_from(n).unwrap()),
+                    Role::FullControl,
+                    SessionKind::Terminal,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            manager.grant_as(peer(100), Role::FullControl, SessionKind::Terminal),
+            Err(CoreError::TerminalSessionLimit {
+                limit: MAX_TERMINAL_SESSIONS
+            })
+        ));
+        // A re-grant of one that is already running is not a new one.
+        manager
+            .grant_as(peer(1), Role::FullControl, SessionKind::Terminal)
+            .unwrap();
+        // And the screen is still there for one guest.
+        manager.grant(peer(100), Role::FullControl).unwrap();
+    }
+
+    /// ADR 0131: a guest that held a terminal and asks for the screen is a
+    /// new screen guest, held to the plan like one.
+    #[test]
+    fn a_terminal_session_asking_for_the_screen_counts_as_a_screen_guest() {
+        let mut manager = SessionManager::with_plan(Plan::Pro);
+        manager.grant(peer(1), Role::FullControl).unwrap();
+        manager
+            .grant_as(peer(2), Role::FullControl, SessionKind::Terminal)
+            .unwrap();
+        assert!(matches!(
+            manager.grant(peer(2), Role::ViewOnly),
+            Err(CoreError::ConcurrentGuestLimit { limit: 1 })
+        ));
+        assert_eq!(manager.kind(&peer(2)), Some(SessionKind::Terminal));
+    }
+
+    /// ADR 0131: the host's dialog is told what the guest came for.
+    #[test]
+    fn a_queued_request_carries_what_it_came_for() {
+        let mut manager = SessionManager::new();
+        manager
+            .request_consent_for(peer(1), Role::FullControl, SessionKind::Terminal)
+            .unwrap();
+        manager.request_consent_as(peer(2), Role::FullControl).unwrap();
+        let kinds: Vec<_> = manager.pending().iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, [SessionKind::Terminal, SessionKind::Screen]);
     }
 
     /// ADR 0078: the grant and the address are two decisions, and a tunnel

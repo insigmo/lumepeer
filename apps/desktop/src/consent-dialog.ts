@@ -40,7 +40,9 @@ export function consentDialog(
     <div class="consent-backdrop">
       <section class="consent" role="dialog" aria-modal="true" aria-labelledby="consent-title">
         <h1 id="consent-title">${t(locale, 'consent.request.title', request.peer_label)}</h1>
-        <p>${t(locale, 'consent.request.body')}</p>
+        <p>
+          ${t(locale, request.terminal_only ? 'consent.request.terminalBody' : 'consent.request.body')}
+        </p>
         <div class="consent-actions">
           <button
             type="button"
@@ -50,20 +52,36 @@ export function consentDialog(
           >
             ${t(locale, 'consent.action.deny')}
           </button>
-          <button
-            type="button"
-            class="consent-action-view"
-            @click=${() => void grant(request.peer_label, 'view_only')}
-          >
-            ${t(locale, 'consent.action.allowView')}
-          </button>
-          <button
-            type="button"
-            class="consent-action-full"
-            @click=${() => void grant(request.peer_label, 'full_control')}
-          >
-            ${t(locale, 'consent.action.allowFull')}
-          </button>
+          ${request.terminal_only
+            ? // A guest that came for a shell (ADR 0131) is let in or not:
+              // a lesser role would carry no shell at all, and the host
+              // grants this one the shell and nothing else whatever the
+              // role, so full control is the only answer that is a yes.
+              html`
+                <button
+                  type="button"
+                  class="consent-action-terminal"
+                  @click=${() => void grant(request.peer_label, 'full_control')}
+                >
+                  ${t(locale, 'consent.action.allowTerminal')}
+                </button>
+              `
+            : html`
+                <button
+                  type="button"
+                  class="consent-action-view"
+                  @click=${() => void grant(request.peer_label, 'view_only')}
+                >
+                  ${t(locale, 'consent.action.allowView')}
+                </button>
+                <button
+                  type="button"
+                  class="consent-action-full"
+                  @click=${() => void grant(request.peer_label, 'full_control')}
+                >
+                  ${t(locale, 'consent.action.allowFull')}
+                </button>
+              `}
         </div>
       </section>
     </div>

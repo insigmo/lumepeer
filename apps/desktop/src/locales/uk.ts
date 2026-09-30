@@ -9,6 +9,9 @@ export const uk: Dictionary = {
   'consent.action.deny': 'Відхилити',
   'consent.action.allowView': 'Дозволити лише перегляд',
   'consent.action.allowFull': 'Дозволити повний доступ',
+  'consent.action.allowTerminal': 'Дозволити термінал',
+  'consent.request.terminalBody':
+    'Просить лише термінал: оболонку на цьому комп’ютері, без перегляду екрана та без клавіатури й миші. Може працювати паралельно із сеансом, що керує комп’ютером.',
   'invite.heading': 'Запрошення та підключення',
   'invite.create': 'Створити запрошення',
   'invite.refresh': 'Відкликати поточний код і видати новий',
@@ -134,6 +137,7 @@ export const uk: Dictionary = {
   'status.role.viewOnly': 'лише перегляд',
   'status.role.controlLimited': 'обмежене керування',
   'status.role.fullControl': 'повний доступ',
+  'status.role.terminal': 'лише термінал',
   'status.ready': 'Готово до підключення',
   'status.notReady': 'Не готово до підключення',
   'status.noCapture':

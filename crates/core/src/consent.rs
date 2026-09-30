@@ -34,6 +34,24 @@ impl Role {
     }
 }
 
+/// What a guest came to this host for (ADR 0131).
+///
+/// Said by the guest in its `Hello` and never trusted as a claim: a
+/// [`Self::Terminal`] session is handed [`Grants::for_terminal`], which is
+/// strictly less than the role would give, so a guest that lies about it
+/// only ends up with less. That is also why it may sit beside a controller:
+/// it holds no picture and no input, and a host that runs one controller and
+/// four shells has still let exactly one guest at its screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    /// The host's screen, with whatever the role grants on top of it.
+    #[default]
+    Screen,
+    /// A shell and nothing else.
+    Terminal,
+}
+
 /// The independent grants an active session may hold (§8.1).
 ///
 /// All fields default to `false`: a fresh session grants nothing.
@@ -262,6 +280,23 @@ impl Grants {
         }
     }
 
+    /// Grants a terminal session starts with (ADR 0131): `terminal`, when the
+    /// role would have carried it, and nothing else.
+    ///
+    /// No `view`, so the host refuses the media connection and never starts
+    /// a capture for it; no `input`, so nothing it sends reaches the desktop
+    /// of whoever is in control; and none of the rest, because each of them
+    /// either acts on the screen or would let a second guest reach past the
+    /// one the host put in charge of it. The host can still switch any of the
+    /// independent ones on for this session afterwards, as for any other.
+    #[must_use]
+    pub fn for_terminal(role: Role) -> Self {
+        Self {
+            terminal: Self::from_role(role).terminal,
+            ..Self::default()
+        }
+    }
+
     /// Sets `which` to `allowed`, leaving `view` and `input` untouched.
     pub fn set(&mut self, which: IndependentGrant, allowed: bool) {
         match which {
@@ -389,6 +424,8 @@ pub struct ConsentTicket {
     pub peer: NodeId,
     /// Role the peer asked for; the host may grant a lower one.
     pub requested_role: Role,
+    /// What the peer came for, so the dialog can say so (ADR 0131).
+    pub kind: SessionKind,
     /// Monotonic instant, not wall-clock (§12.3).
     pub requested_at: std::time::Instant,
     /// 0-based position, bounded by `MAX_PENDING_CONSENTS`.
@@ -432,12 +469,26 @@ impl ConsentQueue {
     /// [`CoreError::PendingConsentQueueFull`] when the queue already holds
     /// `MAX_PENDING_CONSENTS` requests.
     pub fn push(&mut self, peer: NodeId, requested_role: Role) -> Result<ConsentTicket> {
+        self.push_as(peer, requested_role, SessionKind::Screen)
+    }
+
+    /// [`Self::push`], for a request that says what it came for (ADR 0131).
+    ///
+    /// # Errors
+    /// As [`Self::push`].
+    pub fn push_as(
+        &mut self,
+        peer: NodeId,
+        requested_role: Role,
+        kind: SessionKind,
+    ) -> Result<ConsentTicket> {
         if self.pending.len() >= MAX_PENDING_CONSENTS {
             return Err(CoreError::PendingConsentQueueFull);
         }
         let ticket = ConsentTicket {
             peer,
             requested_role,
+            kind,
             requested_at: std::time::Instant::now(),
             queue_position: u8::try_from(self.pending.len()).unwrap_or(u8::MAX),
         };

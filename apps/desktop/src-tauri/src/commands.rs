@@ -19,6 +19,7 @@ use tauri::Window;
 use crate::AppState;
 use lumepeer_runtime::net_errors::classify_net;
 use lumepeer_runtime::network::{ActorError, SessionStateDto};
+use lumepeer_runtime::view::TerminalWindow;
 
 /// Label of the window allowed to call the session/invite/license commands.
 const MAIN_WINDOW_LABEL: &str = "main";
@@ -35,6 +36,15 @@ const VIEW_WINDOW_PREFIX: &str = "view-";
 /// session that already has its screen open, which closes without ending
 /// anything.
 pub const FILES_WINDOW_PREFIX: &str = "files-";
+
+/// Label prefix of a terminal window opened beside a session that already has
+/// a window of its own (ADR 0131).
+///
+/// The same shape as [`FILES_WINDOW_PREFIX`]: a second window onto a running
+/// session instead of a second connect to the same host, which the actor
+/// would refuse. It runs its own shells and nothing else, and closing it ends
+/// those and not the session.
+pub const TERMINAL_WINDOW_PREFIX: &str = "term-";
 
 /// Error returned to the webview. Carries a code and a short message, never
 /// secrets, tickets, tokens or raw peer identities (§15).
@@ -225,6 +235,20 @@ fn check_file_window(window: &Window, peer: &str) -> Result<(), IpcError> {
     }
 }
 
+/// [`check_view_window`], or the terminal window opened beside that view
+/// (ADR 0131), answering which of the two is asking.
+///
+/// Only for the terminal commands: that window is the same session's shells
+/// and nothing else. Which window asked is what keeps each one's shells its
+/// own — both poll the same host, and each must read only what it opened.
+fn check_terminal_window(window: &Window, peer: &str) -> Result<TerminalWindow, IpcError> {
+    if window.label().strip_prefix(TERMINAL_WINDOW_PREFIX) == Some(peer) {
+        Ok(TerminalWindow::Beside)
+    } else {
+        check_view_window(window, peer).map(|()| TerminalWindow::Session)
+    }
+}
+
 /// Role as seen by the webview.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -398,6 +422,11 @@ pub struct SessionStatusDto {
     /// `recording`: the indicator the host cannot switch off hangs off this
     /// one (ADR 0079).
     pub terminal_active: bool,
+    /// Whether this guest came for a shell and nothing else (ADR 0131): a
+    /// terminal session, which holds no picture and no input whatever `role`
+    /// says, and sits beside the one guest in control rather than instead
+    /// of it. What the consent dialog asks about, and how the row reads.
+    pub terminal_only: bool,
     /// Whether this guest wrote in the chat and the host has not opened it
     /// yet (§9.2). Cleared by [`chat_mark_read`].
     pub chat_unread: bool,
@@ -819,6 +848,7 @@ pub async fn session_status(
             tunnel: s.grants.tunnel,
             terminal: s.grants.terminal,
             terminal_active: s.terminal_active,
+            terminal_only: s.kind == lumepeer_core::consent::SessionKind::Terminal,
             chat_unread: s.chat_unread,
         })
         .collect())
@@ -921,11 +951,16 @@ pub async fn history_connect(
     };
     // A session already running onto that host gets its file manager opened
     // beside it rather than a second connect, which the actor would refuse
-    // as a duplicate of the live one (ADR 0124).
-    if surface == ViewSurface::Files
+    // as a duplicate of the live one (ADR 0124). A terminal the same way
+    // (ADR 0131): its shells ride the session that is already there.
+    if matches!(surface, ViewSurface::Files | ViewSurface::Terminal)
         && let Some(peer) = state.network.watching_host(args.peer.clone()).await?
     {
-        crate::view_windows::open_files_window(&app, &peer);
+        if surface == ViewSurface::Files {
+            crate::view_windows::open_files_window(&app, &peer);
+        } else {
+            crate::view_windows::open_terminal_window(&app, &peer);
+        }
         return Ok(());
     }
     state.network.history_connect(args.peer, surface).await?;
@@ -2868,10 +2903,10 @@ pub async fn terminal_open(
     state: tauri::State<'_, AppState>,
     args: TerminalOpenArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    let asking = check_terminal_window(&window, &args.peer)?;
     state
         .network
-        .terminal_open(args.peer, args.cols, args.rows)
+        .terminal_open(args.peer, asking, args.cols, args.rows)
         .await?;
     Ok(())
 }
@@ -2901,7 +2936,7 @@ pub async fn terminal_input(
     state: tauri::State<'_, AppState>,
     args: TerminalInputArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_terminal_window(&window, &args.peer)?;
     state
         .network
         .terminal_input(args.peer, args.shell, args.data)
@@ -2932,7 +2967,7 @@ pub async fn terminal_resize(
     state: tauri::State<'_, AppState>,
     args: TerminalResizeArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_terminal_window(&window, &args.peer)?;
     state
         .network
         .terminal_resize(args.peer, args.shell, args.cols, args.rows)
@@ -2961,7 +2996,7 @@ pub async fn terminal_close(
     state: tauri::State<'_, AppState>,
     args: TerminalCloseArgs,
 ) -> Result<(), IpcError> {
-    check_view_window(&window, &args.peer)?;
+    check_terminal_window(&window, &args.peer)?;
     state.network.terminal_close(args.peer, args.shell).await?;
     Ok(())
 }
@@ -2994,8 +3029,8 @@ pub async fn terminal_poll(
     state: tauri::State<'_, AppState>,
     args: TerminalPollArgs,
 ) -> Result<tauri::ipc::Response, IpcError> {
-    check_view_window(&window, &args.peer)?;
-    let bytes = state.network.terminal_poll(args.peer).await?;
+    let asking = check_terminal_window(&window, &args.peer)?;
+    let bytes = state.network.terminal_poll(args.peer, asking).await?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -4353,7 +4388,7 @@ mod tests {
     /// copies may grant more than production, never less.
     #[test]
     fn the_pilot_capabilities_allow_everything_production_does() {
-        for file in ["main.json", "view.json", "hostbar.json"] {
+        for file in ["main.json", "view.json", "hostbar.json", "terminal.json"] {
             let pilot = capability_commands("capabilities-pilot", file);
             for command in capability_commands("capabilities", file) {
                 assert!(
