@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-09-10
 Amended by: ADR 0130 (a Unix shell gets a UTF-8 `LC_CTYPE` when it inherits none)
+Amended by: ADR 0132 (a Unix shell is told `TERM=xterm-256color` and `COLORTERM=truecolor`)
 
 Follows [ADR 0078](0078-a-tunnel-is-a-grant-plus-an-address-the-host-named.md)
 in shape — a capability nothing already granted implies gets a flag of its own,

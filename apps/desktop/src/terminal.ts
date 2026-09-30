@@ -17,7 +17,9 @@
 // ADR 0041) — the same rule that keeps clipboard contents out of the audit
 // log.
 
-import { html, render, type TemplateResult } from 'lit-html';
+import type { ITheme } from '@xterm/xterm';
+import { html, nothing, render, type TemplateResult } from 'lit-html';
+import { styleMap } from 'lit-html/directives/style-map.js';
 
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
@@ -169,12 +171,75 @@ export function decodeTerminalPoll(buffer: ArrayBufferLike): TerminalEvent[] {
   return events;
 }
 
+/**
+ * The emulator's colours: the app's dark palette, as the sixteen colours a
+ * shell asks for by number (ADR 0132).
+ *
+ * Dark whatever the app's theme is, because the view window is: the terminal
+ * sits on a video picture or fills a window of its own, and in both it is the
+ * panel's black. Every colour but `black` reads at 4.5:1 or better on the
+ * background; `black` is the one programs paint *behind* text with.
+ */
+export const TERMINAL_THEME: ITheme = {
+  background: '#0e1115',
+  foreground: '#e9ecf2',
+  cursor: '#8aa9ff',
+  cursorAccent: '#0e1115',
+  selectionBackground: 'rgba(110, 145, 245, 0.35)',
+  black: '#2a303b',
+  red: '#ff6d7b',
+  green: '#3ccf8e',
+  yellow: '#f2b441',
+  blue: '#6f95ff',
+  magenta: '#c68cf5',
+  cyan: '#46c6d6',
+  white: '#c3c9d4',
+  brightBlack: '#7a8293',
+  brightRed: '#ff929c',
+  brightGreen: '#62dca5',
+  brightYellow: '#f7ca72',
+  brightBlue: '#8aa9ff',
+  brightMagenta: '#d8aefc',
+  brightCyan: '#79dbe7',
+  brightWhite: '#f5f7fa',
+};
+
+/** The app's `--font-mono`, which `xterm.js` cannot read from CSS. */
+const TERMINAL_FONT = "ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace";
+
+/**
+ * What a line this window wrote itself is: news about the shell, or a refusal
+ * (ADR 0132).
+ */
+export type TerminalLineTone = 'note' | 'error';
+
+/**
+ * The SGR each tone is drawn in: grey italic for news, bold red for a refusal.
+ * Numbered colours rather than literal ones, so they come from
+ * {@link TERMINAL_THEME} like everything the shell draws.
+ */
+const LINE_STYLE: Readonly<Record<TerminalLineTone, string>> = {
+  note: '\x1b[3;90m',
+  error: '\x1b[1;31m',
+};
+
+/**
+ * One line this window wrote itself, set apart from the shell's (ADR 0132).
+ *
+ * The reset comes first because the shell may have left a colour on that ours
+ * must not inherit, and last so that nothing the shell draws next inherits
+ * ours.
+ */
+export function ownLine(text: string, tone: TerminalLineTone): string {
+  return `\r\n\x1b[0m${LINE_STYLE[tone]}${text}\x1b[0m`;
+}
+
 /** Where a session draws; `xterm.js` in the window, a fake in the tests. */
 export interface TerminalScreen {
   /** Raw bytes from the shell, escape sequences and all. */
   write(data: Uint8Array): void;
   /** A line this window wrote itself — a refusal, or "the shell ended". */
-  writeLine(text: string): void;
+  writeLine(text: string, tone: TerminalLineTone): void;
 }
 
 /** What the panel is showing right now. */
@@ -255,13 +320,13 @@ export class TerminalSession {
           if (event.shell === this.#shell) {
             this.#shell = null;
             this.#status = 'closed';
-            this.screen.writeLine(t(this.locale, 'terminal.ended'));
+            this.screen.writeLine(t(this.locale, 'terminal.ended'), 'note');
           }
           break;
         case 'refused':
           this.#status = 'refused';
           this.#refusal = event.reason;
-          this.screen.writeLine(t(this.locale, REFUSAL_KEYS[event.reason]));
+          this.screen.writeLine(t(this.locale, REFUSAL_KEYS[event.reason]), 'error');
           break;
       }
     }
@@ -344,7 +409,7 @@ export function terminalChrome(
   return html`
     <div class="term-head">
       <h3 id="term-heading">${t(locale, 'terminal.heading')}</h3>
-      <span class="term-state" role="status" data-testid="terminal-state"
+      <span class="term-state" role="status" data-testid="terminal-state" data-status=${status}
         >${t(locale, terminalStatusKey(status))}</span
       >
       <button
@@ -354,6 +419,110 @@ export function terminalChrome(
         @click=${onClose}
       >
         ${t(locale, 'terminal.close')}
+      </button>
+    </div>
+  `;
+}
+
+/** What a key does to the clipboard instead of reaching the shell (ADR 0132). */
+export type TerminalClipboardKey = 'copy' | 'paste' | null;
+
+/**
+ * Which keys copy and paste rather than go to the shell, on a guest whose
+ * shortcuts use Ctrl (ADR 0132).
+ *
+ * `Ctrl+C` stays the interrupt it is in every terminal, unless text is
+ * selected — then it copies, as it does in Windows Terminal. `Ctrl+V` pastes;
+ * the `^V` it would otherwise send is a shell's quoted-insert, which nobody
+ * reaches for in a remote window. `Ctrl+Shift+C`/`V` always copy and paste,
+ * as in a Linux terminal. Physical keys rather than characters, so the
+ * shortcuts work under a Russian layout too. A Mac guest never gets here: its
+ * `⌘C`/`⌘V` are not keys the emulator sends, and the webview copies and
+ * pastes them itself.
+ */
+export function terminalClipboardKey(
+  event: Pick<KeyboardEvent, 'type' | 'code' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'metaKey'>,
+  hasSelection: boolean,
+): TerminalClipboardKey {
+  if (event.type !== 'keydown' || !event.ctrlKey || event.altKey || event.metaKey) {
+    return null;
+  }
+  if (event.code === 'KeyC' && (event.shiftKey || hasSelection)) {
+    return 'copy';
+  }
+  if (event.code === 'KeyV') {
+    return 'paste';
+  }
+  return null;
+}
+
+/** Where the terminal's own menu is open, and whether there is anything to copy. */
+export interface TerminalMenuState {
+  x: number;
+  y: number;
+  canCopy: boolean;
+}
+
+/** What the menu's three items do. */
+export interface TerminalMenuActions {
+  copy(): void;
+  paste(): void;
+  selectAll(): void;
+}
+
+/**
+ * The menu a right click opens over the terminal (ADR 0132).
+ *
+ * The window suppresses the webview's own menu everywhere — over the picture
+ * a right click belongs to the host — so without this one a right click in
+ * the shell did nothing at all. Copy is disabled rather than hidden when
+ * nothing is selected, so the menu keeps its shape. The shortcuts beside the
+ * items are the ones {@link terminalClipboardKey} answers to.
+ */
+export function terminalMenu(
+  menu: TerminalMenuState | null,
+  locale: Locale,
+  mac: boolean,
+  actions: TerminalMenuActions,
+): TemplateResult | typeof nothing {
+  if (!menu) {
+    return nothing;
+  }
+  const modifier = mac ? '⌘' : 'Ctrl+';
+  return html`
+    <div
+      class="term-menu"
+      role="menu"
+      data-testid="terminal-menu"
+      style=${styleMap({ left: `${menu.x}px`, top: `${menu.y}px` })}
+    >
+      <button
+        type="button"
+        role="menuitem"
+        class="term-menu-item"
+        data-testid="terminal-menu-copy"
+        ?disabled=${!menu.canCopy}
+        @click=${actions.copy}
+      >
+        <span>${t(locale, 'terminal.menu.copy')}</span><kbd>${modifier}C</kbd>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="term-menu-item"
+        data-testid="terminal-menu-paste"
+        @click=${actions.paste}
+      >
+        <span>${t(locale, 'terminal.menu.paste')}</span><kbd>${modifier}V</kbd>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        class="term-menu-item"
+        data-testid="terminal-menu-select-all"
+        @click=${actions.selectAll}
+      >
+        <span>${t(locale, 'terminal.menu.selectAll')}</span>
       </button>
     </div>
   `;
@@ -397,19 +566,118 @@ export async function mountTerminal(
   onClose: () => void,
   commands: TerminalCommands = tauriTerminalCommands,
 ): Promise<TerminalControls> {
-  const { Terminal } = await import('@xterm/xterm');
+  const [{ Terminal }, { FitAddon }] = await Promise.all([
+    import('@xterm/xterm'),
+    import('@xterm/addon-fit'),
+  ]);
   const emulator = new Terminal({
     scrollback: TERMINAL_SCROLLBACK_LINES,
     convertEol: false,
     // Announcing every byte would make a build log unusable with a screen
     // reader; announcing the line the cursor is on is what a terminal is.
     screenReaderMode: true,
+    theme: TERMINAL_THEME,
+    fontFamily: TERMINAL_FONT,
+    fontSize: 13,
+    lineHeight: 1.2,
+    cursorBlink: true,
+    cursorStyle: 'bar',
   });
+  // The shell is as many columns and rows as the window has room for, and
+  // follows it when it changes size (ADR 0132). Without this it was the
+  // emulator's default 80×24 in whatever size of window it sat in. A fit is
+  // at most once a frame, because dragging a window edge resizes on every
+  // pixel and each fit that changes the grid is a resize sent to the host.
+  const fit = new FitAddon();
+  emulator.loadAddon(fit);
   emulator.open(root);
+  // A window laid out at no size at all — minimized, or not yet shown — is
+  // not a size to give the shell. The addon floors "no room" at 2×1, and a
+  // shell handed that redraws its prompt two characters to a line into the
+  // scrollback. So the floor itself is the signal to leave the size alone.
+  const fitToWindow = (): void => {
+    const room = fit.proposeDimensions();
+    if (room && room.cols > 2 && room.rows > 1) {
+      fit.fit();
+    }
+  };
+  fitToWindow();
+  let fitting = 0;
+  const resizer = new ResizeObserver(() => {
+    cancelAnimationFrame(fitting);
+    fitting = requestAnimationFrame(fitToWindow);
+  });
+  resizer.observe(root);
+
+  // Copy and paste (ADR 0132). The keys are left to the webview rather than
+  // done here: the emulator already answers the webview's own `copy` and
+  // `paste` events, bracketed paste included, and a paste the webview does
+  // itself needs no permission to read the clipboard. The menu has no such
+  // event to ride on, so it goes through the clipboard API.
+  const mac = /Macintosh|Mac OS X/.test(navigator.userAgent);
+  emulator.attachCustomKeyEventHandler(
+    (event) => mac || terminalClipboardKey(event, emulator.hasSelection()) === null,
+  );
+  const menuHost = document.createElement('div');
+  document.body.append(menuHost);
+  let menu: TerminalMenuState | null = null;
+  const drawMenu = (): void => {
+    render(terminalMenu(menu, locale, mac, menuActions), menuHost);
+  };
+  const closeMenu = (): void => {
+    if (menu) {
+      menu = null;
+      drawMenu();
+      emulator.focus();
+    }
+  };
+  const menuActions: TerminalMenuActions = {
+    copy: () => {
+      const text = emulator.getSelection();
+      closeMenu();
+      void navigator.clipboard.writeText(text).catch(reportFailure('the selection could not be copied'));
+    },
+    paste: () => {
+      closeMenu();
+      void navigator.clipboard
+        .readText()
+        .then((text) => emulator.paste(text))
+        .catch(reportFailure('the clipboard could not be pasted'));
+    },
+    selectAll: () => {
+      closeMenu();
+      emulator.selectAll();
+    },
+  };
+  root.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    menu = { x: event.clientX, y: event.clientY, canCopy: emulator.hasSelection() };
+    drawMenu();
+    // Kept inside the window: opened near an edge, it moves in rather than
+    // being cut off.
+    const shown = menuHost.querySelector<HTMLElement>('.term-menu');
+    if (shown) {
+      const box = shown.getBoundingClientRect();
+      shown.style.left = `${Math.max(0, Math.min(box.left, window.innerWidth - box.width))}px`;
+      shown.style.top = `${Math.max(0, Math.min(box.top, window.innerHeight - box.height))}px`;
+    }
+  });
+  const dismissOnPointer = (event: PointerEvent): void => {
+    if (!menuHost.contains(event.target as Node | null)) {
+      closeMenu();
+    }
+  };
+  const dismissOnEscape = (event: KeyboardEvent): void => {
+    if (event.key === 'Escape') {
+      closeMenu();
+    }
+  };
+  document.addEventListener('pointerdown', dismissOnPointer, true);
+  document.addEventListener('keydown', dismissOnEscape, true);
 
   const screen: TerminalScreen = {
     write: (data) => emulator.write(data),
-    writeLine: (text) => emulator.writeln(`\r\n${text}`),
+    writeLine: (text, tone) => emulator.writeln(ownLine(text, tone)),
   };
   const session = new TerminalSession(peer, commands, screen, locale);
   const draw = (): void => {
@@ -444,6 +712,14 @@ export async function mountTerminal(
         session.apply(decodeTerminalPoll(body));
         if (session.status !== before) {
           draw();
+          // The size asked for at open is the size the window had then; one
+          // that changed while the host was answering has no shell to reach
+          // until now.
+          if (session.status === 'open') {
+            void session
+              .resize(emulator.cols, emulator.rows)
+              .catch(reportFailure('the shell could not be resized'));
+          }
         }
       })
       .catch(reportFailure('the shell could not be read'));
@@ -459,6 +735,11 @@ export async function mountTerminal(
     },
     stop(): void {
       clearInterval(timer);
+      resizer.disconnect();
+      cancelAnimationFrame(fitting);
+      document.removeEventListener('pointerdown', dismissOnPointer, true);
+      document.removeEventListener('keydown', dismissOnEscape, true);
+      menuHost.remove();
       void session.close().catch(reportFailure('the shell could not be closed'));
       emulator.dispose();
     },

@@ -14,18 +14,41 @@ import { SUPPORTED_LOCALES, t } from './i18n';
 import {
   decodeTerminalPoll,
   mountTerminal,
+  ownLine,
   terminalChrome,
+  terminalClipboardKey,
+  terminalMenu,
+  TERMINAL_THEME,
   TerminalSession,
   type TerminalCommands,
   type TerminalEvent,
+  type TerminalLineTone,
   type TerminalScreen,
 } from './terminal';
 
+/** What the last emulator was constructed with, loaded and handed. */
+const emulator = vi.hoisted(() => ({
+  options: undefined as unknown,
+  addons: [] as unknown[],
+  pasted: [] as string[],
+  selection: '',
+  fits: 0,
+  /** What the fit addon would size the grid to: the room the window has. */
+  room: { cols: 120, rows: 40 },
+  /** The last `ResizeObserver` callback, for a test to call as a resize. */
+  onResize: (() => {}) as () => void,
+}));
+
 // `mountTerminal` loads the emulator itself, and a real `xterm.js` in jsdom
-// would measure a font that is not there. These six calls are the whole of
-// what it asks of one, so the stand-in is the whole of what it needs.
+// would measure a font that is not there. These calls are the whole of what
+// it asks of one, so the stand-in is the whole of what it needs.
 vi.mock('@xterm/xterm', () => ({
   Terminal: class {
+    constructor(options: unknown) {
+      emulator.options = options;
+      emulator.addons = [];
+      emulator.pasted = [];
+    }
     cols = 80;
     rows = 24;
     open(): void {}
@@ -34,8 +57,45 @@ vi.mock('@xterm/xterm', () => ({
     onData(): void {}
     onResize(): void {}
     dispose(): void {}
+    focus(): void {}
+    loadAddon(addon: unknown): void {
+      emulator.addons.push(addon);
+    }
+    attachCustomKeyEventHandler(): void {}
+    hasSelection(): boolean {
+      return emulator.selection !== '';
+    }
+    getSelection(): string {
+      return emulator.selection;
+    }
+    selectAll(): void {}
+    paste(text: string): void {
+      emulator.pasted.push(text);
+    }
   },
 }));
+vi.mock('@xterm/addon-fit', () => ({
+  FitAddon: class {
+    proposeDimensions(): { cols: number; rows: number } {
+      return emulator.room;
+    }
+    fit(): void {
+      emulator.fits += 1;
+    }
+  },
+}));
+// jsdom has no layout, so nothing would ever call it back on its own; a test
+// that wants a resize calls `emulator.onResize`.
+vi.stubGlobal(
+  'ResizeObserver',
+  class {
+    constructor(callback: () => void) {
+      emulator.onResize = callback;
+    }
+    observe(): void {}
+    disconnect(): void {}
+  },
+);
 const PEER = 'guest-ab12';
 
 const EVENT_OUTPUT = 0;
@@ -72,14 +132,23 @@ function commands(): TerminalCommands & Record<keyof TerminalCommands, ReturnTyp
 }
 
 /** A screen that records rather than draws, so no emulator is needed. */
-function screen(): TerminalScreen & { written: Uint8Array[]; lines: string[] } {
+function screen(): TerminalScreen & {
+  written: Uint8Array[];
+  lines: string[];
+  tones: TerminalLineTone[];
+} {
   const written: Uint8Array[] = [];
   const lines: string[] = [];
+  const tones: TerminalLineTone[] = [];
   return {
     written,
     lines,
+    tones,
     write: (data) => written.push(data),
-    writeLine: (text) => lines.push(text),
+    writeLine: (text, tone) => {
+      lines.push(text);
+      tones.push(tone);
+    },
   };
 }
 
@@ -240,6 +309,7 @@ describe('one shell', () => {
     expect(session.shell).toBeNull();
     expect(session.status).toBe('closed');
     expect(sink.lines).toContain(t('en', 'terminal.ended'));
+    expect(sink.tones).toEqual(['note']);
   });
 
   it('ends the shell on the host when the window is done with it', async () => {
@@ -269,6 +339,7 @@ describe('a refusal', () => {
       expect(session.status).toBe('refused');
       expect(session.shell).toBeNull();
       expect(sink.lines).toEqual([t('en', key)]);
+      expect(sink.tones).toEqual(['error']);
     }
   });
 
@@ -280,6 +351,152 @@ describe('a refusal', () => {
     await session.open(80, 24);
     expect(cmds.open).toHaveBeenCalledTimes(2);
     expect(session.refusal).toBeNull();
+  });
+});
+
+// ADR 0132: what this window says is told apart from what the shell says, and
+// the shell's colours are the app's.
+describe('how it looks', () => {
+  it('sets its own lines apart and leaves no colour on for the shell', () => {
+    const note = ownLine('Shell ended', 'note');
+    // Reset first, whatever the shell left on; reset last, so its next
+    // prompt starts plain.
+    expect(note.startsWith('\r\n\x1b[0m')).toBe(true);
+    expect(note.endsWith('Shell ended\x1b[0m')).toBe(true);
+    expect(ownLine('Shell ended', 'error')).not.toBe(note);
+  });
+
+  it('draws the shell in the app palette', async () => {
+    const root = document.createElement('div');
+    const chrome = document.createElement('div');
+    const controls = await mountTerminal(root, chrome, 'en', PEER, () => {}, commands());
+    expect(emulator.options).toMatchObject({ theme: TERMINAL_THEME });
+    controls.stop();
+  });
+
+  // The shell was 80×24 in a window of any size.
+  it('sizes the shell to the window rather than to 80×24', async () => {
+    const { FitAddon } = await import('@xterm/addon-fit');
+    const controls = await mountTerminal(
+      document.createElement('div'),
+      document.createElement('div'),
+      'en',
+      PEER,
+      () => {},
+      commands(),
+    );
+    expect(emulator.addons.some((addon) => addon instanceof FitAddon)).toBe(true);
+    controls.stop();
+  });
+
+  it('follows the window, but not down to no size at all', async () => {
+    const controls = await mountTerminal(
+      document.createElement('div'),
+      document.createElement('div'),
+      'en',
+      PEER,
+      () => {},
+      commands(),
+    );
+    const before = emulator.fits;
+
+    // Minimized: no room at all, which the addon floors at 2×1, so the shell
+    // keeps the size it had.
+    emulator.room = { cols: 2, rows: 1 };
+    emulator.onResize();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(emulator.fits).toBe(before);
+
+    emulator.room = { cols: 120, rows: 40 };
+    emulator.onResize();
+    await vi.waitFor(() => {
+      expect(emulator.fits).toBe(before + 1);
+    });
+    controls.stop();
+  });
+});
+
+// ADR 0132: a right click did nothing and nothing could be copied or pasted.
+describe('copy and paste', () => {
+  const key = (code: string, mods: Partial<KeyboardEvent> = {}) => ({
+    type: 'keydown',
+    code,
+    ctrlKey: true,
+    shiftKey: false,
+    altKey: false,
+    metaKey: false,
+    ...mods,
+  });
+
+  it('keeps Ctrl+C the interrupt unless text is selected', () => {
+    expect(terminalClipboardKey(key('KeyC'), false)).toBeNull();
+    expect(terminalClipboardKey(key('KeyC'), true)).toBe('copy');
+    expect(terminalClipboardKey(key('KeyC', { shiftKey: true }), false)).toBe('copy');
+  });
+
+  it('pastes on Ctrl+V and Ctrl+Shift+V, and leaves every other key to the shell', () => {
+    expect(terminalClipboardKey(key('KeyV'), false)).toBe('paste');
+    expect(terminalClipboardKey(key('KeyV', { shiftKey: true }), false)).toBe('paste');
+    expect(terminalClipboardKey(key('KeyV', { ctrlKey: false }), false)).toBeNull();
+    expect(terminalClipboardKey(key('KeyV', { altKey: true }), false)).toBeNull();
+    expect(terminalClipboardKey(key('KeyD'), true)).toBeNull();
+    expect(terminalClipboardKey(key('KeyC', { type: 'keyup' }), true)).toBeNull();
+  });
+
+  it('offers copy only when something is selected', () => {
+    const host = document.createElement('div');
+    const actions = { copy: vi.fn(), paste: vi.fn(), selectAll: vi.fn() };
+    render(terminalMenu(null, 'en', false, actions), host);
+    expect(host.querySelector('[data-testid="terminal-menu"]')).toBeNull();
+
+    render(terminalMenu({ x: 10, y: 20, canCopy: false }, 'en', false, actions), host);
+    const copy = host.querySelector<HTMLButtonElement>('[data-testid="terminal-menu-copy"]');
+    expect(copy?.disabled).toBe(true);
+    render(terminalMenu({ x: 10, y: 20, canCopy: true }, 'en', false, actions), host);
+    expect(copy?.disabled).toBe(false);
+    copy?.click();
+    host.querySelector<HTMLButtonElement>('[data-testid="terminal-menu-paste"]')?.click();
+    host.querySelector<HTMLButtonElement>('[data-testid="terminal-menu-select-all"]')?.click();
+    expect([actions.copy, actions.paste, actions.selectAll].map((f) => f.mock.calls.length)).toEqual([
+      1, 1, 1,
+    ]);
+  });
+
+  it('opens on a right click, pastes what the clipboard holds, and closes', async () => {
+    const readText = vi.fn().mockResolvedValue('ls -la');
+    // jsdom has no clipboard at all.
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { readText, writeText: vi.fn() },
+      configurable: true,
+    });
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controls = await mountTerminal(root, document.createElement('div'), 'en', PEER, () => {}, commands());
+
+    root.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 5, clientY: 5 }));
+    const paste = document.querySelector<HTMLButtonElement>('[data-testid="terminal-menu-paste"]');
+    expect(paste).not.toBeNull();
+    paste?.click();
+    await vi.waitFor(() => {
+      expect(emulator.pasted).toEqual(['ls -la']);
+    });
+    expect(document.querySelector('[data-testid="terminal-menu"]')).toBeNull();
+
+    controls.stop();
+    root.remove();
+    Reflect.deleteProperty(navigator, 'clipboard');
+  });
+
+  it('closes on Escape without doing anything', async () => {
+    const root = document.createElement('div');
+    document.body.append(root);
+    const controls = await mountTerminal(root, document.createElement('div'), 'en', PEER, () => {}, commands());
+    root.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
+    expect(document.querySelector('[data-testid="terminal-menu"]')).not.toBeNull();
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(document.querySelector('[data-testid="terminal-menu"]')).toBeNull();
+    controls.stop();
+    root.remove();
   });
 });
 
@@ -311,6 +528,16 @@ describe('the close button', () => {
     for (const status of STATUSES) {
       render(terminalChrome(status, 'en', () => {}), chrome);
       expect(button()?.disabled, `disabled while ${status}`).toBe(false);
+    }
+  });
+
+  // The status dot is coloured from this attribute (ADR 0132).
+  it('names its state for the status dot', () => {
+    for (const status of STATUSES) {
+      render(terminalChrome(status, 'en', () => {}), chrome);
+      expect(
+        chrome.querySelector('[data-testid="terminal-state"]')?.getAttribute('data-status'),
+      ).toBe(status);
     }
   });
 
@@ -390,6 +617,18 @@ describe('accessibility', () => {
       const button = container.querySelector<HTMLButtonElement>('[data-testid="terminal-close"]');
       expect(button, `terminal-close missing in ${locale}`).not.toBeNull();
       expect(button?.disabled).toBe(false);
+    });
+
+    it(`has an accessible right-click menu (${locale})`, async () => {
+      const actions = { copy: () => {}, paste: () => {}, selectAll: () => {} };
+      render(terminalMenu({ x: 0, y: 0, canCopy: true }, locale, false, actions), container);
+      const results = await axe.run(container, {
+        rules: Object.fromEntries(LAYOUT_DEPENDENT_RULES.map((id) => [id, { enabled: false }])),
+      });
+      expect(results.violations).toEqual([]);
+      for (const item of container.querySelectorAll('[role="menuitem"]')) {
+        expect(item.textContent?.trim(), `an empty menu item in ${locale}`).not.toBe('');
+      }
     });
   }
 });

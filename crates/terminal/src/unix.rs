@@ -82,8 +82,20 @@ fn is_utf8(locale: &OsStr) -> bool {
     locale.contains("utf-8") || locale.contains("utf8")
 }
 
+/// The terminal the shell is told it is drawn on (ADR 0132).
+///
+/// Every byte the shell writes is drawn by `xterm.js` in the guest's window,
+/// so that is the terminal, whatever started this process. A Lumepeer started
+/// from the Dock, a desktop menu or a launch agent has no `TERM` at all, and
+/// `portable-pty` adds none: `git`, `grep`, `ls` and Debian's prompt then take
+/// the terminal for a dumb one and print no colour. One started from another
+/// terminal carries that terminal's `TERM`, which names the wrong emulator.
+/// `xterm-256color` is what `xterm.js` implements, and its terminfo entry is on
+/// every macOS and in Debian's `ncurses-base`.
+const TERM: &str = "xterm-256color";
+
 /// The host's shell with the host's environment, plus the one variable
-/// [`ctype_override`] says it lacks.
+/// [`ctype_override`] says it lacks, and told what it is drawn on.
 fn shell_command() -> CommandBuilder {
     // No arguments, and the program is this machine's own (ADR 0079).
     // `CommandBuilder::new` inherits this process's environment, which is
@@ -96,6 +108,10 @@ fn shell_command() -> CommandBuilder {
     ) {
         command.env("LC_CTYPE", ctype);
     }
+    command.env("TERM", TERM);
+    // `xterm.js` draws 24-bit colour, and terminfo has no standard way to say
+    // so; this variable is where programs look for it.
+    command.env("COLORTERM", "truecolor");
     command
 }
 
@@ -357,6 +373,50 @@ mod tests {
             .and_then(|rest| rest.lines().next())
             .map(str::trim);
         assert_eq!(charmap, Some("UTF-8"), "the shell said: {seen}");
+    }
+
+    /// The shell is told it is drawn on `xterm.js`, whatever this process was
+    /// started with — which is what makes `ls`, `git` and the prompt colour
+    /// what they print (ADR 0132).
+    ///
+    /// Only proves the fix when the test runs without those values of its
+    /// own — `TERM=dumb COLORTERM= cargo test` — which is what a Lumepeer
+    /// started from the Dock has; under a 256-colour terminal `TERM` would
+    /// pass without it.
+    #[test]
+    fn the_shell_knows_its_terminal_draws_colour() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let shell = Shell::spawn(ShellSize { cols: 80, rows: 24 }).expect("a shell");
+        let (mut reader, mut writer, _control) = shell.into_parts();
+        // The quotes split the marker so the terminal's echo of this line
+        // never contains it; only the printed answer does. The `exit` is what
+        // ends the read below.
+        writer
+            .write_all(b"printf 'term''=%s/%s\\n' \"$TERM\" \"$COLORTERM\"; exit\n")
+            .unwrap();
+        writer.flush().unwrap();
+
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => seen.extend_from_slice(&buffer[..read]),
+            }
+        }
+        let seen = String::from_utf8_lossy(&seen);
+        let answer = seen
+            .split("term=")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(str::trim);
+        assert_eq!(
+            answer,
+            Some("xterm-256color/truecolor"),
+            "the shell said: {seen}"
+        );
     }
 
     /// A shell really starts, really echoes, and is really gone afterwards.
