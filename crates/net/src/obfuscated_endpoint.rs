@@ -42,9 +42,10 @@ use ed25519_dalek::SigningKey;
 use lumepeer_core::NodeId;
 use lumepeer_core::constants::{
     NAT_MAPPING_KEEPALIVE_SECS, OBFUSCATED_CONNECT_ATTEMPTS, OBFUSCATED_CONNECT_RETRY_BACKOFF_MS,
-    OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS, RENDEZVOUS_KNOCK_FRESH_SECS, RENDEZVOUS_POLL_SECS,
-    RENDEZVOUS_PUNCH_INTERVAL_MS, RENDEZVOUS_PUNCH_PACKETS, RENDEZVOUS_PUNCHES_PER_MINUTE,
-    RENDEZVOUS_REPUBLISH_SECS, RENDEZVOUS_REPUNCH_SECS, STUN_QUERY_TIMEOUT_MS,
+    OBFUSCATED_PUNCH_ATTEMPT_TIMEOUT_MS, OBFUSCATED_SILENCE_REKNOCK_MS,
+    RENDEZVOUS_KNOCK_FRESH_SECS, RENDEZVOUS_POLL_SECS, RENDEZVOUS_PUNCH_INTERVAL_MS,
+    RENDEZVOUS_PUNCH_PACKETS, RENDEZVOUS_PUNCHES_PER_MINUTE, RENDEZVOUS_REPUBLISH_SECS,
+    RENDEZVOUS_REPUNCH_SECS, STUN_QUERY_TIMEOUT_MS,
 };
 use noq::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -61,7 +62,9 @@ use rand::{Rng as _, RngExt as _};
 
 use crate::endpoint::SUPPORTED_ALPNS;
 use crate::error::{NetError, Result};
-use crate::obfuscate::{ObfuscatedSocket, Obfuscator, StunTap, obfuscated_transport_config};
+use crate::obfuscate::{
+    HostRoute, ObfuscatedSocket, Obfuscator, StunTap, obfuscated_transport_config,
+};
 use crate::peer_connection::PeerConnection;
 use crate::rendezvous::{Rendezvous, Sighting, Signals, Speaker};
 use crate::stun;
@@ -906,8 +909,13 @@ fn unix_now() -> u64 {
 pub struct GuestObfuscatedEndpoint {
     endpoint: Endpoint,
     /// Where the host's endpoint is: the ticket's address (ADR 0053) until
-    /// the host's rendezvous record names a newer one (ADR 0113).
+    /// the host's rendezvous record names a newer one (ADR 0113). Kept for
+    /// the order of those records; the socket sends to [`Self::route`].
     target: Arc<Mutex<Target>>,
+    /// Where the socket sends the host's datagrams now: moved by every
+    /// record `target` follows, and by the host's own packets arriving from
+    /// somewhere else (ADR 0134).
+    route: HostRoute,
     /// The host's endpoint key, which its rendezvous record is signed with
     /// (ADR 0113).
     host: NodeId,
@@ -973,6 +981,9 @@ struct GuestSignals {
     /// The task that owns the channel and moves the dial target to wherever
     /// the host says it is. Aborting it closes the channel.
     listener: tokio::task::AbortHandle,
+    /// The task that knocks again whenever a live session goes silent
+    /// ([`knock_on_silence`]; ADR 0134).
+    watchdog: tokio::task::AbortHandle,
 }
 
 /// What a guest endpoint needs to look up its host and knock (ADR 0113).
@@ -1048,13 +1059,15 @@ impl GuestObfuscatedEndpoint {
         // Empty until the dial resolves the reflectors: that is DNS, and this
         // runs on the actor's thread.
         let tap = StunTap::new(Vec::new(), reflexive_tx);
+        let route = HostRoute::new(target);
         let runtime: Arc<dyn noq::Runtime> = Arc::new(TokioRuntime);
         let wrapped = runtime
             .wrap_udp_socket(socket)
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
         let obfuscated_socket: Box<dyn AsyncUdpSocket> = Box::new(
             ObfuscatedSocket::new(wrapped, Obfuscator::for_guest(invite_id))
-                .with_stun_tap(tap.clone()),
+                .with_stun_tap(tap.clone())
+                .with_host_route(route.clone()),
         );
         let endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
@@ -1070,6 +1083,7 @@ impl GuestObfuscatedEndpoint {
                 addr: target,
                 at: 0,
             })),
+            route,
             host,
             expected_fingerprint,
             certificate: Arc::new(identity_certificate(identity)?),
@@ -1114,6 +1128,7 @@ impl GuestObfuscatedEndpoint {
         let mut signals = rendezvous.dht.guest_signals(&self.invite_id, self.host)?;
         let speaker = signals.speaker();
         let target = Arc::clone(&self.target);
+        let route = self.route.clone();
         let answered = Arc::clone(&self.answered);
         let listener = tokio::spawn(async move {
             while let Some(seen) = signals.heard().await {
@@ -1126,6 +1141,7 @@ impl GuestObfuscatedEndpoint {
                         tracing::debug!(addr = %seen.addr, "an answer older than the last one came through a relay");
                         continue;
                     }
+                    route.point_at(seen.addr);
                     from
                 };
                 if from == seen.addr {
@@ -1141,9 +1157,20 @@ impl GuestObfuscatedEndpoint {
             }
         })
         .abort_handle();
+        let watchdog = tokio::spawn(knock_on_silence(
+            self.endpoint.clone(),
+            self.route.clone(),
+            speaker.clone(),
+            Arc::clone(&rendezvous.stun_socket),
+            rendezvous.tap.clone(),
+            rendezvous.reflexive.clone(),
+            rendezvous.servers,
+        ))
+        .abort_handle();
         *slot = Some(GuestSignals {
             speaker: speaker.clone(),
             listener,
+            watchdog,
         });
         Some(speaker)
     }
@@ -1155,6 +1182,7 @@ impl GuestObfuscatedEndpoint {
         let host = self.host;
         let invite_id = self.invite_id;
         let target = Arc::clone(&self.target);
+        let route = self.route.clone();
         tokio::spawn(async move {
             let Some(seen) = dht.host(&host, &invite_id).await else {
                 return;
@@ -1163,7 +1191,11 @@ impl GuestObfuscatedEndpoint {
                 return;
             };
             let from = current.addr;
-            if current.follow(&seen) && from != seen.addr {
+            if !current.follow(&seen) {
+                return;
+            }
+            route.point_at(seen.addr);
+            if from != seen.addr {
                 tracing::info!(
                     %from,
                     to = %seen.addr,
@@ -1236,15 +1268,12 @@ impl GuestObfuscatedEndpoint {
 
         let connection = punch_until(
             || async {
-                // Read per attempt: the rendezvous may have moved it since the
-                // last one (ADR 0113).
-                let target = self
-                    .target
-                    .lock()
-                    .map_err(|_| NetError::Dial("the dial target is poisoned".to_owned()))?
-                    .addr;
+                // Always the alias: the socket sends it to wherever the route
+                // says the host is, which the rendezvous may move under an
+                // attempt (ADR 0113) and the host's own packets may move
+                // under a live connection (ADR 0134).
                 self.endpoint
-                    .connect_with(client_config.clone(), target, CERT_SUBJECT)
+                    .connect_with(client_config.clone(), HostRoute::ALIAS, CERT_SUBJECT)
                     .map_err(|e| NetError::Dial(e.to_string()))?
                     .await
                     .map_err(|e| NetError::Dial(e.to_string()))
@@ -1283,6 +1312,7 @@ impl GuestObfuscatedEndpoint {
             && let Some(open) = slot.take()
         {
             open.listener.abort();
+            open.watchdog.abort();
         }
     }
 }
@@ -1328,6 +1358,90 @@ async fn own_reflexive_addr(
         }
     }
     None
+}
+
+/// How often [`knock_on_silence`] looks at how long the host has been quiet,
+/// milliseconds.
+const SILENCE_CHECK_MS: u64 = 250;
+
+/// Knocks again whenever a guest endpoint with a live connection has heard
+/// nothing from its host for [`OBFUSCATED_SILENCE_REKNOCK_MS`] (ADR 0134).
+///
+/// A path that dies under a live session dies because a NAT moved. When it
+/// was the host's, the host's packets arriving from its new address usually
+/// repair it on their own ([`HostRoute`]). When it was this guest's, or one
+/// side's NAT stopped letting the other side in, only the host can repair it:
+/// a knock makes it punch towards where this guest is now and say where it
+/// is now, which is what the dial does for a new session. Without the knock
+/// the session waits out QUIC's idle timeout and is dialed again from scratch,
+/// and that wait is the frozen picture.
+///
+/// The knock goes out at once with the address this socket was last seen at,
+/// and once more if the reflectors say that address has moved. Never more
+/// often than the host would punch towards one address anyway
+/// ([`RENDEZVOUS_REPUNCH_SECS`]), and never while the endpoint has no
+/// connection open.
+async fn knock_on_silence(
+    endpoint: Endpoint,
+    route: HostRoute,
+    speaker: Speaker,
+    socket: Arc<UdpSocket>,
+    tap: StunTap,
+    mut reflexive: tokio::sync::watch::Receiver<Option<SocketAddr>>,
+    servers: &'static [&'static str],
+) {
+    let quiet = Duration::from_millis(OBFUSCATED_SILENCE_REKNOCK_MS);
+    let again = Duration::from_secs(RENDEZVOUS_REPUNCH_SECS);
+    let mut check = tokio::time::interval(Duration::from_millis(SILENCE_CHECK_MS));
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut knocked: Option<tokio::time::Instant> = None;
+    loop {
+        check.tick().await;
+        if endpoint.open_connections() == 0
+            || route.silent_for().is_none_or(|silent| silent < quiet)
+            || knocked.is_some_and(|at| at.elapsed() < again)
+        {
+            continue;
+        }
+        knocked = Some(tokio::time::Instant::now());
+
+        let known = *reflexive.borrow_and_update();
+        let own = match known {
+            Some(own) => Some(own),
+            None => own_reflexive_addr(&socket, &tap, reflexive.clone(), servers).await,
+        };
+        let Some(own) = own else {
+            tracing::warn!("the host went quiet and no reflector answered: cannot knock");
+            continue;
+        };
+        speaker.say(own);
+        tracing::info!(
+            addr = %own,
+            route = %route.addr(),
+            "the host went quiet: knocked again through the signalling relays"
+        );
+
+        // Whether this socket's own mapping is still where the knock said.
+        for server in tap.servers() {
+            let _ = stun::send_binding_request(&socket, server);
+        }
+        let answer = tokio::time::timeout(
+            Duration::from_millis(STUN_QUERY_TIMEOUT_MS),
+            reflexive.changed(),
+        )
+        .await;
+        if let Ok(Ok(())) = answer
+            && let Some(moved) = *reflexive.borrow_and_update()
+            && moved != own
+        {
+            speaker.say(moved);
+            tracing::info!(
+                from = %own,
+                to = %moved,
+                "this guest's own address moved: knocked again from where it is now"
+            );
+        }
+    }
 }
 
 /// The guest's half of the hole punch: `dial` up to
@@ -1545,6 +1659,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::net::{Ipv4Addr, SocketAddr};
+
+    use lumepeer_core::constants::QUIC_MAX_IDLE_TIMEOUT_SECS;
 
     use super::*;
 
@@ -2060,6 +2176,283 @@ mod tests {
         guest.close().await;
     }
 
+    /// A NAT in front of a host whose public address moves (ADR 0134): the
+    /// guest reaches the host at one of two public addresses, and only the
+    /// active one passes anything in either direction — the old mapping is
+    /// simply gone, as it is when an uplink changes or a NAT rebinds.
+    struct MovingNat {
+        public: [SocketAddr; 2],
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        tasks: tokio::task::JoinSet<()>,
+    }
+
+    impl MovingNat {
+        async fn spawn(host: SocketAddr) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let bind = || tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0));
+            let inside = Arc::new(bind().await.unwrap());
+            let fronts = [
+                Arc::new(bind().await.unwrap()),
+                Arc::new(bind().await.unwrap()),
+            ];
+            let public = [
+                fronts[0].local_addr().unwrap(),
+                fronts[1].local_addr().unwrap(),
+            ];
+            let active = Arc::new(AtomicUsize::new(0));
+            let guest: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+            let mut tasks = tokio::task::JoinSet::new();
+
+            for (index, front) in fronts.iter().enumerate() {
+                let (front, inside, active, guest) = (
+                    Arc::clone(front),
+                    Arc::clone(&inside),
+                    Arc::clone(&active),
+                    Arc::clone(&guest),
+                );
+                tasks.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                        if active.load(Ordering::SeqCst) != index {
+                            continue;
+                        }
+                        *guest.lock().unwrap() = Some(from);
+                        let _ = inside.send_to(&buf[..n], host).await;
+                    }
+                });
+            }
+            {
+                let (active, guest) = (Arc::clone(&active), Arc::clone(&guest));
+                tasks.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok((n, _)) = inside.recv_from(&mut buf).await {
+                        let Some(to) = *guest.lock().unwrap() else {
+                            continue;
+                        };
+                        let Some(front) = fronts.get(active.load(Ordering::SeqCst)) else {
+                            continue;
+                        };
+                        let _ = front.send_to(&buf[..n], to).await;
+                    }
+                });
+            }
+            Self {
+                public,
+                active,
+                tasks,
+            }
+        }
+
+        fn move_to(&self, index: usize) {
+            self.active
+                .store(index, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Passes nothing either way until the next [`Self::move_to`].
+        fn black_out(&self) {
+            self.move_to(usize::MAX);
+        }
+    }
+
+    /// The mirror of [`MovingNat`]: a NAT in front of the guest that starts
+    /// sending the guest's packets out from a new public address, and drops
+    /// whatever still arrives at the old one.
+    struct RebindingGuestNat {
+        entry: SocketAddr,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        tasks: tokio::task::JoinSet<()>,
+    }
+
+    impl RebindingGuestNat {
+        async fn spawn(host: SocketAddr) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let bind = || tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0));
+            let entry = Arc::new(bind().await.unwrap());
+            let outs = [
+                Arc::new(bind().await.unwrap()),
+                Arc::new(bind().await.unwrap()),
+            ];
+            let active = Arc::new(AtomicUsize::new(0));
+            let guest: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+            let mut tasks = tokio::task::JoinSet::new();
+
+            for (index, out) in outs.iter().enumerate() {
+                let (out, entry, active, guest) = (
+                    Arc::clone(out),
+                    Arc::clone(&entry),
+                    Arc::clone(&active),
+                    Arc::clone(&guest),
+                );
+                tasks.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok((n, _)) = out.recv_from(&mut buf).await {
+                        let to = *guest.lock().unwrap();
+                        if active.load(Ordering::SeqCst) != index {
+                            continue;
+                        }
+                        if let Some(to) = to {
+                            let _ = entry.send_to(&buf[..n], to).await;
+                        }
+                    }
+                });
+            }
+            let entry_addr = entry.local_addr().unwrap();
+            {
+                let (active, guest) = (Arc::clone(&active), Arc::clone(&guest));
+                tasks.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok((n, from)) = entry.recv_from(&mut buf).await {
+                        *guest.lock().unwrap() = Some(from);
+                        let out = &outs[active.load(Ordering::SeqCst)];
+                        let _ = out.send_to(&buf[..n], host).await;
+                    }
+                });
+            }
+            Self {
+                entry: entry_addr,
+                active,
+                tasks,
+            }
+        }
+
+        fn rebind(&self) {
+            self.active.store(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// One byte to the host's echo and back, or `false` if it did not come
+    /// back well inside the idle timeout.
+    async fn echoed(send: &mut noq::SendStream, recv: &mut noq::RecvStream, byte: u8) -> bool {
+        let round_trip = async {
+            send.write_all(&[byte]).await.ok()?;
+            let mut back = [0u8; 1];
+            recv.read_exact(&mut back).await.ok()?;
+            Some(back[0])
+        };
+        let limit = Duration::from_secs(QUIC_MAX_IDLE_TIMEOUT_SECS - 1);
+        matches!(tokio::time::timeout(limit, round_trip).await, Ok(Some(b)) if b == byte)
+    }
+
+    /// ADR 0134: a host whose public address moves under a live session keeps
+    /// it. Its packets arrive from the new address; before this, the guest's
+    /// QUIC endpoint threw every one of them away as coming from a stranger,
+    /// and the session died of silence with both machines online.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_follows_a_host_whose_public_address_moved() {
+        let host = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let host_addr = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            host.local_addr().unwrap().port(),
+        );
+        let fingerprint = host.cert_fingerprint;
+        let mut nat = MovingNat::spawn(host_addr).await;
+
+        let host_side = tokio::spawn(async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut byte = [0u8; 1];
+            while recv.read_exact(&mut byte).await.is_ok() {
+                if send.write_all(&byte).await.is_err() {
+                    break;
+                }
+            }
+            drop(connection);
+            host
+        });
+
+        let host_id = NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap();
+        let guest = GuestObfuscatedEndpoint::bind(
+            &INVITE,
+            &identity(2),
+            host_id,
+            nat.public[0],
+            fingerprint,
+            None,
+        )
+        .unwrap();
+        let connection = guest.connect(crate::endpoint::ALPN_CONTROL).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        assert!(
+            echoed(&mut send, &mut recv, 1).await,
+            "the path works before the move"
+        );
+
+        nat.move_to(1);
+        assert!(
+            echoed(&mut send, &mut recv, 2).await,
+            "the session must survive the host's public address moving"
+        );
+        assert_eq!(guest.route.addr(), nat.public[1]);
+        assert!(echoed(&mut send, &mut recv, 3).await);
+
+        connection.close(noq::VarInt::from_u32(0), b"");
+        guest.close().await;
+        host_side.abort();
+        nat.tasks.abort_all();
+    }
+
+    /// ADR 0134, the other direction: a guest whose own public address moves
+    /// keeps its session with no help from this module — the host is the
+    /// QUIC server, and a server follows a client that migrates.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_survives_the_guests_own_address_moving() {
+        let host = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let host_addr = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            host.local_addr().unwrap().port(),
+        );
+        let fingerprint = host.cert_fingerprint;
+        let mut nat = RebindingGuestNat::spawn(host_addr).await;
+
+        let host_side = tokio::spawn(async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut byte = [0u8; 1];
+            while recv.read_exact(&mut byte).await.is_ok() {
+                if send.write_all(&byte).await.is_err() {
+                    break;
+                }
+            }
+            drop(connection);
+            host
+        });
+
+        let host_id = NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap();
+        let guest = GuestObfuscatedEndpoint::bind(
+            &INVITE,
+            &identity(2),
+            host_id,
+            nat.entry,
+            fingerprint,
+            None,
+        )
+        .unwrap();
+        let connection = guest.connect(crate::endpoint::ALPN_CONTROL).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        assert!(
+            echoed(&mut send, &mut recv, 1).await,
+            "the path works before the move"
+        );
+
+        nat.rebind();
+        assert!(
+            echoed(&mut send, &mut recv, 2).await,
+            "the session must survive the guest's own public address moving"
+        );
+        assert!(echoed(&mut send, &mut recv, 3).await);
+
+        connection.close(noq::VarInt::from_u32(0), b"");
+        guest.close().await;
+        host_side.abort();
+        nat.tasks.abort_all();
+    }
+
     /// ADR 0113 (B): a host that restarts presents the very certificate the
     /// invite pinned, so a restored invite can be served again — and a node
     /// with a different identity presents a different one.
@@ -2314,6 +2707,91 @@ mod tests {
         connection.close(0u32.into(), b"done");
         guest.close().await;
         host.close().await;
+        reflector_task.abort();
+    }
+
+    /// ADR 0134: a live session that goes silent knocks again, so the host
+    /// punches towards wherever this guest is now — and one that is only
+    /// exchanging keep-alives never does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_session_that_goes_silent_knocks_again() {
+        let relay = Relay::start().await;
+        let (reflector, reflector_task) = spawn_reflector().await;
+        // No rendezvous on the host: its answers would point the guest past
+        // the NAT this test needs the path to go through.
+        let host = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let host_addr = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            host.local_addr().unwrap().port(),
+        );
+        let fingerprint = host.cert_fingerprint;
+        let mut nat = MovingNat::spawn(host_addr).await;
+        let host_side = tokio::spawn(async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut byte = [0u8; 1];
+            while recv.read_exact(&mut byte).await.is_ok() {
+                if send.write_all(&byte).await.is_err() {
+                    break;
+                }
+            }
+            drop(connection);
+            host
+        });
+
+        let guest = GuestObfuscatedEndpoint::bind_via(
+            &INVITE,
+            &identity(2),
+            NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap(),
+            nat.public[0],
+            fingerprint,
+            Some(signalling_through(&relay)),
+            leaked_reflectors(reflector.to_string()),
+        )
+        .unwrap();
+        let connection = guest.connect_control().await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        assert!(echoed(&mut send, &mut recv, 1).await);
+        relay
+            .wait_for("the dial's own knock", |seen| !seen.events.is_empty())
+            .await;
+        let knocks = || relay.seen(|seen| seen.events.len());
+
+        let idle = knocks();
+        tokio::time::sleep(Duration::from_millis(OBFUSCATED_SILENCE_REKNOCK_MS + 1_000)).await;
+        assert_eq!(knocks(), idle, "a session exchanging keep-alives knocked");
+
+        nat.black_out();
+        let silent = tokio::time::Instant::now();
+        relay
+            .wait_for("a knock after the host went quiet", |seen| {
+                seen.events.len() > idle
+            })
+            .await;
+        // The silence began with the host's last keep-alive, which may be
+        // before the black-out: it is what the knock waits on.
+        let quiet = guest.route.silent_for().unwrap();
+        assert!(
+            quiet >= Duration::from_millis(OBFUSCATED_SILENCE_REKNOCK_MS),
+            "knocked {quiet:?} into the silence: before the threshold"
+        );
+        let took = silent.elapsed();
+        assert!(
+            took < Duration::from_millis(OBFUSCATED_SILENCE_REKNOCK_MS + 1_000),
+            "knocked only {took:?} after the host went quiet"
+        );
+
+        // The path comes back inside the idle timeout: the session is the
+        // same one it was.
+        nat.move_to(0);
+        assert!(echoed(&mut send, &mut recv, 2).await);
+
+        connection.close(noq::VarInt::from_u32(0), b"");
+        guest.close().await;
+        host_side.abort();
+        nat.tasks.abort_all();
         reflector_task.abort();
     }
 

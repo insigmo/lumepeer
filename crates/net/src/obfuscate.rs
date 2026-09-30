@@ -22,16 +22,18 @@
 //! here widens a grant (task 17 trap; §2.3).
 
 use std::io::{self, IoSliceMut};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead as _, KeyInit as _};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use lumepeer_core::constants::{
-    OBFUSCATE_PADDING_MAX_BYTES, QUIC_KEEPALIVE_SECS, QUIC_MAX_IDLE_TIMEOUT_SECS,
+    OBFUSCATE_PADDING_MAX_BYTES, OBFUSCATED_HOST_MOVE_QUIET_MS, QUIC_KEEPALIVE_SECS,
+    QUIC_MAX_IDLE_TIMEOUT_SECS,
 };
 use noq::udp::{RecvMeta, Transmit};
 use noq::{AsyncUdpSocket, IdleTimeout, TransportConfig, UdpSender, VarInt};
@@ -240,6 +242,7 @@ pub struct ObfuscatedSocket {
     inner: Box<dyn AsyncUdpSocket>,
     obfuscator: Obfuscator,
     stun_tap: Option<StunTap>,
+    host_route: Option<HostRoute>,
 }
 
 impl ObfuscatedSocket {
@@ -251,6 +254,7 @@ impl ObfuscatedSocket {
             inner,
             obfuscator,
             stun_tap: None,
+            host_route: None,
         }
     }
 
@@ -260,6 +264,122 @@ impl ObfuscatedSocket {
     pub fn with_stun_tap(mut self, tap: StunTap) -> Self {
         self.stun_tap = Some(tap);
         self
+    }
+
+    /// Puts the one host this socket talks to behind [`HostRoute::ALIAS`]
+    /// (ADR 0134): a guest's socket.
+    #[must_use]
+    pub fn with_host_route(mut self, route: HostRoute) -> Self {
+        self.host_route = Some(route);
+        self
+    }
+}
+
+/// Where a guest's host is right now, behind the one fixed address its QUIC
+/// endpoint dials (ADR 0134).
+///
+/// `noq`, like every QUIC client, drops a packet from any address other than
+/// the one it dialed: RFC 9000 lets only the client move. A host behind a NAT
+/// that rebinds, or with a second uplink, *does* move — its packets arrive
+/// from a new address, the guest's endpoint throws every one of them away,
+/// and the session dies of silence although both machines are online. So on a
+/// guest the endpoint never sees the host's real address. It dials
+/// [`Self::ALIAS`]; the socket sends whatever is addressed there to wherever
+/// the host is now, and hands every datagram that opens under the invite's
+/// key to the endpoint as coming from the alias.
+///
+/// The address moves on two kinds of evidence. The host's own signed word
+/// through the rendezvous ([`Self::point_at`]), and the host's packets
+/// arriving from somewhere else once the current address has been silent for
+/// [`OBFUSCATED_HOST_MOVE_QUIET_MS`] (the socket, on every datagram).
+#[derive(Debug, Clone)]
+pub struct HostRoute {
+    state: Arc<Mutex<RouteState>>,
+}
+
+#[derive(Debug)]
+struct RouteState {
+    /// Where datagrams for the host go.
+    addr: SocketAddr,
+    /// When `addr` last delivered a datagram, or was pointed at.
+    addr_heard: Instant,
+    /// When any datagram from the host last arrived; `None` before the first.
+    heard: Option<Instant>,
+}
+
+impl HostRoute {
+    /// The address a guest's endpoint dials and sees its host at. From
+    /// TEST-NET-1 (RFC 5737), so a datagram that ever went out to it by
+    /// mistake would reach nobody.
+    pub const ALIAS: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9));
+
+    /// A route to a host last known at `addr`.
+    #[must_use]
+    pub fn new(addr: SocketAddr) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RouteState {
+                addr,
+                addr_heard: Instant::now(),
+                heard: None,
+            })),
+        }
+    }
+
+    /// Where the host's datagrams go now.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .addr
+    }
+
+    /// Points the route at `addr`, which the host said it is at.
+    pub fn point_at(&self, addr: SocketAddr) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.addr != addr {
+            state.addr = addr;
+            // A fresh address gets the same grace a live one has before the
+            // host's packets from elsewhere can move the route off it.
+            state.addr_heard = Instant::now();
+        }
+    }
+
+    /// How long since anything at all arrived from the host; `None` before
+    /// the first datagram.
+    #[must_use]
+    pub fn silent_for(&self) -> Option<Duration> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .heard
+            .map(|heard| heard.elapsed())
+    }
+
+    /// Takes note of a datagram from the host arriving from `from` at `now`,
+    /// following it there if the current address has gone quiet. Returns the
+    /// address it moved from, if it moved.
+    fn heard_from(&self, from: SocketAddr, now: Instant) -> Option<SocketAddr> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.heard = Some(now);
+        if from == state.addr {
+            state.addr_heard = now;
+            return None;
+        }
+        let quiet = Duration::from_millis(OBFUSCATED_HOST_MOVE_QUIET_MS);
+        if now.saturating_duration_since(state.addr_heard) < quiet {
+            return None;
+        }
+        let was = state.addr;
+        state.addr = from;
+        state.addr_heard = now;
+        Some(was)
     }
 }
 
@@ -299,6 +419,15 @@ impl StunTap {
         }
     }
 
+    /// The reflectors whose answers are taken; empty until they are set.
+    #[must_use]
+    pub fn servers(&self) -> Vec<SocketAddr> {
+        self.servers
+            .read()
+            .map(|servers| servers.clone())
+            .unwrap_or_default()
+    }
+
     /// Publishes the address in `datagram` if it is a STUN answer from a
     /// tapped reflector; anything else is left alone.
     fn take(&self, from: SocketAddr, datagram: &[u8]) {
@@ -332,6 +461,7 @@ impl AsyncUdpSocket for ObfuscatedSocket {
         Box::pin(ObfuscatedSender {
             inner: self.inner.create_sender(),
             obfuscator: self.obfuscator.clone(),
+            host_route: self.host_route.clone(),
         })
     }
 
@@ -385,7 +515,19 @@ impl AsyncUdpSocket for ObfuscatedSocket {
                     };
                     dest_buf.copy_from_slice(&plain);
                     *dest_meta = RecvMeta::default();
-                    dest_meta.addr = raw_meta.addr;
+                    dest_meta.addr = match &self.host_route {
+                        Some(route) => {
+                            if let Some(was) = route.heard_from(raw_meta.addr, Instant::now()) {
+                                tracing::info!(
+                                    from = %was,
+                                    to = %raw_meta.addr,
+                                    "the host is talking from another address: following it there"
+                                );
+                            }
+                            HostRoute::ALIAS
+                        }
+                        None => raw_meta.addr,
+                    };
                     dest_meta.len = plain.len();
                     dest_meta.stride = plain.len();
                     dest_meta.dst_ip = raw_meta.dst_ip;
@@ -419,6 +561,7 @@ impl AsyncUdpSocket for ObfuscatedSocket {
 struct ObfuscatedSender {
     inner: Pin<Box<dyn UdpSender>>,
     obfuscator: Obfuscator,
+    host_route: Option<HostRoute>,
 }
 
 impl std::fmt::Debug for ObfuscatedSender {
@@ -445,8 +588,12 @@ impl UdpSender for ObfuscatedSender {
         // GSO is off (`max_transmit_segments` below), so `transmit` is always
         // exactly one datagram; the padding inside `sealed` changes its
         // length, which is exactly why segmenting is not safe here (§10).
+        let destination = match &this.host_route {
+            Some(route) if transmit.destination == HostRoute::ALIAS => route.addr(),
+            _ => transmit.destination,
+        };
         let out = Transmit {
-            destination: transmit.destination,
+            destination,
             ecn: None,
             contents: &sealed,
             segment_size: None,
@@ -823,5 +970,52 @@ mod tests {
         connection.close(0u32.into(), b"done");
 
         server.await.unwrap();
+    }
+
+    /// ADR 0134: the route follows the host's packets to a new address only
+    /// once the address it is on has gone quiet, so a datagram replayed from
+    /// elsewhere cannot pull a path away while the host is talking on it.
+    #[test]
+    fn the_route_moves_to_a_new_address_only_once_the_old_one_is_quiet() {
+        let old: SocketAddr = "203.0.113.1:1000".parse().unwrap();
+        let new: SocketAddr = "203.0.113.2:2000".parse().unwrap();
+        let route = HostRoute::new(old);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let quiet = OBFUSCATED_HOST_MOVE_QUIET_MS;
+
+        assert_eq!(route.silent_for(), None, "nothing has been heard yet");
+        assert_eq!(route.heard_from(old, at(0)), None);
+        assert_eq!(
+            route.heard_from(new, at(quiet / 2)),
+            None,
+            "the old address is live"
+        );
+        assert_eq!(route.addr(), old);
+
+        assert_eq!(route.heard_from(new, at(quiet + 1)), Some(old));
+        assert_eq!(route.addr(), new);
+        assert!(route.silent_for().is_some());
+
+        // Straight back is held off the same way.
+        assert_eq!(route.heard_from(old, at(quiet + 2)), None);
+        assert_eq!(route.addr(), new);
+    }
+
+    /// ADR 0134: the host's own word moves the route at once, and gives the
+    /// address it names the same grace a live one has.
+    #[test]
+    fn the_host_pointing_elsewhere_moves_the_route_at_once() {
+        let old: SocketAddr = "203.0.113.1:1000".parse().unwrap();
+        let said: SocketAddr = "203.0.113.3:3000".parse().unwrap();
+        let route = HostRoute::new(old);
+        route.point_at(said);
+        assert_eq!(route.addr(), said);
+        assert_eq!(
+            route.heard_from(old, Instant::now()),
+            None,
+            "a stale address must not take the route back within the grace"
+        );
+        assert_eq!(route.addr(), said);
     }
 }

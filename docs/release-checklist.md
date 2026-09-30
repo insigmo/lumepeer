@@ -200,6 +200,23 @@ machine.
       sign-in screen" box is ticked without touching it. Untick it, restart
       the client: it stays unticked.
 
+### A host that moves (ADR 0134)
+
+A guest and a host on different networks, on the obfuscated transport, with
+the tailnet blocked for lumepeer on the host (the firewall rule in the
+project notes). Everything here is about the session *not* reconnecting.
+
+- [ ] Leave a full-control session open for 30 minutes on `beta`. The guest
+      log has no "waiting for its session to come back". If it has "the host
+      is talking from another address: following it there", the view did not
+      freeze across it.
+- [ ] Move the host to another uplink mid-session (e.g. switch it from Wi-Fi
+      to a phone hotspot). The picture freezes for at most a few seconds and
+      carries on with no reconnect banner.
+- [ ] Move the guest to another uplink mid-session. Same result; the guest
+      log shows "the host went quiet: knocked again" if the host's NAT had to
+      be reopened.
+
 ### The guest decodes for itself (ADR 0058, ADR 0059)
 
 The whole picture path changed, and the part that cannot be gated

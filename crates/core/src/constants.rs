@@ -550,6 +550,40 @@ const _: () = assert!(
 /// typical NAT UDP-binding timeout (commonly 30-120 s) so the mapping never
 /// lapses between two resends.
 pub const NAT_MAPPING_KEEPALIVE_SECS: u64 = 25;
+/// How long the address a guest sends its host's packets to must have been
+/// silent before the guest moves to another address the host is talking from,
+/// milliseconds (ADR 0134).
+///
+/// A host whose uplink or NAT mapping changed keeps its session: its packets
+/// arrive from the new address, sealed under the invite, and the guest
+/// follows them there. Only once the old address has gone quiet, so a copy of
+/// an old datagram replayed from somewhere else cannot pull a live path away
+/// while the host is still talking on it. Short against the picture — a host
+/// streaming video sends every few milliseconds — and far under
+/// [`QUIC_MAX_IDLE_TIMEOUT_SECS`].
+pub const OBFUSCATED_HOST_MOVE_QUIET_MS: u64 = 500;
+/// How long a guest with a live obfuscated connection may hear nothing at all
+/// from its host before it knocks again, milliseconds (ADR 0134).
+///
+/// A knock makes the host punch towards where this guest is now and say where
+/// it is now, which is what repairs a path whose NAT on either side moved
+/// under it. Above [`QUIC_KEEPALIVE_SECS`], so an idle session that is only
+/// exchanging keep-alives never knocks; far enough under
+/// [`QUIC_MAX_IDLE_TIMEOUT_SECS`] that the punch lands before QUIC gives up.
+pub const OBFUSCATED_SILENCE_REKNOCK_MS: u64 = 2_500;
+const _: () = assert!(
+    QUIC_KEEPALIVE_SECS * 1_000 < OBFUSCATED_SILENCE_REKNOCK_MS,
+    "a session exchanging only keep-alives must never look silent"
+);
+const _: () = assert!(
+    OBFUSCATED_SILENCE_REKNOCK_MS + RENDEZVOUS_REPUNCH_SECS * 1_000
+        < QUIC_MAX_IDLE_TIMEOUT_SECS * 1_000,
+    "two knocks must fit before the idle timeout closes the connection"
+);
+const _: () = assert!(
+    OBFUSCATED_HOST_MOVE_QUIET_MS < OBFUSCATED_SILENCE_REKNOCK_MS,
+    "a guest must follow a host that moved before it starts knocking for one"
+);
 /// Dial attempts a guest makes over the obfuscated transport before giving up
 /// (task 17 increment 2, ADR 0053).
 ///

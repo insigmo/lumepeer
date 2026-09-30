@@ -78,10 +78,16 @@ async fn main() {
             }
             (_, Err(reason)) => Err(reason),
         },
+        "hold" => match (args.next(), count(args.next())) {
+            (Some(code), Ok(minutes)) => hold(&code, minutes).await,
+            (None, _) => Err("usage: obfuscated_wan_probe hold <invite-code> [minutes]".to_owned()),
+            (_, Err(reason)) => Err(reason),
+        },
         "nat" => nat().await,
         _ => Err(
             "usage: obfuscated_wan_probe nat | obfuscated_wan_probe host [guests] | \
-                  obfuscated_wan_probe guest <invite-code> [attempts]"
+                  obfuscated_wan_probe guest <invite-code> [attempts] | \
+                  obfuscated_wan_probe hold <invite-code> [minutes]"
                 .to_owned(),
         ),
     };
@@ -160,7 +166,8 @@ async fn host(guests: u32) -> Result<(), String> {
     // Each guest is waited for on its own clock: a guest whose punch never
     // lands never arrives, so the series ends at the first quiet
     // `ACCEPT_TIMEOUT` rather than at the count, and the count served is what
-    // is reported.
+    // is reported. The clock only runs while nobody is being served: a `hold`
+    // guest that drops dials again, however long its session was.
     println!(
         "WAITING for {guests} guest(s), each within {}s",
         ACCEPT_TIMEOUT.as_secs()
@@ -168,7 +175,19 @@ async fn host(guests: u32) -> Result<(), String> {
     let mut serving = tokio::task::JoinSet::new();
     let mut served = 0u32;
     while served < guests {
-        let accepted = match tokio::time::timeout(ACCEPT_TIMEOUT, bound.accept()).await {
+        while let Some(outcome) = serving.try_join_next() {
+            if let Ok(Err(reason)) = outcome {
+                println!("SERVE failed: {reason}");
+            }
+        }
+        let accepting = async {
+            if serving.is_empty() {
+                tokio::time::timeout(ACCEPT_TIMEOUT, bound.accept()).await
+            } else {
+                Ok(bound.accept().await)
+            }
+        };
+        let accepted = match accepting.await {
             Ok(Some(accepted)) => accepted,
             Ok(None) => return Err("the endpoint closed while accepting".to_owned()),
             Err(_) => break,
@@ -206,20 +225,26 @@ async fn host(guests: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Answers one guest's ping and waits for it to hang up.
+/// Echoes whatever one guest sends — a `guest` ping or a `hold` session's
+/// ticks — and waits for it to hang up.
 async fn serve(connection: PeerConnection) -> Result<(), String> {
     let (mut send, mut recv) = connection
         .accept_bi()
         .await
         .map_err(|e| format!("accept_bi: {e}"))?;
-    let request = recv
-        .read_to_end(1024)
+    let mut buf = [0u8; 1024];
+    let mut echoed = 0usize;
+    while let Some(n) = recv
+        .read(&mut buf)
         .await
-        .map_err(|e| format!("read: {e}"))?;
-    println!("RECEIVED {:?}", String::from_utf8_lossy(&request));
-    send.write_all(b"pong from host")
-        .await
-        .map_err(|e| format!("write: {e}"))?;
+        .map_err(|e| format!("read after {echoed} bytes: {e}"))?
+    {
+        send.write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("write after {echoed} bytes: {e}"))?;
+        echoed += n;
+    }
+    println!("ECHOED {echoed} bytes");
     send.finish().map_err(|e| format!("finish: {e}"))?;
     connection.closed().await;
     Ok(())
@@ -338,6 +363,159 @@ async fn ping(endpoint: &GuestObfuscatedEndpoint) -> Result<(), String> {
     println!("REPLY {:?}", String::from_utf8_lossy(&reply));
     connection.close(0u32.into(), b"done");
     Ok(())
+}
+
+/// Spacing of a `hold` session's ticks.
+const HOLD_TICK: Duration = Duration::from_millis(100);
+/// A `hold` echo later than this is reported as a gap: well above a WAN round
+/// trip, well below anything a person would not notice.
+const HOLD_GAP: Duration = Duration::from_secs(1);
+
+/// Holds one session for `minutes`, sending a tick every [`HOLD_TICK`] and
+/// timing its echo, and reports every gap and every drop (ADR 0134).
+///
+/// A drop is dialed again at once, as the app's resume would, so one run
+/// counts how often a real path breaks rather than stopping at the first.
+async fn hold(code: &str, minutes: u32) -> Result<(), String> {
+    let ticket = InviteTicket::from_code(code).map_err(|e| format!("ticket: {e}"))?;
+    let (Some(target), Some(fingerprint)) = (ticket.obfuscated_addr, ticket.host_cert_fingerprint)
+    else {
+        return Err("this invite carries no obfuscated-transport address".to_owned());
+    };
+    let host = ticket
+        .endpoint_addr()
+        .map_err(|e| format!("ticket address: {e}"))?
+        .id;
+    let rendezvous = Rendezvous::start().map_err(|e| e.to_string())?;
+    let identity = SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(u64::from(minutes) * 60);
+    let (mut drops, mut gaps) = (0u32, 0u32);
+    let mut worst = Duration::ZERO;
+
+    while Instant::now() < deadline {
+        let endpoint = GuestObfuscatedEndpoint::bind(
+            &ticket.invite_id,
+            &identity,
+            host,
+            target,
+            fingerprint,
+            Some(rendezvous.clone()),
+        )
+        .map_err(|e| format!("bind: {e}"))?;
+        let dialing = Instant::now();
+        match endpoint.connect_control().await {
+            Ok(connection) => {
+                println!(
+                    "CONNECTED at +{}s in {}ms",
+                    started.elapsed().as_secs(),
+                    dialing.elapsed().as_millis()
+                );
+                let held = hold_session(&connection, started, deadline).await?;
+                if held.dropped {
+                    drops += 1;
+                }
+                gaps += held.gaps;
+                worst = worst.max(held.worst);
+                connection.close(0u32.into(), b"done");
+            }
+            Err(e) => {
+                println!("DIAL failed after {}ms: {e}", dialing.elapsed().as_millis());
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+        endpoint.close().await;
+    }
+    println!(
+        "HOLD {minutes} min: drops={drops} gaps={gaps} worst={}ms",
+        worst.as_millis()
+    );
+    Ok(())
+}
+
+/// What one connection of a `hold` run went through.
+struct Held {
+    dropped: bool,
+    gaps: u32,
+    worst: Duration,
+}
+
+/// Ticks on `connection` until `deadline` or until it drops.
+async fn hold_session(
+    connection: &PeerConnection,
+    started: Instant,
+    deadline: Instant,
+) -> Result<Held, String> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| format!("open_bi: {e}"))?;
+    // The echoes are read on a task of their own, so a stalled path never
+    // stalls the ticks and a read is never cut off halfway through one.
+    let last_echo = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+    let reader = tokio::spawn({
+        let last_echo = std::sync::Arc::clone(&last_echo);
+        async move {
+            let (mut gaps, mut worst) = (0u32, Duration::ZERO);
+            let mut echo = [0u8; 8];
+            while recv.read_exact(&mut echo).await.is_ok() {
+                let mut last = last_echo
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let gap = last.elapsed();
+                if gap > HOLD_GAP {
+                    gaps += 1;
+                    worst = worst.max(gap);
+                    println!(
+                        "GAP {}ms ending at +{}s",
+                        gap.as_millis(),
+                        started.elapsed().as_secs()
+                    );
+                }
+                *last = Instant::now();
+            }
+            (gaps, worst)
+        }
+    });
+    let mut tick = tokio::time::interval(HOLD_TICK);
+    let mut seq = 0u64;
+    let ended = loop {
+        if Instant::now() >= deadline {
+            break None;
+        }
+        tick.tick().await;
+        seq += 1;
+        if let Err(e) = send.write_all(&seq.to_le_bytes()).await {
+            break Some(format!("write: {e}"));
+        }
+        if let Some(reason) = connection.close_reason() {
+            break Some(reason.to_string());
+        }
+    };
+    let since_echo = last_echo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .elapsed();
+    if let Some(reason) = &ended {
+        println!(
+            "DROPPED at +{}s, {}ms after the last echo: {reason}",
+            started.elapsed().as_secs(),
+            since_echo.as_millis()
+        );
+    } else {
+        let _ = send.finish();
+    }
+    connection.close(0u32.into(), b"done");
+    let (gaps, worst) = reader.await.unwrap_or((0, Duration::ZERO));
+    Ok(Held {
+        dropped: ended.is_some(),
+        gaps,
+        worst: if ended.is_some() {
+            worst.max(since_echo)
+        } else {
+            worst
+        },
+    })
 }
 
 /// Measures the NAT this machine sits behind (gap-tasks/22 task 2).
