@@ -18,9 +18,10 @@
 //! minor 16 appended `TerminalOpenRequest`, `TerminalOpenResponse`,
 //! `TerminalResize` and `TerminalClose` (ADR 0079), minor 17 appended
 //! `RebootRequest` (ADR 0084), minor 18 added no message but froze a `Hello`
-//! that names the session it resumes (ADR 0089) — and every earlier vector
-//! is still in the file with the same bytes, which is the compatibility claim
-//! this test checks.
+//! that names the session it resumes (ADR 0089), minor 19 added no message
+//! but appended the `CaptureDenied` reason to `MediaUnavailable` (ADR 0110)
+//! — and every earlier vector is still in the file with the same bytes,
+//! which is the compatibility claim this test checks.
 //!
 //! One verdict has changed in the file's life, and it is written down where
 //! it happened: minor 14 raised the offer ceiling, so an offer of 500 MiB
@@ -93,7 +94,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 18,
+        PROTOCOL_MINOR, 19,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 

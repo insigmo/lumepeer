@@ -246,3 +246,16 @@ invalid minor17_reboot_request_unknown_mode abababababababababababababababab0106
 # --- is coming back to, and a first connection names none (all zeroes).
 valid minor18_hello_first_connection 000000000000000000000000000000000100000100000104636f72650301020300
 valid minor18_hello_resume_claim 1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d0100000100000104636f72650301020300
+
+# --- Frozen for PROTOCOL_MINOR 19: the host's operating system refused this
+# --- app screen capture (ADR 0110). No new message: CaptureDenied is appended
+# --- to MediaUnavailableReason after SecureDesktopActive, so the minor 2
+# --- vectors above keep their bytes. SecureDesktopActive went on the wire
+# --- earlier (docs/bugs/11-uac-degradation.md) without a vector of its own;
+# --- it is frozen here, with the reason appended after it. The host sends
+# --- CaptureDenied only to a guest whose Hello minor is at least this one,
+# --- because the set is closed: a reason byte a build has never heard of is
+# --- malformed, which is also what an older guest makes of this one.
+valid minor19_media_unavailable_secure_desktop_active abababababababababababababababab00001e0200
+valid minor19_media_unavailable_capture_denied abababababababababababababababab00001e0300
+invalid minor19_media_unavailable_unknown_reason abababababababababababababababab00001e0400
