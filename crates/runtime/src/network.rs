@@ -5464,6 +5464,15 @@ struct Actor {
     /// tell a change from the steady state and stay silent on every turn that
     /// did not move a session.
     host_bar_up: bool,
+    /// Host side: the power request that keeps this machine from sleeping
+    /// while a guest is connected, or inside its window to come back
+    /// (`reconcile_stay_awake`).
+    #[cfg(target_os = "windows")]
+    stay_awake: Option<lumepeer_service::stay_awake::StayAwake>,
+    /// Whether the last turn counted this machine as hosting, so a request
+    /// Windows refused is not asked for again on every turn.
+    #[cfg(target_os = "windows")]
+    stay_awake_hosting: bool,
     /// Guest side: hosts this node has connected to before (§21 punch-list
     /// item 5). Nothing is recorded on the host side — see
     /// `connection_history`'s module docs.
@@ -5960,10 +5969,42 @@ impl Actor {
             // the bar, and a path that forgot to would leave the host looking
             // at a bar for a guest who left.
             self.reconcile_host_bar();
+            self.reconcile_stay_awake();
         }
         // Nothing is being served any more, so nothing is left to show.
         self.windows.set_host_bar(false);
     }
+
+    /// Keeps this machine out of idle sleep while it hosts anybody.
+    ///
+    /// Counted wider than the bar on purpose: a session inside its reconnect
+    /// window is still somebody's, and a host that fell asleep during the
+    /// drop would turn a resumable blip into the end of the session — or, on
+    /// a lock screen, into a picture that died. The request only stops idle
+    /// sleep; the display still turns off and the screen still locks on the
+    /// owner's schedule.
+    #[cfg(target_os = "windows")]
+    fn reconcile_stay_awake(&mut self) {
+        let hosting = !self.sessions.active().is_empty();
+        if hosting == self.stay_awake_hosting {
+            return;
+        }
+        self.stay_awake_hosting = hosting;
+        if hosting {
+            self.stay_awake = lumepeer_service::stay_awake::StayAwake::hold();
+            if self.stay_awake.is_some() {
+                tracing::info!("a guest is connected: this machine will not sleep for idleness");
+            }
+        } else {
+            self.stay_awake = None;
+            tracing::info!("no guest is connected: idle sleep is this machine's own again");
+        }
+    }
+
+    /// Nothing to hold off Windows yet.
+    #[cfg(not(target_os = "windows"))]
+    #[allow(clippy::unused_self, reason = "the Windows half needs the actor")]
+    const fn reconcile_stay_awake(&mut self) {}
 
     /// Puts the host's session bar up while at least one guest is connected,
     /// and takes it down when the last one leaves.
@@ -18281,6 +18322,10 @@ pub fn spawn_actor_with(
         clipboard_changes,
         windows,
         host_bar_up: false,
+        #[cfg(target_os = "windows")]
+        stay_awake: None,
+        #[cfg(target_os = "windows")]
+        stay_awake_hosting: false,
         history,
         unattended,
         unattended_store,

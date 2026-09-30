@@ -39,6 +39,8 @@ pub mod machine_store;
 pub mod program_data;
 pub mod protocol;
 pub mod session_change;
+#[cfg(target_os = "windows")]
+pub mod stay_awake;
 
 /// Name the service is registered under with the service control manager.
 ///

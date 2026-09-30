@@ -1525,6 +1525,20 @@ mod dxgi {
         }
     }
 
+    /// What [`WindowsCapturer::start`] keeps from one attempt to open a
+    /// duplication: the duplication itself, or — when the secure desktop
+    /// refused it — a recovery due at once. Generic over the duplication so
+    /// the decision can be tested without a display.
+    fn begin<A>(opened: Result<A>) -> Result<(Option<A>, Option<Recovery>)> {
+        match opened {
+            Ok(active) => Ok((Some(active), None)),
+            Err(MediaError::SecureDesktopActive(reason)) => {
+                Ok((None, Some(Recovery::started(reason))))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// DXGI Desktop Duplication capturer (§11; ADR 0012).
     #[derive(Debug, Default)]
     pub struct WindowsCapturer {
@@ -1771,13 +1785,26 @@ mod dxgi {
     }
 
     impl ScreenCapturer for WindowsCapturer {
+        /// Opens a duplication on `target` — or, when the secure desktop is
+        /// in the foreground right now, starts already inside the reopen loop
+        /// of [`next_frame`](Self::next_frame).
+        ///
+        /// A lock screen at the moment a viewer arrives is not a platform
+        /// that cannot capture: it is the same episode `next_frame` rides out
+        /// for a viewer who was already watching, and it clears the same way.
+        /// Refusing here registered no viewer at all, so a session that
+        /// resumed after a network drop while the host was locked had no
+        /// picture for the rest of its life — every media dial ended on "no
+        /// viewer holds a view grant", unlocked or not. Every other failure
+        /// still refuses: a monitor that does not exist is the caller's
+        /// mistake, not an episode to wait out.
         fn start(&mut self, target: CaptureTarget) -> Result<()> {
             // Drop any previous duplication first: Windows caps how many a
             // display may have, so a restart must not compete with itself.
             self.active = None;
             self.recovering = None;
             self.target = Some(target);
-            self.active = Some(Active::open(target)?);
+            (self.active, self.recovering) = begin(Active::open(target))?;
             Ok(())
         }
 
@@ -3493,6 +3520,35 @@ mod dxgi {
                 now += backoff;
             }
             assert!(recovery.due(now));
+        }
+
+        /// A viewer who arrives while the host is locked — a session resuming
+        /// after a network drop, a guest dialing a locked machine — is started
+        /// inside the reopen loop rather than refused. Refused, it was never
+        /// registered as a viewer, and its picture stayed dead after the
+        /// unlock too. Anything that is not the secure desktop still refuses.
+        #[test]
+        fn a_start_behind_the_secure_desktop_waits_instead_of_refusing() {
+            let (active, recovery) =
+                begin::<()>(Err(MediaError::SecureDesktopActive("locked".to_owned()))).unwrap();
+            assert!(active.is_none());
+            let recovery = recovery.expect("the start is a recovery");
+            assert!(
+                recovery.due(Instant::now()),
+                "the first reopen is due at once"
+            );
+            assert_eq!(recovery.reason, "locked");
+
+            let (active, recovery) = begin(Ok(())).unwrap();
+            assert!(active.is_some());
+            assert!(recovery.is_none());
+
+            assert!(matches!(
+                begin::<()>(Err(MediaError::CaptureUnavailable(
+                    "no such display".to_owned()
+                ))),
+                Err(MediaError::CaptureUnavailable(_))
+            ));
         }
 
         /// `COLOR` arrives with straight alpha and the wire wants it

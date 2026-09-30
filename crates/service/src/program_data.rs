@@ -277,6 +277,35 @@ fn set_logon_host_owner_in(root: &Path, sid: Option<&str>) -> bool {
     }
 }
 
+/// Name of the file in an account's own directory that says its owner turned
+/// hosting the logon screen off (ADR 0133). Its presence is the whole answer.
+const LOGON_HOST_DECLINED_FILE: &str = "logon-host-declined";
+
+/// Whether the account whose directory is `directory` turned hosting the logon
+/// screen off (ADR 0133).
+///
+/// Since ADR 0133 the logon screen is hosted as soon as a device password is
+/// set, so what has to be remembered is the refusal, not the consent.
+#[must_use]
+pub fn logon_host_declined(directory: &Path) -> bool {
+    directory.join(LOGON_HOST_DECLINED_FILE).exists()
+}
+
+/// Records whether the account whose directory is `directory` turned hosting
+/// the logon screen off; `false` when that could not be written.
+#[must_use]
+pub fn set_logon_host_declined(directory: &Path, declined: bool) -> bool {
+    let path = directory.join(LOGON_HOST_DECLINED_FILE);
+    if declined {
+        std::fs::write(&path, b"").is_ok()
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+}
+
 /// What to do with a directory whose owner is neither `LocalSystem` nor
 /// administrators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,6 +792,27 @@ mod tests {
         assert!(set_logon_host_owner_in(&base, None));
         assert_eq!(logon_host_owner_in(&base), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ADR 0133: what an account remembers is its refusal, and taking it back
+    /// is as idempotent as giving it.
+    #[test]
+    fn a_declined_logon_screen_is_remembered_until_taken_back() {
+        let directory = std::env::temp_dir().join(format!(
+            "lumepeer-program-data-declined-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+
+        assert!(!logon_host_declined(&directory), "hosted unless refused");
+        assert!(set_logon_host_declined(&directory, true));
+        assert!(set_logon_host_declined(&directory, true));
+        assert!(logon_host_declined(&directory));
+        assert!(set_logon_host_declined(&directory, false));
+        assert!(set_logon_host_declined(&directory, false));
+        assert!(!logon_host_declined(&directory));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// ADR 0122: a folder an ordinary user owns is taken over where nothing in

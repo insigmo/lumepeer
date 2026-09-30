@@ -125,6 +125,9 @@ pub fn run_worker() -> u32 {
 #[must_use]
 pub fn run_input_worker(action: lumepeer_service::protocol::InjectAction) -> u32 {
     if crate::secure_desktop_input::perform(action) {
+        // Which event is deliberately not said: on a lock screen or the
+        // sign-in screen the keys are somebody's password.
+        tracing::info!("secure-desktop input worker: performed one event");
         WORKER_OK
     } else {
         tracing::warn!("secure-desktop input worker: SendInput did not accept the event");
