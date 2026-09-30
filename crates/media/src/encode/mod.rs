@@ -436,14 +436,17 @@ pub mod software {
                 return Err(MediaError::Encode("frame is smaller than 2x2".to_owned()));
             }
 
+            // Through `as_cpu`, never `data`: a zero-copy capture frame
+            // (ADR 0073) has its pixels only on the GPU.
+            let pixels = frame.as_cpu()?;
             let src_stride = frame.width as usize * 4;
             let dst_stride = width * 4;
-            if frame.data.len() < src_stride * height {
+            if pixels.len() < src_stride * height {
                 return Err(MediaError::Encode("frame buffer is short".to_owned()));
             }
             if src_stride == dst_stride {
                 return Ok((
-                    std::borrow::Cow::Borrowed(&frame.data[..dst_stride * height]),
+                    std::borrow::Cow::Borrowed(&pixels[..dst_stride * height]),
                     width,
                     height,
                 ));
@@ -451,7 +454,7 @@ pub mod software {
             let mut cropped = Vec::with_capacity(dst_stride * height);
             for row in 0..height {
                 let start = row * src_stride;
-                cropped.extend_from_slice(&frame.data[start..start + dst_stride]);
+                cropped.extend_from_slice(&pixels[start..start + dst_stride]);
             }
             Ok((std::borrow::Cow::Owned(cropped), width, height))
         }
@@ -529,6 +532,26 @@ pub mod software {
         fn odd_dimensions_are_cropped_rather_than_panicking() {
             let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
             assert!(encoder.encode(&frame(65, 33, 0x40)).is_ok());
+        }
+
+        /// A host with no hardware encoder still gets GPU frames from the
+        /// zero-copy capture as soon as the guest draws its own cursor
+        /// (ADR 0073). Reading `Frame::data` directly refused every one of
+        /// them as "frame buffer is short": the guest kept the first picture
+        /// and never got another.
+        #[test]
+        #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+        fn a_frame_that_stayed_on_the_gpu_is_read_back_and_encoded() {
+            let Some(source) = crate::capture::windows::gpu_test_frame(64, 64, 0x60) else {
+                eprintln!("skipping: no Direct3D 11 hardware device on this machine");
+                return;
+            };
+            assert!(source.data.is_empty(), "the test frame has to be GPU-only");
+            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            let output = encoder
+                .encode(&source)
+                .unwrap_or_else(|error| panic!("a GPU frame failed to encode: {error}"));
+            assert!(!output.data.is_empty());
         }
 
         #[test]
