@@ -144,6 +144,43 @@ pub const SECURE_DESKTOP_RECOVERY_BACKOFF_MS: u64 = 1_000;
 pub const SECURE_DESKTOP_CAPTURE_INTERVAL_MS: u64 = 500;
 /// Control-channel keepalive interval (§9.1).
 pub const PING_INTERVAL_SECS: u64 = 20;
+/// How often a host with a guest who may drive its input checks whether its
+/// desktop needs telling that somebody is still at it (ADR 0123).
+///
+/// What that holds off is the machine going idle underneath a session. On
+/// `beta` an input that ends an idle spell — typically the guest coming back
+/// to the view — can take the whole network down, and it stays down for as
+/// long as the display then stays on (Kernel-Power 566, `Reason InputHid`;
+/// reproduced with no lumepeer running). Holding the display on with a power
+/// request does not prevent it. A machine that never went idle has nothing to
+/// come back from.
+pub const HOST_KEEP_AWAKE_SECS: u64 = 15;
+/// Idle time, in milliseconds, below which a host leaves its desktop alone
+/// (ADR 0123).
+///
+/// Somebody's input that recent is keeping the machine awake by itself. And if
+/// that input was the one that woke the machine and took `beta`'s network
+/// with it, more input is exactly wrong: measured, a keep-awake every thirty
+/// seconds held the network down for twelve minutes instead of three. The
+/// session parks within [`QUIC_MAX_IDLE_TIMEOUT_SECS`] of such a wake, and a
+/// parked session is not kept awake, so this only has to cover that window.
+pub const KEEP_AWAKE_MIN_IDLE_MS: u64 = 10_000;
+/// Idle time, in milliseconds, past which a host no longer keeps its desktop
+/// awake and lets the next real input wake it instead (ADR 0123).
+///
+/// The keep-awake is itself an input, so aimed at a machine that has already
+/// gone idle it would be the very input that takes `beta`'s network down.
+/// Under a minute because a minute is the shortest display or screen-saver
+/// timeout Windows offers: below it the machine cannot have gone idle yet.
+pub const KEEP_AWAKE_MAX_IDLE_MS: u64 = 50_000;
+const _: () = assert!(
+    QUIC_MAX_IDLE_TIMEOUT_SECS * 1_000 < KEEP_AWAKE_MIN_IDLE_MS,
+    "a session on a host whose wake took its network must park before a keep-awake could run"
+);
+const _: () = assert!(
+    KEEP_AWAKE_MIN_IDLE_MS + HOST_KEEP_AWAKE_SECS * 1_000 < KEEP_AWAKE_MAX_IDLE_MS,
+    "a desktop past the lower bound must be kept awake before it reaches the upper one"
+);
 /// Smoothing factor of the exponentially weighted moving average that turns
 /// individual `Ping`/`Pong` round trips into the RTT the UI shows (§11, §18).
 ///
@@ -473,16 +510,34 @@ pub const STUN_QUERY_TIMEOUT_MS: u64 = 3_000;
 /// healthy path at ~30 s, which was once mistaken for a DPI drop
 /// (project-lumepeer-quic-vs-relay-transport). Must stay below
 /// [`QUIC_MAX_IDLE_TIMEOUT_SECS`].
-pub const QUIC_KEEPALIVE_SECS: u64 = 5;
-/// Idle timeout on the obfuscated QUIC transport (task 17, ADR 0052). Larger
-/// than twice [`QUIC_KEEPALIVE_SECS`] so a single lost keep-alive never trips
-/// it, but bounded so a truly dead path is released.
 ///
-/// Short on purpose since ADR 0116: this is how long a session sits on a
-/// frozen picture before anything notices the path is gone, and the dial that
-/// follows now takes about a second, so a path that died is better given up
-/// quickly and dialed again than waited on for a minute.
-pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 20;
+/// Two seconds since ADR 0123, for two reasons. The idle timeout below is
+/// only as short as it can be made while two keep-alives in a row may still
+/// go missing. And the two ends of a path that dies notice it within one
+/// keep-alive of each other, so the guest's first resume
+/// ([`RESUME_RETRY_SECS`] after its own notice) lands on a host that has
+/// already parked the session instead of one that refuses the claim.
+pub const QUIC_KEEPALIVE_SECS: u64 = 2;
+/// Idle timeout on the obfuscated QUIC transport (task 17, ADR 0052), and so
+/// how long a session sits on a frozen picture before anything notices the
+/// path is gone.
+///
+/// Eight seconds since ADR 0123 (twenty since ADR 0116). Measured between
+/// `win` and `beta` on 2026-09-27: the direct path died every three to
+/// twenty-five minutes, one direction first, and each time the host noticed
+/// after this timeout and the guest after this timeout again, so the picture
+/// and the input were gone 20-50 s before the resume even started — which
+/// then took one to five seconds. A path that died is given up on quickly
+/// and dialed again, because the dial is the cheap part.
+pub const QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = 8;
+const _: () = assert!(
+    QUIC_KEEPALIVE_SECS * 3 < QUIC_MAX_IDLE_TIMEOUT_SECS,
+    "two lost keep-alives in a row must not close a healthy path"
+);
+const _: () = assert!(
+    QUIC_KEEPALIVE_SECS < RESUME_RETRY_SECS,
+    "the host must have noticed a dead path before the guest's first resume reaches it"
+);
 /// Interval on which a host holding an obfuscated-transport invite open
 /// resends a STUN request, to keep its NAT mapping from expiring before a
 /// guest dials in (task 17 increment 2, ADR 0053).

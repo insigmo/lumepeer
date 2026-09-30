@@ -588,6 +588,18 @@ pub trait InputInjector: Send + std::fmt::Debug {
 
     /// What this adapter can do, mirroring [`ScreenCapturer::input_capability`].
     fn capability(&self) -> InputCapability;
+
+    /// Tells the desktop that somebody is still at it, so it does not go idle
+    /// under a session — but never wakes one that already has (ADR 0123).
+    ///
+    /// Not an event of any guest's: the host calls it on its own clock while a
+    /// guest who may inject is connected. A no-op where nothing needs it.
+    ///
+    /// # Errors
+    /// [`MediaError::InputUnavailable`] if the platform refused it.
+    fn keep_awake(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Injector that refuses everything, for a session that degraded to view-only

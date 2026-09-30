@@ -362,6 +362,11 @@ pub enum DesktopInjectDetail {
         /// Vertical delta, as the guest sent it.
         dy: i16,
     },
+    /// Not a guest's event: the host's own "somebody is still here", which
+    /// keeps the desktop from going idle under a session and never wakes one
+    /// that already has (ADR 0123). Has no counterpart in `InputDetail`; the
+    /// injector performs it as its own call.
+    KeepAwake,
 }
 
 /// Byte-0 discriminant of a [`DesktopInjectDetail::Press`] descriptor.
@@ -372,6 +377,10 @@ const DESKTOP_KIND_RELEASE: u8 = 2;
 const DESKTOP_KIND_MOVE: u8 = 3;
 /// Byte-0 discriminant of a [`DesktopInjectDetail::Wheel`] descriptor.
 const DESKTOP_KIND_WHEEL: u8 = 4;
+/// Byte-0 discriminant of a [`DesktopInjectDetail::KeepAwake`] descriptor. A
+/// service older than ADR 0123 refuses it like any unknown kind, and the host
+/// then keeps the desktop awake in-process instead.
+const DESKTOP_KIND_KEEP_AWAKE: u8 = 5;
 
 /// Serializes a [`DesktopInjectEvent`] into the fixed descriptor that follows an
 /// [`OP_INJECT_DESKTOP`] request on the wire.
@@ -399,6 +408,7 @@ pub fn encode_desktop_inject(event: DesktopInjectEvent) -> [u8; DESKTOP_INJECT_P
             out[13..15].copy_from_slice(&dx.to_le_bytes());
             out[15..17].copy_from_slice(&dy.to_le_bytes());
         }
+        DesktopInjectDetail::KeepAwake => out[0] = DESKTOP_KIND_KEEP_AWAKE,
     }
     out
 }
@@ -422,6 +432,7 @@ pub fn parse_desktop_inject(
             dx: a.cast_signed(),
             dy: b.cast_signed(),
         },
+        DESKTOP_KIND_KEEP_AWAKE => DesktopInjectDetail::KeepAwake,
         _ => return None,
     };
     Some(DesktopInjectEvent {
@@ -504,6 +515,12 @@ mod tests {
                     dx: i16::MIN,
                     dy: i16::MAX,
                 },
+            },
+            DesktopInjectEvent {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: DesktopInjectDetail::KeepAwake,
             },
         ] {
             assert_eq!(

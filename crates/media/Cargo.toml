@@ -162,6 +162,10 @@ capture-windows = [
     # that an absolute move did not land and switches to relative motion
     # (docs/bugs/17-remote-hotkeys.md).
     "windows/Win32_UI_WindowsAndMessaging",
+    # `GetTickCount`, the clock `GetLastInputInfo` answers in: the keep-awake
+    # measures how long the desktop has been idle before it touches it
+    # (ADR 0123).
+    "windows/Win32_System_SystemInformation",
 ]
 
 [dependencies]

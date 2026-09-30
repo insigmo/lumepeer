@@ -33,7 +33,7 @@ use lumepeer_core::constants::{
     MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
     MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
     PRESENCE_ATTEMPT_TIMEOUT_SECS, PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS,
-    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS, HOST_KEEP_AWAKE_SECS,
     RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
     RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
     SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
@@ -5903,6 +5903,9 @@ impl Actor {
             Duration::from_secs(SAVED_HOST_REFRESH_SECS),
         );
         locate.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Holds the desktop awake for a guest who can wake it (ADR 0123).
+        let mut keep_awake = tokio::time::interval(Duration::from_secs(HOST_KEEP_AWAKE_SECS));
+        keep_awake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.rebind_restored_obfuscated();
         loop {
             tokio::select! {
@@ -5953,6 +5956,7 @@ impl Actor {
                     self.rebind_restored_obfuscated();
                 }
                 _ = locate.tick() => self.refresh_saved_hosts(),
+                _ = keep_awake.tick() => self.keep_desktop_awake(),
             }
             // One place, after every turn, rather than at each of the half
             // dozen paths that start or end a session: a consent, a revoke, a
@@ -10040,6 +10044,51 @@ impl Actor {
             && let Err(error) = injector.inject(event)
         {
             tracing::warn!(peer = %tag, %error, "input injection failed");
+        }
+    }
+
+    /// Host side: keeps this machine from going idle while a guest who may
+    /// drive its input is connected (ADR 0123).
+    ///
+    /// An input that ends an idle spell is what `beta` can lose its whole
+    /// network to — the guest coming back to the view after a pause, in
+    /// practice — and a power request does not hold that off. What does is the
+    /// machine never going idle: the injector tells the desktop somebody is
+    /// still at it. It leaves alone a desktop that already went idle, since
+    /// that nudge would be the wake to avoid, and one that had input moments
+    /// ago, since after such a wake more input keeps the network down. A
+    /// parked session is not kept awake at all (`someone_may_inject`).
+    ///
+    /// Performed where a guest's input is: the `LocalSystem` desktop injector
+    /// first (ADR 0114), which UIPI does not put behind a `VMware` window the
+    /// way it does this process, and in-process when that is not there. Off
+    /// Windows there is nothing to hold off, and nothing is done.
+    fn keep_desktop_awake(&mut self) {
+        if !cfg!(target_os = "windows") || !self.sessions.someone_may_inject() {
+            return;
+        }
+        let keep_awake = lumepeer_service::protocol::DesktopInjectEvent {
+            logical: 0,
+            scancode: 0,
+            modifiers: 0,
+            detail: lumepeer_service::protocol::DesktopInjectDetail::KeepAwake,
+        };
+        if lumepeer_service::client::inject_desktop(keep_awake) {
+            return;
+        }
+        if self.injector.is_none() {
+            match platform_injector() {
+                Ok(injector) => self.injector = Some(injector),
+                Err(error) => {
+                    tracing::debug!(%error, "no input adapter to keep the desktop awake with");
+                    return;
+                }
+            }
+        }
+        if let Some(injector) = self.injector.as_mut()
+            && let Err(error) = injector.keep_awake()
+        {
+            tracing::debug!(%error, "the desktop refused the keep-awake");
         }
     }
 

@@ -569,6 +569,21 @@ impl SessionManager {
         }
     }
 
+    /// Whether any active session could get some input past
+    /// [`Self::authorize_input`] — the guests whose next keystroke or mouse
+    /// move would wake this machine if it had gone idle (ADR 0123).
+    #[must_use]
+    pub fn someone_may_inject(&self) -> bool {
+        self.sessions.values().any(|session| {
+            session.state == SessionState::Active
+                && match session.role {
+                    Role::ViewOnly => false,
+                    Role::FullControl => session.grants.input,
+                    Role::ControlLimited => !session.allowed_actions.is_empty(),
+                }
+        })
+    }
+
     /// Actions `peer` may perform right now, as captured at grant time.
     #[must_use]
     pub fn allowed_actions(&self, peer: &NodeId) -> &[ControlAction] {
@@ -787,6 +802,28 @@ mod tests {
             manager.authorize_input(&peer(2), &key_event()),
             Err(CoreError::UnknownPeer)
         ));
+    }
+
+    #[test]
+    fn only_a_session_that_can_inject_keeps_the_host_awake() {
+        let mut manager = SessionManager::with_plan(Plan::Team);
+        assert!(!manager.someone_may_inject());
+        manager.grant(peer(1), Role::ViewOnly).unwrap();
+        assert!(
+            !manager.someone_may_inject(),
+            "a viewer never wakes the host"
+        );
+        // A limited role with nothing on its allowlist injects nothing either.
+        manager.grant(peer(2), Role::ControlLimited).unwrap();
+        assert!(!manager.someone_may_inject());
+        manager.revoke(peer(2)).unwrap();
+
+        manager.grant(peer(3), Role::FullControl).unwrap();
+        assert!(manager.someone_may_inject());
+        // Parked for its reconnect window, the session sends nothing until it
+        // resumes, and a resume is itself the next input.
+        manager.on_disconnect(peer(3)).unwrap();
+        assert!(!manager.someone_may_inject());
     }
 
     #[test]
