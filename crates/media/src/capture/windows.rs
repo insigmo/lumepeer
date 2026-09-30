@@ -99,24 +99,25 @@ mod dxgi {
         DeleteObject, ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
         SRCCOPY, SelectObject,
     };
+    use windows::Win32::System::SystemInformation::GetTickCount;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
         QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyboardLayout, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
-        KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE,
-        MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
-        MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-        MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-        MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW,
-        MapVirtualKeyW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_ADD, VK_APPS, VK_BACK, VK_CAPITAL,
-        VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
-        VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY,
-        VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4,
-        VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
-        VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
-        VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+        GetKeyboardLayout, GetLastInputInfo, HKL, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+        KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+        KEYEVENTF_UNICODE, LASTINPUTINFO, MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX, MOUSE_EVENT_FLAGS,
+        MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+        MapVirtualKeyExW, MapVirtualKeyW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_ADD, VK_APPS,
+        VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
+        VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
+        VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2,
+        VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS,
+        VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+        VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
         VkKeyScanExW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -130,7 +131,9 @@ mod dxgi {
         POINTER_BUTTON_LOGICAL_BASE, is_chord, names_a_key,
     };
 
-    use lumepeer_core::constants::MAX_CURSOR_SHAPE_PIXELS;
+    use lumepeer_core::constants::{
+        KEEP_AWAKE_MAX_IDLE_MS, KEEP_AWAKE_MIN_IDLE_MS, MAX_CURSOR_SHAPE_PIXELS,
+    };
 
     use crate::capture::{
         CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
@@ -3067,6 +3070,49 @@ mod dxgi {
         fn capability(&self) -> InputCapability {
             InputCapability::Full
         }
+
+        fn keep_awake(&mut self) -> Result<()> {
+            // Only between the two bounds (ADR 0123). Below the lower one,
+            // somebody's recent input keeps the desktop awake already — and if
+            // that input was a wake that took `beta`'s network, more input
+            // would hold the network down. Past the upper one the desktop has
+            // gone idle, and this would be the wake. A desktop that will not
+            // say how long it has been idle is left alone for the same reason.
+            let idle_ms = desktop_idle_ms();
+            if !keep_awake_due(idle_ms) {
+                tracing::debug!(?idle_ms, "the desktop does not need keeping awake now");
+                return Ok(());
+            }
+            // A relative move of nothing. The cursor stays where it is, and it
+            // still counts as input to the idle timer that screen-off, the
+            // screen saver and the lock all run on (measured, ADR 0123).
+            Self::mouse(0, 0, MOUSEEVENTF_MOVE)
+        }
+    }
+
+    /// Whether a desktop idle for `idle_ms` gets the keep-awake (ADR 0123):
+    /// only between the two bounds, and never when the idle time is unknown.
+    fn keep_awake_due(idle_ms: Option<u64>) -> bool {
+        idle_ms.is_some_and(|ms| (KEEP_AWAKE_MIN_IDLE_MS..KEEP_AWAKE_MAX_IDLE_MS).contains(&ms))
+    }
+
+    /// Milliseconds since the last input of this session, or `None` when the
+    /// session will not say.
+    fn desktop_idle_ms() -> Option<u64> {
+        let mut last = LASTINPUTINFO {
+            cbSize: u32::try_from(size_of::<LASTINPUTINFO>()).unwrap_or(0),
+            dwTime: 0,
+        };
+        // SAFETY: `last` is a live `LASTINPUTINFO` with `cbSize` set, which is
+        // all `GetLastInputInfo` requires; it keeps no pointer into it.
+        if !unsafe { GetLastInputInfo(&raw mut last) }.as_bool() {
+            return None;
+        }
+        // Both are the same 32-bit millisecond tick, so the difference is
+        // right across its 49-day wrap as long as it is taken wrapping.
+        // SAFETY: no arguments, no preconditions.
+        let now = unsafe { GetTickCount() };
+        Some(u64::from(now.wrapping_sub(last.dwTime)))
     }
 
     #[cfg(test)]
@@ -3080,6 +3126,20 @@ mod dxgi {
         use std::sync::Mutex;
 
         use super::*;
+
+        /// The keep-awake never wakes a desktop that may have gone idle, never
+        /// piles onto input that just happened, and does nothing when it
+        /// cannot tell which is which (ADR 0123).
+        #[test]
+        fn the_keep_awake_only_runs_between_its_bounds() {
+            assert!(!keep_awake_due(None));
+            assert!(!keep_awake_due(Some(0)));
+            assert!(!keep_awake_due(Some(KEEP_AWAKE_MIN_IDLE_MS - 1)));
+            assert!(keep_awake_due(Some(KEEP_AWAKE_MIN_IDLE_MS)));
+            assert!(keep_awake_due(Some(KEEP_AWAKE_MAX_IDLE_MS - 1)));
+            assert!(!keep_awake_due(Some(KEEP_AWAKE_MAX_IDLE_MS)));
+            assert!(!keep_awake_due(Some(u64::from(u32::MAX))));
+        }
 
         /// Windows allows exactly one duplication of a given output per
         /// process: a second `DuplicateOutput` on the same display reports

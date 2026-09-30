@@ -66,29 +66,39 @@ fn serve() {
     tracing::info!("desktop injector attached; performing forwarded input");
 
     while let Some(event) = link.recv() {
-        if let Err(error) = injector.inject(&to_payload(event)) {
+        // The host's keep-awake is no guest's event and has no payload to
+        // rebuild; the injector performs it as its own call (ADR 0123).
+        let Some(payload) = to_payload(event) else {
+            if let Err(error) = injector.keep_awake() {
+                tracing::debug!(%error, "this desktop refused the keep-awake");
+            }
+            continue;
+        };
+        if let Err(error) = injector.inject(&payload) {
             tracing::warn!(%error, "an authorized input event was refused by this desktop");
         }
     }
     tracing::info!("the desktop injector channel closed; exiting");
 }
 
-/// Rebuilds the host's own [`InputEventPayload`] from the wire event.
+/// Rebuilds the host's own [`InputEventPayload`] from the wire event, or
+/// `None` for the host's keep-awake, which is not a guest's event at all.
 ///
 /// The inverse of the host's `desktop_inject_event`: it carries `logical`,
 /// `scancode` and `modifiers` precisely so this reconstruction is exact, and the
 /// injector reproduces the same chord and grab behaviour it would in-process.
-fn to_payload(event: DesktopInjectEvent) -> InputEventPayload {
+fn to_payload(event: DesktopInjectEvent) -> Option<InputEventPayload> {
     let detail = match event.detail {
         DesktopInjectDetail::Press => InputDetail::Press,
         DesktopInjectDetail::Release => InputDetail::Release,
         DesktopInjectDetail::Move { x, y } => InputDetail::PointerMove { x, y },
         DesktopInjectDetail::Wheel { dx, dy } => InputDetail::Wheel { dx, dy },
+        DesktopInjectDetail::KeepAwake => return None,
     };
-    InputEventPayload {
+    Some(InputEventPayload {
         logical: event.logical,
         scancode: event.scancode,
         modifiers: event.modifiers,
         detail,
-    }
+    })
 }
