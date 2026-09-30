@@ -326,8 +326,7 @@ impl SessionManager {
                 if !already_active && others >= usize::from(limit) {
                     return Err(CoreError::ConcurrentGuestLimit { limit });
                 }
-                if role.is_controller() && self.controller().is_some_and(|holder| holder != peer)
-                {
+                if role.is_controller() && self.controller().is_some_and(|holder| holder != peer) {
                     return Err(CoreError::ControllerAlreadyGranted);
                 }
             }
@@ -1338,7 +1337,9 @@ mod tests {
         manager
             .request_consent_for(peer(1), Role::FullControl, SessionKind::Terminal)
             .unwrap();
-        manager.request_consent_as(peer(2), Role::FullControl).unwrap();
+        manager
+            .request_consent_as(peer(2), Role::FullControl)
+            .unwrap();
         let kinds: Vec<_> = manager.pending().iter().map(|t| t.kind).collect();
         assert_eq!(kinds, [SessionKind::Terminal, SessionKind::Screen]);
     }

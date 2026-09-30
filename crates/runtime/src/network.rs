@@ -30,14 +30,14 @@ use lumepeer_core::constants::{
     CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
     DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS, DISPLAY_MODE_CONFIRM_TIMEOUT_SECS,
     FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS,
-    FILE_TRANSFER_START_TIMEOUT_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
-    MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
-    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
-    PRESENCE_ATTEMPT_TIMEOUT_SECS, PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS,
-    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS, HOST_KEEP_AWAKE_SECS,
-    RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
+    FILE_TRANSFER_START_TIMEOUT_SECS, HOST_KEEP_AWAKE_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
+    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
+    MAX_DIR_MANIFEST_ENTRIES, MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES,
+    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
+    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, PRESENCE_ATTEMPT_TIMEOUT_SECS,
+    PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS,
+    RECONNECT_WINDOW_SECS, RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS,
+    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
     SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
     STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
     TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
@@ -49,9 +49,9 @@ use lumepeer_core::protocol::{
     FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT,
     FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE,
     FEATURE_TERMINAL, FEATURE_TERMINAL_ONLY, FEATURE_TUNNEL, FEATURE_UNATTENDED,
-    FEATURE_UNATTENDED_PROOF, FileFetchRefusal, FileOp, FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry,
-    MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode,
-    TerminalRefusal, TunnelRefusal, UnattendedRejection,
+    FEATURE_UNATTENDED_PROOF, FileFetchRefusal, FileOp, FileOpRefusal, InputDetail,
+    InputEventPayload, ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind, MonitorInfo,
+    ProofKdf, RebootMode, TerminalRefusal, TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path, split_entry_path,
@@ -90,8 +90,9 @@ use crate::unattended_store::UnattendedStore;
 use crate::view::{
     BITSTREAM_POLL_TIMEOUT_MS, BitstreamFeed, CursorFeed, DecodePath, EncodeControl, HostMedia,
     MediaFault, MediaHealth, MediaReport, MediaTarget, SharedCapture, TerminalWindow, ViewSlot,
-    ViewStatus, ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response, encode_view_response,
-    lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver, window_label,
+    ViewStatus, ViewSurface, ViewWindows, encode_chunk_response, encode_cursor_response,
+    encode_view_response, lock_capture, slot_for_poll, spawn_encode_loop, spawn_media_receiver,
+    window_label,
 };
 
 /// First `PROTOCOL_MINOR` that carries `MessageKind::FileTransferStart`, and
@@ -11668,7 +11669,8 @@ impl Actor {
         self.speaks_terminal.remove(&peer);
         self.terminal_only_guests.remove(&peer);
         self.terminal_to_host.remove(&peer);
-        self.terminal_pending.retain(|(holder, _), _| *holder != peer);
+        self.terminal_pending
+            .retain(|(holder, _), _| *holder != peer);
         self.terminal_asks.remove(&peer);
         self.shell_windows.retain(|(holder, _), _| *holder != peer);
         self.speaks_reboot.remove(&peer);
@@ -20728,7 +20730,11 @@ mod tests {
             }
         }
         assert_eq!(refused(&beside), 2, "the window beside got {beside:?}");
-        assert_eq!(refused(&session), 1, "the session's own window got {session:?}");
+        assert_eq!(
+            refused(&session),
+            1,
+            "the session's own window got {session:?}"
+        );
     }
 
     /// ADR 0079 end to end, on a platform whose test process can start a
@@ -20779,7 +20785,12 @@ mod tests {
                 "the shell's prompt never reached the guest before anything was typed"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-            polled = terminal_records(&guest.terminal_poll(host_label.clone(), TerminalWindow::Session).await.unwrap());
+            polled = terminal_records(
+                &guest
+                    .terminal_poll(host_label.clone(), TerminalWindow::Session)
+                    .await
+                    .unwrap(),
+            );
         }
 
         // What comes back is computed by the shell, not echoed from the
@@ -20800,7 +20811,10 @@ mod tests {
                 "the shell never answered: {}",
                 String::from_utf8_lossy(&output)
             );
-            let polled = guest.terminal_poll(host_label.clone(), TerminalWindow::Session).await.unwrap();
+            let polled = guest
+                .terminal_poll(host_label.clone(), TerminalWindow::Session)
+                .await
+                .unwrap();
             for (id, event, payload) in terminal_records(&polled) {
                 if id == shell && event == TERMINAL_EVENT_OUTPUT {
                     output.extend_from_slice(&payload);
@@ -20879,11 +20893,18 @@ mod tests {
             .terminal_window_closed(host_label.clone(), TerminalWindow::Beside)
             .await
             .unwrap();
-        let row = wait_for_row(&host, &guest_label, "the shell outlived its window", |row| {
-            !row.terminal_active
-        })
+        let row = wait_for_row(
+            &host,
+            &guest_label,
+            "the shell outlived its window",
+            |row| !row.terminal_active,
+        )
         .await;
-        assert_eq!(row.state, SessionStateDto::Active, "the session is still there");
+        assert_eq!(
+            row.state,
+            SessionStateDto::Active,
+            "the session is still there"
+        );
     }
 
     /// Polls a guest's terminal queue until one record's event satisfies
@@ -20897,7 +20918,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         let mut seen = Vec::new();
         loop {
-            let polled = guest.terminal_poll(host_label.to_owned(), TerminalWindow::Session).await.unwrap();
+            let polled = guest
+                .terminal_poll(host_label.to_owned(), TerminalWindow::Session)
+                .await
+                .unwrap();
             let records = terminal_records(&polled);
             let found = records.iter().any(|(_, event, _)| wanted(*event));
             seen.extend(records);
@@ -23910,9 +23934,12 @@ mod tests {
             .await
             .expect("a terminal connect asks for consent like any other");
         // …and the host's dialog is told what it is for (ADR 0131).
-        wait_for_row(&host, &again, "the request never said it was for a shell", |row| {
-            row.kind == SessionKind::Terminal
-        })
+        wait_for_row(
+            &host,
+            &again,
+            "the request never said it was for a shell",
+            |row| row.kind == SessionKind::Terminal,
+        )
         .await;
         host.grant(again.clone(), Role::FullControl).await.unwrap();
         let granted = wait_for_row(&host, &again, "the terminal session never started", |row| {
@@ -24003,7 +24030,9 @@ mod tests {
         let controller = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
-        host.grant(controller.clone(), Role::FullControl).await.unwrap();
+        host.grant(controller.clone(), Role::FullControl)
+            .await
+            .unwrap();
         wait_for_phase(&a, ConnectPhase::Connected).await;
         wait_until("the controller never became a viewer", || {
             viewers(&host_capture) == 1
@@ -24018,9 +24047,12 @@ mod tests {
         let shell = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
             .await
             .unwrap();
-        wait_for_row(&host, &shell, "the request never said it was for a shell", |row| {
-            row.kind == SessionKind::Terminal
-        })
+        wait_for_row(
+            &host,
+            &shell,
+            "the request never said it was for a shell",
+            |row| row.kind == SessionKind::Terminal,
+        )
         .await;
         host.grant(shell.clone(), Role::FullControl).await.unwrap();
         wait_for_phase(&b, ConnectPhase::Connected).await;
@@ -24028,11 +24060,18 @@ mod tests {
         let rows = host.status().await.unwrap();
         let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
         assert_eq!(row(&controller).state, SessionStateDto::Active);
-        assert!(row(&controller).grants.input, "the controller keeps the keyboard");
+        assert!(
+            row(&controller).grants.input,
+            "the controller keeps the keyboard"
+        );
         assert_eq!(row(&shell).state, SessionStateDto::Active);
         assert_eq!(row(&shell).kind, SessionKind::Terminal);
         assert!(row(&shell).grants.terminal && !row(&shell).grants.input);
-        assert_eq!(viewers(&host_capture), 1, "only the controller is captured for");
+        assert_eq!(
+            viewers(&host_capture),
+            1,
+            "only the controller is captured for"
+        );
     }
 
     /// §10, ADR 0089: a link that drops mid-session comes back as the same
