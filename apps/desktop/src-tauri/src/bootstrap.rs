@@ -145,6 +145,21 @@ pub async fn spawn_actor(
         policy,
     );
 
+    // A device password set before ADR 0133 hosts the sign-in screen from
+    // this start on, as one set now does.
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            if handle
+                .unattended_status()
+                .await
+                .is_ok_and(|status| status.enabled)
+            {
+                crate::commands::host_logon_screen_unless_declined();
+            }
+        }
+    });
+
     tokio::spawn({
         let online = handle.online_flag();
         async move {

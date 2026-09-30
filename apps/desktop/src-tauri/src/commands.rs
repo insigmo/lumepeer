@@ -1494,14 +1494,25 @@ pub fn unattended_set_logon_screen(window: Window, args: LogonScreenArgs) -> Res
 }
 
 /// The platform half of [`unattended_set_logon_screen`].
+///
+/// The switch records the owner's refusal as well as moving the owner file,
+/// because since ADR 0133 a start with a device password hosts the logon
+/// screen unless it was refused.
 fn set_logon_screen(enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use lumepeer_service::program_data::{logon_host_owner, set_logon_host_owner};
+        use lumepeer_service::program_data::{
+            logon_host_owner, set_logon_host_declined, set_logon_host_owner, user_directory,
+        };
 
         let Some(account) = crate::placement::protected_account() else {
             return Err("the sign-in screen can only be hosted by the installed app".to_owned());
         };
+        let recorded = user_directory(&account)
+            .is_some_and(|directory| set_logon_host_declined(&directory, !enabled));
+        if !recorded {
+            return Err("cannot save the sign-in screen setting".to_owned());
+        }
         let owner = if enabled {
             Some(account.as_str())
         } else if logon_host_owner().as_deref() == Some(&*account) {
@@ -1522,6 +1533,45 @@ fn set_logon_screen(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// Hosts the logon screen with this account's stores, now that it has a device
+/// password — unless its owner turned that off, or another account on this
+/// machine already hosts it (ADR 0133).
+///
+/// Called when a password is set and at every start with unattended access
+/// on, so a machine whose password predates ADR 0133 is hosted too. Another
+/// account's choice is never moved: one owner per machine (ADR 0126 §3), and
+/// only the switch takes it over.
+pub fn host_logon_screen_unless_declined() {
+    #[cfg(target_os = "windows")]
+    {
+        use lumepeer_service::program_data::{
+            logon_host_declined, logon_host_owner, set_logon_host_owner, user_directory,
+        };
+
+        let Some(account) = crate::placement::protected_account() else {
+            return;
+        };
+        let Some(directory) = user_directory(&account) else {
+            return;
+        };
+        if logon_host_declined(&directory) {
+            return;
+        }
+        match logon_host_owner() {
+            Some(owner) if owner == account => {}
+            Some(_) => {
+                tracing::info!("another account on this machine hosts the sign-in screen");
+            }
+            None if set_logon_host_owner(Some(&account)) => {
+                tracing::info!(
+                    "a device password is set: the sign-in screen is hosted too (ADR 0133)"
+                );
+            }
+            None => tracing::warn!("cannot turn hosting the sign-in screen on"),
+        }
+    }
+}
+
 /// Sets or replaces the device password, turning unattended access on (§8).
 ///
 /// The password travels one way only. It is hashed with Argon2id inside
@@ -1539,6 +1589,7 @@ pub async fn unattended_set_password(
 ) -> Result<(), IpcError> {
     check_window(&window)?;
     state.network.unattended_set_password(args.password).await?;
+    host_logon_screen_unless_declined();
     Ok(())
 }
 

@@ -163,8 +163,8 @@ second machine. All manual, once per release.
 ### Hosting the sign-in screen (ADR 0126)
 
 Needs a host you can reboot and a second machine as the guest. The host has a
-device password set, a full-control unattended role, and "Also at the Windows
-sign-in screen" on.
+device password set and a full-control unattended role; "Also at the Windows
+sign-in screen" is then on by itself (ADR 0133).
 
 - [ ] Reboot the host. Before anybody signs in,
       `%ProgramData%\Lumepeer\logs\lumepeer-logon-host.log` says "hosting the
@@ -182,6 +182,23 @@ sign-in screen" on.
 - [ ] Sign out: the logon host comes back and the guest can connect again.
 - [ ] A guest whose unattended role is view-only sees the sign-in screen and
       cannot type into it.
+
+### Locked and signed-out hosts (ADR 0133)
+
+A Windows host with a device password, and a full-control guest on another
+machine.
+
+- [ ] Lock the host (Win+L) during a session. The guest sees the lock screen,
+      clicks it, types the Windows password and gets the desktop back. The
+      service log has one "performed one event" line per click and key.
+- [ ] Break the guest's network for ~20 s while the host is locked, then
+      restore it. The session resumes and the lock screen is on the guest
+      again; the host log does not say "this platform cannot capture".
+- [ ] While a guest is connected, `powercfg /requests` (elevated) lists
+      Lumepeer under SYSTEM; after the guest leaves it does not.
+- [ ] Set a device password on a fresh install: the "Also at the Windows
+      sign-in screen" box is ticked without touching it. Untick it, restart
+      the client: it stays unticked.
 
 ### The guest decodes for itself (ADR 0058, ADR 0059)
 

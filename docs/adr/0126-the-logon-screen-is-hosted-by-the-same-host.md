@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-28
+Amended by: ADR 0133 (§3: on whenever a device password is set; the switch records a refusal)
 
 The user's report: after a reboot the host cannot be reached until somebody
 signs in and types the password at the machine, while other remote-desktop
