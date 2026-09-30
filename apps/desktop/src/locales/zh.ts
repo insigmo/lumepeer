@@ -9,6 +9,9 @@ export const zh: Dictionary = {
   'consent.action.deny': '拒绝',
   'consent.action.allowView': '仅允许查看',
   'consent.action.allowFull': '允许完全控制',
+  'consent.action.allowTerminal': '允许终端',
+  'consent.request.terminalBody':
+    '只请求终端：在这台电脑上运行一个 shell，看不到屏幕，也不能使用键盘或鼠标。可以与正在控制的会话同时运行。',
   'invite.heading': '邀请并连接',
   'invite.create': '创建邀请',
   'invite.refresh': '撤销当前代码并生成新代码',
@@ -129,6 +132,7 @@ export const zh: Dictionary = {
   'status.role.viewOnly': '仅查看',
   'status.role.controlLimited': '受限控制',
   'status.role.fullControl': '完全控制',
+  'status.role.terminal': '仅终端',
   'status.ready': '已就绪，可连接',
   'status.notReady': '尚未就绪，无法连接',
   'status.noCapture': '此设备不支持屏幕捕获，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',

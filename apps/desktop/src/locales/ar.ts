@@ -9,6 +9,9 @@ export const ar: Dictionary = {
   'consent.action.deny': 'رفض',
   'consent.action.allowView': 'السماح بالمشاهدة فقط',
   'consent.action.allowFull': 'السماح بالتحكم الكامل',
+  'consent.action.allowTerminal': 'السماح بالطرفية',
+  'consent.request.terminalBody':
+    'يطلب طرفية فقط: صدفة على هذا الحاسوب، دون رؤية الشاشة ودون لوحة المفاتيح أو الفأرة. يمكن أن تعمل بجانب الجلسة التي تتحكم بالجهاز.',
   'invite.heading': 'الدعوة والاتصال',
   'invite.create': 'إنشاء دعوة',
   'invite.refresh': 'إبطال الرمز الحالي وإصدار رمز جديد',
@@ -133,6 +136,7 @@ export const ar: Dictionary = {
   'status.role.viewOnly': 'مشاهدة فقط',
   'status.role.controlLimited': 'تحكم محدود',
   'status.role.fullControl': 'تحكم كامل',
+  'status.role.terminal': 'طرفية فقط',
   'status.ready': 'جاهز للاتصال',
   'status.notReady': 'غير جاهز للاتصال',
   'status.noCapture':

@@ -996,6 +996,24 @@ pub enum ViewSurface {
     Files,
 }
 
+/// Which of a guest's windows onto one host a shell belongs to (ADR 0131).
+///
+/// A session's shells share one channel and one queue of things to tell the
+/// guest. With the session's own window and a terminal window beside it both
+/// asking for shells, each has to be told only about the ones it opened — a
+/// poll that drained the other's output would leave it with a shell that
+/// never prints anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TerminalWindow {
+    /// The session's own window: the terminal panel of a screen, or the whole
+    /// window of a session that is a shell and nothing else (ADR 0101).
+    #[default]
+    Session,
+    /// A terminal window opened beside a session that already has a window
+    /// of its own, instead of a second connect to the same host (ADR 0131).
+    Beside,
+}
+
 impl ViewSurface {
     /// Whether this window shows the host's picture, which is the same
     /// question as whether the guest dials `rd/media/1` for it: a host starts

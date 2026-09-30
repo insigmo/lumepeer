@@ -9,6 +9,9 @@ export const pl: Dictionary = {
   'consent.action.deny': 'Odmów',
   'consent.action.allowView': 'Zezwól tylko na podgląd',
   'consent.action.allowFull': 'Zezwól na pełną kontrolę',
+  'consent.action.allowTerminal': 'Zezwól na terminal',
+  'consent.request.terminalBody':
+    'Prosi tylko o terminal: powłokę na tym komputerze, bez podglądu ekranu i bez klawiatury czy myszy. Może działać obok sesji, która ma kontrolę.',
   'invite.heading': 'Zaproś i połącz',
   'invite.create': 'Utwórz zaproszenie',
   'invite.refresh': 'Unieważnij bieżący kod i wydaj nowy',
@@ -134,6 +137,7 @@ export const pl: Dictionary = {
   'status.role.viewOnly': 'tylko podgląd',
   'status.role.controlLimited': 'ograniczona kontrola',
   'status.role.fullControl': 'pełna kontrola',
+  'status.role.terminal': 'tylko terminal',
   'status.ready': 'Gotowe do połączenia',
   'status.notReady': 'Niegotowe do połączenia',
   'status.noCapture':

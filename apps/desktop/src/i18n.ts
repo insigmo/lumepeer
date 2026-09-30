@@ -67,6 +67,10 @@ export type TranslationKey =
   | 'consent.action.deny'
   | 'consent.action.allowView'
   | 'consent.action.allowFull'
+  // A guest that came for a shell alone (ADR 0131): what the dialog says
+  // instead of the screen body, and the one way to let it in.
+  | 'consent.action.allowTerminal'
+  | 'consent.request.terminalBody'
   | 'invite.heading'
   | 'invite.create'
   | 'invite.refresh'
@@ -190,6 +194,9 @@ export type TranslationKey =
   | 'status.role.viewOnly'
   | 'status.role.controlLimited'
   | 'status.role.fullControl'
+  // A terminal session's row (ADR 0131): its role is the one its invite
+  // named, but it holds a shell and nothing else.
+  | 'status.role.terminal'
   | 'status.ready'
   | 'status.notReady'
   | 'status.noCapture'

@@ -69,6 +69,7 @@ const activeSession: SessionStatus = {
   tunnel: false,
   terminal: false,
   terminal_active: false,
+  terminal_only: false,
   chat_unread: false,
 };
 

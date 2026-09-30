@@ -2,7 +2,9 @@
 
 Status: accepted
 Date: 2026-09-21
-Amended by: ADR 0130 (decision 4: a terminal window has no toolbar at all)
+Amended by: ADR 0130 (decision 4: a terminal window has no toolbar at all);
+ADR 0131 (decision 1: the guest says it came for a shell, and a terminal
+session holds the shell alone, beside the guest in control)
 
 Follows [ADR 0079](0079-a-terminal-is-its-own-grant-and-never-the-clients-privileges.md),
 which built the terminal as a capability *inside* a remote-view session, and

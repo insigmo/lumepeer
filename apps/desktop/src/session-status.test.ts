@@ -307,6 +307,7 @@ const GUEST: SessionStatus = {
   tunnel: true,
   terminal: true,
   terminal_active: false,
+  terminal_only: false,
   chat_unread: false,
 };
 
@@ -397,6 +398,15 @@ describe('a session card', () => {
     const row = container.querySelector('[data-testid="session-status-row"]');
     expect(row?.querySelector('[data-testid="recording-indicator"]')).not.toBeNull();
     expect(row?.querySelector('[data-testid="terminal-indicator"]')).not.toBeNull();
+  });
+
+  // ADR 0131: a terminal session keeps the role its invite named, but its
+  // card says what it actually holds.
+  it('calls a terminal session a terminal, not by its role', () => {
+    render(sessionStatus([{ ...GUEST, role: 'full_control', terminal_only: true }], 'en'), container);
+    const card = container.querySelector('[data-testid="session-card"]');
+    expect(card?.textContent).toContain('terminal only');
+    expect(card?.textContent).not.toContain('full control');
   });
 
   it('keeps a guest asking to be recorded on the card, where it cannot be missed', () => {

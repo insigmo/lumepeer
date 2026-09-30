@@ -886,6 +886,11 @@ fn main() {
                 if window.label().starts_with(commands::FILES_WINDOW_PREFIX) {
                     return;
                 }
+                // And a terminal window beside one (ADR 0131): hidden, its
+                // shell would keep running on the host with nobody to see it.
+                if window.label().starts_with(commands::TERMINAL_WINDOW_PREFIX) {
+                    return;
+                }
                 // Without a tray there is no icon to click and nothing to
                 // restore a hidden window from, so hiding it would leave a
                 // running process the user cannot reach. The close is allowed

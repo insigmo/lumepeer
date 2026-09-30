@@ -872,6 +872,15 @@ pub const MAX_TUNNEL_TARGETS_PER_SESSION: usize = 16;
 /// short-lived connections a browser opens by itself, and every one of these
 /// is a shell a person deliberately started.
 pub const MAX_TERMINALS_PER_SESSION: usize = 4;
+/// Most terminal sessions a host runs at once, beside the one session that
+/// may be in control of it (ADR 0131).
+///
+/// A terminal session is not counted against the plan's guest limit and does
+/// not hold the controller role, so this is the only bound on how many guests
+/// can be starting processes on this machine at the same time. Each of them
+/// still went through consent, and each is still held to
+/// [`MAX_TERMINALS_PER_SESSION`] shells.
+pub const MAX_TERMINAL_SESSIONS: usize = 4;
 /// Largest single output frame on `rd/term/1`, in bytes (§9.1; ADR 0079).
 ///
 /// The allocation bound of a length a peer announces, checked before anything

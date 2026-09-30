@@ -9,6 +9,9 @@ export const ru: Dictionary = {
   'consent.action.deny': 'Отклонить',
   'consent.action.allowView': 'Разрешить только просмотр',
   'consent.action.allowFull': 'Разрешить полный доступ',
+  'consent.action.allowTerminal': 'Разрешить терминал',
+  'consent.request.terminalBody':
+    'Просит только терминал: оболочку на этом компьютере, без просмотра экрана и без клавиатуры и мыши. Может работать параллельно с сессией, которая управляет компьютером.',
   'invite.heading': 'Приглашение и подключение',
   'invite.create': 'Создать приглашение',
   'invite.refresh': 'Отозвать текущий код и выпустить новый',
@@ -134,6 +137,7 @@ export const ru: Dictionary = {
   'status.role.viewOnly': 'только просмотр',
   'status.role.controlLimited': 'ограниченное управление',
   'status.role.fullControl': 'полный доступ',
+  'status.role.terminal': 'только терминал',
   'status.ready': 'Готово к подключению',
   'status.notReady': 'Не готово к подключению',
   'status.noCapture':
