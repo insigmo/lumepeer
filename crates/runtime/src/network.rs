@@ -9478,8 +9478,7 @@ impl Actor {
         // The media connection lands here once the media task dials, so the
         // mic toggle can open its tagged stream on the *same* `rd/media/1`
         // the picture uses (§4.1; ADR 0028).
-        let media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let media_connection = Arc::new(std::sync::Mutex::new(None::<PeerConnection>));
         let bitstream = Arc::new(BitstreamFeed::default());
         // A terminal session dials nothing here, and that is the whole
         // mechanism: the host starts its encode loop when it accepts
@@ -9511,8 +9510,7 @@ impl Actor {
         // Starts empty for the same reason: a host that composites its cursor
         // into the picture never announces one, and an overlay drawn on a
         // guess would be a second cursor next to the real one (§11).
-        let cursor: Arc<std::sync::RwLock<Option<CursorFeed>>> =
-            Arc::new(std::sync::RwLock::new(None));
+        let cursor = Arc::new(std::sync::RwLock::new(None::<CursorFeed>));
         // Starts at H.264 (0): a host that never sends `MediaCodec` at all —
         // every host built before ADR 0067, and any newer one this guest gave
         // no codec feature string to negotiate with — can only ever mean the
