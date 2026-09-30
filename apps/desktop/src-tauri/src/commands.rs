@@ -4346,7 +4346,11 @@ mod tests {
 
     /// `docs/gap-tasks/README.md`: a pilot capability mirrors its production
     /// counterpart. The pilot build is what end-to-end runs drive, so a
-    /// command missing there is one no e2e run can reach.
+    /// command missing there is one no e2e run can reach. That holds for the
+    /// core permissions as much as for the application commands: a scoped
+    /// `core:window:allow-set-fullscreen` once reached capabilities/view.json
+    /// and not the pilot copy while this compared commands only. The pilot
+    /// copies may grant more than production, never less.
     #[test]
     fn the_pilot_capabilities_allow_everything_production_does() {
         for file in ["main.json", "view.json", "hostbar.json"] {
@@ -4357,11 +4361,50 @@ mod tests {
                     "capabilities/{file} allows {command} and capabilities-pilot/{file} does not"
                 );
             }
+            let pilot = capability_core_permissions("capabilities-pilot", file);
+            for permission in capability_core_permissions("capabilities", file) {
+                assert!(
+                    pilot.contains(&permission),
+                    "capabilities/{file} grants {permission} and capabilities-pilot/{file} does not"
+                );
+            }
         }
     }
 
     /// The application commands a capability file allows, as command names.
     fn capability_commands(dir: &str, file: &str) -> Vec<String> {
+        capability_permissions(dir, file)
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|permission| permission.strip_prefix("allow-"))
+            .map(|command| command.replace('-', "_"))
+            .collect()
+    }
+
+    /// The `core:*` permissions a capability file grants: a plain string
+    /// entry as itself, an object entry as its identifier and the `allow`
+    /// scope that narrows it, so the file's formatting does not count.
+    fn capability_core_permissions(dir: &str, file: &str) -> Vec<serde_json::Value> {
+        capability_permissions(dir, file)
+            .into_iter()
+            .map(|permission| match permission.get("identifier") {
+                Some(identifier) => serde_json::json!({
+                    "identifier": identifier,
+                    "allow": permission["allow"],
+                }),
+                None => permission,
+            })
+            .filter(|permission| {
+                permission
+                    .as_str()
+                    .or_else(|| permission["identifier"].as_str())
+                    .is_some_and(|identifier| identifier.starts_with("core:"))
+            })
+            .collect()
+    }
+
+    /// Every entry of a capability file's permissions list.
+    fn capability_permissions(dir: &str, file: &str) -> Vec<serde_json::Value> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(dir)
             .join(file);
@@ -4371,11 +4414,7 @@ mod tests {
         json["permissions"]
             .as_array()
             .expect("a permissions list")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .filter_map(|permission| permission.strip_prefix("allow-"))
-            .map(|command| command.replace('-', "_"))
-            .collect()
+            .clone()
     }
 
     /// The entries of a bracketed list in a source file, unquoted and without
