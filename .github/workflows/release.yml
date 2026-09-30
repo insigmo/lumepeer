@@ -211,8 +211,9 @@ jobs:
           # libpipewire/libclang are what the capture-portal feature needs:
           # `pipewire-sys` links libpipewire-0.3 and generates its bindings
           # with bindgen, so both the library and libclang have to be here or
-          # the Linux rows of this matrix fail to build (ADR 0039).
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev
+          # the Linux rows of this matrix fail to build (ADR 0039). libva-dev
+          # is for encode-vaapi-zero-copy: `cros-libva` links libva and libva-drm.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev libva-dev
       - uses: actions/setup-node@v7
         with:
           node-version: '24'

@@ -37,6 +37,9 @@ encode-mf = ["lumepeer-media/encode-mf", "lumepeer-runtime/encode-mf"]
 # release build: the path is only worth turning on where it has been
 # measured on the machine in question.
 encode-mf-zero-copy = ["lumepeer-media/encode-mf-zero-copy", "lumepeer-runtime/encode-mf-zero-copy"]
+# The Linux counterpart (ADR 0088): VA-API encoding fed straight from the
+# portal's DMA-BUF. Links libva, so the .deb/.rpm must depend on it.
+encode-vaapi-zero-copy = ["lumepeer-media/encode-vaapi-zero-copy", "lumepeer-runtime/encode-vaapi-zero-copy"]
 encode-videotoolbox = ["lumepeer-media/encode-videotoolbox", "lumepeer-runtime/encode-videotoolbox"]
 decode-openh264 = ["lumepeer-media/decode-openh264", "lumepeer-runtime/decode-openh264"]
 # Off by default: never part of `cargo build --workspace`, the Task client
