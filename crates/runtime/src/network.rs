@@ -6496,7 +6496,7 @@ impl Actor {
     /// deleted. The disk is touched on a blocking thread, never on this one:
     /// a delete of a large tree is seconds of the host's disk, and the answer
     /// lands back as [`ActorEvent::FileOpDone`].
-    fn on_file_op_request(&mut self, peer: NodeId, id: u32, op: FileOp) {
+    fn on_file_op_request(&mut self, peer: NodeId, id: u32, op: &FileOp) {
         let tag = self.label_of(&peer);
         let action = match op {
             FileOp::MakeDir { .. } => "file_make_dir",
@@ -6522,7 +6522,7 @@ impl Actor {
             self.send_file_op_result(peer, id, Some(FileOpRefusal::Busy));
             return;
         }
-        let Some(plan) = FileOpPlan::from_wire(&op) else {
+        let Some(plan) = FileOpPlan::from_wire(op) else {
             tracing::warn!(peer = %tag, "a file operation on a path that is not one; refused");
             self.send_file_op_result(peer, id, Some(FileOpRefusal::BadPath));
             return;
@@ -6567,10 +6567,10 @@ impl Actor {
         if !self.views.contains_key(&peer) {
             return Err(ActorError::UnknownPeer);
         }
-        if !self
+        if self
             .connections
             .get(&peer)
-            .is_some_and(|c| c.peer_minor >= FILE_OPS_MINOR)
+            .is_none_or(|c| c.peer_minor < FILE_OPS_MINOR)
         {
             return Err(ActorError::Unsupported);
         }
@@ -9252,8 +9252,7 @@ impl Actor {
         // The media connection lands here once the media task dials, so the
         // mic toggle can open its tagged stream on the *same* `rd/media/1`
         // the picture uses (§4.1; ADR 0028).
-        let media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let media_connection = Arc::new(std::sync::Mutex::new(None::<PeerConnection>));
         let bitstream = Arc::new(BitstreamFeed::default());
         // A terminal session dials nothing here, and that is the whole
         // mechanism: the host starts its encode loop when it accepts
@@ -9285,8 +9284,7 @@ impl Actor {
         // Starts empty for the same reason: a host that composites its cursor
         // into the picture never announces one, and an overlay drawn on a
         // guess would be a second cursor next to the real one (§11).
-        let cursor: Arc<std::sync::RwLock<Option<CursorFeed>>> =
-            Arc::new(std::sync::RwLock::new(None));
+        let cursor = Arc::new(std::sync::RwLock::new(None::<CursorFeed>));
         // Starts at H.264 (0): a host that never sends `MediaCodec` at all —
         // every host built before ADR 0067, and any newer one this guest gave
         // no codec feature string to negotiate with — can only ever mean the
@@ -10790,7 +10788,7 @@ impl Actor {
             // (ADR 0124).
             MessageKind::FileOpRequest { id, ref op } => {
                 let op = op.clone();
-                self.on_file_op_request(peer, id, op);
+                self.on_file_op_request(peer, id, &op);
             }
             // Guest side: how one of those went.
             MessageKind::FileOpResult { id, refused } => {
