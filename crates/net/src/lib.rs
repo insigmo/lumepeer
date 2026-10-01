@@ -38,5 +38,5 @@ pub use media::{
     check_media_frame_length, decode_audio_payload, encode_audio_payload, open_media_stream,
     open_tagged_media_stream,
 };
-pub use peer_connection::PeerConnection;
+pub use peer_connection::{PathSnapshot, PeerConnection};
 pub use ticket::InviteTicket;

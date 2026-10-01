@@ -41,6 +41,7 @@ const COMMANDS: &[&str] = &[
     "view_next_frame",
     "view_next_chunk",
     "view_cursor",
+    "view_media_stats",
     "input_pointer_move",
     "input_press",
     "input_wheel",

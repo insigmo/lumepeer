@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-view-media-stats"
+description = "Enables the view_media_stats command without any pre-configured scope."
+commands.allow = ["view_media_stats"]
+
+[[permission]]
+identifier = "deny-view-media-stats"
+description = "Denies the view_media_stats command without any pre-configured scope."
+commands.deny = ["view_media_stats"]

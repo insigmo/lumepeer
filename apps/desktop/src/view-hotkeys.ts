@@ -37,7 +37,8 @@ export type HotkeyAction =
   | 'toggle-chat'
   | 'send-cad'
   | 'toggle-toolbar'
-  | 'toggle-keyboard-grab';
+  | 'toggle-keyboard-grab'
+  | 'toggle-stats';
 
 /** The chords, as physical key codes so a non-QWERTY layout still matches. */
 export const HOTKEYS: readonly { code: string; action: HotkeyAction }[] = [
@@ -48,6 +49,7 @@ export const HOTKEYS: readonly { code: string; action: HotkeyAction }[] = [
   { code: 'KeyD', action: 'send-cad' },
   { code: 'KeyT', action: 'toggle-toolbar' },
   { code: 'KeyK', action: 'toggle-keyboard-grab' },
+  { code: 'KeyS', action: 'toggle-stats' },
 ];
 
 /** How the prefix is written wherever the chords are shown to a person. */

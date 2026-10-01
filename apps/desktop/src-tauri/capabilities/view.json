@@ -21,6 +21,7 @@
     "allow-view-next-frame",
     "allow-view-next-chunk",
     "allow-view-cursor",
+    "allow-view-media-stats",
     "allow-input-pointer-move",
     "allow-input-press",
     "allow-input-wheel",

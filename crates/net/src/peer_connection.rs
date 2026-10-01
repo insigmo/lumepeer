@@ -212,4 +212,53 @@ impl PeerConnection {
             Transport::Obfuscated(connection) => connection.close_reason(),
         }
     }
+
+    /// What QUIC itself knows about the path carrying this connection right
+    /// now, or `None` while no path is selected.
+    ///
+    /// For diagnostics only — the statistics overlay and the host's periodic
+    /// media log line. Nothing may take a decision from it, for the same reason
+    /// nothing may take one from [`Self::is_obfuscated`].
+    #[must_use]
+    pub fn path_snapshot(&self) -> Option<PathSnapshot> {
+        match &self.transport {
+            Transport::Iroh(connection) => {
+                let paths = connection.paths();
+                let path = paths.iter().find(iroh::endpoint::Path::is_selected)?;
+                Some(PathSnapshot::from_stats(&path.stats(), path.is_relay()))
+            }
+            // One direct path, and never a relay (ADR 0052).
+            Transport::Obfuscated(connection) => connection
+                .path_stats(noq::PathId::ZERO)
+                .map(|stats| PathSnapshot::from_stats(&stats, false)),
+        }
+    }
+}
+
+/// One reading of a connection's selected QUIC path
+/// ([`PeerConnection::path_snapshot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathSnapshot {
+    /// QUIC's own smoothed round trip on this path.
+    pub rtt: std::time::Duration,
+    /// Congestion window, in bytes.
+    pub cwnd: u64,
+    /// Packets this path has lost since it opened.
+    pub lost_packets: u64,
+    /// Times the congestion controller has backed off on this path.
+    pub congestion_events: u64,
+    /// Whether the path goes through a relay rather than straight to the peer.
+    pub relay: bool,
+}
+
+impl PathSnapshot {
+    fn from_stats(stats: &noq::PathStats, relay: bool) -> Self {
+        Self {
+            rtt: stats.rtt,
+            cwnd: stats.cwnd,
+            lost_packets: stats.lost_packets,
+            congestion_events: stats.congestion_events,
+            relay,
+        }
+    }
 }

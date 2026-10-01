@@ -39,12 +39,16 @@ use lumepeer_media::abr::{
 };
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
-use lumepeer_media::encode::{EncodedFrame, EncoderConfig, VideoCodec, select_encoder};
+use lumepeer_media::encode::{
+    EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, select_encoder,
+};
 use lumepeer_media::error::MediaError;
 use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerConnection, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+use crate::media_stats::{ArrivalStats, EncodeReport, EncodeStats, MediaStatsSnapshot};
 
 /// Microseconds in a second, for turning a frame rate into a delay.
 const MICROS_PER_SEC: u64 = 1_000_000;
@@ -679,6 +683,10 @@ pub struct BitstreamFeed {
     queue: Mutex<BitstreamQueue>,
     ready: tokio::sync::Notify,
     path: std::sync::atomic::AtomicU8,
+    /// What arrived, for the view window's statistics overlay. Kept here
+    /// because this is the one object the media receiver and the window's IPC
+    /// both already hold, whichever side decodes.
+    stats: Mutex<ArrivalStats>,
 }
 
 #[derive(Debug, Default)]
@@ -770,6 +778,34 @@ impl BitstreamFeed {
 
     fn lock(&self) -> MutexGuard<'_, BitstreamQueue> {
         self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Forgets everything measured: a new media stream has started, and the
+    /// host's capture clock with it.
+    pub fn restart_stats(&self) {
+        *self.lock_stats() = ArrivalStats::default();
+    }
+
+    /// One frame arrived from the host, `bytes` long on the wire.
+    pub fn note_arrival(&self, frame: &EncodedFrame, bytes: usize) {
+        self.lock_stats()
+            .record(Instant::now(), frame.timestamp_us, bytes, frame.keyframe);
+    }
+
+    /// The latest reading of the media connection's QUIC path.
+    pub fn note_path(&self, path: Option<lumepeer_net::PathSnapshot>) {
+        self.lock_stats().set_path(path);
+    }
+
+    /// Everything measured so far, for the statistics overlay.
+    pub fn stats(&self) -> MediaStatsSnapshot {
+        self.lock_stats().snapshot(Instant::now())
+    }
+
+    fn lock_stats(&self) -> MutexGuard<'_, ArrivalStats> {
+        self.stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1301,6 +1337,10 @@ pub fn spawn_encode_loop(
         // the whole degradation ladder down over a hiccup
         // (docs/bugs/07-video-quality.md).
         let mut backlog = Backlog::default();
+        // What this loop spent its time on, summarised into the log every
+        // `ENCODE_STATS_PERIOD` for whoever is working out why a session is
+        // slow or soft. Read by nothing else.
+        let mut encode_stats = EncodeStats::new(Instant::now());
         // Session recording (§17): the actor swaps a recorder into the shared
         // `recorder` slot; each written frame is offered to whatever is in
         // there now, so a mid-session start/stop needs no pipeline restart.
@@ -1324,6 +1364,17 @@ pub fn spawn_encode_loop(
 
         loop {
             let tick_started = Instant::now();
+            if let Some(report) = encode_stats.due(tick_started) {
+                log_encode_report(
+                    &tag,
+                    &report,
+                    encoder.kind(),
+                    codec,
+                    target,
+                    control.manual_cap().is_some(),
+                    connection.path_snapshot(),
+                );
+            }
             // Is the link still on the previous frame? Then it cannot take
             // this one, and the honest thing is to not produce it: an encoded
             // frame may not simply be dropped later (everything after it
@@ -1335,6 +1386,7 @@ pub fn spawn_encode_loop(
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Full(())) => {
                     backlog.skipped();
+                    encode_stats.skipped();
                     sleep_for_the_rest_of(interval, tick_started).await;
                     continue;
                 }
@@ -1353,10 +1405,12 @@ pub fn spawn_encode_loop(
             let shared = Arc::clone(&capture);
             // `next_frame` is a blocking platform call; it must not sit on a
             // tokio worker thread.
+            let capture_started = Instant::now();
             let captured =
                 tokio::task::spawn_blocking(move || lock_capture(&shared).next_frame()).await;
             let frame = match captured {
                 Ok(Ok(Some(frame))) => {
+                    encode_stats.captured(capture_started.elapsed());
                     secure_desktop_notified = false;
                     // Ordinary capture just produced a real frame, so
                     // whatever the secure-desktop path was doing a moment
@@ -1510,6 +1564,7 @@ pub fn spawn_encode_loop(
             // `next_frame` above does. The encoder travels with the closure
             // and back.
             let finished = tokio::task::spawn_blocking(move || {
+                let scale_started = Instant::now();
                 let frame = scale_to_percent(frame, scale_percent);
                 // The guest's own box when it named one, the ADR 0018
                 // ceiling when it did not - never both. `MAX_PICTURE_PIXELS`
@@ -1522,16 +1577,23 @@ pub fn spawn_encode_loop(
                     Some((width, height)) => fit_within(frame, width, height),
                     None => fit_within_budget(frame),
                 };
+                let scale_took = scale_started.elapsed();
                 let mut encoder = encoder;
+                let encode_started = Instant::now();
                 let bitstream = encoder.encode(&frame);
-                (encoder, bitstream)
+                let timing = EncodeTiming {
+                    scale: scale_took,
+                    encode: encode_started.elapsed(),
+                    size: (frame.width, frame.height),
+                };
+                (encoder, bitstream, timing)
             })
             .await;
-            let bitstream = match finished {
-                Ok((returned, bitstream)) => {
+            let (bitstream, timing) = match finished {
+                Ok((returned, bitstream, timing)) => {
                     encoder = returned;
                     match bitstream {
-                        Ok(bitstream) => bitstream,
+                        Ok(bitstream) => (bitstream, timing),
                         Err(error) => {
                             // §18: a size the encoder will not take is not a
                             // reason to send nothing at all. The guest's own
@@ -1570,6 +1632,13 @@ pub fn spawn_encode_loop(
                 );
                 continue;
             }
+            encode_stats.encoded(
+                timing.scale,
+                timing.encode,
+                timing.size,
+                bitstream.data.len(),
+                bitstream.keyframe,
+            );
             sent.wrote(bitstream.data.len());
             backlog.offered();
             // Recording rides the frame the guest is being sent (§17): the
@@ -1668,6 +1737,60 @@ pub fn spawn_encode_loop(
             sleep_for_the_rest_of(interval, tick_started).await;
         }
     })
+}
+
+/// How long the blocking half of one encode tick spent where, and on what.
+#[derive(Debug, Clone, Copy)]
+struct EncodeTiming {
+    /// Reducing the picture on the CPU; zero when nothing needed reducing.
+    scale: Duration,
+    /// The encoder call itself.
+    encode: Duration,
+    /// The picture the encoder was handed.
+    size: (u32, u32),
+}
+
+/// One line in the host's log summarising the last `ENCODE_STATS_PERIOD` of
+/// an encode loop, for whoever is working out why a session is slow or soft.
+///
+/// A period in which nothing was encoded and nothing was skipped is a still
+/// screen, and says nothing worth a line.
+fn log_encode_report(
+    tag: &str,
+    report: &EncodeReport,
+    encoder: EncoderKind,
+    codec: VideoCodec,
+    target: QualityTarget,
+    preset: bool,
+    path: Option<lumepeer_net::PathSnapshot>,
+) {
+    if report.frames == 0 && report.skipped == 0 {
+        return;
+    }
+    tracing::info!(
+        peer = %tag,
+        ?encoder,
+        ?codec,
+        width = report.width,
+        height = report.height,
+        fps = report.fps,
+        kbps = report.kbps,
+        keyframes = report.keyframes,
+        skipped = report.skipped,
+        capture_ms = %format_args!("{:.1}/{:.1}", report.capture_ms_avg, report.capture_ms_max),
+        scale_ms = %format_args!("{:.1}/{:.1}", report.scale_ms_avg, report.scale_ms_max),
+        encode_ms = %format_args!("{:.1}/{:.1}", report.encode_ms_avg, report.encode_ms_max),
+        target_kbps = target.bitrate_kbps,
+        target_fps = target.fps,
+        target_scale = target.scale_percent,
+        preset,
+        rtt_ms = ?path.map(|path| path.rtt.as_millis()),
+        cwnd = ?path.map(|path| path.cwnd),
+        lost_packets = ?path.map(|path| path.lost_packets),
+        congestion_events = ?path.map(|path| path.congestion_events),
+        relay = ?path.map(|path| path.relay),
+        "media: the last period of the encode loop (ms as avg/max)"
+    );
 }
 
 /// The pacing delay of one frame at `fps`.
@@ -2102,6 +2225,9 @@ async fn stream_once(
     let Some((connection, mut reader)) = dial_media(target).await else {
         return false;
     };
+    target.bitstream.restart_stats();
+    target.bitstream.note_path(connection.path_snapshot());
+    let path_source = connection.clone();
     let _audio = spawn_audio_pass(connection, target.tag.clone(), pcm.clone());
 
     // The sandboxed worker is spawned only once there is something to decode:
@@ -2129,12 +2255,14 @@ async fn stream_once(
         window.received(payload.len());
         if let Some(report) = window.due() {
             send_report(target, report);
+            target.bitstream.note_path(path_source.path_snapshot());
         }
         let Some(encoded) = decode_media_payload(&payload) else {
             tracing::warn!(peer = %target.tag, "dropping a malformed media payload");
             window.lost();
             continue;
         };
+        target.bitstream.note_arrival(&encoded, payload.len());
 
         // The window decodes for itself, or has not said yet. Either way the
         // bitstream goes straight through: no worker process, no RGBA, no

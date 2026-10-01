@@ -611,6 +611,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::view_next_frame,
         commands::view_next_chunk,
         commands::view_cursor,
+        commands::view_media_stats,
         commands::input_pointer_move,
         commands::input_press,
         commands::input_wheel,
