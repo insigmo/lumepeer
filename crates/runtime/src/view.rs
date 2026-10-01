@@ -34,7 +34,9 @@ use lumepeer_core::constants::{
     RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
-use lumepeer_media::abr::{AbrController, QualityTarget, ReceiverFeedback, pinned_target};
+use lumepeer_media::abr::{
+    AbrController, QualityTarget, ReceiverFeedback, ceiling_fps, pinned_target,
+};
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{EncodedFrame, EncoderConfig, VideoCodec, select_encoder};
@@ -44,8 +46,8 @@ use lumepeer_net::{PeerConnection, STREAM_MIC, accept_media_stream, open_media_s
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-/// Milliseconds in a second, for turning a frame rate into a delay.
-const MILLIS_PER_SEC: u64 = 1_000;
+/// Microseconds in a second, for turning a frame rate into a delay.
+const MICROS_PER_SEC: u64 = 1_000_000;
 
 /// Permille, for turning a share of frames into the integer the wire carries.
 const PERMILLE: u64 = 1_000;
@@ -92,6 +94,10 @@ pub struct EncodeControl {
     /// because a preset and a ladder both driving the picture is what a
     /// person sees as the quality changing on its own.
     manual_cap: Arc<Mutex<Option<u32>>>,
+    /// The frame rate the same preset names, if the guest sent one
+    /// (ADR 0136). Pinned with the preset, and never above the session's own
+    /// ceiling: a guest asking for 144 from a 60 Hz host gets 60.
+    fps_cap: Arc<Mutex<Option<u8>>>,
     /// The picture size the guest said it will draw, in its own device
     /// pixels, if it asked for one (§11; ADR 0060). `None` is a guest that
     /// never asked, which is the only case that still gets the
@@ -139,6 +145,7 @@ impl EncodeControl {
             feedback: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(QualityTarget::default())),
             manual_cap: Arc::new(Mutex::new(None)),
+            fps_cap: Arc::new(Mutex::new(None)),
             size_cap: Arc::new(Mutex::new(None)),
             // Deny until told otherwise: the actor seeds this from the
             // session's live `secure_desktop` grant the moment it accepts the
@@ -233,6 +240,24 @@ impl EncodeControl {
         let changed = *current != cap;
         *current = cap;
         changed
+    }
+
+    /// The frame rate the guest's preset names right now, if any (ADR 0136).
+    #[must_use]
+    pub fn fps_cap(&self) -> Option<u8> {
+        *self
+            .fps_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the frame rate the guest's preset names, replacing whatever was
+    /// there.
+    pub fn set_fps_cap(&self, cap: Option<u8>) {
+        *self
+            .fps_cap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cap;
     }
 
     /// The picture size the guest asked for right now, if any (§11; ADR 0060).
@@ -1210,8 +1235,23 @@ pub fn spawn_encode_loop(
         // and a writer outliving the encoder would keep the session's stream
         // open with nothing behind it.
         let _writer_task = AbortOnDrop(spawn_media_writer(writer, frames_rx, tag.clone()));
+        // As fast as the host's display refreshes, up to ENCODE_MAX_FPS, and
+        // the encoder is told the same figure — it budgets each frame by it
+        // (ADR 0136). Asked once: a display-mode or monitor change mid-session
+        // keeps the rate the session started with until the next redial. On
+        // a blocking thread because on X11 the question is a new connection
+        // to the server.
+        let shared = Arc::clone(&capture);
+        let max_fps = ceiling_fps(
+            tokio::task::spawn_blocking(move || lock_capture(&shared).current_display_mode())
+                .await
+                .ok()
+                .flatten()
+                .map(|mode| mode.refresh_hz),
+        );
         let mut encoder = match select_encoder(EncoderConfig {
             codec,
+            fps: max_fps,
             ..EncoderConfig::default()
         }) {
             Ok(encoder) => encoder,
@@ -1227,11 +1267,14 @@ pub fn spawn_encode_loop(
                 return;
             }
         };
+        // The frame rate the encoder was built for, which a preset can move
+        // (ADR 0136).
+        let mut encoder_fps = max_fps;
         // Three knobs now, not one: the controller walks bitrate, then frame
         // rate, then picture scale (ADR 0037). The loop's own pacing is where
         // the frame rate lives, so `interval` is derived from the target
         // rather than fixed for the session.
-        let mut abr = AbrController::new();
+        let mut abr = AbrController::with_max_fps(max_fps);
         let mut target = abr.target();
         control.publish(target);
         let mut interval = frame_interval(target.fps);
@@ -1565,7 +1608,12 @@ pub fn spawn_encode_loop(
             // still runs while a preset is pinned: it is what keeps the
             // backlog window and the report clock honest for the moment the
             // guest stops naming one.
-            let settled = match pinned_target(control.manual_cap()) {
+            // The preset names its frame rate too (ADR 0136): the most this
+            // host delivers for `performance`, fewer and sharper frames for
+            // the presets that ask for them — never more than the host has.
+            let preset_fps = control.fps_cap().map_or(max_fps, |fps| fps.min(max_fps));
+            let preset = pinned_target(control.manual_cap(), preset_fps);
+            let settled = match preset {
                 Some(pinned) => (pinned != target).then_some(pinned),
                 None => measured.and_then(|feedback| abr.on_feedback(feedback)),
             };
@@ -1582,6 +1630,30 @@ pub fn spawn_encode_loop(
                 }
                 if next.fps != target.fps {
                     interval = frame_interval(next.fps);
+                }
+                // A preset's frame rate has to reach the encoder, not only
+                // the pace: it budgets every frame by the rate it was built
+                // for, so a 30 fps preset on an encoder built for 60 would
+                // spend half its bitrate (ADR 0136). Only a preset rebuilds
+                // it — one intra frame, which a preset change asks for anyway
+                // — where the ladder's 5 fps steps would pay one a second.
+                if preset.is_some() && next.fps != encoder_fps {
+                    match select_encoder(EncoderConfig {
+                        codec,
+                        fps: next.fps,
+                        bitrate_kbps: next.bitrate_kbps,
+                    }) {
+                        Ok(rebuilt) => {
+                            encoder = rebuilt;
+                            encoder_fps = next.fps;
+                        }
+                        Err(error) => tracing::warn!(
+                            peer = %tag,
+                            %error,
+                            fps = next.fps,
+                            "the encoder could not be rebuilt for the preset's frame rate"
+                        ),
+                    }
                 }
                 target = next;
                 control.publish(target);
@@ -1603,8 +1675,11 @@ pub fn spawn_encode_loop(
 /// `max(1)` is not defensive noise: the frame rate is clamped by
 /// `ABR_MIN_FPS` upstream, and dividing by a zero that cannot occur would
 /// still be a panic in a loop that must not have one.
+///
+/// In microseconds: whole milliseconds made 60 fps a 16 ms interval and 144
+/// a 6 ms one — 62.5 and 166 frames a second.
 fn frame_interval(fps: u8) -> Duration {
-    Duration::from_millis(MILLIS_PER_SEC / u64::from(fps.max(1)))
+    Duration::from_micros(MICROS_PER_SEC / u64::from(fps.max(1)))
 }
 
 /// Sleeps only what's left of `interval` after `tick_started`, instead of
@@ -1612,9 +1687,17 @@ fn frame_interval(fps: u8) -> Duration {
 /// tick's own work took — the latter compounds every tick that capture,
 /// encode or write is not instant, and real throughput falls under
 /// `ENCODE_DEFAULT_FPS` under any load at all.
+///
+/// On a blocking thread with `std`'s sleep, not `tokio::time::sleep` (ADR
+/// 0136). Tokio's timer on Windows wakes on the system clock tick: measured
+/// on the reference machine, every sleep from 1 to 11 ms took 15.8 ms and
+/// 16 to 23 ms took 31.7, so a loop doing 5 ms of work a tick ran at 21 fps
+/// when it targeted 30, and at 32 when it targeted 60. `std` sleeps on a
+/// high-resolution waitable timer there — the same requests came back within
+/// half a millisecond.
 async fn sleep_for_the_rest_of(interval: Duration, tick_started: Instant) {
     if let Some(remaining) = interval.checked_sub(tick_started.elapsed()) {
-        tokio::time::sleep(remaining).await;
+        let _ = tokio::task::spawn_blocking(move || std::thread::sleep(remaining)).await;
     }
 }
 
@@ -2692,6 +2775,27 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
+
+    /// ADR 0136: the encode loop's pacing reaches the rate it is asked for.
+    ///
+    /// Real time, on purpose — the defect was the platform timer, which a
+    /// paused tokio clock cannot see. With `tokio::time::sleep` a 60 fps loop
+    /// doing 2 ms of work a tick ran at about 32 on Windows; the bound leaves
+    /// room for a loaded machine without letting that through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pacing_keeps_up_with_60_fps() {
+        const TICKS: u32 = 60;
+        let interval = frame_interval(60);
+        let started = Instant::now();
+        for _ in 0..TICKS {
+            let tick_started = Instant::now();
+            // Capture and encode, standing in.
+            std::thread::sleep(Duration::from_millis(2));
+            sleep_for_the_rest_of(interval, tick_started).await;
+        }
+        let fps = f64::from(TICKS) / started.elapsed().as_secs_f64();
+        assert!(fps >= 48.0, "a 60 fps loop ran at {fps:.1} fps");
+    }
 
     /// D7, docs/bugs/13-stream-resolution.md task 2: the ceiling starts
     /// unset, a new value replaces it, and the loop sees exactly what was

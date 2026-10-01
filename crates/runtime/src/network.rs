@@ -26,18 +26,19 @@ use lumepeer_core::consent::{
     Admission, ConsentRateLimiter, Grants, IndependentGrant, Role, SessionKind,
 };
 use lumepeer_core::constants::{
-    ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS, CONNECT_RETRY_BACKOFF_CEILING_SECS,
-    CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS, DIAL_ATTEMPTS,
-    DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS, DISPLAY_MODE_CONFIRM_TIMEOUT_SECS,
-    FILE_OFFER_LEGACY_MAX_BYTES, FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS,
-    FILE_TRANSFER_START_TIMEOUT_SECS, HOST_KEEP_AWAKE_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
-    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
-    MAX_DIR_MANIFEST_ENTRIES, MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES,
-    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
-    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, PRESENCE_ATTEMPT_TIMEOUT_SECS,
-    PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS,
-    RECONNECT_WINDOW_SECS, RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS,
-    RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
+    ABR_MIN_FPS, ABR_MIN_SCALE_PERCENT, CONNECT_ATTEMPT_TIMEOUT_SECS,
+    CONNECT_RETRY_BACKOFF_CEILING_SECS, CONNECT_RETRY_BACKOFF_SECS, CONTROL_HANDSHAKE_TIMEOUT_SECS,
+    DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
+    DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, ENCODE_MAX_FPS, FILE_OFFER_LEGACY_MAX_BYTES,
+    FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS,
+    HOST_KEEP_AWAKE_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
+    MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
+    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
+    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
+    PRESENCE_ATTEMPT_TIMEOUT_SECS, PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS,
+    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
+    RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
+    RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
     SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
     STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
     TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
@@ -1468,10 +1469,12 @@ enum ActorCommand {
         reply: oneshot::Sender<Result<Vec<MonitorInfo>, ActorError>>,
     },
     /// Guest side: ask the watched host to cap the picture at a percentage of
-    /// its own captured size (§11; D7, docs/bugs/13-stream-resolution.md).
+    /// its own captured size (§11; D7, docs/bugs/13-stream-resolution.md), at
+    /// the frame rate the same preset names (ADR 0136).
     StreamScaleRequest {
         label: String,
         scale_percent: u32,
+        fps: u8,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
     /// Guest side: tell the watched host the picture size this window will
@@ -2468,9 +2471,10 @@ impl ActorHandle {
 
     /// Guest side: asks the watched host to cap the picture at
     /// `scale_percent` of its own captured size (§11; D7,
-    /// docs/bugs/13-stream-resolution.md). Nothing comes back on this call
-    /// other than whether the request could be sent — the picture itself
-    /// simply gets smaller once the host applies it.
+    /// docs/bugs/13-stream-resolution.md), and to send `fps` frames a second
+    /// at most (ADR 0136). Nothing comes back on this call other than whether
+    /// the request could be sent — the picture itself simply changes once the
+    /// host applies it.
     ///
     /// # Errors
     /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
@@ -2482,12 +2486,14 @@ impl ActorHandle {
         &self,
         label: String,
         scale_percent: u32,
+        fps: u8,
     ) -> Result<(), ActorError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(ActorCommand::StreamScaleRequest {
                 label,
                 scale_percent,
+                fps,
                 reply,
             })
             .await
@@ -5730,9 +5736,10 @@ struct PendingReboot {
     generation: u64,
 }
 
-/// Tests only: [`StreamCaps`] as a preset and a window size.
+/// Tests only: [`StreamCaps`] as a preset scale, its frame rate and a window
+/// size.
 #[cfg(test)]
-type StreamCapsView = (Option<u32>, Option<(u32, u32)>);
+type StreamCapsView = (Option<u32>, Option<u8>, Option<(u32, u32)>);
 
 /// Host side: what a guest asked of its picture (§11; ADR 0060, ADR 0064,
 /// ADR 0119).
@@ -5740,6 +5747,8 @@ type StreamCapsView = (Option<u32>, Option<(u32, u32)>);
 struct StreamCaps {
     /// The preset, as a percentage of the captured picture.
     scale: Option<u32>,
+    /// The preset's frame rate (ADR 0136).
+    fps: Option<u8>,
     /// The box the guest's window draws the picture into.
     size: Option<(u32, u32)>,
 }
@@ -6521,6 +6530,36 @@ impl Actor {
         // the picture still rather than adapt it (docs/bugs/07-video-quality.md).
         if session.control.set_manual_cap(Some(scale_percent)) {
             session.control.request_keyframe();
+        }
+    }
+
+    /// Host side: the frame rate the guest's preset names, sent right after
+    /// its [`MessageKind::StreamScaleRequest`] (ADR 0136).
+    ///
+    /// Authorized exactly as the scale is, and kept for the peer for the same
+    /// reason: a guest names its preset once and every later encode loop has
+    /// to be told again. The range is checked here rather than on decode,
+    /// because `QualityAdjust` has carried no bound since it was defined. A
+    /// figure above what this host's display delivers is not an error — the
+    /// encode loop clamps it to its own ceiling.
+    fn on_preset_frame_rate(&mut self, peer: NodeId, fps: u8) {
+        let tag = self.label_of(&peer);
+        if !(ABR_MIN_FPS..=ENCODE_MAX_FPS).contains(&fps) {
+            tracing::warn!(peer = %tag, fps, "preset frame rate outside the range; ignored");
+            return;
+        }
+        let granted = self.connections.contains_key(&peer)
+            && self.sessions.state(&peer) == SessionState::Active
+            && self.sessions.grants(&peer).is_some_and(|g| g.view);
+        if !granted {
+            tracing::warn!(peer = %tag, "preset frame rate without a live view grant; ignored");
+            return;
+        }
+        self.stream_caps.entry(peer).or_default().fps = Some(fps);
+        // No keyframe: a different frame rate changes when pictures are
+        // taken, not what the next one references.
+        if let Some(session) = self.media.get(&peer) {
+            session.control.set_fps_cap(Some(fps));
         }
     }
 
@@ -9439,6 +9478,9 @@ impl Actor {
             if let Some(scale_percent) = caps.scale {
                 control.set_manual_cap(Some(scale_percent));
             }
+            if let Some(fps) = caps.fps {
+                control.set_fps_cap(Some(fps));
+            }
             if let Some(size) = caps.size {
                 control.set_size_cap(Some(size));
             }
@@ -11229,6 +11271,10 @@ impl Actor {
             MessageKind::StreamScaleRequest { scale_percent } => {
                 self.on_stream_scale_request(peer, scale_percent);
             }
+            // Host side: the frame rate of the same preset (ADR 0136).
+            MessageKind::QualityAdjust { target_fps, .. } => {
+                self.on_preset_frame_rate(peer, target_fps);
+            }
             // Host side: the guest named the picture size it will draw
             // (§11; ADR 0060).
             MessageKind::StreamSizeRequest { width, height } => {
@@ -11900,7 +11946,7 @@ impl Actor {
                     .resolve(&label)
                     .ok()
                     .and_then(|peer| self.stream_caps.get(&peer))
-                    .map(|caps| (caps.scale, caps.size));
+                    .map(|caps| (caps.scale, caps.fps, caps.size));
                 let _ = reply.send(caps);
             }
             #[cfg(test)]
@@ -12025,9 +12071,10 @@ impl Actor {
             ActorCommand::StreamScaleRequest {
                 label,
                 scale_percent,
+                fps,
                 reply,
             } => {
-                let _ = reply.send(self.on_request_stream_scale(&label, scale_percent));
+                let _ = reply.send(self.on_request_stream_scale(&label, scale_percent, fps));
             }
             ActorCommand::StreamSizeRequest {
                 label,
@@ -12577,25 +12624,41 @@ impl Actor {
     /// only keeps a value nothing could ever satisfy, or a message a host
     /// that never confirmed it understands, off the wire.
     ///
+    /// The preset's frame rate follows as a `QualityAdjust` (ADR 0136). That
+    /// kind has been in the protocol since its first minor and no host ever
+    /// acted on it, so a host older than ADR 0136 ignores it the way it
+    /// ignored it before, and keeps the frame rate it chose itself.
+    ///
     /// # Errors
     /// [`ActorError::UnknownPeer`] when this node is not watching `label`;
     /// [`ActorError::Core::Malformed`] for a value outside
-    /// `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT`;
+    /// `ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT` or
+    /// `ABR_MIN_FPS..=ENCODE_MAX_FPS`;
     /// [`ActorError::Unsupported`] when the host never answered with a minor
     /// that carries `MessageKind::StreamScaleRequest`.
     fn on_request_stream_scale(
         &mut self,
         label: &str,
         scale_percent: u32,
+        fps: u8,
     ) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
-        if !(ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT).contains(&scale_percent) {
+        if !(ABR_MIN_SCALE_PERCENT..=STREAM_SCALE_MAX_PERCENT).contains(&scale_percent)
+            || !(ABR_MIN_FPS..=ENCODE_MAX_FPS).contains(&fps)
+        {
             return Err(ActorError::Core(CoreError::Malformed));
         }
         if !self.may_request_scale_to(&peer) {
             return Err(ActorError::Unsupported);
         }
         self.send_to(&peer, MessageKind::StreamScaleRequest { scale_percent });
+        self.send_to(
+            &peer,
+            MessageKind::QualityAdjust {
+                target_fps: fps,
+                target_bitrate_kbps: 0,
+            },
+        );
         Ok(())
     }
 
@@ -21432,24 +21495,39 @@ mod tests {
             assert!(
                 matches!(
                     guest
-                        .set_stream_scale(host_label.clone(), scale_percent)
+                        .set_stream_scale(host_label.clone(), scale_percent, ENCODE_MAX_FPS)
                         .await,
                     Err(ActorError::Core(CoreError::Malformed))
                 ),
                 "scale_percent {scale_percent} outside the range was accepted"
             );
         }
+        // The preset's frame rate is bounded the same way (ADR 0136).
+        for fps in [0, ABR_MIN_FPS - 1, ENCODE_MAX_FPS + 1] {
+            assert!(
+                matches!(
+                    guest
+                        .set_stream_scale(host_label.clone(), STREAM_SCALE_MAX_PERCENT, fps)
+                        .await,
+                    Err(ActorError::Core(CoreError::Malformed))
+                ),
+                "fps {fps} outside the range was accepted"
+            );
+        }
 
         // The bounds themselves are ordinary requests: two builds of the same
         // software always speak `FEATURE_STREAM_SCALE` to each other, so the
         // only thing left to refuse is the range.
-        for scale_percent in [ABR_MIN_SCALE_PERCENT, STREAM_SCALE_MAX_PERCENT] {
+        for (scale_percent, fps) in [
+            (ABR_MIN_SCALE_PERCENT, ABR_MIN_FPS),
+            (STREAM_SCALE_MAX_PERCENT, ENCODE_MAX_FPS),
+        ] {
             assert!(
                 guest
-                    .set_stream_scale(host_label.clone(), scale_percent)
+                    .set_stream_scale(host_label.clone(), scale_percent, fps)
                     .await
                     .is_ok(),
-                "scale_percent {scale_percent} at the bound was refused"
+                "scale_percent {scale_percent} / fps {fps} at the bound was refused"
             );
         }
     }
@@ -21461,7 +21539,7 @@ mod tests {
     async fn a_stream_scale_request_to_an_unwatched_peer_is_refused() {
         let (guest, _guest_endpoint, _guest_capture) = actor().await;
         assert!(matches!(
-            guest.set_stream_scale("nobody".to_owned(), 100).await,
+            guest.set_stream_scale("nobody".to_owned(), 100, 60).await,
             Err(ActorError::UnknownPeer)
         ));
     }
@@ -24838,7 +24916,8 @@ mod tests {
     /// still hold for the encode loop a resume starts. They used to be kept
     /// on the loop alone, and the new one ran the adaptive controller under
     /// a preset nobody had changed — the picture sharpening and softening on
-    /// its own for the rest of the session.
+    /// its own for the rest of the session. The preset's frame rate is part
+    /// of the preset and survives with it (ADR 0136).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_guest_preset_survives_a_resume() {
         // Not `session_pair`: both endpoints have to outlive the setup, or
@@ -24861,13 +24940,13 @@ mod tests {
         .await;
         let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         guest
-            .set_stream_scale(host_label.clone(), 50)
+            .set_stream_scale(host_label.clone(), 50, 30)
             .await
             .unwrap();
         wait_until_async("the preset never reached the host", || async {
             host.media_caps(guest_label.clone())
                 .await
-                .is_some_and(|(scale, _)| scale == Some(50))
+                .is_some_and(|(scale, fps, _)| (scale, fps) == (Some(50), Some(30)))
         })
         .await;
 
@@ -24877,8 +24956,8 @@ mod tests {
         assert_eq!(
             host.media_caps(guest_label.clone())
                 .await
-                .and_then(|(scale, _)| scale),
-            Some(50),
+                .map(|(scale, fps, _)| (scale, fps)),
+            Some((Some(50), Some(30))),
             "the resumed session forgot the preset its window will not send again"
         );
     }

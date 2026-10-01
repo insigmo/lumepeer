@@ -103,8 +103,11 @@ export interface ToolbarCommands {
    *
    * A ceiling, not a target: the host's own adaptive controller stays free
    * to sit below it, and stays free to recover only up to it.
+   *
+   * `fps` is the frame rate the same preset asks for; the host holds it under
+   * its own display's refresh rate (ADR 0136).
    */
-  viewSetScale(peer: string, scalePercent: number): Promise<void>;
+  viewSetScale(peer: string, scalePercent: number, fps: number): Promise<void>;
   /**
    * Names the picture size this window will draw, in its own device pixels
    * (§11; ADR 0060).
@@ -172,11 +175,11 @@ export const tauriToolbarCommands: ToolbarCommands = {
     // what the rest of this surface already uses (`since_us`, `code_required`).
     return invoke('monitor_select', { args: { peer, monitor_id: monitorId } });
   },
-  async viewSetScale(peer, scalePercent) {
+  async viewSetScale(peer, scalePercent, fps) {
     const { invoke } = await import('@tauri-apps/api/core');
     // `scale_percent`, not `scalePercent`: same snake_case boundary as
     // `monitor_id` above.
-    return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent } });
+    return invoke('view_set_scale', { args: { peer, scale_percent: scalePercent, fps } });
   },
   async viewSetSize(peer, width, height) {
     const { invoke } = await import('@tauri-apps/api/core');
@@ -230,6 +233,27 @@ const MIN_SCALE_PERCENT = 50;
  * one that has fewer.
  */
 const PERFORMANCE_TARGET_HEIGHT = 720;
+
+/**
+ * The frame rate each preset asks the host for (ADR 0136).
+ *
+ * The other half of the same tradeoff. A preset holds the bitrate still, so
+ * every extra frame is fewer bits for each one: `quality` keeps them sharp at
+ * 30, `balance` sends 60, and `performance` asks for the most there is —
+ * `crates/core/src/constants.rs::ENCODE_MAX_FPS`, restated because it is not
+ * importable across the IPC boundary. The host holds each under its own
+ * display's refresh rate, so 144 from a 60 Hz host is 60.
+ */
+const PRESET_FPS: Record<QualityPreset, number> = {
+  performance: 144,
+  balance: 60,
+  quality: 30,
+};
+
+/** The frame rate `preset` asks the host for (ADR 0136). */
+export function fpsFor(preset: QualityPreset): number {
+  return PRESET_FPS[preset];
+}
 
 /** The percentage of `height` that shows `target` lines, within the floor. */
 function percentForHeight(target: number, height: number): number {
@@ -1000,7 +1024,8 @@ export function mountToolbar(
    * whatever the selector said (§11; docs/bugs/07-video-quality.md).
    */
   function sendQuality(): void {
-    void commands.viewSetScale(peer, scalePercentFor(state.quality, watchedMonitor())).catch(() => {
+    const scale = scalePercentFor(state.quality, watchedMonitor());
+    void commands.viewSetScale(peer, scale, fpsFor(state.quality)).catch(() => {
       // The host refused (grant gone, an old peer) or the session ended:
       // the selector keeps showing what was asked for, and the picture
       // simply does not change.

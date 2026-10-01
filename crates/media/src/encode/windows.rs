@@ -2572,6 +2572,93 @@ mod tests {
         }
     }
 
+    /// What the frame rate the encoder is *told* does to what each frame may
+    /// cost, when frames really arrive at 60 a second (ADR 0136):
+    ///
+    /// ```text
+    /// cargo test -p lumepeer-media --release \
+    ///   --features capture-windows,encode-mf \
+    ///   -- --ignored --nocapture a_declared_frame_rate_sets_the_frame_budget
+    /// ```
+    ///
+    /// On the reference machine, 8 Mbit/s at 2560x1440: declared 30 spent
+    /// 11.2 Mbit/s, declared 60 spent 8.1, declared 144 spent 3.5 — the rate
+    /// controller divides by the declared rate, not the real one.
+    #[test]
+    #[ignore = "a measurement, not an assertion; run it by name with --nocapture"]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "a fixed 2560x1440 picture, 120 frames and a few megabytes: every value is far \
+                  inside each type's exact range"
+    )]
+    fn a_declared_frame_rate_sets_the_frame_budget() {
+        const WIDTH: usize = 2560;
+        const HEIGHT: usize = 1440;
+        const ARRIVING_FPS: u64 = 60;
+
+        // Blocky pseudo-noise scrolled four rows a frame: a moving desktop.
+        let palette: Vec<[u8; 4]> = {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            (0..(WIDTH / 8) * (HEIGHT / 8))
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let bytes = state.to_le_bytes();
+                    [bytes[0], bytes[1], bytes[2], 0xff]
+                })
+                .collect()
+        };
+        let frames: Vec<Frame> = (0..ARRIVING_FPS * 2)
+            .map(|index| {
+                let mut data = vec![0u8; WIDTH * HEIGHT * 4];
+                for row in 0..HEIGHT {
+                    let block_row = ((row + index as usize * 4) / 8) % (HEIGHT / 8);
+                    for column in 0..WIDTH {
+                        data[(row * WIDTH + column) * 4..][..4]
+                            .copy_from_slice(&palette[block_row * (WIDTH / 8) + column / 8]);
+                    }
+                }
+                let timestamp_us = index * 1_000_000 / ARRIVING_FPS;
+                Frame::cpu(
+                    WIDTH as u32,
+                    HEIGHT as u32,
+                    PixelFormat::Bgra8,
+                    timestamp_us,
+                    data,
+                )
+            })
+            .collect();
+
+        for declared in [30_u8, 60, 144] {
+            let config = EncoderConfig {
+                fps: declared,
+                bitrate_kbps: 8_000,
+                codec: VideoCodec::H264,
+            };
+            let Ok(mut encoder) = MediaFoundationEncoder::new(config) else {
+                eprintln!("no hardware H.264 encoder MFT on this machine");
+                return;
+            };
+            // The intra frame is left out: it is the same size whatever the
+            // rate, and it is the steady state this is about.
+            let mut bytes = 0_usize;
+            for (index, frame) in frames.iter().enumerate() {
+                let output = encoder.encode(frame).unwrap();
+                if index > 0 {
+                    bytes += output.data.len();
+                }
+            }
+            let seconds = (frames.len() - 1) as f64 / ARRIVING_FPS as f64;
+            eprintln!(
+                "declared {declared:>3} fps, arriving {ARRIVING_FPS}: {:.0} kbit/s spent, {:.0} B/frame",
+                bytes as f64 * 8.0 / 1000.0 / seconds,
+                bytes as f64 / (frames.len() - 1) as f64,
+            );
+        }
+    }
+
     /// Each codec is enumerated and negotiated under its own Media Foundation
     /// subtype. The failure this guards is the copy-paste one: an AV1 request
     /// that enumerates `MFVideoFormat_H264` finds the H.264 encoder every

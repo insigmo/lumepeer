@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { t } from './i18n';
 import {
+  fpsFor,
   hostResolutionKey,
   hostResolutionsFrom,
   mountToolbar,
@@ -461,6 +462,16 @@ describe('the floating session toolbar', () => {
     expect(button?.textContent).toContain('2');
   });
 
+  describe('fpsFor', () => {
+    // ADR 0136: at the bitrate a preset holds, frames and sharpness are one
+    // budget, and each preset spends it its own way.
+    it('trades frames for sharpness in preset order', () => {
+      expect(fpsFor('quality')).toBe(30);
+      expect(fpsFor('balance')).toBe(60);
+      expect(fpsFor('performance')).toBe(144);
+    });
+  });
+
   describe('scalePercentFor', () => {
     const monitor = (width: number, height: number): MonitorDto => ({
       id: 0,
@@ -606,7 +617,7 @@ describe('the floating session toolbar', () => {
         select.dispatchEvent(new Event('change'));
       }
       // 900 of a 1080-tall screen: halfway between 720p and the screen.
-      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83));
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83, 60));
     } finally {
       stop();
     }
@@ -821,7 +832,7 @@ describe('the floating session toolbar', () => {
     );
     try {
       await vi.waitFor(() =>
-        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100),
+        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100, 30),
       );
     } finally {
       stop();
@@ -840,7 +851,7 @@ describe('the floating session toolbar', () => {
     );
     try {
       await vi.waitFor(() =>
-        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100),
+        expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100, 30),
       );
     } finally {
       stop();
@@ -868,7 +879,7 @@ describe('the floating session toolbar', () => {
         select.value = 'balance';
         select.dispatchEvent(new Event('change'));
       }
-      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83));
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 83, 60));
       commands.viewSetScale.mockClear();
 
       container.querySelector<HTMLButtonElement>('[data-testid="toolbar-monitors"]')?.click();
@@ -883,7 +894,7 @@ describe('the floating session toolbar', () => {
       // A 1280x720 screen has nothing for `balance` to cap: the same preset
       // now means no cap at all, rather than a ceiling the old screen's size
       // happened to imply.
-      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100));
+      await vi.waitFor(() => expect(commands.viewSetScale).toHaveBeenCalledWith('host-ab12', 100, 60));
     } finally {
       stop();
     }
