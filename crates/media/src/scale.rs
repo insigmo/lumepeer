@@ -15,6 +15,7 @@
 //! source pixel contributes to exactly one destination pixel.
 
 use lumepeer_core::constants::MAX_PICTURE_PIXELS;
+use lumepeer_core::protocol::CursorShapeData;
 
 use crate::abr::FULL_SCALE_PERCENT;
 use crate::capture::{Frame, PixelFormat};
@@ -201,6 +202,52 @@ pub fn fit_within(frame: Frame, max_width: u32, max_height: u32) -> Frame {
     };
     let data = box_downscale(pixels, frame.width, frame.height, width, height);
     Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
+}
+
+/// The host's cursor at the scale of the picture the guest is sent, or a copy
+/// of it when the picture is the captured surface's own size (ADR 0138).
+///
+/// A capture backend reports the cursor in the captured surface's pixels, and
+/// the guest draws it in the picture's: the picture is the only size it has.
+/// Every reduction in this module shrinks the picture and not the cursor, so a
+/// 4K host sending a 1080p picture had its cursor drawn twice as large as the
+/// screen under it — and its hotspot twice as far from the pointer.
+///
+/// Premultiplied BGRA averages correctly under the same box filter the picture
+/// gets. The picture is never enlarged, and neither is the cursor.
+#[must_use]
+pub fn cursor_for_picture(
+    shape: &CursorShapeData,
+    captured: (u32, u32),
+    picture: (u32, u32),
+) -> CursorShapeData {
+    let (width, height) = (u32::from(shape.width), u32::from(shape.height));
+    let reduced = picture.0 < captured.0 || picture.1 < captured.1;
+    let whole = (width as usize) * (height as usize) * BGRA_BYTES;
+    if !reduced || shape.rgba.len() < whole {
+        return shape.clone();
+    }
+    // `picture <= captured` on both axes, so every result fits the `u16` the
+    // value came from.
+    let across = |value: u32, to: u32, from: u32| -> u16 {
+        u16::try_from(u64::from(value) * u64::from(to.min(from)) / u64::from(from.max(1)))
+            .unwrap_or(u16::MAX)
+    };
+    let target_width = across(width, picture.0, captured.0).max(1);
+    let target_height = across(height, picture.1, captured.1).max(1);
+    CursorShapeData {
+        width: target_width,
+        height: target_height,
+        hotspot_x: across(u32::from(shape.hotspot_x), picture.0, captured.0).min(target_width - 1),
+        hotspot_y: across(u32::from(shape.hotspot_y), picture.1, captured.1).min(target_height - 1),
+        rgba: box_downscale(
+            &shape.rgba,
+            width,
+            height,
+            u32::from(target_width),
+            u32::from(target_height),
+        ),
+    }
 }
 
 /// Box-averages `src` (BGRA8, `src_width`x`src_height`) down to
@@ -430,5 +477,57 @@ mod tests {
         let kept = fit_within(broken, 1280, 720);
         assert_eq!(kept.width, 2560);
         assert_eq!(kept.data.len(), 16);
+    }
+
+    fn cursor(width: u16, height: u16, hotspot: (u16, u16), rgba: Vec<u8>) -> CursorShapeData {
+        CursorShapeData {
+            width,
+            height,
+            hotspot_x: hotspot.0,
+            hotspot_y: hotspot.1,
+            rgba,
+        }
+    }
+
+    /// The reported bug: a 4K host on the `performance` preset sends a 1080p
+    /// picture, and the guest drew the 4K cursor over it at twice its size
+    /// with the hotspot twice as far from the pointer (ADR 0138).
+    #[test]
+    fn a_cursor_shrinks_with_the_picture_hotspot_included() {
+        let shape = cursor(64, 64, (20, 30), vec![0xFF; 64 * 64 * BGRA_BYTES]);
+        let scaled = cursor_for_picture(&shape, (3840, 2160), (1920, 1080));
+        assert_eq!((scaled.width, scaled.height), (32, 32));
+        assert_eq!((scaled.hotspot_x, scaled.hotspot_y), (10, 15));
+        assert_eq!(scaled.rgba.len(), 32 * 32 * BGRA_BYTES);
+        assert!(scaled.rgba.iter().all(|byte| *byte == 0xFF));
+    }
+
+    #[test]
+    fn a_cursor_over_a_picture_at_full_size_is_sent_as_it_is() {
+        let shape = cursor(2, 1, (1, 0), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            cursor_for_picture(&shape, (1920, 1080), (1920, 1080)),
+            shape
+        );
+    }
+
+    /// Premultiplied pixels average under the box filter: an opaque white
+    /// pixel next to a transparent one is half-covered white, not grey.
+    #[test]
+    fn a_reduced_cursor_is_box_averaged() {
+        let shape = cursor(2, 1, (0, 0), vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+        let scaled = cursor_for_picture(&shape, (200, 100), (100, 100));
+        assert_eq!((scaled.width, scaled.height), (1, 1));
+        assert_eq!(scaled.rgba, vec![0x7F, 0x7F, 0x7F, 0x7F]);
+    }
+
+    /// However far the picture shrinks, the cursor keeps a pixel and its
+    /// hotspot stays inside it — §14 refuses a shape that breaks either.
+    #[test]
+    fn a_tiny_cursor_keeps_a_pixel_and_its_hotspot_inside_it() {
+        let shape = cursor(3, 3, (2, 2), vec![0xFF; 3 * 3 * BGRA_BYTES]);
+        let scaled = cursor_for_picture(&shape, (3840, 2160), (2, 2));
+        assert_eq!((scaled.width, scaled.height), (1, 1));
+        assert_eq!((scaled.hotspot_x, scaled.hotspot_y), (0, 0));
     }
 }

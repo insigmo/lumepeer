@@ -44,7 +44,7 @@ use lumepeer_media::encode::{
 };
 use lumepeer_media::error::MediaError;
 use lumepeer_media::playout::AudioPlayer;
-use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
+use lumepeer_media::scale::{cursor_for_picture, fit_within, fit_within_budget, scale_to_percent};
 use lumepeer_net::{PeerConnection, STREAM_MIC, accept_media_stream, open_media_stream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -1428,6 +1428,9 @@ fn spawn_encode_loop_with(
         // Frames the encoder would not take: how many in a row, for the
         // bound that ends this loop, and how many since the last log line.
         let mut refusals = EncodeRefusals::default();
+        // The cursor at the scale the guest draws it: the picture's, which the
+        // reductions below can make smaller than the screen (ADR 0138).
+        let mut cursor = PictureCursor::default();
 
         loop {
             let tick_started = Instant::now();
@@ -1606,12 +1609,14 @@ fn spawn_encode_loop_with(
             // and is read only then: a shape the loop would never send is a
             // platform call made for nothing. `cursor_shape` answers `None`
             // for a cursor that has not changed, so this is one comparison on
-            // a steady screen (§11).
+            // a steady screen (§11). It is sent once the frame is, at that
+            // frame's scale.
             if control.cursor_channel()
                 && let Some(shape) = lock_capture(&capture).cursor_shape()
             {
-                control.send_cursor(shape);
+                cursor.changed(shape);
             }
+            let captured_size = (frame.width, frame.height);
 
             // A guest that just started decoding, or that lost more than it
             // could conceal, has nothing to decode against until an intra
@@ -1717,6 +1722,9 @@ fn spawn_encode_loop_with(
                     return;
                 }
             };
+            if let Some(shape) = cursor.due(captured_size, timing.size) {
+                control.send_cursor(shape);
+            }
             if bitstream.data.len() > MAX_MEDIA_FRAME_BYTES {
                 tracing::warn!(
                     peer = %tag,
@@ -2243,6 +2251,41 @@ impl EncodeRefusals {
         }
         self.logged_at = Some(now);
         Some(std::mem::take(&mut self.unlogged))
+    }
+}
+
+/// The host's cursor, kept at the captured surface's own scale, and the sizes
+/// it was last sent scaled between (ADR 0138).
+///
+/// The guest draws the cursor at the scale of the picture it receives, so the
+/// shape has to be re-sent when the picture changes size as well as when the
+/// cursor changes: a preset picked mid-session halves the picture and leaves
+/// an unchanged cursor as large as it was.
+#[derive(Debug, Default)]
+struct PictureCursor {
+    /// The newest shape the capture backend reported.
+    shape: Option<CursorShapeData>,
+    /// `(captured, picture)` the current shape was last sent for; `None`
+    /// while it has not been sent at all.
+    sent_for: Option<((u32, u32), (u32, u32))>,
+}
+
+impl PictureCursor {
+    /// The capture backend reported a different cursor.
+    fn changed(&mut self, shape: CursorShapeData) {
+        self.shape = Some(shape);
+        self.sent_for = None;
+    }
+
+    /// The cursor to send now that a `captured`-sized frame went out as a
+    /// `picture`-sized one, or `None` when the guest already has it.
+    fn due(&mut self, captured: (u32, u32), picture: (u32, u32)) -> Option<CursorShapeData> {
+        let shape = self.shape.as_ref()?;
+        if self.sent_for == Some((captured, picture)) {
+            return None;
+        }
+        self.sent_for = Some((captured, picture));
+        Some(cursor_for_picture(shape, captured, picture))
     }
 }
 
@@ -4085,6 +4128,39 @@ mod tests {
             GuestSize::Honoured,
             "a guest that named no size has nothing to withdraw"
         );
+    }
+
+    /// ADR 0138: the cursor goes out at the scale of the picture it is drawn
+    /// over, once per shape and again whenever the picture changes size.
+    #[test]
+    fn the_cursor_is_sent_at_the_picture_scale_and_again_when_that_changes() {
+        let mut cursor = PictureCursor::default();
+        assert!(
+            cursor.due((3840, 2160), (1920, 1080)).is_none(),
+            "no shape yet, nothing to send"
+        );
+
+        cursor.changed(CursorShapeData {
+            width: 64,
+            height: 64,
+            hotspot_x: 20,
+            hotspot_y: 30,
+            rgba: vec![0xFF; 64 * 64 * 4],
+        });
+        // A new shape is sent, at the picture's scale.
+        let sent = cursor.due((3840, 2160), (1920, 1080)).unwrap();
+        assert_eq!((sent.width, sent.height), (32, 32));
+        assert_eq!((sent.hotspot_x, sent.hotspot_y), (10, 15));
+        assert!(
+            cursor.due((3840, 2160), (1920, 1080)).is_none(),
+            "the guest already has it at this scale"
+        );
+
+        // The guest switched to `quality`: same cursor, a full-size picture,
+        // and the cursor goes out again.
+        let resent = cursor.due((3840, 2160), (3840, 2160)).unwrap();
+        assert_eq!((resent.width, resent.height), (64, 64));
+        assert_eq!((resent.hotspot_x, resent.hotspot_y), (20, 30));
     }
 
     /// ADR 0135: one log line per interval, however fast frames are refused,

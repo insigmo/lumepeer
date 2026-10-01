@@ -1191,6 +1191,10 @@ mod dxgi {
         width: u32,
         height: u32,
         pitch: u32,
+        /// The point under the pointer, from the shape's top-left. Compositing
+        /// never needs it — `PointerPosition` already names the top-left —
+        /// but a guest drawing the cursor at its own pointer does (ADR 0138).
+        hotspot: (i32, i32),
         pixels: Vec<u8>,
     }
 
@@ -1228,6 +1232,7 @@ mod dxgi {
             width: shape_info.Width,
             height: shape_info.Height,
             pitch: shape_info.Pitch,
+            hotspot: (shape_info.HotSpot.x, shape_info.HotSpot.y),
             pixels: buffer,
         })
     }
@@ -2028,8 +2033,8 @@ mod dxgi {
         bounded_cursor_shape(
             u16::try_from(width).ok()?,
             u16::try_from(height).ok()?,
-            0,
-            0,
+            u16::try_from(shape.hotspot.0).ok()?,
+            u16::try_from(shape.hotspot.1).ok()?,
             pixels,
         )
     }
@@ -2069,8 +2074,8 @@ mod dxgi {
         bounded_cursor_shape(
             u16::try_from(width).ok()?,
             u16::try_from(height).ok()?,
-            0,
-            0,
+            u16::try_from(shape.hotspot.0).ok()?,
+            u16::try_from(shape.hotspot.1).ok()?,
             pixels,
         )
     }
@@ -3622,6 +3627,7 @@ mod dxgi {
                 width: 2,
                 height: 1,
                 pitch: 8,
+                hotspot: (0, 0),
                 pixels: vec![0, 0, 255, 255, 0, 0, 255, 128],
             };
             let converted = to_cursor_shape(&shape).expect("a 2x1 colour cursor is a valid shape");
@@ -3629,6 +3635,38 @@ mod dxgi {
             assert_eq!(&converted.rgba[..4], &[0, 0, 255, 255]);
             // 255 * 128 / 255 == 128, and the alpha byte is untouched.
             assert_eq!(&converted.rgba[4..], &[0, 0, 128, 128]);
+        }
+
+        /// The guest draws the cursor at its own pointer, so the point that
+        /// belongs under it has to travel. Sent as the top-left corner, every
+        /// cursor but the arrow sat off by its hotspot — an I-beam by half its
+        /// size, down and to the right (ADR 0138).
+        #[test]
+        fn the_hotspot_dxgi_reports_travels_with_the_shape() {
+            let colour = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0.cast_unsigned(),
+                width: 2,
+                height: 2,
+                pitch: 8,
+                hotspot: (1, 1),
+                pixels: vec![0u8; 16],
+            };
+            let converted = to_cursor_shape(&colour).expect("a 2x2 colour cursor is a valid shape");
+            assert_eq!((converted.hotspot_x, converted.hotspot_y), (1, 1));
+
+            // Monochrome halves the height; the hotspot is already relative
+            // to the cursor, not to the stacked masks.
+            let monochrome = PointerShape {
+                kind: DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0.cast_unsigned(),
+                width: 8,
+                height: 4,
+                pitch: 1,
+                hotspot: (3, 1),
+                pixels: vec![0u8; 4],
+            };
+            let converted =
+                to_cursor_shape(&monochrome).expect("an 8x2 monochrome cursor is a valid shape");
+            assert_eq!((converted.hotspot_x, converted.hotspot_y), (3, 1));
         }
 
         /// `MASKED_COLOR` has no alpha at all: the fourth byte is a 1-bit AND
@@ -3643,6 +3681,7 @@ mod dxgi {
                 width: 2,
                 height: 1,
                 pitch: 8,
+                hotspot: (0, 0),
                 pixels: vec![10, 20, 30, 0, 10, 20, 30, 0xFF],
             };
             let converted = to_cursor_shape(&shape).expect("a 2x1 masked cursor is a valid shape");
@@ -3664,6 +3703,7 @@ mod dxgi {
                 width: 8,
                 height: 2,
                 pitch: 1,
+                hotspot: (0, 0),
                 // AND: 0b1100_0000 — the first two pixels are "leave alone".
                 // XOR: 0b1010_0000 — pixel 0 inverts, pixel 2 is white.
                 pixels: vec![0b1100_0000, 0b1010_0000],
@@ -3691,6 +3731,7 @@ mod dxgi {
                 width: 1,
                 height: 1,
                 pitch: 4,
+                hotspot: (0, 0),
                 pixels: vec![0, 0, 0, 0],
             };
             assert!(to_cursor_shape(&shape).is_none());
@@ -3706,6 +3747,7 @@ mod dxgi {
                 width: side,
                 height: side,
                 pitch: side * 4,
+                hotspot: (0, 0),
                 pixels: vec![0u8; (side * side * 4) as usize],
             };
             assert!(to_cursor_shape(&shape).is_none());
@@ -3719,6 +3761,7 @@ mod dxgi {
                 width: 4,
                 height: 4,
                 pitch: 16,
+                hotspot: (0, 0),
                 pixels: vec![0u8; 8],
             };
             assert!(to_cursor_shape(&shape).is_none());
@@ -4057,6 +4100,7 @@ mod dxgi {
                 width: 1,
                 height: 1,
                 pitch: 4,
+                hotspot: (0, 0),
                 pixels: vec![0, 0, 0xFF, 0xFF], // BGRA: opaque red
             };
             composite_pointer(&mut data, 4, 4, (1, 1), &shape);
@@ -4075,6 +4119,7 @@ mod dxgi {
                 width: 1,
                 height: 1,
                 pitch: 4,
+                hotspot: (0, 0),
                 pixels: vec![0xFF, 0xFF, 0xFF, 0],
             };
             composite_pointer(&mut data, 4, 4, (2, 2), &shape);
@@ -4098,6 +4143,7 @@ mod dxgi {
                 width: 2,
                 height: 1,
                 pitch: 8,
+                hotspot: (0, 0),
                 pixels: vec![
                     0xF0, 0xF0, 0xF0, 0x00, // col 0: mask clear -> opaque replace
                     0xF0, 0xF0, 0xF0, 0xFF, // col 1: mask set -> XOR
@@ -4122,6 +4168,7 @@ mod dxgi {
                 width: 4,
                 height: 2, // one real row: AND row then XOR row
                 pitch: 1,
+                hotspot: (0, 0),
                 pixels: vec![
                     0b1010_0000, // AND row: col0=1 col1=0 col2=1 col3=0
                     0b1100_0000, // XOR row: col0=1 col1=1 col2=0 col3=0
@@ -4150,6 +4197,7 @@ mod dxgi {
                 width: 2,
                 height: 2,
                 pitch: 8,
+                hotspot: (0, 0),
                 pixels: vec![0xFF; 32], // 2x2 opaque white
             };
             composite_pointer(&mut data, 4, 4, (-1, -1), &shape);
@@ -4168,6 +4216,7 @@ mod dxgi {
                 width: 2,
                 height: 2,
                 pitch: 8,
+                hotspot: (0, 0),
                 pixels: vec![0xFF; 32],
             };
             composite_pointer(&mut data, 4, 4, (3, 3), &shape);
