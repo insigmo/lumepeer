@@ -258,7 +258,14 @@ valid minor18_hello_resume_claim 1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d010000010000010
 # --- malformed, which is also what an older guest makes of this one.
 valid minor19_media_unavailable_secure_desktop_active abababababababababababababababab00001e0200
 valid minor19_media_unavailable_capture_denied abababababababababababababababab00001e0300
-invalid minor19_media_unavailable_unknown_reason abababababababababababababababab00001e0400
+# The second verdict in this file that changed while its bytes did not:
+# minor 22 appended EncoderFailed as reason 4 (ADR 0135), so this reason
+# decodes today where it was malformed through minor 21. An interop partner
+# replaying these bytes against a build below minor 22 still gets the old
+# answer, which is why a host sends EncoderFailed only to a guest at minor 22
+# or later. An unknown reason is still refused: see
+# minor22_media_unavailable_unknown_reason.
+valid minor19_media_unavailable_unknown_through_minor21 abababababababababababababababab00001e0400
 
 # --- Frozen for PROTOCOL_MINOR 20: the file manager changes the host's disk
 # --- (ADR 0124). FileOpRequest and FileOpResult are appended after
@@ -287,3 +294,12 @@ valid minor21_device_info_host abababababababababababababababab0003410b4d6163426
 valid minor21_device_info_unknown_os abababababababababababababababab0108410141056861696b7500
 valid minor21_device_info_empty abababababababababababababababab010941000000
 invalid minor21_device_info_os_too_long abababababababababababababababab010a41014111787878787878787878787878787878787800
+
+# --- Frozen for PROTOCOL_MINOR 22: the host's encoder refused every frame it
+# --- was given (ADR 0135). No new message: EncoderFailed is appended to
+# --- MediaUnavailableReason after CaptureDenied, so every earlier vector keeps
+# --- its bytes, and one keeps its bytes but not its verdict (see the minor 19
+# --- block). The host sends EncoderFailed only to a guest whose Hello minor is
+# --- at least this one; a reason byte past it is still malformed.
+valid minor22_media_unavailable_encoder_failed abababababababababababababababab00001e0400
+invalid minor22_media_unavailable_unknown_reason abababababababababababababababab00001e0500

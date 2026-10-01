@@ -190,6 +190,8 @@ export const ja: Dictionary = {
     '相手のデバイスにはビデオエンコーダーがないため、画面を送信できません。接続自体は正常です。',
   'view.unavailable.captureDenied':
     '相手のデバイスのシステムが Lumepeer による画面収録を許可していません。そのデバイスの前にいる人が Lumepeer の画面収録を許可すると、再接続できます。接続自体は正常です。',
+  'view.unavailable.encoderFailed':
+    '相手のデバイスのビデオエンコーダーが動作しなくなったため、画面を送信できません。再接続すると解決する場合があります。接続自体は正常です。',
   'view.unavailable.dismiss': '閉じる',
   'view.recording': 'このセッションは録画されています',
   'chat.logLabel': 'チャット',

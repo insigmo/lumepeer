@@ -230,16 +230,30 @@ const CAPTURE_DENIED_MINOR: u16 = 19;
 /// and close the connection (§9.1).
 const DEVICE_INFO_MINOR: u16 = 21;
 
+/// First `PROTOCOL_MINOR` that decodes `MediaUnavailableReason::EncoderFailed`
+/// (ADR 0135).
+///
+/// Host side, and for the same reason as [`CAPTURE_DENIED_MINOR`]: the
+/// variant rides the `FEATURE_MEDIA_UNAVAILABLE` message, and a guest below
+/// this minor would read it as malformed and close the connection (§9.1).
+const ENCODER_FAILED_MINOR: u16 = 22;
+
 /// Whether a guest can decode `MediaUnavailable(reason)`: it advertised
-/// `FEATURE_MEDIA_UNAVAILABLE`, and for `CaptureDenied` it is also at
-/// [`CAPTURE_DENIED_MINOR`] or later.
+/// `FEATURE_MEDIA_UNAVAILABLE`, and for `CaptureDenied` or `EncoderFailed` it
+/// is also at the minor that appended that reason.
 fn announces_media_fault(
     speaks_media_unavailable: bool,
     peer_minor: u16,
     reason: MediaUnavailableReason,
 ) -> bool {
     speaks_media_unavailable
-        && (reason != MediaUnavailableReason::CaptureDenied || peer_minor >= CAPTURE_DENIED_MINOR)
+        && match reason {
+            MediaUnavailableReason::CaptureDenied => peer_minor >= CAPTURE_DENIED_MINOR,
+            MediaUnavailableReason::EncoderFailed => peer_minor >= ENCODER_FAILED_MINOR,
+            MediaUnavailableReason::NoCaptureBackend
+            | MediaUnavailableReason::NoEncoder
+            | MediaUnavailableReason::SecureDesktopActive => true,
+        }
 }
 
 /// How many frames one terminal connection queues before its producer waits.
@@ -4224,7 +4238,8 @@ fn codec_in_use(
         | ViewStatus::Failed
         | ViewStatus::NoCapture
         | ViewStatus::NoEncoder
-        | ViewStatus::CaptureDenied => None,
+        | ViewStatus::CaptureDenied
+        | ViewStatus::EncoderFailed => None,
     }
 }
 
@@ -25521,6 +25536,19 @@ mod tests {
         ));
         assert!(announces_media_fault(true, CAPTURE_DENIED_MINOR - 1, blind));
         assert!(!announces_media_fault(false, CAPTURE_DENIED_MINOR, denied));
+    }
+
+    /// ADR 0135: the same gate for `EncoderFailed`, one minor later.
+    #[test]
+    fn encoder_failed_goes_only_to_a_guest_that_can_decode_it() {
+        let failed = MediaUnavailableReason::EncoderFailed;
+        assert!(announces_media_fault(true, ENCODER_FAILED_MINOR, failed));
+        assert!(!announces_media_fault(
+            true,
+            ENCODER_FAILED_MINOR - 1,
+            failed
+        ));
+        assert!(!announces_media_fault(false, ENCODER_FAILED_MINOR, failed));
     }
 
     /// §11, ADR 0028: a guest holding the `input` grant can put the

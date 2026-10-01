@@ -342,7 +342,15 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// way — so there is no feature string for it. A guest sends it right after
 /// the handshake, a host with the `ConsentGrant` that admits a guest. See
 /// `docs/adr/0121-a-peer-is-shown-by-its-machine-name.md`.
-pub const PROTOCOL_MINOR: u16 = 21;
+///
+/// 22: no new message. Appended [`MediaUnavailableReason::EncoderFailed`]
+/// after `CaptureDenied`: the host's encoder refused every frame it was given
+/// for a bounded run, and the encode loop gave up rather than skip frames for
+/// the rest of the session. Gated exactly like minor 19: a host sends it only
+/// to a guest whose `Hello` minor is at least this one, and an older guest is
+/// told nothing. See
+/// `docs/adr/0135-a-host-whose-encoder-refuses-every-frame-says-so.md`.
+pub const PROTOCOL_MINOR: u16 = 22;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -1797,6 +1805,12 @@ pub enum MediaUnavailableReason {
     /// and a later session asks again. Sent only to a guest at minor 19 or
     /// later (ADR 0110).
     CaptureDenied,
+    /// The host built a video encoder, and it refused every frame for
+    /// [`crate::constants::ENCODE_REFUSALS_BEFORE_FAULT`] frames in a row.
+    /// Terminal for this session, like `NoEncoder`, but not a fact about the
+    /// host's build: the encoder exists, and the next session builds a fresh
+    /// one. Sent only to a guest at minor 22 or later (ADR 0135).
+    EncoderFailed,
 }
 
 /// Pixel geometry plus pixel payload of one cursor shape (§11).
@@ -3062,6 +3076,7 @@ mod tests {
             MediaUnavailableReason::NoEncoder,
             MediaUnavailableReason::SecureDesktopActive,
             MediaUnavailableReason::CaptureDenied,
+            MediaUnavailableReason::EncoderFailed,
         ] {
             let original = envelope(MessageKind::MediaUnavailable(reason));
             let bytes = original.encode().unwrap();

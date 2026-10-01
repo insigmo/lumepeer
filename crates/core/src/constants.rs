@@ -831,6 +831,19 @@ pub const LOG_ROTATION_MAX_MIB: u32 = 100;
 /// forever, per the "degrade towards safety, tell the user" rule of §24.5
 /// (ADR 0011).
 pub const ENCODE_HW_EVENT_TIMEOUT_MS: u64 = 2_000;
+/// Frames in a row the host's encoder may refuse before the encode loop stops
+/// and tells the guest this session will carry no picture (§18; ADR 0135).
+///
+/// Not in the design doc. A refused frame used to be skipped and the next one
+/// tried, without end: a host whose encoder could not read what capture handed
+/// it refused every frame for minutes, while the guest kept the one picture it
+/// had and was told nothing. Sixty is two seconds at [`ENCODE_DEFAULT_FPS`]
+/// and six at [`ABR_MIN_FPS`], which is past any single frame the encoder
+/// merely stumbled on. Frames are counted rather than time, because a screen
+/// that does not change produces none and is not a failing encoder. An encoder
+/// that stalls rather than refuses takes [`ENCODE_HW_EVENT_TIMEOUT_MS`] per
+/// frame to say so, and reaches this bound in two minutes instead.
+pub const ENCODE_REFUSALS_BEFORE_FAULT: u32 = 60;
 
 /// Maximum UTF-8 byte length of one chat message (§9.2). Chat rides the
 /// control channel, so it must always stay well under

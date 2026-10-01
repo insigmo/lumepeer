@@ -191,6 +191,8 @@ export const pl: Dictionary = {
     'Drugie urządzenie nie ma kodera wideo, więc nie może wysłać obrazu. Samo połączenie działa prawidłowo.',
   'view.unavailable.captureDenied':
     'System drugiego urządzenia nie zezwolił Lumepeer na nagrywanie ekranu. Ktoś przy tym urządzeniu musi zezwolić Lumepeer na nagrywanie ekranu, potem możesz połączyć się ponownie. Samo połączenie działa prawidłowo.',
+  'view.unavailable.encoderFailed':
+    'Koder wideo drugiego urządzenia przestał działać, więc nie może ono wysłać obrazu. Ponowne połączenie może pomóc. Samo połączenie działa prawidłowo.',
   'view.unavailable.dismiss': 'Zamknij',
   'view.recording': 'Ta sesja jest nagrywana',
   'chat.logLabel': 'Czat',
