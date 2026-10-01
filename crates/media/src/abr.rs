@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use lumepeer_core::constants::{
     ABR_ADJUST_MAX_RATE_PER_SEC, ABR_FPS_STEP, ABR_GOODPUT_SHORTFALL_PERCENT, ABR_MAX_BITRATE_KBPS,
     ABR_MIN_BITRATE_KBPS, ABR_MIN_FPS, ABR_MIN_SCALE_PERCENT, ABR_SCALE_STEP_PERCENT,
-    ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS,
+    ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS, ENCODE_MAX_FPS,
 };
 
 /// Loss above which the controller halves the bitrate outright.
@@ -94,12 +94,39 @@ impl Default for QualityTarget {
 /// instead of quietly softening, which is the trade a person makes when they
 /// pick a preset by name. Nothing adapts on its own again until the guest
 /// stops naming one.
+///
+/// `fps` is the frame rate the same preset names, already held under the
+/// session's [`ceiling_fps`] by the caller (ADR 0136): the preset picks the
+/// tradeoff between fewer, sharper frames and more, softer ones, because at a
+/// pinned bitrate those are the only two ways to spend it.
 #[must_use]
-pub fn pinned_target(manual_cap: Option<u32>) -> Option<QualityTarget> {
+pub fn pinned_target(manual_cap: Option<u32>, fps: u8) -> Option<QualityTarget> {
     manual_cap.map(|scale_percent| QualityTarget {
+        fps,
         scale_percent,
         ..QualityTarget::default()
     })
+}
+
+/// The frame rate a session runs at when nothing holds it back: the host
+/// display's own refresh rate, up to [`ENCODE_MAX_FPS`] (§11; ADR 0136).
+///
+/// The encoder is told this figure, and that is why it cannot simply be the
+/// ceiling for everyone: a hardware encoder divides its bitrate by the frame
+/// rate it was *told*, not by the one frames arrive at. Measured on the
+/// reference machine's Media Foundation encoder, 60 frames a second declared
+/// as 144 spent 3.5 of 8 Mbit/s — every frame 2.3 times softer than declared
+/// as 60, on the 60 Hz panel most hosts have.
+///
+/// `None`, or a figure below [`ABR_MIN_FPS`] that no real panel reports, is a
+/// display that could not say: [`ENCODE_DEFAULT_FPS`] then.
+#[must_use]
+pub fn ceiling_fps(refresh_hz: Option<u32>) -> u8 {
+    refresh_hz
+        .filter(|&hz| hz >= u32::from(ABR_MIN_FPS))
+        .map_or(ENCODE_DEFAULT_FPS, |hz| {
+            u8::try_from(hz.min(u32::from(ENCODE_MAX_FPS))).unwrap_or(ENCODE_MAX_FPS)
+        })
 }
 
 /// Which way the last feedback pushed the target.
@@ -116,6 +143,8 @@ enum Pressure {
 pub struct AbrController {
     target: QualityTarget,
     last_adjust: Option<Instant>,
+    /// Where frame-rate recovery stops: this session's [`ceiling_fps`].
+    max_fps: u8,
 }
 
 impl Default for AbrController {
@@ -129,9 +158,21 @@ impl AbrController {
     /// size.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_max_fps(ENCODE_DEFAULT_FPS)
+    }
+
+    /// As [`Self::new`], for a session whose frame rate tops out at
+    /// `max_fps` — its [`ceiling_fps`] — rather than at the default. The
+    /// controller starts there and recovers back to there (ADR 0136).
+    #[must_use]
+    pub fn with_max_fps(max_fps: u8) -> Self {
         Self {
-            target: QualityTarget::default(),
+            target: QualityTarget {
+                fps: max_fps,
+                ..QualityTarget::default()
+            },
             last_adjust: None,
+            max_fps,
         }
     }
 
@@ -252,12 +293,12 @@ impl AbrController {
                 .min(FULL_SCALE_PERCENT);
             return;
         }
-        if self.target.fps < ENCODE_DEFAULT_FPS {
+        if self.target.fps < self.max_fps {
             self.target.fps = self
                 .target
                 .fps
                 .saturating_add(ABR_FPS_STEP)
-                .min(ENCODE_DEFAULT_FPS);
+                .min(self.max_fps);
             return;
         }
         if self.target.bitrate_kbps < ABR_MAX_BITRATE_KBPS {
@@ -501,26 +542,69 @@ mod tests {
     #[test]
     fn a_named_preset_is_the_whole_target() {
         for scale in [ABR_MIN_SCALE_PERCENT, 67, FULL_SCALE_PERCENT] {
-            let pinned = pinned_target(Some(scale)).expect("a named preset pins");
+            let pinned =
+                pinned_target(Some(scale), ENCODE_DEFAULT_FPS).expect("a named preset pins");
             assert_eq!(pinned.scale_percent, scale);
         }
     }
 
     /// And it pins the other two knobs as well: a bitrate walking under a
     /// held scale is the same flicker by another name
-    /// (docs/bugs/07-video-quality.md).
+    /// (docs/bugs/07-video-quality.md). The frame rate it pins is the one
+    /// the preset names, not a constant (ADR 0136).
     #[test]
     fn a_named_preset_pins_the_bitrate_and_frame_rate_too() {
-        let pinned = pinned_target(Some(50)).expect("a named preset pins");
-        assert_eq!(pinned.bitrate_kbps, ENCODE_DEFAULT_BITRATE_KBPS);
-        assert_eq!(pinned.fps, ENCODE_DEFAULT_FPS);
+        for fps in [30, ENCODE_DEFAULT_FPS, ENCODE_MAX_FPS] {
+            let pinned = pinned_target(Some(50), fps).expect("a named preset pins");
+            assert_eq!(pinned.bitrate_kbps, ENCODE_DEFAULT_BITRATE_KBPS);
+            assert_eq!(pinned.fps, fps);
+        }
     }
 
     /// No preset at all: nothing is pinned and the adaptive controller is
     /// the whole answer, as it always was.
     #[test]
     fn no_preset_pins_nothing() {
-        assert_eq!(pinned_target(None), None);
+        assert_eq!(pinned_target(None, ENCODE_DEFAULT_FPS), None);
+    }
+
+    /// ADR 0136: the display's refresh rate is the ceiling, the owner's cap
+    /// is the ceiling above that, and a display that cannot say gets the
+    /// default rather than a guess.
+    #[test]
+    fn the_ceiling_is_the_display_refresh_up_to_the_owners_cap() {
+        for (refresh_hz, expected) in [
+            (Some(30), 30),
+            (Some(60), 60),
+            (Some(75), 75),
+            (Some(144), ENCODE_MAX_FPS),
+            (Some(165), ENCODE_MAX_FPS),
+            (Some(360), ENCODE_MAX_FPS),
+            (None, ENCODE_DEFAULT_FPS),
+            // Windows' "hardware default" answers; no panel refreshes this slowly.
+            (Some(0), ENCODE_DEFAULT_FPS),
+            (Some(1), ENCODE_DEFAULT_FPS),
+        ] {
+            assert_eq!(ceiling_fps(refresh_hz), expected, "refresh {refresh_hz:?}");
+        }
+    }
+
+    /// A 144 Hz host starts at 144 and, once a bad link has passed, climbs
+    /// back to 144 — not to the default the ladder used to stop at.
+    #[test]
+    fn a_session_starts_at_and_recovers_to_its_own_ceiling() {
+        let mut abr = AbrController::with_max_fps(ENCODE_MAX_FPS);
+        assert_eq!(abr.target().fps, ENCODE_MAX_FPS);
+        for _ in 0..256 {
+            allow_another_decision(&mut abr);
+            abr.on_feedback(feedback(1.0));
+        }
+        assert_eq!(abr.target().fps, ABR_MIN_FPS);
+        for _ in 0..256 {
+            allow_another_decision(&mut abr);
+            abr.on_feedback(feedback(0.0));
+        }
+        assert_eq!(abr.target().fps, ENCODE_MAX_FPS);
     }
 
     #[test]

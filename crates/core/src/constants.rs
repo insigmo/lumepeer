@@ -687,8 +687,20 @@ pub const SHORT_LINK_CREATE_RATE_PER_MIN: u32 = 10;
 pub const SHORT_LINK_RESOLVE_RATE_PER_MIN: u32 = 30;
 /// Hard cutoff for an already active session after a wall-clock rollback (§12.3).
 pub const CLOCK_ROLLBACK_ACTIVE_SESSION_CUTOFF_SECS: u64 = 10 * 60;
-/// Default encoder frame rate (§11).
-pub const ENCODE_DEFAULT_FPS: u8 = 30;
+/// Encoder frame rate for a host whose display cannot say how often it
+/// refreshes (§11; ADR 0136).
+///
+/// 60, not the 30 it was: 30 was a ceiling on every session, fast host or
+/// not, and 60 Hz is what nearly every panel runs at. A host that can report
+/// its refresh rate runs at that instead, up to [`ENCODE_MAX_FPS`].
+pub const ENCODE_DEFAULT_FPS: u8 = 60;
+/// Highest frame rate a session runs at, whatever the host's display does
+/// (§11; ADR 0136).
+///
+/// The owner's ceiling. Desktop Duplication and `ScreenCaptureKit` deliver no
+/// more than the display presents anyway, so this only binds a panel faster
+/// than 144 Hz.
+pub const ENCODE_MAX_FPS: u8 = 144;
 /// Ceiling on the worker threads the software H.264 encoder may use (§11,
 /// ADR 0027).
 ///

@@ -3243,10 +3243,13 @@ pub struct ViewSetScaleArgs {
     /// Requested ceiling, as a percentage of the host's own captured size
     /// (§11; D7, docs/bugs/13-stream-resolution.md).
     pub scale_percent: u32,
+    /// The frame rate the same preset asks for (ADR 0136).
+    pub fps: u8,
 }
 
 /// Guest side: caps the picture at `scale_percent` of the host's own
-/// captured size (§11; D7, docs/bugs/13-stream-resolution.md task 3).
+/// captured size (§11; D7, docs/bugs/13-stream-resolution.md task 3), at the
+/// preset's frame rate (ADR 0136).
 ///
 /// The host re-checks the `view` grant and the range before applying
 /// anything; this call only says whether the request could be sent at all.
@@ -3263,7 +3266,7 @@ pub async fn view_set_scale(
     check_view_window(&window, &args.peer)?;
     state
         .network
-        .set_stream_scale(args.peer, args.scale_percent)
+        .set_stream_scale(args.peer, args.scale_percent, args.fps)
         .await?;
     Ok(())
 }

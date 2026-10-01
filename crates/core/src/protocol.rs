@@ -687,11 +687,16 @@ pub enum MessageKind {
     },
     /// Answer to `FileOffer`; `true` opens the `rd/file/1` connection (§4).
     FileAccept(bool),
-    /// Encoder target adjustment derived from receiver feedback (§11).
+    /// Encoder target adjustment (§11).
+    ///
+    /// Unused until ADR 0136, and since then what a guest sends right after
+    /// its `StreamScaleRequest`: the frame rate of the same quality preset.
+    /// The host holds it under its own ceiling; a host older than ADR 0136
+    /// ignores it, as every host always did.
     QualityAdjust {
-        /// Requested frame rate.
+        /// Requested frame rate, `ABR_MIN_FPS..=ENCODE_MAX_FPS`.
         target_fps: u8,
-        /// Requested bitrate.
+        /// Requested bitrate. Not acted on; sent as 0 (ADR 0136).
         target_bitrate_kbps: u32,
     },
     /// Keepalive, sent every `PING_INTERVAL_SECS` (§9.1).
