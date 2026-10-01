@@ -31,8 +31,10 @@ import {
   NativeDecoder,
   nativeDecodingAvailable,
   type ViewChunk,
+  type WireCodec,
 } from './view-decoder';
 import { installHotkeys } from './view-hotkeys';
+import { DecodeMeter, statsOverlay, statsRows, type MediaStats } from './view-stats';
 import {
   clampPan,
   cursorCssFor,
@@ -86,6 +88,12 @@ const CURSOR_POLL_INTERVAL_MS = 250;
  */
 const THUMBNAIL_INTERVAL_MS = 15_000;
 
+/**
+ * How often the statistics overlay asks for fresh numbers while it is shown.
+ * It is not asked at all while hidden.
+ */
+const STATS_POLL_INTERVAL_MS = 500;
+
 const params = new URLSearchParams(window.location.search);
 const peer = params.get('peer') ?? '';
 /**
@@ -113,6 +121,7 @@ const surface = document.querySelector<HTMLElement>('#view');
 const toolbarRootElement = document.querySelector<HTMLElement>('#toolbar-root');
 const overlay = document.querySelector<HTMLElement>('#overlay');
 const recordingIndicator = document.querySelector<HTMLElement>('#recording-indicator');
+const statsElement = document.querySelector<HTMLElement>('#stats-overlay');
 const chatPanel = document.querySelector<HTMLElement>('#chat-panel');
 const terminalPanel = document.querySelector<HTMLElement>('#terminal-panel');
 const terminalChrome = document.querySelector<HTMLElement>('#terminal-chrome');
@@ -562,6 +571,65 @@ let nativeDecoder: NativeDecoder | null = null;
 // on the very first request — nothing can be decoded before one — and again
 // whenever the decoder loses its footing.
 let needKeyframe = true;
+// Decode timing for the statistics overlay; cheap enough to keep running.
+const decodeMeter = new DecodeMeter();
+// The codec the last chunk arrived in, for the statistics overlay.
+let lastCodec: WireCodec | null = null;
+// The overlay's poll, or `null` while it is hidden.
+let statsTimer: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Redraws the statistics overlay from the media receiver's numbers and this
+ * window's own decode timing.
+ */
+async function refreshStats(): Promise<void> {
+  if (!statsElement || statsTimer === null) {
+    return;
+  }
+  let media: MediaStats | null = null;
+  try {
+    const invoke = await invoker();
+    media = (await invoke('view_media_stats', { args: { peer } })) as MediaStats;
+  } catch {
+    // The session ended, or the host is gone: what this window measured
+    // itself is still worth showing.
+  }
+  if (statsTimer === null) {
+    return;
+  }
+  render(
+    statsOverlay(
+      locale,
+      statsRows(locale, media, decodeMeter.take(), {
+        width: frameSize.width,
+        height: frameSize.height,
+        codec: lastCodec,
+      }),
+    ),
+    statsElement,
+  );
+}
+
+/** Shows or hides the statistics overlay (Ctrl+Alt+Shift+S). */
+function toggleStats(): void {
+  if (!statsElement) {
+    return;
+  }
+  if (statsTimer === null) {
+    // A fresh period, so the first reading is not an average since the
+    // window opened.
+    decodeMeter.take();
+    statsElement.hidden = false;
+    statsTimer = setInterval(() => {
+      void refreshStats();
+    }, STATS_POLL_INTERVAL_MS);
+    void refreshStats();
+    return;
+  }
+  clearInterval(statsTimer);
+  statsTimer = null;
+  statsElement.hidden = true;
+}
 
 function renderOverlay(): void {
   if (!overlay) {
@@ -705,6 +773,7 @@ async function nativeTick(): Promise<void> {
     });
     needKeyframe = false;
     const chunk: ViewChunk = decodeViewChunk(response as ArrayBuffer);
+    lastCodec = chunk.codec;
     applySessionFlags(chunk);
     if (chunk.desync) {
       // Frames were lost or the media connection was redialled: everything
@@ -947,6 +1016,7 @@ async function main(): Promise<void> {
       });
     },
     'toggle-toolbar': () => toolbar?.toggleCollapsed(),
+    'toggle-stats': toggleStats,
     // While the grab is on, this machine's `Win+D` and `Alt+Tab` go to the
     // host instead of to this desktop (ADR 0090). This is the way back, and
     // it is deliberately a chord the grab never claims. The Rust side owns
@@ -1028,10 +1098,14 @@ async function main(): Promise<void> {
     // at its own size (ADR 0058, ADR 0060).
     pictureCeiling = NATIVE_PICTURE_CEILING;
     syncStreamSize();
-    nativeDecoder = new NativeDecoder(canvas, (width, height) => {
-      frameSize = { width, height };
-      applyLayout();
-    });
+    nativeDecoder = new NativeDecoder(
+      canvas,
+      (width, height) => {
+        frameSize = { width, height };
+        applyLayout();
+      },
+      decodeMeter,
+    );
     nativeLoop();
   } else {
     loop();

@@ -79,6 +79,41 @@
         font-weight: 600;
         pointer-events: none;
       }
+      /* Video statistics (Ctrl+Alt+Shift+S). Bottom corner, clear of the
+         toolbar at the top, and transparent to the pointer: it sits over the
+         remote screen, and a click on it belongs to the host. */
+      .view-stats {
+        position: absolute;
+        inset-inline-start: 0.75rem;
+        inset-block-end: 0.75rem;
+        z-index: 30;
+        margin: 0;
+        padding: 0.5rem 0.75rem;
+        border-radius: 0.5rem;
+        background: rgb(0 0 0 / 72%);
+        font-size: 0.75rem;
+        line-height: 1.35;
+        font-variant-numeric: tabular-nums;
+        pointer-events: none;
+      }
+      .view-stats-title {
+        margin: 0 0 0.25rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+      }
+      .view-stats-rows {
+        display: grid;
+        grid-template-columns: auto auto;
+        column-gap: 1rem;
+        margin: 0;
+      }
+      .view-stats-rows dt {
+        opacity: 0.75;
+      }
+      .view-stats-rows dd {
+        margin: 0;
+        text-align: end;
+      }
       .view-recording-dot {
         width: 0.6rem;
         height: 0.6rem;
@@ -520,6 +555,8 @@
       <canvas id="cursor" width="1" height="1" aria-hidden="true" hidden></canvas>
       <div id="overlay"></div>
       <div id="recording-indicator"></div>
+      <!-- Video statistics (Ctrl+Alt+Shift+S): hidden until asked for. -->
+      <div id="stats-overlay" hidden></div>
       <aside id="chat-panel" class="chat-panel" hidden></aside>
       <!-- The terminal (ADR 0079). Two elements rather than one: `xterm.js`
            owns `#terminal-screen` outright and a re-render would destroy it,

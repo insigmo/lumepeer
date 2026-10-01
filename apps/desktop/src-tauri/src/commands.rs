@@ -1894,6 +1894,32 @@ pub async fn view_cursor(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Argument of [`view_media_stats`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ViewStatsArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+}
+
+/// What has arrived on this view window's media stream, for its statistics
+/// overlay: frame rate, bitrate, frame sizes, how far behind the best recent
+/// case the newest frame is, and what QUIC knows about the media connection.
+///
+/// Polled while the overlay is open and never otherwise.
+///
+/// # Errors
+/// Rejects calls from anything but this peer's own view window; [`IpcError`]
+/// if no such view exists.
+#[tauri::command]
+pub async fn view_media_stats(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: ViewStatsArgs,
+) -> Result<lumepeer_runtime::media_stats::MediaStatsSnapshot, IpcError> {
+    check_view_window(&window, &args.peer)?;
+    Ok(state.network.view_media_stats(&args.peer)?)
+}
+
 /// Forwards absolute pointer motion to the host being watched (§11).
 ///
 /// # Errors

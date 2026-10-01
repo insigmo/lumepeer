@@ -85,6 +85,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::address_book_store::AddressBookStore;
 use crate::connection_history::{ConnectionHistory, HistoryEntry};
+use crate::media_stats::MediaStatsSnapshot;
 use crate::remembered_password::RememberedPasswordStore;
 use crate::unattended_store::UnattendedStore;
 use crate::view::{
@@ -2172,6 +2173,18 @@ impl ActorHandle {
             desync,
             feed.codec.load(Ordering::Relaxed),
         ))
+    }
+
+    /// What has arrived on one view window's media stream, for its statistics
+    /// overlay.
+    ///
+    /// Answered off the actor loop, like [`Self::view_chunk`]: a read of
+    /// numbers the media receiver keeps, which nothing else mutates.
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] if no view window belongs to `label`.
+    pub fn view_media_stats(&self, label: &str) -> Result<MediaStatsSnapshot, ActorError> {
+        Ok(self.view_feed(label)?.bitstream.stats())
     }
 
     /// The live feed behind one view window's label.

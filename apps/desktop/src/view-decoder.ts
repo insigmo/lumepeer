@@ -68,6 +68,16 @@ export enum WireCodec {
   Vp9 = 3,
 }
 
+/**
+ * What {@link NativeDecoder} tells about how long each picture took to
+ * decode; `DecodeMeter` in `view-stats.ts` is the one the window uses.
+ */
+export interface DecodeTimer {
+  submitted(timestampUs: number, now: number): void;
+  decoded(timestampUs: number, now: number): void;
+  reset(): void;
+}
+
 /** One encoded picture as `view_next_chunk` delivers it. */
 export interface ChunkFrame {
   /** Whether this frame can be decoded without any frame before it. */
@@ -404,6 +414,8 @@ export function configStringFor(codec: WireCodec, keyframe: ChunkFrame): string 
 export class NativeDecoder {
   readonly #canvas: HTMLCanvasElement;
   readonly #onResize: (width: number, height: number) => void;
+  /** Times each frame from `decode` to its picture, for the statistics overlay. */
+  readonly #meter: DecodeTimer | null;
   #context: CanvasRenderingContext2D | null = null;
   #decoder: VideoDecoder | null = null;
   /** Set by the decoder's own error callback, read after the next batch. */
@@ -416,9 +428,14 @@ export class NativeDecoder {
    */
   #codec: WireCodec | null = null;
 
-  constructor(canvas: HTMLCanvasElement, onResize: (width: number, height: number) => void) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    onResize: (width: number, height: number) => void,
+    meter: DecodeTimer | null = null,
+  ) {
     this.#canvas = canvas;
     this.#onResize = onResize;
+    this.#meter = meter;
   }
 
   /** Whether a picture has ever been painted. */
@@ -438,6 +455,7 @@ export class NativeDecoder {
     const decoder = this.#decoder;
     this.#decoder = null;
     this.#broken = false;
+    this.#meter?.reset();
     if (!decoder) {
       return;
     }
@@ -534,6 +552,7 @@ export class NativeDecoder {
       return false;
     }
     try {
+      this.#meter?.submitted(frame.timestampUs, performance.now());
       decoder.decode(
         new EncodedVideoChunk({
           type: frame.keyframe ? 'key' : 'delta',
@@ -558,6 +577,7 @@ export class NativeDecoder {
    * exactly what a document does not.
    */
   #paint(frame: VideoFrame): void {
+    this.#meter?.decoded(frame.timestamp, performance.now());
     try {
       const width = frame.displayWidth;
       const height = frame.displayHeight;
