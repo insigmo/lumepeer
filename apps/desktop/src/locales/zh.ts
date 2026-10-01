@@ -181,6 +181,7 @@ export const zh: Dictionary = {
   'view.unavailable.noEncoder': '对方设备没有视频编码器，因此无法发送其屏幕。连接本身运行正常。',
   'view.unavailable.captureDenied':
     '对方设备的系统未允许 Lumepeer 录制屏幕。需要对方设备前的人允许 Lumepeer 录制屏幕，然后即可重新连接。连接本身运行正常。',
+  'view.unavailable.encoderFailed': '对方设备的视频编码器已停止工作，因此无法发送其屏幕。重新连接可能会有帮助。连接本身运行正常。',
   'view.unavailable.dismiss': '关闭',
   'view.recording': '此会话正在被录制',
   'chat.logLabel': '聊天',

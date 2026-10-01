@@ -191,6 +191,8 @@ export const it: Dictionary = {
     "L'altro dispositivo non ha un encoder video, quindi non può inviare la sua schermata. La connessione in sé funziona bene.",
   'view.unavailable.captureDenied':
     "Il sistema dell'altro dispositivo non ha consentito a Lumepeer di registrare lo schermo. Qualcuno su quel dispositivo deve consentire la registrazione dello schermo a Lumepeer, poi potrai riconnetterti. La connessione in sé funziona bene.",
+  'view.unavailable.encoderFailed':
+    "L'encoder video dell'altro dispositivo ha smesso di funzionare, quindi non può inviare la sua schermata. Riconnettersi potrebbe aiutare. La connessione in sé funziona bene.",
   'view.unavailable.dismiss': 'Chiudi',
   'view.recording': 'Questa sessione è in fase di registrazione',
   'chat.logLabel': 'Chat',

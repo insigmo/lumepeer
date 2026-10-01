@@ -21,15 +21,18 @@
 //! that names the session it resumes (ADR 0089), minor 19 added no message
 //! but appended the `CaptureDenied` reason to `MediaUnavailable` (ADR 0110),
 //! minor 20 appended `FileOpRequest` and `FileOpResult` (ADR 0124), minor 21
-//! appended `DeviceInfo` (ADR 0121) — and every earlier vector is still in
-//! the file with the same bytes, which is the compatibility claim this test
-//! checks.
+//! appended `DeviceInfo` (ADR 0121), minor 22 added no message but appended
+//! the `EncoderFailed` reason to `MediaUnavailable` (ADR 0135) — and every
+//! earlier vector is still in the file with the same bytes, which is the
+//! compatibility claim this test checks.
 //!
-//! One verdict has changed in the file's life, and it is written down where
-//! it happened: minor 14 raised the offer ceiling, so an offer of 500 MiB
-//! plus one byte decodes today where it was malformed before (ADR 0077). The
-//! bytes of that vector are untouched; what an interop partner learns from it
-//! is which minor the far side is speaking.
+//! Two verdicts have changed in the file's life, and each is written down
+//! where it happened: minor 14 raised the offer ceiling, so an offer of 500 MiB
+//! plus one byte decodes today where it was malformed before (ADR 0077), and
+//! minor 22 appended a fifth `MediaUnavailable` reason, so the reason byte
+//! minor 19 froze as unknown decodes today too (ADR 0135). The bytes of both
+//! vectors are untouched; what an interop partner learns from them is which
+//! minor the far side is speaking.
 //!
 //! The corpus replay runs the same assertions the `cargo fuzz` targets make,
 //! so a stable toolchain still exercises them on every CI run; the nightly
@@ -96,7 +99,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 21,
+        PROTOCOL_MINOR, 22,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 

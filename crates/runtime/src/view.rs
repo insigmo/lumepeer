@@ -30,8 +30,8 @@ use lumepeer_core::NodeId;
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
-    KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES, MEDIA_REDIAL_BACKOFF_MS,
-    RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
+    ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
+    MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
 use lumepeer_media::abr::{
@@ -40,7 +40,7 @@ use lumepeer_media::abr::{
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{
-    EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, select_encoder,
+    EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, select_encoder,
 };
 use lumepeer_media::error::MediaError;
 use lumepeer_media::scale::{fit_within, fit_within_budget, scale_to_percent};
@@ -487,7 +487,9 @@ impl MediaHealth {
     /// refused a session over a UAC prompt that has since closed
     /// (`docs/bugs/11-uac-degradation.md`). `CaptureDenied` is not recorded
     /// for the same reason: someone at this host can grant capture, and the
-    /// next session must ask the operating system again (ADR 0110).
+    /// next session must ask the operating system again (ADR 0110). Nor is
+    /// `EncoderFailed`: this host does have an encoder, and the next session
+    /// builds a fresh one rather than being refused over this one (ADR 0135).
     pub fn record(&self, reason: MediaUnavailableReason) {
         match reason {
             MediaUnavailableReason::NoCaptureBackend => {
@@ -496,8 +498,9 @@ impl MediaHealth {
             MediaUnavailableReason::NoEncoder => {
                 self.encoder_missing.store(true, Ordering::Relaxed);
             }
-            MediaUnavailableReason::SecureDesktopActive | MediaUnavailableReason::CaptureDenied => {
-            }
+            MediaUnavailableReason::SecureDesktopActive
+            | MediaUnavailableReason::CaptureDenied
+            | MediaUnavailableReason::EncoderFailed => {}
         }
     }
 
@@ -905,6 +908,9 @@ pub enum ViewStatus {
     /// The host's operating system refused it screen capture (ADR 0110).
     /// Terminal, same as `NoCapture`, with text that says who can fix it.
     CaptureDenied,
+    /// The host's encoder refused every frame it was given until the host
+    /// gave up (ADR 0135). Terminal, same as `NoEncoder`.
+    EncoderFailed,
 }
 
 impl From<MediaUnavailableReason> for ViewStatus {
@@ -914,6 +920,7 @@ impl From<MediaUnavailableReason> for ViewStatus {
             MediaUnavailableReason::NoEncoder => Self::NoEncoder,
             MediaUnavailableReason::SecureDesktopActive => Self::SecureDesktop,
             MediaUnavailableReason::CaptureDenied => Self::CaptureDenied,
+            MediaUnavailableReason::EncoderFailed => Self::EncoderFailed,
         }
     }
 }
@@ -935,6 +942,7 @@ impl ViewStatus {
             Self::NoEncoder => 5,
             Self::SecureDesktop => 6,
             Self::CaptureDenied => 7,
+            Self::EncoderFailed => 8,
         }
     }
 
@@ -944,7 +952,11 @@ impl ViewStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Failed | Self::NoCapture | Self::NoEncoder | Self::CaptureDenied
+            Self::Failed
+                | Self::NoCapture
+                | Self::NoEncoder
+                | Self::CaptureDenied
+                | Self::EncoderFailed
         )
     }
 }
@@ -1227,12 +1239,6 @@ pub type SharedRecorder = Arc<std::sync::Mutex<Option<Arc<crate::recorder::Sessi
 /// and never revisited: a mid-session codec change is not supported, so a
 /// redial simply starts a fresh loop with whatever the actor decides then.
 #[allow(
-    clippy::too_many_lines,
-    reason = "one uninterrupted pass over one frame — capture, scale, encode, \
-              write, record, adapt — and every split would put a step of it \
-              behind a call that hides the order the steps must happen in"
-)]
-#[allow(
     clippy::too_many_arguments,
     reason = "codec (ADR 0067) is the eighth: a struct just to carry these \
               past the one call site that assembles them would be indirection \
@@ -1247,6 +1253,47 @@ pub fn spawn_encode_loop(
     peer: NodeId,
     faults: mpsc::Sender<MediaFault>,
     control: EncodeControl,
+) -> JoinHandle<()> {
+    spawn_encode_loop_with(
+        connection,
+        capture,
+        recorder,
+        tag,
+        codec,
+        peer,
+        faults,
+        control,
+        select_encoder,
+    )
+}
+
+/// [`spawn_encode_loop`] with the building of its encoder handed in, so a test
+/// can put an encoder that refuses every frame behind the real loop
+/// (ADR 0135). The builder is called again when a preset rebuilds the
+/// encoder for its frame rate (ADR 0136).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one uninterrupted pass over one frame — capture, scale, encode, \
+              write, record, adapt — and every split would put a step of it \
+              behind a call that hides the order the steps must happen in"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same eight as `spawn_encode_loop`, and the builder its \
+              encoder comes from"
+)]
+fn spawn_encode_loop_with(
+    connection: PeerConnection,
+    capture: SharedCapture,
+    recorder: SharedRecorder,
+    tag: String,
+    codec: VideoCodec,
+    peer: NodeId,
+    faults: mpsc::Sender<MediaFault>,
+    control: EncodeControl,
+    build_encoder: impl Fn(EncoderConfig) -> lumepeer_media::Result<Box<dyn VideoEncoder>>
+    + Send
+    + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let writer = match open_media_stream(&connection).await {
@@ -1285,7 +1332,7 @@ pub fn spawn_encode_loop(
                 .flatten()
                 .map(|mode| mode.refresh_hz),
         );
-        let mut encoder = match select_encoder(EncoderConfig {
+        let mut encoder = match build_encoder(EncoderConfig {
             codec,
             fps: max_fps,
             ..EncoderConfig::default()
@@ -1359,8 +1406,12 @@ pub fn spawn_encode_loop(
         // `WindowsCapturer` for its ordinary frames.
         let media_started = Instant::now();
         // Whether the guest's own picture size (ADR 0060) has been withdrawn
-        // because the encoder would not take it (ADR 0074).
-        let mut size_cap_refused = false;
+        // because the encoder would not take it (ADR 0074), or is on trial
+        // for a refusal that may have had nothing to do with it (ADR 0135).
+        let mut guest_size = GuestSize::Honoured;
+        // Frames the encoder would not take: how many in a row, for the
+        // bound that ends this loop, and how many since the last log line.
+        let mut refusals = EncodeRefusals::default();
 
         loop {
             let tick_started = Instant::now();
@@ -1527,12 +1578,12 @@ pub fn spawn_encode_loop(
             // reduction is the hard ceiling of §15 that no choice may exceed,
             // so it goes last and has the final say (ADR 0018).
             let scale_percent = target.scale_percent;
-            // Ignored for the rest of the session once the encoder has
-            // refused it: see the `encoder refused a frame` arm below.
-            let size_cap = if size_cap_refused {
-                None
-            } else {
+            // Ignored while it is on trial, and for the rest of the session
+            // once the encoder has refused it: see [`GuestSize`].
+            let size_cap = if guest_size.honoured() {
                 control.size_cap()
+            } else {
+                None
             };
 
             // The cursor rides its own channel when the guest asked for one,
@@ -1593,7 +1644,21 @@ pub fn spawn_encode_loop(
                 Ok((returned, bitstream, timing)) => {
                     encoder = returned;
                     match bitstream {
-                        Ok(bitstream) => (bitstream, timing),
+                        Ok(bitstream) => {
+                            // A frame at the picture budget, right after one
+                            // at the guest's size was refused: that refusal
+                            // was the size's (ADR 0074, ADR 0135).
+                            if guest_size == GuestSize::OnTrial {
+                                tracing::warn!(
+                                    peer = %tag,
+                                    "the encoder refused the size this guest asked for; \
+                                     the rest of this session runs at the picture budget"
+                                );
+                            }
+                            guest_size = guest_size.after_frame();
+                            refusals.took();
+                            (bitstream, timing)
+                        }
                         Err(error) => {
                             // §18: a size the encoder will not take is not a
                             // reason to send nothing at all. The guest's own
@@ -1602,17 +1667,29 @@ pub fn spawn_encode_loop(
                             // measured, both MFTs on the reference machine
                             // refuse every size above 4K while
                             // `MAX_STREAM_PIXELS` now allows 5K (ADR 0074) —
-                            // so it is the first thing given up, once, and the
-                            // picture continues at the ADR 0018 budget.
-                            if size_cap.is_some() && !size_cap_refused {
-                                size_cap_refused = true;
+                            // so it is the first thing given up, and the next
+                            // frame tries the ADR 0018 budget. Only that frame
+                            // going through says the size was the cause.
+                            guest_size = guest_size.after_refusal(size_cap.is_some());
+                            // §18 again: skipping refused frames without end
+                            // left a guest on its one picture for minutes,
+                            // told nothing, while this log took thirty lines a
+                            // second (ADR 0135). A bounded run, then the guest
+                            // is told and the loop ends.
+                            if refusals.refused() >= ENCODE_REFUSALS_BEFORE_FAULT {
                                 tracing::warn!(
                                     peer = %tag,
                                     %error,
-                                    "the encoder refused the size this guest asked for;                                      the rest of this session runs at the picture budget"
+                                    in_a_row = ENCODE_REFUSALS_BEFORE_FAULT,
+                                    "the encoder keeps refusing frames: this session stays blank"
                                 );
-                            } else {
-                                tracing::warn!(peer = %tag, %error, "encoder refused a frame");
+                                let _ = faults
+                                    .send((peer, MediaUnavailableReason::EncoderFailed))
+                                    .await;
+                                return;
+                            }
+                            if let Some(refused) = refusals.due(Instant::now()) {
+                                tracing::warn!(peer = %tag, %error, refused, "encoder refused a frame");
                             }
                             sleep_for_the_rest_of(interval, tick_started).await;
                             continue;
@@ -1707,7 +1784,7 @@ pub fn spawn_encode_loop(
                 // it — one intra frame, which a preset change asks for anyway
                 // — where the ladder's 5 fps steps would pay one a second.
                 if preset.is_some() && next.fps != encoder_fps {
-                    match select_encoder(EncoderConfig {
+                    match build_encoder(EncoderConfig {
                         codec,
                         fps: next.fps,
                         bitrate_kbps: next.bitrate_kbps,
@@ -2053,6 +2130,103 @@ impl SendRate {
             return 0;
         }
         u32::try_from(bits / millis).unwrap_or(u32::MAX)
+    }
+}
+
+/// Where the guest's own picture size (ADR 0060) stands with the encoder.
+///
+/// ADR 0074 gives the size up the first time the encoder refuses a frame,
+/// because it is the one thing in this pipeline that can exceed what a
+/// hardware encoder negotiates. A refusal does not say why, though, and
+/// blaming every first one on the size logged "the encoder refused the size
+/// this guest asked for" on a host whose encoder refused everything, and
+/// dropped the guest's size over a failure it had no part in (ADR 0135). So
+/// the size is withdrawn on trial, and the next frame decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuestSize {
+    /// In effect. A refusal of a frame fitted to it puts it on trial.
+    Honoured,
+    /// Withdrawn after one refusal, until the next frame, at the picture
+    /// budget, says whether that refusal was the size's.
+    OnTrial,
+    /// The encoder refused it and took the budget: withdrawn for the rest of
+    /// the session.
+    Refused,
+    /// The encoder refused the budget too, so the size was not the cause. In
+    /// effect again, and not put on trial again until the encoder takes a
+    /// frame.
+    Cleared,
+}
+
+impl GuestSize {
+    /// Whether the picture is fitted to the guest's size, when it named one.
+    const fn honoured(self) -> bool {
+        matches!(self, Self::Honoured | Self::Cleared)
+    }
+
+    /// The encoder refused a frame; `capped` is whether that frame had been
+    /// fitted to the guest's size.
+    const fn after_refusal(self, capped: bool) -> Self {
+        match self {
+            Self::Honoured if capped => Self::OnTrial,
+            Self::OnTrial => Self::Cleared,
+            other => other,
+        }
+    }
+
+    /// The encoder took a frame.
+    const fn after_frame(self) -> Self {
+        match self {
+            Self::OnTrial => Self::Refused,
+            Self::Cleared => Self::Honoured,
+            other => other,
+        }
+    }
+}
+
+/// Shortest gap between two log lines about refused frames (ADR 0135).
+const ENCODE_REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Frames the encoder would not take, counted for the two things that depend
+/// on them: the run that ends the loop at [`ENCODE_REFUSALS_BEFORE_FAULT`],
+/// and the log, which gets one line per [`ENCODE_REFUSAL_LOG_INTERVAL`]
+/// rather than one per frame. An encoder that refuses every other frame never
+/// reaches the bound, and must not write fifteen lines a second either.
+#[derive(Debug, Default)]
+struct EncodeRefusals {
+    /// Refusals since the encoder last took a frame.
+    in_a_row: u32,
+    /// Refusals no log line has counted yet.
+    unlogged: u32,
+    /// When the last line was written.
+    logged_at: Option<Instant>,
+}
+
+impl EncodeRefusals {
+    /// Counts one refusal, and answers how many are now in a row.
+    fn refused(&mut self) -> u32 {
+        self.in_a_row = self.in_a_row.saturating_add(1);
+        self.unlogged = self.unlogged.saturating_add(1);
+        self.in_a_row
+    }
+
+    /// The encoder took a frame. The run is over; what it left unlogged is
+    /// counted by the next line.
+    fn took(&mut self) {
+        self.in_a_row = 0;
+    }
+
+    /// How many refusals the line about to be written stands for, or `None`
+    /// while the last one is too recent for another.
+    fn due(&mut self, now: Instant) -> Option<u32> {
+        if self
+            .logged_at
+            .is_some_and(|at| now.duration_since(at) < ENCODE_REFUSAL_LOG_INTERVAL)
+        {
+            return None;
+        }
+        self.logged_at = Some(now);
+        Some(std::mem::take(&mut self.unlogged))
     }
 }
 
@@ -3547,5 +3721,176 @@ mod tests {
             VIEW_RESPONSE_HEADER_BYTES,
             "no stale pixels ride along"
         );
+    }
+
+    /// An encoder that exists and refuses every frame, which is what an
+    /// `openh264` fallback handed zero-copy GPU frames did on 2026-09-30
+    /// (ADR 0135).
+    struct RefusingEncoder;
+
+    impl VideoEncoder for RefusingEncoder {
+        fn encode(&mut self, _frame: &Frame) -> lumepeer_media::Result<EncodedFrame> {
+            Err(MediaError::Encode("frame buffer is short".to_owned()))
+        }
+
+        fn set_bitrate(&mut self, _bitrate_kbps: u32) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn request_keyframe(&mut self) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn kind(&self) -> lumepeer_media::encode::EncoderKind {
+            lumepeer_media::encode::EncoderKind::SoftwareOpenH264
+        }
+    }
+
+    /// A capturer that hands over a picture every time it is asked, so every
+    /// tick of the loop reaches the encoder.
+    #[derive(Debug)]
+    struct ChangingCapturer;
+
+    impl lumepeer_media::capture::ScreenCapturer for ChangingCapturer {
+        fn start(
+            &mut self,
+            _target: lumepeer_media::capture::CaptureTarget,
+        ) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> lumepeer_media::Result<Option<Frame>> {
+            Ok(Some(Frame::cpu(
+                64,
+                64,
+                PixelFormat::Bgra8,
+                0,
+                vec![0; 64 * 64 * 4],
+            )))
+        }
+
+        fn stop(&mut self) {}
+
+        fn input_capability(&self) -> lumepeer_media::capture::InputCapability {
+            lumepeer_media::capture::InputCapability::None
+        }
+    }
+
+    /// ADR 0135: a refused frame used to be skipped and the next one tried,
+    /// for as long as the session lasted, and the guest was never told. The
+    /// loop now gives up after a bounded run, says why, and ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_encoder_that_refuses_every_frame_ends_the_loop_and_says_so() {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        // Held so the media connection stays up for the whole run: a closed
+        // stream would end the loop down a different path.
+        let _guest_side = dialed.unwrap();
+        let connection = accepted.unwrap().unwrap();
+
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(ChangingCapturer),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let (faults, mut faults_rx) = mpsc::channel(4);
+        let task = spawn_encode_loop_with(
+            connection,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            EncodeControl::new(peer, None),
+            |_| Ok(Box::new(RefusingEncoder)),
+        );
+
+        // Two seconds of frames at the default rate; the rest is headroom
+        // for a loaded machine. A timeout here is the old behaviour: the loop
+        // skipping refused frames for as long as the session lasts.
+        let fault = tokio::time::timeout(Duration::from_secs(30), faults_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(fault, Some((peer, MediaUnavailableReason::EncoderFailed)));
+        // And having said so, the loop is over rather than still encoding.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// ADR 0135: a refusal is blamed on the guest's size only when the next
+    /// frame, at the picture budget, goes through.
+    #[test]
+    fn a_refusal_the_budget_shares_is_not_the_guest_sizes() {
+        let on_trial = GuestSize::Honoured.after_refusal(true);
+        assert_eq!(on_trial, GuestSize::OnTrial);
+        assert!(!on_trial.honoured(), "the next frame tries the budget");
+        assert_eq!(on_trial.after_frame(), GuestSize::Refused);
+
+        let cleared = on_trial.after_refusal(false);
+        assert_eq!(cleared, GuestSize::Cleared);
+        assert!(cleared.honoured(), "the size was not the cause");
+        assert_eq!(
+            cleared.after_refusal(true),
+            GuestSize::Cleared,
+            "not put on trial again within the same run"
+        );
+        assert_eq!(cleared.after_frame(), GuestSize::Honoured);
+
+        assert_eq!(
+            GuestSize::Honoured.after_refusal(false),
+            GuestSize::Honoured,
+            "a guest that named no size has nothing to withdraw"
+        );
+    }
+
+    /// ADR 0135: one log line per interval, however fast frames are refused,
+    /// and each line counts the refusals it stands for.
+    #[test]
+    fn refused_frames_are_logged_once_per_interval_with_a_count() {
+        let mut refusals = EncodeRefusals::default();
+        let start = Instant::now();
+        assert_eq!(refusals.refused(), 1);
+        assert_eq!(
+            refusals.due(start),
+            Some(1),
+            "the first refusal is logged at once"
+        );
+        for _ in 0..29 {
+            refusals.refused();
+            assert_eq!(refusals.due(start + Duration::from_millis(500)), None);
+        }
+        refusals.took();
+        assert_eq!(
+            refusals.refused(),
+            1,
+            "a frame the encoder took ends the run"
+        );
+        assert_eq!(
+            refusals.due(start + ENCODE_REFUSAL_LOG_INTERVAL),
+            Some(30),
+            "the next line counts every refusal since the last one"
+        );
+    }
+
+    /// ADR 0135: the host does have an encoder, so a failed one says nothing
+    /// about the next session.
+    #[test]
+    fn a_failed_encoder_is_not_recorded_as_a_missing_one() {
+        let health = MediaHealth::healthy();
+        health.record(MediaUnavailableReason::EncoderFailed);
+        assert!(health.can_encode());
+        assert_eq!(health.fault(), None);
     }
 }

@@ -191,6 +191,8 @@ export const tr: Dictionary = {
     'Diğer cihazda video kodlayıcı yok, bu yüzden ekranını gönderemiyor. Bağlantının kendisi sorunsuz.',
   'view.unavailable.captureDenied':
     "Diğer cihazın sistemi Lumepeer'in ekranı kaydetmesine izin vermedi. O cihazdaki birinin Lumepeer için ekran kaydına izin vermesi gerekiyor, ardından yeniden bağlanabilirsiniz. Bağlantının kendisi sorunsuz.",
+  'view.unavailable.encoderFailed':
+    'Diğer cihazın video kodlayıcısı çalışmayı durdurdu, bu yüzden ekranını gönderemiyor. Yeniden bağlanmak işe yarayabilir. Bağlantının kendisi sorunsuz.',
   'view.unavailable.dismiss': 'Kapat',
   'view.recording': 'Bu oturum kaydediliyor',
   'chat.logLabel': 'Sohbet',
