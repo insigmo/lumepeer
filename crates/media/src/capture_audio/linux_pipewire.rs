@@ -310,9 +310,9 @@ impl AudioCapturer for PipewireMonitorCapturer {
             .ok_or_else(|| MediaError::CaptureInterrupted("capture not started".to_owned()))?;
         match rx.recv_timeout(READ_TIMEOUT) {
             Ok(chunk) => Ok(chunk),
-            Err(RecvTimeoutError::Timeout) => Err(MediaError::CaptureInterrupted(
-                "no audio arrived within the read timeout".to_owned(),
-            )),
+            // An idle sink may hand its monitor nothing at all: a quiet host,
+            // not a dead stream — a gone one disconnects below (ADR 0137).
+            Err(RecvTimeoutError::Timeout) => Ok(PcmChunk::silence(capture_timestamp_us())),
             Err(RecvTimeoutError::Disconnected) => Err(MediaError::CaptureInterrupted(
                 "the capture thread is gone".to_owned(),
             )),

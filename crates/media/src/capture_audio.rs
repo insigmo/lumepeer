@@ -75,7 +75,8 @@ pub trait AudioCapturer: Send + std::fmt::Debug {
     /// platform refused.
     fn start(&mut self) -> Result<()>;
 
-    /// Blocks until the next `AUDIO_FRAME_MS` chunk is available.
+    /// Blocks until the next `AUDIO_FRAME_MS` chunk is available, or answers
+    /// with silence once the host has played nothing for a while.
     ///
     /// # Errors
     /// [`MediaError::CaptureInterrupted`] once the stream is gone (device
@@ -134,9 +135,11 @@ pub(crate) fn capture_timestamp_us() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// How long one blocking read may take before the backend is considered
-/// stuck. Generous on purpose: a chunk itself is 20 ms of audio, but a device
-/// resuming from suspend may legitimately be late once.
+/// How long one blocking read waits for audio. The desktop-mix backends then
+/// answer with a chunk of silence: each goes quiet while the host plays
+/// nothing, and that is a silent host, not a stuck one — only a stream that is
+/// actually gone ends capture (ADR 0137). A microphone always streams, so
+/// there the wait running out still means a stuck device.
 #[cfg(any(
     all(target_os = "windows", feature = "audio-capture"),
     all(
