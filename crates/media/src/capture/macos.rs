@@ -1323,9 +1323,12 @@ mod screen_capture_kit {
             }
             match active.rx.recv_timeout(READ_TIMEOUT) {
                 Ok(chunk) => Ok(chunk),
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(MediaError::CaptureInterrupted(
-                    "no audio arrived within the read timeout".to_owned(),
-                )),
+                // ScreenCaptureKit delivers no audio buffers while nothing
+                // plays: a quiet host, not a dead stream — a stopped one
+                // reports through `stop_reason` above (ADR 0137).
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Ok(PcmChunk::silence(capture_timestamp_us()))
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(MediaError::CaptureInterrupted(
                     "the ScreenCaptureKit audio stream is gone".to_owned(),
                 )),

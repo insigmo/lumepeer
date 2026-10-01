@@ -297,13 +297,18 @@ impl crate::capture_audio::AudioCapturer for WasapiLoopbackCapturer {
             }
 
             // Not enough yet: sleep roughly one wire frame and drain again.
-            // The wall clock bounds the wait so a wedged device fails the call
-            // instead of hanging the session (the video encoder's event
-            // timeout follows the same contract).
-            if !state.running.load(Ordering::Relaxed) || started.elapsed() > READ_TIMEOUT {
+            if !state.running.load(Ordering::Relaxed) {
                 return Err(MediaError::CaptureInterrupted(
-                    "audio capture stopped or timed out".to_owned(),
+                    "audio capture stopped".to_owned(),
                 ));
+            }
+            // Loopback hands back no packets at all while nothing plays, so a
+            // quiet wait is a silent host, not a dead device — a device that
+            // is gone fails `GetNextPacketSize` above (ADR 0137). One chunk of
+            // silence keeps the caller's loop turning without a timeout ending
+            // the stream.
+            if started.elapsed() > READ_TIMEOUT {
+                return Ok(PcmChunk::silence(capture_timestamp_us()));
             }
             std::thread::sleep(std::time::Duration::from_millis(
                 lumepeer_core::constants::AUDIO_FRAME_MS.into(),

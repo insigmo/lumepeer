@@ -4324,8 +4324,8 @@ impl MediaSession {
 
 /// Host side: one running audio loop for a peer, with its own stop flag.
 ///
-/// Audio is opt-in per session: the host user turns it on (`AudioStart` of
-/// §11) and off again, and every teardown path — revoke, disconnect, media
+/// Audio starts with every media session (ADR 0137) and may be turned off and
+/// on again (`audio_toggle`); every teardown path — revoke, disconnect, media
 /// session replacement — flips the flag and aborts the task.
 struct AudioSession {
     stop: Arc<AtomicBool>,
@@ -9565,6 +9565,9 @@ impl Actor {
         // One capture backend feeds every viewer, so whether the cursor is
         // drawn into the frame is decided across all of them, not per session.
         self.refresh_cursor_embedding();
+        // Sound comes with the picture, on the same grant (§8.1; ADR 0137).
+        // Nothing in the UI ever turned it on, so no guest ever heard a host.
+        self.start_audio(peer);
         // The guest-mic pass rides the same connection and parks until the
         // guest actually opens its tagged `M` stream (§11; ADR 0028); it is
         // bounded by the media session's own lifetime.
@@ -9592,8 +9595,12 @@ impl Actor {
         }
         self.health.record(reason);
         // The loop has already returned; its media connection has nothing
-        // left to carry, and dropping the entry closes it.
+        // left to carry, and dropping the entry closes it — once the audio
+        // loop riding it lets go too (ADR 0137).
         self.media.remove(&peer);
+        if let Some(audio) = self.audio.remove(&peer) {
+            audio.stop();
+        }
         self.announce_media_fault(peer, reason);
     }
 
@@ -9675,10 +9682,10 @@ impl Actor {
 
     /// Host side: stops sending video to `peer` and drops it as a viewer, which
     /// stops capture altogether if it was the last one (§8.1, §11).
-    /// The audio stream, if the host user had enabled it, dies with the media
-    /// session — there is no audio without a picture's session. A live
-    /// recording is flushed and closed too: a recording may only cover the
-    /// session it was granted for (§8.2, §17).
+    /// The audio stream dies with the media session — there is no audio
+    /// without a picture's session. A live recording is flushed and closed
+    /// too: a recording may only cover the session it was granted for (§8.2,
+    /// §17).
     fn stop_media(&mut self, peer: NodeId) {
         if let Some(session) = self.media.remove(&peer) {
             session.stop();
@@ -12439,8 +12446,8 @@ impl Actor {
     ///
     /// Authorization mirrors `on_media_accepted`: a live control connection,
     /// an Active session and a `view` grant — audio is part of what `view`
-    /// may carry (§8.1 "receive video **and audio**"), but it is opt-in per
-    /// session because it is the host user's microphone-adjacent surface.
+    /// may carry (§8.1 "receive video **and audio**"). It is already on with
+    /// every picture (ADR 0137); this turns it off, or back on.
     fn on_audio_toggle(&mut self, label: &str, on: bool) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
         let granted = self.connections.contains_key(&peer)
@@ -12453,36 +12460,53 @@ impl Actor {
             if self.audio.contains_key(&peer) {
                 return Ok(()); // already streaming; idempotent
             }
-            let Some(session) = self.media.get(&peer) else {
+            if !self.start_audio(peer) {
                 // No media connection to ride on yet.
                 return Err(ActorError::UnknownPeer);
-            };
-            let stop = Arc::new(AtomicBool::new(false));
-            // The §17 slot starts empty; the actor fills it when a recording
-            // is turned on, and the loop picks it up on its next packet.
-            let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(
-                self.recorders.get(&peer).map(Arc::clone),
-            ));
-            let task = crate::view::spawn_audio_loop(
-                session.connection.clone(),
-                Arc::clone(&stop),
-                Arc::clone(&recorder),
-                self.label_of(&peer),
-            );
-            self.audio.insert(
-                peer,
-                AudioSession {
-                    stop,
-                    recorder,
-                    task,
-                },
-            );
+            }
             tracing::info!(peer = %label, "audio streaming enabled");
         } else if let Some(session) = self.audio.remove(&peer) {
             session.stop();
             tracing::info!(peer = %label, "audio streaming disabled");
         }
         Ok(())
+    }
+
+    /// Host side: streams desktop audio to `peer` on its current media
+    /// connection, replacing any audio loop that rode an earlier one
+    /// (ADR 0137). `false` when there is no media connection to ride on.
+    fn start_audio(&mut self, peer: NodeId) -> bool {
+        let Some(session) = self.media.get(&peer) else {
+            return false;
+        };
+        let connection = session.connection.clone();
+        let video_stream = session.control.video_stream_opened();
+        if let Some(previous) = self.audio.remove(&peer) {
+            previous.stop();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        // The §17 slot starts with whatever recording is running; the actor
+        // swaps it when one is turned on or off, and the loop picks it up on
+        // its next packet.
+        let recorder: crate::view::SharedRecorder = Arc::new(std::sync::Mutex::new(
+            self.recorders.get(&peer).map(Arc::clone),
+        ));
+        let task = crate::view::spawn_audio_loop(
+            connection,
+            Arc::clone(&stop),
+            Arc::clone(&recorder),
+            self.label_of(&peer),
+            video_stream,
+        );
+        self.audio.insert(
+            peer,
+            AudioSession {
+                stop,
+                recorder,
+                task,
+            },
+        );
+        true
     }
 
     /// Guest side: turns the view window's own microphone towards `label`'s
