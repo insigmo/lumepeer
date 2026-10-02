@@ -412,6 +412,101 @@ impl Frame {
         }
         Ok(&self.data)
     }
+
+    /// This frame reduced to `width`x`height` on the GPU it is already on, or
+    /// `None` when it is not on one or that GPU will not do it (ADR 0139).
+    ///
+    /// What comes back is again a GPU frame, so the encoder's zero-copy path
+    /// takes it as it is, and a software encoder reads back the small picture
+    /// rather than the large one.
+    #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+    #[must_use]
+    pub(crate) fn scaled_on_gpu(&self, width: u32, height: u32) -> Option<Self> {
+        let scaled = self.gpu.as_ref()?.scaled(width, height).ok()?;
+        Some(Self {
+            width,
+            height,
+            format: self.format,
+            timestamp_us: self.timestamp_us,
+            data: Vec::new(),
+            gpu: Some(scaled),
+        })
+    }
+}
+
+/// The newest picture a platform capture thread has produced and nobody has
+/// taken yet, for the backends whose frames arrive on a thread of the
+/// platform's own — `ScreenCaptureKit`, `PipeWire` (§11.1; ADR 0139).
+///
+/// The newest wins: a picture put while another is still waiting replaces
+/// it. Dropping the newer one instead, as a full one-slot channel does, can
+/// lose the last change of a burst, and the guest is then shown the screen as
+/// it was before it until something else changes.
+///
+/// [`Self::take_within`] waits for a picture rather than answering at once,
+/// so a backend built on it waits for a change the way Desktop Duplication
+/// does ([`ScreenCapturer::waits_for_change`]).
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "capture-screencapturekit"
+    ),
+    all(target_os = "linux", feature = "capture-portal")
+))]
+#[derive(Debug, Default)]
+pub(crate) struct LatestFrame {
+    frame: std::sync::Mutex<Option<Frame>>,
+    ready: std::sync::Condvar,
+}
+
+#[cfg(any(
+    test,
+    all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "capture-screencapturekit"
+    ),
+    all(target_os = "linux", feature = "capture-portal")
+))]
+impl LatestFrame {
+    /// Offers `frame`, replacing any picture still waiting.
+    pub(crate) fn put(&self, frame: Frame) {
+        *self
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(frame);
+        self.ready.notify_all();
+    }
+
+    /// The waiting picture, or the next one put within `wait`, or `None`.
+    pub(crate) fn take_within(&self, wait: std::time::Duration) -> Option<Frame> {
+        let slot = self
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut slot, _timed_out) = self
+            .ready
+            .wait_timeout_while(slot, wait, |frame| frame.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.take()
+    }
+}
+
+/// How long a backend waits in `next_frame` for a picture before saying
+/// nothing changed: one frame interval at
+/// [`lumepeer_core::constants::ENCODE_DEFAULT_FPS`], as long as Desktop
+/// Duplication's own wait (ADR 0139).
+#[cfg(any(
+    all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "capture-screencapturekit"
+    ),
+    all(target_os = "linux", feature = "capture-portal")
+))]
+pub(crate) fn frame_wait() -> std::time::Duration {
+    std::time::Duration::from_micros(
+        1_000_000 / u64::from(lumepeer_core::constants::ENCODE_DEFAULT_FPS.max(1)),
+    )
 }
 
 /// Platform screen capture backend (§11.1).
@@ -430,6 +525,19 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// [`MediaError::CaptureInterrupted`] on screen lock, user switch or
     /// desktop change (§18).
     fn next_frame(&mut self) -> Result<Option<Frame>>;
+
+    /// Whether [`Self::next_frame`] itself waits, up to about a frame
+    /// interval, for the screen to change before it answers `None`
+    /// (ADR 0139).
+    ///
+    /// A backend that does may be asked again the moment it answers `None`:
+    /// the wait is already inside the call, and a change that lands just
+    /// after it is caught at once. One that answers at once has to be paced
+    /// by its caller instead, or the loop asking it spins. `false` by
+    /// default, which is the safe answer for a backend that does not say.
+    fn waits_for_change(&self) -> bool {
+        false
+    }
 
     /// Stops capturing. Idempotent.
     fn stop(&mut self);
@@ -1030,6 +1138,13 @@ impl CaptureController {
         result
     }
 
+    /// Whether the backend's [`Self::next_frame`] waits for a change itself
+    /// (ADR 0139); see [`ScreenCapturer::waits_for_change`].
+    #[must_use]
+    pub fn waits_for_change(&self) -> bool {
+        self.capturer.waits_for_change()
+    }
+
     /// The host's cursor, when the backend can report it and it changed
     /// (§11's `CursorShape`).
     ///
@@ -1345,5 +1460,53 @@ mod tests {
 
         controller.remove_viewer(&watcher);
         assert!(controller.cursor_shape().is_none());
+    }
+
+    fn stamped(timestamp_us: u64) -> Frame {
+        Frame::cpu(2, 2, PixelFormat::Bgra8, timestamp_us, vec![0; 16])
+    }
+
+    /// ADR 0139: the picture still waiting is replaced by a newer one, never
+    /// the other way round, and is taken once.
+    #[test]
+    fn the_latest_frame_keeps_the_newest_picture() {
+        let now = std::time::Duration::ZERO;
+        let latest = LatestFrame::default();
+        assert!(latest.take_within(now).is_none());
+        latest.put(stamped(1));
+        latest.put(stamped(2));
+        assert_eq!(
+            latest.take_within(now).map(|frame| frame.timestamp_us),
+            Some(2)
+        );
+        assert!(latest.take_within(now).is_none(), "a picture is taken once");
+    }
+
+    /// ADR 0139: a wait ends the moment a picture is put, and runs out with
+    /// nothing when none is.
+    #[test]
+    fn the_latest_frame_waits_for_a_picture_and_no_longer_than_asked() {
+        let latest = std::sync::Arc::new(LatestFrame::default());
+        let started = std::time::Instant::now();
+        assert!(
+            latest
+                .take_within(std::time::Duration::from_millis(20))
+                .is_none()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+
+        let producer = std::sync::Arc::clone(&latest);
+        let putting = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            producer.put(stamped(3));
+        });
+        let started = std::time::Instant::now();
+        let taken = latest.take_within(std::time::Duration::from_secs(5));
+        assert_eq!(taken.map(|frame| frame.timestamp_us), Some(3));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the wait ended on the put, not on its timeout"
+        );
+        putting.join().unwrap();
     }
 }

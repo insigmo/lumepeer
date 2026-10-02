@@ -9552,6 +9552,7 @@ impl Actor {
             self.faults_tx.clone(),
             control.clone(),
         );
+        let acks = control.acks();
         self.media.insert(
             peer,
             MediaSession {
@@ -9568,10 +9569,11 @@ impl Actor {
         // Sound comes with the picture, on the same grant (§8.1; ADR 0137).
         // Nothing in the UI ever turned it on, so no guest ever heard a host.
         self.start_audio(peer);
-        // The guest-mic pass rides the same connection and parks until the
-        // guest actually opens its tagged `M` stream (§11; ADR 0028); it is
-        // bounded by the media session's own lifetime.
-        crate::view::spawn_guest_mic_pass(connection, tag);
+        // What the guest opens on the same connection — its microphone's `M`
+        // stream (ADR 0028), its acknowledgements of the picture (ADR 0139) —
+        // is accepted by one pass that parks until it does; it is bounded by
+        // the media session's own lifetime.
+        crate::view::spawn_guest_streams(connection, tag, acks);
     }
 
     /// Host side: an encode loop found it cannot produce a picture at all —

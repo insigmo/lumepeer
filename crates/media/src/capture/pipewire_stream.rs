@@ -16,11 +16,10 @@
 //! feature — goes exactly the way this module always went.
 
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::capture::linux_wayland::portal::StreamSize;
-use crate::capture::{Frame, PixelFormat};
+use crate::capture::{Frame, LatestFrame, PixelFormat, frame_wait};
 use crate::error::{MediaError, Result};
 
 #[cfg(feature = "encode-vaapi-zero-copy")]
@@ -81,7 +80,7 @@ fn timestamp_us(started_at: std::time::Instant) -> u64 {
 struct StreamUserData {
     width: u32,
     height: u32,
-    sender: SyncSender<Frame>,
+    sender: Arc<LatestFrame>,
     started_at: std::time::Instant,
     last_hash: Option<[u8; 32]>,
     stream_size: Arc<StreamSize>,
@@ -95,12 +94,13 @@ struct StreamUserData {
 /// exists exactly for signaling a loop running on another thread.
 struct Shutdown;
 
-/// Owns a PipeWire `MainLoop` on a dedicated thread, feeding decoded frames
-/// through a bounded channel. Dropping this joins the thread.
+/// Owns a PipeWire `MainLoop` on a dedicated thread, handing decoded frames
+/// over through a newest-wins slot (ADR 0139). Dropping this joins the
+/// thread.
 pub(crate) struct PipeWireFrameThread {
     handle: Option<JoinHandle<()>>,
     shutdown: pipewire::channel::Sender<Shutdown>,
-    frames: Receiver<Frame>,
+    frames: Arc<LatestFrame>,
 }
 
 // `pipewire::channel::Sender`/`Receiver` do not implement `Debug`, so this is
@@ -144,7 +144,8 @@ impl PipeWireFrameThread {
         stream_size: Arc<StreamSize>,
         offer_dmabuf: bool,
     ) -> Result<Self> {
-        let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(1);
+        let frames = Arc::new(LatestFrame::default());
+        let frame_tx = Arc::clone(&frames);
         let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<Shutdown>();
 
         let handle = std::thread::Builder::new()
@@ -161,7 +162,7 @@ impl PipeWireFrameThread {
         Ok(Self {
             handle: Some(handle),
             shutdown: shutdown_tx,
-            frames: frame_rx,
+            frames,
         })
     }
 
@@ -171,7 +172,7 @@ impl PipeWireFrameThread {
     )]
     fn run(
         node_id: u32,
-        frame_tx: &SyncSender<Frame>,
+        frame_tx: &Arc<LatestFrame>,
         shutdown_rx: pipewire::channel::Receiver<Shutdown>,
         stream_size: &Arc<StreamSize>,
         offer_dmabuf: bool,
@@ -232,7 +233,7 @@ impl PipeWireFrameThread {
         let data = StreamUserData {
             width: 0,
             height: 0,
-            sender: frame_tx.clone(),
+            sender: Arc::clone(frame_tx),
             started_at: std::time::Instant::now(),
             last_hash: None,
             stream_size: Arc::clone(stream_size),
@@ -358,13 +359,12 @@ impl PipeWireFrameThread {
         Ok(())
     }
 
-    /// Drains the next available frame, or `None` if nothing new has
-    /// arrived, matching `ScreenCapturer::next_frame`'s "no change" contract.
+    /// The newest frame, waiting up to a frame interval for one, or `None`
+    /// if nothing new arrived — `ScreenCapturer::next_frame`'s "no change"
+    /// (ADR 0139). A producer thread that has gone produces nothing, which
+    /// reads the same way.
     pub(crate) fn try_recv_frame(&self) -> Option<Frame> {
-        // Both error arms — nothing queued, and the producer thread gone —
-        // are "no new frame right now" to the caller, which is exactly what
-        // `ok()` collapses them to.
-        self.frames.try_recv().ok()
+        self.frames.take_within(frame_wait())
     }
 }
 
@@ -378,12 +378,9 @@ fn send_packed(user_data: &mut StreamUserData, stride: usize, bytes: &[u8]) {
         user_data.started_at,
         &mut user_data.last_hash,
     ) {
-        // A full channel means the consumer hasn't caught up:
-        // drop this frame rather than block the PipeWire thread.
-        // An error here also covers a disconnected receiver
-        // (WaylandPortalCapturer gone); nothing more to do until
-        // `stop()` tears this down.
-        let _ = user_data.sender.try_send(frame);
+        // A consumer that has not caught up loses the older picture, not
+        // this one, and the PipeWire thread never blocks (ADR 0139).
+        user_data.sender.put(frame);
     }
 }
 
@@ -754,9 +751,9 @@ mod dmabuf {
                 dmabuf_frame(user_data, data, raw),
             ) {
                 (Some(_), Some(frame)) => {
-                    // A full channel drops the frame, and dropping it is what
-                    // gives the buffer back.
-                    let _ = user_data.sender.try_send(frame);
+                    // A picture still waiting is replaced, and dropping it
+                    // is what gives its buffer back (ADR 0139).
+                    user_data.sender.put(frame);
                 }
                 _ => give_back(),
             }

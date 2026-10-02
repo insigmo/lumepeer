@@ -289,6 +289,7 @@ pub struct EncodeStats {
     frames: u32,
     keyframes: u32,
     skipped: u32,
+    held: u32,
     bytes: u64,
     capture: Stage,
     scale: Stage,
@@ -306,6 +307,7 @@ impl EncodeStats {
             frames: 0,
             keyframes: 0,
             skipped: 0,
+            held: 0,
             bytes: 0,
             capture: Stage::EMPTY,
             scale: Stage::EMPTY,
@@ -318,6 +320,12 @@ impl EncodeStats {
     /// A tick the link would not take, so nothing was captured.
     pub const fn skipped(&mut self) {
         self.skipped = self.skipped.saturating_add(1);
+    }
+
+    /// A tick held back because the guest had not yet acknowledged enough of
+    /// what was already sent (ADR 0139).
+    pub const fn held(&mut self) {
+        self.held = self.held.saturating_add(1);
     }
 
     /// Capture produced a picture, after `took` (which includes waiting for
@@ -361,6 +369,7 @@ impl EncodeStats {
             frames: self.frames,
             keyframes: self.keyframes,
             skipped: self.skipped,
+            held: self.held,
             width: self.width,
             height: self.height,
             capture_ms_avg: self.capture.avg_ms(),
@@ -388,6 +397,9 @@ pub struct EncodeReport {
     pub keyframes: u32,
     /// Ticks skipped because the link was still busy with the previous frame.
     pub skipped: u32,
+    /// Ticks held back because the guest had not yet acknowledged enough of
+    /// what was already on its way (ADR 0139).
+    pub held: u32,
     /// Size of the last picture handed to the encoder.
     pub width: u32,
     /// See [`Self::width`].
@@ -396,7 +408,9 @@ pub struct EncodeReport {
     pub capture_ms_avg: f32,
     /// See [`Self::capture_ms_avg`].
     pub capture_ms_max: f32,
-    /// Downscaling on the CPU (zero when nothing needed reducing).
+    /// Downscaling: the hand-off to the GPU when the frame is there
+    /// (ADR 0139), the whole filter on the CPU otherwise; zero when nothing
+    /// needed reducing.
     pub scale_ms_avg: f32,
     /// See [`Self::scale_ms_avg`].
     pub scale_ms_max: f32,
@@ -533,6 +547,8 @@ mod tests {
             );
         }
         stats.skipped();
+        stats.held();
+        stats.held();
         assert!(stats.due(start + ms(4_999)).is_none());
 
         let report = stats.due(start + ENCODE_STATS_PERIOD).unwrap();
@@ -540,6 +556,7 @@ mod tests {
         assert_eq!(report.kbps, 150 * 25_000 * 8 / 5_000);
         assert_eq!(report.keyframes, 1);
         assert_eq!(report.skipped, 1);
+        assert_eq!(report.held, 2);
         assert_eq!((report.width, report.height), (1920, 1080));
         assert!((report.encode_ms_avg - 9.0).abs() < 0.01);
         assert!((report.encode_ms_max - 10.0).abs() < 0.01);

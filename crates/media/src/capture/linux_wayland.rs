@@ -208,6 +208,20 @@ impl ScreenCapturer for WaylandPortalCapturer {
         }
     }
 
+    /// Once the stream runs, `next_frame` waits up to a frame interval for
+    /// its next picture (ADR 0139). While the portal's dialog is still up it
+    /// answers at once, and the caller has to pace it.
+    fn waits_for_change(&self) -> bool {
+        #[cfg(feature = "capture-portal")]
+        {
+            self.stream.is_some() && self.negotiating.is_none()
+        }
+        #[cfg(not(feature = "capture-portal"))]
+        {
+            false
+        }
+    }
+
     fn input_capability(&self) -> InputCapability {
         #[cfg(feature = "capture-portal")]
         {
