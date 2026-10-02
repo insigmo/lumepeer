@@ -15,6 +15,11 @@ fn var(name: &str) -> String {
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    assert!(
+        env::var_os("CARGO_FEATURE_AOM").is_none() || env::var_os("CARGO_FEATURE_LUMEPEER_AOM").is_none(),
+        "`aom` and `lumepeer-aom` both link a libaom and both define aom_shim_*; \
+         build them into separate binaries (`--no-default-features --features lumepeer-aom`)"
+    );
     // openh264-sys2 silently builds without its x86 assembly when it cannot
     // run nasm, or when OPENH264_NO_ASM is set; record which case this binary
     // was built under, because it changes the openh264 numbers several-fold.

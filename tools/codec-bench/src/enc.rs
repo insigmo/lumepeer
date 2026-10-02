@@ -71,6 +71,8 @@ pub fn build(name: &str, p: &Params) -> Result<Box<dyn Bench>, String> {
         "mf-av1" => Mf::new(p, VideoCodec::Av1).map(|e| Box::new(e) as Box<dyn Bench>),
         #[cfg(feature = "aom")]
         "aom" => aom::Aom::new(p).map(|e| Box::new(e) as Box<dyn Bench>),
+        #[cfg(feature = "lumepeer-aom")]
+        "lumepeer-aom" => LumepeerAom::new(p).map(|e| Box::new(e) as Box<dyn Bench>),
         #[cfg(feature = "svt")]
         "svt" => svt::Svt::new(p).map(|e| Box::new(e) as Box<dyn Bench>),
         #[cfg(feature = "rav1e")]
@@ -120,6 +122,55 @@ impl Bench for OpenH264 {
     }
     fn describe(&self) -> String {
         format!("lumepeer OpenH264Encoder (openh264 crate 0.9.8, nasm at build: {})", env!("CB_OPENH264_ASM"))
+    }
+}
+
+/// lumepeer's software AV1 encoder, product code path (ADR 0139): BGRA in,
+/// its own conversion inside the call, its own settings. `--kbps` is the
+/// session's figure, as the product gets it — libaom is asked for
+/// `encode::aom::av1_kbps` of it, half — so this at 2T is `aom` at T.
+/// `--speed`, `--threads`, `--tiles`, `--screen` and `--minq/--maxq` do not
+/// apply: the product fixes all of them (speed 10, min(cores, 8) threads,
+/// four tile columns, screen content, 0..63).
+#[cfg(feature = "lumepeer-aom")]
+struct LumepeerAom {
+    inner: lumepeer_media::encode::aom::AomEncoder,
+    kbps: u32,
+    w: u32,
+    h: u32,
+}
+
+#[cfg(feature = "lumepeer-aom")]
+impl LumepeerAom {
+    fn new(p: &Params) -> Result<Self, String> {
+        let inner = lumepeer_media::encode::aom::AomEncoder::new(lp_config(p, VideoCodec::Av1)).map_err(|e| e.to_string())?;
+        Ok(Self { inner, kbps: p.kbps, w: p.width as u32, h: p.height as u32 })
+    }
+}
+
+#[cfg(feature = "lumepeer-aom")]
+impl Bench for LumepeerAom {
+    fn wants_i420(&self) -> bool {
+        false
+    }
+    fn codec(&self) -> Codec {
+        Codec::Av1
+    }
+    fn encode(&mut self, input: Input<'_>, pts: i64) -> Result<Output, String> {
+        let Input::Bgra(buf) = input else { return Err("lumepeer-aom takes BGRA".into()) };
+        let frame = Frame::cpu(self.w, self.h, PixelFormat::Bgra8, pts as u64, std::mem::take(buf));
+        let result = self.inner.encode(&frame);
+        *buf = frame.data;
+        let out = result.map_err(|e| e.to_string())?;
+        Ok(one(pts, out.data, out.keyframe))
+    }
+    fn describe(&self) -> String {
+        format!(
+            "lumepeer AomEncoder (libaom {}, product settings; session target {} kbit/s, libaom target {} kbit/s)",
+            lumepeer_media::encode::aom::version(),
+            self.kbps,
+            lumepeer_media::encode::aom::av1_kbps(self.kbps)
+        )
     }
 }
 

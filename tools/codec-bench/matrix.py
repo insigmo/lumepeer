@@ -45,6 +45,12 @@ def configs(machine, threads):
     # natural-content path. 7 is left out: ~100 ms a 1080p frame.
     for preset in (8, 9, 10, 11, 12, 13):
         out.append((f"svt-p{preset}", "asm", ["--encoder", "svt", "--speed", str(preset), "--threads", "0"]))
+    # Stage 2 (ADR 0139): the product's own software AV1 encoder, from its
+    # own binary (`--no-default-features --features lumepeer-aom`). Its
+    # `--kbps` is the session's H.264 figure and libaom gets half of it, so
+    # the command below passes twice the matrix bitrate: lumepeer-aom-<T>
+    # has libaom at T, exactly like aom-s10-<T>, and the two must agree.
+    out.append(("lumepeer-aom", "lumepeer", ["--encoder", "lumepeer-aom"]))
     if machine == "pc":
         out.append(("mf-h264", "asm", ["--encoder", "mf-h264"]))
         out.append(("mf-av1", "asm", ["--encoder", "mf-av1"]))
@@ -62,10 +68,12 @@ def commands(args):
         for kbps in [int(b) for b in args.bitrates.split(",")]:
             ext = "h264" if "h264" in tag else "ivf"
             base = os.path.join(out_dir, f"{tag}-{kbps}")
-            cmd = [args.bin_noasm if binary == "noasm" else args.bin, "encode",
+            exe = {"noasm": args.bin_noasm, "lumepeer": args.bin_lumepeer}.get(binary, args.bin)
+            session_kbps = kbps * 2 if binary == "lumepeer" else kbps
+            cmd = [exe, "encode",
                    "--input", clip, "--width", str(width), "--height", str(height),
                    "--start", str(start), "--frames", str(frames), "--fps", "30",
-                   "--kbps", str(kbps), "--screen", str(screen), "--minq", "0", "--maxq", "63",
+                   "--kbps", str(session_kbps), "--screen", str(screen), "--minq", "0", "--maxq", "63",
                    *enc, "--out", f"{base}.{ext}", "--csv", f"{base}.csv", "--json", f"{base}.json"]
             cmds.append((base, cmd))
     return out_dir, cmds
@@ -79,6 +87,8 @@ def main():
     p.add_argument("--out", default="runs")
     p.add_argument("--bin", default="codec-bench.exe")
     p.add_argument("--bin-noasm", default="codec-bench-noasm.exe")
+    p.add_argument("--bin-lumepeer", default="codec-bench-lumepeer.exe",
+                   help="built with --no-default-features --features lumepeer-aom (ADR 0139)")
     p.add_argument("--threads", type=int, default=8, help="libaom threads")
     p.add_argument("--only", default="", help="comma-separated tag prefixes")
     p.add_argument("--bitrates", default=",".join(map(str, BITRATES)),

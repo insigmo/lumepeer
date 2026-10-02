@@ -1,4 +1,8 @@
 # Build output of the measurement tool (and of its no-asm openh264 variant).
 /target/
 /target-noasm/
+# The stage-1 `aom` shim and the product's `lumepeer-aom` link a libaom each,
+# so they are built apart (ADR 0139).
+/target-aom/
+/target-lumepeer/
 __pycache__/
