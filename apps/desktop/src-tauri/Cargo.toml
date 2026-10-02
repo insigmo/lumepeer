@@ -31,6 +31,9 @@ capture-screencapturekit = ["lumepeer-media/capture-screencapturekit", "lumepeer
 audio-capture-screencapturekit = ["lumepeer-media/audio-capture-screencapturekit", "lumepeer-runtime/audio-capture-screencapturekit"]
 audio-playout-coreaudio = ["lumepeer-media/audio-playout-coreaudio", "lumepeer-runtime/audio-playout-coreaudio"]
 encode-openh264 = ["lumepeer-media/encode-openh264", "lumepeer-runtime/encode-openh264"]
+# Software AV1 for a host with no hardware encoder (ADR 0139). x86-64 Windows
+# and Linux only, where it is inert everywhere else; needs nasm to build.
+encode-aom = ["lumepeer-media/encode-aom", "lumepeer-runtime/encode-aom"]
 encode-mf = ["lumepeer-media/encode-mf", "lumepeer-runtime/encode-mf"]
 # Zero-copy capture-to-encoder frame path on Windows (ADR 0073). A
 # pass-through like the ones above, and deliberately not part of any

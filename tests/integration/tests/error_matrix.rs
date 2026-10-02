@@ -271,16 +271,29 @@ fn row_no_hardware_codec_falls_back_or_explains() {
         Err(other) => panic!("unexpected encoder error: {other}"),
     }
 
-    // AV1 has no software fallback in v1, so it must refuse rather than
-    // silently downgrade the codec (§11).
+    // AV1 must never be silently downgraded to the H.264 fallback (§11). Its
+    // one software encoder is libaom (ADR 0139), and only in a build that
+    // has it, on a processor that can run it; anywhere else it refuses.
     let av1 = EncoderConfig {
         codec: VideoCodec::Av1,
         ..EncoderConfig::default()
     };
-    assert!(matches!(
-        select_encoder(av1),
-        Err(MediaError::EncoderUnavailable(_))
-    ));
+    let software_av1 = lumepeer_media::encode::software_av1::built()
+        && lumepeer_media::encode::software_av1::cpu_supported();
+    match select_encoder(av1) {
+        Ok(encoder) => {
+            assert!(software_av1, "AV1 was served with no encoder for it");
+            assert_eq!(encoder.kind(), EncoderKind::SoftwareAv1);
+        }
+        Err(MediaError::EncoderUnavailable(reason)) => {
+            assert!(
+                !software_av1,
+                "libaom is built in and runs here, yet AV1 was refused"
+            );
+            assert!(!reason.is_empty(), "the refusal must explain itself");
+        }
+        Err(other) => panic!("unexpected encoder error: {other}"),
+    }
 }
 
 /// Row: the decoder sandbox is unavailable.

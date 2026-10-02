@@ -72,6 +72,18 @@ audio-playout-coreaudio = [
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
+# libaom's realtime AV1 encoder in software, for a host with no hardware
+# encoder at all (§11; ADR 0139) — the one exception to "an optional codec
+# needs hardware on both sides". libaom is vendored in `lumepeer-aom-sys` and
+# built from source, statically, with its x86 assembly; the build fails
+# without nasm rather than producing the several-times-slower C-only library
+# `openh264-sys2` silently falls back to. x86-64 Windows and Linux only: the
+# dependency is declared in that target table below, so on every other target
+# this feature is inert, exactly like encode-vaapi off Linux. Needs
+# `encode-openh264` for the BGRA-to-I420 conversion the measurement timed,
+# and for the `openh264` fallback each host measures software AV1 against
+# before it is ever chosen.
+encode-aom = ["encode-openh264", "dep:lumepeer-aom-sys"]
 # VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4; ADR
 # 0031). Same convention as encode-mf: `cargo build --workspace` needs no
 # platform SDK, and `cros-libva` is declared optional in the Linux target
@@ -207,6 +219,11 @@ cros-libva = { version = "0.0.13", optional = true }
 # (encode-vaapi-zero-copy; ADR 0088). Already in the workspace, for the
 # decoder sandbox's seccomp filter.
 libc = { workspace = true, optional = true }
+
+# The vendored libaom behind `encode-aom` (ADR 0139). Only where software AV1
+# was measured — the build of libaom itself refuses every other target.
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))'.dependencies]
+lumepeer-aom-sys = { workspace = true, optional = true }
 
 # ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in
 # (§11, ADR 0013), all optional and pulled in only by

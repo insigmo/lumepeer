@@ -2,9 +2,10 @@
 //! §11, §18).
 //!
 //! H.264 baseline/main is the mandatory desktop baseline, and AV1 is what a
-//! session prefers whenever both sides have hardware for it; there is no
-//! software fallback for AV1 (ADR 0069, ADR 0072). Opus is the only audio
-//! codec.
+//! session prefers whenever both sides have hardware for it (ADR 0069, ADR
+//! 0072). The one exception to "hardware on both sides" is software AV1 on a
+//! host with no hardware encoder at all, under the conditions of ADR 0139
+//! that `choose_media_codec` checks. Opus is the only audio codec.
 
 use lumepeer_core::constants::{ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS};
 
@@ -21,7 +22,8 @@ pub enum VideoCodec {
     /// Mandatory desktop baseline.
     H264,
     /// Preferred over the baseline, but only with mutual hardware support
-    /// (ADR 0069, ADR 0072).
+    /// (ADR 0069, ADR 0072) — or, on a host with no hardware encoder, in
+    /// software under ADR 0139's conditions.
     Av1,
 }
 
@@ -32,6 +34,9 @@ pub enum EncoderKind {
     Hardware,
     /// `openh264` software fallback, allowed only past the resource gate.
     SoftwareOpenH264,
+    /// libaom's realtime AV1 in software, for a host with no hardware
+    /// encoder that passed its own measurement (ADR 0139).
+    SoftwareAv1,
 }
 
 /// Encoder settings; defaults come from §14, not from magic numbers.
@@ -193,10 +198,30 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     let hardware = probe_hardware(config);
 
     if config.codec != VideoCodec::H264 && hardware != Some(EncoderKind::Hardware) {
-        // §11: an optional codec is only ever used with mutual hardware
-        // support, and none of them has a software fallback in v1.
+        // ADR 0139: the one software encoder above the baseline. Whether a
+        // session may have it — a guest that decodes AV1, no hardware
+        // encoder here, the 30 fps preset, a picture of at most 1080p, and a
+        // measurement this host passed — is `choose_media_codec`'s rule, and
+        // it is the only caller that ever asks for AV1. What is checked here
+        // is only what is fixed for the life of the process, so the answer
+        // cannot change between the codec being announced on the wire and
+        // the encoder being built for it.
+        if config.codec == VideoCodec::Av1 && software_av1::built() && software_av1::cpu_supported()
+        {
+            #[cfg(all(
+                feature = "encode-aom",
+                target_arch = "x86_64",
+                any(target_os = "windows", target_os = "linux")
+            ))]
+            {
+                tracing::info!("no hardware AV1 encoder, using libaom in software (ADR 0139)");
+                return aom::AomEncoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>);
+            }
+        }
+        // §11: otherwise an optional codec is only ever used with mutual
+        // hardware support.
         return Err(MediaError::EncoderUnavailable(format!(
-            "{:?} needs hardware support on both sides and has no software fallback",
+            "{:?} needs hardware support on both sides, and this host has no software encoder for it",
             config.codec
         )));
     }
@@ -336,6 +361,26 @@ pub mod linux_vaapi;
 )]
 pub mod windows;
 
+/// Whether this host may encode AV1 in software, and the one measurement
+/// per process that decides it (§11; ADR 0139).
+pub mod software_av1;
+
+/// libaom's realtime AV1 encoder, in software (§11; ADR 0139).
+///
+/// The third module of the encoder that needs `unsafe`: every libaom call
+/// crosses into C through `lumepeer-aom-sys`'s shim. Each `unsafe` block
+/// carries a `SAFETY:` note, as §21 requires.
+#[cfg(all(
+    feature = "encode-aom",
+    target_arch = "x86_64",
+    any(target_os = "windows", target_os = "linux")
+))]
+#[allow(
+    unsafe_code,
+    reason = "libaom is C; every call through lumepeer-aom-sys is `unsafe`. See ADR 0139."
+)]
+pub mod aom;
+
 /// `openh264` software fallback (§5.1, §18).
 ///
 /// Kept as an inline module so the file list of §6 stays exact.
@@ -415,54 +460,61 @@ pub mod software {
             Encoder::with_api_config(openh264::OpenH264API::from_source(), h264)
                 .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))
         }
+    }
 
-        /// Crops to even dimensions: 4:2:0 subsampling has no odd rows or
-        /// columns, and the conversion asserts on them.
-        ///
-        /// Borrows when the picture is already even, which every real screen
-        /// mode is: the copy this used to make unconditionally was a full
-        /// frame — 8 MiB at 1080p — on the encoder's own hot path, spent to
-        /// produce a byte-for-byte duplicate (ADR 0027).
-        fn even_bgra(frame: &Frame) -> Result<(std::borrow::Cow<'_, [u8]>, usize, usize)> {
-            if frame.format != PixelFormat::Bgra8 {
-                return Err(MediaError::Encode(format!(
-                    "openh264 fallback expects BGRA8 input, got {:?}",
-                    frame.format
-                )));
-            }
-            let width = (frame.width as usize) & !1;
-            let height = (frame.height as usize) & !1;
-            if width == 0 || height == 0 {
-                return Err(MediaError::Encode("frame is smaller than 2x2".to_owned()));
-            }
-
-            // Through `as_cpu`, never `data`: a zero-copy capture frame
-            // (ADR 0073) has its pixels only on the GPU.
-            let pixels = frame.as_cpu()?;
-            let src_stride = frame.width as usize * 4;
-            let dst_stride = width * 4;
-            if pixels.len() < src_stride * height {
-                return Err(MediaError::Encode("frame buffer is short".to_owned()));
-            }
-            if src_stride == dst_stride {
-                return Ok((
-                    std::borrow::Cow::Borrowed(&pixels[..dst_stride * height]),
-                    width,
-                    height,
-                ));
-            }
-            let mut cropped = Vec::with_capacity(dst_stride * height);
-            for row in 0..height {
-                let start = row * src_stride;
-                cropped.extend_from_slice(&pixels[start..start + dst_stride]);
-            }
-            Ok((std::borrow::Cow::Owned(cropped), width, height))
+    /// Crops to even dimensions: 4:2:0 subsampling has no odd rows or
+    /// columns, and the conversion asserts on them. `encoder` names the
+    /// caller in the error.
+    ///
+    /// Borrows when the picture is already even, which every real screen
+    /// mode is: the copy this used to make unconditionally was a full
+    /// frame — 8 MiB at 1080p — on the encoder's own hot path, spent to
+    /// produce a byte-for-byte duplicate (ADR 0027).
+    ///
+    /// Shared with the software AV1 encoder (ADR 0139), which takes the same
+    /// BGRA through the same conversion.
+    pub(super) fn even_bgra<'a>(
+        frame: &'a Frame,
+        encoder: &str,
+    ) -> Result<(std::borrow::Cow<'a, [u8]>, usize, usize)> {
+        if frame.format != PixelFormat::Bgra8 {
+            return Err(MediaError::Encode(format!(
+                "{encoder} expects BGRA8 input, got {:?}",
+                frame.format
+            )));
         }
+        let width = (frame.width as usize) & !1;
+        let height = (frame.height as usize) & !1;
+        if width == 0 || height == 0 {
+            return Err(MediaError::Encode("frame is smaller than 2x2".to_owned()));
+        }
+
+        // Through `as_cpu`, never `data`: a zero-copy capture frame
+        // (ADR 0073) has its pixels only on the GPU.
+        let pixels = frame.as_cpu()?;
+        let src_stride = frame.width as usize * 4;
+        let dst_stride = width * 4;
+        if pixels.len() < src_stride * height {
+            return Err(MediaError::Encode("frame buffer is short".to_owned()));
+        }
+        if src_stride == dst_stride {
+            return Ok((
+                std::borrow::Cow::Borrowed(&pixels[..dst_stride * height]),
+                width,
+                height,
+            ));
+        }
+        let mut cropped = Vec::with_capacity(dst_stride * height);
+        for row in 0..height {
+            let start = row * src_stride;
+            cropped.extend_from_slice(&pixels[start..start + dst_stride]);
+        }
+        Ok((std::borrow::Cow::Owned(cropped), width, height))
     }
 
     impl VideoEncoder for OpenH264Encoder {
         fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-            let (bgra, width, height) = Self::even_bgra(frame)?;
+            let (bgra, width, height) = even_bgra(frame, "openh264 fallback")?;
             let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
             let bitstream = self
                 .inner
@@ -597,28 +649,65 @@ mod tests {
         assert_eq!(config.codec, VideoCodec::H264);
     }
 
-    /// §11's mutual-hardware-support rule, checked mechanically rather than by
-    /// inspection so it runs the same on a machine with an AV1 encoder and on
-    /// one without: AV1 is either refused outright or served by genuine
-    /// hardware, and never by the software fallback (ADR 0069).
+    /// §11's mutual-hardware-support rule and its one exception, checked
+    /// mechanically rather than by inspection so it runs the same on every
+    /// machine: AV1 is served by genuine hardware when the probe says there
+    /// is some; otherwise by libaom exactly when this build has it and this
+    /// processor can run it (ADR 0139); otherwise refused — and never by the
+    /// `openh264` fallback (ADR 0069).
     #[test]
-    fn av1_is_served_by_hardware_or_refused_and_never_by_software() {
+    fn av1_is_served_by_hardware_then_by_libaom_and_never_by_openh264() {
         let config = EncoderConfig {
             codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         };
+        let hardware = probe_hardware(config) == Some(EncoderKind::Hardware);
+        let software = software_av1::built() && software_av1::cpu_supported();
         match select_encoder(config) {
-            Ok(encoder) => assert_eq!(
-                encoder.kind(),
-                EncoderKind::Hardware,
-                "AV1 has no software encoder in v1"
-            ),
-            Err(MediaError::EncoderUnavailable(_)) => assert_ne!(
-                probe_hardware(config),
-                Some(EncoderKind::Hardware),
-                "AV1 was refused even though the probe reported hardware"
-            ),
+            Ok(encoder) if hardware => assert_eq!(encoder.kind(), EncoderKind::Hardware),
+            Ok(encoder) => {
+                assert!(software, "AV1 was served with no hardware and no libaom");
+                assert_eq!(encoder.kind(), EncoderKind::SoftwareAv1);
+            }
+            Err(MediaError::EncoderUnavailable(_)) => {
+                assert!(
+                    !hardware,
+                    "AV1 was refused even though the probe reported hardware"
+                );
+                assert!(
+                    !software,
+                    "AV1 was refused even though libaom is built in and runs here"
+                );
+            }
             Err(other) => panic!("unexpected error selecting an AV1 encoder: {other}"),
         }
+    }
+
+    /// The software AV1 branch builds an encoder that actually produces a
+    /// picture, not one that only constructs (ADR 0139).
+    #[test]
+    fn a_software_av1_encoder_from_select_encoder_encodes() {
+        let config = EncoderConfig {
+            codec: VideoCodec::Av1,
+            ..EncoderConfig::default()
+        };
+        let Ok(mut encoder) = select_encoder(config) else {
+            return;
+        };
+        if encoder.kind() != EncoderKind::SoftwareAv1 {
+            return;
+        }
+        let frame = Frame::cpu(
+            128,
+            72,
+            crate::capture::PixelFormat::Bgra8,
+            0,
+            vec![0x80; 128 * 72 * 4],
+        );
+        let first = match encoder.encode(&frame) {
+            Ok(first) => first,
+            Err(error) => panic!("libaom refused a frame: {error}"),
+        };
+        assert!(first.keyframe && !first.data.is_empty());
     }
 }

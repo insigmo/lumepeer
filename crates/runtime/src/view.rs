@@ -32,6 +32,8 @@ use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
     ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
     MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
+    SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS, SOFTWARE_AV1_SLOW_WINDOWS,
+    SOFTWARE_AV1_WATCH_FRAMES,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
 use lumepeer_media::abr::{
@@ -41,6 +43,7 @@ use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelForm
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{
     EncodedFrame, EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, select_encoder,
+    software_av1,
 };
 use lumepeer_media::error::MediaError;
 use lumepeer_media::playout::AudioPlayer;
@@ -141,6 +144,11 @@ pub struct EncodeControl {
     /// first stream it accepts as the picture, and the picture's stream
     /// carries no tag that would let it tell otherwise.
     video_stream_open: Arc<watch::Sender<bool>>,
+    /// The size of the last picture the loop captured, before any reduction
+    /// (ADR 0139). Written by the loop, read by the actor when it chooses
+    /// this peer's codec again: software AV1 is chosen only for a picture of
+    /// at most 1080p, and this is how the actor learns what the screen is.
+    captured_size: Arc<Mutex<Option<(u32, u32)>>>,
 }
 
 impl EncodeControl {
@@ -166,7 +174,26 @@ impl EncodeControl {
             secure_desktop_active: Arc::new(AtomicBool::new(false)),
             secure_desktop_blocked: Arc::new(AtomicBool::new(false)),
             video_stream_open: Arc::new(watch::channel(false).0),
+            captured_size: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// The size of the last picture this session's loop captured, if it has
+    /// captured one (ADR 0139).
+    #[must_use]
+    pub fn captured_size(&self) -> Option<(u32, u32)> {
+        *self
+            .captured_size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records the size of a picture the loop just captured.
+    fn note_captured(&self, size: (u32, u32)) {
+        *self
+            .captured_size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size);
     }
 
     /// Resolves once the picture's stream is open on the media connection
@@ -565,6 +592,12 @@ pub struct HostMedia {
     /// from the same session as the pixels. `None` everywhere else, which
     /// leaves the actor building one lazily on the first input event (§18).
     pub injector: Option<Box<dyn InputInjector>>,
+    /// Where this host stands on encoding AV1 in software (ADR 0139):
+    /// [`software_av1::readiness`] — the build, the processor, the hardware
+    /// probe and this host's own measurement — on every real host. A seam so
+    /// a test can run the software AV1 path without depending on how fast an
+    /// unoptimised test build happens to measure.
+    pub software_av1: fn() -> software_av1::Readiness,
 }
 
 /// What an encode loop reports back when it cannot produce a picture at all.
@@ -1366,6 +1399,18 @@ fn spawn_encode_loop_with(
                 return;
             }
         };
+        // Software AV1 is chosen for the 30 fps preset and runs at it,
+        // whatever the display could do (ADR 0139); the encoder has already
+        // held its own budget there. Everything paced off `max_fps` below —
+        // the ladder, a preset's rate — inherits the same ceiling.
+        let software_av1 = encoder.kind() == EncoderKind::SoftwareAv1;
+        let max_fps = if software_av1 {
+            max_fps.min(SOFTWARE_AV1_MAX_FPS)
+        } else {
+            max_fps
+        };
+        // Whether this host keeps up with it, window by window (ADR 0139).
+        let mut software_av1_watch = SoftwareAv1Watch::default();
         // The frame rate the encoder was built for, which a preset can move
         // (ADR 0136).
         let mut encoder_fps = max_fps;
@@ -1617,6 +1662,22 @@ fn spawn_encode_loop_with(
                 cursor.changed(shape);
             }
             let captured_size = (frame.width, frame.height);
+            control.note_captured(captured_size);
+            // Software AV1 is chosen for a picture of at most 1080p (ADR
+            // 0139). A screen that is larger — a first session the actor
+            // could not size yet, or a display mode switched mid-session —
+            // ends this loop rather than encoding something nobody measured:
+            // the guest redials, and the actor, which now knows the size
+            // from `note_captured`, gives it H.264.
+            if software_av1 && picture_pixels(captured_size) > SOFTWARE_AV1_MAX_PIXELS {
+                tracing::info!(
+                    peer = %tag,
+                    width = captured_size.0,
+                    height = captured_size.1,
+                    "the screen is larger than software AV1 is chosen for; ending this stream so the guest redials into H.264"
+                );
+                return;
+            }
 
             // A guest that just started decoding, or that lost more than it
             // could conceal, has nothing to decode against until an intra
@@ -1698,6 +1759,16 @@ fn spawn_encode_loop_with(
                             // second (ADR 0135). A bounded run, then the guest
                             // is told and the loop ends.
                             if refusals.refused() >= ENCODE_REFUSALS_BEFORE_FAULT {
+                                // Software AV1 has H.264 behind it on the
+                                // same host (ADR 0139): give it up for this
+                                // process and let the guest redial into
+                                // that, instead of ending the session.
+                                if software_av1 {
+                                    software_av1::demote(&format!(
+                                        "the encoder refused {ENCODE_REFUSALS_BEFORE_FAULT} frames in a row: {error}"
+                                    ));
+                                    return;
+                                }
                                 tracing::warn!(
                                     peer = %tag,
                                     %error,
@@ -1740,6 +1811,33 @@ fn spawn_encode_loop_with(
                 bitstream.data.len(),
                 bitstream.keyframe,
             );
+            // A host that passed its measurement can still fall behind in
+            // real use — a game where the measurement had text, the person at
+            // the host busy with something heavy. Two windows in a row that
+            // cannot hold the frame rate software AV1 was chosen for, and it
+            // is off for this process; the guest redials into H.264
+            // (ADR 0139).
+            if software_av1 {
+                match software_av1_watch.frame(timing.scale + timing.encode) {
+                    SoftwareAv1Verdict::Pending => {}
+                    SoftwareAv1Verdict::KeepingUp(p95) => tracing::info!(
+                        peer = %tag,
+                        p95_ms = %format_args!("{:.1}", p95.as_secs_f64() * 1_000.0),
+                        frames = SOFTWARE_AV1_WATCH_FRAMES,
+                        "software AV1 frame time (scale and encode, p95)"
+                    ),
+                    SoftwareAv1Verdict::Behind(p95) => {
+                        software_av1::demote(&format!(
+                            "a session's p95 frame time stayed at {:.1} ms, over the {} fps interval, for {} windows of {} frames",
+                            p95.as_secs_f64() * 1_000.0,
+                            SOFTWARE_AV1_MAX_FPS,
+                            SOFTWARE_AV1_SLOW_WINDOWS,
+                            SOFTWARE_AV1_WATCH_FRAMES,
+                        ));
+                        return;
+                    }
+                }
+            }
             sent.wrote(bitstream.data.len());
             backlog.offered();
             // Recording rides the frame the guest is being sent (§17): the
@@ -1838,6 +1936,65 @@ fn spawn_encode_loop_with(
             sleep_for_the_rest_of(interval, tick_started).await;
         }
     })
+}
+
+/// Pixels in a picture of `size`.
+fn picture_pixels((width, height): (u32, u32)) -> usize {
+    usize::try_from(u64::from(width) * u64::from(height)).unwrap_or(usize::MAX)
+}
+
+/// What one more frame tells a live software AV1 session about keeping up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoftwareAv1Verdict {
+    /// The window is not full yet.
+    Pending,
+    /// A window closed within the frame interval; its p95.
+    KeepingUp(Duration),
+    /// The [`SOFTWARE_AV1_SLOW_WINDOWS`]-th window in a row closed over the
+    /// frame interval; the last one's p95.
+    Behind(Duration),
+}
+
+/// A live software AV1 session's check that this host keeps up (ADR 0139):
+/// the p95 of scale-and-encode time over windows of
+/// [`SOFTWARE_AV1_WATCH_FRAMES`] encoded frames, against the frame interval
+/// at [`SOFTWARE_AV1_MAX_FPS`].
+///
+/// The interval, not the 22 ms the measurement held the host to before
+/// choosing it: that threshold was about whether to offer software AV1 at
+/// all. In a session the only question left is whether it can keep the frame
+/// rate — and on the reference host a game took 22–27 ms a frame in software
+/// AV1 against 31–67 ms in `openh264`, which drops 40% of a game's frames
+/// besides, so falling back on anything stricter would hand such a session to
+/// the encoder that does worse.
+#[derive(Debug, Default)]
+struct SoftwareAv1Watch {
+    window: Vec<Duration>,
+    behind: u32,
+}
+
+impl SoftwareAv1Watch {
+    /// Records one frame's time.
+    fn frame(&mut self, took: Duration) -> SoftwareAv1Verdict {
+        self.window.push(took);
+        if self.window.len() < SOFTWARE_AV1_WATCH_FRAMES {
+            return SoftwareAv1Verdict::Pending;
+        }
+        self.window.sort_unstable();
+        let rank = (self.window.len() * 95).div_ceil(100);
+        let p95 = self.window[rank.saturating_sub(1)];
+        self.window.clear();
+        if p95 > frame_interval(SOFTWARE_AV1_MAX_FPS) {
+            self.behind += 1;
+        } else {
+            self.behind = 0;
+        }
+        if self.behind >= SOFTWARE_AV1_SLOW_WINDOWS {
+            SoftwareAv1Verdict::Behind(p95)
+        } else {
+            SoftwareAv1Verdict::KeepingUp(p95)
+        }
+    }
 }
 
 /// How long the blocking half of one encode tick spent where, and on what.
@@ -3221,6 +3378,68 @@ mod tests {
     #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
     use super::*;
+
+    /// ADR 0139: a window that holds the frame rate reports its p95 and
+    /// resets the count; one slow window alone is not enough to give up.
+    #[test]
+    fn one_slow_window_is_not_a_host_that_cannot_keep_up() {
+        let mut watch = SoftwareAv1Watch::default();
+        let fast = Duration::from_millis(15);
+        let slow = Duration::from_millis(40);
+        for _ in 1..SOFTWARE_AV1_WATCH_FRAMES {
+            assert_eq!(watch.frame(slow), SoftwareAv1Verdict::Pending);
+        }
+        assert_eq!(watch.frame(slow), SoftwareAv1Verdict::KeepingUp(slow));
+        for _ in 1..SOFTWARE_AV1_WATCH_FRAMES {
+            watch.frame(fast);
+        }
+        assert_eq!(
+            watch.frame(fast),
+            SoftwareAv1Verdict::KeepingUp(fast),
+            "a good window must reset the count"
+        );
+        for _ in 0..SOFTWARE_AV1_WATCH_FRAMES {
+            assert_ne!(watch.frame(slow), SoftwareAv1Verdict::Behind(slow));
+        }
+    }
+
+    /// ADR 0139: [`SOFTWARE_AV1_SLOW_WINDOWS`] windows in a row over the 30
+    /// fps interval, by p95 — the rare long frame does not count.
+    #[test]
+    fn windows_in_a_row_over_the_interval_mean_the_host_is_behind() {
+        let mut watch = SoftwareAv1Watch::default();
+        let slow = Duration::from_millis(34);
+        let mut verdict = SoftwareAv1Verdict::Pending;
+        for _ in 0..SOFTWARE_AV1_WATCH_FRAMES * SOFTWARE_AV1_SLOW_WINDOWS as usize {
+            verdict = watch.frame(slow);
+        }
+        assert_eq!(verdict, SoftwareAv1Verdict::Behind(slow));
+
+        // Four frames in a hundred at a second each are under the p95.
+        let mut watch = SoftwareAv1Watch::default();
+        let mut verdict = SoftwareAv1Verdict::Pending;
+        for window in 0..SOFTWARE_AV1_SLOW_WINDOWS as usize * 2 {
+            for frame in 0..SOFTWARE_AV1_WATCH_FRAMES {
+                let took = if frame % 25 == 0 {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::from_millis(20)
+                };
+                verdict = watch.frame(took);
+            }
+            assert_eq!(
+                verdict,
+                SoftwareAv1Verdict::KeepingUp(Duration::from_millis(20)),
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn picture_pixels_does_not_overflow() {
+        assert_eq!(picture_pixels((1920, 1080)), SOFTWARE_AV1_MAX_PIXELS);
+        assert!(picture_pixels((u32::MAX, u32::MAX)) > SOFTWARE_AV1_MAX_PIXELS);
+    }
 
     /// ADR 0136: the encode loop's pacing reaches the rate it is asked for.
     ///
