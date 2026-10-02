@@ -15,10 +15,16 @@ vars:
   # 0010, ADR 0039). Dropping either one leaves half the Linux desktops with
   # no picture.
   LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
+  # x86-64 adds libaom's software AV1 for a host with no hardware encoder
+  # (ADR 0139), exactly as release.yml's amd64 rows do. Building it needs nasm
+  # on PATH (or NASM pointing at it); without one the build stops and says so.
+  LINUX_AMD64_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom
   # Both encoders: Media Foundation needs hardware support the host may not
   # have, and without the openh264 software fallback such a host reports
   # "no usable encoder" and the guest never gets a picture.
   WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
+  # See LINUX_AMD64_MEDIA_FEATURES.
+  WINDOWS_AMD64_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264,encode-aom
   # Both encoders, for the same reason Windows carries both: VideoToolbox
   # (ADR 0066) is what an Apple host should encode with, but its probe opens
   # a real session and pushes a frame through it before it says so, and a Mac
@@ -192,7 +198,7 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-unknown-linux-gnu
-      - npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm --features {{.LINUX_MEDIA_FEATURES}}
+      - npx tauri build --target x86_64-unknown-linux-gnu --bundles deb,rpm --features {{.LINUX_AMD64_MEDIA_FEATURES}}
 
   build:client:linux-arm64:
     desc: >-
@@ -235,7 +241,7 @@ tasks:
     dir: "{{.DESKTOP_DIR}}"
     cmds:
       - rustup target add x86_64-pc-windows-msvc
-      - npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --features {{.WINDOWS_MEDIA_FEATURES}}
+      - npx tauri build --target x86_64-pc-windows-msvc --bundles nsis --features {{.WINDOWS_AMD64_MEDIA_FEATURES}}
 
   build:client:windows-arm64:
     desc: >-

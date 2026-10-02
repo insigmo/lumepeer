@@ -58,7 +58,29 @@ jobs:
       - run: cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D warnings
       - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
       - name: Clippy the whole shipped Linux feature set
-        run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,audio-opus,audio-capture-pipewire -- -D warnings
+        run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom,audio-opus,audio-capture-pipewire -- -D warnings
+      # Software AV1 (ADR 0139): the vendored libaom builds from source with
+      # its assembly, encodes, and a host and a guest negotiate it, follow the
+      # preset off it and back. Then the two things a release must never do
+      # quietly: build without nasm, or link without the assembly.
+      - name: Clippy and test software AV1
+        run: |
+          cargo clippy -p lumepeer-aom-sys --all-targets -- -D warnings
+          cargo clippy -p lumepeer-runtime --all-targets --features encode-aom -- -D warnings
+          cargo test -p lumepeer-media --features encode-aom --lib encode::
+          cargo test -p lumepeer-runtime --features encode-aom --lib software_av1
+      - name: A build without nasm fails rather than losing libaom's assembly
+        run: |
+          if NASM=/nonexistent/nasm CARGO_TARGET_DIR=target/no-nasm cargo build -p lumepeer-aom-sys 2> no-nasm.log; then
+            echo "::error::lumepeer-aom-sys built without nasm"
+            exit 1
+          fi
+          grep -q "nasm not found" no-nasm.log
+      - name: The test binary carries libaom's assembly
+        run: |
+          BIN="$(cargo test -p lumepeer-runtime --features encode-aom --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)"
+          python3 ci/find-libaom-asm.py "target/debug/build/lumepeer-aom-sys-*/out/build" "${BIN}"
       - name: Clippy and test the VA-API encoder
         run: |
           cargo clippy -p lumepeer-media --all-targets --features encode-vaapi -- -D warnings

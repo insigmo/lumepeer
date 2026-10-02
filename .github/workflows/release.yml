@@ -173,12 +173,22 @@ jobs:
       # encoding a frame through it, so a Mac where that fails declines
       # honestly — and then has to land on `encode-openh264` rather than on
       # nothing.
+      #
+      # The two x86-64 rows on Windows and Linux also carry `encode-aom`:
+      # libaom's realtime AV1, in software, for a host with no hardware
+      # encoder at all (ADR 0139). Only there — those are the machines it was
+      # measured on, and the feature is inert on every other target anyway.
+      # `aom: true` is what installs nasm for it and, after the build, checks
+      # that libaom's assembly actually reached the binary: a libaom without
+      # its SIMD is several times slower, which is exactly what the openh264
+      # fallback turned out to ship as whenever its build found no nasm.
       matrix:
         include:
           - name: linux-amd64 (deb/rpm)
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
+            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom
+            aom: true
           - name: linux-arm64 (deb/rpm)
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -186,7 +196,8 @@ jobs:
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
+            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264,encode-aom
+            aom: true
           - name: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
@@ -213,7 +224,20 @@ jobs:
           # with bindgen, so both the library and libclang have to be here or
           # the Linux rows of this matrix fail to build (ADR 0039). libva-dev
           # is for encode-vaapi-zero-copy: `cros-libva` links libva and libva-drm.
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev libva-dev
+          # nasm assembles libaom's x86 kernels (encode-aom; ADR 0139), whose
+          # build fails without it — and openh264's, which until now built
+          # without them on Linux, silently.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev libva-dev nasm
+      # The Windows image has no nasm. libaom's build refuses to go on
+      # without one (ADR 0139), and openh264's quietly loses its assembly.
+      - name: Install nasm
+        if: matrix.aom && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -384,6 +408,23 @@ jobs:
               sleep "${DELAY}"
             done
           done
+      # ADR 0139: the build already refuses to go on without nasm, and
+      # checks libaom configured its x86 kernels. This is the other end: the
+      # machine code nasm assembled is in the executable that ships. Run
+      # whether or not the upload above needed its retry; it reads only what
+      # the build left on disk.
+      - name: Check the binary carries libaom's assembly
+        if: matrix.aom && !cancelled()
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          PYTHON="$(command -v python3 || command -v python)"
+          "${PYTHON}" ci/find-libaom-asm.py \
+            "target/${{ matrix.target }}/release/build/lumepeer-aom-sys-*/out/build" \
+            "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
       # The build signs silently or not at all, so the row says which it was:
       # a bundle whose requirement names no certificate would lose every
       # grant again on the next update (ADR 0128).

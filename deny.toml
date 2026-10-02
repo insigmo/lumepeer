@@ -37,7 +37,18 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "MIT-0",
+    # The two vendored video encoders' code: Cisco's openh264 (through the
+    # `openh264`/`openh264-sys2` crates) and libaom (vendored in
+    # `crates/aom-sys`, ADR 0139).
     "BSD-2-Clause",
+    # libaom's patent grant (`crates/aom-sys/libaom/PATENTS`): royalty-free,
+    # for any implementation of AV1, terminated only for a licensee who sues
+    # over AV1 patents. It is what makes AV1 free to ship in an installer,
+    # where H.265 is not (ADR 0072). `lumepeer-aom-sys` declares it in its
+    # `license` field next to BSD-2-Clause so the SBOM names both; as a
+    # private workspace crate it is not checked against this list, but the
+    # terms the project ships under are recorded here all the same.
+    "LicenseRef-AOMedia-Patent-License-1.0",
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
