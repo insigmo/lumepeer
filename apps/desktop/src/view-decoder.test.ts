@@ -217,8 +217,18 @@ describe('configStringFor', () => {
     // Main 8-bit, the other two because nothing encodes them yet (batches
     // 08/09). The frame's own bytes are irrelevant to the answer.
     const frame = keyframe([0xff]);
-    expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.05M.08');
+    expect(configStringFor(WireCodec.Av1, frame)).toBe('av01.0.09M.08');
     expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
+  });
+
+  it('names AV1 level 4.1, the level its comment promises (ADR 0139)', () => {
+    // `av01.P.LLT.DD`: LL is seq_level_idx, and level X.Y is
+    // idx = (X - 2) * 4 + Y. The string used to say 05 — level 3.1, which
+    // covers 1280x720 and nothing larger — under a comment that said 4.1.
+    const level = configStringFor(WireCodec.Av1, keyframe([0xff]))?.split('.')[2];
+    expect(level).toBe('09M');
+    const index = Number.parseInt(level?.slice(0, 2) ?? '', 10);
+    expect(`${2 + (index >> 2)}.${index & 3}`).toBe('4.1');
   });
 
   it('never walks an AV1 temporal unit as if it were Annex-B (ADR 0069)', () => {
@@ -227,13 +237,13 @@ describe('configStringFor', () => {
     // path that fell back to avcCodecString would answer null and the window
     // would sit waiting for a keyframe that already arrived.
     const temporalUnit = keyframe([0x12, 0x00, 0x0a, 0x01, 0x00]);
-    expect(configStringFor(WireCodec.Av1, temporalUnit)).toBe('av01.0.05M.08');
+    expect(configStringFor(WireCodec.Av1, temporalUnit)).toBe('av01.0.09M.08');
     expect(avcCodecString(temporalUnit.data)).toBeNull();
 
     // And the reverse: a buffer that does contain a start code must not make
     // the AV1 answer any different, because the answer never looks.
     const looksLikeAnnexB = keyframe([0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0x00]);
-    expect(configStringFor(WireCodec.Av1, looksLikeAnnexB)).toBe('av01.0.05M.08');
+    expect(configStringFor(WireCodec.Av1, looksLikeAnnexB)).toBe('av01.0.09M.08');
   });
 
   it('answers nothing for a codec byte it has no config for, rather than guessing', () => {
@@ -262,7 +272,7 @@ describe('supportedOptionalCodecs', () => {
         // Only the AV1 config this module uses is "supported" here, so a
         // table that assumed every codec is available would be caught by
         // the exact set asserted on.
-        return Promise.resolve({ supported: config.codec === 'av01.0.05M.08' });
+        return Promise.resolve({ supported: config.codec === 'av01.0.09M.08' });
       }
       constructor(init: { output: (frame: { close(): void }) => void; error: (e: Error) => void }) {
         this.#init = init;
@@ -302,7 +312,7 @@ describe('supportedOptionalCodecs', () => {
     const { asked, restore } = fakeDecoder(true);
     try {
       await expect(supportedOptionalCodecs()).resolves.toEqual([WireCodec.Av1]);
-      expect(asked).toEqual(['av01.0.05M.08', 'vp09.00.10.08']);
+      expect(asked).toEqual(['av01.0.09M.08', 'vp09.00.10.08']);
     } finally {
       restore();
     }
@@ -374,7 +384,7 @@ describe('NativeDecoder configuration', () => {
       // A temporal delimiter OBU followed by a sequence header OBU.
       decoder.push([keyframe([0x12, 0x00, 0x0a, 0x01, 0x00])], WireCodec.Av1);
       expect(configs).toHaveLength(1);
-      expect(configs[0]?.codec).toBe('av01.0.05M.08');
+      expect(configs[0]?.codec).toBe('av01.0.09M.08');
       expect(configs[0]).not.toHaveProperty('description');
     } finally {
       restore();
@@ -387,7 +397,7 @@ describe('NativeDecoder configuration', () => {
       const decoder = new NativeDecoder(document.createElement('canvas'), () => {});
       decoder.push([keyframe([0x12, 0x00, 0x0a, 0x01, 0x00])], WireCodec.Av1);
       decoder.push([keyframe([0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28, 0x00])], WireCodec.H264);
-      expect(configs.map((config) => config.codec)).toEqual(['av01.0.05M.08', 'avc1.640028']);
+      expect(configs.map((config) => config.codec)).toEqual(['av01.0.09M.08', 'avc1.640028']);
     } finally {
       restore();
     }

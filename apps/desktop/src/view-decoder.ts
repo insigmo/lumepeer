@@ -261,8 +261,9 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
  * of the stream itself. For AV1 that is now a decision rather than a gap: an
  * AV1 temporal unit is a sequence of OBUs, not Annex-B NAL units, so its
  * profile and level sit inside a sequence header OBU behind variable-length
- * bit fields — and the host's Media Foundation encoder produces Main profile
- * 8-bit and nothing else, which is the whole of what this string has to say.
+ * bit fields — and both of the host's AV1 encoders, Media Foundation's and
+ * libaom in software (ADR 0139), produce Main profile 8-bit and nothing else,
+ * which is the whole of what this string has to say.
  * VP9 still has no encoder anywhere in this workspace to read a stream from
  * (batch 09).
  *
@@ -272,10 +273,11 @@ export async function nativeDecodingAvailable(): Promise<boolean> {
  * ceiling the decoder is asked to clear, not a description of any particular
  * stream, so naming one level above what a default session needs costs
  * nothing — and a machine that cannot clear it says so, and the session stays
- * on H.264.
+ * on H.264. (`09` is that level's `seq_level_idx`; the string said `05` —
+ * level 3.1 — until ADR 0139, under this same comment.)
  */
 const OPTIONAL_CODEC_CONFIGS: Readonly<Record<WireCodec.Av1 | WireCodec.Vp9, string>> = {
-  [WireCodec.Av1]: 'av01.0.05M.08',
+  [WireCodec.Av1]: 'av01.0.09M.08',
   [WireCodec.Vp9]: 'vp09.00.10.08',
 };
 
