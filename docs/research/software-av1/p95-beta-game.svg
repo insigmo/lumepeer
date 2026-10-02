@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="740" height="358" viewBox="0 0 740 358" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<rect width="100%" height="100%" fill="#fcfcfb"/>
+<text x="16" y="24" font-size="14" font-weight="600" fill="#0b0b0b">beta, game 1080p30, 4 Mbit/s target: frame time p95</text>
+<text x="142" y="57" font-size="11" fill="#52514e" text-anchor="end">openh264</text>
+<path d="M150,44 H446.9 Q450.9,44 450.9,48 V58 Q450.9,62 446.9,62 H150 Z" fill="#2a78d6"><title>openh264: 40.5 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="456.9" y="57" font-size="11" fill="#52514e">40.5</text>
+<text x="142" y="81" font-size="11" fill="#52514e" text-anchor="end">aom-s7</text>
+<path d="M150,68 H398.5 Q402.5,68 402.5,72 V82 Q402.5,86 398.5,86 H150 Z" fill="#eb6834"><title>aom-s7: 34.0 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="408.5" y="81" font-size="11" fill="#52514e">34.0</text>
+<text x="142" y="105" font-size="11" fill="#52514e" text-anchor="end">aom-s8</text>
+<path d="M150,92 H348.8 Q352.8,92 352.8,96 V106 Q352.8,110 348.8,110 H150 Z" fill="#eb6834"><title>aom-s8: 27.3 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="358.8" y="105" font-size="11" fill="#52514e">27.3</text>
+<text x="142" y="129" font-size="11" fill="#52514e" text-anchor="end">aom-s9</text>
+<path d="M150,116 H328.6 Q332.6,116 332.6,120 V130 Q332.6,134 328.6,134 H150 Z" fill="#eb6834"><title>aom-s9: 24.6 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="338.6" y="129" font-size="11" fill="#52514e">24.6</text>
+<text x="142" y="153" font-size="11" fill="#52514e" text-anchor="end">aom-s10</text>
+<path d="M150,140 H318.5 Q322.5,140 322.5,144 V154 Q322.5,158 318.5,158 H150 Z" fill="#eb6834"><title>aom-s10: 23.2 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="328.5" y="153" font-size="11" fill="#52514e">23.2</text>
+<text x="142" y="177" font-size="11" fill="#52514e" text-anchor="end">svt-p8</text>
+<path d="M150,164 H469.4 Q473.4,164 473.4,168 V178 Q473.4,182 469.4,182 H150 Z" fill="#1baf7a"><title>svt-p8: 43.5 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="479.4" y="177" font-size="11" fill="#52514e">43.5</text>
+<text x="142" y="201" font-size="11" fill="#52514e" text-anchor="end">svt-p9</text>
+<path d="M150,188 H402.4 Q406.4,188 406.4,192 V202 Q406.4,206 402.4,206 H150 Z" fill="#1baf7a"><title>svt-p9: 34.5 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="412.4" y="201" font-size="11" fill="#52514e">34.5</text>
+<text x="142" y="225" font-size="11" fill="#52514e" text-anchor="end">svt-p10</text>
+<path d="M150,212 H395.7 Q399.7,212 399.7,216 V226 Q399.7,230 395.7,230 H150 Z" fill="#1baf7a"><title>svt-p10: 33.6 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="405.7" y="225" font-size="11" fill="#52514e">33.6</text>
+<text x="142" y="249" font-size="11" fill="#52514e" text-anchor="end">svt-p11</text>
+<path d="M150,236 H326.8 Q330.8,236 330.8,240 V250 Q330.8,254 326.8,254 H150 Z" fill="#1baf7a"><title>svt-p11: 24.3 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="336.8" y="249" font-size="11" fill="#52514e">24.3</text>
+<text x="142" y="273" font-size="11" fill="#52514e" text-anchor="end">svt-p12</text>
+<path d="M150,260 H318.8 Q322.8,260 322.8,264 V274 Q322.8,278 318.8,278 H150 Z" fill="#1baf7a"><title>svt-p12: 23.3 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="328.8" y="273" font-size="11" fill="#52514e">23.3</text>
+<text x="142" y="297" font-size="11" fill="#52514e" text-anchor="end">svt-p13</text>
+<path d="M150,284 H318.7 Q322.7,284 322.7,288 V298 Q322.7,302 318.7,302 H150 Z" fill="#1baf7a"><title>svt-p13: 23.2 ms per frame (BGRA->I420 + encode), p95</title></path>
+<text x="328.7" y="297" font-size="11" fill="#52514e">23.2</text>
+<line x1="274.1" x2="274.1" y1="38" y2="308" stroke="#52514e" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="278.1" y="36" font-size="10" fill="#52514e">16.7 ms</text>
+<line x1="397.4" x2="397.4" y1="38" y2="308" stroke="#52514e" stroke-width="1" stroke-dasharray="4 3"/>
+<text x="401.4" y="36" font-size="10" fill="#52514e">33.3 ms = 30 fps</text>
+<line x1="150" x2="150" y1="40" y2="308" stroke="#c3c2b7"/>
+<text x="410.0" y="328" font-size="11" fill="#52514e" text-anchor="middle">ms per frame (BGRA-&gt;I420 + encode), p95</text>
+<rect x="150" y="339" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="164" y="348" font-size="11" fill="#52514e">openh264 (lumepeer)</text>
+<rect x="297.5" y="339" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="311.5" y="348" font-size="11" fill="#52514e">libaom</text>
+<rect x="360.5" y="339" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="374.5" y="348" font-size="11" fill="#52514e">SVT-AV1</text>
+</svg>
