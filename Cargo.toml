@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/net",
     "crates/media",
+    "crates/aom-sys",
     "crates/runtime",
     "crates/host",
     "crates/decoder-worker",
@@ -29,6 +30,7 @@ repository = "https://github.com/insigmo/lumepeer"
 lumepeer-core = { path = "crates/core" }
 lumepeer-net = { path = "crates/net" }
 lumepeer-media = { path = "crates/media" }
+lumepeer-aom-sys = { path = "crates/aom-sys" }
 lumepeer-runtime = { path = "crates/runtime" }
 lumepeer-host = { path = "crates/host" }
 lumepeer-service = { path = "crates/service" }

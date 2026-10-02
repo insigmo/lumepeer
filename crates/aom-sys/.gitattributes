@@ -1,0 +1,3 @@
+# libaom is vendored byte for byte (ADR 0139): a checkout must not rewrite
+# its line endings, or the tree no longer matches the release it came from.
+libaom/** -text

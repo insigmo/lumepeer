@@ -1,0 +1,25 @@
+[package]
+name = "lumepeer-aom-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "libaom's realtime AV1 encoder, built from the vendored source with its x86 assembly and linked statically, behind a small C shim (ADR 0139)"
+# libaom's own terms: BSD 2-Clause for the code, and the AOMedia Patent
+# License 1.0 for the patents (`libaom/LICENSE`, `libaom/PATENTS`). Recorded
+# here so the SBOM names them; `deny.toml` carries the same two.
+license = "BSD-2-Clause AND LicenseRef-AOMedia-Patent-License-1.0"
+# There is exactly one libaom in a binary; a second crate linking its own copy
+# would collide on every `aom_*` symbol.
+links = "aom"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+# Both are already in the lock file: `cmake` for audiopus_sys's vendored
+# libopus, `cc` for openh264-sys2.
+cmake = "0.1.58"
+cc = "1.4"
