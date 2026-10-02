@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1036" height="440" viewBox="0 0 1036 440" font-family="system-ui, -apple-system, Segoe UI, sans-serif">
+<rect width="100%" height="100%" fill="#fcfcfb"/>
+<text x="52" y="28" font-size="14" font-weight="600" fill="#0b0b0b">desktop clip, 1080p30</text>
+<line x1="52" x2="512" y1="366.0" y2="366.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="370.0" font-size="11" fill="#898781" text-anchor="end">40</text>
+<line x1="52" x2="512" y1="312.7" y2="312.7" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="316.7" font-size="11" fill="#898781" text-anchor="end">50</text>
+<line x1="52" x2="512" y1="259.3" y2="259.3" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="263.3" font-size="11" fill="#898781" text-anchor="end">60</text>
+<line x1="52" x2="512" y1="206.0" y2="206.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="210.0" font-size="11" fill="#898781" text-anchor="end">70</text>
+<line x1="52" x2="512" y1="152.7" y2="152.7" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="156.7" font-size="11" fill="#898781" text-anchor="end">80</text>
+<line x1="52" x2="512" y1="99.3" y2="99.3" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="103.3" font-size="11" fill="#898781" text-anchor="end">90</text>
+<line x1="52" x2="512" y1="46.0" y2="46.0" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="50.0" font-size="11" fill="#898781" text-anchor="end">100</text>
+<line x1="122.8" x2="122.8" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="122.8" y="384" font-size="11" fill="#898781" text-anchor="middle">500 k</text>
+<line x1="196.6" x2="196.6" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="196.6" y="384" font-size="11" fill="#898781" text-anchor="middle">1 M</text>
+<line x1="270.4" x2="270.4" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="270.4" y="384" font-size="11" fill="#898781" text-anchor="middle">2 M</text>
+<line x1="344.2" x2="344.2" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="344.2" y="384" font-size="11" fill="#898781" text-anchor="middle">4 M</text>
+<line x1="418.0" x2="418.0" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="418.0" y="384" font-size="11" fill="#898781" text-anchor="middle">8 M</text>
+<line x1="491.9" x2="491.9" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="491.9" y="384" font-size="11" fill="#898781" text-anchor="middle">16 M</text>
+<line x1="52" x2="512" y1="366" y2="366" stroke="#c3c2b7"/>
+<text x="282.0" y="402" font-size="11" fill="#52514e" text-anchor="middle">actual bitrate, bit/s (log scale)</text>
+<path d="M85.1,342.7 L153.1,206.0 L222.4,89.7 L235.1,60.9 L240.1,60.0 L248.1,58.2" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="85.1" cy="342.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 351 kbit/s, VMAF 44.37</title></circle>
+<circle cx="153.1" cy="206.0" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 664 kbit/s, VMAF 70.00</title></circle>
+<circle cx="222.4" cy="89.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 1274 kbit/s, VMAF 91.80</title></circle>
+<circle cx="235.1" cy="60.9" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 1436 kbit/s, VMAF 97.21</title></circle>
+<circle cx="240.1" cy="60.0" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 1503 kbit/s, VMAF 97.37</title></circle>
+<circle cx="248.1" cy="58.2" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 1621 kbit/s, VMAF 97.72</title></circle>
+<path d="M198.2,76.5 L202.1,71.9 L225.7,63.6 L242.2,58.5 L248.1,58.2" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="198.2" cy="76.5" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 1015 kbit/s, VMAF 94.29</title></circle>
+<circle cx="202.1" cy="71.9" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 1052 kbit/s, VMAF 95.15</title></circle>
+<circle cx="225.7" cy="63.6" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 1313 kbit/s, VMAF 96.71</title></circle>
+<circle cx="242.2" cy="58.5" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 1533 kbit/s, VMAF 97.66</title></circle>
+<circle cx="248.1" cy="58.2" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 1621 kbit/s, VMAF 97.72</title></circle>
+<path d="M101.4,92.2 L161.3,67.6 L221.8,63.8 L276.1,61.3 L328.6,58.4 L371.4,56.8" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="101.4" cy="92.2" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 409 kbit/s, VMAF 91.33</title></circle>
+<circle cx="161.3" cy="67.6" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 718 kbit/s, VMAF 95.95</title></circle>
+<circle cx="221.8" cy="63.8" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 1267 kbit/s, VMAF 96.66</title></circle>
+<circle cx="276.1" cy="61.3" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 2109 kbit/s, VMAF 97.13</title></circle>
+<circle cx="328.6" cy="58.4" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 3454 kbit/s, VMAF 97.67</title></circle>
+<circle cx="371.4" cy="56.8" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 5162 kbit/s, VMAF 97.97</title></circle>
+<path d="M93.1,282.9 L160.7,221.5 L227.5,181.9 L287.3,140.2 L350.3,111.2 L403.2,82.1" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="93.1" cy="282.9" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 378 kbit/s, VMAF 55.59</title></circle>
+<circle cx="160.7" cy="221.5" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 713 kbit/s, VMAF 67.09</title></circle>
+<circle cx="227.5" cy="181.9" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 1336 kbit/s, VMAF 74.53</title></circle>
+<circle cx="287.3" cy="140.2" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 2343 kbit/s, VMAF 82.34</title></circle>
+<circle cx="350.3" cy="111.2" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 4234 kbit/s, VMAF 87.77</title></circle>
+<circle cx="403.2" cy="82.1" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 6959 kbit/s, VMAF 93.24</title></circle>
+<path d="M204.7,107.2 L271.7,66.9 L345.5,60.3 L419.3,56.7 L488.2,53.6" fill="none" stroke="#e87ba4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="204.7" cy="107.2" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 1078 kbit/s, VMAF 88.53</title></circle>
+<circle cx="271.7" cy="66.9" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 2024 kbit/s, VMAF 96.09</title></circle>
+<circle cx="345.5" cy="60.3" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 4048 kbit/s, VMAF 97.32</title></circle>
+<circle cx="419.3" cy="56.7" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 8092 kbit/s, VMAF 97.99</title></circle>
+<circle cx="488.2" cy="53.6" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 15467 kbit/s, VMAF 98.57</title></circle>
+<path d="M75.8,90.4 L134.1,59.8 L202.9,54.9 L269.0,53.9 L321.6,53.6 L364.2,53.5" fill="none" stroke="#008300" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="75.8" cy="90.4" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 321 kbit/s, VMAF 91.67</title></circle>
+<circle cx="134.1" cy="59.8" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 556 kbit/s, VMAF 97.42</title></circle>
+<circle cx="202.9" cy="54.9" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 1060 kbit/s, VMAF 98.34</title></circle>
+<circle cx="269.0" cy="53.9" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 1974 kbit/s, VMAF 98.51</title></circle>
+<circle cx="321.6" cy="53.6" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 3233 kbit/s, VMAF 98.57</title></circle>
+<circle cx="364.2" cy="53.5" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 4823 kbit/s, VMAF 98.58</title></circle>
+<text x="552" y="28" font-size="14" font-weight="600" fill="#0b0b0b">game clip, 1080p30</text>
+<line x1="552" x2="1012" y1="366.0" y2="366.0" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="312.7" y2="312.7" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="259.3" y2="259.3" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="206.0" y2="206.0" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="152.7" y2="152.7" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="99.3" y2="99.3" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="552" x2="1012" y1="46.0" y2="46.0" stroke="#e1e0d9" stroke-width="1"/>
+<line x1="607.0" x2="607.0" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="607.0" y="384" font-size="11" fill="#898781" text-anchor="middle">2 M</text>
+<line x1="707.2" x2="707.2" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="707.2" y="384" font-size="11" fill="#898781" text-anchor="middle">4 M</text>
+<line x1="807.4" x2="807.4" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="807.4" y="384" font-size="11" fill="#898781" text-anchor="middle">8 M</text>
+<line x1="907.6" x2="907.6" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="907.6" y="384" font-size="11" fill="#898781" text-anchor="middle">16 M</text>
+<line x1="1007.8" x2="1007.8" y1="366" y2="370" stroke="#c3c2b7"/>
+<text x="1007.8" y="384" font-size="11" fill="#898781" text-anchor="middle">32 M</text>
+<line x1="552" x2="1012" y1="366" y2="366" stroke="#c3c2b7"/>
+<text x="782.0" y="402" font-size="11" fill="#52514e" text-anchor="middle">actual bitrate, bit/s (log scale)</text>
+<path d="M584.3,334.7 L676.9,291.0 L768.3,242.9 L865.3,194.2" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="584.3" cy="334.7" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 1709 kbit/s, VMAF 45.86</title></circle>
+<circle cx="676.9" cy="291.0" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 3245 kbit/s, VMAF 54.07</title></circle>
+<circle cx="768.3" cy="242.9" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 6104 kbit/s, VMAF 63.09</title></circle>
+<circle cx="865.3" cy="194.2" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"><title>openh264: 11941 kbit/s, VMAF 72.21</title></circle>
+<path d="M860.5,133.3 L866.0,125.0 L904.3,97.7 L979.7,70.5" fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="860.5" cy="133.3" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 11554 kbit/s, VMAF 83.63</title></circle>
+<circle cx="866.0" cy="125.0" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 11999 kbit/s, VMAF 85.19</title></circle>
+<circle cx="904.3" cy="97.7" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 15638 kbit/s, VMAF 90.31</title></circle>
+<circle cx="979.7" cy="70.5" r="4" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"><title>h264-noskip: 26359 kbit/s, VMAF 95.41</title></circle>
+<path d="M607.7,233.6 L705.7,154.6 L804.1,93.2 L902.0,55.9" fill="none" stroke="#1baf7a" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="607.7" cy="233.6" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 2010 kbit/s, VMAF 64.82</title></circle>
+<circle cx="705.7" cy="154.6" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 3959 kbit/s, VMAF 79.63</title></circle>
+<circle cx="804.1" cy="93.2" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 7822 kbit/s, VMAF 91.15</title></circle>
+<circle cx="902.0" cy="55.9" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"><title>aom-s9: 15400 kbit/s, VMAF 98.14</title></circle>
+<path d="M606.9,228.6 L707.4,164.8 L807.5,105.3 L902.7,61.5" fill="none" stroke="#eda100" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="606.9" cy="228.6" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 1999 kbit/s, VMAF 65.75</title></circle>
+<circle cx="707.4" cy="164.8" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 4006 kbit/s, VMAF 77.73</title></circle>
+<circle cx="807.5" cy="105.3" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 8005 kbit/s, VMAF 88.87</title></circle>
+<circle cx="902.7" cy="61.5" r="4" fill="#eda100" stroke="#fcfcfb" stroke-width="2"><title>svt-p11: 15465 kbit/s, VMAF 97.10</title></circle>
+<path d="M605.6,267.9 L705.7,166.5 L804.9,89.8 L905.7,53.0" fill="none" stroke="#e87ba4" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="605.6" cy="267.9" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 1981 kbit/s, VMAF 58.38</title></circle>
+<circle cx="705.7" cy="166.5" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 3960 kbit/s, VMAF 77.40</title></circle>
+<circle cx="804.9" cy="89.8" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 7864 kbit/s, VMAF 91.79</title></circle>
+<circle cx="905.7" cy="53.0" r="4" fill="#e87ba4" stroke="#fcfcfb" stroke-width="2"><title>mf-h264: 15794 kbit/s, VMAF 98.69</title></circle>
+<path d="M599.6,203.5 L706.6,134.3 L808.7,80.8 L909.2,52.7" fill="none" stroke="#008300" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="599.6" cy="203.5" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 1900 kbit/s, VMAF 70.47</title></circle>
+<circle cx="706.6" cy="134.3" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 3985 kbit/s, VMAF 83.44</title></circle>
+<circle cx="808.7" cy="80.8" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 8075 kbit/s, VMAF 93.48</title></circle>
+<circle cx="909.2" cy="52.7" r="4" fill="#008300" stroke="#fcfcfb" stroke-width="2"><title>mf-av1: 16183 kbit/s, VMAF 98.74</title></circle>
+<text x="14" y="206.0" font-size="11" fill="#52514e" transform="rotate(-90 14 206.0)" text-anchor="middle">VMAF</text>
+<rect x="52" y="421" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="66" y="430" font-size="11" fill="#52514e">openh264</text>
+<rect x="126.0" y="421" width="10" height="10" rx="2" fill="#eb6834"/>
+<text x="140.0" y="430" font-size="11" fill="#52514e">h264-noskip</text>
+<rect x="219.5" y="421" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="233.5" y="430" font-size="11" fill="#52514e">aom-s9</text>
+<rect x="280.5" y="421" width="10" height="10" rx="2" fill="#eda100"/>
+<text x="294.5" y="430" font-size="11" fill="#52514e">svt-p11</text>
+<rect x="348.0" y="421" width="10" height="10" rx="2" fill="#e87ba4"/>
+<text x="362.0" y="430" font-size="11" fill="#52514e">mf-h264</text>
+<rect x="415.5" y="421" width="10" height="10" rx="2" fill="#008300"/>
+<text x="429.5" y="430" font-size="11" fill="#52514e">mf-av1</text>
+</svg>

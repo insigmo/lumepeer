@@ -1,0 +1,40 @@
+[package]
+name = "codec-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Measures lumepeer's openh264 and Media Foundation encoders against libaom, SVT-AV1 and rav1e on recorded screen clips (docs/research/software-av1.md)"
+
+# Standalone on purpose: a measurement tool, not part of the lumepeer
+# workspace, its lockfile or its release builds.
+[workspace]
+
+[features]
+default = ["aom", "svt", "rav1e"]
+# libaom realtime; needs AOM_INCLUDE and AOM_LIB_DIR (see build.rs).
+aom = []
+# SVT-AV1 rtc; needs SVT_INCLUDE and SVT_LIB_DIR (see build.rs).
+svt = []
+rav1e = ["dep:rav1e"]
+# lumepeer's own Media Foundation hardware encoder (H.264 and AV1), Windows.
+mf = ["lumepeer-media/encode-mf"]
+
+[dependencies]
+# The product's own encoder code, so openh264 runs with exactly its settings.
+lumepeer-media = { path = "../../crates/media", features = ["encode-openh264"] }
+# The version the product locks; also its BGRA->I420 converter, which every
+# software encoder here is fed through so all of them see the same pixels.
+openh264 = "=0.9.8"
+rav1e = { version = "0.8", optional = true, default-features = false, features = ["asm", "threading"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = 1

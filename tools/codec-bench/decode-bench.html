@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AV1 decode bench</title>
+<!--
+  WebCodecs decode time of an AV1 stream the way lumepeer's guest decodes it
+  (apps/desktop/src/view-decoder.ts: { codec, optimizeForLatency: true }, no
+  hardware preference). The stream is an IVF file from codec-bench, turned
+  into a script by make-decode-data.py so the page works from file://.
+
+  Results go to console.log as one JSON line prefixed "DECODE-BENCH ", which a
+  headless Chromium/Edge run with --enable-logging=stderr prints, and to the
+  page body for a browser opened by hand.
+-->
+<pre id="out">running…</pre>
+<script src="decode-data.js"></script>
+<script>
+'use strict';
+const CODEC = 'av01.0.05M.08';
+const params = new URLSearchParams(location.search);
+const FPS = Number(params.get('fps') || 30);
+
+function frames(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const width = view.getUint16(12, true), height = view.getUint16(14, true);
+  const out = [];
+  for (let off = 32; off + 12 <= bytes.length;) {
+    const size = view.getUint32(off, true);
+    out.push(bytes.subarray(off + 12, off + 12 + size));
+    off += 12 + size;
+  }
+  return { width, height, out };
+}
+
+function stats(v) {
+  const s = [...v].sort((a, b) => a - b);
+  const p = (q) => s[Math.min(s.length - 1, Math.round((s.length - 1) * q))];
+  return { n: s.length, mean: s.reduce((a, b) => a + b, 0) / s.length, p50: p(0.5), p95: p(0.95), p99: p(0.99), max: s[s.length - 1] };
+}
+
+// Mode "paced": one chunk every 1/FPS s, as frames arrive in a session;
+// latency = output callback time - decode() call time, queueing included.
+// Mode "serial": the next chunk only once the previous picture is out, which
+// is the decoder's own per-frame time with nothing queued in front of it.
+async function run(chunks, mode, hw) {
+  const sent = new Map();
+  const lat = [];
+  let done, errors = 0;
+  const finished = new Promise((r) => (done = r));
+  let waiting = null;
+  const decoder = new VideoDecoder({
+    output: (frame) => {
+      const t = performance.now();
+      const t0 = sent.get(frame.timestamp);
+      if (t0 !== undefined) lat.push(t - t0);
+      frame.close();
+      if (waiting) { const w = waiting; waiting = null; w(); }
+      if (lat.length === chunks.length) done();
+    },
+    error: (e) => { errors++; console.log('DECODE-BENCH-ERROR ' + e); done(); },
+  });
+  const config = { codec: CODEC, optimizeForLatency: true };
+  if (hw) config.hardwareAcceleration = hw;
+  decoder.configure(config);
+  const start = performance.now();
+  for (let i = 0; i < chunks.length; i++) {
+    if (decoder.state === 'closed') break;
+    if (mode === 'paced') {
+      const due = start + (i * 1000) / FPS;
+      const wait = due - performance.now();
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    }
+    const ts = i * 1000;
+    sent.set(ts, performance.now());
+    decoder.decode(new EncodedVideoChunk({ type: i === 0 ? 'key' : 'delta', timestamp: ts, data: chunks[i] }));
+    if (mode === 'serial') await new Promise((r) => (waiting = r));
+  }
+  await Promise.race([finished, new Promise((r) => setTimeout(r, 10000))]);
+  const wall = performance.now() - start;
+  if (decoder.state !== 'closed') decoder.close();
+  // The first picture carries decoder start-up; it is reported on its own.
+  return { mode, hw: hw || 'no-preference', errors, decoded: lat.length, wall_ms: wall,
+           first_ms: lat[0], latency_ms: stats(lat.slice(1)) };
+}
+
+(async () => {
+  const result = { userAgent: navigator.userAgent, codec: CODEC, streams: [] };
+  try {
+    for (const hw of [undefined, 'prefer-software', 'prefer-hardware']) {
+      const c = { codec: CODEC, optimizeForLatency: true };
+      if (hw) c.hardwareAcceleration = hw;
+      const s = await VideoDecoder.isConfigSupported(c);
+      result['supported_' + (hw || 'no-preference')] = s.supported;
+    }
+    for (const [name, b64] of Object.entries(window.DECODE_DATA || {})) {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const { width, height, out } = frames(bytes);
+      const entry = { name, width, height, frames: out.length, runs: [] };
+      for (const hw of [undefined, 'prefer-software']) {
+        for (const mode of ['serial', 'paced']) entry.runs.push(await run(out, mode, hw));
+      }
+      result.streams.push(entry);
+    }
+  } catch (e) {
+    result.error = String(e);
+  }
+  const line = JSON.stringify(result);
+  document.getElementById('out').textContent = JSON.stringify(result, null, 1);
+  console.log('DECODE-BENCH ' + line);
+  console.log('DECODE-BENCH-DONE');
+})();
+</script>
