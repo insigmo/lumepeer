@@ -1,0 +1,4 @@
+# Build output of the measurement tool (and of its no-asm openh264 variant).
+/target/
+/target-noasm/
+__pycache__/
