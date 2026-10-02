@@ -41,10 +41,10 @@
 
 #[cfg(feature = "encode-mf-zero-copy")]
 pub use dxgi::GpuTexture;
-#[cfg(all(test, feature = "encode-mf-zero-copy"))]
-pub(crate) use dxgi::gpu_test_frame;
 #[cfg(feature = "capture-windows")]
 pub use dxgi::{WindowsCapturer, WindowsInjector};
+#[cfg(all(test, feature = "encode-mf-zero-copy"))]
+pub(crate) use dxgi::{gpu_test_frame, gpu_test_frame_of};
 #[cfg(not(feature = "capture-windows"))]
 pub use stub::{WindowsCapturer, WindowsInjector};
 
@@ -73,9 +73,17 @@ mod dxgi {
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
     #[cfg(feature = "encode-mf-zero-copy")]
+    use windows::Win32::Graphics::Direct3D::Fxc::{
+        D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile,
+    };
+    #[cfg(feature = "encode-mf-zero-copy")]
+    use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+    #[cfg(feature = "encode-mf-zero-copy")]
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_USAGE_DEFAULT,
-        ID3D11Multithread,
+        D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        D3D11_BUFFER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
+        D3D11_VIEWPORT, ID3D11Buffer, ID3D11DepthStencilView, ID3D11Multithread, ID3D11PixelShader,
+        ID3D11RenderTargetView, ID3D11ShaderResourceView, ID3D11VertexShader,
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
@@ -400,6 +408,11 @@ mod dxgi {
         /// exactly as [`Staging`] does for the readback path.
         #[cfg(feature = "encode-mf-zero-copy")]
         last_gpu: Option<std::sync::Arc<GpuTexture>>,
+        /// What reduces this device's GPU frames on the GPU (ADR 0139), held
+        /// here and only weakly by the frames, so it ends with the capture.
+        /// `None` on a device with no video processing.
+        #[cfg(feature = "encode-mf-zero-copy")]
+        scaler: Option<std::sync::Arc<GpuScaler>>,
         /// Hash of the last frame handed out, so a screen that was repainted
         /// without actually changing yields `None` instead of a duplicate
         /// (§11.1), exactly as the X11 backend does it.
@@ -539,6 +552,12 @@ mod dxgi {
             // this device on the readback path for the whole session.
             #[cfg(feature = "encode-mf-zero-copy")]
             let gpu_ready = enable_multithread_protection(&device);
+            #[cfg(feature = "encode-mf-zero-copy")]
+            let scaler = if gpu_ready {
+                GpuScaler::new(&device, &context)
+            } else {
+                None
+            };
 
             Ok(Self {
                 device,
@@ -549,6 +568,8 @@ mod dxgi {
                 gpu_ready,
                 #[cfg(feature = "encode-mf-zero-copy")]
                 last_gpu: None,
+                #[cfg(feature = "encode-mf-zero-copy")]
+                scaler,
                 last_hash: None,
                 pointer_shape: None,
                 pointer_shape_seq: 0,
@@ -581,36 +602,52 @@ mod dxgi {
                 return Ok(self.finish_frame(data));
             }
 
-            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-            let mut resource: Option<IDXGIResource> = None;
-            // SAFETY: both out-parameters are locals that outlive the call.
-            // On success the duplication owes this side exactly one
-            // ReleaseFrame, which every path below pays before returning.
-            match unsafe {
-                self.duplication.AcquireNextFrame(
-                    acquire_timeout_ms(),
-                    &raw mut info,
-                    &raw mut resource,
+            // "Nothing changed" only once the whole wait has run out
+            // (ADR 0139): an acquire that carried nothing to send — the
+            // pointer moving over a picture the guest draws its own cursor
+            // on, a repaint with identical pixels — goes back to waiting for
+            // what is left of it. The caller asks again the moment this says
+            // `None`, so a `None` that had not waited would be a loop turning
+            // at the rate the mouse moves.
+            let deadline = Instant::now() + Duration::from_millis(u64::from(acquire_timeout_ms()));
+            loop {
+                let left = u32::try_from(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
                 )
-            } {
-                Ok(()) => {}
-                // Nothing was presented within the timeout: §11.1's "identical
-                // to the previous one", straight from the compositor.
-                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-                Err(e) => return Err(map_runtime_error(&e)),
+                .unwrap_or(u32::MAX);
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource: Option<IDXGIResource> = None;
+                // SAFETY: both out-parameters are locals that outlive the
+                // call. On success the duplication owes this side exactly one
+                // ReleaseFrame, which every path below pays before returning.
+                match unsafe {
+                    self.duplication
+                        .AcquireNextFrame(left, &raw mut info, &raw mut resource)
+                } {
+                    Ok(()) => {}
+                    // Nothing was presented within the timeout: §11.1's
+                    // "identical to the previous one", straight from the
+                    // compositor.
+                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+                    Err(e) => return Err(map_runtime_error(&e)),
+                }
+
+                let outcome = self.frame_from(resource.as_ref(), &info);
+
+                // SAFETY: balances the AcquireNextFrame above. It has to run
+                // on the failure paths too: an unreleased frame makes every
+                // later AcquireNextFrame fail with DXGI_ERROR_INVALID_CALL,
+                // turning one bad frame into a permanently dead capture.
+                let released = unsafe { self.duplication.ReleaseFrame() };
+
+                let frame = outcome?;
+                released.map_err(|e| map_runtime_error(&e))?;
+                if frame.is_some() || Instant::now() >= deadline {
+                    return Ok(frame);
+                }
             }
-
-            let outcome = self.frame_from(resource.as_ref(), &info);
-
-            // SAFETY: balances the AcquireNextFrame above. It has to run on
-            // the failure paths too: an unreleased frame makes every later
-            // AcquireNextFrame fail with DXGI_ERROR_INVALID_CALL, turning one
-            // bad frame into a permanently dead capture.
-            let released = unsafe { self.duplication.ReleaseFrame() };
-
-            let frame = outcome?;
-            released.map_err(|e| map_runtime_error(&e))?;
-            Ok(frame)
         }
 
         /// Turns an acquired desktop surface into an owned, tightly packed
@@ -814,6 +851,7 @@ mod dxgi {
                     &self.context,
                     width,
                     height,
+                    self.scaler.as_ref().map(std::sync::Arc::downgrade),
                 )?),
             };
 
@@ -898,6 +936,13 @@ mod dxgi {
         /// picture in main memory after all, and reset when the capture
         /// backend recycles the texture for the next frame.
         readback: std::sync::OnceLock<Vec<u8>>,
+        /// The CPU-readable copy [`GpuTexture::pixels`] goes through, kept
+        /// with the texture: a host whose encoder reads every frame back
+        /// (`openh264`) would otherwise allocate one per frame (ADR 0139).
+        staging: std::sync::Mutex<Option<Staging>>,
+        /// What reduces this picture on the GPU, while the capture that made
+        /// it is still open (ADR 0139).
+        scaler: Option<std::sync::Weak<GpuScaler>>,
     }
 
     // SAFETY: `GpuTexture` holds Direct3D 11 COM interfaces, which
@@ -908,8 +953,9 @@ mod dxgi {
     // `ID3D11Multithread::SetMultithreadProtected` is on — which is exactly
     // what `enable_multithread_protection` above establishes before a single
     // `GpuTexture` is ever made, and a device that refuses it produces none.
-    // The only interior state is a `OnceLock`, which brings its own
-    // synchronization.
+    // The interior state is a `OnceLock` and a `Mutex`, which bring their own
+    // synchronization, and a `Weak` to a `GpuScaler`, which is `Sync` by the
+    // same reasoning.
     #[cfg(feature = "encode-mf-zero-copy")]
     unsafe impl Send for GpuTexture {}
     // SAFETY: as above.
@@ -931,12 +977,14 @@ mod dxgi {
     #[cfg(feature = "encode-mf-zero-copy")]
     impl GpuTexture {
         /// Allocates a GPU-resident BGRA8 texture the video processor of
-        /// `encode::windows` can read as an input view.
+        /// `encode::windows` can read as an input view, and [`GpuScaler`]
+        /// can read from and render into.
         fn new(
             device: &ID3D11Device,
             context: &ID3D11DeviceContext,
             width: u32,
             height: u32,
+            scaler: Option<std::sync::Weak<GpuScaler>>,
         ) -> Result<Self> {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
@@ -978,6 +1026,8 @@ mod dxgi {
                 width,
                 height,
                 readback: std::sync::OnceLock::new(),
+                staging: std::sync::Mutex::new(None),
+                scaler,
             })
         }
 
@@ -985,10 +1035,10 @@ mod dxgi {
         /// call and remembered for every later one.
         ///
         /// This is the cost the zero-copy path exists to avoid, so reaching
-        /// it means something downstream — scaling, the software encoder, a
-        /// test — needed the pixels after all. It is still the correct
-        /// answer, and it is why nothing had to learn about GPU frames to
-        /// keep working (ADR 0073).
+        /// it means something downstream — the software encoder, a test —
+        /// needed the pixels after all. It is still the correct answer, and it
+        /// is why nothing had to learn about GPU frames to keep working
+        /// (ADR 0073).
         ///
         /// # Errors
         /// [`MediaError::CaptureInterrupted`] when the copy or the map fails.
@@ -996,15 +1046,46 @@ mod dxgi {
             if let Some(cached) = self.readback.get() {
                 return Ok(cached);
             }
-            let staging = Staging::new(&self.device, self.width, self.height)?;
+            // Held across the copy and the map: two readers of one texture
+            // must not interleave on the one staging copy it keeps.
+            let mut slot = self
+                .staging
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(Staging::new(&self.device, self.width, self.height)?);
+            }
+            let staging = slot.as_ref().ok_or_else(|| {
+                MediaError::CaptureInterrupted("the readback copy is gone".to_owned())
+            })?;
             // SAFETY: a GPU-side copy between two textures of identical
             // description on this struct's own device, into a staging texture
-            // no other thread has ever seen.
+            // only this texture owns and the lock above keeps to one caller.
             unsafe {
                 self.context.CopyResource(&staging.texture, &self.texture);
             }
             let data = read_back(&self.context, &staging.texture, self.width, self.height)?;
             Ok(self.readback.get_or_init(|| data))
+        }
+
+        /// This picture reduced to `width`x`height` on the GPU it is already
+        /// on, without a trip through main memory (ADR 0139).
+        ///
+        /// # Errors
+        /// [`MediaError::CaptureUnavailable`] when this device has no video
+        /// processing, the capture that made the texture has ended, or the
+        /// video processor refuses — the caller reduces on the CPU instead.
+        pub(crate) fn scaled(&self, width: u32, height: u32) -> Result<std::sync::Arc<Self>> {
+            let scaler = self
+                .scaler
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or_else(|| {
+                    MediaError::CaptureUnavailable(
+                        "no video processor to reduce this picture with".to_owned(),
+                    )
+                })?;
+            GpuScaler::scale(&scaler, self, width, height)
         }
 
         /// The texture itself, for the encoder's video processor.
@@ -1029,6 +1110,398 @@ mod dxgi {
         }
     }
 
+    /// Most size pairs one capture device keeps a constant buffer for: a
+    /// viewer each, and a host serves at most a handful.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    const SCALE_PATHS: usize = 4;
+
+    /// The reduction, as a pixel shader: [`crate::scale`]'s box filter, step
+    /// for step and in the same integer arithmetic, so a picture reduced on
+    /// the GPU is the very picture the CPU would have made (ADR 0139).
+    ///
+    /// Every destination pixel averages the source rectangle
+    /// `[x*sw/dw, max((x+1)*sw/dw, x0+1))` by `[y*sh/dh, …)`, summing whole
+    /// bytes and dividing with truncation. A UNORM texel reads back as
+    /// `byte/255`, which `round(v*255)` turns into the byte exactly, and the
+    /// quotient written out as `q/255` stores `q` exactly again.
+    ///
+    /// The vertex shader is the usual single triangle that covers the whole
+    /// target, made from the vertex index alone, so there is no vertex buffer
+    /// and no input layout.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    const SCALE_SHADER: &str = r"
+Texture2D<float4> source : register(t0);
+cbuffer Sizes : register(b0) { uint sw; uint sh; uint dw; uint dh; };
+
+float4 cover(uint id : SV_VertexID) : SV_Position {
+    float2 corner = float2((id << 1) & 2, id & 2);
+    return float4(corner * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 reduce(float4 position : SV_Position) : SV_Target {
+    uint x = (uint)position.x;
+    uint y = (uint)position.y;
+    uint x0 = x * sw / dw;
+    uint x1 = max((x + 1) * sw / dw, x0 + 1);
+    uint y0 = y * sh / dh;
+    uint y1 = max((y + 1) * sh / dh, y0 + 1);
+    uint4 sum = uint4(0, 0, 0, 0);
+    [loop] for (uint row = y0; row < y1; row++) {
+        [loop] for (uint column = x0; column < x1; column++) {
+            sum += (uint4)round(source.Load(int3(column, row, 0)) * 255.0);
+        }
+    }
+    uint count = (y1 - y0) * (x1 - x0);
+    return float4(sum / count) / 255.0;
+}
+";
+
+    /// Reduces this capture device's GPU frames on the GPU (ADR 0139).
+    ///
+    /// The picture a guest asks for is often smaller than the host's screen —
+    /// a 4K host in a 1080p window, or a preset's own reduction — and the
+    /// reduction used to read the whole frame back and box-filter it on one
+    /// CPU thread: 50 ms a frame at 4K, measured, against 13 ms for the
+    /// encode itself. [`SCALE_SHADER`] does the same on the GPU the frame is
+    /// already on, and what comes out is again a [`GpuTexture`], so the
+    /// encoder's zero-copy path takes it as it is.
+    ///
+    /// A pixel shader and not the Direct3D 11 video processor, which can scale
+    /// too: its filter is the driver's choice, and the one measured here
+    /// sharpened — a white page next to text came out brighter than white, at
+    /// 22 dB against the exact area average where the box filter makes 59.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    pub(crate) struct GpuScaler {
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        /// Held across one pass, so the pipeline state it sets is not
+        /// interleaved with another thread's calls on the shared context.
+        multithread: ID3D11Multithread,
+        vertex: ID3D11VertexShader,
+        pixel: ID3D11PixelShader,
+        state: std::sync::Mutex<ScalerState>,
+    }
+
+    // SAFETY: as `GpuTexture`: Direct3D 11 interfaces on a free-threaded
+    // device whose immediate context has multithread protection on before a
+    // scaler is ever made (`Active::open` builds one only when
+    // `enable_multithread_protection` succeeded). The mutable state is behind
+    // a `Mutex`.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    unsafe impl Send for GpuScaler {}
+    // SAFETY: as above.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    unsafe impl Sync for GpuScaler {}
+
+    #[cfg(feature = "encode-mf-zero-copy")]
+    impl std::fmt::Debug for GpuScaler {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GpuScaler").finish_non_exhaustive()
+        }
+    }
+
+    /// What a [`GpuScaler`] remembers between frames.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    #[derive(Default)]
+    struct ScalerState {
+        /// One per size pair, least recently made first.
+        paths: Vec<ScalePath>,
+        /// Latched the first time a pass fails, so a capture says so once and
+        /// stays on the CPU filter rather than failing — and logging — every
+        /// frame.
+        refused: bool,
+    }
+
+    /// The constant buffer for one source size and one target size.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    struct ScalePath {
+        from: (u32, u32),
+        to: (u32, u32),
+        sizes: ID3D11Buffer,
+        /// The texture the previous reduction went out in, written again as
+        /// soon as nothing downstream still holds it — the same recycling
+        /// `Active::gpu_frame` does for the captured frame.
+        last: Option<std::sync::Arc<GpuTexture>>,
+    }
+
+    /// Compiles one entry point of [`SCALE_SHADER`] for `target`.
+    #[cfg(feature = "encode-mf-zero-copy")]
+    fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<Vec<u8>> {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source pointer and length describe `SCALE_SHADER`, a
+        // static string; the entry point and target are NUL-terminated
+        // literals; both out-parameters are locals that receive owned blobs.
+        let compiled = unsafe {
+            D3DCompile(
+                SCALE_SHADER.as_ptr().cast(),
+                SCALE_SHADER.len(),
+                windows::core::s!("lumepeer-scale"),
+                None,
+                None,
+                entry,
+                target,
+                D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                0,
+                &raw mut code,
+                Some(&raw mut errors),
+            )
+        };
+        let bytes = |blob: &ID3DBlob| {
+            // SAFETY: a blob's pointer addresses `GetBufferSize` bytes for as
+            // long as the blob lives, and the slice is copied out before it
+            // is dropped.
+            unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+                .to_vec()
+            }
+        };
+        if let Err(error) = compiled {
+            let message = errors
+                .as_ref()
+                .map(|blob| String::from_utf8_lossy(&bytes(blob)).into_owned())
+                .unwrap_or_default();
+            return Err(MediaError::CaptureUnavailable(format!(
+                "the reduction shader did not compile: {error} {message}"
+            )));
+        }
+        code.as_ref().map(bytes).ok_or_else(|| {
+            MediaError::CaptureUnavailable("the shader compiler returned no code".to_owned())
+        })
+    }
+
+    #[cfg(feature = "encode-mf-zero-copy")]
+    impl GpuScaler {
+        /// A scaler on `device`, or `None` when the shader will not build on
+        /// it — that capture then reduces on the CPU, as before.
+        fn new(
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+        ) -> Option<std::sync::Arc<Self>> {
+            match Self::build(device, context) {
+                Ok(scaler) => Some(std::sync::Arc::new(scaler)),
+                Err(error) => {
+                    tracing::info!(%error, "no GPU reduction on this device; reducing on the CPU");
+                    None
+                }
+            }
+        }
+
+        fn build(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Result<Self> {
+            let vertex_code = compile(windows::core::s!("cover"), windows::core::s!("vs_4_0"))?;
+            let pixel_code = compile(windows::core::s!("reduce"), windows::core::s!("ps_4_0"))?;
+            let refused = |what: &str, e: windows::core::Error| {
+                MediaError::CaptureUnavailable(format!("{what} failed: {e}"))
+            };
+            let mut vertex: Option<ID3D11VertexShader> = None;
+            // SAFETY: the bytecode is a local the call only reads; the
+            // out-parameter receives an owned interface pointer.
+            unsafe { device.CreateVertexShader(&vertex_code, None, Some(&raw mut vertex)) }
+                .map_err(|e| refused("CreateVertexShader", e))?;
+            let mut pixel: Option<ID3D11PixelShader> = None;
+            // SAFETY: as above.
+            unsafe { device.CreatePixelShader(&pixel_code, None, Some(&raw mut pixel)) }
+                .map_err(|e| refused("CreatePixelShader", e))?;
+            let (Some(vertex), Some(pixel)) = (vertex, pixel) else {
+                return Err(MediaError::CaptureUnavailable(
+                    "Direct3D reported success with no shader".to_owned(),
+                ));
+            };
+            let multithread = context
+                .cast::<ID3D11Multithread>()
+                .map_err(|e| refused("ID3D11Multithread", e))?;
+            Ok(Self {
+                device: device.clone(),
+                context: context.clone(),
+                multithread,
+                vertex,
+                pixel,
+                state: std::sync::Mutex::new(ScalerState::default()),
+            })
+        }
+
+        /// `source` reduced to `width`x`height`, in a texture of this device.
+        fn scale(
+            this: &std::sync::Arc<Self>,
+            source: &GpuTexture,
+            width: u32,
+            height: u32,
+        ) -> Result<std::sync::Arc<GpuTexture>> {
+            let mut state = this
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.refused {
+                return Err(MediaError::CaptureUnavailable(
+                    "this device would not reduce a picture".to_owned(),
+                ));
+            }
+            let scaled = Self::scale_with(this, &mut state, source, width, height);
+            if let Err(error) = &scaled {
+                tracing::info!(
+                    %error,
+                    "the GPU will not reduce the picture; reducing on the CPU for the rest of this capture"
+                );
+                state.refused = true;
+            }
+            scaled
+        }
+
+        fn scale_with(
+            this: &std::sync::Arc<Self>,
+            state: &mut ScalerState,
+            source: &GpuTexture,
+            width: u32,
+            height: u32,
+        ) -> Result<std::sync::Arc<GpuTexture>> {
+            let from = (source.width, source.height);
+            let to = (width, height);
+            let index = if let Some(index) = state
+                .paths
+                .iter()
+                .position(|path| path.from == from && path.to == to)
+            {
+                index
+            } else {
+                if state.paths.len() >= SCALE_PATHS {
+                    state.paths.remove(0);
+                }
+                state.paths.push(this.path(from, to)?);
+                state.paths.len() - 1
+            };
+            let path = &mut state.paths[index];
+            let recycled = path.last.take().and_then(|mut held| {
+                // Only once the previous reduction is gone downstream:
+                // overwriting it would change a picture somebody is encoding.
+                std::sync::Arc::get_mut(&mut held)?.readback.take();
+                Some(held)
+            });
+            let output = match recycled {
+                Some(held) => held,
+                None => std::sync::Arc::new(GpuTexture::new(
+                    &this.device,
+                    &this.context,
+                    width,
+                    height,
+                    Some(std::sync::Arc::downgrade(this)),
+                )?),
+            };
+            this.draw(&path.sizes, source, &output)?;
+            path.last = Some(std::sync::Arc::clone(&output));
+            Ok(output)
+        }
+
+        /// The constant buffer that tells [`SCALE_SHADER`] one size pair.
+        fn path(&self, from: (u32, u32), to: (u32, u32)) -> Result<ScalePath> {
+            let sizes = [from.0, from.1, to.0, to.1];
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: u32::try_from(std::mem::size_of_val(&sizes)).unwrap_or(u32::MAX),
+                Usage: D3D11_USAGE_IMMUTABLE,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0.cast_unsigned(),
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let data = D3D11_SUBRESOURCE_DATA {
+                pSysMem: sizes.as_ptr().cast(),
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
+            let mut buffer: Option<ID3D11Buffer> = None;
+            // SAFETY: the descriptor and the initial data are locals that
+            // outlive the call, and `data` addresses exactly `ByteWidth`
+            // bytes; the out-parameter receives an owned interface pointer.
+            unsafe {
+                self.device.CreateBuffer(
+                    &raw const desc,
+                    Some(&raw const data),
+                    Some(&raw mut buffer),
+                )
+            }
+            .map_err(|e| MediaError::CaptureUnavailable(format!("CreateBuffer failed: {e}")))?;
+            let sizes = buffer.ok_or_else(|| {
+                MediaError::CaptureUnavailable(
+                    "Direct3D reported success with no buffer".to_owned(),
+                )
+            })?;
+            Ok(ScalePath {
+                from,
+                to,
+                sizes,
+                last: None,
+            })
+        }
+
+        /// One pass of [`SCALE_SHADER`] from `source` into `output`.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a viewport is in floats; texture sizes are far inside f32's exact integer range"
+        )]
+        fn draw(
+            &self,
+            sizes: &ID3D11Buffer,
+            source: &GpuTexture,
+            output: &GpuTexture,
+        ) -> Result<()> {
+            let refused = |what: &str, e: windows::core::Error| {
+                MediaError::CaptureUnavailable(format!("{what} failed: {e}"))
+            };
+            let mut read: Option<ID3D11ShaderResourceView> = None;
+            // SAFETY: the texture is borrowed for the call, no descriptor
+            // means "the whole texture as it is", and the out-parameter
+            // receives an owned view.
+            unsafe {
+                self.device
+                    .CreateShaderResourceView(&source.texture, None, Some(&raw mut read))
+            }
+            .map_err(|e| refused("CreateShaderResourceView", e))?;
+            let mut write: Option<ID3D11RenderTargetView> = None;
+            // SAFETY: as above.
+            unsafe {
+                self.device
+                    .CreateRenderTargetView(&output.texture, None, Some(&raw mut write))
+            }
+            .map_err(|e| refused("CreateRenderTargetView", e))?;
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: output.width as f32,
+                Height: output.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            // SAFETY: every call borrows interfaces this function holds and
+            // locals that outlive it. `Enter`/`Leave` bracket the pass so the
+            // state it sets cannot be interleaved with another thread's use
+            // of the same immediate context, and the views are unbound again
+            // before `Leave`, so the output is never still a render target
+            // when the encoder's video processor reads it.
+            unsafe {
+                self.multithread.Enter();
+                let context = &self.context;
+                context.IASetInputLayout(None);
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                context.VSSetShader(&self.vertex, None);
+                context.PSSetShader(&self.pixel, None);
+                context.PSSetConstantBuffers(0, Some(&[Some(sizes.clone())]));
+                context.PSSetShaderResources(0, Some(&[read]));
+                context.RSSetState(None);
+                context.RSSetViewports(Some(&[viewport]));
+                context.OMSetBlendState(None, None, u32::MAX);
+                context.OMSetDepthStencilState(None, 0);
+                context.OMSetRenderTargets(Some(&[write]), None::<&ID3D11DepthStencilView>);
+                context.Draw(3, 0);
+                context.OMSetRenderTargets(None, None::<&ID3D11DepthStencilView>);
+                context.PSSetShaderResources(0, Some(&[None]));
+                self.multithread.Leave();
+            }
+            Ok(())
+        }
+    }
+
     /// A GPU-resident frame of one flat colour, on a Direct3D device of this
     /// function's own (ADR 0073).
     ///
@@ -1039,6 +1512,24 @@ mod dxgi {
     /// hardware device at all, which is a skip and not a failure.
     #[cfg(all(test, feature = "encode-mf-zero-copy"))]
     pub(crate) fn gpu_test_frame(width: u32, height: u32, fill: u8) -> Option<Frame> {
+        let pixels = vec![fill; (width as usize) * (height as usize) * BYTES_PER_PIXEL];
+        gpu_test_frame_of(width, height, &pixels).map(|(frame, _scaler)| frame)
+    }
+
+    /// [`gpu_test_frame`] with pixels of the caller's choosing, and the
+    /// scaler of its device, which the caller holds for as long as it wants
+    /// the frame to be reducible on the GPU (ADR 0139). `None` also when
+    /// `pixels` is not `width`x`height` BGRA, or the device has no video
+    /// processing.
+    #[cfg(all(test, feature = "encode-mf-zero-copy"))]
+    pub(crate) fn gpu_test_frame_of(
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Option<(Frame, std::sync::Arc<GpuScaler>)> {
+        if pixels.len() != (width as usize) * (height as usize) * BYTES_PER_PIXEL {
+            return None;
+        }
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         // SAFETY: as `Active::open`'s call, except that no adapter is named,
@@ -1062,8 +1553,15 @@ mod dxgi {
         if !enable_multithread_protection(&device) {
             return None;
         }
-        let texture = GpuTexture::new(&device, &context, width, height).ok()?;
-        let pixels = vec![fill; (width as usize) * (height as usize) * BYTES_PER_PIXEL];
+        let scaler = GpuScaler::new(&device, &context)?;
+        let texture = GpuTexture::new(
+            &device,
+            &context,
+            width,
+            height,
+            Some(std::sync::Arc::downgrade(&scaler)),
+        )
+        .ok()?;
         // SAFETY: with no destination box the whole subresource is written,
         // reading `RowPitch * Height` bytes from `pixels`, which is exactly
         // that long and outlives the call.
@@ -1077,14 +1575,17 @@ mod dxgi {
                 0,
             );
         }
-        Some(Frame {
-            width,
-            height,
-            format: PixelFormat::Bgra8,
-            timestamp_us: 0,
-            data: Vec::new(),
-            gpu: Some(std::sync::Arc::new(texture)),
-        })
+        Some((
+            Frame {
+                width,
+                height,
+                format: PixelFormat::Bgra8,
+                timestamp_us: 0,
+                data: Vec::new(),
+                gpu: Some(std::sync::Arc::new(texture)),
+            },
+            scaler,
+        ))
     }
 
     impl Staging {
@@ -1892,6 +2393,14 @@ mod dxgi {
             self.active = None;
             self.recovering = None;
             self.target = None;
+        }
+
+        /// While a duplication is live, `None` comes back only once
+        /// `Active::next_frame` has waited out its whole timeout for something
+        /// to send (ADR 0139). Without one — mid-recovery — the answers are
+        /// immediate.
+        fn waits_for_change(&self) -> bool {
+            self.active.is_some()
         }
 
         fn input_capability(&self) -> InputCapability {

@@ -170,6 +170,28 @@ pub const STREAM_AUDIO: u8 = b'A';
 /// the reverse of [`STREAM_AUDIO`], and a different tag so the host can
 /// never confuse its own outbound stream with one a guest opened.
 pub const STREAM_MIC: u8 = b'M';
+/// First (and only) byte of the announcement frame on a frame-acknowledgement
+/// stream (§11; ADR 0139). Guest to host, like [`STREAM_MIC`]: every frame
+/// after the tag is [`encode_frame_ack`] of how many video frames the guest
+/// has received so far on this media connection.
+///
+/// A host that predates it reads the tag, finds it is not [`STREAM_MIC`] and
+/// skips the stream, so the guest opens it without asking first.
+pub const STREAM_ACKS: u8 = b'K';
+
+/// Serializes one acknowledgement: the count of video frames received so far,
+/// little endian (§11; ADR 0139).
+#[must_use]
+pub const fn encode_frame_ack(received: u64) -> [u8; 8] {
+    received.to_le_bytes()
+}
+
+/// Parses one acknowledgement, or `None` for anything that is not one.
+/// Untrusted input on a network path: returns rather than panics.
+#[must_use]
+pub fn decode_frame_ack(bytes: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
 
 /// Host side: opens a media stream and announces it as carrying `kind`.
 ///
@@ -399,5 +421,20 @@ mod tests {
         let payload = decode_audio_payload(&reader.read_frame().await.unwrap()).unwrap();
         assert_eq!(payload.timestamp_us, 5);
         assert_eq!(payload.data, vec![9, 9]);
+    }
+
+    /// ADR 0139: an acknowledgement is the received count and nothing else,
+    /// and anything not exactly that size is refused rather than guessed at.
+    #[test]
+    fn a_frame_ack_round_trips_and_nothing_else_parses_as_one() {
+        assert_eq!(decode_frame_ack(&encode_frame_ack(0)), Some(0));
+        assert_eq!(
+            decode_frame_ack(&encode_frame_ack(u64::MAX)),
+            Some(u64::MAX)
+        );
+        assert_eq!(decode_frame_ack(&encode_frame_ack(1_234)), Some(1_234));
+        assert_eq!(decode_frame_ack(&[1, 2, 3]), None);
+        assert_eq!(decode_frame_ack(&[0; 9]), None);
+        assert_ne!(STREAM_ACKS, STREAM_MIC, "a host must tell the two apart");
     }
 }

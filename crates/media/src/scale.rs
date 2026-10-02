@@ -27,8 +27,7 @@ const BGRA_BYTES: usize = 4;
 ///
 /// The pixels come through [`Frame::as_cpu`], so a frame the Windows
 /// zero-copy path left on the GPU (ADR 0073) is read back here — which is
-/// what makes reducing a picture and keeping it off main memory mutually
-/// exclusive, and why that path is only live while nothing needs reducing.
+/// why [`reduced`] asks the GPU first (ADR 0139).
 fn usable_pixels(frame: &Frame) -> Option<&[u8]> {
     let expected = (frame.width as usize)
         .saturating_mul(frame.height as usize)
@@ -110,13 +109,7 @@ pub fn scale_to_percent(frame: Frame, percent: u32) -> Frame {
     let Some((width, height)) = scaled_size(frame.width, frame.height, percent) else {
         return frame;
     };
-    let Some(pixels) = usable_pixels(&frame) else {
-        // Same reasoning as `fit_within_budget`: a short buffer is not this
-        // module's to interpret.
-        return frame;
-    };
-    let data = box_downscale(pixels, frame.width, frame.height, width, height);
-    Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
+    reduced(frame, width, height)
 }
 
 /// Downscales `frame` to fit [`MAX_PICTURE_PIXELS`], or returns it unchanged.
@@ -133,13 +126,7 @@ pub fn fit_within_budget(frame: Frame) -> Frame {
     let Some((width, height)) = target_size(frame.width, frame.height) else {
         return frame;
     };
-    let Some(pixels) = usable_pixels(&frame) else {
-        // A short buffer is not this module's to interpret; the encoder
-        // rejects it with a message that names the real problem.
-        return frame;
-    };
-    let data = box_downscale(pixels, frame.width, frame.height, width, height);
-    Frame::cpu(width, height, frame.format, frame.timestamp_us, data)
+    reduced(frame, width, height)
 }
 
 /// Target dimensions for a picture fitted inside `max_width`x`max_height`,
@@ -194,9 +181,20 @@ pub fn fit_within(frame: Frame, max_width: u32, max_height: u32) -> Frame {
     let Some((width, height)) = box_size(frame.width, frame.height, max_width, max_height) else {
         return frame;
     };
+    reduced(frame, width, height)
+}
+
+/// `frame` reduced to `width`x`height`: on the GPU it is already on when it is
+/// on one and that GPU will do it (ADR 0139), with [`box_downscale`] on the CPU
+/// otherwise.
+fn reduced(frame: Frame, width: u32, height: u32) -> Frame {
+    #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+    if let Some(scaled) = frame.scaled_on_gpu(width, height) {
+        return scaled;
+    }
     let Some(pixels) = usable_pixels(&frame) else {
-        // Same reasoning as `fit_within_budget`: a short buffer is not this
-        // module's to interpret.
+        // A short buffer is not this module's to interpret; the encoder
+        // rejects it with a message that names the real problem.
         return frame;
     };
     let data = box_downscale(pixels, frame.width, frame.height, width, height);
@@ -430,5 +428,98 @@ mod tests {
         let kept = fit_within(broken, 1280, 720);
         assert_eq!(kept.width, 2560);
         assert_eq!(kept.data.len(), 16);
+    }
+
+    /// A picture of the kind a desktop is, which is the kind a cheap filter
+    /// gets wrong: one-pixel rules, thin dark strokes on white like text, a
+    /// smooth gradient, and a patch of noise standing in for a photograph.
+    #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+    fn desktop_like(width: u32, height: u32) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut out = vec![0u8; (width as usize) * (height as usize) * BGRA_BYTES];
+        for y in 0..height {
+            for x in 0..width {
+                let base = ((y * width + x) as usize) * BGRA_BYTES;
+                let pixel: [u8; 3] = if y < height / 2 {
+                    // Rules every 9 pixels and "glyphs": short strokes on a
+                    // 6x11 character cell.
+                    let rule = x % 9 == 0 || y % 9 == 0;
+                    let (cx, cy) = (x % 6, y % 11);
+                    let stroke = (cx == 1 && cy > 1 && cy < 9) || (cy == 5 && cx < 5);
+                    if rule || stroke {
+                        [20, 20, 20]
+                    } else {
+                        [250, 250, 250]
+                    }
+                } else if x < width / 2 {
+                    let level = u8::try_from(x * 255 / (width / 2)).unwrap_or(u8::MAX);
+                    [level, 128, 255 - level]
+                } else {
+                    let value = noise().to_le_bytes();
+                    [value[0], value[1], value[2]]
+                };
+                out[base..base + 3].copy_from_slice(&pixel);
+                out[base + 3] = 0xFF;
+            }
+        }
+        out
+    }
+
+    /// ADR 0139: a frame still on the GPU is reduced there, and the picture
+    /// that comes out is byte for byte the one the CPU box filter makes — on
+    /// the ratios guests actually ask for, on a picture of the kind that
+    /// shows a filter's faults. Skipped on a machine with no Direct3D 11
+    /// device to run the shader on.
+    #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
+    #[test]
+    fn a_gpu_frame_is_reduced_on_the_gpu_into_the_cpu_filters_very_picture() {
+        for ((sw, sh), (dw, dh)) in [
+            ((3840, 2160), (1920, 1080)),
+            ((2560, 1440), (1920, 1080)),
+            ((3840, 2160), (1600, 900)),
+            ((1920, 1080), (1280, 720)),
+        ] {
+            let pixels = desktop_like(sw, sh);
+            let Some((frame, _scaler)) =
+                crate::capture::windows::gpu_test_frame_of(sw, sh, &pixels)
+            else {
+                eprintln!("no Direct3D 11 device to reduce on here: skipped");
+                return;
+            };
+
+            // Twice: the first pass also builds the size pair's constant
+            // buffer and its output texture, the second is the steady state.
+            drop(fit_within(frame.clone(), dw, dh));
+            let started = std::time::Instant::now();
+            let on_gpu = fit_within(frame.clone(), dw, dh);
+            let submitted = started.elapsed();
+            assert!(on_gpu.gpu.is_some(), "the reduction left the GPU");
+            assert_eq!((on_gpu.width, on_gpu.height), (dw, dh));
+            let gpu_pixels = on_gpu.as_cpu().unwrap().to_vec();
+            let gpu_took = started.elapsed();
+
+            let started = std::time::Instant::now();
+            let cpu_pixels = box_downscale(frame.as_cpu().unwrap(), sw, sh, dw, dh);
+            let cpu_took = started.elapsed();
+            eprintln!(
+                "{sw}x{sh} -> {dw}x{dh}: GPU {submitted:?} to submit, {gpu_took:?} with the                  small readback; CPU {cpu_took:?} with the large readback"
+            );
+            assert!(
+                gpu_pixels == cpu_pixels,
+                "{sw}x{sh} -> {dw}x{dh}: {} of {} bytes differ from the CPU filter's",
+                gpu_pixels
+                    .iter()
+                    .zip(&cpu_pixels)
+                    .filter(|(a, b)| a != b)
+                    .count(),
+                cpu_pixels.len()
+            );
+        }
     }
 }

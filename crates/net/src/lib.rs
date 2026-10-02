@@ -33,10 +33,10 @@ pub use connection::{
 pub use endpoint::{ALPN_CONTROL, ALPN_FILE, ALPN_MEDIA, ALPN_TERMINAL, ALPN_TUNNEL, PeerEndpoint};
 pub use error::{NetError, Result};
 pub use media::{
-    MediaFrameReader, MediaFrameWriter, STREAM_AUDIO, STREAM_MIC, STREAM_VIDEO,
+    MediaFrameReader, MediaFrameWriter, STREAM_ACKS, STREAM_AUDIO, STREAM_MIC, STREAM_VIDEO,
     accept_audio_media_stream, accept_media_stream, accept_tagged_media_stream,
-    check_media_frame_length, decode_audio_payload, encode_audio_payload, open_media_stream,
-    open_tagged_media_stream,
+    check_media_frame_length, decode_audio_payload, decode_frame_ack, encode_audio_payload,
+    encode_frame_ack, open_media_stream, open_tagged_media_stream,
 };
 pub use peer_connection::{PathSnapshot, PeerConnection};
 pub use ticket::InviteTicket;
