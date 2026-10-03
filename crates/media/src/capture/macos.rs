@@ -76,7 +76,8 @@ mod screen_capture_kit {
     use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
 
     use crate::capture::{
-        CaptureTarget, Frame, InputCapability, InputInjector, PixelFormat, ScreenCapturer,
+        CaptureTarget, Frame, InputCapability, InputInjector, LatestFrame, PixelFormat,
+        ScreenCapturer, frame_wait,
     };
     use crate::error::{MediaError, Result};
 
@@ -248,7 +249,7 @@ mod screen_capture_kit {
         /// Newest frame the delegate produced and nobody has taken yet. Only
         /// the newest is kept: a remote viewer wants the current screen, not a
         /// backlog (§11.1).
-        frame: Mutex<Option<Frame>>,
+        frame: LatestFrame,
         /// blake3 of the last frame published, so an unchanged screen yields
         /// `None` instead of a duplicate (§11.1).
         last_hash: Mutex<Option<[u8; 32]>>,
@@ -275,7 +276,7 @@ mod screen_capture_kit {
     impl Shared {
         fn new() -> Self {
             Self {
-                frame: Mutex::new(None),
+                frame: LatestFrame::default(),
                 last_hash: Mutex::new(None),
                 stopped: Mutex::new(None),
                 started_at: Instant::now(),
@@ -381,11 +382,13 @@ mod screen_capture_kit {
                 }
                 *last = Some(hash);
             }
-            *lock(&self.frame) = Some(frame);
+            self.frame.put(frame);
         }
 
+        /// The newest picture, waiting up to a frame interval for one
+        /// (ADR 0139).
         fn take_frame(&self) -> Option<Frame> {
-            lock(&self.frame).take()
+            self.frame.take_within(frame_wait())
         }
 
         fn record_stop(&self, reason: String) {
@@ -883,6 +886,12 @@ mod screen_capture_kit {
                 // SAFETY: as in `start`; the handler outlives the call.
                 unsafe { stream.stopCaptureWithCompletionHandler(Some(handler)) };
             });
+        }
+
+        /// `next_frame` waits up to a frame interval for the stream's next
+        /// picture while one is running (ADR 0139).
+        fn waits_for_change(&self) -> bool {
+            self.active.is_some()
         }
 
         fn input_capability(&self) -> InputCapability {

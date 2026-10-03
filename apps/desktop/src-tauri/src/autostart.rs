@@ -5,7 +5,7 @@
 //!
 //! | Platform | Where |
 //! | --- | --- |
-//! | Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+//! | Windows | a per-user logon task, `\Lumepeer\Autostart-<user>` (ADR 0140) |
 //! | macOS | `~/Library/LaunchAgents/io.insigmo.lumepeer.plist` |
 //! | Linux | `~/.config/autostart/io.insigmo.lumepeer.desktop` |
 //!
@@ -122,6 +122,13 @@ impl Autostart {
         #[cfg(target_os = "macos")]
         platform::remove_stale_login_item();
 
+        // Windows only: an older release's `Run` entry, which never started
+        // the elevated client, becomes a task (ADR 0140).
+        #[cfg(target_os = "windows")]
+        if let Some(exe) = self.exe.as_deref() {
+            platform::migrate_legacy(exe);
+        }
+
         let Some(marker) = first_launch_marker() else {
             tracing::warn!("no per-user directory: cannot tell whether this is a first launch");
             return;
@@ -176,48 +183,171 @@ fn first_launch_marker() -> Option<PathBuf> {
     lumepeer_runtime::config::config_dir().map(|dir| dir.join("autostart-first-launch"))
 }
 
+/// Windows: a per-user scheduled task, not the `Run` key (ADR 0140).
+///
+/// The client is `requireAdministrator` (ADR 0057), and Windows silently
+/// skips a `Run` entry that needs elevation — so after a sign-in, including
+/// one a guest made through the logon-screen host (ADR 0126), nothing was
+/// hosting. A logon-triggered task with `HighestAvailable` starts it elevated
+/// without a prompt. It is still per user: the trigger and the principal name
+/// the account that turned it on, and nobody else's sign-in starts anything.
 #[cfg(target_os = "windows")]
 mod platform {
     use super::DISPLAY_NAME;
-    use std::path::Path;
+    use std::os::windows::process::CommandExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
-    /// The per-user Run key. `HKLM`'s equivalent is deliberately untouched:
-    /// writing there needs elevation and starts the app for every account on
-    /// the machine, neither of which a settings toggle may decide.
+    /// The per-user Run key the entry used to live in. Only read and cleared
+    /// now: an entry left there is the one Windows never starts.
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-    pub fn is_enabled() -> bool {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        // No Run key at all is a machine that has never had a startup entry,
-        // which is the same answer as "not enabled".
-        hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ)
+    /// `CREATE_NO_WINDOW`: no console flashes up when the toggle is moved.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// `DOMAIN\user` of whoever this process runs as.
+    fn account() -> Option<String> {
+        let user = std::env::var("USERNAME").ok().filter(|u| !u.is_empty())?;
+        Some(match std::env::var("USERDOMAIN") {
+            Ok(domain) if !domain.is_empty() => format!("{domain}\\{user}"),
+            _ => user,
+        })
+    }
+
+    /// One task per account, so two people on one machine do not share it.
+    fn task_name() -> Option<String> {
+        let user = std::env::var("USERNAME").ok().filter(|u| !u.is_empty())?;
+        Some(format!(r"\Lumepeer\Autostart-{user}"))
+    }
+
+    /// `schtasks.exe` by full path: this process is elevated, and a bare name
+    /// would be resolved through a search path a user can write to.
+    fn schtasks() -> Command {
+        let root = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let mut command = Command::new(root.join("System32").join("schtasks.exe"));
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    fn task_exists() -> bool {
+        task_name().is_some_and(|name| {
+            schtasks()
+                .args(["/Query", "/TN", &name])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    }
+
+    fn legacy_run_entry_exists() -> bool {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(RUN_KEY, KEY_READ)
             .is_ok_and(|key| key.get_value::<String, _>(DISPLAY_NAME).is_ok())
     }
 
-    pub fn enable(exe: &Path) -> Result<(), String> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (key, _) = hkcu
-            .create_subkey_with_flags(RUN_KEY, KEY_WRITE)
-            .map_err(|error| format!("cannot open the per-user Run key: {error}"))?;
-        // Quoted: a path with a space in it is otherwise read as a command
-        // plus arguments, and `C:\Program Files\...` is the normal case.
-        let command = format!("\"{}\"", exe.display());
-        key.set_value(DISPLAY_NAME, &command)
-            .map_err(|error| format!("cannot write the startup entry: {error}"))
-    }
-
-    pub fn disable() -> Result<(), String> {
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_WRITE) else {
+    fn remove_legacy_run_entry() -> Result<(), String> {
+        let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_WRITE)
+        else {
             return Ok(());
         };
         match key.delete_value(DISPLAY_NAME) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("cannot remove the startup entry: {error}")),
+            Err(error) => Err(format!("cannot remove the old startup entry: {error}")),
+        }
+    }
+
+    fn xml_escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    /// The task definition. `Priority` 4 is normal: the default of 7 would run
+    /// a remote-desktop host at below-normal CPU and low I/O priority.
+    pub(super) fn task_xml(account: &str, exe: &Path) -> String {
+        let account = xml_escape(account);
+        let exe = xml_escape(&exe.display().to_string());
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Starts Lumepeer when {account} signs in.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{account}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author"><UserId>{account}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{exe}</Command></Exec></Actions>
+</Task>
+"#
+        )
+    }
+
+    /// A legacy `Run` entry counts as on: it is what the user chose, and the
+    /// next start moves it into a task ([`migrate_legacy`]).
+    pub fn is_enabled() -> bool {
+        task_exists() || legacy_run_entry_exists()
+    }
+
+    pub fn enable(exe: &Path) -> Result<(), String> {
+        let (Some(account), Some(name)) = (account(), task_name()) else {
+            return Err("cannot tell which account this process runs as".to_owned());
+        };
+        // UTF-16 with a BOM is the encoding schtasks reads without argument.
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(
+            task_xml(&account, exe)
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let file =
+            std::env::temp_dir().join(format!("lumepeer-autostart-{}.xml", std::process::id()));
+        std::fs::write(&file, bytes)
+            .map_err(|error| format!("cannot write the task definition: {error}"))?;
+        let out = schtasks()
+            .args(["/Create", "/F", "/TN", &name, "/XML"])
+            .arg(&file)
+            .output();
+        let _ = std::fs::remove_file(&file);
+        let out = out.map_err(|error| format!("cannot run schtasks: {error}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot create the startup task: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        remove_legacy_run_entry()
+    }
+
+    pub fn disable() -> Result<(), String> {
+        if let Some(name) = task_name().filter(|_| task_exists()) {
+            let out = schtasks()
+                .args(["/Delete", "/F", "/TN", &name])
+                .output()
+                .map_err(|error| format!("cannot run schtasks: {error}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "cannot remove the startup task: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        remove_legacy_run_entry()
+    }
+
+    /// Moves an entry an older release wrote into the `Run` key into a task.
+    pub fn migrate_legacy(exe: &Path) {
+        if legacy_run_entry_exists()
+            && let Err(error) = enable(exe)
+        {
+            tracing::warn!(%error, "could not move autostart from the Run key to a task");
         }
     }
 }
@@ -405,6 +535,21 @@ mod tests {
         }
         assert!(autostart.set(false).is_ok());
         assert!(!autostart.is_enabled());
+    }
+
+    /// The task starts this exe elevated, as the account that turned it on,
+    /// and only at that account's sign-in (ADR 0140).
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_task_starts_elevated_for_its_own_account_only() {
+        let xml = platform::task_xml(
+            r"PC\a&b",
+            Path::new(r"C:\Program Files\Lumepeer\lumepeer-desktop.exe"),
+        );
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains(r"<LogonTrigger><Enabled>true</Enabled><UserId>PC\a&amp;b</UserId>"));
+        assert!(xml.contains(r"<Command>C:\Program Files\Lumepeer\lumepeer-desktop.exe</Command>"));
     }
 
     /// The marker is the whole difference between "on by default" and "cannot

@@ -153,10 +153,12 @@ encode-mf = ["windows/Win32_System_Ole"]
 # the frame on the GPU and Media Foundation has to accept it there — so a
 # build with only one of them cannot have it, and a shipped build takes it
 # only once it has been measured on the machine it ships to. Adds no
-# dependency and no `windows` binding module of its own: everything it needs
-# is what `capture-windows` (Direct3D 11/DXGI) and the unconditional
+# dependency, and one `windows` binding module of its own: the shader
+# compiler, `d3dcompiler_47.dll`, which builds the pixel shader that reduces a
+# picture on the GPU (ADR 0139). Everything else it needs is what
+# `capture-windows` (Direct3D 11/DXGI) and the unconditional
 # `Win32_Media_MediaFoundation` already bring in.
-encode-mf-zero-copy = ["encode-mf", "capture-windows"]
+encode-mf-zero-copy = ["encode-mf", "capture-windows", "windows/Win32_Graphics_Direct3D_Fxc"]
 # DXGI Desktop Duplication screen capture (§11, §18; ADR 0012). Same
 # convention as capture-x11/encode-mf above, so `cargo build --workspace`
 # needs no platform SDK and pulls in no extra bindings. The `windows` crate

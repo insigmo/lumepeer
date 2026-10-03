@@ -915,6 +915,29 @@ pub const ENCODE_HW_EVENT_TIMEOUT_MS: u64 = 2_000;
 /// frame to say so, and reaches this bound in two minutes instead.
 pub const ENCODE_REFUSALS_BEFORE_FAULT: u32 = 60;
 
+/// The least the media link may fall behind its own best recent case before
+/// the host stops producing frames for it (§11; ADR 0139).
+///
+/// Not in the design doc. "Behind" is how much longer the oldest frame the
+/// guest has not yet acknowledged has been on its way than the quickest
+/// acknowledgement of the last [`MEDIA_ACK_BEST_WINDOW_MS`] took: time a frame
+/// spends queued rather than travelling. The allowance is two frame intervals,
+/// held between this and [`MEDIA_QUEUE_SLACK_MAX_MS`] — a frame big enough to
+/// take a while to send is not a link falling behind, and anything queued past
+/// the bound is latency the person at the guest feels on every click.
+pub const MEDIA_QUEUE_SLACK_MIN_MS: u64 = 16;
+/// The most the media link may fall behind before the host stops producing
+/// frames for it, however low the frame rate (§11; ADR 0139).
+pub const MEDIA_QUEUE_SLACK_MAX_MS: u64 = 50;
+/// How long the quickest acknowledgement of a frame is remembered as the
+/// media link's best case (§11; ADR 0139).
+///
+/// Not in the design doc. Long enough that a busy stretch, which never shows
+/// the link empty, does not make its own queue the baseline; short enough that
+/// a session moved onto a slower path (ADR 0134) stops being held to the old
+/// path's round trip within seconds.
+pub const MEDIA_ACK_BEST_WINDOW_MS: u64 = 5_000;
+
 /// Maximum UTF-8 byte length of one chat message (§9.2). Chat rides the
 /// control channel, so it must always stay well under
 /// `MAX_CONTROL_FRAME_BYTES`.

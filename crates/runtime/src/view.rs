@@ -31,6 +31,7 @@ use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
     ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
+    MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MIN_MS,
     MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
     SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS, SOFTWARE_AV1_SLOW_WINDOWS,
     SOFTWARE_AV1_WATCH_FRAMES,
@@ -48,7 +49,10 @@ use lumepeer_media::encode::{
 use lumepeer_media::error::MediaError;
 use lumepeer_media::playout::AudioPlayer;
 use lumepeer_media::scale::{cursor_for_picture, fit_within, fit_within_budget, scale_to_percent};
-use lumepeer_net::{PeerConnection, STREAM_MIC, accept_media_stream, open_media_stream};
+use lumepeer_net::{
+    PeerConnection, STREAM_ACKS, STREAM_MIC, accept_media_stream, decode_frame_ack,
+    encode_frame_ack, open_media_stream,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -62,6 +66,11 @@ const PERMILLE: u64 = 1_000;
 
 /// Bits in a byte, for turning received bytes into kilobits per second.
 const BITS_PER_BYTE: u64 = 8;
+
+/// Longest the encode loop waits for an acknowledgement before looking again
+/// (ADR 0139). Only a fallback: an acknowledgement, or the end of the stream
+/// that carries them, wakes it at once.
+const ACK_HOLD_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Host side: what the actor may say to a running encode loop, and what the
 /// loop says back (§11).
@@ -149,6 +158,10 @@ pub struct EncodeControl {
     /// this peer's codec again: software AV1 is chosen only for a picture of
     /// at most 1080p, and this is how the actor learns what the screen is.
     captured_size: Arc<Mutex<Option<(u32, u32)>>>,
+    /// What the guest has acknowledged of the picture's stream, which the
+    /// loop waits on rather than queueing frames the link cannot carry yet
+    /// (ADR 0139). Fed by [`spawn_guest_streams`].
+    acks: Arc<FrameAcks>,
 }
 
 impl EncodeControl {
@@ -157,6 +170,7 @@ impl EncodeControl {
     #[must_use]
     pub fn new(peer: NodeId, cursors: Option<mpsc::Sender<(NodeId, CursorShapeData)>>) -> Self {
         Self {
+            acks: Arc::new(FrameAcks::default()),
             peer,
             cursors,
             keyframe: Arc::new(AtomicBool::new(false)),
@@ -194,6 +208,12 @@ impl EncodeControl {
             .captured_size
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size);
+    }
+
+    /// Where the guest's acknowledgements of the picture go (ADR 0139).
+    #[must_use]
+    pub fn acks(&self) -> Arc<FrameAcks> {
+        Arc::clone(&self.acks)
     }
 
     /// Resolves once the picture's stream is open on the media connection
@@ -1476,8 +1496,18 @@ fn spawn_encode_loop_with(
         // The cursor at the scale the guest draws it: the picture's, which the
         // reductions below can make smaller than the screen (ADR 0138).
         let mut cursor = PictureCursor::default();
+        // When the last picture was captured. The next one is not taken
+        // before a frame interval after it, and that is the whole of the
+        // pacing: a screen that has been still is captured the moment it
+        // changes, not at the next tick of a clock that started when it was
+        // last looked at (ADR 0139).
+        let mut last_capture: Option<Instant> = None;
+        let acks = control.acks();
 
         loop {
+            if let Some(at) = last_capture {
+                sleep_for_the_rest_of(interval, at).await;
+            }
             let tick_started = Instant::now();
             if let Some(report) = encode_stats.due(tick_started) {
                 log_encode_report(
@@ -1488,7 +1518,18 @@ fn spawn_encode_loop_with(
                     target,
                     control.manual_cap().is_some(),
                     connection.path_snapshot(),
+                    acks.best(),
                 );
+            }
+            // Is the link still carrying what was sent before, longer than it
+            // takes when nothing is queued? Then a frame made now would only
+            // wait behind them, and the picture the guest sees would be that
+            // much older on every click. Wait for the guest to say what it has
+            // instead, and capture what is on screen then (ADR 0139).
+            if acks.hold(queue_slack(interval), ACK_HOLD_TIMEOUT).await {
+                backlog.skipped();
+                encode_stats.held();
+                continue;
             }
             // Is the link still on the previous frame? Then it cannot take
             // this one, and the honest thing is to not produce it: an encoded
@@ -1521,8 +1562,15 @@ fn spawn_encode_loop_with(
             // `next_frame` is a blocking platform call; it must not sit on a
             // tokio worker thread.
             let capture_started = Instant::now();
-            let captured =
-                tokio::task::spawn_blocking(move || lock_capture(&shared).next_frame()).await;
+            let (captured, waits_for_change) = match tokio::task::spawn_blocking(move || {
+                let mut capture = lock_capture(&shared);
+                (capture.next_frame(), capture.waits_for_change())
+            })
+            .await
+            {
+                Ok((captured, waits)) => (Ok(captured), waits),
+                Err(error) => (Err(error), false),
+            };
             let frame = match captured {
                 Ok(Ok(Some(frame))) => {
                     encode_stats.captured(capture_started.elapsed());
@@ -1544,7 +1592,13 @@ fn spawn_encode_loop_with(
                     secure_desktop_notified = false;
                     control.set_secure_desktop_active(false);
                     control.set_secure_desktop_blocked(false);
-                    sleep_for_the_rest_of(interval, tick_started).await;
+                    // A backend that waited for a change before saying "none"
+                    // is asked again at once: sleeping out the interval here
+                    // is time a change would wait unseen — up to 17 ms of
+                    // every 33 at 30 fps (ADR 0139).
+                    if !waits_for_change {
+                        sleep_for_the_rest_of(interval, tick_started).await;
+                    }
                     continue;
                 }
                 // The secure desktop (lock screen, UAC prompt or fast user
@@ -1633,6 +1687,7 @@ fn spawn_encode_loop_with(
                     return;
                 }
             };
+            last_capture = Some(Instant::now());
 
             // Two reductions, in this order and for different reasons. The
             // target is whatever the guest's preset pinned, or whatever the
@@ -1847,6 +1902,7 @@ fn spawn_encode_loop_with(
                 frame: bitstream,
                 recorder: recorder_now.clone(),
             });
+            acks.sent(Instant::now());
             // The guest's own measurement wins whenever there is a fresh one;
             // the host-local stand-in only speaks for a link nobody is
             // reporting on (ADR 0015, ADR 0037).
@@ -1933,7 +1989,6 @@ fn spawn_encode_loop_with(
                     "quality target moved"
                 );
             }
-            sleep_for_the_rest_of(interval, tick_started).await;
         }
     })
 }
@@ -2000,7 +2055,9 @@ impl SoftwareAv1Watch {
 /// How long the blocking half of one encode tick spent where, and on what.
 #[derive(Debug, Clone, Copy)]
 struct EncodeTiming {
-    /// Reducing the picture on the CPU; zero when nothing needed reducing.
+    /// Reducing the picture — handing the work to the GPU when the frame is
+    /// there (ADR 0139), the whole filter on the CPU otherwise; zero when
+    /// nothing needed reducing.
     scale: Duration,
     /// The encoder call itself.
     encode: Duration,
@@ -2011,8 +2068,12 @@ struct EncodeTiming {
 /// One line in the host's log summarising the last `ENCODE_STATS_PERIOD` of
 /// an encode loop, for whoever is working out why a session is slow or soft.
 ///
-/// A period in which nothing was encoded and nothing was skipped is a still
-/// screen, and says nothing worth a line.
+/// A period in which nothing was encoded, skipped or held is a still screen,
+/// and says nothing worth a line.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one log line, and each argument is a different source's part of it"
+)]
 fn log_encode_report(
     tag: &str,
     report: &EncodeReport,
@@ -2021,8 +2082,9 @@ fn log_encode_report(
     target: QualityTarget,
     preset: bool,
     path: Option<lumepeer_net::PathSnapshot>,
+    link_best: Option<Duration>,
 ) {
-    if report.frames == 0 && report.skipped == 0 {
+    if report.frames == 0 && report.skipped == 0 && report.held == 0 {
         return;
     }
     tracing::info!(
@@ -2035,6 +2097,8 @@ fn log_encode_report(
         kbps = report.kbps,
         keyframes = report.keyframes,
         skipped = report.skipped,
+        held = report.held,
+        link_best_ms = ?link_best.map(|best| best.as_millis()),
         capture_ms = %format_args!("{:.1}/{:.1}", report.capture_ms_avg, report.capture_ms_max),
         scale_ms = %format_args!("{:.1}/{:.1}", report.scale_ms_avg, report.scale_ms_max),
         encode_ms = %format_args!("{:.1}/{:.1}", report.encode_ms_avg, report.encode_ms_max),
@@ -2277,6 +2341,168 @@ fn backlog_feedback(loss: f32, sent_kbps: u32) -> ReceiverFeedback {
         goodput_kbps: sent_kbps,
         sent_kbps,
     }
+}
+
+/// Host side: what the guest has acknowledged of the picture's stream, and
+/// whether the link has room for another frame (§11; ADR 0139).
+///
+/// A frame written to the media stream is not a frame on its way: QUIC takes
+/// it into its send buffer as soon as flow control allows, which is over a
+/// megabyte, and sends it when congestion control allows. On a link slower
+/// than the encoder that buffer filled, and every click waited behind seconds
+/// of picture nobody would see. The guest now says how many frames it has
+/// received, and the loop produces a frame only while the oldest one still
+/// unacknowledged has not been on its way much longer than the quickest
+/// recent one took — the link's own round trip, with nothing queued.
+///
+/// Inert until an acknowledgement stream opens: a guest that predates
+/// ADR 0139 sends none, and its sessions run exactly as they did.
+#[derive(Debug, Default)]
+pub struct FrameAcks {
+    state: Mutex<AckState>,
+    /// Woken on every acknowledgement and when the stream ends.
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug, Default)]
+struct AckState {
+    /// An acknowledgement stream is open: the guest speaks ADR 0139.
+    live: bool,
+    /// Frames handed to the writer since the picture's stream opened.
+    sent: u64,
+    /// Frames the guest has said it received, cumulatively.
+    acked: u64,
+    /// The frames not yet acknowledged, oldest first, with when each was
+    /// handed to the writer. Only kept while `live`.
+    in_flight: std::collections::VecDeque<(u64, Instant)>,
+    /// How long acknowledgements took over the last
+    /// [`MEDIA_ACK_BEST_WINDOW_MS`], as a monotonic queue: each entry is
+    /// quicker than every one after it, so the front is the minimum.
+    best: std::collections::VecDeque<(Instant, Duration)>,
+}
+
+impl AckState {
+    fn note_delay(&mut self, at: Instant, delay: Duration) {
+        while self.best.back().is_some_and(|&(_, slower)| slower >= delay) {
+            self.best.pop_back();
+        }
+        self.best.push_back((at, delay));
+    }
+
+    fn best(&mut self, now: Instant) -> Option<Duration> {
+        let window = Duration::from_millis(MEDIA_ACK_BEST_WINDOW_MS);
+        while self
+            .best
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > window)
+        {
+            self.best.pop_front();
+        }
+        self.best.front().map(|&(_, delay)| delay)
+    }
+}
+
+impl FrameAcks {
+    fn lock(&self) -> MutexGuard<'_, AckState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The guest opened its acknowledgement stream.
+    pub fn opened(&self) {
+        self.lock().live = true;
+    }
+
+    /// The acknowledgement stream ended. Nothing more will be acknowledged,
+    /// so nothing is held back any longer either.
+    pub fn closed(&self) {
+        {
+            let mut state = self.lock();
+            state.live = false;
+            state.in_flight.clear();
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// One frame was handed to the writer at `at`.
+    fn sent(&self, at: Instant) {
+        let mut state = self.lock();
+        state.sent = state.sent.saturating_add(1);
+        if state.live {
+            let seq = state.sent;
+            state.in_flight.push_back((seq, at));
+        }
+    }
+
+    /// The guest has received `count` frames, as of `at`.
+    pub fn acked(&self, count: u64, at: Instant) {
+        {
+            let mut state = self.lock();
+            if count <= state.acked {
+                return;
+            }
+            state.acked = count;
+            // Only the newest frame this covers is timed: the older ones were
+            // waiting for this acknowledgement as much as for the link.
+            let mut newest = None;
+            while state
+                .in_flight
+                .front()
+                .is_some_and(|&(seq, _)| seq <= count)
+            {
+                newest = state.in_flight.pop_front();
+            }
+            if let Some((_, handed_over)) = newest {
+                state.note_delay(at, at.saturating_duration_since(handed_over));
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Whether the link has room for another frame at `now`: nothing is
+    /// waiting, nothing has been measured yet, or the oldest frame waiting
+    /// has been on its way no more than `slack` longer than the best case.
+    fn admits(&self, now: Instant, slack: Duration) -> bool {
+        let mut state = self.lock();
+        let Some(&(_, oldest)) = state.in_flight.front() else {
+            return true;
+        };
+        let Some(best) = state.best(now) else {
+            return true;
+        };
+        now.saturating_duration_since(oldest) <= best + slack
+    }
+
+    /// `false` at once when the link has room for another frame; otherwise
+    /// waits for the next acknowledgement, at most `timeout`, and says `true`.
+    async fn hold(&self, slack: Duration, timeout: Duration) -> bool {
+        // Armed before the check, so an acknowledgement landing between the
+        // two is not waited out to the timeout.
+        let changed = self.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if self.admits(Instant::now(), slack) {
+            return false;
+        }
+        let _ = tokio::time::timeout(timeout, changed).await;
+        true
+    }
+
+    /// The link's best case right now, for the log.
+    fn best(&self) -> Option<Duration> {
+        self.lock().best(Instant::now())
+    }
+}
+
+/// How far behind its best case the media link may fall at a frame interval
+/// of `interval`: two intervals, between [`MEDIA_QUEUE_SLACK_MIN_MS`] and
+/// [`MEDIA_QUEUE_SLACK_MAX_MS`] (ADR 0139).
+fn queue_slack(interval: Duration) -> Duration {
+    (interval * 2).clamp(
+        Duration::from_millis(MEDIA_QUEUE_SLACK_MIN_MS),
+        Duration::from_millis(MEDIA_QUEUE_SLACK_MAX_MS),
+    )
 }
 
 /// How much this host has written since the guest's previous report.
@@ -2607,6 +2833,14 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
     target.bitstream.restart_stats();
     target.bitstream.note_path(connection.path_snapshot());
     let path_source = connection.clone();
+    // How many frames have arrived on this pass, told to the host as they
+    // arrive, so it sends no more than the link carries (ADR 0139).
+    let (received_tx, received_rx) = watch::channel(0u64);
+    let _acks = AbortOnDrop(spawn_frame_acks(
+        connection.clone(),
+        received_rx,
+        target.tag.clone(),
+    ));
     let _audio = spawn_audio_pass(
         connection,
         target.tag.clone(),
@@ -2635,6 +2869,9 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
                 return produced;
             }
         };
+        // Counted on arrival, before anything is made of it: the host counts
+        // what it wrote, and a frame the decoder then refuses still arrived.
+        received_tx.send_modify(|count| *count = count.saturating_add(1));
         window.received(payload.len());
         if let Some(report) = window.due() {
             send_report(target, report);
@@ -2725,6 +2962,38 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
             }
         }
     }
+}
+
+/// Guest side: tells the host, as frames arrive, how many have (§11;
+/// ADR 0139), on a stream of its own on the media connection.
+///
+/// Opened without asking whether the host understands it: a host that does
+/// not skips the stream, and the first write that finds it gone ends this
+/// task without touching the picture.
+fn spawn_frame_acks(
+    connection: PeerConnection,
+    mut received: watch::Receiver<u64>,
+    tag: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut writer =
+            match lumepeer_net::open_tagged_media_stream(&connection, STREAM_ACKS).await {
+                Ok(writer) => writer,
+                Err(error) => {
+                    tracing::debug!(peer = %tag, %error, "cannot open the frame acknowledgements");
+                    return;
+                }
+            };
+        // Only the newest count matters: one write that covers several
+        // frames says the same as one per frame.
+        while received.changed().await.is_ok() {
+            let count = *received.borrow_and_update();
+            if let Err(error) = writer.write_frame(&encode_frame_ack(count)).await {
+                tracing::debug!(peer = %tag, %error, "the host takes no frame acknowledgements");
+                return;
+            }
+        }
+    })
 }
 
 /// Hands one encoded frame to the window that decodes for itself, and
@@ -3290,87 +3559,141 @@ pub fn spawn_mic_loop(connection: PeerConnection, tag: String) -> JoinHandle<()>
     })
 }
 
-/// Host side: accept the guest's tagged `M` mic stream on the media
-/// connection and play it on the speakers (§11; ADR 0028), for as long as
-/// that pass lasts. One per media session, started when the media connection
-/// is accepted; the loop inside parks while no mic stream exists and ends
-/// with the session.
+/// Host side: every stream the guest opens on the media connection, by the
+/// tag it announces itself with (§11): its microphone (ADR 0028) and its
+/// acknowledgements of the picture (ADR 0139). One per media session, started
+/// when the media connection is accepted; it parks while the guest opens
+/// nothing and ends with the connection.
+///
+/// One acceptor for all of them, because there can be only one: a pass that
+/// accepted streams looking for its own tag dropped every other kind it met,
+/// which is what the microphone's pass alone used to do.
 #[allow(
     clippy::must_use_candidate,
-    reason = "the handle is a way to abort the task, not a result: this pass               parks on a stream the guest may never open and is bounded by               the media session's own lifetime, so dropping it is the               ordinary call"
+    reason = "the handle is a way to abort the task, not a result: it parks on               streams the guest may never open and is bounded by the media               session's own lifetime, so dropping it is the ordinary call"
 )]
-pub fn spawn_guest_mic_pass(connection: PeerConnection, tag: String) -> JoinHandle<()> {
+pub fn spawn_guest_streams(
+    connection: PeerConnection,
+    tag: String,
+    acks: Arc<FrameAcks>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // The mic stream is opt-in on the guest: most sessions never carry
-        // one, and the accept call parks until it shows up or the connection
-        // ends — no polling, no spin.
-        let mut reader = match lumepeer_net::accept_tagged_media_stream(&connection, STREAM_MIC)
-            .await
-        {
-            Ok(Some(reader)) => reader,
-            Ok(None) => {
-                tracing::debug!(peer = %tag, "connection ended before a mic stream arrived");
-                return;
-            }
-            Err(error) => {
-                tracing::debug!(peer = %tag, %error, "media connection ended before a mic stream");
-                return;
-            }
-        };
-        // The Opus decoder runs in this process by the same decision as the
-        // host→guest audio direction: libopus never panics on hostile input
-        // and reports concealment instead.
-        let mut decoder = match lumepeer_media::audio::OpusDecoder::new() {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "no Opus decoder: guest mic stays off");
-                return;
-            }
-        };
-        // Playback is a platform backend like capture is: a target without
-        // one refuses here and the mic simply stays off (§18).
-        let mut player = match lumepeer_media::playout::platform_player() {
-            Ok(player) => player,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "no playback backend: guest mic stays off");
-                return;
-            }
-        };
-        if let Err(error) = player.start() {
-            tracing::warn!(peer = %tag, %error, "no playback device: guest mic stays off");
-            return;
-        }
         loop {
-            let payload = match reader.read_frame().await {
-                Ok(payload) => payload,
+            let reader = match accept_media_stream(&connection).await {
+                Ok(reader) => reader,
                 Err(error) => {
-                    tracing::debug!(peer = %tag, %error, "mic stream ended");
+                    tracing::debug!(peer = %tag, %error, "the media connection ended");
                     return;
                 }
             };
-            let Some(chunk) = lumepeer_net::decode_audio_payload(&payload) else {
-                tracing::warn!(peer = %tag, "dropping a malformed mic payload");
-                continue;
-            };
-            // An empty packet is a loss hint: libopus synthesizes concealment.
-            let packet = if chunk.data.is_empty() {
-                &[][..]
-            } else {
-                &chunk.data[..]
-            };
-            match decoder.decode(packet) {
-                Ok(samples) => {
-                    if let Err(error) = player.push(&samples, chunk.timestamp_us) {
-                        tracing::warn!(peer = %tag, %error, "mic playback stopped");
-                        return;
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(peer = %tag, %error, "decoder refused a mic packet");
-                }
-            }
+            // On a task of its own: a stream that is slow to say what it is
+            // must not keep the next one from being accepted.
+            tokio::spawn(serve_guest_stream(reader, tag.clone(), Arc::clone(&acks)));
         }
     })
+}
+
+/// Reads the tag one guest stream opens with and serves it accordingly.
+async fn serve_guest_stream(
+    mut reader: lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
+    tag: String,
+    acks: Arc<FrameAcks>,
+) {
+    match reader.read_frame().await {
+        Ok(kind) if kind == [STREAM_MIC] => play_guest_mic(reader, tag).await,
+        Ok(kind) if kind == [STREAM_ACKS] => read_frame_acks(reader, &acks, &tag).await,
+        Ok(_) => tracing::debug!(peer = %tag, "skipping an unannounced media stream"),
+        Err(error) => {
+            tracing::debug!(peer = %tag, %error, "a guest stream ended before saying what it carries");
+        }
+    }
+}
+
+/// Host side: hands every acknowledgement on one guest stream to the encode
+/// loop, and tells it when they stop (ADR 0139).
+async fn read_frame_acks(
+    mut reader: lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
+    acks: &FrameAcks,
+    tag: &str,
+) {
+    acks.opened();
+    loop {
+        match reader.read_frame().await {
+            Ok(payload) => {
+                let Some(count) = decode_frame_ack(&payload) else {
+                    tracing::warn!(peer = %tag, "a malformed frame acknowledgement: ignoring the rest");
+                    break;
+                };
+                acks.acked(count, Instant::now());
+            }
+            Err(error) => {
+                tracing::debug!(peer = %tag, %error, "the frame acknowledgements ended");
+                break;
+            }
+        }
+    }
+    acks.closed();
+}
+
+/// Host side: plays the guest's `M` mic stream on the speakers (§11;
+/// ADR 0028) until it ends.
+async fn play_guest_mic(
+    mut reader: lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
+    tag: String,
+) {
+    // The Opus decoder runs in this process by the same decision as the
+    // host→guest audio direction: libopus never panics on hostile input
+    // and reports concealment instead.
+    let mut decoder = match lumepeer_media::audio::OpusDecoder::new() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            tracing::warn!(peer = %tag, %error, "no Opus decoder: guest mic stays off");
+            return;
+        }
+    };
+    // Playback is a platform backend like capture is: a target without
+    // one refuses here and the mic simply stays off (§18).
+    let mut player = match lumepeer_media::playout::platform_player() {
+        Ok(player) => player,
+        Err(error) => {
+            tracing::warn!(peer = %tag, %error, "no playback backend: guest mic stays off");
+            return;
+        }
+    };
+    if let Err(error) = player.start() {
+        tracing::warn!(peer = %tag, %error, "no playback device: guest mic stays off");
+        return;
+    }
+    loop {
+        let payload = match reader.read_frame().await {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::debug!(peer = %tag, %error, "mic stream ended");
+                return;
+            }
+        };
+        let Some(chunk) = lumepeer_net::decode_audio_payload(&payload) else {
+            tracing::warn!(peer = %tag, "dropping a malformed mic payload");
+            continue;
+        };
+        // An empty packet is a loss hint: libopus synthesizes concealment.
+        let packet = if chunk.data.is_empty() {
+            &[][..]
+        } else {
+            &chunk.data[..]
+        };
+        match decoder.decode(packet) {
+            Ok(samples) => {
+                if let Err(error) = player.push(&samples, chunk.timestamp_us) {
+                    tracing::warn!(peer = %tag, %error, "mic playback stopped");
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::debug!(peer = %tag, %error, "decoder refused a mic packet");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4419,5 +4742,277 @@ mod tests {
         health.record(MediaUnavailableReason::EncoderFailed);
         assert!(health.can_encode());
         assert_eq!(health.fault(), None);
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// ADR 0139: a guest that sends no acknowledgements — every guest before
+    /// this one — is never held back, and nothing is kept for it.
+    #[test]
+    fn frame_acks_hold_nothing_until_the_guest_acknowledges() {
+        let acks = FrameAcks::default();
+        let start = Instant::now();
+        for _ in 0..100 {
+            acks.sent(start);
+        }
+        assert!(acks.admits(start + ms(10_000), ms(16)));
+        assert!(
+            acks.lock().in_flight.is_empty(),
+            "nothing kept for an old guest"
+        );
+    }
+
+    /// ADR 0139: once the link's best case is known, a frame is held back
+    /// exactly while the oldest unacknowledged one has been on its way longer
+    /// than that and the slack.
+    #[test]
+    fn frame_acks_hold_a_frame_while_the_link_runs_behind_its_best_case() {
+        let acks = FrameAcks::default();
+        acks.opened();
+        let start = Instant::now();
+        acks.sent(start);
+        assert!(
+            acks.admits(start + ms(500), ms(16)),
+            "nothing is held before anything has been measured"
+        );
+        // The first frame took 40 ms: that is the link's best case so far.
+        acks.acked(1, start + ms(40));
+        assert_eq!(acks.lock().best(start + ms(40)), Some(ms(40)));
+        assert!(acks.admits(start + ms(41), ms(16)), "nothing is in flight");
+
+        acks.sent(start + ms(50));
+        assert!(acks.admits(start + ms(50 + 40 + 16), ms(16)));
+        assert!(
+            !acks.admits(start + ms(50 + 40 + 17), ms(16)),
+            "a frame on its way longer than the best case and the slack is queued"
+        );
+        acks.acked(2, start + ms(150));
+        assert!(
+            acks.admits(start + ms(150), ms(16)),
+            "acknowledged, the link is free"
+        );
+        assert_eq!(
+            acks.lock().best(start + ms(150)),
+            Some(ms(40)),
+            "a slower acknowledgement does not raise the best case"
+        );
+    }
+
+    /// ADR 0139: an acknowledgement that covers several frames times only the
+    /// newest of them, and one that repeats an older count changes nothing.
+    #[test]
+    fn frame_acks_time_only_the_newest_frame_an_acknowledgement_covers() {
+        let acks = FrameAcks::default();
+        acks.opened();
+        let start = Instant::now();
+        acks.sent(start);
+        acks.sent(start + ms(30));
+        acks.sent(start + ms(60));
+        acks.acked(3, start + ms(80));
+        assert_eq!(acks.lock().best(start + ms(80)), Some(ms(20)));
+        assert!(acks.lock().in_flight.is_empty());
+
+        acks.sent(start + ms(100));
+        acks.acked(2, start + ms(500));
+        assert_eq!(
+            acks.lock().in_flight.len(),
+            1,
+            "a stale count acknowledges nothing"
+        );
+        assert_eq!(acks.lock().best(start + ms(500)), Some(ms(20)));
+    }
+
+    /// ADR 0139: the best case is forgotten after its window, so a session
+    /// moved onto a slower path is not held to the old one's round trip.
+    #[test]
+    fn frame_acks_forget_a_best_case_older_than_its_window() {
+        let acks = FrameAcks::default();
+        acks.opened();
+        let start = Instant::now();
+        acks.sent(start);
+        acks.acked(1, start + ms(10));
+        let later = start + ms(10 + MEDIA_ACK_BEST_WINDOW_MS + 1);
+        acks.sent(later);
+        acks.acked(2, later + ms(90));
+        assert_eq!(acks.lock().best(later + ms(90)), Some(ms(90)));
+    }
+
+    /// ADR 0139: when the acknowledgements stop, so does the holding back.
+    #[test]
+    fn frame_acks_hold_nothing_once_their_stream_ends() {
+        let acks = FrameAcks::default();
+        acks.opened();
+        let start = Instant::now();
+        acks.sent(start);
+        acks.acked(1, start + ms(5));
+        acks.sent(start + ms(10));
+        assert!(!acks.admits(start + ms(500), ms(16)));
+        acks.closed();
+        assert!(acks.admits(start + ms(500), ms(16)));
+        acks.sent(start + ms(600));
+        assert!(acks.lock().in_flight.is_empty());
+    }
+
+    /// ADR 0139: the slack is two frame intervals, held between its bounds.
+    #[test]
+    fn the_queue_slack_is_two_frames_within_its_bounds() {
+        assert_eq!(
+            queue_slack(frame_interval(144)),
+            ms(MEDIA_QUEUE_SLACK_MIN_MS)
+        );
+        assert_eq!(queue_slack(frame_interval(60)), frame_interval(60) * 2);
+        assert_eq!(
+            queue_slack(frame_interval(30)),
+            ms(MEDIA_QUEUE_SLACK_MAX_MS)
+        );
+    }
+
+    /// A capturer whose every frame is stamped with when it was taken, against
+    /// `epoch`, so the far end can tell how old a picture is when it lands.
+    #[derive(Debug)]
+    struct StampingCapturer {
+        epoch: Instant,
+    }
+
+    impl lumepeer_media::capture::ScreenCapturer for StampingCapturer {
+        fn start(
+            &mut self,
+            _target: lumepeer_media::capture::CaptureTarget,
+        ) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> lumepeer_media::Result<Option<Frame>> {
+            let stamp = u64::try_from(self.epoch.elapsed().as_micros()).unwrap();
+            Ok(Some(Frame::cpu(
+                64,
+                64,
+                PixelFormat::Bgra8,
+                stamp,
+                vec![0; 64 * 64 * 4],
+            )))
+        }
+
+        fn stop(&mut self) {}
+
+        fn input_capability(&self) -> lumepeer_media::capture::InputCapability {
+            lumepeer_media::capture::InputCapability::None
+        }
+    }
+
+    /// An encoder that turns every picture into a frame of `bytes` bytes and
+    /// keeps its timestamp, like a real one does.
+    struct StampEncoder {
+        bytes: usize,
+    }
+
+    impl VideoEncoder for StampEncoder {
+        fn encode(&mut self, frame: &Frame) -> lumepeer_media::Result<EncodedFrame> {
+            Ok(EncodedFrame {
+                keyframe: false,
+                timestamp_us: frame.timestamp_us,
+                data: vec![7; self.bytes],
+            })
+        }
+
+        fn set_bitrate(&mut self, _bitrate_kbps: u32) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn request_keyframe(&mut self) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn kind(&self) -> lumepeer_media::encode::EncoderKind {
+            lumepeer_media::encode::EncoderKind::SoftwareOpenH264
+        }
+    }
+
+    /// How old the pictures a slow guest is shown get, with and without it
+    /// acknowledging them: the encode loop at its own pace, the guest taking
+    /// one frame every 50 ms — a link slower than the encoder, in miniature.
+    ///
+    /// Returns the age of the last picture read, after `reads` of them.
+    async fn age_at_a_slow_guest(acknowledging: bool, reads: u32) -> Duration {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        let guest_side = dialed.unwrap();
+        let host_side = accepted.unwrap().unwrap();
+
+        let epoch = Instant::now();
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(StampingCapturer { epoch }),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let control = EncodeControl::new(peer, None);
+        let streams =
+            spawn_guest_streams(host_side.clone(), "test-peer".to_owned(), control.acks());
+        let (faults, _faults_rx) = mpsc::channel(4);
+        let encode = spawn_encode_loop_with(
+            host_side,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            control,
+            |_| Ok(Box::new(StampEncoder { bytes: 4_000 })),
+        );
+
+        let mut reader = accept_media_stream(&guest_side).await.unwrap();
+        let (received_tx, received_rx) = watch::channel(0u64);
+        let _acks = acknowledging.then(|| {
+            AbortOnDrop(spawn_frame_acks(
+                guest_side.clone(),
+                received_rx,
+                "test-peer".to_owned(),
+            ))
+        });
+        let mut age = Duration::ZERO;
+        for read in 1..=reads {
+            let payload = reader.read_frame().await.unwrap();
+            received_tx.send_replace(u64::from(read));
+            let frame = decode_media_payload(&payload).unwrap();
+            age = epoch
+                .elapsed()
+                .saturating_sub(Duration::from_micros(frame.timestamp_us));
+            tokio::time::sleep(ms(50)).await;
+        }
+        encode.abort();
+        streams.abort();
+        age
+    }
+
+    /// ADR 0139: without acknowledgements the host writes ahead of a guest
+    /// that cannot keep up, and every picture it is shown is older than the
+    /// last; with them the host waits, and every picture is fresh.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acknowledging_guest_is_shown_fresh_pictures_on_a_slow_link() {
+        let queued = age_at_a_slow_guest(false, 40).await;
+        let fresh = age_at_a_slow_guest(true, 40).await;
+        eprintln!(
+            "a slow guest's last picture: {queued:?} old without acknowledgements, {fresh:?} with"
+        );
+        assert!(
+            queued > ms(800),
+            "the test's link is not slow enough to queue anything: {queued:?}"
+        );
+        assert!(
+            fresh < ms(400),
+            "an acknowledging guest was shown a picture {fresh:?} old (without: {queued:?})"
+        );
     }
 }
