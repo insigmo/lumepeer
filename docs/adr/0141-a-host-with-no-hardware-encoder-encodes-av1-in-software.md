@@ -89,15 +89,19 @@ fails is logged as the reason):
 3. **The captured picture** is at most 1920×1080 pixels
    (`SOFTWARE_AV1_MAX_PIXELS`) — by count, so a portrait 1080×1920 qualifies
    and a 16:10 1920×1200 does not. The size is what the peer's last stream
-   learned: the display's own size when that stream's loop started, where the
-   platform can say (Windows, X11), else its last captured picture, before any
-   reduction for the guest's window — and it is carried into each new stream,
-   so it survives redials onto a screen that never changes. A first session
-   knows no size and counts as fitting. A software AV1 stream for a larger
-   screen ends at once: before taking a single frame where the display mode is
-   known, at its first frame where it is not (Wayland). The guest's redial,
-   half a second later, is chosen for with the size known — H.264 — and opens
-   with a picture (section 3).
+   learned: its last captured picture, before any reduction for the guest's
+   window, or — before any picture said otherwise — the display's own mode
+   when that stream's loop started, where the platform can say (Windows,
+   X11). It is carried into each new stream, so it survives redials onto a
+   screen that never changes. A picture outranks the mode because the mode is
+   the CRTC's: an X11 monitor scaled with `xrandr --scale` or split with
+   `--setmonitor` captures less, and the mode read over a 1080p picture
+   ended every software AV1 stream of that screen. A first session knows no
+   size and counts as fitting. A software AV1 stream for a larger screen ends
+   at once: before taking a single frame where the display mode is known and
+   no picture has been, at its first frame otherwise (Wayland, a mode
+   switched since). The guest's redial, half a second later, is chosen for
+   with the size known — H.264 — and opens with a picture (section 3).
 
 Anything else is H.264.
 
@@ -119,11 +123,26 @@ measuring yet, when its preset arrives.
 
 A capture that only reports changes would leave that redial with nothing to
 send on a still screen — the guest under "reconnecting" until something on
-the host moved. So every encode loop asks the capture for the screen as it is
-now when it starts (`ScreenCapturer::refresh`): Desktop Duplication takes the
-GDI snapshot a capture opens with, X11 forgets its last hash. The `PipeWire`
-portal cannot repeat a picture the compositor does not send again, and keeps
-the default, which does nothing.
+the host moved. So every encode loop takes a snapshot of the screen as it is
+now when it starts (`ScreenCapturer::snapshot`) and encodes it first. The
+snapshot is returned to the loop that asked rather than left for the next
+poll: one capture serves every viewer's loop, and a picture left for the next
+poll went to whichever loop polled first — a duplicate, and on Windows'
+zero-copy path two encoder rebuilds, for a guest that already had the screen,
+and still nothing for the one that asked. It counts as delivered, as a polled
+frame does, so the asking loop's next poll does not repeat it.
+
+X11 grabs the screen as every poll does, without the change check. Desktop
+Duplication cannot answer without a present, so it asks the duplication first,
+without waiting, and only then takes the GDI snapshot a capture opens with.
+Nothing polls the duplication between two loops, and a lock screen, a UAC
+prompt or a mode change in that gap has already invalidated it; a GDI snapshot
+taken regardless fails on the secure desktop and would end the new loop,
+where the poll meets `DXGI_ERROR_ACCESS_LOST` and starts the secure-desktop
+recovery of ADR 0049. That error therefore starts the recovery from the
+snapshot too, and any other failure leaves the loop to meet it on its first
+poll: a snapshot never ends a loop by itself. The `PipeWire` portal cannot
+repeat a picture the compositor does not send again, and takes none.
 
 ### 4. The bitrate target
 

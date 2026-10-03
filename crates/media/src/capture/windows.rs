@@ -391,6 +391,15 @@ mod dxgi {
         height: u32,
     }
 
+    /// What one `AcquireNextFrame` came back with.
+    enum Acquired {
+        /// Nothing was presented within the wait.
+        Nothing,
+        /// A present, and the frame it made — `None` when it carried nothing
+        /// to send (§11.1).
+        Present(Option<Frame>),
+    }
+
     /// A live duplication of one monitor.
     struct Active {
         device: ID3D11Device,
@@ -617,37 +626,90 @@ mod dxgi {
                         .as_millis(),
                 )
                 .unwrap_or(u32::MAX);
-                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-                let mut resource: Option<IDXGIResource> = None;
-                // SAFETY: both out-parameters are locals that outlive the
-                // call. On success the duplication owes this side exactly one
-                // ReleaseFrame, which every path below pays before returning.
-                match unsafe {
-                    self.duplication
-                        .AcquireNextFrame(left, &raw mut info, &raw mut resource)
-                } {
-                    Ok(()) => {}
+                match self.acquire(left)? {
                     // Nothing was presented within the timeout: §11.1's
                     // "identical to the previous one", straight from the
                     // compositor.
-                    Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-                    Err(e) => return Err(map_runtime_error(&e)),
-                }
-
-                let outcome = self.frame_from(resource.as_ref(), &info);
-
-                // SAFETY: balances the AcquireNextFrame above. It has to run
-                // on the failure paths too: an unreleased frame makes every
-                // later AcquireNextFrame fail with DXGI_ERROR_INVALID_CALL,
-                // turning one bad frame into a permanently dead capture.
-                let released = unsafe { self.duplication.ReleaseFrame() };
-
-                let frame = outcome?;
-                released.map_err(|e| map_runtime_error(&e))?;
-                if frame.is_some() || Instant::now() >= deadline {
-                    return Ok(frame);
+                    Acquired::Nothing => return Ok(None),
+                    Acquired::Present(frame) => {
+                        if frame.is_some() || Instant::now() >= deadline {
+                            return Ok(frame);
+                        }
+                    }
                 }
             }
+        }
+
+        /// One `AcquireNextFrame`/`ReleaseFrame` pair, waiting at most
+        /// `timeout_ms` for a present.
+        fn acquire(&mut self, timeout_ms: u32) -> Result<Acquired> {
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            // SAFETY: both out-parameters are locals that outlive the call.
+            // On success the duplication owes this side exactly one
+            // ReleaseFrame, which every path below pays before returning.
+            match unsafe {
+                self.duplication
+                    .AcquireNextFrame(timeout_ms, &raw mut info, &raw mut resource)
+            } {
+                Ok(()) => {}
+                Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(Acquired::Nothing),
+                Err(e) => return Err(map_runtime_error(&e)),
+            }
+
+            let outcome = self.frame_from(resource.as_ref(), &info);
+
+            // SAFETY: balances the AcquireNextFrame above. It has to run on
+            // the failure paths too: an unreleased frame makes every later
+            // AcquireNextFrame fail with DXGI_ERROR_INVALID_CALL, turning one
+            // bad frame into a permanently dead capture.
+            let released = unsafe { self.duplication.ReleaseFrame() };
+
+            let frame = outcome?;
+            released.map_err(|e| map_runtime_error(&e))?;
+            Ok(Acquired::Present(frame))
+        }
+
+        /// The screen as it is now, for an encode loop that starts on this
+        /// duplication with nothing to show its guest yet
+        /// ([`ScreenCapturer::snapshot`]; ADR 0141).
+        ///
+        /// The duplication is asked first, without waiting. Nobody may have
+        /// polled it since the previous loop ended, and a lock screen, a UAC
+        /// prompt or a mode change in that gap has already invalidated it. A
+        /// GDI snapshot taken regardless fails on the secure desktop and
+        /// would end the new loop, where a poll meets
+        /// `DXGI_ERROR_ACCESS_LOST` and starts the secure-desktop recovery;
+        /// that error therefore comes back from here, for
+        /// `WindowsCapturer::snapshot` to start the recovery with. A present
+        /// waiting there is the screen as it is now and is handed out like
+        /// any frame. Only when there is none — the still screen this exists
+        /// for — is GDI asked, at the size the healthy duplication still
+        /// has.
+        ///
+        /// The GDI picture is recorded as the first frame's is — as the
+        /// cursor-free copy a pointer move is redrawn on, and as the hash —
+        /// so the poll after it does not repeat it, and on the zero-copy
+        /// path a pointer move over it hashes the same and stays a "no
+        /// change" rather than a CPU frame for the GPU encoder.
+        fn snapshot(&mut self) -> Result<Option<Frame>> {
+            // Freshly opened, so known good a moment ago: the poll that
+            // would answer next is the GDI first frame, and this is it.
+            if self.awaiting_first_frame {
+                return self.next_frame();
+            }
+            if let Acquired::Present(Some(frame)) = self.acquire(0)? {
+                return Ok(Some(frame));
+            }
+            let data = gdi_snapshot(
+                &self.device_name,
+                self.staging.width.cast_signed(),
+                self.staging.height.cast_signed(),
+            )?;
+            self.last_frame_data = Some(data.clone());
+            let data = self.with_cursor(data);
+            self.last_hash = Some(*blake3::hash(&data).as_bytes());
+            Ok(Some(self.cpu_frame(data)))
         }
 
         /// Turns an acquired desktop surface into an owned, tightly packed
@@ -771,19 +833,8 @@ mod dxgi {
         /// hashes the result and turns it into a [`Frame`], or `None` when
         /// §11.1's "identical to the previous one" holds even with the
         /// cursor included.
-        fn finish_frame(&mut self, mut data: Vec<u8>) -> Option<Frame> {
-            if self.embed_cursor
-                && let (Some(pos), Some(shape)) =
-                    (self.pointer_position, self.pointer_shape.as_ref())
-            {
-                composite_pointer(
-                    &mut data,
-                    self.staging.width,
-                    self.staging.height,
-                    pos,
-                    shape,
-                );
-            }
+        fn finish_frame(&mut self, data: Vec<u8>) -> Option<Frame> {
+            let data = self.with_cursor(data);
 
             // A present is not a change: Windows repaints regions that end up
             // pixel-identical (measured here - 13 consecutive presents, each
@@ -800,16 +851,38 @@ mod dxgi {
                 return None;
             }
             self.last_hash = Some(hash);
+            Some(self.cpu_frame(data))
+        }
 
+        /// `data` with the cached cursor composited on, if one is visible and
+        /// the guest is not drawing it itself.
+        fn with_cursor(&self, mut data: Vec<u8>) -> Vec<u8> {
+            if self.embed_cursor
+                && let (Some(pos), Some(shape)) =
+                    (self.pointer_position, self.pointer_shape.as_ref())
+            {
+                composite_pointer(
+                    &mut data,
+                    self.staging.width,
+                    self.staging.height,
+                    pos,
+                    shape,
+                );
+            }
+            data
+        }
+
+        /// A desktop image of the staging size as a main-memory [`Frame`].
+        fn cpu_frame(&self, data: Vec<u8>) -> Frame {
             let timestamp_us =
                 u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            Some(Frame::cpu(
+            Frame::cpu(
                 self.staging.width,
                 self.staging.height,
                 PixelFormat::Bgra8,
                 timestamp_us,
                 data,
-            ))
+            )
         }
 
         /// Hands the acquired desktop surface on as a GPU texture, without it
@@ -2439,15 +2512,30 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
             }
         }
 
-        fn refresh(&mut self) {
-            // Desktop Duplication only answers a present, and a still desktop
-            // may not present for minutes; the GDI snapshot a capture opens
-            // with is the one way to have the screen as it is now (ADR 0141).
-            // The hash goes too, or that snapshot of an unchanged screen
-            // would be dropped as the duplicate it is.
-            if let Some(active) = self.active.as_mut() {
-                active.awaiting_first_frame = true;
-                active.last_hash = None;
+        /// Desktop Duplication only answers a present, and a still desktop
+        /// may not present for minutes; GDI is the one way to have the screen
+        /// as it is now (ADR 0141), once the duplication has been checked
+        /// ([`Active::snapshot`]).
+        fn snapshot(&mut self) -> Option<Frame> {
+            let active = self.active.as_mut()?;
+            match active.snapshot() {
+                Ok(frame) => frame,
+                // Lost while no loop was polling it: dropped, and the reopen
+                // loop started, exactly as `next_frame` does, so the caller's
+                // first poll answers `SecureDesktopActive` and the guest gets
+                // the secure-desktop path (docs/bugs/11-uac-degradation.md,
+                // ADR 0049) rather than a stream that ends.
+                Err(MediaError::SecureDesktopActive(reason)) => {
+                    self.active = None;
+                    self.recovering = Some(Recovery::started(reason));
+                    None
+                }
+                // Anything else the caller's next poll meets the ordinary
+                // way: a snapshot is best effort and never ends a loop.
+                Err(error) => {
+                    tracing::debug!(%error, "no snapshot of the screen");
+                    None
+                }
             }
         }
 

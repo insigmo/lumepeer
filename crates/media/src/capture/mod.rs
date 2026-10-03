@@ -575,17 +575,30 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// draws nothing — two cursors is worse than one that lags.
     fn set_cursor_embedded(&mut self, _embedded: bool) {}
 
-    /// Makes the next [`Self::next_frame`] answer with the screen as it is
-    /// now, even if nothing on it changed since the last frame.
+    /// The screen as it is now, changed or not, handed to the one caller
+    /// that asks.
     ///
     /// For an encode loop that starts on a capture already running — the
     /// redial that replaces a stream, which software AV1 makes routine
     /// (ADR 0141) — whose guest has nothing to decode until a picture
     /// arrives, and on a still screen a backend that only reports changes
-    /// would otherwise send it nothing until something moves. Ignored by
-    /// default: a backend that cannot repeat its last picture without the
-    /// compositor sending a new one says nothing rather than pretending.
-    fn refresh(&mut self) {}
+    /// would otherwise send it nothing until something moves.
+    ///
+    /// The picture is returned, not queued for [`Self::next_frame`]: a
+    /// capture is shared by every viewer's loop, and a queued one went to
+    /// whichever loop polled first — a duplicate for a guest that already
+    /// had the screen, and still nothing for the one that asked. It counts
+    /// as delivered, as a polled frame does, so the asking loop's next poll
+    /// does not repeat it.
+    ///
+    /// Best effort: `None` when taking it failed, and the caller's next poll
+    /// meets whatever is wrong the ordinary way. A snapshot never ends a
+    /// loop by itself. `None` too by default: a backend that cannot repeat
+    /// its last picture without the compositor sending a new one says
+    /// nothing rather than pretending.
+    fn snapshot(&mut self) -> Option<Frame> {
+        None
+    }
 
     /// Every mode the monitor `target` names actually supports, for the
     /// host's own physical screen (docs/bugs/16-host-display-mode.md #1; D7
@@ -1179,15 +1192,16 @@ impl CaptureController {
         self.capturer.set_cursor_embedded(embedded);
     }
 
-    /// Asks the backend for the whole current screen on the next poll,
-    /// changed or not ([`ScreenCapturer::refresh`]; ADR 0141).
+    /// The whole current screen for the caller alone, changed or not
+    /// ([`ScreenCapturer::snapshot`]; ADR 0141).
     ///
     /// Gated on `capturing` like everything that touches pixels: with no
-    /// viewer there is no next poll to answer.
-    pub fn refresh(&mut self) {
-        if self.capturing {
-            self.capturer.refresh();
+    /// viewer there is no screen to hand out.
+    pub fn snapshot(&mut self) -> Option<Frame> {
+        if !self.capturing {
+            return None;
         }
+        self.capturer.snapshot()
     }
 
     /// Every mode the monitor this controller currently targets actually
@@ -1249,11 +1263,12 @@ mod tests {
 
     use super::*;
 
-    /// A capturer that counts the refreshes it is asked for.
+    /// A capturer that counts the snapshots it is asked for and answers
+    /// each with a one-pixel picture.
     #[derive(Debug)]
-    struct CountingRefreshes(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    struct CountingSnapshots(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-    impl ScreenCapturer for CountingRefreshes {
+    impl ScreenCapturer for CountingSnapshots {
         fn start(&mut self, _target: CaptureTarget) -> Result<()> {
             Ok(())
         }
@@ -1264,37 +1279,34 @@ mod tests {
         fn input_capability(&self) -> InputCapability {
             InputCapability::None
         }
-        fn refresh(&mut self) {
+        fn snapshot(&mut self) -> Option<Frame> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Frame::cpu(1, 1, PixelFormat::Bgra8, 0, vec![0; 4]))
         }
     }
 
-    /// ADR 0141: a refresh reaches the backend only while something is being
-    /// captured — like every other call that touches pixels.
+    /// ADR 0141: a snapshot reaches the backend only while something is
+    /// being captured — like every other call that touches pixels — and its
+    /// picture comes back to the caller.
     #[test]
-    fn a_refresh_reaches_the_backend_only_while_capturing() {
+    fn a_snapshot_reaches_the_backend_only_while_capturing() {
         use std::sync::atomic::Ordering;
-        let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let snapshots = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut controller = CaptureController::new(
-            Box::new(CountingRefreshes(std::sync::Arc::clone(&refreshes))),
+            Box::new(CountingSnapshots(std::sync::Arc::clone(&snapshots))),
             CaptureTarget::PrimaryDisplay,
         );
-        controller.refresh();
-        assert_eq!(
-            refreshes.load(Ordering::Relaxed),
-            0,
-            "refreshed with no viewer"
-        );
+        assert!(controller.snapshot().is_none(), "a picture with no viewer");
+        assert_eq!(snapshots.load(Ordering::Relaxed), 0);
         controller.add_viewer(peer(7)).unwrap();
-        controller.refresh();
-        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        assert!(controller.snapshot().is_some());
+        assert_eq!(snapshots.load(Ordering::Relaxed), 1);
         controller.remove_viewer(&peer(7));
-        controller.refresh();
-        assert_eq!(
-            refreshes.load(Ordering::Relaxed),
-            1,
-            "refreshed after the last viewer left"
+        assert!(
+            controller.snapshot().is_none(),
+            "a picture after the last viewer left"
         );
+        assert_eq!(snapshots.load(Ordering::Relaxed), 1);
     }
 
     /// gap-tasks/05: inside ChromeOS's container the host role is refused the

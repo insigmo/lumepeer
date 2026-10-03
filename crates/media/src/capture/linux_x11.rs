@@ -670,64 +670,12 @@ impl ScreenCapturer for X11Capturer {
             .active
             .as_mut()
             .ok_or_else(|| MediaError::CaptureUnavailable("capturer not started".to_owned()))?;
-
-        let reply = active
-            .connection
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                active.root,
-                active.origin_x,
-                active.origin_y,
-                active.width,
-                active.height,
-                ALL_PLANES,
-            )
-            .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?
-            .reply()
-            .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?;
-
-        // Read before the change check, because the pointer is part of what
-        // "changed" means: a cursor moving over an otherwise still screen is a
-        // picture the viewer sees change.
-        active.pointer = active.read_pointer();
-
-        let mut data = reply.data;
-        let mut hash = blake3::Hasher::new();
-        hash.update(&data);
-        if active.embed_cursor
-            && let Some(pointer) = &active.pointer
-        {
-            hash.update(&pointer.x.to_le_bytes());
-            hash.update(&pointer.y.to_le_bytes());
-            hash.update(&pointer.serial.to_le_bytes());
-        }
-        let hash = *hash.finalize().as_bytes();
+        let (data, hash) = active.grab()?;
         if active.last_hash == Some(hash) {
             return Ok(None);
         }
         active.last_hash = Some(hash);
-
-        if active.embed_cursor
-            && let Some(pointer) = &active.pointer
-        {
-            composite_pointer(
-                &mut data,
-                u32::from(active.width),
-                u32::from(active.height),
-                pointer,
-            );
-        }
-
-        let timestamp_us =
-            u64::try_from(active.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        Ok(Some(Frame::cpu(
-            u32::from(active.width),
-            u32::from(active.height),
-            // X11 TrueColor visuals hand back little-endian BGRX in Z_PIXMAP.
-            PixelFormat::Bgra8,
-            timestamp_us,
-            data,
-        )))
+        Ok(Some(active.frame(data)))
     }
 
     fn stop(&mut self) {
@@ -770,11 +718,19 @@ impl ScreenCapturer for X11Capturer {
         }
     }
 
-    fn refresh(&mut self) {
-        // Every poll grabs the whole screen anyway; forgetting the hash is
-        // what lets an unchanged one through (ADR 0141).
-        if let Some(active) = self.active.as_mut() {
-            active.last_hash = None;
+    fn snapshot(&mut self) -> Option<Frame> {
+        // Every poll grabs the whole screen anyway; this one skips the
+        // change check, and still records what it handed out (ADR 0141).
+        let active = self.active.as_mut()?;
+        match active.grab() {
+            Ok((data, hash)) => {
+                active.last_hash = Some(hash);
+                Some(active.frame(data))
+            }
+            Err(error) => {
+                tracing::debug!(%error, "no snapshot of the screen");
+                None
+            }
         }
     }
 
@@ -801,6 +757,66 @@ impl ScreenCapturer for X11Capturer {
 }
 
 impl Active {
+    /// One `GetImage` of the captured monitor, with the pointer read as it
+    /// is now, and the hash §11.1's change check compares.
+    ///
+    /// The pointer is read here, before any check, because it is part of
+    /// what "changed" means: a cursor moving over an otherwise still screen
+    /// is a picture the viewer sees change.
+    fn grab(&mut self) -> Result<(Vec<u8>, [u8; 32])> {
+        let reply = self
+            .connection
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                self.origin_x,
+                self.origin_y,
+                self.width,
+                self.height,
+                ALL_PLANES,
+            )
+            .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?
+            .reply()
+            .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?;
+        self.pointer = self.read_pointer();
+
+        let mut hash = blake3::Hasher::new();
+        hash.update(&reply.data);
+        if self.embed_cursor
+            && let Some(pointer) = &self.pointer
+        {
+            hash.update(&pointer.x.to_le_bytes());
+            hash.update(&pointer.y.to_le_bytes());
+            hash.update(&pointer.serial.to_le_bytes());
+        }
+        Ok((reply.data, *hash.finalize().as_bytes()))
+    }
+
+    /// Turns grabbed pixels into a [`Frame`], with the cursor drawn in when
+    /// the guest is not drawing it itself.
+    fn frame(&self, mut data: Vec<u8>) -> Frame {
+        if self.embed_cursor
+            && let Some(pointer) = &self.pointer
+        {
+            composite_pointer(
+                &mut data,
+                u32::from(self.width),
+                u32::from(self.height),
+                pointer,
+            );
+        }
+
+        let timestamp_us = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        Frame::cpu(
+            u32::from(self.width),
+            u32::from(self.height),
+            // X11 TrueColor visuals hand back little-endian BGRX in Z_PIXMAP.
+            PixelFormat::Bgra8,
+            timestamp_us,
+            data,
+        )
+    }
+
     /// The pointer as XFIXES has it, or `None` when the extension is missing,
     /// the cursor is hidden, or the reply does not describe a usable bitmap.
     ///
@@ -1790,12 +1806,12 @@ mod tests {
         assert!(capturer.next_frame().is_err());
     }
 
-    /// ADR 0141: an unchanged screen answers "no change" until it is asked
-    /// to refresh, and then once more with the whole picture — what a loop
-    /// that replaces another needs on a still desktop. Skipped without a
-    /// display, like the test above.
+    /// ADR 0141: on an unchanged screen, where a poll answers "no change", a
+    /// snapshot still hands over the whole picture — what a loop that
+    /// replaces another needs on a still desktop — and the poll after it
+    /// does not repeat it. Skipped without a display, like the test above.
     #[test]
-    fn a_refresh_repeats_an_unchanged_screen_once() {
+    fn a_snapshot_is_the_unchanged_screen_and_is_not_repeated() {
         let mut capturer = X11Capturer::new();
         if capturer.start(CaptureTarget::PrimaryDisplay).is_err() {
             return;
@@ -1811,14 +1827,15 @@ mod tests {
             eprintln!("skipping: the screen changed between two polls");
             return;
         }
-        capturer.refresh();
-        let repeated = capturer.next_frame().unwrap();
-        assert!(repeated.is_some(), "a refresh did not repeat the screen");
-        assert_eq!(repeated.unwrap().data, first.unwrap().data);
+        let snapshot = capturer.snapshot();
+        assert!(snapshot.is_some(), "no snapshot of a still screen");
+        assert_eq!(snapshot.unwrap().data, first.unwrap().data);
         assert!(
             capturer.next_frame().unwrap().is_none(),
-            "a refresh repeats once, not forever"
+            "the poll after a snapshot repeated the screen"
         );
+        capturer.stop();
+        assert!(capturer.snapshot().is_none(), "a snapshot with no capture");
     }
 
     /// Read-only: enumerates the primary monitor's real modes over `RandR`

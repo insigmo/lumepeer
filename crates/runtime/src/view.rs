@@ -1433,11 +1433,20 @@ fn spawn_encode_loop_with(
         };
         // The screen's own size, known before a single frame is taken where
         // the platform can say (ADR 0141). A software AV1 stream for a screen
-        // larger than it is chosen for ends here, before it has consumed the
-        // picture a freshly started capture hands out once: the guest
-        // redials, the actor reads the size from here, and the H.264 stream
-        // it gets is the one that receives that first picture.
-        if let Some(mode) = display_mode {
+        // larger than it is chosen for ends here, before it has taken a
+        // picture at all: the guest redials, the actor reads the size from
+        // here, and the H.264 stream it gets takes the snapshot below.
+        //
+        // Only while no frame has said otherwise: a display mode is the
+        // CRTC's, and an X11 monitor scaled with `xrandr --scale` or split
+        // with `--setmonitor` captures less than that. Read over a size the
+        // frames had already reported, it ended every software AV1 stream
+        // of a 1080p capture, and the H.264 stream's frames then put the
+        // real size back for the next preset to choose AV1 from again. A
+        // mode switched since is caught by the first frame below instead.
+        if let Some(mode) = display_mode
+            && control.captured_size().is_none()
+        {
             control.note_captured((mode.width, mode.height));
         }
         if software_av1
@@ -1454,10 +1463,16 @@ fn spawn_encode_loop_with(
         }
         // A loop that replaces another starts on a capture that is already
         // running and only reports changes, so on a still screen its guest
-        // would wait for something to move before seeing anything. Ask for
-        // the screen as it is now (ADR 0141).
+        // would wait for something to move before seeing anything. Take the
+        // screen as it is now, for this loop alone: the capture is shared,
+        // and a picture left for the next poll went to whichever viewer's
+        // loop polled first (ADR 0141). The first tick encodes it instead of
+        // polling.
         let shared = Arc::clone(&capture);
-        let _ = tokio::task::spawn_blocking(move || lock_capture(&shared).refresh()).await;
+        let mut snapshot = tokio::task::spawn_blocking(move || lock_capture(&shared).snapshot())
+            .await
+            .ok()
+            .flatten();
         // Whether this host keeps up with it, window by window (ADR 0141).
         let mut software_av1_watch = SoftwareAv1Watch::default();
         // The frame rate the encoder was built for, which a preset can move
@@ -1591,14 +1606,18 @@ fn spawn_encode_loop_with(
             // `next_frame` is a blocking platform call; it must not sit on a
             // tokio worker thread.
             let capture_started = Instant::now();
-            let (captured, waits_for_change) = match tokio::task::spawn_blocking(move || {
-                let mut capture = lock_capture(&shared);
-                (capture.next_frame(), capture.waits_for_change())
-            })
-            .await
-            {
-                Ok((captured, waits)) => (Ok(captured), waits),
-                Err(error) => (Err(error), false),
+            let (captured, waits_for_change) = if let Some(frame) = snapshot.take() {
+                (Ok(Ok(Some(frame))), false)
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    let mut capture = lock_capture(&shared);
+                    (capture.next_frame(), capture.waits_for_change())
+                })
+                .await
+                {
+                    Ok((captured, waits)) => (Ok(captured), waits),
+                    Err(error) => (Err(error), false),
+                }
             };
             let frame = match captured {
                 Ok(Ok(Some(frame))) => {
@@ -1753,8 +1772,10 @@ fn spawn_encode_loop_with(
             // display mode switched mid-session — ends this loop rather than
             // encoding something nobody measured: the guest redials, and the
             // actor, which now knows the size from `note_captured`, gives it
-            // H.264. The redial's loop asks the capture for a fresh picture,
-            // so this frame is not the guest's last chance at one.
+            // H.264. Where the backend can take a snapshot (Windows, X11)
+            // the redial's loop takes its own, so this frame is not the
+            // guest's last chance at one; on Wayland, which cannot, the
+            // H.264 stream waits for the screen to change.
             if software_av1 && picture_pixels(captured_size) > SOFTWARE_AV1_MAX_PIXELS {
                 tracing::info!(
                     peer = %tag,

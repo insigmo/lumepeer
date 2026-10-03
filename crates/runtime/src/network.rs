@@ -26498,11 +26498,14 @@ mod tests {
     }
 
     /// A screen that never changes, of `size`: one picture after the capture
-    /// starts and one after each [`ScreenCapturer::refresh`], nothing in
-    /// between — what a change-detecting backend gives on a still desktop.
+    /// starts, nothing on the polls after it — what a change-detecting
+    /// backend gives on a still desktop — and one for every
+    /// [`ScreenCapturer::snapshot`] where the platform takes them (Windows,
+    /// X11), which counts as that first picture if no poll took it yet.
     /// `reports_mode` is whether it can say its size before the first frame
-    /// (Windows, X11) or not (Wayland); `refreshes` whether it can repeat a
-    /// picture on request (Windows, X11) or not (Wayland).
+    /// (Windows, X11) or not (Wayland), and `mode` a display mode that
+    /// differs from what it captures. `pictures` counts every picture it
+    /// hands out, polled or snapshot.
     #[cfg(feature = "encode-aom")]
     #[derive(Debug)]
     #[allow(
@@ -26514,19 +26517,58 @@ mod tests {
         fresh: bool,
         size: (u32, u32),
         reports_mode: bool,
-        refreshes: bool,
+        mode: Option<(u32, u32)>,
+        snapshots: bool,
+        pictures: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(feature = "encode-aom")]
     impl StillCapturer {
-        fn new(size: (u32, u32), reports_mode: bool, refreshes: bool) -> Self {
+        fn new(size: (u32, u32), reports_mode: bool, snapshots: bool) -> Self {
             Self {
                 running: false,
                 fresh: false,
                 size,
                 reports_mode,
-                refreshes,
+                mode: None,
+                snapshots,
+                pictures: Arc::default(),
             }
+        }
+
+        /// The same capturer, reporting a display mode of `size` while it
+        /// captures its own: an X11 monitor whose CRTC runs a larger mode
+        /// than the area captured, under `xrandr --scale`.
+        fn with_mode(mut self, size: (u32, u32)) -> Self {
+            self.mode = Some(size);
+            self
+        }
+
+        /// The same capturer, counting the pictures it hands out into
+        /// `pictures`.
+        fn counting(mut self, pictures: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            self.pictures = Arc::clone(pictures);
+            self
+        }
+
+        fn picture(&self) -> Frame {
+            self.pictures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (width, height) = self.size;
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let value = u8::try_from((x / 8 + y / 8) % 256).unwrap();
+                    data.extend_from_slice(&[value, 0x80, 255 - value, 255]);
+                }
+            }
+            Frame::cpu(
+                width,
+                height,
+                lumepeer_media::capture::PixelFormat::Bgra8,
+                0,
+                data,
+            )
         }
     }
 
@@ -26547,37 +26589,26 @@ mod tests {
                 return Ok(None);
             }
             self.fresh = false;
-            let (width, height) = self.size;
-            let mut data = Vec::with_capacity((width * height * 4) as usize);
-            for y in 0..height {
-                for x in 0..width {
-                    let value = u8::try_from((x / 8 + y / 8) % 256).unwrap();
-                    data.extend_from_slice(&[value, 0x80, 255 - value, 255]);
-                }
-            }
-            Ok(Some(Frame::cpu(
-                width,
-                height,
-                lumepeer_media::capture::PixelFormat::Bgra8,
-                0,
-                data,
-            )))
+            Ok(Some(self.picture()))
         }
 
-        fn refresh(&mut self) {
-            if self.refreshes {
-                self.fresh = true;
+        fn snapshot(&mut self) -> Option<Frame> {
+            if !(self.running && self.snapshots) {
+                return None;
             }
+            self.fresh = false;
+            Some(self.picture())
         }
 
         fn current_display_mode(
             &self,
             _target: CaptureTarget,
         ) -> Option<lumepeer_media::capture::DisplayMode> {
+            let (width, height) = self.mode.unwrap_or(self.size);
             self.reports_mode
                 .then_some(lumepeer_media::capture::DisplayMode {
-                    width: self.size.0,
-                    height: self.size.1,
+                    width,
+                    height,
                     refresh_hz: 60,
                 })
         }
@@ -26626,25 +26657,9 @@ mod tests {
         (host, guest, peer_label, vec![host_endpoint, guest_endpoint])
     }
 
-    /// Every codec byte the guest's window is handed frames in over `span`.
-    #[cfg(feature = "encode-aom")]
-    async fn codecs_seen(guest: &ActorHandle, label: &str, span: Duration) -> Vec<u8> {
-        let deadline = tokio::time::Instant::now() + span;
-        let mut seen = Vec::new();
-        while tokio::time::Instant::now() < deadline {
-            let chunk = guest.view_chunk(label, false).await.unwrap();
-            if let (byte, Some(_)) = chunk_codec(&chunk)
-                && !seen.contains(&byte)
-            {
-                seen.push(byte);
-            }
-        }
-        seen
-    }
-
     /// ADR 0141: a preset change restarts the stream in the other codec, and
     /// on a screen that does not change at all the new stream still opens
-    /// with a picture — the loop asks the capture for the screen as it is
+    /// with a picture — the loop takes a snapshot of the screen as it is
     /// now. Without that the guest sat on "reconnecting" until something on
     /// the host moved.
     #[cfg(feature = "encode-aom")]
@@ -26676,51 +26691,109 @@ mod tests {
     }
 
     /// ADR 0141: a screen above 1080p whose size the platform reports gets
-    /// H.264 from its very first picture — the software AV1 stream the actor
-    /// chose before it knew the size ends before taking a frame — and a
-    /// later `quality` preset does not move it back to AV1, though its
-    /// H.264 stream never captured a frame of its own to learn the size from.
+    /// H.264 from its very first picture: the software AV1 stream the actor
+    /// chose before it knew the size ends before taking one, so the only
+    /// picture of the still screen is the snapshot the H.264 stream that
+    /// replaces it takes. A later `quality` preset then leaves the host on
+    /// H.264, restarting nothing.
     #[cfg(feature = "encode-aom")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_screen_above_1080p_is_h264_from_its_first_picture_and_stays_there() {
+        use std::sync::atomic::Ordering;
         if !(software_av1::built() && software_av1::cpu_supported())
             || hardware_encodes(VideoCodec::Av1)
         {
             eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
             return;
         }
-        let (_host, guest, label, _endpoints) =
-            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), true, true))).await;
+        let pictures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (host, guest, label, _endpoints) = software_av1_pair(Box::new(
+            StillCapturer::new((2560, 1440), true, true).counting(&pictures),
+        ))
+        .await;
         let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
         assert!(keyframe && (unit.starts_with(&[0, 0, 0, 1]) || unit.starts_with(&[0, 0, 1])));
+        assert_eq!(
+            pictures.load(Ordering::Relaxed),
+            1,
+            "the software AV1 stream took a picture before it ended"
+        );
         guest
             .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
             .await
             .unwrap();
-        let seen = codecs_seen(&guest, &label, Duration::from_secs(2)).await;
-        assert!(
-            !seen.contains(&MediaCodec::Av1.to_wire()),
-            "a 1440p screen was restarted into software AV1: {seen:?}"
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(
+                host_codec(&host).await,
+                Some(MediaCodec::H264),
+                "the quality preset moved a 1440p screen to software AV1"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            pictures.load(Ordering::Relaxed),
+            1,
+            "the quality preset restarted the stream"
         );
     }
 
-    /// ADR 0141: where the platform cannot say the size before the first
-    /// frame (Wayland), the software AV1 stream finds out from that frame and
-    /// ends; the H.264 stream that replaces it still gets a picture of the
-    /// unchanged screen.
+    /// ADR 0141: where the size is not known before the first frame but a
+    /// snapshot can be taken — a display-mode query that answers nothing, as
+    /// on an X server without `RandR` — the software AV1 stream finds out
+    /// from its picture and ends, and the H.264 stream that replaces it
+    /// takes a snapshot of its own of the unchanged screen. Wayland, which
+    /// can do neither, is `the_screen_size_outlives_a_redial_that_captures_nothing`.
     #[cfg(feature = "encode-aom")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_screen_above_1080p_sized_only_by_its_first_frame_still_reaches_the_guest() {
+    async fn a_screen_above_1080p_found_by_its_first_frame_still_reaches_the_guest() {
+        use std::sync::atomic::Ordering;
         if !(software_av1::built() && software_av1::cpu_supported())
             || hardware_encodes(VideoCodec::Av1)
         {
             eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
             return;
         }
-        let (_host, guest, label, _endpoints) =
-            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), false, true))).await;
+        let pictures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_host, guest, label, _endpoints) = software_av1_pair(Box::new(
+            StillCapturer::new((2560, 1440), false, true).counting(&pictures),
+        ))
+        .await;
         let (keyframe, _unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
         assert!(keyframe);
+        assert_eq!(
+            pictures.load(Ordering::Relaxed),
+            2,
+            "one picture for the stream that ended, one for its replacement"
+        );
+    }
+
+    /// ADR 0141: a display mode larger than what is captured — an X11
+    /// monitor scaled with `xrandr --scale`, whose CRTC runs 4K for a 1080p
+    /// screen — sizes only a stream with no picture to go by. Once a frame
+    /// has said 1080p, the `quality` preset's software AV1 stream runs; read
+    /// over that size, the mode ended every one of them, and the guest
+    /// bounced back to H.264 on each preset.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_display_mode_larger_than_the_capture_does_not_outrank_its_frames() {
+        if !(software_av1::built() && software_av1::cpu_supported())
+            || hardware_encodes(VideoCodec::Av1)
+        {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return;
+        }
+        let (_host, guest, label, _endpoints) = software_av1_pair(Box::new(
+            StillCapturer::new((1920, 1080), true, true).with_mode((3840, 2160)),
+        ))
+        .await;
+        // No picture yet, so the mode sizes the first stream: H.264.
+        assert!(first_frame_in(&guest, &label, MediaCodec::H264).await.0);
+        guest
+            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
+            .await
+            .unwrap();
+        assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
     }
 
     /// The codec the host's own diagnostics name for its one guest.
