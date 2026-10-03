@@ -575,6 +575,18 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     /// draws nothing — two cursors is worse than one that lags.
     fn set_cursor_embedded(&mut self, _embedded: bool) {}
 
+    /// Makes the next [`Self::next_frame`] answer with the screen as it is
+    /// now, even if nothing on it changed since the last frame.
+    ///
+    /// For an encode loop that starts on a capture already running — the
+    /// redial that replaces a stream, which software AV1 makes routine
+    /// (ADR 0141) — whose guest has nothing to decode until a picture
+    /// arrives, and on a still screen a backend that only reports changes
+    /// would otherwise send it nothing until something moves. Ignored by
+    /// default: a backend that cannot repeat its last picture without the
+    /// compositor sending a new one says nothing rather than pretending.
+    fn refresh(&mut self) {}
+
     /// Every mode the monitor `target` names actually supports, for the
     /// host's own physical screen (docs/bugs/16-host-display-mode.md #1; D7
     /// point 2).
@@ -1167,6 +1179,17 @@ impl CaptureController {
         self.capturer.set_cursor_embedded(embedded);
     }
 
+    /// Asks the backend for the whole current screen on the next poll,
+    /// changed or not ([`ScreenCapturer::refresh`]; ADR 0141).
+    ///
+    /// Gated on `capturing` like everything that touches pixels: with no
+    /// viewer there is no next poll to answer.
+    pub fn refresh(&mut self) {
+        if self.capturing {
+            self.capturer.refresh();
+        }
+    }
+
     /// Every mode the monitor this controller currently targets actually
     /// supports (docs/bugs/16-host-display-mode.md #1).
     ///
@@ -1225,6 +1248,54 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// A capturer that counts the refreshes it is asked for.
+    #[derive(Debug)]
+    struct CountingRefreshes(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ScreenCapturer for CountingRefreshes {
+        fn start(&mut self, _target: CaptureTarget) -> Result<()> {
+            Ok(())
+        }
+        fn next_frame(&mut self) -> Result<Option<Frame>> {
+            Ok(None)
+        }
+        fn stop(&mut self) {}
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::None
+        }
+        fn refresh(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// ADR 0141: a refresh reaches the backend only while something is being
+    /// captured — like every other call that touches pixels.
+    #[test]
+    fn a_refresh_reaches_the_backend_only_while_capturing() {
+        use std::sync::atomic::Ordering;
+        let refreshes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut controller = CaptureController::new(
+            Box::new(CountingRefreshes(std::sync::Arc::clone(&refreshes))),
+            CaptureTarget::PrimaryDisplay,
+        );
+        controller.refresh();
+        assert_eq!(
+            refreshes.load(Ordering::Relaxed),
+            0,
+            "refreshed with no viewer"
+        );
+        controller.add_viewer(peer(7)).unwrap();
+        controller.refresh();
+        assert_eq!(refreshes.load(Ordering::Relaxed), 1);
+        controller.remove_viewer(&peer(7));
+        controller.refresh();
+        assert_eq!(
+            refreshes.load(Ordering::Relaxed),
+            1,
+            "refreshed after the last viewer left"
+        );
+    }
 
     /// gap-tasks/05: inside ChromeOS's container the host role is refused the
     /// way a missing backend is, so the honest "no picture" path runs instead

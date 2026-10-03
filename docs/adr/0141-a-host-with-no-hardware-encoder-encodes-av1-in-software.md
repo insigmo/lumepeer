@@ -88,11 +88,16 @@ fails is logged as the reason):
    its session runs at 30 (section 3).
 3. **The captured picture** is at most 1920×1080 pixels
    (`SOFTWARE_AV1_MAX_PIXELS`) — by count, so a portrait 1080×1920 qualifies
-   and a 16:10 1920×1200 does not. The size is what the peer's previous encode
-   loop last captured, before any reduction for the guest's window. A first
-   session has no previous loop and counts as fitting; if the screen turns out
-   larger, the encode loop ends the stream at its first frame and the guest's
-   redial, half a second later, is chosen for with the size known — H.264.
+   and a 16:10 1920×1200 does not. The size is what the peer's last stream
+   learned: the display's own size when that stream's loop started, where the
+   platform can say (Windows, X11), else its last captured picture, before any
+   reduction for the guest's window — and it is carried into each new stream,
+   so it survives redials onto a screen that never changes. A first session
+   knows no size and counts as fitting. A software AV1 stream for a larger
+   screen ends at once: before taking a single frame where the display mode is
+   known, at its first frame where it is not (Wayland). The guest's redial,
+   half a second later, is chosen for with the size known — H.264 — and opens
+   with a picture (section 3).
 
 Anything else is H.264.
 
@@ -111,6 +116,14 @@ to `quality` moves it back to AV1 the same way. The guest keeps its last
 picture under "reconnecting" for the half second in between. The same path
 moves a session that started on H.264 because its host had not finished
 measuring yet, when its preset arrives.
+
+A capture that only reports changes would leave that redial with nothing to
+send on a still screen — the guest under "reconnecting" until something on
+the host moved. So every encode loop asks the capture for the screen as it is
+now when it starts (`ScreenCapturer::refresh`): Desktop Duplication takes the
+GDI snapshot a capture opens with, X11 forgets its last hash. The `PipeWire`
+portal cannot repeat a picture the compositor does not send again, and keeps
+the default, which does nothing.
 
 ### 4. The bitrate target
 
@@ -173,6 +186,10 @@ only, and the vendored libaom's build refuses any other target.
   from source with `cmake`, statically, realtime-only (as WebRTC builds it),
   encoder only, with runtime CPU detection — and the result encodes byte for
   byte what the untrimmed release does.
+- **Built only when asked for.** `lumepeer-aom-sys` is a workspace member, and
+  `cargo build --workspace` must keep needing no platform SDK on any
+  platform, so its build script does nothing without its `vendored` feature,
+  which `encode-aom` turns on.
 - **The build fails without nasm.** `openh264-sys2` quietly drops its assembly
   when it cannot find one, which stage 1 timed at four to eight times slower.
   `lumepeer-aom-sys` looks for nasm itself, stops with the reason when there is
@@ -214,7 +231,12 @@ the comment always said.
   connection beat the six-second measurement, and the guest named its preset
   before the measurement finished too. The next session gets AV1.
 - A host with a screen above 1080p and an AV1 guest loses about half a second
-  at the start of each session while the first stream finds out.
+  at the start of each session while the first stream finds out — without
+  losing the picture: on Windows and X11 that stream ends before it captures
+  anything, and the H.264 stream that replaces it asks for a fresh one anyway.
+- Every new encode loop costs the capture one full picture of the screen as it
+  is, changed or not — on Windows a GDI snapshot. A redial was already the
+  rare case; it is still not a per-frame cost.
 - The measurement costs every host that builds `encode-aom`, has AVX2 and no
   hardware encoder about five core-seconds of CPU over six of wall time, once per
   process, the first time a guest that decodes AV1 connects.
@@ -246,6 +268,11 @@ the comment always said.
 - **A live pair on Windows**, and on beta: the end-to-end test runs a host and
   a guest in one process with the real libaom (`a_host_without_hardware_streams_software_av1_and_follows_the_preset`),
   but no two real windows have yet shown each other an AV1 picture from it.
+- **Wayland after a restart.** A preset change, or a stream that ends for a
+  screen above 1080p, restarts the stream; on a Wayland host whose screen does
+  not change the new stream has nothing to send until the compositor sends a
+  new buffer, since the `PipeWire` path cannot repeat its last picture without
+  keeping a copy of every frame.
 - **Games against the 22 ms.** On beta at the `quality` preset's 4 Mbit/s of
   AV1 a game measured 23.2 ms at p95: inside "no worse than `openh264`" by a
   wide margin, 1.2 ms outside the absolute half of the threshold. The

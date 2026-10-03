@@ -9655,6 +9655,12 @@ impl Actor {
             .contains(&peer)
             .then(|| self.cursors_tx.clone());
         let control = EncodeControl::new(peer, cursors);
+        // What the stream this one replaces knew about the screen, kept for
+        // the next choice too: a redial onto a screen that does not change
+        // may never capture a frame to learn it from (ADR 0141).
+        if let Some(size) = captured {
+            control.note_captured(size);
+        }
         // What the guest already asked of this session's picture, before this
         // connection existed (ADR 0119). The window says it once; this loop
         // may be the second or the tenth to serve it.
@@ -26488,6 +26494,274 @@ mod tests {
 
         fn input_capability(&self) -> InputCapability {
             InputCapability::None
+        }
+    }
+
+    /// A screen that never changes, of `size`: one picture after the capture
+    /// starts and one after each [`ScreenCapturer::refresh`], nothing in
+    /// between — what a change-detecting backend gives on a still desktop.
+    /// `reports_mode` is whether it can say its size before the first frame
+    /// (Windows, X11) or not (Wayland); `refreshes` whether it can repeat a
+    /// picture on request (Windows, X11) or not (Wayland).
+    #[cfg(feature = "encode-aom")]
+    #[derive(Debug)]
+    struct StillCapturer {
+        running: bool,
+        fresh: bool,
+        size: (u32, u32),
+        reports_mode: bool,
+        refreshes: bool,
+    }
+
+    #[cfg(feature = "encode-aom")]
+    impl StillCapturer {
+        fn new(size: (u32, u32), reports_mode: bool, refreshes: bool) -> Self {
+            Self {
+                running: false,
+                fresh: false,
+                size,
+                reports_mode,
+                refreshes,
+            }
+        }
+    }
+
+    #[cfg(feature = "encode-aom")]
+    impl ScreenCapturer for StillCapturer {
+        fn start(&mut self, _target: CaptureTarget) -> MediaResult<()> {
+            self.running = true;
+            self.fresh = true;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> MediaResult<Option<Frame>> {
+            if !self.running {
+                return Err(MediaError::CaptureUnavailable("stopped".to_owned()));
+            }
+            if !self.fresh {
+                std::thread::sleep(Duration::from_millis(5));
+                return Ok(None);
+            }
+            self.fresh = false;
+            let (width, height) = self.size;
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let value = u8::try_from((x / 8 + y / 8) % 256).unwrap();
+                    data.extend_from_slice(&[value, 0x80, 255 - value, 255]);
+                }
+            }
+            Ok(Some(Frame::cpu(
+                width,
+                height,
+                lumepeer_media::capture::PixelFormat::Bgra8,
+                0,
+                data,
+            )))
+        }
+
+        fn refresh(&mut self) {
+            if self.refreshes {
+                self.fresh = true;
+            }
+        }
+
+        fn current_display_mode(
+            &self,
+            _target: CaptureTarget,
+        ) -> Option<lumepeer_media::capture::DisplayMode> {
+            self.reports_mode
+                .then_some(lumepeer_media::capture::DisplayMode {
+                    width: self.size.0,
+                    height: self.size.1,
+                    refresh_hz: 60,
+                })
+        }
+
+        fn stop(&mut self) {
+            self.running = false;
+        }
+
+        fn input_capability(&self) -> InputCapability {
+            InputCapability::None
+        }
+    }
+
+    /// A host with software AV1 ready, capturing through `capturer`, and a
+    /// guest that decodes AV1 watching it; returns both and the label the
+    /// guest knows the host by.
+    #[cfg(feature = "encode-aom")]
+    async fn software_av1_pair(
+        capturer: Box<dyn ScreenCapturer>,
+    ) -> (ActorHandle, ActorHandle, String, Vec<PeerEndpoint>) {
+        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(CaptureController::new(
+            capturer,
+            CaptureTarget::PrimaryDisplay,
+        )));
+        let mut media = test_media(&capture);
+        media.software_av1 = measured_and_ready;
+        let (host, host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        guest
+            .report_decoder_codecs(vec![MediaCodec::H264.to_wire(), MediaCodec::Av1.to_wire()])
+            .await
+            .unwrap();
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label, Role::ViewOnly).await.unwrap();
+        wait_until("no view window was opened", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
+        (host, guest, peer_label, vec![host_endpoint, guest_endpoint])
+    }
+
+    /// Every codec byte the guest's window is handed frames in over `span`.
+    #[cfg(feature = "encode-aom")]
+    async fn codecs_seen(guest: &ActorHandle, label: &str, span: Duration) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + span;
+        let mut seen = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let chunk = guest.view_chunk(label, false).await.unwrap();
+            if let (byte, Some(_)) = chunk_codec(&chunk)
+                && !seen.contains(&byte)
+            {
+                seen.push(byte);
+            }
+        }
+        seen
+    }
+
+    /// ADR 0141: a preset change restarts the stream in the other codec, and
+    /// on a screen that does not change at all the new stream still opens
+    /// with a picture — the loop asks the capture for the screen as it is
+    /// now. Without that the guest sat on "reconnecting" until something on
+    /// the host moved.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restart_on_a_still_screen_still_shows_the_guest_a_picture() {
+        if !(software_av1::built() && software_av1::cpu_supported())
+            || hardware_encodes(VideoCodec::Av1)
+        {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return;
+        }
+        let (_host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(StillCapturer::new((640, 360), true, true))).await;
+        guest
+            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
+            .await
+            .unwrap();
+        assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
+        guest
+            .set_stream_scale(label.clone(), 100, 60)
+            .await
+            .unwrap();
+        assert!(first_frame_in(&guest, &label, MediaCodec::H264).await.0);
+        guest
+            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
+            .await
+            .unwrap();
+        assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
+    }
+
+    /// ADR 0141: a screen above 1080p whose size the platform reports gets
+    /// H.264 from its very first picture — the software AV1 stream the actor
+    /// chose before it knew the size ends before taking a frame — and a
+    /// later `quality` preset does not move it back to AV1, though its
+    /// H.264 stream never captured a frame of its own to learn the size from.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_screen_above_1080p_is_h264_from_its_first_picture_and_stays_there() {
+        if !(software_av1::built() && software_av1::cpu_supported())
+            || hardware_encodes(VideoCodec::Av1)
+        {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return;
+        }
+        let (_host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), true, true))).await;
+        let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
+        assert!(keyframe && (unit.starts_with(&[0, 0, 0, 1]) || unit.starts_with(&[0, 0, 1])));
+        guest
+            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
+            .await
+            .unwrap();
+        let seen = codecs_seen(&guest, &label, Duration::from_secs(2)).await;
+        assert!(
+            !seen.contains(&MediaCodec::Av1.to_wire()),
+            "a 1440p screen was restarted into software AV1: {seen:?}"
+        );
+    }
+
+    /// ADR 0141: where the platform cannot say the size before the first
+    /// frame (Wayland), the software AV1 stream finds out from that frame and
+    /// ends; the H.264 stream that replaces it still gets a picture of the
+    /// unchanged screen.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_screen_above_1080p_sized_only_by_its_first_frame_still_reaches_the_guest() {
+        if !(software_av1::built() && software_av1::cpu_supported())
+            || hardware_encodes(VideoCodec::Av1)
+        {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return;
+        }
+        let (_host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), false, true))).await;
+        let (keyframe, _unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
+        assert!(keyframe);
+    }
+
+    /// The codec the host's own diagnostics name for its one guest.
+    #[cfg(feature = "encode-aom")]
+    async fn host_codec(host: &ActorHandle) -> Option<MediaCodec> {
+        host.connection_stats()
+            .await
+            .unwrap()
+            .first()
+            .and_then(|stats| stats.codec)
+    }
+
+    /// ADR 0141: once a stream has learned the screen is above 1080p, the
+    /// size outlives the redial — even onto a stream that never captures a
+    /// frame of its own, as on a Wayland host whose screen does not change —
+    /// so a later `quality` preset does not restart it into software AV1.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_screen_size_outlives_a_redial_that_captures_nothing() {
+        if !(software_av1::built() && software_av1::cpu_supported())
+            || hardware_encodes(VideoCodec::Av1)
+        {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return;
+        }
+        let (host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), false, false))).await;
+        // The first stream is AV1 until its first frame says 1440p; the
+        // redial is H.264 and, on this screen, never gets a frame.
+        wait_until_async("the host never settled on H.264", || async {
+            host_codec(&host).await == Some(MediaCodec::H264)
+        })
+        .await;
+        guest
+            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(
+                host_codec(&host).await,
+                Some(MediaCodec::H264),
+                "the quality preset moved a 1440p screen to software AV1"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 

@@ -770,6 +770,14 @@ impl ScreenCapturer for X11Capturer {
         }
     }
 
+    fn refresh(&mut self) {
+        // Every poll grabs the whole screen anyway; forgetting the hash is
+        // what lets an unchanged one through (ADR 0141).
+        if let Some(active) = self.active.as_mut() {
+            active.last_hash = None;
+        }
+    }
+
     fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
         display_modes_for(target)
     }
@@ -1780,6 +1788,37 @@ mod tests {
 
         capturer.stop();
         assert!(capturer.next_frame().is_err());
+    }
+
+    /// ADR 0141: an unchanged screen answers "no change" until it is asked
+    /// to refresh, and then once more with the whole picture — what a loop
+    /// that replaces another needs on a still desktop. Skipped without a
+    /// display, like the test above.
+    #[test]
+    fn a_refresh_repeats_an_unchanged_screen_once() {
+        let mut capturer = X11Capturer::new();
+        if capturer.start(CaptureTarget::PrimaryDisplay).is_err() {
+            return;
+        }
+        let first = capturer.next_frame().unwrap();
+        assert!(
+            first.is_some(),
+            "the first frame after start cannot be a duplicate"
+        );
+        // A screen nothing draws on: Xvfb, or a desktop nobody touches for
+        // the length of two polls. Anything else is not this test's case.
+        if capturer.next_frame().unwrap().is_some() {
+            eprintln!("skipping: the screen changed between two polls");
+            return;
+        }
+        capturer.refresh();
+        let repeated = capturer.next_frame().unwrap();
+        assert!(repeated.is_some(), "a refresh did not repeat the screen");
+        assert_eq!(repeated.unwrap().data, first.unwrap().data);
+        assert!(
+            capturer.next_frame().unwrap().is_none(),
+            "a refresh repeats once, not forever"
+        );
     }
 
     /// Read-only: enumerates the primary monitor's real modes over `RandR`

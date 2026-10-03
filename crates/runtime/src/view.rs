@@ -202,8 +202,11 @@ impl EncodeControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records the size of a picture the loop just captured.
-    fn note_captured(&self, size: (u32, u32)) {
+    /// Records the size of the screen this session shows: the display's own
+    /// size when a loop starts, each captured picture's after that, and —
+    /// from the actor — what the stream this one replaced last knew, so the
+    /// size survives a chain of redials on a screen that never changes.
+    pub(crate) fn note_captured(&self, size: (u32, u32)) {
         *self
             .captured_size
             .lock()
@@ -1394,13 +1397,12 @@ fn spawn_encode_loop_with(
         // a blocking thread because on X11 the question is a new connection
         // to the server.
         let shared = Arc::clone(&capture);
-        let max_fps = ceiling_fps(
+        let display_mode =
             tokio::task::spawn_blocking(move || lock_capture(&shared).current_display_mode())
                 .await
                 .ok()
-                .flatten()
-                .map(|mode| mode.refresh_hz),
-        );
+                .flatten();
+        let max_fps = ceiling_fps(display_mode.map(|mode| mode.refresh_hz));
         let mut encoder = match build_encoder(EncoderConfig {
             codec,
             fps: max_fps,
@@ -1429,6 +1431,33 @@ fn spawn_encode_loop_with(
         } else {
             max_fps
         };
+        // The screen's own size, known before a single frame is taken where
+        // the platform can say (ADR 0141). A software AV1 stream for a screen
+        // larger than it is chosen for ends here, before it has consumed the
+        // picture a freshly started capture hands out once: the guest
+        // redials, the actor reads the size from here, and the H.264 stream
+        // it gets is the one that receives that first picture.
+        if let Some(mode) = display_mode {
+            control.note_captured((mode.width, mode.height));
+        }
+        if software_av1
+            && let Some(size) = control.captured_size()
+            && picture_pixels(size) > SOFTWARE_AV1_MAX_PIXELS
+        {
+            tracing::info!(
+                peer = %tag,
+                width = size.0,
+                height = size.1,
+                "the screen is larger than software AV1 is chosen for; ending this stream so the guest redials into H.264"
+            );
+            return;
+        }
+        // A loop that replaces another starts on a capture that is already
+        // running and only reports changes, so on a still screen its guest
+        // would wait for something to move before seeing anything. Ask for
+        // the screen as it is now (ADR 0141).
+        let shared = Arc::clone(&capture);
+        let _ = tokio::task::spawn_blocking(move || lock_capture(&shared).refresh()).await;
         // Whether this host keeps up with it, window by window (ADR 0141).
         let mut software_av1_watch = SoftwareAv1Watch::default();
         // The frame rate the encoder was built for, which a preset can move
@@ -1719,11 +1748,13 @@ fn spawn_encode_loop_with(
             let captured_size = (frame.width, frame.height);
             control.note_captured(captured_size);
             // Software AV1 is chosen for a picture of at most 1080p (ADR
-            // 0141). A screen that is larger — a first session the actor
-            // could not size yet, or a display mode switched mid-session —
-            // ends this loop rather than encoding something nobody measured:
-            // the guest redials, and the actor, which now knows the size
-            // from `note_captured`, gives it H.264.
+            // 0141). A screen that turns out larger — one whose platform
+            // could not say so before the first frame (Wayland), or a
+            // display mode switched mid-session — ends this loop rather than
+            // encoding something nobody measured: the guest redials, and the
+            // actor, which now knows the size from `note_captured`, gives it
+            // H.264. The redial's loop asks the capture for a fresh picture,
+            // so this frame is not the guest's last chance at one.
             if software_av1 && picture_pixels(captured_size) > SOFTWARE_AV1_MAX_PIXELS {
                 tracing::info!(
                     peer = %tag,

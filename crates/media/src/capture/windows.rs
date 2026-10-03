@@ -2439,6 +2439,18 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
             }
         }
 
+        fn refresh(&mut self) {
+            // Desktop Duplication only answers a present, and a still desktop
+            // may not present for minutes; the GDI snapshot a capture opens
+            // with is the one way to have the screen as it is now (ADR 0141).
+            // The hash goes too, or that snapshot of an unchanged screen
+            // would be dropped as the duplicate it is.
+            if let Some(active) = self.active.as_mut() {
+                active.awaiting_first_frame = true;
+                active.last_hash = None;
+            }
+        }
+
         fn display_modes(&self, target: CaptureTarget) -> Vec<crate::capture::DisplayMode> {
             Self::display_modes_for(target)
         }
