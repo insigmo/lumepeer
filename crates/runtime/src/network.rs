@@ -26505,6 +26505,10 @@ mod tests {
     /// picture on request (Windows, X11) or not (Wayland).
     #[cfg(feature = "encode-aom")]
     #[derive(Debug)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "two of them are the capture's state and two are which platform it stands for; a test double, not a state machine"
+    )]
     struct StillCapturer {
         running: bool,
         fresh: bool,
