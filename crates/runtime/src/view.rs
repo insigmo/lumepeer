@@ -2067,13 +2067,12 @@ enum SoftwareAv1Verdict {
 /// [`SOFTWARE_AV1_WATCH_FRAMES`] encoded frames, against the frame interval
 /// at [`SOFTWARE_AV1_MAX_FPS`].
 ///
-/// The interval, not the 22 ms the measurement held the host to before
-/// choosing it: that threshold was about whether to offer software AV1 at
-/// all. In a session the only question left is whether it can keep the frame
-/// rate — and on the reference host a game took 22–27 ms a frame in software
-/// AV1 against 31–67 ms in `openh264`, which drops 40% of a game's frames
-/// besides, so falling back on anything stricter would hand such a session to
-/// the encoder that does worse.
+/// The interval, the same line the measurement holds the host to before
+/// choosing it (ADR 0142). In a session the only question left is whether it
+/// can keep the frame rate — and on the reference host a game took 22–27 ms a
+/// frame in software AV1 against 31–67 ms in `openh264`, which drops 40% of a
+/// game's frames besides, so falling back on anything stricter would hand such
+/// a session to the encoder that does worse.
 #[derive(Debug, Default)]
 struct SoftwareAv1Watch {
     window: Vec<Duration>,

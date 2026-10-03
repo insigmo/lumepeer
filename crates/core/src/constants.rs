@@ -753,10 +753,13 @@ pub const SOFTWARE_AV1_MAX_THREADS: usize = 8;
 /// software AV1 encoder may take in its measurement on a host before it is
 /// chosen there (§11; ADR 0141).
 ///
-/// The owner's threshold: two thirds of a 30 fps frame interval, the rest
-/// being capture and sending. The same measurement also has to come in no
-/// slower than the `openh264` fallback on the same machine.
-pub const SOFTWARE_AV1_FRAME_BUDGET_MS: u64 = 22;
+/// The owner's threshold: the whole 30 fps frame interval, the line a live
+/// session is held to as well. The same measurement also has to come in no
+/// slower than the `openh264` fallback on the same machine. It was two thirds
+/// of the interval, 22 ms, until the reference host measured 23–25 ms idle
+/// and 26–27 ms beside a running session — against 27.7 ms for the
+/// `openh264` it was left on (ADR 0142).
+pub const SOFTWARE_AV1_FRAME_BUDGET_MS: u64 = 33;
 /// Encoded frames per window over which a live software AV1 session checks
 /// that it keeps up (§11; ADR 0141): three seconds at
 /// [`SOFTWARE_AV1_MAX_FPS`].

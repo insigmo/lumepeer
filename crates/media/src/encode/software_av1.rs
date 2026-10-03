@@ -558,6 +558,17 @@ mod tests {
         assert!(!over_budget.passes(), "faster than openh264 is not enough");
     }
 
+    /// What the reference host measured beside a running session on
+    /// 2026-10-03, which the 22 ms budget refused (ADR 0142).
+    #[test]
+    fn the_reference_host_passes_its_own_measurement() {
+        let beta = Measurement {
+            av1_p95_us: 26_300,
+            h264_p95_us: 27_800,
+        };
+        assert!(beta.passes());
+    }
+
     #[test]
     fn p95_is_the_nearest_rank() {
         let mut samples: Vec<Duration> = (1..=40).map(Duration::from_millis).collect();
