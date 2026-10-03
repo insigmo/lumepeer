@@ -144,11 +144,35 @@ async function endSession(): Promise<void> {
   await invoke('session_revoke', { args: { peer } });
 }
 
+// Pointer motion is sent at most once per frame, newest position only. A
+// high-rate mouse otherwise floods the host's single input queue, and a click
+// waits behind every move sent before it. A press first sends the pending
+// move, so the click still lands where the pointer is.
+let pendingMove: { x: number; y: number; modifiers: number } | null = null;
+let moveFrame = 0;
+
+function flushMove(): void {
+  if (moveFrame) {
+    cancelAnimationFrame(moveFrame);
+    moveFrame = 0;
+  }
+  const move = pendingMove;
+  pendingMove = null;
+  if (move) {
+    void invoker().then((invoke) => invoke('input_pointer_move', { args: { peer, ...move } }));
+  }
+}
+
 const sink: InputSink = {
   pointerMove(x, y, modifiers) {
-    void invoker().then((invoke) => invoke('input_pointer_move', { args: { peer, x, y, modifiers } }));
+    pendingMove = { x, y, modifiers };
+    moveFrame ||= requestAnimationFrame(() => {
+      moveFrame = 0;
+      flushMove();
+    });
   },
   press(logical, scancode, modifiers, pressed) {
+    flushMove();
     void invoker().then((invoke) =>
       invoke('input_press', { args: { peer, logical, scancode, modifiers, pressed } }),
     );
