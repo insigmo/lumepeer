@@ -1,4 +1,4 @@
-//! Raw bindings to the libaom shim (`shim/aom_shim.c`; ADR 0139).
+//! Raw bindings to the libaom shim (`shim/aom_shim.c`; ADR 0141).
 //!
 //! Declarations only. Every call is `unsafe`, and the one caller,
 //! `lumepeer_media::encode::aom`, carries the `SAFETY:` reasoning for each of

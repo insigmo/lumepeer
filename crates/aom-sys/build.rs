@@ -1,5 +1,5 @@
 //! Builds the vendored libaom (`libaom/`, release 3.15.1) as a static library
-//! with its x86 assembly, and the C shim over it (ADR 0139).
+//! with its x86 assembly, and the C shim over it (ADR 0141).
 //!
 //! The assembly is not optional. `openh264-sys2` silently builds without its
 //! SIMD when it cannot find `nasm`, and the measurement that found it timed
@@ -31,7 +31,7 @@ fn main() {
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     assert!(
         arch == "x86_64" && (os == "windows" || os == "linux"),
-        "lumepeer-aom-sys is built for x86-64 Windows and Linux only (ADR 0139): \
+        "lumepeer-aom-sys is built for x86-64 Windows and Linux only (ADR 0141): \
          software AV1 was measured nowhere else. This target is {arch}-{os}; \
          `encode-aom` should not have pulled this crate in."
     );
@@ -107,7 +107,7 @@ fn find_nasm() -> PathBuf {
         }
         _ => panic!(
             "nasm not found (tried {}). libaom's x86 assembly is required, not optional \
-             (ADR 0139): without it the encoder is several times slower and nothing would \
+             (ADR 0141): without it the encoder is several times slower and nothing would \
              say so. Install nasm {}.{} or newer — `apt install nasm`, `dnf install nasm`, \
              `choco install nasm` or `winget install NASM.NASM` — and put it on PATH, or \
              set NASM to its full path.",
@@ -119,7 +119,7 @@ fn find_nasm() -> PathBuf {
     let found = parse_nasm_version(&version);
     assert!(
         found.is_some_and(|found| found >= NASM_MIN),
-        "{} reports {:?}; libaom needs nasm {}.{} or newer (ADR 0139)",
+        "{} reports {:?}; libaom needs nasm {}.{} or newer (ADR 0141)",
         candidate.display(),
         version.trim(),
         NASM_MIN.0,
@@ -166,7 +166,7 @@ fn check_configuration(header: &Path) {
         assert!(
             config.contains(&format!("#define {wanted}")),
             "libaom configured without `{wanted}` ({}); the build would not be the one \
-             ADR 0139 measured",
+             ADR 0141 measured",
             header.display()
         );
     }

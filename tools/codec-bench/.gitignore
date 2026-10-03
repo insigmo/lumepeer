@@ -2,7 +2,7 @@
 /target/
 /target-noasm/
 # The stage-1 `aom` shim and the product's `lumepeer-aom` link a libaom each,
-# so they are built apart (ADR 0139).
+# so they are built apart (ADR 0141).
 /target-aom/
 /target-lumepeer/
 __pycache__/

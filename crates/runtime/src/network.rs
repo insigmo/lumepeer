@@ -4156,7 +4156,7 @@ impl HelloExtras {
 }
 
 /// Host side: what a session's picture is known to be when its codec is
-/// chosen (§11; ADR 0139).
+/// chosen (§11; ADR 0141).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SessionPicture {
     /// The frame rate the guest's preset names, once it has named one.
@@ -4177,7 +4177,7 @@ struct SessionPicture {
 }
 
 /// Host side: why a guest that decodes AV1, on a host with no hardware AV1
-/// encoder, is given H.264 rather than software AV1 (§11; ADR 0139).
+/// encoder, is given H.264 rather than software AV1 (§11; ADR 0141).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SoftwareAv1Refusal {
     /// The host's own answer: not in this build, a processor without AVX2,
@@ -4191,7 +4191,7 @@ enum SoftwareAv1Refusal {
 }
 
 /// Host side: whether a session may be given software AV1, and if not, why
-/// (§11; ADR 0139). Every condition of ADR 0139 that is not about the guest
+/// (§11; ADR 0141). Every condition of ADR 0141 that is not about the guest
 /// or about hardware AV1 is here, in the order of the ADR; `None` means
 /// every one of them holds.
 fn software_av1_refusal(
@@ -4233,7 +4233,7 @@ fn software_av1_refusal(
 /// AV1 is asked about first and taken whenever the answer is yes: it is the
 /// codec this project prefers, and the only one above the baseline it will
 /// ever choose (ADR 0072). The one exception to "hardware on both sides" is
-/// ADR 0139's: a guest that decodes AV1, a host with no hardware encoder at
+/// ADR 0141's: a guest that decodes AV1, a host with no hardware encoder at
 /// all whose own measurement passed, the 30 fps preset and a screen of at
 /// most 1080p — [`software_av1_refusal`] — and the host encodes AV1 in
 /// software. H.264 is what remains when any of that fails — a baseline, not
@@ -4387,7 +4387,7 @@ struct MediaSession {
     /// What the hardware AV1 probe answered when this session was accepted,
     /// kept so choosing again on a preset change does not build a second
     /// hardware encoder next to the one this session may be running
-    /// (ADR 0139).
+    /// (ADR 0141).
     hardware_av1: bool,
 }
 
@@ -4399,7 +4399,7 @@ impl MediaSession {
 
     /// Stops the loop and closes the media connection, leaving the session
     /// in place for the guest's redial to replace — and to read what this
-    /// one learned about the screen from (ADR 0139).
+    /// one learned about the screen from (ADR 0141).
     fn halt(&self) {
         self.task.abort();
         self.connection.close(
@@ -5550,7 +5550,7 @@ struct Actor {
     cursors_rx: mpsc::Receiver<(NodeId, CursorShapeData)>,
     /// What this host knows about its own ability to produce a picture.
     health: Arc<MediaHealth>,
-    /// Where this host stands on software AV1 (ADR 0139); see
+    /// Where this host stands on software AV1 (ADR 0141); see
     /// [`HostMedia::software_av1`].
     software_av1: fn() -> SoftwareAv1Readiness,
     notify: broadcast::Sender<ActorNotification>,
@@ -6679,12 +6679,12 @@ impl Actor {
         if let Some(session) = self.media.get(&peer) {
             session.control.set_fps_cap(Some(fps));
         }
-        // A frame rate is one of software AV1's conditions (ADR 0139).
+        // A frame rate is one of software AV1's conditions (ADR 0141).
         self.recheck_media_codec(peer);
     }
 
     /// Host side: chooses `peer`'s codec again after its preset moved, and
-    /// restarts its media stream if the answer changed (§11; ADR 0139).
+    /// restarts its media stream if the answer changed (§11; ADR 0141).
     ///
     /// Software AV1 is chosen for the 30 fps preset only. A guest that
     /// switches to `balance` or `performance` gets H.264 from then on, and
@@ -6725,7 +6725,7 @@ impl Actor {
             peer = %self.label_of(&peer),
             from = ?session.codec,
             to = ?wanted,
-            "the preset moved this session's codec; restarting its media stream for the guest to redial (ADR 0139)"
+            "the preset moved this session's codec; restarting its media stream for the guest to redial (ADR 0141)"
         );
         session.halt();
         if let Some(audio) = self.audio.remove(&peer) {
@@ -9394,7 +9394,7 @@ impl Actor {
                 // need to know whether it can encode AV1 in software, and
                 // consent is still to come: measured now, the answer is
                 // usually ready by the time the media connection is
-                // (ADR 0139). A no-op on every build and machine where it
+                // (ADR 0141). A no-op on every build and machine where it
                 // could lead nowhere, and once it has run.
                 if guest_codec_support.av1 {
                     software_av1::start_measurement();
@@ -9625,7 +9625,7 @@ impl Actor {
         }
         // A redial replaces the previous stream rather than adding a second
         // encode loop against the same capture. What that stream last
-        // captured is what this one's codec is chosen for (ADR 0139).
+        // captured is what this one's codec is chosen for (ADR 0141).
         let previous = self.media.remove(&peer);
         let captured = previous
             .as_ref()
@@ -9733,7 +9733,7 @@ impl Actor {
 
     /// Host side: the codec `peer`'s new media stream is encoded in, and
     /// whether a hardware AV1 encoder answered its probe (§11; ADR 0067,
-    /// ADR 0139). `captured` is what the stream this one replaces last
+    /// ADR 0141). `captured` is what the stream this one replaces last
     /// captured, if there was one.
     ///
     /// Logs why a guest that decodes AV1 is given H.264, and starts this
@@ -9758,12 +9758,12 @@ impl Actor {
             match software_av1_refusal(software, picture) {
                 None => tracing::info!(
                     peer = %tag,
-                    "no hardware AV1 encoder: encoding AV1 in software (ADR 0139)"
+                    "no hardware AV1 encoder: encoding AV1 in software (ADR 0141)"
                 ),
                 Some(refusal) => tracing::info!(
                     peer = %tag,
                     ?refusal,
-                    "the guest decodes AV1 but this session gets H.264 (ADR 0139)"
+                    "the guest decodes AV1 but this session gets H.264 (ADR 0141)"
                 ),
             }
             // The first AV1 guest is what makes measuring worth six
@@ -19467,7 +19467,7 @@ mod tests {
         vp9: false,
     };
 
-    /// A host that passed its own software AV1 measurement (ADR 0139).
+    /// A host that passed its own software AV1 measurement (ADR 0141).
     fn ready() -> SoftwareAv1Readiness {
         SoftwareAv1Readiness::Ready(software_av1::Measurement {
             av1_p95_us: 17_400,
@@ -19475,14 +19475,14 @@ mod tests {
         })
     }
 
-    /// The `quality` preset on a 1080p screen: everything ADR 0139 asks of
+    /// The `quality` preset on a 1080p screen: everything ADR 0141 asks of
     /// the session itself.
     const QUALITY_1080P: SessionPicture = SessionPicture {
         fps: Some(SOFTWARE_AV1_MAX_FPS),
         captured: Some((1920, 1080)),
     };
 
-    /// ADR 0139, the branch the whole exception exists for: a guest that
+    /// ADR 0141, the branch the whole exception exists for: a guest that
     /// decodes AV1, a host with no hardware AV1 that passed its measurement,
     /// the `quality` preset and a 1080p screen — AV1, in software.
     #[test]
@@ -19494,7 +19494,7 @@ mod tests {
         );
     }
 
-    /// Hardware AV1 is the rule of ADR 0069 and needs none of ADR 0139's
+    /// Hardware AV1 is the rule of ADR 0069 and needs none of ADR 0141's
     /// conditions: no measurement, any preset, any screen.
     #[test]
     fn hardware_av1_is_chosen_whatever_the_software_conditions_say() {
@@ -19508,7 +19508,7 @@ mod tests {
         );
     }
 
-    /// ADR 0139: every way the host itself can say no — not built, no
+    /// ADR 0141: every way the host itself can say no — not built, no
     /// AVX2, a hardware H.264 encoder, not measured yet, measured too slow,
     /// given up on mid-session — gives H.264, and names itself as the reason.
     #[test]
@@ -19537,7 +19537,7 @@ mod tests {
         }
     }
 
-    /// ADR 0139: the `quality` preset's 30 fps and nothing faster.
+    /// ADR 0141: the `quality` preset's 30 fps and nothing faster.
     /// `balance` (60) and `performance` (144) stay on H.264.
     #[test]
     fn only_the_thirty_fps_preset_gets_software_av1() {
@@ -19569,7 +19569,7 @@ mod tests {
         }
     }
 
-    /// ADR 0139: at most 1080p of pixels, in either orientation; a 16:10
+    /// ADR 0141: at most 1080p of pixels, in either orientation; a 16:10
     /// 1920x1200 panel is already over, and so is anything larger.
     #[test]
     fn only_a_screen_of_at_most_1080p_gets_software_av1() {
@@ -19600,7 +19600,7 @@ mod tests {
         }
     }
 
-    /// ADR 0139: a session accepted before its guest named a preset, or
+    /// ADR 0141: a session accepted before its guest named a preset, or
     /// before any loop captured a picture, is chosen for as the `quality`
     /// session on a screen that fits it — the preset every guest opens with.
     /// What it then turns out to be is corrected by a restart: the preset by
@@ -19613,7 +19613,7 @@ mod tests {
         );
     }
 
-    /// ADR 0139: the host's own answer is asked first, so a host that cannot
+    /// ADR 0141: the host's own answer is asked first, so a host that cannot
     /// do it says so even for a session that would not have fitted anyway.
     #[test]
     fn the_hosts_own_refusal_comes_before_the_sessions() {
@@ -26489,7 +26489,7 @@ mod tests {
         }
     }
 
-    /// A host that passed its software AV1 measurement (ADR 0139), without
+    /// A host that passed its software AV1 measurement (ADR 0141), without
     /// depending on how fast this test build measures.
     #[cfg(feature = "encode-aom")]
     fn measured_and_ready() -> SoftwareAv1Readiness {
@@ -26565,7 +26565,7 @@ mod tests {
         false
     }
 
-    /// ADR 0139 end to end, with the real libaom: a host with no hardware
+    /// ADR 0141 end to end, with the real libaom: a host with no hardware
     /// encoder that passed its measurement streams AV1 to a guest that
     /// decodes it, on the `quality` preset; switching the guest to
     /// `balance` (60 fps) restarts the stream in H.264, and switching back

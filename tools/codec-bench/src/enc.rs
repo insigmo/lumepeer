@@ -125,7 +125,7 @@ impl Bench for OpenH264 {
     }
 }
 
-/// lumepeer's software AV1 encoder, product code path (ADR 0139): BGRA in,
+/// lumepeer's software AV1 encoder, product code path (ADR 0141): BGRA in,
 /// its own conversion inside the call, its own settings. `--kbps` is the
 /// session's figure, as the product gets it — libaom is asked for
 /// `encode::aom::av1_kbps` of it, half — so this at 2T is `aom` at T.

@@ -39,7 +39,7 @@ allow = [
     "MIT-0",
     # The two vendored video encoders' code: Cisco's openh264 (through the
     # `openh264`/`openh264-sys2` crates) and libaom (vendored in
-    # `crates/aom-sys`, ADR 0139).
+    # `crates/aom-sys`, ADR 0141).
     "BSD-2-Clause",
     # libaom's patent grant (`crates/aom-sys/libaom/PATENTS`): royalty-free,
     # for any implementation of AV1, terminated only for a licensee who sues

@@ -59,7 +59,7 @@ jobs:
       - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
       - name: Clippy the whole shipped Linux feature set
         run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom,audio-opus,audio-capture-pipewire -- -D warnings
-      # Software AV1 (ADR 0139): the vendored libaom builds from source with
+      # Software AV1 (ADR 0141): the vendored libaom builds from source with
       # its assembly, encodes, and a host and a guest negotiate it, follow the
       # preset off it and back. Then the two things a release must never do
       # quietly: build without nasm, or link without the assembly.

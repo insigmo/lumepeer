@@ -1,5 +1,5 @@
 //! Software AV1: libaom's realtime encoder for a host with no hardware
-//! encoder (§11; ADR 0139).
+//! encoder (§11; ADR 0141).
 //!
 //! The configuration is the one the stage-1 measurement ran
 //! (docs/research/software-av1.md): `cpu-used` 10, WebRTC's RTC settings, the
@@ -44,7 +44,7 @@ const MAX_QUANTIZER: c_int = 63;
 const ERROR_BYTES: usize = 256;
 
 /// The bitrate libaom is asked for when the session asks for `h264_kbps`
-/// (§11; ADR 0139): the share the BD-rate measurement found buys the same
+/// (§11; ADR 0141): the share the BD-rate measurement found buys the same
 /// picture, never zero.
 #[must_use]
 pub fn av1_kbps(h264_kbps: u32) -> u32 {
@@ -207,7 +207,7 @@ impl Drop for Shim {
     }
 }
 
-/// Software AV1 encoder over libaom's realtime mode (§11; ADR 0139).
+/// Software AV1 encoder over libaom's realtime mode (§11; ADR 0141).
 pub struct AomEncoder {
     /// What the session asked for: an H.264-equivalent bitrate and a frame
     /// rate already held to [`SOFTWARE_AV1_MAX_FPS`].

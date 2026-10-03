@@ -176,7 +176,7 @@ jobs:
       #
       # The two x86-64 rows on Windows and Linux also carry `encode-aom`:
       # libaom's realtime AV1, in software, for a host with no hardware
-      # encoder at all (ADR 0139). Only there — those are the machines it was
+      # encoder at all (ADR 0141). Only there — those are the machines it was
       # measured on, and the feature is inert on every other target anyway.
       # `aom: true` is what installs nasm for it and, after the build, checks
       # that libaom's assembly actually reached the binary: a libaom without
@@ -224,12 +224,12 @@ jobs:
           # with bindgen, so both the library and libclang have to be here or
           # the Linux rows of this matrix fail to build (ADR 0039). libva-dev
           # is for encode-vaapi-zero-copy: `cros-libva` links libva and libva-drm.
-          # nasm assembles libaom's x86 kernels (encode-aom; ADR 0139), whose
+          # nasm assembles libaom's x86 kernels (encode-aom; ADR 0141), whose
           # build fails without it — and openh264's, which until now built
           # without them on Linux, silently.
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev libva-dev nasm
       # The Windows image has no nasm. libaom's build refuses to go on
-      # without one (ADR 0139), and openh264's quietly loses its assembly.
+      # without one (ADR 0141), and openh264's quietly loses its assembly.
       - name: Install nasm
         if: matrix.aom && runner.os == 'Windows'
         shell: pwsh
@@ -408,7 +408,7 @@ jobs:
               sleep "${DELAY}"
             done
           done
-      # ADR 0139: the build already refuses to go on without nasm, and
+      # ADR 0141: the build already refuses to go on without nasm, and
       # checks libaom configured its x86 kernels. This is the other end: the
       # machine code nasm assembled is in the executable that ships. Run
       # whether or not the upload above needed its retry; it reads only what

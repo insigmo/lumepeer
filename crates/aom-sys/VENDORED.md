@@ -1,4 +1,4 @@
-# libaom, vendored (ADR 0139)
+# libaom, vendored (ADR 0141)
 
 `libaom/` is **libaom 3.15.1**, the release the stage-1 measurement ran
 (`docs/research/software-av1.md`), taken from the official release tarball:
@@ -29,5 +29,5 @@ capture at speed 10, the stage-1 shim's settings).
 To move to another release: run `./vendor.sh <version> <sha256>` from this
 directory, then build, run `cargo test -p lumepeer-media --features
 encode-aom --lib encode::` and re-measure (`codec-bench`'s `lumepeer-aom`
-variant) before anything ships with it. The numbers ADR 0139 relies on are
+variant) before anything ships with it. The numbers ADR 0141 relies on are
 this release's.

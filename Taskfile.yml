@@ -16,7 +16,7 @@ vars:
   # no picture.
   LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
   # x86-64 adds libaom's software AV1 for a host with no hardware encoder
-  # (ADR 0139), exactly as release.yml's amd64 rows do. Building it needs nasm
+  # (ADR 0141), exactly as release.yml's amd64 rows do. Building it needs nasm
   # on PATH (or NASM pointing at it); without one the build stops and says so.
   LINUX_AMD64_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom
   # Both encoders: Media Foundation needs hardware support the host may not

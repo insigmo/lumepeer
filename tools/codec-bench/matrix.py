@@ -45,7 +45,7 @@ def configs(machine, threads):
     # natural-content path. 7 is left out: ~100 ms a 1080p frame.
     for preset in (8, 9, 10, 11, 12, 13):
         out.append((f"svt-p{preset}", "asm", ["--encoder", "svt", "--speed", str(preset), "--threads", "0"]))
-    # Stage 2 (ADR 0139): the product's own software AV1 encoder, from its
+    # Stage 2 (ADR 0141): the product's own software AV1 encoder, from its
     # own binary (`--no-default-features --features lumepeer-aom`). Its
     # `--kbps` is the session's H.264 figure and libaom gets half of it, so
     # the command below passes twice the matrix bitrate: lumepeer-aom-<T>
@@ -88,7 +88,7 @@ def main():
     p.add_argument("--bin", default="codec-bench.exe")
     p.add_argument("--bin-noasm", default="codec-bench-noasm.exe")
     p.add_argument("--bin-lumepeer", default="codec-bench-lumepeer.exe",
-                   help="built with --no-default-features --features lumepeer-aom (ADR 0139)")
+                   help="built with --no-default-features --features lumepeer-aom (ADR 0141)")
     p.add_argument("--threads", type=int, default=8, help="libaom threads")
     p.add_argument("--only", default="", help="comma-separated tag prefixes")
     p.add_argument("--bitrates", default=",".join(map(str, BITRATES)),

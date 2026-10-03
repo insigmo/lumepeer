@@ -18,7 +18,7 @@ svt = []
 rav1e = ["dep:rav1e"]
 # lumepeer's own Media Foundation hardware encoder (H.264 and AV1), Windows.
 mf = ["lumepeer-media/encode-mf"]
-# lumepeer's own software AV1 encoder (ADR 0139): `--encoder lumepeer-aom`,
+# lumepeer's own software AV1 encoder (ADR 0141): `--encoder lumepeer-aom`,
 # the product's `encode::aom::AomEncoder` with the product's settings, over
 # the vendored libaom `lumepeer-aom-sys` builds. Not together with `aom`:
 # both link a libaom and both define the stage-1 shim's symbols, so build it

@@ -145,7 +145,7 @@ pub struct EncodeControl {
     /// carries no tag that would let it tell otherwise.
     video_stream_open: Arc<watch::Sender<bool>>,
     /// The size of the last picture the loop captured, before any reduction
-    /// (ADR 0139). Written by the loop, read by the actor when it chooses
+    /// (ADR 0141). Written by the loop, read by the actor when it chooses
     /// this peer's codec again: software AV1 is chosen only for a picture of
     /// at most 1080p, and this is how the actor learns what the screen is.
     captured_size: Arc<Mutex<Option<(u32, u32)>>>,
@@ -179,7 +179,7 @@ impl EncodeControl {
     }
 
     /// The size of the last picture this session's loop captured, if it has
-    /// captured one (ADR 0139).
+    /// captured one (ADR 0141).
     #[must_use]
     pub fn captured_size(&self) -> Option<(u32, u32)> {
         *self
@@ -592,7 +592,7 @@ pub struct HostMedia {
     /// from the same session as the pixels. `None` everywhere else, which
     /// leaves the actor building one lazily on the first input event (§18).
     pub injector: Option<Box<dyn InputInjector>>,
-    /// Where this host stands on encoding AV1 in software (ADR 0139):
+    /// Where this host stands on encoding AV1 in software (ADR 0141):
     /// [`software_av1::readiness`] — the build, the processor, the hardware
     /// probe and this host's own measurement — on every real host. A seam so
     /// a test can run the software AV1 path without depending on how fast an
@@ -1400,7 +1400,7 @@ fn spawn_encode_loop_with(
             }
         };
         // Software AV1 is chosen for the 30 fps preset and runs at it,
-        // whatever the display could do (ADR 0139); the encoder has already
+        // whatever the display could do (ADR 0141); the encoder has already
         // held its own budget there. Everything paced off `max_fps` below —
         // the ladder, a preset's rate — inherits the same ceiling.
         let software_av1 = encoder.kind() == EncoderKind::SoftwareAv1;
@@ -1409,7 +1409,7 @@ fn spawn_encode_loop_with(
         } else {
             max_fps
         };
-        // Whether this host keeps up with it, window by window (ADR 0139).
+        // Whether this host keeps up with it, window by window (ADR 0141).
         let mut software_av1_watch = SoftwareAv1Watch::default();
         // The frame rate the encoder was built for, which a preset can move
         // (ADR 0136).
@@ -1664,7 +1664,7 @@ fn spawn_encode_loop_with(
             let captured_size = (frame.width, frame.height);
             control.note_captured(captured_size);
             // Software AV1 is chosen for a picture of at most 1080p (ADR
-            // 0139). A screen that is larger — a first session the actor
+            // 0141). A screen that is larger — a first session the actor
             // could not size yet, or a display mode switched mid-session —
             // ends this loop rather than encoding something nobody measured:
             // the guest redials, and the actor, which now knows the size
@@ -1760,7 +1760,7 @@ fn spawn_encode_loop_with(
                             // is told and the loop ends.
                             if refusals.refused() >= ENCODE_REFUSALS_BEFORE_FAULT {
                                 // Software AV1 has H.264 behind it on the
-                                // same host (ADR 0139): give it up for this
+                                // same host (ADR 0141): give it up for this
                                 // process and let the guest redial into
                                 // that, instead of ending the session.
                                 if software_av1 {
@@ -1816,7 +1816,7 @@ fn spawn_encode_loop_with(
             // the host busy with something heavy. Two windows in a row that
             // cannot hold the frame rate software AV1 was chosen for, and it
             // is off for this process; the guest redials into H.264
-            // (ADR 0139).
+            // (ADR 0141).
             if software_av1 {
                 match software_av1_watch.frame(timing.scale + timing.encode) {
                     SoftwareAv1Verdict::Pending => {}
@@ -1955,7 +1955,7 @@ enum SoftwareAv1Verdict {
     Behind(Duration),
 }
 
-/// A live software AV1 session's check that this host keeps up (ADR 0139):
+/// A live software AV1 session's check that this host keeps up (ADR 0141):
 /// the p95 of scale-and-encode time over windows of
 /// [`SOFTWARE_AV1_WATCH_FRAMES`] encoded frames, against the frame interval
 /// at [`SOFTWARE_AV1_MAX_FPS`].
@@ -3379,7 +3379,7 @@ mod tests {
 
     use super::*;
 
-    /// ADR 0139: a window that holds the frame rate reports its p95 and
+    /// ADR 0141: a window that holds the frame rate reports its p95 and
     /// resets the count; one slow window alone is not enough to give up.
     #[test]
     fn one_slow_window_is_not_a_host_that_cannot_keep_up() {
@@ -3403,7 +3403,7 @@ mod tests {
         }
     }
 
-    /// ADR 0139: [`SOFTWARE_AV1_SLOW_WINDOWS`] windows in a row over the 30
+    /// ADR 0141: [`SOFTWARE_AV1_SLOW_WINDOWS`] windows in a row over the 30
     /// fps interval, by p95 — the rare long frame does not count.
     #[test]
     fn windows_in_a_row_over_the_interval_mean_the_host_is_behind() {

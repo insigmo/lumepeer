@@ -1,4 +1,4 @@
-// libaom realtime encoder wrapper (ADR 0139).
+// libaom realtime encoder wrapper (ADR 0141).
 //
 // This is the shim of the stage-1 measurement (tools/codec-bench/shim/
 // aom_shim.c on the research/software-av1 branch, docs/research/

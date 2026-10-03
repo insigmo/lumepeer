@@ -1,5 +1,5 @@
 //! Whether this host may encode AV1 in software, and the measurement that
-//! decides it (§11; ADR 0139).
+//! decides it (§11; ADR 0141).
 //!
 //! Software AV1 is the one exception to §11's mutual-hardware-support rule,
 //! and only for a host that can carry it. Four things stand between a build
@@ -85,7 +85,7 @@ impl std::fmt::Display for Measurement {
 }
 
 impl Measurement {
-    /// The owner's threshold (ADR 0139): no slower than `openh264` on the
+    /// The owner's threshold (ADR 0141): no slower than `openh264` on the
     /// same machine, and within [`SOFTWARE_AV1_FRAME_BUDGET_MS`].
     #[must_use]
     pub const fn passes(self) -> bool {
@@ -194,7 +194,7 @@ pub fn start_measurement() -> bool {
             let hardware = super::probe_hardware(super::EncoderConfig::default())
                 == Some(super::EncoderKind::Hardware);
             if hardware {
-                tracing::info!("hardware H.264 encoder found: software AV1 is not for this host (ADR 0139)");
+                tracing::info!("hardware H.264 encoder found: software AV1 is not for this host (ADR 0141)");
                 let mut state = state();
                 state.measuring = false;
                 state.hardware = true;
@@ -209,7 +209,7 @@ pub fn start_measurement() -> bool {
                         %found,
                         budget_ms = SOFTWARE_AV1_FRAME_BUDGET_MS,
                         ready = found.passes(),
-                        "software AV1 measured on this host (ADR 0139)"
+                        "software AV1 measured on this host (ADR 0141)"
                     );
                     state.measured = Some(found);
                 }
@@ -232,7 +232,7 @@ pub fn start_measurement() -> bool {
 pub fn demote(reason: &str) {
     let mut state = state();
     if state.demoted.is_none() {
-        tracing::warn!(%reason, "software AV1 is off on this host until lumepeer restarts (ADR 0139)");
+        tracing::warn!(%reason, "software AV1 is off on this host until lumepeer restarts (ADR 0141)");
         state.demoted = Some(reason.to_owned());
     }
 }
@@ -346,7 +346,7 @@ mod timing {
     /// encoders stood in about the same ratio (1.45) to beta's stage-1
     /// timings of the recorded desktop, which is what says that clip weighs
     /// what the recording did. This screen, in turn, measures 20–22 ms there:
-    /// still a little kinder than the clip, which ADR 0139 records.
+    /// still a little kinder than the clip, which ADR 0141 records.
     pub(super) struct Screen {
         page: Vec<u8>,
     }

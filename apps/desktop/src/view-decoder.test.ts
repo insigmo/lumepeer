@@ -221,7 +221,7 @@ describe('configStringFor', () => {
     expect(configStringFor(WireCodec.Vp9, frame)).toBe('vp09.00.10.08');
   });
 
-  it('names AV1 level 4.1, the level its comment promises (ADR 0139)', () => {
+  it('names AV1 level 4.1, the level its comment promises (ADR 0141)', () => {
     // `av01.P.LLT.DD`: LL is seq_level_idx, and level X.Y is
     // idx = (X - 2) * 4 + Y. The string used to say 05 — level 3.1, which
     // covers 1280x720 and nothing larger — under a comment that said 4.1.

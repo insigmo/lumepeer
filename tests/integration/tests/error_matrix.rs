@@ -272,7 +272,7 @@ fn row_no_hardware_codec_falls_back_or_explains() {
     }
 
     // AV1 must never be silently downgraded to the H.264 fallback (§11). Its
-    // one software encoder is libaom (ADR 0139), and only in a build that
+    // one software encoder is libaom (ADR 0141), and only in a build that
     // has it, on a processor that can run it; anywhere else it refuses.
     let av1 = EncoderConfig {
         codec: VideoCodec::Av1,

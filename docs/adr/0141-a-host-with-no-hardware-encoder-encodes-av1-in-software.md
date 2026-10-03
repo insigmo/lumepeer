@@ -1,7 +1,11 @@
-# ADR 0139 — A host with no hardware encoder encodes AV1 in software, at 30 fps and up to 1080p, once it has measured itself
+# ADR 0141 — A host with no hardware encoder encodes AV1 in software, at 30 fps and up to 1080p, once it has measured itself
 
 Status: accepted
 Date: 2026-10-02
+
+Written as ADR 0139 and renumbered: [0139](0139-the-picture-waits-for-the-link-not-the-link-for-the-picture.md)
+and [0140](0140-windows-autostart-is-a-logon-task.md) were taken on master
+while this was in review.
 
 Amends §11's mutual-hardware-support rule for optional codecs,
 [ADR 0069](0069-av1-asks-each-backend-and-va-api-cannot-answer.md) ("No

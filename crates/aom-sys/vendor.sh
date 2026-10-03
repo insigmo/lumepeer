@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Replaces libaom/ with another libaom release, trimmed exactly as
-# VENDORED.md describes (ADR 0139).
+# VENDORED.md describes (ADR 0141).
 #
 #   ./vendor.sh 3.15.1 8ca0c52746174603500f0adb6f2a215d69c9ca2aab2acb3caa06fb791d8d01bf
 set -euo pipefail
@@ -30,4 +30,4 @@ find "${SRC}/examples" -type f ! -name 'encoder_util.*' ! -name 'multilayer_meta
 
 rm -rf "${HERE}/libaom"
 mv "${SRC}" "${HERE}/libaom"
-echo "libaom ${VERSION} vendored; update VENDORED.md and re-measure (ADR 0139)."
+echo "libaom ${VERSION} vendored; update VENDORED.md and re-measure (ADR 0141)."

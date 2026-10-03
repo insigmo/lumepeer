@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Does a binary carry libaom's x86 assembly? (ADR 0139)
+"""Does a binary carry libaom's x86 assembly? (ADR 0141)
 
 `lumepeer-aom-sys` refuses to build without nasm, and checks that libaom
 configured itself with its x86 kernels. This is the check on the other end:

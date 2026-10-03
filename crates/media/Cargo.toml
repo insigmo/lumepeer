@@ -73,7 +73,7 @@ audio-playout-coreaudio = [
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
 encode-openh264 = ["dep:openh264"]
 # libaom's realtime AV1 encoder in software, for a host with no hardware
-# encoder at all (§11; ADR 0139) — the one exception to "an optional codec
+# encoder at all (§11; ADR 0141) — the one exception to "an optional codec
 # needs hardware on both sides". libaom is vendored in `lumepeer-aom-sys` and
 # built from source, statically, with its x86 assembly; the build fails
 # without nasm rather than producing the several-times-slower C-only library
@@ -220,7 +220,7 @@ cros-libva = { version = "0.0.13", optional = true }
 # decoder sandbox's seccomp filter.
 libc = { workspace = true, optional = true }
 
-# The vendored libaom behind `encode-aom` (ADR 0139). Only where software AV1
+# The vendored libaom behind `encode-aom` (ADR 0141). Only where software AV1
 # was measured — the build of libaom itself refuses every other target.
 [target.'cfg(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))'.dependencies]
 lumepeer-aom-sys = { workspace = true, optional = true }

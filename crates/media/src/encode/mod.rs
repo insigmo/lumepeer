@@ -4,7 +4,7 @@
 //! H.264 baseline/main is the mandatory desktop baseline, and AV1 is what a
 //! session prefers whenever both sides have hardware for it (ADR 0069, ADR
 //! 0072). The one exception to "hardware on both sides" is software AV1 on a
-//! host with no hardware encoder at all, under the conditions of ADR 0139
+//! host with no hardware encoder at all, under the conditions of ADR 0141
 //! that `choose_media_codec` checks. Opus is the only audio codec.
 
 use lumepeer_core::constants::{ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS};
@@ -23,7 +23,7 @@ pub enum VideoCodec {
     H264,
     /// Preferred over the baseline, but only with mutual hardware support
     /// (ADR 0069, ADR 0072) — or, on a host with no hardware encoder, in
-    /// software under ADR 0139's conditions.
+    /// software under ADR 0141's conditions.
     Av1,
 }
 
@@ -35,7 +35,7 @@ pub enum EncoderKind {
     /// `openh264` software fallback, allowed only past the resource gate.
     SoftwareOpenH264,
     /// libaom's realtime AV1 in software, for a host with no hardware
-    /// encoder that passed its own measurement (ADR 0139).
+    /// encoder that passed its own measurement (ADR 0141).
     SoftwareAv1,
 }
 
@@ -198,7 +198,7 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     let hardware = probe_hardware(config);
 
     if config.codec != VideoCodec::H264 && hardware != Some(EncoderKind::Hardware) {
-        // ADR 0139: the one software encoder above the baseline. Whether a
+        // ADR 0141: the one software encoder above the baseline. Whether a
         // session may have it — a guest that decodes AV1, no hardware
         // encoder here, the 30 fps preset, a picture of at most 1080p, and a
         // measurement this host passed — is `choose_media_codec`'s rule, and
@@ -214,7 +214,7 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
                 any(target_os = "windows", target_os = "linux")
             ))]
             {
-                tracing::info!("no hardware AV1 encoder, using libaom in software (ADR 0139)");
+                tracing::info!("no hardware AV1 encoder, using libaom in software (ADR 0141)");
                 return aom::AomEncoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>);
             }
         }
@@ -362,10 +362,10 @@ pub mod linux_vaapi;
 pub mod windows;
 
 /// Whether this host may encode AV1 in software, and the one measurement
-/// per process that decides it (§11; ADR 0139).
+/// per process that decides it (§11; ADR 0141).
 pub mod software_av1;
 
-/// libaom's realtime AV1 encoder, in software (§11; ADR 0139).
+/// libaom's realtime AV1 encoder, in software (§11; ADR 0141).
 ///
 /// The third module of the encoder that needs `unsafe`: every libaom call
 /// crosses into C through `lumepeer-aom-sys`'s shim. Each `unsafe` block
@@ -377,7 +377,7 @@ pub mod software_av1;
 ))]
 #[allow(
     unsafe_code,
-    reason = "libaom is C; every call through lumepeer-aom-sys is `unsafe`. See ADR 0139."
+    reason = "libaom is C; every call through lumepeer-aom-sys is `unsafe`. See ADR 0141."
 )]
 pub mod aom;
 
@@ -471,7 +471,7 @@ pub mod software {
     /// frame — 8 MiB at 1080p — on the encoder's own hot path, spent to
     /// produce a byte-for-byte duplicate (ADR 0027).
     ///
-    /// Shared with the software AV1 encoder (ADR 0139), which takes the same
+    /// Shared with the software AV1 encoder (ADR 0141), which takes the same
     /// BGRA through the same conversion.
     pub(super) fn even_bgra<'a>(
         frame: &'a Frame,
@@ -653,7 +653,7 @@ mod tests {
     /// mechanically rather than by inspection so it runs the same on every
     /// machine: AV1 is served by genuine hardware when the probe says there
     /// is some; otherwise by libaom exactly when this build has it and this
-    /// processor can run it (ADR 0139); otherwise refused — and never by the
+    /// processor can run it (ADR 0141); otherwise refused — and never by the
     /// `openh264` fallback (ADR 0069).
     #[test]
     fn av1_is_served_by_hardware_then_by_libaom_and_never_by_openh264() {
@@ -684,7 +684,7 @@ mod tests {
     }
 
     /// The software AV1 branch builds an encoder that actually produces a
-    /// picture, not one that only constructs (ADR 0139).
+    /// picture, not one that only constructs (ADR 0141).
     #[test]
     fn a_software_av1_encoder_from_select_encoder_encodes() {
         let config = EncoderConfig {
