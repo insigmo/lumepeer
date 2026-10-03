@@ -71,11 +71,14 @@ jobs:
           cargo test -p lumepeer-runtime --features encode-aom --lib software_av1
       - name: A build without nasm fails rather than losing libaom's assembly
         run: |
-          if NASM=/nonexistent/nasm CARGO_TARGET_DIR=target/no-nasm cargo build -p lumepeer-aom-sys 2> no-nasm.log; then
+          if NASM=/nonexistent/nasm CARGO_TARGET_DIR=target/no-nasm cargo build -p lumepeer-aom-sys --features vendored 2> no-nasm.log; then
             echo "::error::lumepeer-aom-sys built without nasm"
             exit 1
           fi
           grep -q "nasm not found" no-nasm.log
+          # Without the feature the crate is inert, nasm or not: what keeps
+          # `cargo build --workspace` free of platform SDKs.
+          NASM=/nonexistent/nasm CARGO_TARGET_DIR=target/no-nasm cargo build -p lumepeer-aom-sys
       - name: The test binary carries libaom's assembly
         run: |
           BIN="$(cargo test -p lumepeer-runtime --features encode-aom --lib --no-run --message-format=json \

@@ -18,6 +18,14 @@ build = "build.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Builds and links the vendored libaom. `lumepeer-media`'s `encode-aom` turns
+# it on; without it the build script does nothing, so this crate is an inert
+# member of `cargo build --workspace` on every platform and on a machine with
+# no nasm or cmake — the promise that command keeps (README).
+vendored = []
+
 [build-dependencies]
 # Both are already in the lock file: `cmake` for audiopus_sys's vendored
 # libopus, `cc` for openh264-sys2.

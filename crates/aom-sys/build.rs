@@ -12,6 +12,11 @@
 //!
 //! `NASM` may name the assembler to use; otherwise `nasm` is looked up on
 //! `PATH`.
+//!
+//! All of it only with the `vendored` feature, which `lumepeer-media`'s
+//! `encode-aom` turns on. Without it this script returns at once: the crate is
+//! a workspace member, and `cargo build --workspace` must keep needing no
+//! platform SDK, on every platform.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -26,6 +31,10 @@ fn main() {
     // A directory: cargo watches every file under it.
     println!("cargo:rerun-if-changed=libaom");
     println!("cargo:rerun-if-env-changed=NASM");
+
+    if env::var_os("CARGO_FEATURE_VENDORED").is_none() {
+        return;
+    }
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

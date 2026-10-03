@@ -5,6 +5,9 @@
 //! them. The shim, not libaom itself, is what is bound: it owns the
 //! `aom_codec_enc_cfg_t` and `aom_image_t` layouts, so no libaom struct has to
 //! be mirrored here and kept in step with the vendored release by hand.
+//!
+//! The declarations resolve only with the `vendored` feature, which builds and
+//! links libaom; without it nothing may call them.
 
 use std::ffi::{c_char, c_int};
 

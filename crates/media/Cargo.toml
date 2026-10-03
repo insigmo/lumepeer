@@ -83,7 +83,7 @@ encode-openh264 = ["dep:openh264"]
 # `encode-openh264` for the BGRA-to-I420 conversion the measurement timed,
 # and for the `openh264` fallback each host measures software AV1 against
 # before it is ever chosen.
-encode-aom = ["encode-openh264", "dep:lumepeer-aom-sys"]
+encode-aom = ["encode-openh264", "dep:lumepeer-aom-sys", "lumepeer-aom-sys/vendored"]
 # VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4; ADR
 # 0031). Same convention as encode-mf: `cargo build --workspace` needs no
 # platform SDK, and `cros-libva` is declared optional in the Linux target
