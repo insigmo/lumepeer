@@ -315,6 +315,54 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     }
 }
 
+/// Whether the `openh264` fallback is compiled into this build.
+#[must_use]
+pub const fn openh264_built() -> bool {
+    cfg!(feature = "encode-openh264")
+}
+
+/// Builds the software encoder for `config.codec` even where a hardware one
+/// exists: `openh264` for H.264, libaom for AV1. For a guest that picked one
+/// by hand (ADR 0143); [`select_encoder`] is what every other session gets.
+///
+/// # Errors
+/// [`MediaError::EncoderUnavailable`] when this build or this processor has
+/// no software encoder for the codec.
+pub fn select_software_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
+    match config.codec {
+        VideoCodec::H264 => {
+            #[cfg(feature = "encode-openh264")]
+            {
+                tracing::info!("openh264 picked by the guest (ADR 0143)");
+                software::OpenH264Encoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>)
+            }
+            #[cfg(not(feature = "encode-openh264"))]
+            {
+                Err(MediaError::EncoderUnavailable(
+                    "the openh264 fallback is not built in".to_owned(),
+                ))
+            }
+        }
+        VideoCodec::Av1 => {
+            if software_av1::built() && software_av1::cpu_supported() {
+                #[cfg(all(
+                    feature = "encode-aom",
+                    target_arch = "x86_64",
+                    any(target_os = "windows", target_os = "linux")
+                ))]
+                {
+                    tracing::info!("libaom picked by the guest (ADR 0143)");
+                    return aom::AomEncoder::new(config)
+                        .map(|e| Box::new(e) as Box<dyn VideoEncoder>);
+                }
+            }
+            Err(MediaError::EncoderUnavailable(
+                "software AV1 is not built in or this processor lacks AVX2".to_owned(),
+            ))
+        }
+    }
+}
+
 /// BGRA/NV12 conversion shared by every hardware backend.
 #[cfg(any(
     all(target_os = "windows", feature = "encode-mf"),

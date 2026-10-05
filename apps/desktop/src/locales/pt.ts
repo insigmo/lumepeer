@@ -327,6 +327,13 @@ export const pt: Dictionary = {
   'toolbar.settings.zoom': 'Nível de zoom',
   'toolbar.zoom.in': 'Aumentar zoom',
   'toolbar.zoom.out': 'Diminuir zoom',
+  'toolbar.settings.encoder': 'Codificador',
+  'toolbar.encoder.auto': 'Automático',
+  'toolbar.encoder.h264_hardware': 'H.264, hardware',
+  'toolbar.encoder.h264_software': 'H.264, software (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1, hardware',
+  'toolbar.encoder.av1_software': 'AV1, software (libaom)',
+  'toolbar.encoder.unavailable': 'O host não oferece escolha de codificador.',
   'toolbar.settings.hostResolution': 'Resolução de tela do host',
   'toolbar.settings.hostResolutionWarning':
     'Isso altera a resolução do próprio computador host, não apenas o que você vê aqui.',

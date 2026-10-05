@@ -327,6 +327,13 @@ export const uk: Dictionary = {
   'toolbar.settings.zoom': 'Рівень масштабу',
   'toolbar.zoom.in': 'Збільшити',
   'toolbar.zoom.out': 'Зменшити',
+  'toolbar.settings.encoder': 'Кодувальник',
+  'toolbar.encoder.auto': 'Автоматично',
+  'toolbar.encoder.h264_hardware': 'H.264, апаратний',
+  'toolbar.encoder.h264_software': 'H.264, програмний (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1, апаратний',
+  'toolbar.encoder.av1_software': 'AV1, програмний (libaom)',
+  'toolbar.encoder.unavailable': 'Хост не пропонує вибору кодувальника.',
   'toolbar.settings.hostResolution': 'Роздільна здатність екрана хоста',
   'toolbar.settings.hostResolutionWarning':
     'Це змінює роздільну здатність екрана самого хоста, а не лише те, що ви бачите тут.',

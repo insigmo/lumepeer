@@ -656,6 +656,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::view_keyboard_grab,
         commands::host_display_modes,
         commands::host_display_set_mode,
+        commands::host_encoders,
+        commands::host_encoder_select,
         commands::recordings_list,
         commands::recording_export,
         commands::audit_list,

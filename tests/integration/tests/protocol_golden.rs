@@ -22,7 +22,8 @@
 //! but appended the `CaptureDenied` reason to `MediaUnavailable` (ADR 0110),
 //! minor 20 appended `FileOpRequest` and `FileOpResult` (ADR 0124), minor 21
 //! appended `DeviceInfo` (ADR 0121), minor 22 added no message but appended
-//! the `EncoderFailed` reason to `MediaUnavailable` (ADR 0135) — and every
+//! the `EncoderFailed` reason to `MediaUnavailable` (ADR 0135), minor 23
+//! appended `EncoderOptions` and `EncoderSelect` (ADR 0143) — and every
 //! earlier vector is still in the file with the same bytes, which is the
 //! compatibility claim this test checks.
 //!
@@ -99,7 +100,7 @@ fn vectors() -> Vec<Vector> {
 #[test]
 fn the_golden_vectors_still_hold_for_this_minor_version() {
     assert_eq!(
-        PROTOCOL_MINOR, 22,
+        PROTOCOL_MINOR, 23,
         "the vectors are frozen per minor; bump the file together with the version"
     );
 

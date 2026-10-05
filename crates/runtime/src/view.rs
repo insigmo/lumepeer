@@ -158,6 +158,12 @@ pub struct EncodeControl {
     /// this peer's codec again: software AV1 is chosen only for a picture of
     /// at most 1080p, and this is how the actor learns what the screen is.
     captured_size: Arc<Mutex<Option<(u32, u32)>>>,
+    /// Whether the guest picked this loop's encoder by hand (ADR 0143). Set
+    /// by the actor before the loop starts. A picked software AV1 encoder is
+    /// kept whatever the screen size or the frame time: the loop's own way
+    /// out of software AV1 is a redial into what the host would choose, and
+    /// the host would choose the same pick again.
+    encoder_pinned: Arc<AtomicBool>,
     /// What the guest has acknowledged of the picture's stream, which the
     /// loop waits on rather than queueing frames the link cannot carry yet
     /// (ADR 0139). Fed by [`spawn_guest_streams`].
@@ -189,7 +195,18 @@ impl EncodeControl {
             secure_desktop_blocked: Arc::new(AtomicBool::new(false)),
             video_stream_open: Arc::new(watch::channel(false).0),
             captured_size: Arc::new(Mutex::new(None)),
+            encoder_pinned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Marks this loop's encoder as the guest's own pick (ADR 0143).
+    pub(crate) fn pin_encoder(&self) {
+        self.encoder_pinned.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the guest picked this loop's encoder by hand (ADR 0143).
+    fn encoder_pinned(&self) -> bool {
+        self.encoder_pinned.load(Ordering::Relaxed)
     }
 
     /// The size of the last picture this session's loop captured, if it has
@@ -621,6 +638,11 @@ pub struct HostMedia {
     /// a test can run the software AV1 path without depending on how fast an
     /// unoptimised test build happens to measure.
     pub software_av1: fn() -> software_av1::Readiness,
+    /// Starts this host's one software AV1 measurement, soon after the actor
+    /// starts (ADR 0143): [`software_av1::start_measurement`] on every real
+    /// host, and nothing in a test, which has no use for six seconds of
+    /// encoding.
+    pub measure_software_av1: fn() -> bool,
 }
 
 /// What an encode loop reports back when it cannot produce a picture at all.
@@ -1352,7 +1374,7 @@ pub fn spawn_encode_loop(
     reason = "the same eight as `spawn_encode_loop`, and the builder its \
               encoder comes from"
 )]
-fn spawn_encode_loop_with(
+pub(crate) fn spawn_encode_loop_with(
     connection: PeerConnection,
     capture: SharedCapture,
     recorder: SharedRecorder,
@@ -1426,6 +1448,11 @@ fn spawn_encode_loop_with(
         // held its own budget there. Everything paced off `max_fps` below —
         // the ladder, a preset's rate — inherits the same ceiling.
         let software_av1 = encoder.kind() == EncoderKind::SoftwareAv1;
+        // The way out of software AV1 below — a stream that ends so the
+        // guest's redial gets what the host would choose — is only for the
+        // host's own choice. A guest's pick would come straight back
+        // (ADR 0143).
+        let chosen_av1 = software_av1 && !control.encoder_pinned();
         let max_fps = if software_av1 {
             max_fps.min(SOFTWARE_AV1_MAX_FPS)
         } else {
@@ -1449,7 +1476,7 @@ fn spawn_encode_loop_with(
         {
             control.note_captured((mode.width, mode.height));
         }
-        if software_av1
+        if chosen_av1
             && let Some(size) = control.captured_size()
             && picture_pixels(size) > SOFTWARE_AV1_MAX_PIXELS
         {
@@ -1776,7 +1803,7 @@ fn spawn_encode_loop_with(
             // the redial's loop takes its own, so this frame is not the
             // guest's last chance at one; on Wayland, which cannot, the
             // H.264 stream waits for the screen to change.
-            if software_av1 && picture_pixels(captured_size) > SOFTWARE_AV1_MAX_PIXELS {
+            if chosen_av1 && picture_pixels(captured_size) > SOFTWARE_AV1_MAX_PIXELS {
                 tracing::info!(
                     peer = %tag,
                     width = captured_size.0,
@@ -1870,7 +1897,7 @@ fn spawn_encode_loop_with(
                                 // same host (ADR 0141): give it up for this
                                 // process and let the guest redial into
                                 // that, instead of ending the session.
-                                if software_av1 {
+                                if chosen_av1 {
                                     software_av1::demote(&format!(
                                         "the encoder refused {ENCODE_REFUSALS_BEFORE_FAULT} frames in a row: {error}"
                                     ));
@@ -1924,7 +1951,7 @@ fn spawn_encode_loop_with(
             // cannot hold the frame rate software AV1 was chosen for, and it
             // is off for this process; the guest redials into H.264
             // (ADR 0141).
-            if software_av1 {
+            if chosen_av1 {
                 match software_av1_watch.frame(timing.scale + timing.encode) {
                     SoftwareAv1Verdict::Pending => {}
                     SoftwareAv1Verdict::KeepingUp(p95) => tracing::info!(

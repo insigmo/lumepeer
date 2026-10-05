@@ -11,10 +11,10 @@ use crate::constants::{
     DEVICE_NAME_MAX_BYTES, DEVICE_OS_MAX_BYTES, DIR_PATH_MAX_BYTES, FILE_NAME_MAX_BYTES,
     FILE_OFFER_MAX_BYTES, MANIFEST_PATH_MAX_BYTES, MAX_CONTROL_FRAME_BYTES,
     MAX_CURSOR_SHAPE_PIXELS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
-    MAX_DISPLAY_MODES_PER_HOST, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS, STREAM_SCALE_MAX_PERCENT,
-    STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
-    UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES, UNATTENDED_PROOF_MAX_ITERATIONS,
-    UNATTENDED_PROOF_MAX_LANES, UNATTENDED_PROOF_MAX_MEMORY_KIB,
+    MAX_DISPLAY_MODES_PER_HOST, MAX_ENCODER_CHOICES, MAX_MONITORS_PER_HOST, MAX_STREAM_PIXELS,
+    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX,
+    TUNNEL_HOST_MAX_BYTES, UNATTENDED_CODE_MAX_BYTES, UNATTENDED_PASSWORD_MAX_BYTES,
+    UNATTENDED_PROOF_MAX_ITERATIONS, UNATTENDED_PROOF_MAX_LANES, UNATTENDED_PROOF_MAX_MEMORY_KIB,
     UNATTENDED_PROOF_MAX_MESSAGE_BYTES, UNATTENDED_PROOF_MAX_OUTPUT_BYTES,
     UNATTENDED_PROOF_MAX_SALT_BYTES, UNATTENDED_PROOF_MIN_OUTPUT_BYTES,
     UNATTENDED_PROOF_MIN_SALT_BYTES,
@@ -350,7 +350,16 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// to a guest whose `Hello` minor is at least this one, and an older guest is
 /// told nothing. See
 /// `docs/adr/0135-a-host-whose-encoder-refuses-every-frame-says-so.md`.
-pub const PROTOCOL_MINOR: u16 = 22;
+///
+/// 23: appended [`MessageKind::EncoderOptions`] and
+/// [`MessageKind::EncoderSelect`] after `DeviceInfo`: the host tells a guest
+/// which encoders it could use for that guest's picture, and the guest picks
+/// one or leaves the choice to the host. Gated on the minor alone, in both
+/// directions, like minor 21: a host announces the options only to a guest
+/// whose `Hello` minor is at least this one, and a guest asks only a host
+/// whose `HelloAck` minor is. See
+/// `docs/adr/0143-the-guest-can-pick-the-hosts-encoder.md`.
+pub const PROTOCOL_MINOR: u16 = 23;
 
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::MediaUnavailable`].
@@ -1430,6 +1439,51 @@ pub enum MessageKind {
         /// malformed frame that closes the connection (§9.1).
         os: String,
     },
+    /// Host to guest: the encoders this host could use for this guest's
+    /// picture right now, and the one this guest asked for (ADR 0143). New in
+    /// minor 23.
+    ///
+    /// Sent with every media stream the host starts for the guest, after
+    /// `MediaCodec`. `available` already leaves out an AV1 encoder for a
+    /// guest that does not decode AV1, and always holds
+    /// [`EncoderChoice::Auto`].
+    EncoderOptions {
+        /// What the guest may ask for, at most
+        /// [`crate::constants::MAX_ENCODER_CHOICES`] entries.
+        available: Vec<EncoderChoice>,
+        /// What the guest asked for last, [`EncoderChoice::Auto`] until it
+        /// asks.
+        chosen: EncoderChoice,
+    },
+    /// Guest to host: encode my picture with this encoder from now on
+    /// (ADR 0143). New in minor 23.
+    ///
+    /// Acted on only for a guest holding the `view` grant, and only for a
+    /// choice the host itself could make; anything else is logged and
+    /// ignored. The host restarts the media stream to apply it, and the
+    /// guest's redial comes back on the new encoder.
+    EncoderSelect {
+        /// The encoder asked for.
+        choice: EncoderChoice,
+    },
+}
+
+/// One encoder a guest can ask its host to use (ADR 0143).
+///
+/// A closed set, decoded by `serde`: a discriminant outside it is a malformed
+/// frame (§9.1), never a guess at an encoder this build does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EncoderChoice {
+    /// The host decides, by the rule of ADR 0141.
+    Auto,
+    /// H.264 on the host's hardware encoder.
+    H264Hardware,
+    /// H.264 in software, `openh264`.
+    H264Software,
+    /// AV1 on the host's hardware encoder.
+    Av1Hardware,
+    /// AV1 in software, libaom.
+    Av1Software,
 }
 
 /// One change a guest may ask a host to make to its own disk
@@ -1570,7 +1624,8 @@ impl MessageKind {
             | Self::TerminalOpenResponse { .. }
             | Self::SessionGrants { .. }
             | Self::UnattendedProofChallenge { .. }
-            | Self::FileOpResult { .. } => Some(Direction::HostToGuest),
+            | Self::FileOpResult { .. }
+            | Self::EncoderOptions { .. } => Some(Direction::HostToGuest),
             // The guest's requests: everything that asks the host to do
             // something to its own machine.
             Self::Hello { .. }
@@ -1595,7 +1650,8 @@ impl MessageKind {
             | Self::TerminalResize { .. }
             | Self::RebootRequest { .. }
             | Self::UnattendedProof { .. }
-            | Self::FileOpRequest { .. } => Some(Direction::GuestToHost),
+            | Self::FileOpRequest { .. }
+            | Self::EncoderSelect { .. } => Some(Direction::GuestToHost),
             // Content between two people, transfers either of them can
             // start, the keepalive, and the ends of things either side can
             // end.
@@ -2414,6 +2470,13 @@ impl MessageEnvelope {
             MessageKind::MediaCodec { codec } if MediaCodec::try_from(*codec).is_err() => {
                 return Err(CoreError::Malformed);
             }
+            // A host lists each encoder once at most; a longer list is not
+            // one this build could have produced (ADR 0143).
+            MessageKind::EncoderOptions { available, .. }
+                if available.len() > MAX_ENCODER_CHOICES =>
+            {
+                return Err(CoreError::Malformed);
+            }
             _ => {}
         }
         Ok(())
@@ -2445,8 +2508,8 @@ mod tests {
         AUDIO_CHANNELS, AUDIO_SAMPLE_RATE_HZ, CLIPBOARD_FILE_LIST_MAX_ENTRIES, CLIPBOARD_MAX_BYTES,
         DEVICE_NAME_MAX_BYTES, DEVICE_OS_MAX_BYTES, FILE_NAME_MAX_BYTES, FILE_OFFER_MAX_BYTES,
         MANIFEST_PATH_MAX_BYTES, MAX_DIR_MANIFEST_ENTRIES, MAX_DISPLAY_MODES_PER_HOST,
-        STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX, TUNNEL_HOST_MAX_BYTES,
-        UNATTENDED_LOCKOUT_DURATION_SECS,
+        MAX_ENCODER_CHOICES, STREAM_SIZE_MIN_PX, TERMINAL_COLS_MAX, TERMINAL_ROWS_MAX,
+        TUNNEL_HOST_MAX_BYTES, UNATTENDED_LOCKOUT_DURATION_SECS,
     };
 
     /// docs/bugs/17-remote-hotkeys.md: Shift selects a character, the other
@@ -3004,6 +3067,47 @@ mod tests {
         let original = envelope(MessageKind::ConsentGrant(Role::ViewOnly));
         let bytes = original.encode().unwrap();
         assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+    }
+
+    /// ADR 0143: the options travel host to guest and the choice guest to
+    /// host, both round-trip, and a list longer than there are encoders is
+    /// refused.
+    #[test]
+    fn encoder_options_and_select_roundtrip_one_way_each() {
+        let every = vec![
+            EncoderChoice::Auto,
+            EncoderChoice::H264Hardware,
+            EncoderChoice::H264Software,
+            EncoderChoice::Av1Hardware,
+            EncoderChoice::Av1Software,
+        ];
+        assert_eq!(every.len(), MAX_ENCODER_CHOICES);
+        let options = MessageKind::EncoderOptions {
+            available: every.clone(),
+            chosen: EncoderChoice::Av1Software,
+        };
+        assert_eq!(options.direction(), Some(Direction::HostToGuest));
+        let select = MessageKind::EncoderSelect {
+            choice: EncoderChoice::H264Software,
+        };
+        assert_eq!(select.direction(), Some(Direction::GuestToHost));
+        for kind in [options, select] {
+            let original = envelope(kind);
+            let bytes = original.encode().unwrap();
+            assert_eq!(MessageEnvelope::decode(&bytes).unwrap(), original);
+        }
+        let mut too_many = every;
+        too_many.push(EncoderChoice::Auto);
+        let bytes = envelope(MessageKind::EncoderOptions {
+            available: too_many,
+            chosen: EncoderChoice::Auto,
+        })
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            MessageEnvelope::decode(&bytes),
+            Err(CoreError::Malformed)
+        ));
     }
 
     /// ADR 0121: the name and the tag cross as they are, up to their bounds,

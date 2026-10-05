@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-host-encoder-select"
+description = "Enables the host_encoder_select command without any pre-configured scope."
+commands.allow = ["host_encoder_select"]
+
+[[permission]]
+identifier = "deny-host-encoder-select"
+description = "Denies the host_encoder_select command without any pre-configured scope."
+commands.deny = ["host_encoder_select"]

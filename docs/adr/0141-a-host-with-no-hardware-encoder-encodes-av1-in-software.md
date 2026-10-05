@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-10-02
 Amended by: ADR 0142 (§5.1: the budget is the 30 fps frame interval, 33 ms, not 22)
+Amended by: ADR 0143 (§5.1: measured 10 s after the host starts, not at the first AV1 guest; a guest can pick the encoder)
 
 Written as ADR 0139 and renumbered: [0139](0139-the-picture-waits-for-the-link-not-the-link-for-the-picture.md)
 and [0140](0140-windows-autostart-is-a-logon-task.md) were taken on master

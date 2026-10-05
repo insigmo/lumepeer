@@ -303,3 +303,13 @@ invalid minor21_device_info_os_too_long abababababababababababababababab010a4101
 # --- at least this one; a reason byte past it is still malformed.
 valid minor22_media_unavailable_encoder_failed abababababababababababababababab00001e0400
 invalid minor22_media_unavailable_unknown_reason abababababababababababababababab00001e0500
+# --- Frozen for PROTOCOL_MINOR 23: the guest picks the host's encoder
+# --- (ADR 0143). EncoderOptions (host to guest) and EncoderSelect (guest to
+# --- host) are appended after DeviceInfo. EncoderChoice is Auto 0,
+# --- H264Hardware 1, H264Software 2, Av1Hardware 3, Av1Software 4; a sixth is
+# --- malformed, and so is a list of more than five.
+valid minor23_encoder_options abababababababababababababababab000542030002040400
+valid minor23_encoder_options_every abababababababababababababababab0006420500010203040000
+valid minor23_encoder_select abababababababababababababababab010b430200
+invalid minor23_encoder_select_unknown_choice abababababababababababababababab010c430500
+invalid minor23_encoder_options_too_many abababababababababababababababab0007420600010203040000

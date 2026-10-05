@@ -145,6 +145,8 @@ describe("the guest toolbar's clipboard indicator", () => {
       viewSetSize: vi.fn().mockResolvedValue(undefined),
       hostDisplayModes: vi.fn().mockResolvedValue({ modes: [], reason: null }),
       hostDisplaySetMode: vi.fn().mockResolvedValue(undefined),
+      hostEncoders: vi.fn().mockResolvedValue({ available: [], chosen: null }),
+      hostEncoderSelect: vi.fn().mockResolvedValue(undefined),
     };
   }
 
@@ -162,6 +164,7 @@ describe("the guest toolbar's clipboard indicator", () => {
       pickMonitor: () => {},
       pickQuality: () => {},
       pickHostResolution: () => {},
+      pickEncoder: () => {},
       zoomBy: () => {},
       beginDrag: () => {},
       nudge: () => {},

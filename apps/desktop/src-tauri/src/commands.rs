@@ -12,7 +12,7 @@
 )]
 
 use lumepeer_core::consent::IndependentGrant;
-use lumepeer_core::protocol::{MediaCodec, RebootMode};
+use lumepeer_core::protocol::{EncoderChoice, MediaCodec, RebootMode};
 use serde::{Deserialize, Serialize};
 use tauri::Window;
 
@@ -3528,6 +3528,104 @@ pub async fn host_display_set_mode(
     state
         .network
         .host_display_set_mode(args.peer, args.mode_id)
+        .await?;
+    Ok(())
+}
+
+/// One encoder a guest can pick for its picture, as the toolbar names it
+/// (ADR 0143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderChoiceDto {
+    Auto,
+    H264Hardware,
+    H264Software,
+    Av1Hardware,
+    Av1Software,
+}
+
+impl From<EncoderChoice> for EncoderChoiceDto {
+    fn from(choice: EncoderChoice) -> Self {
+        match choice {
+            EncoderChoice::Auto => Self::Auto,
+            EncoderChoice::H264Hardware => Self::H264Hardware,
+            EncoderChoice::H264Software => Self::H264Software,
+            EncoderChoice::Av1Hardware => Self::Av1Hardware,
+            EncoderChoice::Av1Software => Self::Av1Software,
+        }
+    }
+}
+
+impl From<EncoderChoiceDto> for EncoderChoice {
+    fn from(choice: EncoderChoiceDto) -> Self {
+        match choice {
+            EncoderChoiceDto::Auto => Self::Auto,
+            EncoderChoiceDto::H264Hardware => Self::H264Hardware,
+            EncoderChoiceDto::H264Software => Self::H264Software,
+            EncoderChoiceDto::Av1Hardware => Self::Av1Hardware,
+            EncoderChoiceDto::Av1Software => Self::Av1Software,
+        }
+    }
+}
+
+/// What `host_encoders` hands back: what the host offered and what it is
+/// using, both empty/`null` while a host has announced nothing (ADR 0143).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostEncodersDto {
+    pub available: Vec<EncoderChoiceDto>,
+    pub chosen: Option<EncoderChoiceDto>,
+}
+
+/// Guest side: the encoders the watched host offered for this picture
+/// (ADR 0143).
+///
+/// # Errors
+/// [`IpcError`] when unallowed or the actor refuses.
+#[tauri::command]
+pub async fn host_encoders(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    peer: String,
+) -> Result<HostEncodersDto, IpcError> {
+    check_view_window(&window, &peer)?;
+    let announced = state.network.host_encoders(peer).await?;
+    Ok(match announced {
+        Some((available, chosen)) => HostEncodersDto {
+            available: available.into_iter().map(EncoderChoiceDto::from).collect(),
+            chosen: Some(chosen.into()),
+        },
+        None => HostEncodersDto {
+            available: Vec::new(),
+            chosen: None,
+        },
+    })
+}
+
+/// Argument of [`host_encoder_select`].
+#[derive(Debug, Deserialize)]
+pub struct HostEncoderSelectArgs {
+    /// Pseudonymized label of the host being watched.
+    pub peer: String,
+    /// The encoder picked, one the host offered.
+    pub choice: EncoderChoiceDto,
+}
+
+/// Guest side: asks the watched host to encode this picture with the encoder
+/// picked (ADR 0143). The host restarts the stream to apply it.
+///
+/// # Errors
+/// [`IpcError`] when unallowed, the host did not offer that encoder, or the
+/// host is too old for the message.
+#[tauri::command]
+pub async fn host_encoder_select(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HostEncoderSelectArgs,
+) -> Result<(), IpcError> {
+    check_view_window(&window, &args.peer)?;
+    state
+        .network
+        .host_encoder_select(args.peer, args.choice.into())
         .await?;
     Ok(())
 }

@@ -52,6 +52,8 @@ function fakeCommands(): ToolbarCommands & {
   viewSetSize: ReturnType<typeof vi.fn>;
   hostDisplayModes: ReturnType<typeof vi.fn>;
   hostDisplaySetMode: ReturnType<typeof vi.fn>;
+  hostEncoders: ReturnType<typeof vi.fn>;
+  hostEncoderSelect: ReturnType<typeof vi.fn>;
 } {
   const commands = {
     micToggle: vi.fn().mockResolvedValue(undefined),
@@ -65,6 +67,11 @@ function fakeCommands(): ToolbarCommands & {
     viewSetSize: vi.fn().mockResolvedValue(undefined),
     hostDisplayModes: vi.fn().mockResolvedValue({ modes: [], reason: null }),
     hostDisplaySetMode: vi.fn().mockResolvedValue(undefined),
+    hostEncoders: vi.fn().mockResolvedValue({
+      available: ['auto', 'h264_software', 'av1_software'],
+      chosen: 'auto',
+    }),
+    hostEncoderSelect: vi.fn().mockResolvedValue(undefined),
   };
   return commands;
 }
@@ -158,6 +165,9 @@ function draw(
       state.hostResolution = key;
       draw(state, commands, hooks);
     },
+    pickEncoder: (choice) => {
+      void commands.hostEncoderSelect('host-ab12', choice);
+    },
     zoomBy: () => {},
     beginDrag: () => {},
     nudge: () => {},
@@ -184,6 +194,7 @@ function noopActions(): Parameters<typeof renderToolbar>[4] {
     pickMonitor: () => {},
     pickQuality: () => {},
     pickHostResolution: () => {},
+    pickEncoder: () => {},
     zoomBy: () => {},
     beginDrag: () => {},
     nudge: () => {},
@@ -811,6 +822,72 @@ describe('the floating session toolbar', () => {
       await vi.waitFor(() =>
         expect(commands.hostDisplaySetMode).toHaveBeenCalledWith('host-ab12', 1),
       );
+    } finally {
+      stop();
+    }
+  });
+
+  // ADR 0143: every encoder is listed, the ones the host cannot use are
+  // greyed out, and a pick goes to the host.
+  it('lists every encoder, greys out what the host lacks and sends a pick', async () => {
+    const commands = fakeCommands();
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() =>
+        expect(container.querySelector('[data-testid="toolbar-encoder"]')).not.toBeNull(),
+      );
+      const options = [
+        ...container.querySelectorAll<HTMLOptionElement>('[data-testid="toolbar-encoder"] option'),
+      ];
+      expect(options.map((option) => option.value)).toEqual([
+        'auto',
+        'h264_hardware',
+        'h264_software',
+        'av1_hardware',
+        'av1_software',
+      ]);
+      expect(options.filter((option) => option.disabled).map((option) => option.value)).toEqual([
+        'h264_hardware',
+        'av1_hardware',
+      ]);
+      expect(options.find((option) => option.selected)?.value).toBe('auto');
+      const select = container.querySelector<HTMLSelectElement>('[data-testid="toolbar-encoder"]');
+      if (select) {
+        select.value = 'av1_software';
+        select.dispatchEvent(new Event('change'));
+      }
+      await vi.waitFor(() =>
+        expect(commands.hostEncoderSelect).toHaveBeenCalledWith('host-ab12', 'av1_software'),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it('says the host offers no encoder choice when it announced none', async () => {
+    const commands = fakeCommands();
+    commands.hostEncoders.mockResolvedValue({ available: [], chosen: null });
+    const stop = mountToolbar(
+      container,
+      'en',
+      'host-ab12',
+      commands,
+      fakeHooks({ chatVisible: () => false }),
+    );
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() => expect(commands.hostEncoders).toHaveBeenCalled());
+      expect(container.querySelector('[data-testid="toolbar-encoder"]')).toBeNull();
+      expect(
+        container.querySelector('[data-testid="toolbar-encoder-empty"]')?.textContent?.trim(),
+      ).toBe('The host offers no choice of encoder.');
     } finally {
       stop();
     }

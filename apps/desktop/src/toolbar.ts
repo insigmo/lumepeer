@@ -60,6 +60,29 @@ export interface HostDisplayModesDto {
   reason: HostDisplayModeUnavailableReason | null;
 }
 
+/**
+ * The encoders a guest can ask its host to use for the picture (ADR 0143),
+ * in the order the settings list shows them.
+ */
+export const ENCODER_CHOICES = [
+  'auto',
+  'h264_hardware',
+  'h264_software',
+  'av1_hardware',
+  'av1_software',
+] as const;
+export type EncoderChoice = (typeof ENCODER_CHOICES)[number];
+
+/**
+ * What `host_encoders` hands back: what the host offered and what it is
+ * using. Empty and `null` while the host has announced nothing — an older
+ * host, or no picture yet.
+ */
+export interface HostEncodersDto {
+  available: EncoderChoice[];
+  chosen: EncoderChoice | null;
+}
+
 /** How the toolbar talks to Tauri; injectable for tests. */
 export interface ToolbarCommands {
   micToggle(peer: string, on: boolean): Promise<void>;
@@ -134,6 +157,13 @@ export interface ToolbarCommands {
    * acting; this call only says whether the request could be sent at all.
    */
   hostDisplaySetMode(peer: string, modeId: number): Promise<void>;
+  /** What the host could encode this picture with, and what it uses (ADR 0143). */
+  hostEncoders(peer: string): Promise<HostEncodersDto>;
+  /**
+   * Asks the host to encode this picture with `choice` (ADR 0143). The host
+   * restarts the picture's stream to apply it.
+   */
+  hostEncoderSelect(peer: string, choice: EncoderChoice): Promise<void>;
 }
 
 /** Default binding to the real IPC surface. */
@@ -195,6 +225,15 @@ export const tauriToolbarCommands: ToolbarCommands = {
     const { invoke } = await import('@tauri-apps/api/core');
     // `mode_id`, not `modeId`: same snake_case boundary as `monitor_id`.
     return invoke('host_display_set_mode', { args: { peer, mode_id: modeId } });
+  },
+  async hostEncoders(peer) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    // A bare `peer`, like `hostDisplayModes`.
+    return (await invoke('host_encoders', { peer })) as HostEncodersDto;
+  },
+  async hostEncoderSelect(peer, choice) {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return invoke('host_encoder_select', { args: { peer, choice } });
   },
 };
 
@@ -401,6 +440,11 @@ export class ToolbarState {
    */
   hostResolution: string | null = null;
   /**
+   * The encoders the host offered for this picture and the one in use, as
+   * last fetched (ADR 0143).
+   */
+  hostEncoders: HostEncodersDto = { available: [], chosen: null };
+  /**
    * Whether a recording request has already been sent this session.
    *
    * Only so the button can stop inviting a second press while the first is
@@ -548,6 +592,7 @@ export function renderToolbar(
     pickMonitor(id: number): void;
     pickQuality(preset: QualityPreset): void;
     pickHostResolution(key: string): void;
+    pickEncoder(choice: EncoderChoice): void;
     zoomBy(steps: number): void;
     beginDrag(event: PointerEvent): void;
     nudge(dx: number, dy: number): void;
@@ -575,6 +620,8 @@ export function renderToolbar(
   // #4).
   const hostDisplayModes = state.hostDisplayModes ?? { modes: [], reason: null };
   const hostResolutions = hostResolutionsFrom(hostDisplayModes.modes);
+  // Same guard again, for the encoder list (ADR 0143).
+  const hostEncoders = state.hostEncoders ?? { available: [], chosen: null };
   // Nothing picked yet means the host is still at the size it announced for
   // the monitor being watched, so that is what the select shows selected —
   // never a blank, and never the first row of a list the guest did not choose.
@@ -646,6 +693,32 @@ export function renderToolbar(
                     </option>`,
                 )}
               </select>
+            </label>
+            <!-- ADR 0143. Every encoder is listed; the ones this host cannot
+                 use are greyed out rather than left off, so the list says
+                 what the host lacks. -->
+            <label class="toolbar-pop-row">
+              <span>${t(locale, 'toolbar.settings.encoder')}</span>
+              ${hostEncoders.chosen === null
+                ? html`<span data-testid="toolbar-encoder-empty">
+                    ${t(locale, 'toolbar.encoder.unavailable')}
+                  </span>`
+                : html`<select
+                    data-testid="toolbar-encoder"
+                    @change=${(event: Event) =>
+                      actions.pickEncoder((event.target as HTMLSelectElement).value as EncoderChoice)}
+                  >
+                    ${ENCODER_CHOICES.map(
+                      (choice) =>
+                        html`<option
+                          value=${choice}
+                          ?selected=${choice === hostEncoders.chosen}
+                          ?disabled=${!hostEncoders.available.includes(choice)}
+                        >
+                          ${t(locale, `toolbar.encoder.${choice}` as TranslationKeyAlias)}
+                        </option>`,
+                    )}
+                  </select>`}
             </label>
             <label class="toolbar-pop-row">
               <span>${t(locale, 'toolbar.settings.hostResolution')}</span>
@@ -967,6 +1040,13 @@ const TOOLBAR_INSET = 8;
 const CLIPBOARD_SYNC_POLL_INTERVAL_MS = 1000;
 
 /**
+ * How long after an encoder pick the toolbar asks the host's list again
+ * (ADR 0143): the guest redials the picture half a second after the host
+ * stops it, and the new stream's announcement follows the redial.
+ */
+const ENCODER_REFRESH_MS = 1500;
+
+/**
  * Wires the toolbar to the DOM: render loop, drag, popovers, and IPC.
  *
  * Returns a stop function that removes the global listeners; the container
@@ -1045,6 +1125,22 @@ export function mountToolbar(
     return monitor ? hostResolutionKey(monitor) : null;
   }
 
+  /** Asks for the host's encoder list again and redraws (ADR 0143). */
+  function refreshEncoders(): void {
+    void commands
+      .hostEncoders(peer)
+      .then((encoders) => {
+        state.hostEncoders = encoders;
+        draw();
+      })
+      .catch(() => {
+        // The session is gone or the window is not allowed: the row says the
+        // host offers no choice, never a select that silently does nothing.
+        state.hostEncoders = { available: [], chosen: null };
+        draw();
+      });
+  }
+
   /**
    * Switches the host's own screen to the resolution now selected.
    *
@@ -1120,6 +1216,11 @@ export function mountToolbar(
             state.hostDisplayModes = { modes: [], reason: 'no_modes_reported' };
             draw();
           });
+      }
+      // Asked every time: the list changes with each stream the host starts
+      // (ADR 0143), and the ask goes no further than this device.
+      if (which === 'settings') {
+        refreshEncoders();
       }
       draw();
     },
@@ -1224,6 +1325,16 @@ export function mountToolbar(
       state.hostResolution = key;
       applyHostResolution();
       draw();
+    },
+    pickEncoder(choice: EncoderChoice): void {
+      state.hostEncoders = { ...state.hostEncoders, chosen: choice };
+      draw();
+      void commands
+        .hostEncoderSelect(peer, choice)
+        // The host restarts the picture's stream and says what it settled
+        // on with the new one; ask again once that has had time to land.
+        .then(() => setTimeout(refreshEncoders, ENCODER_REFRESH_MS))
+        .catch(refreshEncoders);
     },
     zoomBy(steps: number): void {
       hooks.zoomBy(steps);

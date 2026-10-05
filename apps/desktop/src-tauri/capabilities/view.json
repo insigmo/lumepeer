@@ -58,6 +58,8 @@
     "allow-view-keyboard-grab",
     "allow-host-display-modes",
     "allow-host-display-set-mode",
+    "allow-host-encoders",
+    "allow-host-encoder-select",
     "allow-session-revoke"
   ]
 }

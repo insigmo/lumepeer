@@ -350,6 +350,15 @@ export const en: Dictionary = {
   'toolbar.settings.zoom': 'Zoom level',
   'toolbar.zoom.in': 'Zoom in',
   'toolbar.zoom.out': 'Zoom out',
+  // ADR 0143: which encoder the host uses for this picture. Temporary,
+  // for comparing the encoders by eye on a real pair.
+  'toolbar.settings.encoder': 'Encoder',
+  'toolbar.encoder.auto': 'Automatic',
+  'toolbar.encoder.h264_hardware': 'H.264, hardware',
+  'toolbar.encoder.h264_software': 'H.264, software (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1, hardware',
+  'toolbar.encoder.av1_software': 'AV1, software (libaom)',
+  'toolbar.encoder.unavailable': 'The host offers no choice of encoder.',
   // D7, docs/bugs/16-host-display-mode.md: switches the host's actual
   // monitor, never merely what this window receives. Refresh rates are not
   // listed here — the quality preset above picks one, so the same resolution

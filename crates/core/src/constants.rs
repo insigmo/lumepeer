@@ -760,6 +760,13 @@ pub const SOFTWARE_AV1_MAX_THREADS: usize = 8;
 /// and 26–27 ms beside a running session — against 27.7 ms for the
 /// `openh264` it was left on (ADR 0142).
 pub const SOFTWARE_AV1_FRAME_BUDGET_MS: u64 = 33;
+/// Seconds after a host starts before it measures software AV1 (ADR 0143).
+///
+/// At the start, so the answer is there before the first session rather than
+/// racing it, and measured on a machine no session is loading yet; not at
+/// the very first second, when the same process is still building its
+/// windows and finding the network.
+pub const SOFTWARE_AV1_MEASURE_DELAY_SECS: u64 = 10;
 /// Encoded frames per window over which a live software AV1 session checks
 /// that it keeps up (§11; ADR 0141): three seconds at
 /// [`SOFTWARE_AV1_MAX_FPS`].
@@ -1269,6 +1276,10 @@ pub const CLIPBOARD_FILE_PATH_MAX_BYTES: usize = 4096;
 /// legacy VESA sizes included. What is left to bound is the count a peer
 /// can claim before anything downstream allocates per mode.
 pub const MAX_DISPLAY_MODES_PER_HOST: usize = 128;
+
+/// Most entries an `EncoderOptions` may list (ADR 0143): one per
+/// `EncoderChoice`, each at most once.
+pub const MAX_ENCODER_CHOICES: usize = 5;
 
 /// How long the host waits, after switching its own physical display mode,
 /// for something to confirm the new mode actually produces a picture before

@@ -86,6 +86,8 @@ const COMMANDS: &[&str] = &[
     "view_keyboard_grab",
     "host_display_modes",
     "host_display_set_mode",
+    "host_encoders",
+    "host_encoder_select",
     "recordings_list",
     "recording_export",
     "audit_list",

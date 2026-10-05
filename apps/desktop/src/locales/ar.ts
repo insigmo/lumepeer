@@ -325,6 +325,13 @@ export const ar: Dictionary = {
   'toolbar.settings.zoom': 'مستوى التكبير',
   'toolbar.zoom.in': 'تكبير',
   'toolbar.zoom.out': 'تصغير',
+  'toolbar.settings.encoder': 'المُرمِّز',
+  'toolbar.encoder.auto': 'تلقائي',
+  'toolbar.encoder.h264_hardware': 'H.264، عتادي',
+  'toolbar.encoder.h264_software': 'H.264، برمجي (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1، عتادي',
+  'toolbar.encoder.av1_software': 'AV1، برمجي (libaom)',
+  'toolbar.encoder.unavailable': 'لا يتيح المضيف اختيار المُرمِّز.',
   'toolbar.settings.hostResolution': 'دقة شاشة المضيف',
   'toolbar.settings.hostResolutionWarning':
     'هذا يغيّر دقة شاشة جهاز المضيف نفسه، وليس فقط ما تراه هنا.',

@@ -326,6 +326,13 @@ export const ru: Dictionary = {
   'toolbar.settings.zoom': 'Уровень масштаба',
   'toolbar.zoom.in': 'Увеличить',
   'toolbar.zoom.out': 'Уменьшить',
+  'toolbar.settings.encoder': 'Кодировщик',
+  'toolbar.encoder.auto': 'Автоматически',
+  'toolbar.encoder.h264_hardware': 'H.264, аппаратный',
+  'toolbar.encoder.h264_software': 'H.264, программный (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1, аппаратный',
+  'toolbar.encoder.av1_software': 'AV1, программный (libaom)',
+  'toolbar.encoder.unavailable': 'Хост не предлагает выбор кодировщика.',
   'toolbar.settings.hostResolution': 'Разрешение экрана хоста',
   'toolbar.settings.hostResolutionWarning':
     'Это изменяет разрешение экрана самого хоста, а не только то, что вы видите здесь.',

@@ -327,6 +327,13 @@ export const tr: Dictionary = {
   'toolbar.settings.zoom': 'Yakınlaştırma düzeyi',
   'toolbar.zoom.in': 'Yakınlaştır',
   'toolbar.zoom.out': 'Uzaklaştır',
+  'toolbar.settings.encoder': 'Kodlayıcı',
+  'toolbar.encoder.auto': 'Otomatik',
+  'toolbar.encoder.h264_hardware': 'H.264, donanım',
+  'toolbar.encoder.h264_software': 'H.264, yazılım (openh264)',
+  'toolbar.encoder.av1_hardware': 'AV1, donanım',
+  'toolbar.encoder.av1_software': 'AV1, yazılım (libaom)',
+  'toolbar.encoder.unavailable': 'Ana bilgisayar kodlayıcı seçimi sunmuyor.',
   'toolbar.settings.hostResolution': 'Ana bilgisayarın ekran çözünürlüğü',
   'toolbar.settings.hostResolutionWarning':
     'Bu, yalnızca burada gördüğünüzü değil, ana bilgisayar bilgisayarının kendi çözünürlüğünü değiştirir.',
