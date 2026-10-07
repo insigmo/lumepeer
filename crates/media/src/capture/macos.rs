@@ -20,8 +20,10 @@
 //! Losing a permission mid-session is a normal, handled event, not a crash: the
 //! stream's `stream:didStopWithError:` fires and the next `next_frame` returns
 //! [`MediaError::CaptureInterrupted`], which revokes the session and notifies
-//! both sides (§18). The same applies to the Accessibility permission on the
-//! input side, where the next `CGEvent` fails instead. iOS is viewer-only in v1,
+//! both sides (§18). The Accessibility permission on the input side is asked
+//! for, not inferred: a `CGEvent` posted without it is dropped with no error,
+//! so `MacosInjector` checks the permission itself and refuses the event with
+//! [`MediaError::InputUnavailable`] while it is missing. iOS is viewer-only in v1,
 //! so no capture backend exists there (§1.2).
 
 #[cfg(all(target_os = "macos", feature = "capture-screencapturekit"))]
@@ -47,6 +49,7 @@ mod screen_capture_kit {
         reason = "every ScreenCaptureKit/CoreMedia/CoreVideo entry point in the objc2 bindings is an `unsafe fn` because it crosses into Objective-C, and the SCStreamOutput delegate must be a real Objective-C class. Every block below carries a SAFETY note, per §21. See ADR 0013."
     )]
 
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
@@ -58,7 +61,8 @@ mod screen_capture_kit {
     use objc2_core_foundation::{CFRetained, CGPoint};
     use objc2_core_graphics::{
         CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType,
-        CGKeyCode, CGMainDisplayID, CGMouseButton, CGScrollEventUnit,
+        CGKeyCode, CGMainDisplayID, CGMouseButton, CGPreflightPostEventAccess,
+        CGRequestPostEventAccess, CGScrollEventUnit,
     };
     use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
@@ -1416,20 +1420,90 @@ mod screen_capture_kit {
         })
     }
 
+    /// How long [`MacosInjector`] trusts its last answer from
+    /// [`may_post_events`] before asking macOS again: often enough that a
+    /// permission granted mid-session starts working without a restart,
+    /// rarely enough that a pointer move does not cost a trip to TCC.
+    const POST_ACCESS_RECHECK: Duration = Duration::from_secs(2);
+
+    /// What a refused event says, and so what the host's log says once.
+    ///
+    /// The second half is the case that actually happens: a grant given to a
+    /// build signed differently (any build before ADR 0128, or an unsigned
+    /// one) names that build's exact code hash, so System Settings shows the
+    /// switch on while every later build is refused.
+    const NO_POST_ACCESS: &str = "macOS does not let Lumepeer control this Mac: allow it in \
+        System Settings > Privacy & Security > Accessibility (if Lumepeer is already listed and on, \
+        remove it with - and add it again: a grant given to an older build does not cover this one)";
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        /// Whether this process holds the Accessibility permission. A plain
+        /// query of the calling process's own TCC state, with no arguments.
+        safe fn AXIsProcessTrusted() -> bool;
+    }
+
+    /// Whether macOS lets this process post input events (§11.1).
+    ///
+    /// Either grant will do: Accessibility, which is what System Settings
+    /// shows and what this app asks users for, or the narrower `PostEvent`
+    /// grant `CGRequestPostEventAccess` asks for. It has to be asked rather
+    /// than read off a failed post: `CGEventPost` from a process with neither
+    /// drops every event and reports nothing, so a host without it took the
+    /// guest's whole session of input and performed none of it.
+    fn may_post_events() -> bool {
+        AXIsProcessTrusted() || CGPreflightPostEventAccess()
+    }
+
+    /// Puts the system's own "would like to control this computer" prompt on
+    /// the host's screen, once per run — where the guest, who is looking at
+    /// that screen, sees it too. Once, because asking again on every refused
+    /// event would only stack the same dialog.
+    fn request_post_access_once() {
+        static ASKED: AtomicBool = AtomicBool::new(false);
+        if !ASKED.swap(true, Ordering::Relaxed) {
+            // The answer is the same `may_post_events` reads; what matters
+            // here is the prompt this shows.
+            let _ = CGRequestPostEventAccess();
+        }
+    }
+
+    /// The primary display's size in points as it is now, or `None` while it
+    /// reads 0x0.
+    fn main_display_size() -> Option<(f64, f64)> {
+        let display = CGMainDisplayID();
+        let width = CGDisplayPixelsWide(display);
+        let height = CGDisplayPixelsHigh(display);
+        // A real display's pixel width/height is nowhere near f64's 2^52
+        // exact-integer ceiling, so the precision this could lose in
+        // principle never actually happens.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "display pixel counts stay far below f64's 52-bit exact-integer range"
+        )]
+        let size = (width as f64, height as f64);
+        (width > 0 && height > 0).then_some(size)
+    }
+
     /// Input injection through `CGEvent`, posted at the HID tap so it reaches
     /// every application, the same reach `SendInput` has on Windows and
     /// XTEST has on X11 (§11).
     ///
     /// Screen Recording (this file's own permission, for capture) and
     /// Accessibility (this type's permission, for posting events) are
-    /// separate macOS grants. Losing Accessibility mid-session is a normal,
-    /// handled event: the next `inject` returns [`MediaError::InputUnavailable`]
-    /// and the caller revokes rather than crashing (§18).
+    /// separate macOS grants. Without Accessibility `inject` returns
+    /// [`MediaError::InputUnavailable`] instead of posting into nothing, and
+    /// the permission is asked again every [`POST_ACCESS_RECHECK`], so losing
+    /// it mid-session or granting it mid-session both take effect on their
+    /// own (§18).
     #[derive(Debug)]
     pub struct MacosInjector {
-        /// Primary display size in points, read once at `connect` so every
-        /// `PointerMove` scales the guest's normalized 0..=65535 coordinate
-        /// without re-querying `CGDirectDisplay` per event.
+        /// Primary display size in points, re-read on every `PointerMove`
+        /// (the last nonzero answer is kept). Read once at `connect` only, it
+        /// went stale the moment the display changed mode: a VM leaving full
+        /// screen goes from 1920x1080 to 1718x920 under a running host, and
+        /// every move then landed scaled by the old size — right at the
+        /// top-left corner, ever further off towards the bottom-right.
         width: f64,
         height: f64,
         /// Wherever `PointerMove` last put the pointer. `Press`/`Release`
@@ -1448,6 +1522,10 @@ mod screen_capture_kit {
         /// so getting this wrong silently breaks drag-select and window
         /// dragging rather than just mislabeling an event.
         held: Option<CGMouseButton>,
+        /// What [`may_post_events`] answered when it was last asked, and when
+        /// that was.
+        may_post: bool,
+        may_post_checked: Instant,
     }
 
     impl MacosInjector {
@@ -1456,26 +1534,18 @@ mod screen_capture_kit {
         /// cannot be read — implausible on a running desktop, but this keeps
         /// `PointerMove` from ever scaling against a size it never checked.
         pub fn connect() -> Result<Self> {
-            let display = CGMainDisplayID();
-            let width = CGDisplayPixelsWide(display);
-            let height = CGDisplayPixelsHigh(display);
-            if width == 0 || height == 0 {
+            let Some((width, height)) = main_display_size() else {
                 return Err(MediaError::InputUnavailable(
                     "cannot read the primary display's size".to_owned(),
                 ));
-            }
-            // A real display's pixel width/height is nowhere near f64's
-            // 2^52 exact-integer ceiling, so the precision this could lose
-            // in principle never actually happens.
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "display pixel counts stay far below f64's 52-bit exact-integer range"
-            )]
+            };
             Ok(Self {
-                width: width as f64,
-                height: height as f64,
+                width,
+                height,
                 last_position: CGPoint { x: 0.0, y: 0.0 },
                 held: None,
+                may_post: may_post_events(),
+                may_post_checked: Instant::now(),
             })
         }
 
@@ -1598,8 +1668,8 @@ mod screen_capture_kit {
 
         /// `x`/`y` are normalized to 0..=65535 of the captured surface
         /// (§9.1); `CGEvent`'s mouse position is in points from the primary
-        /// display's top-left, so this scales by the size cached in
-        /// `connect` — the same role `X11Injector::to_screen` plays.
+        /// display's top-left, so this scales by the size `inject` just read
+        /// — the same role `X11Injector::to_screen` plays.
         fn point(&self, x: u16, y: u16) -> CGPoint {
             CGPoint {
                 x: f64::from(x) * self.width / f64::from(POINTER_RANGE),
@@ -1624,8 +1694,20 @@ mod screen_capture_kit {
 
     impl InputInjector for MacosInjector {
         fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
+            if self.may_post_checked.elapsed() >= POST_ACCESS_RECHECK {
+                self.may_post = may_post_events();
+                self.may_post_checked = Instant::now();
+            }
+            if !self.may_post {
+                request_post_access_once();
+                return Err(MediaError::InputUnavailable(NO_POST_ACCESS.to_owned()));
+            }
             match event.detail {
                 InputDetail::PointerMove { x, y } => {
+                    if let Some((width, height)) = main_display_size() {
+                        self.width = width;
+                        self.height = height;
+                    }
                     self.last_position = self.point(x, y);
                     let (event_type, button) = match self.held {
                         Some(button @ CGMouseButton::Left) => {

@@ -5683,6 +5683,12 @@ struct Actor {
     /// moves between it and the in-process injector — once per change, not
     /// per keystroke (ADR 0119). `None` before the first event.
     injected_via_service: Option<bool>,
+    /// Host side: the last injection failure the log was told about, so a
+    /// failure every event repeats — a macOS host without the Accessibility
+    /// permission refuses every pointer move — is logged once when it
+    /// starts, not sixty times a second. Cleared by the next event that
+    /// lands.
+    last_injection_error: Option<String>,
     /// Host side: the last pointer position a guest moved to *on the secure
     /// desktop*, so a click there can be placed without spawning a helper
     /// worker for every intervening move (ADR 0057).
@@ -10850,10 +10856,18 @@ impl Actor {
                 }
             }
         }
-        if let Some(injector) = self.injector.as_mut()
-            && let Err(error) = injector.inject(event)
-        {
-            tracing::warn!(peer = %tag, %error, "input injection failed");
+        let Some(injector) = self.injector.as_mut() else {
+            return;
+        };
+        match injector.inject(event) {
+            Ok(()) => self.last_injection_error = None,
+            Err(error) => {
+                let text = error.to_string();
+                if self.last_injection_error.as_deref() != Some(text.as_str()) {
+                    tracing::warn!(peer = %tag, %error, "input injection failed");
+                    self.last_injection_error = Some(text);
+                }
+            }
         }
     }
 
@@ -19262,6 +19276,7 @@ pub fn spawn_actor_with(
         record_request_rate: ConsentRateLimiter::new(),
         injector,
         injected_via_service: None,
+        last_injection_error: None,
         secure_desktop_pointer: None,
         views: std::collections::HashMap::new(),
         view_feeds: Arc::clone(&view_feeds),
