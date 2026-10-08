@@ -1366,6 +1366,23 @@ const _: () = assert!(
     "the wait for a rebooting host must outlast the resume window"
 );
 
+/// How long a guest whose host said it is restarting into an update waits
+/// before dialing it for a new session (ADR 0148).
+///
+/// Not zero: the process that said so is still on its way out, and a dial
+/// that reached it would only be turned away. Not more: an installer takes
+/// several seconds at the least, and the dial that starts here keeps knocking
+/// until the new process answers, so starting early costs nothing.
+pub const HOST_RESTART_REDIAL_SECS: u64 = 2;
+
+/// How long a process restarting into an update gives the closes it sent its
+/// peers to leave before it exits, milliseconds (ADR 0148).
+///
+/// QUIC sends a close on the connection's next poll, well inside this; the
+/// installer that follows ends the process outright, and a close still
+/// queued then is a close nobody receives.
+pub const RESTART_CLOSE_FLUSH_MS: u64 = 250;
+
 /// How often a guest whose session dropped tries to resume it while
 /// [`RECONNECT_WINDOW_SECS`] is still open (§10; ADR 0089).
 ///

@@ -500,6 +500,11 @@ pub const CLOSE_RESUME_REFUSED: u32 = 7;
 /// there: it closes the control connection before any `Hello`, so no session
 /// and no consent request ever follow (ADR 0127).
 pub const CLOSE_PRESENCE: u32 = 8;
+/// QUIC application close code for a process that is restarting into an
+/// update (ADR 0148). Its sessions end with it and the process that comes
+/// back knows none of them, so a guest dials a new session at once rather
+/// than trying to resume this one.
+pub const CLOSE_RESTARTING: u32 = 9;
 
 /// Close code and reason string that a framing error must close the stream
 /// with (§9.1, §18).

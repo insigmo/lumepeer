@@ -1381,6 +1381,13 @@ const SILENCE_CHECK_MS: u64 = 250;
 /// often than the host would punch towards one address anyway
 /// ([`RENDEZVOUS_REPUNCH_SECS`]), and never while the endpoint has no
 /// connection open.
+///
+/// A dial that has heard nothing at all yet is silent too, counted from its
+/// own knock (ADR 0148). That knock is lost when the host is not listening
+/// yet — a host restarting into an update, say — and the relays keep no
+/// knock for later, so without this one the host that comes up mid-dial
+/// would never hear this guest until the dial's next attempt, many seconds
+/// on.
 async fn knock_on_silence(
     endpoint: Endpoint,
     route: HostRoute,
@@ -1394,11 +1401,14 @@ async fn knock_on_silence(
     let again = Duration::from_secs(RENDEZVOUS_REPUNCH_SECS);
     let mut check = tokio::time::interval(Duration::from_millis(SILENCE_CHECK_MS));
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut knocked: Option<tokio::time::Instant> = None;
+    // Started by the dial that knocks as it starts this (`start_rendezvous`).
+    let started = tokio::time::Instant::now();
+    let mut knocked = Some(started);
     loop {
         check.tick().await;
+        let silent = route.silent_for().unwrap_or_else(|| started.elapsed());
         if endpoint.open_connections() == 0
-            || route.silent_for().is_none_or(|silent| silent < quiet)
+            || silent < quiet
             || knocked.is_some_and(|at| at.elapsed() < again)
         {
             continue;
@@ -1418,6 +1428,7 @@ async fn knock_on_silence(
         tracing::info!(
             addr = %own,
             route = %route.addr(),
+            heard_before = route.silent_for().is_some(),
             "the host went quiet: knocked again through the signalling relays"
         );
 
@@ -2792,6 +2803,58 @@ mod tests {
         guest.close().await;
         host_side.abort();
         nat.tasks.abort_all();
+        reflector_task.abort();
+    }
+
+    /// ADR 0148: a dial whose host is not listening yet — one restarting into
+    /// an update — knocks again while it hears nothing. The relays keep no
+    /// knock, so the dial's first one is lost on such a host, and a host that
+    /// comes up mid-dial would otherwise not hear this guest until the dial's
+    /// next attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dial_that_hears_nothing_knocks_again() {
+        let relay = Relay::start().await;
+        let (reflector, reflector_task) = spawn_reflector().await;
+        // Bound and never read: where the host was, and will be again.
+        let nobody = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let guest = GuestObfuscatedEndpoint::bind_via(
+            &INVITE,
+            &identity(2),
+            NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap(),
+            nobody.local_addr().unwrap(),
+            [0u8; 32],
+            Some(signalling_through(&relay)),
+            leaked_reflectors(reflector.to_string()),
+        )
+        .unwrap();
+        let dialing = tokio::spawn(async move {
+            let dialed = guest.connect_control().await;
+            (dialed.is_ok(), guest)
+        });
+        relay
+            .wait_for("the dial's own knock", |seen| !seen.events.is_empty())
+            .await;
+        let first = tokio::time::Instant::now();
+        relay
+            .wait_for("a knock while the dial heard nothing", |seen| {
+                seen.events.len() >= 2
+            })
+            .await;
+        let took = first.elapsed();
+
+        let again = Duration::from_secs(RENDEZVOUS_REPUNCH_SECS);
+        assert!(
+            took + Duration::from_millis(SILENCE_CHECK_MS) >= again,
+            "knocked again {took:?} after the first: more often than the host punches"
+        );
+        assert!(
+            took < again + Duration::from_secs(1),
+            "knocked again only {took:?} after the first"
+        );
+        let (connected, guest) = dialing.await.unwrap();
+        assert!(!connected, "nothing was there to connect to");
+        guest.close().await;
+        drop(nobody);
         reflector_task.abort();
     }
 

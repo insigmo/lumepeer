@@ -31,18 +31,19 @@ use lumepeer_core::constants::{
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
     DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, ENCODE_MAX_FPS, FILE_OFFER_LEGACY_MAX_BYTES,
     FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS,
-    HOST_KEEP_AWAKE_SECS, INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS,
-    MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES,
-    MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS,
-    MAX_TERMINALS_PER_SESSION, MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS,
-    PRESENCE_ATTEMPT_TIMEOUT_SECS, PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS,
-    REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS, RECONNECT_WINDOW_SECS,
-    RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS, RESUME_RETRY_SECS, RTT_EWMA_ALPHA,
-    RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS, SAVED_HOST_FIRST_REFRESH_SECS,
-    SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS, SAVED_HOSTS_PER_REFRESH,
-    SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS, SOFTWARE_AV1_MEASURE_DELAY_SECS,
-    STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX, TERMINAL_OUTPUT_MAX_BYTES,
-    TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS, TUNNEL_IDLE_TIMEOUT_SECS,
+    HOST_KEEP_AWAKE_SECS, HOST_RESTART_REDIAL_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
+    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
+    MAX_DIR_MANIFEST_ENTRIES, MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES,
+    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
+    MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, PRESENCE_ATTEMPT_TIMEOUT_SECS,
+    PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS,
+    RECONNECT_WINDOW_SECS, RESTART_CLOSE_FLUSH_MS, RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS,
+    RESUME_RETRY_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS,
+    SAVED_HOST_FIRST_REFRESH_SECS, SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS,
+    SAVED_HOSTS_PER_REFRESH, SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS,
+    SOFTWARE_AV1_MEASURE_DELAY_SECS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS,
+    TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
@@ -1343,6 +1344,9 @@ enum ActorCommand {
     },
     /// Host side: the person at this machine stopped it (ADR 0084).
     RebootCancel { reply: oneshot::Sender<()> },
+    /// This process is about to restart into an update: tell every peer, and
+    /// take no new connection (ADR 0148).
+    Restarting { reply: oneshot::Sender<()> },
     /// Guest side: how this node's own outgoing connect attempt is going, and
     /// the §18 code of the last failure if it ended in one.
     ConnectState {
@@ -1992,6 +1996,27 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Tells every peer this process is restarting into an update, and
+    /// returns once those closes have had time to leave (ADR 0148).
+    ///
+    /// Without it the installer ends the process in silence, and a guest
+    /// learns its host is gone only from QUIC's idle timeout — then spends
+    /// its first attempts on resuming a session the new process never heard
+    /// of. Told, it dials a new session straight away.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn announce_restart(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::Restarting { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?;
+        tokio::time::sleep(Duration::from_millis(RESTART_CLOSE_FLUSH_MS)).await;
+        Ok(())
     }
 
     /// How this node's own outgoing connect attempt is going.
@@ -5543,6 +5568,11 @@ struct Actor {
     /// (ADR 0084). The same shape `display_mode_generation` uses, for the
     /// same reason and with higher stakes.
     reboot_generation: u64,
+    /// This process has told its peers it is restarting into an update
+    /// (ADR 0148). It is on its way out, so a connection that reaches it now
+    /// is told the same and closed rather than given a session that would
+    /// die with the process a moment later.
+    restarting: bool,
     /// Guest side: every host this node is waiting to come back, one wait
     /// per host (ADR 0084).
     ///
@@ -6068,10 +6098,10 @@ struct ReconnectWait {
     /// came back as a screen one would start an encode loop on the host that
     /// nobody asked for.
     surface: ViewSurface,
-    /// The host refused the resume (ADR 0144). It has no session to repair,
-    /// so a new one cannot race the repair, and the host has just proved it
-    /// is up: the wait dials at once instead of sitting out the rest of
-    /// [`RECONNECT_WINDOW_SECS`].
+    /// The host refused the resume (ADR 0144), or said it is restarting into
+    /// an update (ADR 0148). Either way it has no session to repair, so a new
+    /// one cannot race the repair: the wait dials without sitting out the
+    /// rest of [`RECONNECT_WINDOW_SECS`].
     refused: bool,
 }
 
@@ -9607,6 +9637,17 @@ impl Actor {
                 guest_codec_support,
                 resume_claim,
             } => {
+                // A guest that reached this process after it said it is
+                // restarting would get a session that dies with it a moment
+                // later. Told the same as everyone else, it dials again and
+                // finds the process that comes back (ADR 0148).
+                if self.restarting {
+                    connection.connection().close(
+                        lumepeer_net::connection::CLOSE_RESTARTING.into(),
+                        lumepeer_net::error::close_code::RESTARTING.as_bytes(),
+                    );
+                    return;
+                }
                 // First, before a single feature of this `Hello` is recorded:
                 // letting go of a connection this claim proves dead runs the
                 // per-connection teardown, which would otherwise wipe what is
@@ -12291,6 +12332,11 @@ impl Actor {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one funnel for every way a connection ends; each kind of ending reads its \
+                  own few lines here, and splitting them would hide the order they run in"
+    )]
     fn on_closed(&mut self, peer: NodeId, id: u64) {
         // Only the current generation may tear the peer's state down.
         if self.connections.get(&peer).is_some_and(|c| c.id != id) {
@@ -12397,6 +12443,14 @@ impl Actor {
                     .connection
                     .closed_by_peer_with(lumepeer_net::connection::CLOSE_RESUME_REFUSED)
             });
+        // The host said it is restarting into an update (ADR 0148): the
+        // session ends with that process, and the one that comes back has
+        // never heard of it, so there is nothing to resume.
+        let host_restarting = closed.as_ref().is_some_and(|handle| {
+            handle
+                .connection
+                .closed_by_peer_with(lumepeer_net::connection::CLOSE_RESTARTING)
+        });
         let dialing_again = self.connect_is_still_unanswered(peer, was_watching, closed.as_ref())
             && self.retry_connect_soon(peer);
         if !dialing_again {
@@ -12428,7 +12482,31 @@ impl Actor {
             self.stop_view(peer);
         }
         if was_watching {
-            self.start_reconnect_wait(peer, host_tag(&peer), resume, was_surface);
+            self.start_reconnect_wait(
+                peer,
+                host_tag(&peer),
+                resume.filter(|_| !host_restarting),
+                was_surface,
+                host_restarting,
+            );
+        } else if host_restarting
+            && (self.reconnect_waits.contains_key(&peer) || self.parked_views.contains_key(&peer))
+        {
+            // A wait's own dial reached the process that is on its way out,
+            // which may have ended the wait before turning it away. The next
+            // dial, a moment later, finds the process that replaces it, and
+            // the parked window is still the one it fills.
+            let surface = self
+                .reconnect_waits
+                .get(&peer)
+                .map(|wait| wait.surface)
+                .or_else(|| {
+                    self.parked_views
+                        .get(&peer)
+                        .map(|parked| parked.state.surface)
+                })
+                .unwrap_or_default();
+            self.start_reconnect_wait(peer, host_tag(&peer), None, surface, true);
         } else if resume_refused {
             self.on_resume_refused(peer);
         } else if resuming_over_this {
@@ -12793,6 +12871,10 @@ impl Actor {
             }
             ActorCommand::RebootCancel { reply } => {
                 self.on_reboot_cancel();
+                let _ = reply.send(());
+            }
+            ActorCommand::Restarting { reply } => {
+                self.on_restarting();
                 let _ = reply.send(());
             }
             ActorCommand::RemoteDownload {
@@ -16417,6 +16499,26 @@ impl Actor {
         let _ = self.notify.send(ActorNotification::RebootPending);
     }
 
+    /// This process is about to restart into an update (ADR 0148): every peer
+    /// reads that in the close of its connection, and nothing new is taken in
+    /// for the moment the process has left.
+    ///
+    /// Only closed, not torn down: the exit a moment later takes everything
+    /// else with it.
+    fn on_restarting(&mut self) {
+        self.restarting = true;
+        for handle in self.connections.values() {
+            handle.connection.close(
+                lumepeer_net::connection::CLOSE_RESTARTING.into(),
+                lumepeer_net::error::close_code::RESTARTING.as_bytes(),
+            );
+        }
+        tracing::info!(
+            peers = self.connections.len(),
+            "restarting into an update: every peer has been told"
+        );
+    }
+
     /// Host side: what the banner needs, or `None` when there is nothing to
     /// warn about (ADR 0084).
     fn reboot_pending_dto(&self) -> Option<RebootPending> {
@@ -16475,12 +16577,19 @@ impl Actor {
     /// [`RESUME_RETRY_SECS`] for as long as the window lasts (§10; ADR 0089).
     /// Those attempts are not new sessions, so they are what the window is
     /// for rather than a race with it.
+    ///
+    /// `host_restarting` is the host having said it is restarting into an
+    /// update (ADR 0148). Then there is no repair to race: the session ended
+    /// with the process, so the wait dials a new one after
+    /// [`HOST_RESTART_REDIAL_SECS`], and that dial keeps knocking until the
+    /// new process answers.
     fn start_reconnect_wait(
         &mut self,
         peer: NodeId,
         host_tag: String,
         resume: Option<[u8; 16]>,
         surface: ViewSurface,
+        host_restarting: bool,
     ) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
@@ -16495,7 +16604,7 @@ impl Actor {
                 dialing: false,
                 dial_seq: 0,
                 surface,
-                refused: false,
+                refused: host_restarting,
             },
         );
         // A goodbye still owed to an earlier session with this host is moot:
@@ -16512,7 +16621,9 @@ impl Actor {
             self.connect_retry_secs = None;
             self.connect_credentials_auto = false;
         }
-        let first_attempt_secs = if resume.is_some() {
+        let first_attempt_secs = if host_restarting {
+            HOST_RESTART_REDIAL_SECS
+        } else if resume.is_some() {
             RESUME_RETRY_SECS
         } else {
             RECONNECT_WINDOW_SECS
@@ -16521,6 +16632,7 @@ impl Actor {
             peer = %self.label_of(&peer),
             first_attempt_secs,
             resuming = resume.is_some(),
+            host_restarting,
             "waiting for a host to come back"
         );
         self.arm_reconnect_wait(generation, first_attempt_secs);
@@ -19379,6 +19491,7 @@ pub fn spawn_actor_with(
         reboot_to_host: std::collections::HashMap::new(),
         pending_reboot: None,
         reboot_generation: 0,
+        restarting: false,
         stream_caps: std::collections::HashMap::new(),
         reconnect_waits: std::collections::HashMap::new(),
         reconnect_wait_generation: 0,
@@ -25569,6 +25682,173 @@ mod tests {
             recorder.opened().len(),
             1,
             "the new session came back into the old window"
+        );
+    }
+
+    /// ADR 0148: a host that says it is restarting into an update is dialed
+    /// for a new session a moment later — no claim on a session the new
+    /// process never heard of, and no resume window sat out first. A dial
+    /// that reaches the old process on its way out is told the same and
+    /// dials again, and the session comes back into the window it left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_restarting_into_an_update_is_dialed_again_at_once() {
+        use lumepeer_core::protocol::MessageKind;
+
+        async fn next_control(endpoint: &PeerEndpoint) -> PeerConnection {
+            loop {
+                if let Ok(connection) = endpoint.accept().await.unwrap()
+                    && connection.alpn() == lumepeer_net::ALPN_CONTROL
+                {
+                    return connection;
+                }
+            }
+        }
+
+        fn say_restarting(control: &ControlConnection) {
+            control.connection().close(
+                lumepeer_net::connection::CLOSE_RESTARTING.into(),
+                lumepeer_net::error::close_code::RESTARTING.as_bytes(),
+            );
+        }
+
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::ViewOnly,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+        let (mut session, _) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed");
+        session
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+
+        // Twice: the update, then the old process turning away a dial that
+        // reached it before it was gone.
+        let mut told = session;
+        for _ in 0..2 {
+            say_restarting(&told);
+            let asked = tokio::time::Instant::now();
+            let (next, hello) = tokio::time::timeout(TIMEOUT, async {
+                lumepeer_net::host_handshake(next_control(&host).await)
+                    .await
+                    .unwrap()
+            })
+            .await
+            .expect("the guest never dialed the host again");
+            let took = asked.elapsed();
+            assert_eq!(hello.resume_claim, None, "a new session, not the old one");
+            assert!(
+                took < Duration::from_secs(HOST_RESTART_REDIAL_SECS + 3),
+                "dialed again only {took:?} after the host said it was restarting"
+            );
+            told = next;
+        }
+        told.send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        assert!(
+            recorder.closed().is_empty(),
+            "the window closed while its host restarted"
+        );
+        assert_eq!(
+            recorder.opened().len(),
+            1,
+            "the new session came back into the old window"
+        );
+    }
+
+    /// ADR 0148: a host restarting into an update tells every guest so in the
+    /// close, and turns away whoever reaches it after that the same way rather
+    /// than give them a session that would die with the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_restarting_into_an_update_tells_its_guests() {
+        /// A guest's hello, held open: the endpoint and the control stream
+        /// both have to outlive it, or the host sees the guest leave.
+        async fn hello_from(
+            addr: &iroh::EndpointAddr,
+            ticket: &InviteTicket,
+        ) -> (
+            PeerEndpoint,
+            PeerConnection,
+            Result<ControlConnection, NetError>,
+        ) {
+            let guest = PeerEndpoint::bind_local(iroh::SecretKey::generate())
+                .await
+                .unwrap();
+            let connection = guest.connect_control(addr.clone()).await.unwrap();
+            // The handshake may itself be what the close cuts short; the
+            // close is read off the connection either way.
+            let control = tokio::time::timeout(
+                TIMEOUT,
+                lumepeer_net::guest_resume_handshake(
+                    connection.clone(),
+                    Role::ViewOnly,
+                    postcard::to_allocvec(ticket).unwrap(),
+                    Vec::new(),
+                    None,
+                ),
+            )
+            .await
+            .expect("the host never answered the hello");
+            (guest, connection, control)
+        }
+
+        let (host, _host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        let ticket = InviteTicket::from_code(&invite.code).unwrap();
+        let addr = ticket.endpoint_addr().unwrap();
+
+        let (_guest, connection, _control) = hello_from(&addr, &ticket).await;
+        wait_until_async("the host never took the guest in", || async {
+            host.status()
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.state == SessionStateDto::Pending)
+        })
+        .await;
+        host.announce_restart().await.unwrap();
+        tokio::time::timeout(TIMEOUT, connection.closed())
+            .await
+            .expect("the guest was never told");
+        assert!(
+            connection.closed_by_peer_with(lumepeer_net::connection::CLOSE_RESTARTING),
+            "the guest was not told the host is restarting"
+        );
+
+        let (_late, connection, _control) = hello_from(&addr, &ticket).await;
+        tokio::time::timeout(TIMEOUT, connection.closed())
+            .await
+            .expect("a guest that came after the word was kept");
+        assert!(
+            connection.closed_by_peer_with(lumepeer_net::connection::CLOSE_RESTARTING),
+            "a guest that came after the word was not told the same"
         );
     }
 
