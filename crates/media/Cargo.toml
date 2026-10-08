@@ -28,6 +28,7 @@ capture-screencapturekit = [
     "dep:objc2-core-media",
     "dep:objc2-core-video",
     "dep:objc2-screen-capture-kit",
+    "dep:objc2-app-kit",
     "dep:block2",
     "dep:dispatch2",
 ]
@@ -263,6 +264,25 @@ objc2-core-graphics = { version = "0.3.2", optional = true, default-features = f
     "CGEvent",
     "CGEventTypes",
     "CGRemoteOperation",
+    # Drawing the system cursor's image into a premultiplied BGRA bitmap for
+    # the guest to draw itself (ADR 0150).
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGImage",
+] }
+# The system cursor's image and hotspot (`NSCursor.currentSystemCursor`), so
+# the cursor can leave the picture and be drawn by the guest at its own
+# pointer, without the picture's latency (ADR 0150). Already in the graph at
+# this exact version through tao (see Cargo.lock), so this is a direct edge
+# onto a crate the desktop app builds anyway, not a new objc2 generation.
+objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = [
+    "std",
+    "NSCursor",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "objc2-core-graphics",
 ] }
 objc2-core-media = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",

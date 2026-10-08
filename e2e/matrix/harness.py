@@ -293,6 +293,64 @@ POINTER_JS = """((type, x, y, button) => {
   return target.id || target.tagName;
 })(%s, %s, %s, 0)"""
 
+# The view's own copy of the host's cursor (ADR 0038, ADR 0150): whether its
+# layer is shown, its size in canvas pixels, a checksum of what it draws, and
+# the picture canvas's own `cursor` style (`none` while the layer is the
+# pointer).
+CURSOR_LAYER_JS = """(() => {
+  const layer = document.getElementById('cursor'), c = document.getElementById('screen');
+  if (!layer) return null;
+  let sum = 0;
+  if (!layer.hidden && layer.width && layer.height) {
+    const d = layer.getContext('2d').getImageData(0, 0, layer.width, layer.height).data;
+    for (let i = 0; i < d.length; i++) sum = (sum * 31 + d[i]) >>> 0;
+  }
+  return { shown: !layer.hidden, w: layer.width, h: layer.height, sum, css: c ? c.style.cursor : '' };
+})()"""
+
+# The picture's own pixels in a box, as the guest drew them: RGB rows of the
+# frame canvas from (x, y), w x h frame pixels.
+PICTURE_BOX_JS = """((x, y, w, h) => {
+  const c = document.getElementById('screen');
+  x = Math.max(0, Math.min(c.width - w, x)); y = Math.max(0, Math.min(c.height - h, y));
+  const d = c.getContext('2d').getImageData(x, y, w, h).data;
+  return Array.from(d.filter((_, i) => i % 4 !== 3));
+})(%s, %s, %s, %s)"""
+
+# Guest pointer moves along `points` at `interval` ms, the pace of a hand on
+# a mouse; when each one was dispatched, by this machine's clock.
+SWEEP_JS = """(async (points, interval) => {
+  const sent = [];
+  for (const [x, y] of points) {
+    const target = document.elementFromPoint(x, y) || document.getElementById('view');
+    target.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: y, bubbles: true, cancelable: true,
+      composed: true, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+    sent.push(Date.now());
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  return sent;
+})(%s, %s)"""
+
+# The host's pointer for `ms` milliseconds, by its own clock: a row
+# [ms, x, y] each time it moves. A loop of awaited IPC calls, not a timer,
+# so a window under others is not throttled to a sample a second.
+CURSOR_WATCH_JS = """((ms) => {
+  const w = window.__e2eCursor = { rows: [], done: false };
+  const until = Date.now() + ms;
+  (async () => {
+    let last = '';
+    while (Date.now() < until) {
+      const p = await window.__TAURI_INTERNALS__.invoke('plugin:window|cursor_position', { label: 'main' });
+      const key = Math.round(p.x) + ',' + Math.round(p.y);
+      if (key !== last) { w.rows.push([Date.now(), Math.round(p.x), Math.round(p.y)]); last = key; }
+    }
+    w.done = true;
+  })();
+  return 'watching';
+})(%s)"""
+
+CURSOR_WATCH_READ_JS = "(() => window.__e2eCursor || null)()"
+
 # On <body>, not on whatever has the focus: the view's chat box would keep
 # them. Spaced like a person types, so the test is about what arrives, not
 # about how fast.
@@ -527,6 +585,18 @@ class Host:
 
     def windows(self):
         return [w["label"] for w in self.pilot("windows.list")["windows"]]
+
+    def clock_offset(self, window="main", tries=5):
+        """This machine's `Date.now()` minus the harness's clock, in ms, and
+        how far off that can be: half the quickest of `tries` round trips."""
+        best = None
+        for _ in range(tries):
+            t0 = time.time() * 1000
+            now = self.js("Date.now()", window=window)
+            t1 = time.time() * 1000
+            if best is None or t1 - t0 < 2 * best[1]:
+                best = (now - (t0 + t1) / 2, (t1 - t0) / 2)
+        return best
 
     def press(self, combo, window):
         """A real OS key event (enigo), after tauri-pilot focuses `window`."""

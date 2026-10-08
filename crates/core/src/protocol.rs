@@ -426,9 +426,9 @@ pub const FEATURE_RECEIVER_REPORT: &str = "receiver-report";
 /// cannot draw the cursor and is no longer sent one has no cursor at all.
 ///
 /// Both halves have to hold. A host whose platform cannot stop compositing
-/// (Wayland's `CursorMode::Embedded`, macOS's `setShowsCursor(true)`) sends no
-/// `CursorShape` at all, which is what tells the guest to keep its own overlay
-/// off: two cursors are worse than one that lags.
+/// (Wayland's `CursorMode::Embedded`) sends no `CursorShape` at all, which is
+/// what tells the guest to keep its own overlay off: two cursors are worse
+/// than one that lags.
 pub const FEATURE_CURSOR_SHAPE: &str = "cursor-shape";
 
 /// `Hello.features` string a guest sends to say it understands

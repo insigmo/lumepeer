@@ -1732,6 +1732,20 @@ pub(crate) fn spawn_encode_loop_with(
                     secure_desktop_notified = false;
                     control.set_secure_desktop_active(false);
                     control.set_secure_desktop_blocked(false);
+                    // The cursor changes on a screen that does not: crossing
+                    // a text field turns the arrow into an I-beam and
+                    // repaints nothing. With the cursor out of the picture no
+                    // frame comes for it, so the shape is read here too and
+                    // goes out at the size of the last picture sent, rather
+                    // than waiting for the next repaint (ADR 0150).
+                    if control.cursor_channel()
+                        && let Some(shape) = lock_capture(&capture).cursor_shape()
+                    {
+                        cursor.changed(shape);
+                    }
+                    if let Some(shape) = cursor.due_for_last_picture() {
+                        control.send_cursor(shape);
+                    }
                     // A backend that waited for a change before saying "none"
                     // is asked again at once: sleeping out the interval here
                     // is time a change would wait unseen — up to 17 ms of
@@ -2869,6 +2883,9 @@ struct PictureCursor {
     /// `(captured, picture)` the current shape was last sent for; `None`
     /// while it has not been sent at all.
     sent_for: Option<((u32, u32), (u32, u32))>,
+    /// `(captured, picture)` of the last frame that went out, for a shape
+    /// that changes while the screen stands still.
+    last_frame: Option<((u32, u32), (u32, u32))>,
 }
 
 impl PictureCursor {
@@ -2881,12 +2898,21 @@ impl PictureCursor {
     /// The cursor to send now that a `captured`-sized frame went out as a
     /// `picture`-sized one, or `None` when the guest already has it.
     fn due(&mut self, captured: (u32, u32), picture: (u32, u32)) -> Option<CursorShapeData> {
+        self.last_frame = Some((captured, picture));
         let shape = self.shape.as_ref()?;
         if self.sent_for == Some((captured, picture)) {
             return None;
         }
         self.sent_for = Some((captured, picture));
         Some(cursor_for_picture(shape, captured, picture))
+    }
+
+    /// The cursor to send while no frame goes out, at the sizes of the last
+    /// one that did, or `None` when the guest already has it — or has no
+    /// picture yet, whose first frame will carry it.
+    fn due_for_last_picture(&mut self) -> Option<CursorShapeData> {
+        let (captured, picture) = self.last_frame?;
+        self.due(captured, picture)
     }
 }
 
@@ -4931,6 +4957,35 @@ mod tests {
         let resent = cursor.due((3840, 2160), (3840, 2160)).unwrap();
         assert_eq!((resent.width, resent.height), (64, 64));
         assert_eq!((resent.hotspot_x, resent.hotspot_y), (20, 30));
+    }
+
+    /// ADR 0150: an arrow turning into an I-beam over a still screen goes
+    /// out without a frame, at the size of the last picture sent.
+    #[test]
+    fn a_cursor_that_changes_over_a_still_screen_is_sent_at_the_last_pictures_scale() {
+        let shape = |width: u16| CursorShapeData {
+            width,
+            height: 64,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            rgba: vec![0xFF; usize::from(width) * 64 * 4],
+        };
+        let mut cursor = PictureCursor::default();
+        cursor.changed(shape(64));
+        assert!(
+            cursor.due_for_last_picture().is_none(),
+            "no picture yet: the first frame carries the cursor"
+        );
+        assert!(cursor.due((3840, 2160), (1920, 1080)).is_some());
+        assert!(
+            cursor.due_for_last_picture().is_none(),
+            "the guest already has this one"
+        );
+
+        cursor.changed(shape(32));
+        let sent = cursor.due_for_last_picture().unwrap();
+        assert_eq!((sent.width, sent.height), (16, 32));
+        assert!(cursor.due_for_last_picture().is_none());
     }
 
     /// ADR 0135: one log line per interval, however fast frames are refused,

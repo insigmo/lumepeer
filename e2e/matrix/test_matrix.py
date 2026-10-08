@@ -4,17 +4,22 @@
    control, and the host's picture reaches the guest's view window.
 2. mouse: the guest moves the pointer in its view by what is 10 host pixels
    to the right; the host's own cursor has to move by exactly that.
-3. keys: the guest types a line of text and a set of chords into its view;
+3. cursor: the host's cursor lands where the guest points, all over the
+   screen; the guest draws it itself, at its own pointer, and the picture no
+   longer carries a second one a frame behind; it turns into an I-beam over
+   text on a still screen; and it follows a sweep of the hand no later than
+   the network makes it (ADR 0150).
+4. keys: the guest types a line of text and a set of chords into its view;
    the host's tracker has to receive the same characters and every chord.
-4. hotkeys (Windows guest): the same chords once more, pressed on the
+5. hotkeys (Windows guest): the same chords once more, pressed on the
    guest's own keyboard with its grab live, and Ctrl+A/C/V have to copy and
    paste on the host.
-5. terminal: the guest reconnects to the host for the terminal alone, the
+6. terminal: the guest reconnects to the host for the terminal alone, the
    way a person does from the remembered host's row; the shell's prompt has
    to show before anything is typed, a typed command has to answer, and
    Close has to end the shell on the host.
 
-What the guest does in 1-3 is dispatched into its view window as DOM events,
+What the guest does in 1-4 is dispatched into its view window as DOM events,
 key by key and in a person's rhythm, carrying the `key`, `code` and modifiers
 a US keyboard produces. From there on everything is real: the view's own
 handlers, the IPC, the network, the host's injection into its OS, and the
@@ -22,21 +27,23 @@ host's webview receiving the result. OS-level key injection through enigo was
 tried and dropped: it types by the guest's *current* layout (Russian here
 turned letters into VK_PACKET with no keyup).
 
-That leaves the guest's keyboard grab out of 3, and on a Windows guest the
-grab is what carries every chord a person presses (ADR 0107). So 4 clicks
+That leaves the guest's keyboard grab out of 4, and on a Windows guest the
+grab is what carries every chord a person presses (ADR 0107). So 5 clicks
 into the view and presses scan codes through SendInput, marked so that the
 grab of a pilot build takes them as a person's (agent.py `press_keys`).
 """
 
 import json
+import math
 import re
 import time
 
 import pytest
 
-from harness import (GRAB_JS, KEYS_JS, POINTER_JS, SPY_READ_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS,
-                     TERMINAL_TYPE_JS, VIEW_STATE_JS, connect, disconnect, expected, host_flags, label, os_events,
-                     parse, sessions_of, synthetic_events, text_combos, with_logs)
+from harness import (CURSOR_LAYER_JS, CURSOR_WATCH_JS, CURSOR_WATCH_READ_JS, GRAB_JS, KEYS_JS, PICTURE_BOX_JS,
+                     POINTER_JS, SPY_READ_JS, SWEEP_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS, TERMINAL_TYPE_JS,
+                     VIEW_STATE_JS, connect, disconnect, expected, host_flags, label, os_events, parse, sessions_of,
+                     synthetic_events, text_combos, with_logs)
 
 TEXT = "Hello, lumepeer 42"
 # Chords every host OS delivers to a focused webview and none of them acts
@@ -141,6 +148,160 @@ def test_mouse(session, request):
 
 
 # ── 3 ───────────────────────────────────────────────────────────────────────
+
+# Host pixels the pointer is aimed at, as fractions of the screen: near each
+# corner and in the middle. A size the host read once and kept, or a picture
+# scaled by another factor than it was drawn at, is right at the origin and
+# ever further off towards the far corner.
+AIMS = [(0.08, 0.1), (0.92, 0.1), (0.5, 0.5), (0.08, 0.9), (0.92, 0.9)]
+# The sweep: a hand moving the mouse for about a second.
+SWEEP_MOVES = 60
+SWEEP_INTERVAL_MS = 16
+# How long after the network's one-way delay the host's cursor may arrive,
+# and how much later the last moves of the sweep may arrive than the first:
+# a host that takes moves slower than they come falls further behind with
+# each one, and that is the cursor that crawls after the hand.
+LAG_BUDGET_MS = 150
+LAG_GROWTH_MS = 150
+# Picture pixels under the host's cursor that may change when it moves away
+# — compression noise — before the cursor counts as part of the picture.
+PICTURE_CURSOR_PIXELS = 6
+
+
+def layer(g, view, differs_from=None, timeout=3.0):
+    """The guest's cursor layer once it shows (and, given `differs_from`,
+    draws something else than that), or as it is when `timeout` runs out.
+    The view asks for a changed shape four times a second."""
+    deadline = time.monotonic() + timeout
+    while True:
+        now = g.js(CURSOR_LAYER_JS, window=view) or {}
+        if now.get("shown") and (differs_from is None or now.get("sum") != differs_from.get("sum")):
+            return now
+        if time.monotonic() > deadline:
+            return now
+        time.sleep(0.2)
+
+
+def changed_pixels(a, b):
+    """Pixels of two RGB boxes that differ by more than noise in any channel."""
+    return sum(1 for i in range(0, min(len(a), len(b)), 3) if max(abs(a[i + j] - b[i + j]) for j in range(3)) > 64)
+
+
+def test_cursor(session, request):
+    s = live(session)
+    g, h = s.guest, s.host
+    if s.picture_error:
+        fail(f"no picture to aim at ({s.picture_error})")
+    mark = h.log_mark()
+    v = g.js(VIEW_STATE_JS, window=s.view)
+    mon = h.monitor
+    ox, oy = mon["position"]["x"], mon["position"]["y"]
+    width, height = mon["size"]["width"], mon["size"]["height"]
+    k = v["w"] / width  # picture pixels per host pixel
+    # One picture pixel on the host's screen, and one more for rounding.
+    tol = math.ceil(1 / k) + 1
+    problems, said = [], []
+
+    def aim_at(x, y):
+        x, y = s.view_point(x, y)
+        g.js(POINTER_JS % (json.dumps("pointermove"), x, y), window=s.view)
+
+    # Where it lands: everywhere on the screen, not only by how much it moved.
+    worst, before = 0, h.cursor()
+    for fx, fy in AIMS:
+        aim = (ox + round(fx * width), oy + round(fy * height))
+        aim_at(*aim)
+        got = settle(h, before)
+        before = got
+        off = None if got is None else max(abs(got[0] - aim[0]), abs(got[1] - aim[1]))
+        if off is None or off > tol:
+            problems.append(f"aimed at {aim}, the host's cursor went to {got}")
+        else:
+            worst = max(worst, off)
+    said.append(f"landed within {worst}px (tol {tol}) at {len(AIMS)} points")
+
+    # Who draws it. Wayland's compositor burns the cursor into the picture and
+    # hands nobody its shape, so there it stays in the picture (ADR 0038).
+    text = h.tracker_point()  # the host's tracker: a text box, an I-beam over it
+    if h.wayland:
+        said.append("cursor in the picture (Wayland)")
+    else:
+        aim_at(ox + 4, oy + 4)
+        settle(h, before)
+        arrow = layer(g, s.view)
+        if not arrow.get("shown"):
+            problems.append(f"the guest draws no cursor of the host's own (layer {arrow}): the host's cursor "
+                            f"travels in the picture, a frame behind the pointer")
+        else:
+            aim_at(*text)
+            beam = layer(g, s.view, differs_from=arrow)
+            if beam.get("sum") == arrow.get("sum"):
+                problems.append(f"over the host's text box the guest's cursor stayed the {arrow['w']}x{arrow['h']} "
+                                f"it was in the corner: a cursor that changes on a still screen never reached it")
+            # Nothing of the cursor left in the picture: the picture under it
+            # stays the same when it moves away.
+            box = (round((text[0] - ox) * k) - 2, round((text[1] - oy) * k) - 2,
+                   max(8, round(24 * k)), max(8, round(36 * k)))
+            time.sleep(1.0)
+            under = g.js(PICTURE_BOX_JS % box, window=s.view)
+            aim_at(text[0] + max(60, 4 * tol), text[1])
+            time.sleep(1.0)
+            after = g.js(PICTURE_BOX_JS % box, window=s.view)
+            moved = changed_pixels(under, after)
+            if moved > PICTURE_CURSOR_PIXELS:
+                problems.append(f"the host's cursor is in the picture as well: {moved} pixels under it changed when "
+                                f"it moved away, while the guest draws its own")
+            said.append(f"drawn by the guest ({arrow['w']}x{arrow['h']}, {beam['w']}x{beam['h']} over text), "
+                        f"{moved}px of it in the picture")
+
+    # How far behind: a sweep along the text box's row, the host's cursor
+    # watched by its own clock against the guest's.
+    if h.wayland:
+        said.append("lag unmeasured (no global cursor position on Wayland)")
+    else:
+        spacing = 2 * tol + 2
+        moves = min(SWEEP_MOVES, int(width * 0.8) // spacing)
+        x0 = max(ox + 10, min(text[0] - moves * spacing // 2, ox + width - 10 - moves * spacing))
+        targets = [(x0 + i * spacing, text[1]) for i in range(moves)]
+        points = [s.view_point(x, y) for x, y in targets]
+        host_off, host_err = h.clock_offset()
+        guest_off, guest_err = g.clock_offset(window=s.view)
+        watch_ms = moves * SWEEP_INTERVAL_MS + 3000
+        h.js(CURSOR_WATCH_JS % watch_ms)
+        sent = g.js(SWEEP_JS % (json.dumps(points), SWEEP_INTERVAL_MS), window=s.view, timeout=60)
+        h.wait(lambda: (h.js(CURSOR_WATCH_READ_JS) or {}).get("done"), watch_ms / 1000 + 10,
+               "the host's cursor watch never finished")
+        rows = h.js(CURSOR_WATCH_READ_JS)["rows"]
+        arrived = {}
+        for t, x, y in rows:
+            near = min(range(moves), key=lambda i: abs(targets[i][0] - x))
+            lag = (t - host_off) - (sent[near] - guest_off)
+            # A cursor already there before the move was sent is not an arrival.
+            if abs(targets[near][0] - x) <= tol and abs(targets[near][1] - y) <= tol and near not in arrived \
+                    and lag > -(host_err + guest_err):
+                arrived[near] = lag
+        lags = sorted(arrived.values())
+        rows_stats = g.ipc("connection_stats") or [{}]
+        rtt = rows_stats[0].get("rtt_ms") or 0
+        err = host_err + guest_err
+        if len(lags) < moves // 2:
+            problems.append(f"the host's cursor followed {len(lags)} of {moves} moves of a sweep")
+        else:
+            p50, growth = lags[len(lags) // 2], lags[int(len(lags) * 0.9)] - lags[0]
+            if p50 > rtt / 2 + LAG_BUDGET_MS + err:
+                problems.append(f"the host's cursor runs {p50:.0f}ms behind the pointer (+-{err:.0f}), with the "
+                                f"network's one-way delay ~{rtt / 2:.0f}ms")
+            if growth > LAG_GROWTH_MS:
+                problems.append(f"the host's cursor fell {growth:.0f}ms further behind over a one-second sweep: it "
+                                f"takes moves slower than they come")
+            said.append(f"followed {len(lags)}/{moves} moves {p50:.0f}ms after (+-{err:.0f}, rtt {rtt}ms), "
+                        f"{growth:.0f}ms further behind by the end")
+    if problems:
+        fail(with_log(" | ".join(problems) + f" | view frame {v['w']}x{v['h']} for host {width}x{height}", s, mark))
+    note(request, "; ".join(said))
+
+
+# ── 4 ───────────────────────────────────────────────────────────────────────
 
 
 def is_modifier(code):
@@ -262,7 +423,7 @@ def test_keys(session, request):
     note(request, f"text ok, {tested} chords ok{untested}")
 
 
-# ── 4 ───────────────────────────────────────────────────────────────────────
+# ── 5 ───────────────────────────────────────────────────────────────────────
 
 PASTE = "lumepeer"
 # Select all, copy, to the end, paste: the tracker's text doubles only if the
@@ -332,7 +493,7 @@ def test_hotkeys(session, request):
     note(request, f"{len(CHORDS) - len(taken)} chords ok through the grab, copy/paste ok{untested}")
 
 
-# ── 5 ───────────────────────────────────────────────────────────────────────
+# ── 6 ───────────────────────────────────────────────────────────────────────
 
 # A sum in the host's own shell, `%COMSPEC%` on Windows and `$SHELL`
 # elsewhere (ADR 0079): the answer is nowhere in what was typed, so seeing it

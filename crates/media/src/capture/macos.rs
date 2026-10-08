@@ -55,12 +55,14 @@ mod screen_capture_kit {
 
     use block2::RcBlock;
     use dispatch2::DispatchQueue;
-    use objc2::rc::Retained;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2::runtime::ProtocolObject;
     use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-    use objc2_core_foundation::{CFRetained, CGPoint};
+    use objc2_app_kit::NSCursor;
+    use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{
-        CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType,
+        CGBitmapContextCreate, CGColorSpace, CGContext, CGDisplayPixelsHigh, CGDisplayPixelsWide,
+        CGEvent, CGEventTapLocation, CGEventType, CGImageAlphaInfo, CGImageByteOrderInfo,
         CGKeyCode, CGMainDisplayID, CGMouseButton, CGPreflightPostEventAccess,
         CGRequestPostEventAccess, CGScrollEventUnit,
     };
@@ -77,11 +79,13 @@ mod screen_capture_kit {
     };
 
     use lumepeer_core::constants::ENCODE_DEFAULT_FPS;
-    use lumepeer_core::protocol::{InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE};
+    use lumepeer_core::protocol::{
+        CursorShapeData, InputDetail, InputEventPayload, POINTER_BUTTON_LOGICAL_BASE,
+    };
 
     use crate::capture::{
         CaptureTarget, Frame, InputCapability, InputInjector, LatestFrame, PixelFormat,
-        ScreenCapturer, frame_wait,
+        ScreenCapturer, cursor_shape, frame_wait,
     };
     use crate::error::{MediaError, Result};
 
@@ -144,6 +148,16 @@ mod screen_capture_kit {
     /// `WindowServer`, and a stall must fail one call rather than hang the
     /// session (§18).
     const COMPLETION_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How often the system cursor is read while the guest draws it itself
+    /// (ADR 0150).
+    ///
+    /// On a timer of its own rather than in [`ScreenCapturer::cursor_shape`]:
+    /// asking the window server took 2-5 ms on a loaded Mac VM, once 77 ms,
+    /// and the encode loop asks for the shape from inside its async task.
+    /// A tenth of a second is how late an arrow can turn into an I-beam
+    /// without anyone telling it from the network's own delay.
+    const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
     /// Video framerate configured on [`MacosAudioCapturer`]'s stream. That
     /// stream exists only for its audio output — nothing here ever reads a
@@ -678,6 +692,200 @@ mod screen_capture_kit {
         }
     }
 
+    /// The stream's settings: the display's own size, BGRA, a short queue,
+    /// and the cursor drawn into the picture or left out of it.
+    ///
+    /// One function for the start and for every later change of the cursor,
+    /// because `updateConfiguration` replaces the whole configuration: a
+    /// second copy of these settings that drifted from the first would
+    /// change the picture along with the cursor.
+    fn stream_configuration(
+        width: isize,
+        height: isize,
+        shows_cursor: bool,
+    ) -> Retained<SCStreamConfiguration> {
+        // SAFETY: a freshly created configuration; the setters only write its
+        // own properties.
+        unsafe {
+            let config = SCStreamConfiguration::new();
+            config.setWidth(usize::try_from(width).unwrap_or(0));
+            config.setHeight(usize::try_from(height).unwrap_or(0));
+            config.setPixelFormat(PIXEL_FORMAT_32BGRA);
+            config.setQueueDepth(STREAM_QUEUE_DEPTH);
+            config.setShowsCursor(shows_cursor);
+            config.setCapturesAudio(false);
+            config.setMinimumFrameInterval(CMTime::new(1, i32::from(ENCODE_DEFAULT_FPS)));
+            config
+        }
+    }
+
+    /// A cursor dimension in points as a whole number of pixels at this
+    /// backend's scale (it captures in points), or `None` for one that is no
+    /// size at all.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "checked finite and within 1..=u16::MAX just before the cast"
+    )]
+    fn whole_points(points: f64) -> Option<u16> {
+        let rounded = points.ceil();
+        (rounded.is_finite() && (1.0..=f64::from(u16::MAX)).contains(&rounded))
+            .then_some(rounded as u16)
+    }
+
+    /// A hotspot coordinate in points, clamped onto the `len` pixels it has
+    /// to fall inside.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped into 0..len, and len is a u16, just before the cast"
+    )]
+    fn hotspot_pixel(points: f64, len: u16) -> u16 {
+        let last = f64::from(len.saturating_sub(1));
+        if points.is_finite() {
+            points.round().clamp(0.0, last) as u16
+        } else {
+            0
+        }
+    }
+
+    /// `cursor` drawn at its size in points as premultiplied BGRA — the unit
+    /// this backend captures in and the layout [`CursorShapeData`] carries.
+    ///
+    /// Drawn rather than copied: the image holds a representation per scale
+    /// (28x40, 56x80, ... for the arrow), and the one that matches a 1x
+    /// picture is whichever `CGImageForProposedRect` picks for that rect, so
+    /// the bitmap is filled at exactly that size whatever it picked.
+    fn rasterize_cursor(cursor: &NSCursor) -> Option<CursorShapeData> {
+        let image = cursor.image();
+        let size = image.size();
+        let hotspot = cursor.hotSpot();
+        let width = whole_points(size.width)?;
+        let height = whole_points(size.height)?;
+        let (columns, rows) = (usize::from(width), usize::from(height));
+        let row_bytes = columns.checked_mul(BGRA_BYTES_PER_PIXEL)?;
+        let mut pixels = vec![0_u8; row_bytes.checked_mul(rows)?];
+
+        let space = CGColorSpace::new_device_rgb()?;
+        let mut proposed = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size,
+        };
+        // SAFETY: `proposed` is a live rect for the call; no reference
+        // context and no hints, both of which the method accepts as nil.
+        let picture =
+            unsafe { image.CGImageForProposedRect_context_hints(&raw mut proposed, None, None) }?;
+        {
+            // SAFETY: `pixels` is `rows` rows of `row_bytes` bytes, exactly
+            // what the context is told, and it outlives the context, which
+            // is dropped at the end of this block before `pixels` is read or
+            // moved.
+            let context = unsafe {
+                CGBitmapContextCreate(
+                    pixels.as_mut_ptr().cast(),
+                    columns,
+                    rows,
+                    8,
+                    row_bytes,
+                    Some(&space),
+                    CGImageAlphaInfo::PremultipliedFirst.0 | CGImageByteOrderInfo::Order32Little.0,
+                )
+            }?;
+            CGContext::draw_image(
+                Some(&context),
+                CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: f64::from(width),
+                        height: f64::from(height),
+                    },
+                },
+                Some(&picture),
+            );
+        }
+        cursor_shape(
+            width,
+            height,
+            hotspot_pixel(hotspot.x, width),
+            hotspot_pixel(hotspot.y, height),
+            pixels,
+        )
+    }
+
+    /// The cursor on screen right now, whichever application set it.
+    ///
+    /// `currentSystemCursor` is deprecated, and Apple's header says it will
+    /// answer nil in a future macOS. That answer is `None` here: the guest
+    /// then has no shape to draw and shows its own arrow, which is still
+    /// where the pointer is. The replacement Apple names, ScreenCaptureKit's
+    /// `showsCursor`, can only draw the cursor into the picture — the very
+    /// latency this exists to take away (ADR 0150).
+    fn read_system_cursor() -> Option<CursorShapeData> {
+        autoreleasepool(|_| {
+            #[allow(
+                deprecated,
+                reason = "the only API that reads another application's cursor; see the doc comment"
+            )]
+            let cursor = NSCursor::currentSystemCursor()?;
+            rasterize_cursor(&cursor)
+        })
+    }
+
+    /// The system cursor as [`CursorWatcher`]'s thread last read it,
+    /// numbered so [`ScreenCapturer::cursor_shape`] can tell a new one from
+    /// the one it already handed out.
+    #[derive(Debug, Default)]
+    struct CursorWatch {
+        latest: Mutex<Option<(u64, CursorShapeData)>>,
+        stop: AtomicBool,
+    }
+
+    /// The thread that reads the system cursor while the guest draws it,
+    /// stopped when this is dropped.
+    #[derive(Debug)]
+    struct CursorWatcher(Arc<CursorWatch>);
+
+    impl CursorWatcher {
+        fn spawn() -> Self {
+            let watch = Arc::new(CursorWatch::default());
+            let theirs = Arc::clone(&watch);
+            let spawned = std::thread::Builder::new()
+                .name("lumepeer-cursor".to_owned())
+                .spawn(move || {
+                    let mut seq = 0_u64;
+                    while !theirs.stop.load(Ordering::Relaxed) {
+                        if let Some(shape) = read_system_cursor() {
+                            let mut latest = lock(&theirs.latest);
+                            if latest.as_ref().map(|(_, known)| known) != Some(&shape) {
+                                seq += 1;
+                                *latest = Some((seq, shape));
+                            }
+                        }
+                        std::thread::sleep(CURSOR_POLL_INTERVAL);
+                    }
+                });
+            if let Err(error) = spawned {
+                // The cursor is already out of the picture; the guest is left
+                // with its own arrow, which is still where the pointer is.
+                tracing::warn!(%error, "cannot start the thread that reads the cursor");
+            }
+            Self(watch)
+        }
+
+        /// The newest cursor, unless it is the one numbered `seen`.
+        fn newer_than(&self, seen: Option<u64>) -> Option<(u64, CursorShapeData)> {
+            let latest = lock(&self.0.latest);
+            let (seq, shape) = latest.as_ref()?;
+            (Some(*seq) != seen).then(|| (*seq, shape.clone()))
+        }
+    }
+
+    impl Drop for CursorWatcher {
+        fn drop(&mut self) {
+            self.0.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// A running stream and everything that has to stay alive alongside it.
     struct Active {
         stream: Retained<SCStream>,
@@ -685,11 +893,62 @@ mod screen_capture_kit {
         /// always are, so dropping this would silently stop every callback.
         _sink: Retained<FrameSink>,
         shared: Arc<Shared>,
+        /// The display's size in points, which every later configuration of
+        /// the stream has to repeat.
+        width: isize,
+        height: isize,
+        /// Reads the cursor while it is left out of the picture; `None`
+        /// while the picture carries it.
+        cursor: Option<CursorWatcher>,
+        /// Number of the cursor [`ScreenCapturer::cursor_shape`] last handed
+        /// out, so the same one is never sent twice.
+        reported_cursor: Option<u64>,
+    }
+
+    impl Active {
+        /// Draws the cursor into the picture, or leaves it out and starts
+        /// reading it for the guest instead (ADR 0150).
+        ///
+        /// Not waited for: this runs on the actor, and the stream answers on
+        /// a queue of its own. A refusal leaves the cursor in the picture,
+        /// which is said in the log.
+        fn show_cursor(&mut self, shows: bool) {
+            let config = stream_configuration(self.width, self.height, shows);
+            let handler = RcBlock::new(|error: *mut NSError| {
+                if !error.is_null() {
+                    // SAFETY: as in `wait_for_completion`: null or a valid
+                    // NSError for this call, only read.
+                    let info = ErrorInfo::from_ns(unsafe { &*error });
+                    tracing::warn!(
+                        code = info.code,
+                        message = %info.message,
+                        "ScreenCaptureKit did not change whether the picture shows the cursor"
+                    );
+                }
+            });
+            // SAFETY: `config` is the configuration just built for this
+            // stream; the block is copied by the framework for the
+            // asynchronous completion, so it may be dropped here.
+            unsafe {
+                self.stream
+                    .updateConfiguration_completionHandler(&config, Some(&handler));
+            }
+            // The picture genuinely changes, and it must not be taken for a
+            // duplicate of the last one sent (§11.1).
+            *lock(&self.shared.last_hash) = None;
+            self.cursor = (!shows).then(CursorWatcher::spawn);
+            self.reported_cursor = None;
+        }
     }
 
     /// `ScreenCaptureKit` capturer.
     pub struct MacosCapturer {
         active: Option<Active>,
+        /// Whether the cursor is drawn into the frames this backend produces.
+        /// Turned off when the guest has said it will draw the cursor itself
+        /// (§11; `FEATURE_CURSOR_SHAPE`). Kept here rather than on the
+        /// stream, so a capture restarted mid-session keeps it.
+        embed_cursor: bool,
     }
 
     // SAFETY: the objc2 bindings do not claim thread-safety for any
@@ -724,7 +983,10 @@ mod screen_capture_kit {
         /// [`ScreenCapturer::start`].
         #[must_use]
         pub const fn new() -> Self {
-            Self { active: None }
+            Self {
+                active: None,
+                embed_cursor: true,
+            }
         }
 
         /// Frames per second the stream is configured to cap at; the encoder
@@ -792,11 +1054,10 @@ mod screen_capture_kit {
             let display = select_display(&content, target)?;
 
             // SAFETY: `display` came from the snapshot just fetched, the
-            // exclusion list is a live empty array, and both `alloc`/`init`
-            // pairs below follow ObjC's ownership rules through
-            // `Allocated`/`Retained`. The setters only write the
-            // configuration's own properties.
-            let (filter, config, width, height) = unsafe {
+            // exclusion list is a live empty array, and the `alloc`/`init`
+            // pair below follows ObjC's ownership rules through
+            // `Allocated`/`Retained`.
+            let (filter, width, height) = unsafe {
                 let width = display.width();
                 let height = display.height();
                 let excluded: Retained<NSArray<SCWindow>> = NSArray::new();
@@ -805,17 +1066,9 @@ mod screen_capture_kit {
                     &display,
                     &excluded,
                 );
-
-                let config = SCStreamConfiguration::new();
-                config.setWidth(usize::try_from(width).unwrap_or(0));
-                config.setHeight(usize::try_from(height).unwrap_or(0));
-                config.setPixelFormat(PIXEL_FORMAT_32BGRA);
-                config.setQueueDepth(STREAM_QUEUE_DEPTH);
-                config.setShowsCursor(true);
-                config.setCapturesAudio(false);
-                config.setMinimumFrameInterval(CMTime::new(1, i32::from(ENCODE_DEFAULT_FPS)));
-                (filter, config, width, height)
+                (filter, width, height)
             };
+            let config = stream_configuration(width, height, self.embed_cursor);
             if width <= 0 || height <= 0 {
                 return Err(MediaError::CaptureUnavailable(format!(
                     "ScreenCaptureKit reports a {width}x{height} display"
@@ -860,6 +1113,10 @@ mod screen_capture_kit {
                 stream,
                 _sink: sink,
                 shared,
+                width,
+                height,
+                cursor: (!self.embed_cursor).then(CursorWatcher::spawn),
+                reported_cursor: None,
             });
             Ok(())
         }
@@ -903,6 +1160,23 @@ mod screen_capture_kit {
             // Accessibility permission is granted; losing it mid-session
             // surfaces as `InputUnavailable` on the next event (§11.1, §18).
             InputCapability::Full
+        }
+
+        fn cursor_shape(&mut self) -> Option<CursorShapeData> {
+            let active = self.active.as_mut()?;
+            let (seq, shape) = active.cursor.as_ref()?.newer_than(active.reported_cursor)?;
+            active.reported_cursor = Some(seq);
+            Some(shape)
+        }
+
+        fn set_cursor_embedded(&mut self, embedded: bool) {
+            if self.embed_cursor == embedded {
+                return;
+            }
+            self.embed_cursor = embedded;
+            if let Some(active) = self.active.as_mut() {
+                active.show_cursor(embedded);
+            }
         }
     }
 
@@ -1961,6 +2235,106 @@ mod screen_capture_kit {
 
             capturer.stop();
             assert!(capturer.next_frame().is_err());
+        }
+
+        #[test]
+        fn cursor_sizes_round_up_to_whole_pixels_and_hotspots_stay_inside() {
+            assert_eq!(whole_points(28.0), Some(28));
+            assert_eq!(whole_points(27.25), Some(28));
+            assert_eq!(whole_points(0.0), None);
+            assert_eq!(whole_points(-4.0), None);
+            assert_eq!(whole_points(f64::NAN), None);
+            assert_eq!(whole_points(1e9), None);
+
+            assert_eq!(hotspot_pixel(5.0, 28), 5);
+            assert_eq!(hotspot_pixel(4.6, 28), 5);
+            assert_eq!(hotspot_pixel(-1.0, 28), 0);
+            assert_eq!(hotspot_pixel(40.0, 28), 27);
+            assert_eq!(hotspot_pixel(f64::INFINITY, 28), 0);
+        }
+
+        /// The cursor on screen, drawn the way the guest will draw it: at its
+        /// size in points, upright, with something drawn at the hotspot — the
+        /// arrow's tip, the I-beam's middle, the hand's fingertip. A bitmap
+        /// filled upside down (Core Graphics counts rows from the bottom)
+        /// would put the arrow's tip in the far corner and leave its hotspot
+        /// on nothing. The system cursor rather than `arrowCursor`, which
+        /// answers nil in a process with no `NSApplication`; skipped where
+        /// no cursor is readable at all (see `read_system_cursor`).
+        #[test]
+        fn the_cursor_is_drawn_upright_at_its_size_in_points() {
+            #[allow(deprecated, reason = "the call under test")]
+            let Some(cursor) = NSCursor::currentSystemCursor() else {
+                eprintln!("skipped: no system cursor readable from this process");
+                return;
+            };
+            let size = cursor.image().size();
+            let Some(shape) = rasterize_cursor(&cursor) else {
+                panic!("the system cursor is not drawable");
+            };
+
+            assert_eq!(Some(shape.width), whole_points(size.width));
+            assert_eq!(Some(shape.height), whole_points(size.height));
+            assert!(shape.hotspot_x < shape.width && shape.hotspot_y < shape.height);
+
+            let alpha = |x: u16, y: u16| {
+                shape.rgba[(usize::from(y) * usize::from(shape.width) + usize::from(x)) * 4 + 3]
+            };
+            let (hx, hy) = (shape.hotspot_x, shape.hotspot_y);
+            let near_tip = (hy.saturating_sub(1)..=(hy + 1).min(shape.height - 1)).any(|y| {
+                (hx.saturating_sub(1)..=(hx + 1).min(shape.width - 1)).any(|x| alpha(x, y) > 0)
+            });
+            let art: String = (0..shape.height)
+                .map(|y| {
+                    (0..shape.width)
+                        .map(|x| if alpha(x, y) > 127 { '#' } else { '.' })
+                        .chain(std::iter::once('\n'))
+                        .collect::<String>()
+                })
+                .collect();
+            eprintln!(
+                "{}x{} hotspot ({hx}, {hy}):\n{art}",
+                shape.width, shape.height
+            );
+            assert!(near_tip, "nothing is drawn at the hotspot ({hx}, {hy})");
+            let Some(top) = (0..shape.height).find(|&y| (0..shape.width).any(|x| alpha(x, y) > 0))
+            else {
+                panic!("the cursor draws nothing");
+            };
+            assert!(
+                top <= hy,
+                "the first drawn row is {top}, below the hotspot row {hy}: upside down"
+            );
+        }
+
+        /// The thread reads whatever cursor is on screen and numbers it once,
+        /// not once per read. Skipped where this process cannot reach a
+        /// window server's cursor at all, which is the answer a future macOS
+        /// gives too (see `read_system_cursor`).
+        #[test]
+        fn the_watcher_numbers_a_cursor_once_however_often_it_reads_it() {
+            if read_system_cursor().is_none() {
+                eprintln!("skipped: no system cursor readable from this process");
+                return;
+            }
+            let watcher = CursorWatcher::spawn();
+            let mut first = None;
+            for _ in 0..30 {
+                first = watcher.newer_than(None);
+                if first.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let Some((seq, shape)) = first else {
+                panic!("the watcher did not read the cursor within 1.5s");
+            };
+            assert!(shape.width > 0 && shape.height > 0);
+            // Several reads later, the same cursor is still the same number.
+            std::thread::sleep(CURSOR_POLL_INTERVAL * 3);
+            if let Some((later, again)) = watcher.newer_than(Some(seq)) {
+                assert_ne!(again, shape, "an unchanged cursor got a new number {later}");
+            }
         }
 
         /// The real thing, against the real window server. Skipped rather

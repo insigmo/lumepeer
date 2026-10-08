@@ -7,6 +7,7 @@ pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
 |-----------|----------------------------------------------------------------------------------------------|
 | `connect` | invite → dial → grant works and the host's picture reaches the guest's view window           |
 | `mouse`   | a pointer move of 10 host pixels to the right in the guest's view moves the host's cursor by 10 ±1 px right and 0 ±1 px down |
+| `cursor`  | the host's cursor lands within a picture pixel (+1) of where the guest points, at five spots from corner to corner; the guest draws the host's cursor itself and the picture under it does not change when it moves away (not on Wayland, which burns it in); over the host's tracker it turns into the I-beam with nothing else on screen changing; and through a one-second sweep it arrives at most 150 ms after the network's one-way delay, falling no more than 150 ms further behind by the end (ADR 0150) |
 | `keys`    | `Hello, lumepeer 42` typed in the guest's view arrives as exactly that text, and 10 chords (Ctrl+A/C/V/Z, Ctrl+Shift+Z, Alt+X, Ctrl+Alt+J, Shift+Left, Ctrl+Home, Ctrl+Enter) arrive with the same modifiers |
 | `hotkeys` | Windows guest only: the same 10 chords pressed on the guest's own keyboard with its keyboard grab live arrive with the same modifiers, and Ctrl+A, Ctrl+C, Ctrl+End, Ctrl+V on `lumepeer` in the host's tracker leave `lumepeerlumepeer` |
 | `terminal` | the guest reconnects to the host for the terminal alone, as the remembered host's terminal button does (ADR 0101); the host's shell shows its prompt before anything is typed, `echo $((4200+37))` (`set /a 4200+37` on a Windows host) typed into it shows `4237`, and Close leaves no shell running on the host |
@@ -51,6 +52,7 @@ How to read it:
 - `mouse`: `dx`/`dy` is how far the host's cursor moved, in physical pixels.
   `center landed` is where the first move put it, next to where the center of
   the host's screen is.
+- `cursor`: `landed within Npx (tol T)` is the worst miss of the five aims; `drawn by the guest (WxH, wxh over text)` is the arrow and the I-beam the guest drew, and `Npx of it in the picture` how many picture pixels changed under the cursor when it moved away. `followed n/N moves Xms after (+-E, rtt R)` is how long the host's cursor took to reach a move, by the two machines' clocks lined up through the harness (E is how far off that can be), and `Yms further behind by the end` how much that grew over the sweep.
 - `keys`: `Ctrl+Alt+J(saw A)` means J reached the host with Alt held but no
   Ctrl, and `(saw nothing)` means the key never arrived. The `guest sent` part
   counts the `input_press` IPC calls the view made and how many succeeded, so

@@ -555,9 +555,9 @@ pub trait ScreenCapturer: Send + std::fmt::Debug {
     ///
     /// The default is `None`, and that is the honest answer for a platform
     /// whose compositor burns the cursor into the frame and never hands the
-    /// bitmap over — Wayland's `CursorMode::Embedded` and macOS's
-    /// `setShowsCursor(true)` both do. A made-up shape would be worse than
-    /// none: the guest would draw a second cursor next to the real one.
+    /// bitmap over — Wayland's `CursorMode::Embedded` does. A made-up shape
+    /// would be worse than none: the guest would draw a second cursor next
+    /// to the real one.
     ///
     /// No position travels with it. Where the cursor is is something the guest
     /// already knows — it is the one moving the pointer — and a message per
