@@ -71,7 +71,7 @@ audio-playout-coreaudio = [
 # xdg-desktop-portal negotiation and PipeWire frame consumption for the
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
-encode-openh264 = ["dep:openh264"]
+encode-openh264 = ["dep:openh264", "dep:openh264-sys2"]
 # libaom's realtime AV1 encoder in software, for a host with no hardware
 # encoder at all (§11; ADR 0141) — the one exception to "an optional codec
 # needs hardware on both sides". libaom is vendored in `lumepeer-aom-sys` and
@@ -192,6 +192,9 @@ thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
 openh264 = { workspace = true, optional = true }
+# The constants and struct `openh264`'s raw API takes for a live bitrate
+# (ADR 0144); the same build `openh264` already links, nothing more.
+openh264-sys2 = { version = "=0.9.8", default-features = false, optional = true }
 opus = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]

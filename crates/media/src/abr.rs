@@ -311,6 +311,293 @@ impl AbrController {
     }
 }
 
+/// How long [`EncodeSpeed`] and [`LinkPressure`] each measure before they
+/// decide anything (ADR 0144).
+const KEEP_UP_WINDOW: Duration = Duration::from_secs(1);
+
+/// What one step of [`EncodeSpeed`] keeps of each side of the picture, in
+/// percent: 85% of each axis is 72% of the pixels, and an encoder's time
+/// follows the pixels.
+const SPEED_STEP_PERCENT: u32 = 85;
+/// Windows in a row the encoder misses the interval before the picture is
+/// reduced: one slow second is a keyframe or a scene change, two are the
+/// picture.
+const SPEED_SLOW_WINDOWS: u32 = 2;
+/// Windows in a row with room to spare before the picture is enlarged again.
+/// Five times [`SPEED_SLOW_WINDOWS`], because each change of size is a
+/// keyframe, and a film that alternates calm and busy scenes must not be
+/// resized at every cut.
+const SPEED_ROOM_WINDOWS: u32 = 10;
+/// "Room to spare": the time the next step up is predicted to take, as a
+/// percentage of the interval it has to fit.
+const SPEED_ROOM_PERCENT: u32 = 80;
+/// The preset frame rate at and below which [`defended_fps`] gives up a third
+/// of the frames before any sharpness...
+const SPEED_SHARP_FPS: u8 = 30;
+/// ...and at and above which it gives up sharpness before any frame.
+const SPEED_SMOOTH_FPS: u8 = 120;
+
+/// The frame rate the encoder has to make before [`EncodeSpeed`] reduces the
+/// picture, for a preset that asked for `asked` frames a second on a session
+/// running at `rate` (ADR 0144).
+///
+/// The more frames a preset asks for, the more of them it keeps: `quality`'s
+/// 30 gives up a third of them before it gives up any sharpness,
+/// `performance`'s 144 gives up sharpness before any frame, and `balance`'s
+/// 60 sits between. Never above `rate` — a host whose display makes 60 is not
+/// held to 144 — and never under [`ABR_MIN_FPS`].
+#[must_use]
+pub fn defended_fps(asked: u8, rate: u8) -> u8 {
+    let over = u32::from(asked.clamp(SPEED_SHARP_FPS, SPEED_SMOOTH_FPS) - SPEED_SHARP_FPS);
+    let span = u32::from(SPEED_SMOOTH_FPS - SPEED_SHARP_FPS);
+    // Two thirds at the sharp end, all of it at the smooth one, in thousandths.
+    let share = 667 + 333 * over / span;
+    let kept = u32::from(rate) * share / 1_000;
+    u8::try_from(kept)
+        .unwrap_or(rate)
+        .clamp(ABR_MIN_FPS.min(rate), rate)
+}
+
+/// Reduces the picture while the encoder cannot make the frame rate, and
+/// gives the size back once it can (ADR 0144).
+///
+/// [`AbrController`] answers the link, and a preset switches even that off;
+/// nothing answered the host's own processor. A software encoder took
+/// 40–60 ms for each 1080p frame of a film on a host with no hardware
+/// encoder, and the `quality` preset kept asking it for 30 of them a second.
+/// This measures what reducing and encoding actually take, a second at a
+/// time, and lowers the share of the captured picture the encoder is handed
+/// once two seconds in a row miss the interval.
+#[derive(Debug)]
+pub struct EncodeSpeed {
+    /// When the current window started; `None` until its first frame.
+    started: Option<Instant>,
+    /// Reducing and encoding, summed over the window's frames.
+    busy: Duration,
+    /// Frames in the window.
+    frames: u32,
+    /// Windows in a row that missed the interval.
+    slow: u32,
+    /// Windows in a row that had room for the next step up.
+    room: u32,
+    /// The most of the captured picture's side the encoder is handed, in
+    /// percent.
+    cap_percent: u32,
+}
+
+impl Default for EncodeSpeed {
+    fn default() -> Self {
+        Self {
+            started: None,
+            busy: Duration::ZERO,
+            frames: 0,
+            slow: 0,
+            room: 0,
+            cap_percent: FULL_SCALE_PERCENT,
+        }
+    }
+}
+
+impl EncodeSpeed {
+    /// The most of the captured picture's side, in percent, the encoder is
+    /// handed now: [`FULL_SCALE_PERCENT`] while it keeps up.
+    #[must_use]
+    pub const fn cap_percent(&self) -> u32 {
+        self.cap_percent
+    }
+
+    /// Forgets everything, the reduction included: a new preset is a new
+    /// tradeoff, and is measured afresh.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// One frame took `took` to reduce and encode, at `picture_percent` of
+    /// the captured picture's side, on a session that has to make a frame
+    /// every `interval`. The new cap when this frame closed a window that
+    /// moved it.
+    pub fn frame(
+        &mut self,
+        now: Instant,
+        took: Duration,
+        picture_percent: u32,
+        interval: Duration,
+    ) -> Option<u32> {
+        let started = *self.started.get_or_insert(now);
+        self.busy = self.busy.saturating_add(took);
+        self.frames = self.frames.saturating_add(1);
+        if now.saturating_duration_since(started) < KEEP_UP_WINDOW {
+            return None;
+        }
+        let mean = self.busy / self.frames.max(1);
+        self.started = None;
+        self.busy = Duration::ZERO;
+        self.frames = 0;
+        // What was actually encoded, which a guest's smaller window can
+        // already have made smaller than the cap: reducing from the cap would
+        // spend steps that change nothing.
+        let picture = picture_percent.clamp(1, self.cap_percent);
+
+        if mean > interval {
+            self.room = 0;
+            self.slow = self.slow.saturating_add(1);
+            if self.slow < SPEED_SLOW_WINDOWS {
+                return None;
+            }
+            self.slow = 0;
+            let reduced = (picture * SPEED_STEP_PERCENT / PERCENT).max(ABR_MIN_SCALE_PERCENT);
+            if reduced >= picture {
+                // On the floor already; nothing smaller is readable.
+                return None;
+            }
+            self.cap_percent = reduced;
+            return Some(reduced);
+        }
+        self.slow = 0;
+        if self.cap_percent >= FULL_SCALE_PERCENT {
+            self.room = 0;
+            return None;
+        }
+        let next = (self.cap_percent * PERCENT / SPEED_STEP_PERCENT).min(FULL_SCALE_PERCENT);
+        // The encoder's time follows the pixels: the next step up costs
+        // (next / now)² of this one.
+        let predicted = mean.mul_f64((f64::from(next) / f64::from(picture)).powi(2));
+        if predicted * PERCENT > interval * SPEED_ROOM_PERCENT {
+            self.room = 0;
+            return None;
+        }
+        self.room = self.room.saturating_add(1);
+        if self.room < SPEED_ROOM_WINDOWS {
+            return None;
+        }
+        self.room = 0;
+        self.cap_percent = next;
+        Some(next)
+    }
+}
+
+/// Share of a window spent waiting on the link, in percent, at and above
+/// which [`LinkPressure`] calls the window pressed.
+const PRESSED_HELD_PERCENT: u32 = 50;
+/// Share at and below which it calls the window clear.
+const CLEAR_HELD_PERCENT: u32 = 10;
+/// Pressed windows in a row before the bitrate comes down: one is a Wi-Fi
+/// hiccup that is over before anything could act on it, and lowering the
+/// picture for it would cost seconds of softness to save nothing.
+const PRESSED_WINDOWS: u32 = 2;
+/// Clear windows in a row before the bitrate starts going back up, a step
+/// each clear window after that.
+const CLEAR_WINDOWS: u32 = 2;
+/// Each step back up, in percent of the cap: from the floor to a preset's
+/// 8 Mbit/s in nine steps, so about ten seconds of a clear link.
+const RECOVERY_STEP_PERCENT: u32 = 150;
+
+/// Lowers the bitrate a preset pinned while the link cannot carry the
+/// picture, and gives it back as the link recovers (ADR 0144).
+///
+/// A preset pins the whole quality target (ADR 0064), so nothing answered a
+/// link that fell below it. ADR 0139 made the host wait for the guest instead
+/// of queueing frames, which keeps every frame current — and on a link that
+/// loses packets steadily a 25 KB frame took seconds to arrive, so the guest
+/// saw the same picture for as long as the loss lasted. The waiting is the
+/// signal: windows mostly spent waiting halve the bitrate, from what was
+/// actually sent rather than from the target, which a software encoder
+/// undershoots by two thirds. Smaller frames get through where large ones
+/// stall.
+#[derive(Debug, Default)]
+pub struct LinkPressure {
+    /// When the current window started; `None` until it is first asked.
+    started: Option<Instant>,
+    /// Time spent waiting on the link in the window.
+    held: Duration,
+    /// Bytes handed to the link in the window.
+    bytes: u64,
+    /// Pressed windows in a row.
+    pressed: u32,
+    /// Clear windows in a row.
+    clear: u32,
+    /// The bitrate the picture is held under, if any.
+    cap_kbps: Option<u32>,
+}
+
+impl LinkPressure {
+    /// The bitrate the picture is held under now, if any.
+    #[must_use]
+    pub const fn cap_kbps(&self) -> Option<u32> {
+        self.cap_kbps
+    }
+
+    /// The loop waited `took` for the link.
+    pub fn held(&mut self, took: Duration) {
+        self.held = self.held.saturating_add(took);
+    }
+
+    /// `bytes` of picture went to the link.
+    pub fn sent(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+    }
+
+    /// Drops the cap and everything measured, for a session no preset pins
+    /// any more: the adaptive controller has the bitrate then. Whether there
+    /// was a cap to drop.
+    pub fn release(&mut self) -> bool {
+        let had = self.cap_kbps.is_some();
+        *self = Self::default();
+        had
+    }
+
+    /// Closes the window once it has run, against the `ceiling_kbps` the
+    /// preset pinned. The bitrate to encode at from now on, when the cap
+    /// moved: the cap, or the ceiling once the cap is gone.
+    pub fn due(&mut self, now: Instant, ceiling_kbps: u32) -> Option<u32> {
+        let started = *self.started.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed < KEEP_UP_WINDOW {
+            return None;
+        }
+        let held = std::mem::take(&mut self.held);
+        let bytes = std::mem::take(&mut self.bytes);
+        self.started = Some(now);
+
+        if held * PERCENT >= elapsed * PRESSED_HELD_PERCENT {
+            self.clear = 0;
+            self.pressed = self.pressed.saturating_add(1);
+            if self.pressed < PRESSED_WINDOWS {
+                return None;
+            }
+            let millis = u64::try_from(elapsed.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            let sent_kbps = u32::try_from(bytes.saturating_mul(8) / millis).unwrap_or(u32::MAX);
+            let current = self
+                .cap_kbps
+                .map_or(ceiling_kbps, |cap| cap.min(ceiling_kbps));
+            let lowered = (current.min(sent_kbps) / 2).max(ABR_MIN_BITRATE_KBPS);
+            if lowered >= current {
+                return None;
+            }
+            self.cap_kbps = Some(lowered);
+            return Some(lowered);
+        }
+        self.pressed = 0;
+        let Some(cap) = self.cap_kbps else {
+            self.clear = 0;
+            return None;
+        };
+        if held * PERCENT > elapsed * CLEAR_HELD_PERCENT {
+            self.clear = 0;
+            return None;
+        }
+        self.clear = self.clear.saturating_add(1);
+        if self.clear < CLEAR_WINDOWS {
+            return None;
+        }
+        let raised = cap.saturating_mul(RECOVERY_STEP_PERCENT) / PERCENT;
+        self.cap_kbps = (raised < ceiling_kbps).then_some(raised);
+        Some(raised.min(ceiling_kbps))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used, reason = "a failed assumption must fail the test")]
@@ -614,5 +901,214 @@ mod tests {
         assert!(abr.on_feedback(feedback(0.5)).is_none());
         std::thread::sleep(Duration::from_secs(1) / ABR_ADJUST_MAX_RATE_PER_SEC);
         assert!(abr.on_feedback(feedback(0.5)).is_some());
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// ADR 0144: `quality` gives up a third of its frames before any
+    /// sharpness, `performance` none, `balance` some; never more than the
+    /// session runs at, never under the floor.
+    #[test]
+    fn a_preset_defends_more_of_its_frames_the_more_it_asks_for() {
+        assert_eq!(defended_fps(30, 30), 20);
+        assert_eq!(defended_fps(60, 60), 46);
+        assert_eq!(defended_fps(144, 144), 144);
+        assert_eq!(defended_fps(144, 60), 60, "a 60 Hz host is not held to 144");
+        assert_eq!(defended_fps(30, 12), ABR_MIN_FPS);
+        assert_eq!(
+            defended_fps(30, 5),
+            5,
+            "never above what the session runs at"
+        );
+    }
+
+    /// One second of frames that each took `took` at `picture` percent, and
+    /// what the frame that closed the window said.
+    fn speed_window(
+        speed: &mut EncodeSpeed,
+        at: &mut Instant,
+        took: Duration,
+        picture: u32,
+        interval: Duration,
+    ) -> Option<u32> {
+        let mut said = None;
+        for _ in 0..=10 {
+            said = speed.frame(*at, took, picture, interval);
+            *at += ms(100);
+        }
+        said
+    }
+
+    /// ADR 0144: two slow seconds in a row reduce the picture a step, from
+    /// what was actually encoded, down to the floor and no further.
+    #[test]
+    fn an_encoder_that_misses_the_interval_twice_gets_a_smaller_picture() {
+        let interval = ms(50);
+        let mut speed = EncodeSpeed::default();
+        let mut at = Instant::now();
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(60), 100, interval),
+            None,
+            "one slow second is a scene change, not the picture"
+        );
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(60), 100, interval),
+            Some(85)
+        );
+        assert_eq!(speed.cap_percent(), 85);
+
+        // The guest's window already made the picture 80%: the next step
+        // comes from that.
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(60), 80, interval),
+            None
+        );
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(60), 80, interval),
+            Some(68)
+        );
+
+        let mut floor = speed.cap_percent();
+        for _ in 0..10 {
+            speed_window(&mut speed, &mut at, ms(60), floor, interval);
+            floor = speed.cap_percent();
+        }
+        assert_eq!(floor, ABR_MIN_SCALE_PERCENT);
+    }
+
+    /// ADR 0144: the size comes back after ten seconds with room for the next
+    /// step, and a second without room starts the count again.
+    #[test]
+    fn the_picture_grows_back_after_ten_seconds_with_room_for_it() {
+        let interval = ms(50);
+        let mut speed = EncodeSpeed::default();
+        let mut at = Instant::now();
+        speed_window(&mut speed, &mut at, ms(60), 100, interval);
+        speed_window(&mut speed, &mut at, ms(60), 100, interval);
+        assert_eq!(speed.cap_percent(), 85);
+
+        // 25 ms at 85% is 35 ms at full size: inside 80% of 50 ms.
+        for _ in 0..5 {
+            assert_eq!(
+                speed_window(&mut speed, &mut at, ms(25), 85, interval),
+                None
+            );
+        }
+        // 33 ms is still inside the interval, but the full size would take
+        // 46: no room, and the count starts over.
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(33), 85, interval),
+            None
+        );
+        for _ in 0..9 {
+            assert_eq!(
+                speed_window(&mut speed, &mut at, ms(25), 85, interval),
+                None
+            );
+        }
+        assert_eq!(
+            speed_window(&mut speed, &mut at, ms(25), 85, interval),
+            Some(FULL_SCALE_PERCENT)
+        );
+    }
+
+    /// One second of the link, waited on for `held_ms` and carrying `kbps`,
+    /// and what closing it said.
+    fn link_window(
+        link: &mut LinkPressure,
+        at: &mut Instant,
+        held_ms: u64,
+        kbps: u32,
+        ceiling: u32,
+    ) -> Option<u32> {
+        // Opens the window the first time; mid-window it says nothing.
+        assert_eq!(link.due(*at, ceiling), None);
+        link.held(ms(held_ms));
+        link.sent(usize::try_from(u64::from(kbps) * 1_000 / 8).expect("fits"));
+        *at += ms(1_000);
+        link.due(*at, ceiling)
+    }
+
+    /// ADR 0144: one stalled second is a hiccup; from the second one on the
+    /// bitrate halves from what was actually sent, down to the floor.
+    #[test]
+    fn a_link_that_keeps_stalling_halves_the_bitrate_from_what_was_sent() {
+        let mut link = LinkPressure::default();
+        let mut at = Instant::now();
+        assert_eq!(link_window(&mut link, &mut at, 900, 2_400, 8_000), None);
+        assert_eq!(
+            link_window(&mut link, &mut at, 900, 2_400, 8_000),
+            Some(1_200)
+        );
+        assert_eq!(
+            link_window(&mut link, &mut at, 900, 1_200, 8_000),
+            Some(600)
+        );
+        assert_eq!(
+            link_window(&mut link, &mut at, 900, 600, 8_000),
+            Some(ABR_MIN_BITRATE_KBPS)
+        );
+        assert_eq!(
+            link_window(&mut link, &mut at, 900, 300, 8_000),
+            None,
+            "on the floor"
+        );
+        assert_eq!(link.cap_kbps(), Some(ABR_MIN_BITRATE_KBPS));
+    }
+
+    /// ADR 0144: a link that carries nothing at all goes straight to the
+    /// floor.
+    #[test]
+    fn a_frozen_link_goes_straight_to_the_floor() {
+        let mut link = LinkPressure::default();
+        let mut at = Instant::now();
+        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        assert_eq!(
+            link_window(&mut link, &mut at, 1_000, 0, 8_000),
+            Some(ABR_MIN_BITRATE_KBPS)
+        );
+    }
+
+    /// ADR 0144: two clear seconds, then a step up every clear second, until
+    /// the preset's own bitrate is back and the cap is gone; a middling
+    /// second holds where it is.
+    #[test]
+    fn a_clear_link_gets_its_bitrate_back_a_step_a_second() {
+        let mut link = LinkPressure::default();
+        let mut at = Instant::now();
+        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        assert_eq!(link.cap_kbps(), Some(300));
+
+        assert_eq!(link_window(&mut link, &mut at, 0, 300, 8_000), None);
+        assert_eq!(link_window(&mut link, &mut at, 0, 300, 8_000), Some(450));
+        assert_eq!(
+            link_window(&mut link, &mut at, 300, 450, 8_000),
+            None,
+            "neither pressed nor clear"
+        );
+        assert_eq!(link_window(&mut link, &mut at, 0, 450, 8_000), None);
+        assert_eq!(link_window(&mut link, &mut at, 0, 450, 8_000), Some(675));
+        let mut steps = 0;
+        while link.cap_kbps().is_some() {
+            link_window(&mut link, &mut at, 0, 1_000, 8_000);
+            steps += 1;
+            assert!(steps < 20, "the cap never went away");
+        }
+        assert!(!link.release(), "nothing left to release");
+    }
+
+    /// ADR 0144: releasing says whether there was a cap, and forgets it.
+    #[test]
+    fn releasing_the_link_cap_forgets_it() {
+        let mut link = LinkPressure::default();
+        let mut at = Instant::now();
+        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        assert!(link.release());
+        assert_eq!(link.cap_kbps(), None);
+        assert!(!link.release());
     }
 }

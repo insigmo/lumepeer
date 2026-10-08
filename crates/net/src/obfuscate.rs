@@ -627,6 +627,10 @@ pub fn obfuscated_transport_config() -> TransportConfig {
     let idle_timeout_ms =
         u32::try_from(QUIC_MAX_IDLE_TIMEOUT_SECS.saturating_mul(1000)).unwrap_or(u32::MAX);
     config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_timeout_ms))));
+    // Cubic, deaf to losses that do not look like a queue (ADR 0144).
+    config.congestion_controller_factory(std::sync::Arc::new(
+        crate::loss_tolerant::LossTolerantConfig::default(),
+    ));
     config
 }
 
