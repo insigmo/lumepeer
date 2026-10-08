@@ -27,7 +27,7 @@ default = []
 vendored = []
 
 [build-dependencies]
-# Both are already in the lock file: `cmake` for audiopus_sys's vendored
+# Both are already in the lock file: `cmake` for opusic-sys's vendored
 # libopus, `cc` for openh264-sys2.
 cmake = "0.1.58"
 cc = "1.4"

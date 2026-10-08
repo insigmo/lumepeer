@@ -43,6 +43,10 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+On Windows, a release build also needs `ninja` on PATH (`winget install
+Ninja-build.Ninja`); without it libopus would be compiled unoptimised
+([ADR 0149](docs/adr/0149-libopus-is-built-with-ninja-on-windows.md)).
+
 ## License
 
 See the repository for license information.
