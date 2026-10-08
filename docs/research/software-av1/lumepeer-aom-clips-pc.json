@@ -1,0 +1,463 @@
+{
+ "machine": "i7-11800H, Windows 11",
+ "clip": "desktop 1080p (clips/desktop.bgra, frames 30-929, paced at 30 fps)",
+ "note": "lumepeer-aom gets twice the bitrate (session H.264 figure); libaom inside it gets the same target as aom-s10",
+ "batches": {
+  "stage1 (2026-10-01, runs-pc)": [
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 2000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 6.217,
+     "p50": 5.771,
+     "p95": 10.18,
+     "p99": 15.515,
+     "max": 21.807
+    },
+    "cpu_cores_used": 0.559,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 4000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 6.707,
+     "p50": 6.044,
+     "p95": 11.796,
+     "p99": 15.329,
+     "max": 25.041
+    },
+    "cpu_cores_used": 0.605,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 8000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 7.079,
+     "p50": 6.098,
+     "p95": 13.332,
+     "p99": 16.234,
+     "max": 35.819
+    },
+    "cpu_cores_used": 0.627,
+    "late_frames": 0,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 16000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 7.497,
+     "p50": 6.202,
+     "p95": 14.509,
+     "p99": 18.414,
+     "max": 42.122
+    },
+    "cpu_cores_used": 0.709,
+    "late_frames": 0,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   }
+  ],
+  "2026-10-08 10:55-10:59, unfixed product libaom (runs-pc-lumepeer-aom)": [
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 2000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 7.087,
+     "p50": 6.587,
+     "p95": 13.674,
+     "p99": 17.83,
+     "max": 22.924
+    },
+    "cpu_cores_used": 0.59,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 4000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 7.157,
+     "p50": 6.535,
+     "p95": 12.58,
+     "p99": 17.235,
+     "max": 26.061
+    },
+    "cpu_cores_used": 0.599,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 8000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 7.7,
+     "p50": 6.674,
+     "p95": 14.151,
+     "p99": 21.248,
+     "max": 38.758
+    },
+    "cpu_cores_used": 0.686,
+    "late_frames": 0,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 16000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 7.932,
+     "p50": 6.706,
+     "p95": 15.08,
+     "p99": 20.846,
+     "max": 50.916
+    },
+    "cpu_cores_used": 0.692,
+    "late_frames": 3,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 2000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 4000 kbit/s, libaom target 2000 kbit/s)",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 15.985,
+     "p50": 13.337,
+     "p95": 33.319,
+     "p99": 48.519,
+     "max": 82.154
+    },
+    "cpu_cores_used": 1.75,
+    "late_frames": 24,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 4000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 8000 kbit/s, libaom target 4000 kbit/s)",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 16.806,
+     "p50": 13.508,
+     "p95": 36.746,
+     "p99": 56.322,
+     "max": 93.865
+    },
+    "cpu_cores_used": 1.825,
+    "late_frames": 27,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 8000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 16000 kbit/s, libaom target 8000 kbit/s)",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 18.277,
+     "p50": 13.184,
+     "p95": 41.358,
+     "p99": 57.891,
+     "max": 130.197
+    },
+    "cpu_cores_used": 1.966,
+    "late_frames": 111,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 16000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 32000 kbit/s, libaom target 16000 kbit/s)",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 18.713,
+     "p50": 14.328,
+     "p95": 43.875,
+     "p99": 61.946,
+     "max": 123.014
+    },
+    "cpu_cores_used": 1.946,
+    "late_frames": 207,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   }
+  ],
+  "2026-10-08 11:07-11:10, fixed product libaom, ADR 0146 (runs-pc-lumepeer-aom-fixed)": [
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 2000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 6.683,
+     "p50": 5.976,
+     "p95": 11.966,
+     "p99": 18.525,
+     "max": 29.364
+    },
+    "cpu_cores_used": 0.608,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 4000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 7.994,
+     "p50": 6.549,
+     "p95": 18.812,
+     "p99": 24.027,
+     "max": 31.713
+    },
+    "cpu_cores_used": 0.707,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 8000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 16.059,
+     "p50": 13.976,
+     "p95": 30.796,
+     "p99": 48.727,
+     "max": 72.456
+    },
+    "cpu_cores_used": 1.19,
+    "late_frames": 24,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 16000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 9.255,
+     "p50": 7.762,
+     "p95": 18.26,
+     "p99": 22.583,
+     "max": 46.269
+    },
+    "cpu_cores_used": 0.81,
+    "late_frames": 0,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 2000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 4000 kbit/s, libaom target 2000 kbit/s)",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 7.162,
+     "p50": 6.933,
+     "p95": 11.433,
+     "p99": 17.522,
+     "max": 26.087
+    },
+    "cpu_cores_used": 0.594,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 4000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 8000 kbit/s, libaom target 4000 kbit/s)",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 7.592,
+     "p50": 6.876,
+     "p95": 13.352,
+     "p99": 21.288,
+     "max": 38.151
+    },
+    "cpu_cores_used": 0.632,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 8000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 16000 kbit/s, libaom target 8000 kbit/s)",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 7.853,
+     "p50": 6.92,
+     "p95": 14.385,
+     "p99": 18.37,
+     "max": 34.461
+    },
+    "cpu_cores_used": 0.683,
+    "late_frames": 0,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 16000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 32000 kbit/s, libaom target 16000 kbit/s)",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 8.298,
+     "p50": 6.811,
+     "p95": 16.012,
+     "p99": 19.561,
+     "max": 40.874
+    },
+    "cpu_cores_used": 0.73,
+    "late_frames": 0,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   }
+  ],
+  "2026-10-08 16:17-16:21, fixed, machine busy with the owner's apps, 35-42% CPU (runs-pc-lumepeer-aom-fixed2)": [
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 2000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 10.9,
+     "p50": 10.726,
+     "p95": 18.499,
+     "p99": 23.459,
+     "max": 46.537
+    },
+    "cpu_cores_used": 0.939,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 4000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 12.115,
+     "p50": 11.249,
+     "p95": 20.713,
+     "p99": 26.802,
+     "max": 41.062
+    },
+    "cpu_cores_used": 1.053,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 8000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 12.429,
+     "p50": 11.132,
+     "p95": 21.283,
+     "p99": 28.605,
+     "max": 44.503
+    },
+    "cpu_cores_used": 1.074,
+    "late_frames": 0,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "aom-s10",
+    "libaom_kbps": 16000,
+    "describe": "libaom 3.15.1 realtime cpu-used=10 threads=8 tile-cols-log2=2 screen=true q=0..63",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 12.854,
+     "p50": 11.506,
+     "p95": 22.907,
+     "p99": 29.92,
+     "max": 44.239
+    },
+    "cpu_cores_used": 1.153,
+    "late_frames": 0,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 2000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 4000 kbit/s, libaom target 2000 kbit/s)",
+    "kbps_actual": 1284.1,
+    "frame_ms": {
+     "mean": 11.966,
+     "p50": 11.137,
+     "p95": 19.536,
+     "p99": 27.744,
+     "max": 51.64
+    },
+    "cpu_cores_used": 0.988,
+    "late_frames": 0,
+    "md5": "eccbe76cf36a2b64b8fc45c7dce046e9"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 4000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 8000 kbit/s, libaom target 4000 kbit/s)",
+    "kbps_actual": 2143.9,
+    "frame_ms": {
+     "mean": 13.15,
+     "p50": 12.178,
+     "p95": 23.121,
+     "p99": 27.879,
+     "max": 39.581
+    },
+    "cpu_cores_used": 1.079,
+    "late_frames": 0,
+    "md5": "2ede559863bc5d821ac2d7627b1a7e88"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 8000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 16000 kbit/s, libaom target 8000 kbit/s)",
+    "kbps_actual": 3483.7,
+    "frame_ms": {
+     "mean": 12.451,
+     "p50": 11.99,
+     "p95": 21.791,
+     "p99": 27.581,
+     "max": 44.584
+    },
+    "cpu_cores_used": 1.122,
+    "late_frames": 0,
+    "md5": "35cf164ef8f6184c98feae5d0a18d873"
+   },
+   {
+    "encoder": "lumepeer-aom",
+    "libaom_kbps": 16000,
+    "describe": "lumepeer AomEncoder (libaom v3.15.1, product settings; session target 32000 kbit/s, libaom target 16000 kbit/s)",
+    "kbps_actual": 5240.4,
+    "frame_ms": {
+     "mean": 13.462,
+     "p50": 12.235,
+     "p95": 23.686,
+     "p99": 28.883,
+     "max": 47.122
+    },
+    "cpu_cores_used": 1.113,
+    "late_frames": 1,
+    "md5": "0ca6ddedef1d29837cb3405278dc8a78"
+   }
+  ]
+ }
+}
