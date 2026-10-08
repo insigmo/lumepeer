@@ -310,10 +310,12 @@ mod timing {
     /// Frames encoded first and not timed: the keyframe and the rate
     /// controller finding its feet.
     const WARMUP_FRAMES: usize = 5;
-    /// A frame this slow ends the measurement at once: nothing that follows can
-    /// bring the p95 back under the budget, and a machine this slow should not
-    /// be kept busy finding out by how much.
+    /// A p95 this slow ends the measurement at once: a machine this slow
+    /// should not be kept busy finding out by how much (ADR 0145).
     const HOPELESS: Duration = Duration::from_millis(250);
+    /// The timed frames at or above the p95: the p95 is the `TAIL`-th
+    /// slowest of them. One slow frame is not a slow p95; `TAIL` of them are.
+    const TAIL: usize = TIMED_FRAMES + 1 - (TIMED_FRAMES * 95).div_ceil(100);
     /// Picture size of the measurement: the largest software AV1 is chosen for.
     pub(super) const WIDTH: usize = 1920;
     pub(super) const HEIGHT: usize = 1080;
@@ -497,7 +499,7 @@ mod timing {
     ) -> crate::Result<Duration> {
         let interval = Duration::from_micros(1_000_000 / u64::from(SOFTWARE_AV1_MAX_FPS));
         let started = Instant::now();
-        let mut took = Vec::with_capacity(TIMED_FRAMES);
+        let mut tally = Tally::default();
         for n in 0..WARMUP_FRAMES + TIMED_FRAMES {
             let frame = screen.frame(n);
             let due = started + interval * u32::try_from(n).unwrap_or(u32::MAX);
@@ -506,15 +508,49 @@ mod timing {
             }
             let begun = Instant::now();
             encoder.encode(&frame)?;
-            let elapsed = begun.elapsed();
-            if n >= WARMUP_FRAMES {
-                took.push(elapsed);
-            }
-            if elapsed >= HOPELESS {
-                return Ok(elapsed);
+            if let Some(hopeless) = tally.frame(n, begun.elapsed()) {
+                return Ok(hopeless);
             }
         }
-        Ok(p95(&mut took))
+        Ok(tally.p95())
+    }
+
+    /// The frame times of one encoder's run.
+    #[derive(Debug, Default)]
+    pub(super) struct Tally {
+        took: Vec<Duration>,
+    }
+
+    impl Tally {
+        /// Records frame `n`, warm-up included, and says whether the run can
+        /// stop: `Some` once the p95 is [`HOPELESS`] whatever follows, with
+        /// the least it can come to — the `TAIL`-th slowest frame so far.
+        ///
+        /// A warm-up frame never stops it, and neither does one slow frame:
+        /// a start-up stall or a slow keyframe is not the machine's speed,
+        /// and the p95 leaves out exactly such frames (ADR 0145).
+        pub(super) fn frame(&mut self, n: usize, took: Duration) -> Option<Duration> {
+            if n < WARMUP_FRAMES {
+                return None;
+            }
+            self.took.push(took);
+            let mut slow: Vec<Duration> = self
+                .took
+                .iter()
+                .copied()
+                .filter(|&t| t >= HOPELESS)
+                .collect();
+            if slow.len() < TAIL {
+                return None;
+            }
+            slow.sort_unstable_by(|a, b| b.cmp(a));
+            Some(slow[TAIL - 1])
+        }
+
+        /// The p95 of the timed frames.
+        pub(super) fn p95(mut self) -> Duration {
+            p95(&mut self.took)
+        }
     }
 
     /// The 95th percentile, nearest rank.
@@ -532,7 +568,7 @@ mod timing {
 mod tests {
     use std::time::Duration;
 
-    use super::timing::{HEIGHT, Screen, WIDTH, p95};
+    use super::timing::{HEIGHT, Screen, Tally, WIDTH, p95};
     use super::*;
 
     #[test]
@@ -574,6 +610,51 @@ mod tests {
         let mut samples: Vec<Duration> = (1..=40).map(Duration::from_millis).collect();
         assert_eq!(p95(&mut samples), Duration::from_millis(38));
         assert_eq!(p95(&mut []), Duration::ZERO);
+    }
+
+    /// Five warm-up frames, then ninety timed: `slow` of the timed ones take
+    /// `slow_ms`, the rest 20 ms. What the run ends with, and at which frame.
+    fn run(slow: &[usize], slow_ms: u64, warmup_ms: u64) -> (Duration, usize) {
+        let mut tally = Tally::default();
+        for n in 0..95 {
+            let took = if n < 5 {
+                Duration::from_millis(warmup_ms)
+            } else if slow.contains(&(n - 5)) {
+                Duration::from_millis(slow_ms)
+            } else {
+                Duration::from_millis(20)
+            };
+            if let Some(hopeless) = tally.frame(n, took) {
+                return (hopeless, n);
+            }
+        }
+        (tally.p95(), 95)
+    }
+
+    /// beta on 2026-10-07 logged a p95 of 262.9, 251.8 and 284.7 ms: each
+    /// the time of the one frame that ended the run, kept as the answer for
+    /// the rest of the process. One frame, or a slow keyframe in the
+    /// warm-up, is not the machine's speed (ADR 0145).
+    #[test]
+    fn one_slow_frame_does_not_end_the_measurement() {
+        assert_eq!(run(&[10], 1_050, 20), (Duration::from_millis(20), 95));
+        assert_eq!(run(&[], 20, 1_050), (Duration::from_millis(20), 95));
+        assert_eq!(
+            run(&[1, 30, 60, 89], 300, 20),
+            (Duration::from_millis(20), 95),
+            "four slow frames of ninety are left out of the p95"
+        );
+    }
+
+    #[test]
+    fn a_hopeless_p95_ends_the_measurement_at_once() {
+        // The fifth slow frame puts the p95 past HOPELESS, whatever follows.
+        assert_eq!(
+            run(&[0, 1, 2, 3, 4], 300, 20),
+            (Duration::from_millis(300), 9)
+        );
+        let (p95, at) = run(&[0, 2, 4, 6, 8], 260, 20);
+        assert_eq!((p95, at), (Duration::from_millis(260), 13));
     }
 
     #[test]
