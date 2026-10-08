@@ -10,6 +10,8 @@ pytest drives four machines through tauri-pilot. Every `[guest, host]` pair in
 | `keys`    | `Hello, lumepeer 42` typed in the guest's view arrives as exactly that text, and 10 chords (Ctrl+A/C/V/Z, Ctrl+Shift+Z, Alt+X, Ctrl+Alt+J, Shift+Left, Ctrl+Home, Ctrl+Enter) arrive with the same modifiers |
 | `hotkeys` | Windows guest only: the same 10 chords pressed on the guest's own keyboard with its keyboard grab live arrive with the same modifiers, and Ctrl+A, Ctrl+C, Ctrl+End, Ctrl+V on `lumepeer` in the host's tracker leave `lumepeerlumepeer` |
 | `terminal` | the guest reconnects to the host for the terminal alone, as the remembered host's terminal button does (ADR 0101); the host's shell shows its prompt before anything is typed, `echo $((4200+37))` (`set /a 4200+37` on a Windows host) typed into it shows `4237`, and Close leaves no shell running on the host |
+| `sound` | `test_audio.py`: the host plays an 880 Hz tone on its default output for 3 s (agent.py `play_tone`: winsound, afplay, pw-play/paplay/aplay); the guest has to decode it as 880 Hz ±5 % and its speakers have to take it. Each side counts what went through it (`connection_stats` `audio_out` on the host, `audio_in` on the guest, ADR 0147), so a failure names the stage: the host's capture never heard its own tone, nothing reached the guest, or the guest's playback device refused |
+| `mic` | `test_audio.py`: the guest turns its microphone on as the view's mic button does; at least a second of it has to reach the host, be played by the host's speakers and not be digital silence (a muted microphone, or one the OS keeps from the app, delivers exact zeros). The guest's real microphone is used: a guest machine without one, or a build without microphone capture (macOS), fails with that reason |
 | `vmware_typing` | win→beta only (`test_vmware.py`): with the `debian` VM in front in VMware on beta, a line of letters, capitals, digits, Ctrl/Alt chords and letters typed with Ctrl held reaches the VM byte for byte, read back from a raw-mode xterm inside it (`vm_recorder.sh`); once with the guest's grab off and once on, on a US and a Russian guest layout (ADR 0119). Injector changes need beta's LumepeerHelper on the e2e build: `helper-path.ps1 -To e2e`, and `-To installed` after |
 
 `guest->host` means the guest controls the host. The pairs are win↔mac, win↔linux,
@@ -24,6 +26,7 @@ e2e/matrix/deploy.sh                          # build + install the pilot app: w
 python -m pytest e2e/matrix                   # the whole matrix
 python -m pytest e2e/matrix --only win,beta   # only pairs made of these machines
 python -m pytest e2e/matrix -k keys           # one scenario
+python -m pytest e2e/matrix/test_audio.py    # sound both ways, on a session of its own
 ```
 
 Run `deploy.sh` again after every change to the app: each machine runs the build

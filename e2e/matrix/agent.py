@@ -40,7 +40,10 @@ SESSION_VARS = (
     "XAUTHORITY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
     "DESKTOP_SESSION", "KDE_FULL_SESSION", "KDE_SESSION_VERSION",
 )
-SESSION_PROCESSES = ("plasmashell", "kwin_wayland", "gnome-shell", "xfce4-session", "labwc", "Xorg")
+# `gsd-`/`csd-media-keys`: GNOME and Cinnamon on Wayland, whose compositors
+# carry no display variables of their own; their settings daemons do.
+SESSION_PROCESSES = ("plasmashell", "kwin_wayland", "gnome-shell", "xfce4-session", "labwc", "Xorg", "gsd-media-keys",
+                     "csd-media-keys")
 
 
 class State:
@@ -554,8 +557,64 @@ def keyboard_layout(arg):
             "after": "%08x" % (after & 0xFFFFFFFF)}
 
 
+def tone_wav(path, hz, secs, rate=48000):
+    """A stereo 16-bit WAV of a sine at `hz`, -9 dBFS, faded in and out over
+    10 ms so it starts and ends without a click."""
+    import math
+    import struct
+    import wave
+
+    n, fade = int(rate * secs), rate // 100
+    frames = bytearray()
+    for i in range(n):
+        gain = min(1.0, i / fade, (n - i) / fade)
+        v = int(11500 * gain * math.sin(2 * math.pi * hz * i / rate))
+        frames += struct.pack("<hh", v, v)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def play_tone(arg):
+    """Plays a `secs`-long tone of `hz` on this machine's default output and
+    returns once it has played: what the app's desktop-audio capture has to
+    pick up (ADR 0147). `secs` in the answer is how long playing took, which
+    a player that found no device makes far shorter than the tone."""
+    path = os.path.join(work_dir(), "tone-%d.wav" % arg["hz"])
+    tone_wav(path, arg["hz"], arg["secs"])
+    started = time.time()
+    if WINDOWS:
+        import winsound
+
+        winsound.PlaySound(path, winsound.SND_FILENAME)
+        player = "winsound"
+    elif MACOS:
+        out = subprocess.run(["afplay", path], capture_output=True, text=True, timeout=arg["secs"] + 30)
+        if out.returncode != 0:
+            raise RuntimeError("afplay: " + (out.stderr or out.stdout).strip()[-200:])
+        player = "afplay"
+    else:
+        # The user's sound server lives in their session, which an ssh login
+        # does not have.
+        env = dict(os.environ, **linux_session_env())
+        errors = []
+        for cmd in (["pw-play", path], ["paplay", path], ["aplay", "-q", path]):
+            if not shutil.which(cmd[0]):
+                continue
+            out = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=arg["secs"] + 30)
+            if out.returncode == 0:
+                player = cmd[0]
+                break
+            errors.append("%s: %s" % (cmd[0], (out.stderr or out.stdout).strip()[-120:]))
+        else:
+            raise RuntimeError("no player played the tone: " + ("; ".join(errors) or "none installed"))
+    return {"player": player, "secs": round(time.time() - started, 2)}
+
+
 QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys, "focus_window": focus_window, "press_keys": press_keys,
-           "raise_exe": raise_exe, "keyboard_layout": keyboard_layout}
+           "raise_exe": raise_exe, "keyboard_layout": keyboard_layout, "play_tone": play_tone}
 
 
 def on_desktop(name, arg):
@@ -621,6 +680,13 @@ def op_keyboard_layout(req):
     if not WINDOWS:
         return {"switched": False, "why": "only on Windows"}
     return on_desktop("keyboard_layout", {"pids": processes_of(State.exe), "klid": req["klid"]})
+
+
+def op_play_tone(req):
+    arg = {"hz": int(req.get("hz", 880)), "secs": float(req.get("secs", 3))}
+    # On Windows from the logged-in desktop: sshd's session 0 has no sound
+    # of the user's to play into.
+    return on_desktop("play_tone", arg) if WINDOWS else play_tone(arg)
 
 
 # ── tauri-pilot ─────────────────────────────────────────────────────────────
@@ -724,7 +790,7 @@ def op_log(req):
 OPS = {"hello": op_hello, "start": op_start, "stop": op_stop, "alive": op_alive,
        "foreground": op_foreground, "hotkeys": op_hotkeys, "focus_window": op_focus_window,
        "press_keys": op_press_keys, "raise_exe": op_raise_exe, "keyboard_layout": op_keyboard_layout,
-       "pilot": op_pilot, "log": op_log}
+       "play_tone": op_play_tone, "pilot": op_pilot, "log": op_log}
 
 
 def main():

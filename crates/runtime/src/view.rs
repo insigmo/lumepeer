@@ -29,7 +29,8 @@ use std::time::{Duration, Instant};
 use lumepeer_core::NodeId;
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
-    ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
+    ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_CHANNELS, AUDIO_MAX_FRAME_BYTES,
+    AUDIO_SAMPLE_RATE_HZ,
     ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
     MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_JITTER_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MAX_MS,
     MEDIA_QUEUE_SLACK_MIN_MS, MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS,
@@ -37,6 +38,7 @@ use lumepeer_core::constants::{
     SOFTWARE_AV1_SLOW_WINDOWS, SOFTWARE_AV1_WATCH_FRAMES,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
+use lumepeer_media::audio_meter::AudioMeter;
 use lumepeer_media::abr::{
     AbrController, EncodeSpeed, FULL_SCALE_PERCENT, LinkPressure, QualityTarget, ReceiverFeedback,
     ceiling_fps, defended_fps, pinned_target,
@@ -2917,13 +2919,17 @@ pub struct MediaTarget {
     /// and only queues.
     pub bitstream: Arc<BitstreamFeed>,
     /// Where the live media connection lands once dialed (§4.1; ADR 0028):
-    /// the mic toggle reads it to open its tagged stream on the *same*
-    /// connection, never a second one.
+    /// the guest's microphone reads it to open its tagged stream on the
+    /// *same* connection, never a second one, and to follow the picture onto
+    /// the next one a pass dials (ADR 0147).
     #[allow(
         dead_code,
         reason = "read by the actor through ViewState::media_connection; the cell is shared"
     )]
     pub connection_cell: Arc<std::sync::Mutex<Option<PeerConnection>>>,
+    /// The host's sound as the window this loop feeds hears it: every audio
+    /// stream a pass accepts reports here (ADR 0147).
+    pub audio_in: Arc<AudioMeter>,
 }
 
 /// Guest side: dial media, decode, and keep the newest picture in `slot`.
@@ -3067,6 +3073,7 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
         connection,
         target.tag.clone(),
         Arc::new(lumepeer_media::playout::platform_player),
+        Arc::clone(&target.audio_in),
     );
 
     // The sandboxed worker is spawned only once there is something to decode:
@@ -3363,27 +3370,34 @@ async fn spawn_decoder(worker: Option<PathBuf>) -> Result<DecoderHandle, String>
 /// says the picture's has, because a guest takes the first stream it accepts
 /// as the picture. Capture runs behind the `audio-capture` feature; without a
 /// backend the loop refuses loudly in the log and the session stays
-/// video-only (§18).
+/// video-only (§18). What it captured and sent is counted in `meter`
+/// (ADR 0147).
 pub fn spawn_audio_loop(
     connection: PeerConnection,
     stop: Arc<AtomicBool>,
     recorder: crate::view::SharedRecorder,
     tag: String,
     video_stream: impl Future<Output = bool> + Send + 'static,
+    meter: Arc<AudioMeter>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let capturer = match lumepeer_media::capture_audio::platform_audio_capturer() {
             Ok(capturer) => capturer,
             Err(error) => {
                 tracing::warn!(peer = %tag, %error, "no audio capture backend: staying video-only");
+                meter.device_failed(&error.to_string());
                 return;
             }
         };
-        run_audio_loop(capturer, connection, stop, recorder, tag, video_stream).await;
+        run_audio_loop(capturer, connection, stop, recorder, tag, video_stream, meter).await;
     })
 }
 
 /// The body of [`spawn_audio_loop`], over whichever capturer it was handed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass per chunk — read, count, encode, write, record — in the order it must happen"
+)]
 async fn run_audio_loop(
     capturer: Box<dyn lumepeer_media::capture_audio::AudioCapturer>,
     connection: PeerConnection,
@@ -3391,6 +3405,7 @@ async fn run_audio_loop(
     recorder: crate::view::SharedRecorder,
     tag: String,
     video_stream: impl Future<Output = bool>,
+    meter: Arc<AudioMeter>,
 ) {
     let mut capturer = Some(capturer);
     let mut encoder = match lumepeer_media::audio::OpusEncoder::new() {
@@ -3413,6 +3428,7 @@ async fn run_audio_loop(
                 return;
             }
         };
+    meter.stream_opened();
     // `start` is fallible on the platform side; a refusal ends this loop
     // before any packet flows, leaving the session video-only (§18).
     let Some(started) = capturer.as_mut() else {
@@ -3420,8 +3436,10 @@ async fn run_audio_loop(
     };
     if let Err(error) = started.start() {
         tracing::warn!(peer = %tag, %error, "audio capture refused to start");
+        meter.device_failed(&error.to_string());
         return;
     }
+    meter.device_open();
     tracing::info!(peer = %tag, "audio loop started");
 
     loop {
@@ -3456,6 +3474,11 @@ async fn run_audio_loop(
         capturer = Some(device);
         match read_result {
             Ok(samples_chunk) => {
+                meter.observe(
+                    &samples_chunk.samples,
+                    usize::from(AUDIO_CHANNELS),
+                    AUDIO_SAMPLE_RATE_HZ,
+                );
                 match encoder.encode(&samples_chunk.samples, samples_chunk.timestamp_us) {
                     Ok(packet) => {
                         if packet.data.len() > AUDIO_MAX_FRAME_BYTES {
@@ -3490,6 +3513,7 @@ async fn run_audio_loop(
             }
             Err(error) => {
                 tracing::info!(peer = %tag, %error, "audio capture ended");
+                meter.device_failed(&error.to_string());
                 if let Some(mut c) = capturer.take() {
                     c.stop();
                 }
@@ -3522,11 +3546,15 @@ const SPEAKER_RETRY: Duration = Duration::from_secs(2);
 /// rest of the session silent.
 struct Speakers {
     chunks: std::sync::mpsc::SyncSender<(Vec<i16>, u64)>,
+    /// Where what reached the device, and what did not, is counted
+    /// (ADR 0147).
+    meter: Arc<AudioMeter>,
 }
 
 impl Speakers {
     /// Starts the playback thread; `None` when the OS refused a thread.
-    fn open(open_player: OpenPlayer, tag: String) -> Option<Self> {
+    fn open(open_player: OpenPlayer, tag: String, meter: Arc<AudioMeter>) -> Option<Self> {
+        let counted = Arc::clone(&meter);
         let (chunks, queue) =
             std::sync::mpsc::sync_channel::<(Vec<i16>, u64)>(SPEAKER_QUEUE_CHUNKS);
         let spawned = std::thread::Builder::new()
@@ -3539,23 +3567,35 @@ impl Speakers {
                 while let Ok((samples, timestamp_us)) = queue.recv() {
                     if player.is_none() && Instant::now() >= retry_at {
                         match open_player().and_then(|mut opened| opened.start().map(|()| opened)) {
-                            Ok(opened) => player = Some(opened),
+                            Ok(opened) => {
+                                if warned {
+                                    tracing::info!(peer = %tag, "a playback device opened: host audio plays again");
+                                    warned = false;
+                                }
+                                counted.device_open();
+                                player = Some(opened);
+                            }
                             Err(error) => {
                                 if !warned {
                                     tracing::warn!(peer = %tag, %error, "no playback device: host audio is silent");
                                     warned = true;
                                 }
+                                counted.device_failed(&error.to_string());
                                 retry_at = Instant::now() + SPEAKER_RETRY;
                             }
                         }
                     }
-                    if let Some(device) = player.as_mut()
-                        && let Err(error) = device.push(&samples, timestamp_us)
-                    {
-                        tracing::warn!(peer = %tag, %error, "host audio playback stopped; reopening");
-                        device.stop();
-                        player = None;
-                        retry_at = Instant::now() + SPEAKER_RETRY;
+                    if let Some(device) = player.as_mut() {
+                        match device.push(&samples, timestamp_us) {
+                            Ok(()) => counted.played(),
+                            Err(error) => {
+                                tracing::warn!(peer = %tag, %error, "host audio playback stopped; reopening");
+                                counted.device_failed(&error.to_string());
+                                device.stop();
+                                player = None;
+                                retry_at = Instant::now() + SPEAKER_RETRY;
+                            }
+                        }
                     }
                 }
                 if let Some(mut device) = player {
@@ -3563,9 +3603,10 @@ impl Speakers {
                 }
             });
         match spawned {
-            Ok(_thread) => Some(Self { chunks }),
+            Ok(_thread) => Some(Self { chunks, meter }),
             Err(error) => {
                 tracing::warn!(%error, "cannot start the audio playout thread");
+                meter.device_failed(&error.to_string());
                 None
             }
         }
@@ -3577,6 +3618,7 @@ impl Speakers {
             self.chunks.try_send((samples, timestamp_us))
         {
             tracing::debug!("dropping a chunk of host audio: the speakers are behind");
+            self.meter.dropped();
         }
     }
 }
@@ -3590,6 +3632,7 @@ async fn stream_audio_once(
     connection: &PeerConnection,
     tag: &str,
     open_player: &OpenPlayer,
+    meter: &Arc<AudioMeter>,
 ) -> bool {
     let mut reader = match lumepeer_net::accept_audio_media_stream(connection).await {
         Ok(Some(reader)) => reader,
@@ -3610,9 +3653,11 @@ async fn stream_audio_once(
             return false;
         }
     };
-    let Some(speakers) = Speakers::open(Arc::clone(open_player), tag.to_owned()) else {
+    let Some(speakers) = Speakers::open(Arc::clone(open_player), tag.to_owned(), Arc::clone(meter))
+    else {
         return false;
     };
+    meter.stream_opened();
     tracing::info!(peer = %tag, "host audio stream accepted");
     loop {
         let payload = match reader.read_frame().await {
@@ -3633,7 +3678,10 @@ async fn stream_audio_once(
             &chunk.data[..]
         };
         match decoder.decode(packet) {
-            Ok(samples) => speakers.play(samples, chunk.timestamp_us),
+            Ok(samples) => {
+                meter.observe(&samples, usize::from(AUDIO_CHANNELS), AUDIO_SAMPLE_RATE_HZ);
+                speakers.play(samples, chunk.timestamp_us);
+            }
             Err(error) => {
                 tracing::debug!(peer = %tag, %error, "decoder refused a packet");
             }
@@ -3666,11 +3714,12 @@ fn spawn_audio_pass(
     connection: PeerConnection,
     tag: String,
     open_player: OpenPlayer,
+    meter: Arc<AudioMeter>,
 ) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         let backoff = Duration::from_millis(MEDIA_REDIAL_BACKOFF_MS.max(1_000));
         loop {
-            let produced = stream_audio_once(&connection, &tag, &open_player).await;
+            let produced = stream_audio_once(&connection, &tag, &open_player, &meter).await;
             // A stream that carried audio and then ended may be followed by
             // another one — the host toggling audio off and on again.
             // One that never arrived means a video-only host: park, retry.
@@ -3681,110 +3730,156 @@ fn spawn_audio_pass(
     }))
 }
 
-/// Guest side: capture the microphone, Opus-encode and write it onto one
-/// tagged `M` media stream, until `stop` flips or the stream fails
-/// (§11; ADR 0028).
-///
-/// Started by the toolbar's mic button through the `mic_toggle` IPC command;
-/// rides the media connection the picture already dialed, exactly like the
-/// host→guest audio stream but in the other direction, announcing itself
-/// with [`STREAM_MIC`] so the host can tell it from the streams it opens
-/// itself. Capture runs behind the `audio-capture` feature; without a
-/// backend, or when the OS refuses microphone access, the loop refuses
-/// loudly in the log and the toolbar button reports the refusal (§18).
-#[must_use]
-pub fn spawn_mic_loop(connection: PeerConnection, tag: String) -> JoinHandle<()> {
-    use lumepeer_media::audio::OpusEncoder;
-    use lumepeer_media::capture_audio::{MicCapturer, platform_mic_capturer};
+/// How long the microphone waits after its stream ended before opening
+/// another, so a host that refused the last one is not asked again at once.
+const MIC_REOPEN_PAUSE: Duration = Duration::from_secs(1);
 
+/// Guest side: capture the microphone, Opus-encode and write it onto a tagged
+/// `M` media stream on whichever media connection the view's picture rides,
+/// until the toggle turns it off (§11; ADR 0028, ADR 0147).
+///
+/// Started by the toolbar's mic button through the `mic_toggle` IPC command,
+/// and owned by the view window rather than by one connection: when the
+/// picture's pass ends and the next one dials — a lost link, a codec change,
+/// a session coming back — the stream ends with the old connection and a new
+/// one opens on the connection `connection` names next. It used to end with
+/// its first connection while the button still said the microphone was on.
+/// The tag, [`STREAM_MIC`], is what lets the host tell it from the streams it
+/// opens itself. Without a backend, or when the OS refuses microphone access,
+/// the loop refuses loudly in the log and in `meter` (§18).
+#[must_use]
+pub fn spawn_mic_loop(
+    connection: Arc<Mutex<Option<PeerConnection>>>,
+    tag: String,
+    meter: Arc<AudioMeter>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut capturer: Option<Box<dyn MicCapturer>> = match platform_mic_capturer() {
-            Ok(capturer) => Some(capturer),
+        let capturer = match lumepeer_media::capture_audio::platform_mic_capturer() {
+            Ok(capturer) => capturer,
             Err(error) => {
                 tracing::warn!(peer = %tag, %error, "no microphone backend: mic stays off");
+                meter.device_failed(&error.to_string());
                 return;
             }
         };
-        let mut encoder = match OpusEncoder::new() {
-            Ok(encoder) => encoder,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "no Opus encoder: mic stays off");
-                return;
-            }
-        };
-        let mut writer = match lumepeer_net::open_tagged_media_stream(&connection, STREAM_MIC).await
-        {
-            Ok(writer) => writer,
-            Err(error) => {
-                tracing::warn!(peer = %tag, %error, "cannot open the mic stream");
-                return;
-            }
-        };
-        let Some(started) = capturer.as_mut() else {
-            return;
-        };
-        if let Err(error) = started.start() {
-            tracing::warn!(peer = %tag, %error, "microphone capture refused to start");
-            return;
-        }
-        tracing::info!(peer = %tag, "mic loop started");
-
-        loop {
-            // `next_chunk` blocks on the device; it must not sit on a tokio
-            // worker thread — the same take/restore dance the host audio
-            // loop uses.
-            let Some(mut borrowed) = capturer.take() else {
-                return;
-            };
-            let read = match tokio::task::spawn_blocking(move || {
-                let result = borrowed.next_chunk();
-                (borrowed, result)
-            })
-            .await
-            {
-                Ok(read) => read,
-                Err(error) => {
-                    tracing::warn!(peer = %tag, %error, "the mic read task ended unexpectedly");
-                    return;
-                }
-            };
-            let (device, read_result) = read;
-            capturer = Some(device);
-            match read_result {
-                Ok(samples_chunk) => {
-                    match encoder.encode(&samples_chunk.samples, samples_chunk.timestamp_us) {
-                        Ok(packet) => {
-                            if packet.data.len() > AUDIO_MAX_FRAME_BYTES {
-                                tracing::warn!(peer = %tag, "dropping an oversized mic frame");
-                                continue;
-                            }
-                            let payload = lumepeer_net::encode_audio_payload(&packet);
-                            if let Err(error) = writer.write_frame(&payload).await {
-                                tracing::info!(peer = %tag, %error, "mic stream ended");
-                                if let Some(mut c) = capturer.take() {
-                                    c.stop();
-                                }
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            // One bad chunk is a skip, not a teardown: audio
-                            // degrades towards noise, never towards an error
-                            // (§24.5).
-                            tracing::debug!(peer = %tag, %error, "encoder refused a mic chunk");
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::info!(peer = %tag, %error, "microphone capture ended");
-                    if let Some(mut c) = capturer.take() {
-                        c.stop();
-                    }
-                    return;
-                }
-            }
-        }
+        run_mic_loop(capturer, connection, tag, meter).await;
     })
+}
+
+/// The body of [`spawn_mic_loop`], over whichever capturer it was handed.
+async fn run_mic_loop(
+    capturer: Box<dyn lumepeer_media::capture_audio::MicCapturer>,
+    connection: Arc<Mutex<Option<PeerConnection>>>,
+    tag: String,
+    meter: Arc<AudioMeter>,
+) {
+    let mut capturer = Some(capturer);
+    let Some(started) = capturer.as_mut() else {
+        return;
+    };
+    if let Err(error) = started.start() {
+        tracing::warn!(peer = %tag, %error, "microphone capture refused to start");
+        meter.device_failed(&error.to_string());
+        return;
+    }
+    meter.device_open();
+    tracing::info!(peer = %tag, "mic loop started");
+
+    // The open stream and an encoder of its own: the host decodes every
+    // stream with a fresh decoder, and an encoder carried over from the last
+    // one would start this one in the middle of its prediction.
+    let mut writer = None;
+    let mut reopen_at = Instant::now();
+    loop {
+        // `next_chunk` blocks on the device; it must not sit on a tokio
+        // worker thread — the same take/restore dance the host audio loop
+        // uses.
+        let Some(mut borrowed) = capturer.take() else {
+            return;
+        };
+        let read = match tokio::task::spawn_blocking(move || {
+            let result = borrowed.next_chunk();
+            (borrowed, result)
+        })
+        .await
+        {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "the mic read task ended unexpectedly");
+                return;
+            }
+        };
+        let (device, read_result) = read;
+        capturer = Some(device);
+        let chunk = match read_result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                tracing::info!(peer = %tag, %error, "microphone capture ended");
+                meter.device_failed(&error.to_string());
+                if let Some(mut c) = capturer.take() {
+                    c.stop();
+                }
+                return;
+            }
+        };
+        if writer.is_none() && Instant::now() >= reopen_at {
+            // The picture's connection as of now, and only a live one: a
+            // pass that just ended leaves its closed connection in the cell
+            // until the next dial replaces it.
+            let live = connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .filter(|c| c.close_reason().is_none());
+            if let Some(live) = live {
+                let encoder = match lumepeer_media::audio::OpusEncoder::new() {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        tracing::warn!(peer = %tag, %error, "no Opus encoder: mic stays off");
+                        meter.device_failed(&error.to_string());
+                        return;
+                    }
+                };
+                match lumepeer_net::open_tagged_media_stream(&live, STREAM_MIC).await {
+                    Ok(opened) => {
+                        meter.stream_opened();
+                        tracing::info!(peer = %tag, "mic stream opened on the picture's connection");
+                        writer = Some((opened, encoder));
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %tag, %error, "cannot open the mic stream yet");
+                        reopen_at = Instant::now() + MIC_REOPEN_PAUSE;
+                    }
+                }
+            }
+        }
+        // With no stream open the chunk is read and let go: the device keeps
+        // streaming, and nothing stale piles up for the next stream.
+        let Some((open, encoder)) = writer.as_mut() else {
+            continue;
+        };
+        match encoder.encode(&chunk.samples, chunk.timestamp_us) {
+            Ok(packet) => {
+                if packet.data.len() > AUDIO_MAX_FRAME_BYTES {
+                    tracing::warn!(peer = %tag, "dropping an oversized mic frame");
+                    continue;
+                }
+                let payload = lumepeer_net::encode_audio_payload(&packet);
+                if let Err(error) = open.write_frame(&payload).await {
+                    tracing::info!(peer = %tag, %error, "mic stream ended; it follows the picture's next connection");
+                    writer = None;
+                    reopen_at = Instant::now() + MIC_REOPEN_PAUSE;
+                    continue;
+                }
+                meter.observe(&chunk.samples, usize::from(AUDIO_CHANNELS), AUDIO_SAMPLE_RATE_HZ);
+            }
+            Err(error) => {
+                // One bad chunk is a skip, not a teardown: audio degrades
+                // towards noise, never towards an error (§24.5).
+                tracing::debug!(peer = %tag, %error, "encoder refused a mic chunk");
+            }
+        }
+    }
 }
 
 /// Host side: every stream the guest opens on the media connection, by the
@@ -3804,6 +3899,7 @@ pub fn spawn_guest_streams(
     connection: PeerConnection,
     tag: String,
     acks: Arc<FrameAcks>,
+    mic: Arc<AudioMeter>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -3816,7 +3912,12 @@ pub fn spawn_guest_streams(
             };
             // On a task of its own: a stream that is slow to say what it is
             // must not keep the next one from being accepted.
-            tokio::spawn(serve_guest_stream(reader, tag.clone(), Arc::clone(&acks)));
+            tokio::spawn(serve_guest_stream(
+                reader,
+                tag.clone(),
+                Arc::clone(&acks),
+                Arc::clone(&mic),
+            ));
         }
     })
 }
@@ -3826,9 +3927,10 @@ async fn serve_guest_stream(
     mut reader: lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
     tag: String,
     acks: Arc<FrameAcks>,
+    mic: Arc<AudioMeter>,
 ) {
     match reader.read_frame().await {
-        Ok(kind) if kind == [STREAM_MIC] => play_guest_mic(reader, tag).await,
+        Ok(kind) if kind == [STREAM_MIC] => play_guest_mic(reader, tag, &mic).await,
         Ok(kind) if kind == [STREAM_ACKS] => read_frame_acks(reader, &acks, &tag).await,
         Ok(_) => tracing::debug!(peer = %tag, "skipping an unannounced media stream"),
         Err(error) => {
@@ -3868,7 +3970,9 @@ async fn read_frame_acks(
 async fn play_guest_mic(
     mut reader: lumepeer_net::MediaFrameReader<iroh::endpoint::RecvStream>,
     tag: String,
+    meter: &AudioMeter,
 ) {
+    meter.stream_opened();
     // The Opus decoder runs in this process by the same decision as the
     // host→guest audio direction: libopus never panics on hostile input
     // and reports concealment instead.
@@ -3885,13 +3989,16 @@ async fn play_guest_mic(
         Ok(player) => player,
         Err(error) => {
             tracing::warn!(peer = %tag, %error, "no playback backend: guest mic stays off");
+            meter.device_failed(&error.to_string());
             return;
         }
     };
     if let Err(error) = player.start() {
         tracing::warn!(peer = %tag, %error, "no playback device: guest mic stays off");
+        meter.device_failed(&error.to_string());
         return;
     }
+    meter.device_open();
     loop {
         let payload = match reader.read_frame().await {
             Ok(payload) => payload,
@@ -3912,10 +4019,13 @@ async fn play_guest_mic(
         };
         match decoder.decode(packet) {
             Ok(samples) => {
+                meter.observe(&samples, usize::from(AUDIO_CHANNELS), AUDIO_SAMPLE_RATE_HZ);
                 if let Err(error) = player.push(&samples, chunk.timestamp_us) {
                     tracing::warn!(peer = %tag, %error, "mic playback stopped");
+                    meter.device_failed(&error.to_string());
                     return;
                 }
+                meter.played();
             }
             Err(error) => {
                 tracing::debug!(peer = %tag, %error, "decoder refused a mic packet");
@@ -4103,6 +4213,7 @@ mod tests {
                 worker: None,
                 bitstream: Arc::new(BitstreamFeed::default()),
                 connection_cell: Arc::new(std::sync::Mutex::new(None)),
+                audio_in: Arc::default(),
             },
             Arc::new(slot_tx),
         );
@@ -4194,6 +4305,7 @@ mod tests {
         let (_host, host_side) = accepting.await.unwrap();
 
         let (video_open, mut video_seen) = watch::channel(false);
+        let sent = Arc::new(AudioMeter::default());
         let audio = tokio::spawn(run_audio_loop(
             Box::new(ToneCapturer { sample: 0 }),
             host_side.clone(),
@@ -4201,6 +4313,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             "test-peer".to_owned(),
             async move { video_seen.wait_for(|open| *open).await.is_ok() },
+            Arc::clone(&sent),
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(500), accept_media_stream(&guest_side))
@@ -4216,12 +4329,14 @@ mod tests {
         assert_eq!(first.read_frame().await.unwrap(), vec![0, 42]);
 
         let (heard, played) = std::sync::mpsc::channel();
+        let received = Arc::new(AudioMeter::default());
         let _pass = spawn_audio_pass(
             guest_side,
             "test-peer".to_owned(),
             Arc::new(
                 move || Ok(Box::new(RecordingSpeakers(heard.clone())) as Box<dyn AudioPlayer>),
             ),
+            Arc::clone(&received),
         );
         let loudest = tokio::task::spawn_blocking(move || {
             let mut loudest = 0;
@@ -4248,7 +4363,143 @@ mod tests {
             loudest > 4_000,
             "the speakers heard only silence (peak {loudest})"
         );
+        // ADR 0147: both ends counted what went through them, and the guest
+        // can name the tone it heard — what the e2e matrix reads.
+        let heard = received.snapshot();
+        assert_eq!(heard.streams, 1);
+        assert!(heard.loud > 0 && heard.played > 0, "{heard:?}");
+        assert_eq!(heard.device, lumepeer_media::audio_meter::DeviceState::Open);
+        let hz = heard.loud_hz.unwrap();
+        assert!((418..=462).contains(&hz), "a 440 Hz tone was heard as {hz} Hz");
+        let captured = sent.snapshot();
+        assert_eq!(captured.streams, 1);
+        assert!(captured.loud > 0, "{captured:?}");
         audio.abort();
+    }
+
+    /// A microphone "hearing" a 660 Hz tone, at roughly the pace a device
+    /// would.
+    #[derive(Debug)]
+    struct ToneMic {
+        sample: u32,
+    }
+
+    impl lumepeer_media::capture_audio::MicCapturer for ToneMic {
+        fn start(&mut self) -> lumepeer_media::error::Result<()> {
+            Ok(())
+        }
+
+        fn next_chunk(
+            &mut self,
+        ) -> lumepeer_media::error::Result<lumepeer_media::capture_audio::PcmChunk> {
+            std::thread::sleep(Duration::from_millis(5));
+            let mut samples = Vec::new();
+            for _ in 0..lumepeer_media::capture_audio::SAMPLES_PER_CHUNK {
+                let t = f64::from(self.sample) / 48_000.0;
+                #[allow(clippy::cast_possible_truncation, reason = "bounded to ±8000")]
+                let value = ((t * 660.0 * std::f64::consts::TAU).sin() * 8_000.0) as i16;
+                samples.extend([value, value]);
+                self.sample += 1;
+            }
+            Ok(lumepeer_media::capture_audio::PcmChunk {
+                samples,
+                timestamp_us: 0,
+            })
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    /// ADR 0147: the guest's microphone belongs to its window, not to the
+    /// media connection it first rode. When the picture's pass ends and the
+    /// next one dials — a lost link, a codec change, a session coming back —
+    /// the microphone opens its stream again on the new connection. It used
+    /// to end with the first one while the button still said "on".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_guest_microphone_follows_the_picture_onto_its_next_connection() {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let addr = host.addr();
+        let (accepted_tx, mut accepted) = mpsc::channel(2);
+        let accepting = tokio::spawn(async move {
+            while let Some(Ok(connection)) = host.accept().await {
+                if accepted_tx.send(connection).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let cell = Arc::new(Mutex::new(None));
+        let sent = Arc::new(AudioMeter::default());
+        let mic = tokio::spawn(run_mic_loop(
+            Box::new(ToneMic { sample: 0 }),
+            Arc::clone(&cell),
+            "test-peer".to_owned(),
+            Arc::clone(&sent),
+        ));
+
+        // The picture's first pass.
+        let first = guest
+            .connect(addr.clone(), lumepeer_net::ALPN_MEDIA)
+            .await
+            .unwrap();
+        *cell.lock().unwrap() = Some(first.clone());
+        let host_first = accepted.recv().await.unwrap();
+        let mut stream = lumepeer_net::accept_tagged_media_stream(&host_first, STREAM_MIC)
+            .await
+            .unwrap()
+            .unwrap();
+        stream.read_frame().await.unwrap();
+
+        // It ends, the way a lost link or a redial leaves it, and the next
+        // pass dials a connection of its own.
+        first.close(
+            lumepeer_net::connection::CLOSE_MALFORMED.into(),
+            b"the pass ended",
+        );
+        let second = guest.connect(addr, lumepeer_net::ALPN_MEDIA).await.unwrap();
+        *cell.lock().unwrap() = Some(second.clone());
+        let host_second = accepted.recv().await.unwrap();
+        let Ok(followed) = tokio::time::timeout(
+            Duration::from_secs(5),
+            lumepeer_net::accept_tagged_media_stream(&host_second, STREAM_MIC),
+        )
+        .await
+        else {
+            panic!("the microphone never followed the picture onto its next connection");
+        };
+        let mut again = followed.unwrap().unwrap();
+
+        // And what it carries there is still the microphone. Measured past
+        // the first loud chunks: a fresh Opus stream fades in over its
+        // first frame, and that onset is not the tone.
+        let mut decoder = lumepeer_media::audio::OpusDecoder::new().unwrap();
+        let mut tone = None;
+        let mut loud = 0;
+        for _ in 0..50 {
+            let payload = again.read_frame().await.unwrap();
+            let chunk = lumepeer_net::decode_audio_payload(&payload).unwrap();
+            let samples = decoder.decode(&chunk.data).unwrap();
+            if samples.iter().any(|s| s.unsigned_abs() > 4_000) {
+                loud += 1;
+                if loud == 3 {
+                    tone = lumepeer_media::audio_meter::tone_hz(&samples, 2, 48_000);
+                    break;
+                }
+            }
+        }
+        let Some(hz) = tone else {
+            panic!("the second stream carried only silence");
+        };
+        assert!((627..=693).contains(&hz), "a 660 Hz tone arrived as {hz} Hz");
+        assert_eq!(sent.snapshot().streams, 2, "one stream per connection");
+
+        mic.abort();
+        accepting.abort();
     }
 
     #[test]
@@ -5227,8 +5478,12 @@ mod tests {
         )));
         lock_capture(&capture).add_viewer(peer).unwrap();
         let control = EncodeControl::new(peer, None);
-        let streams =
-            spawn_guest_streams(host_side.clone(), "test-peer".to_owned(), control.acks());
+        let streams = spawn_guest_streams(
+            host_side.clone(),
+            "test-peer".to_owned(),
+            control.acks(),
+            Arc::default(),
+        );
         let (faults, _faults_rx) = mpsc::channel(4);
         let encode = spawn_encode_loop_with(
             host_side,

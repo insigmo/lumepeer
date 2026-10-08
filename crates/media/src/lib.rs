@@ -27,6 +27,7 @@
 
 pub mod abr;
 pub mod audio;
+pub mod audio_meter;
 pub mod capture;
 pub mod capture_audio;
 pub mod decode;
