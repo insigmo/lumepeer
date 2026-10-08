@@ -45,6 +45,16 @@ use lumepeer_core::constants::{AUDIO_CHANNELS, AUDIO_FRAME_MS, AUDIO_SAMPLE_RATE
 /// Samples per channel of one capture chunk: the Opus frame the encoder eats.
 pub const SAMPLES_PER_CHUNK: usize = AUDIO_SAMPLE_RATE_HZ as usize * AUDIO_FRAME_MS as usize / 1000;
 
+/// Frames of input at `input_rate` that make one `AUDIO_FRAME_MS` chunk: 882
+/// at 44.1 kHz, 1920 at 96 kHz. What a backend must take per chunk for
+/// [`to_wire_pcm`] to see exactly one chunk's worth of time (ADR 0147).
+#[must_use]
+pub fn frames_per_chunk(input_rate: u32) -> usize {
+    let frames =
+        SAMPLES_PER_CHUNK as u64 * u64::from(input_rate) / u64::from(AUDIO_SAMPLE_RATE_HZ);
+    usize::try_from(frames.max(1)).unwrap_or(SAMPLES_PER_CHUNK)
+}
+
 /// Interleaved s16 PCM of exactly one `AUDIO_FRAME_MS` chunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcmChunk {
@@ -175,7 +185,7 @@ mod linux_pipewire;
     not(target_os = "android"),
     feature = "audio-capture-pipewire"
 ))]
-pub use linux_pipewire::PipewireMonitorCapturer;
+pub use linux_pipewire::{PipewireMicCapturer, PipewireMonitorCapturer};
 
 /// Opens the desktop-audio backend of the current platform.
 ///
@@ -225,12 +235,41 @@ pub fn platform_mic_capturer() -> Result<Box<dyn MicCapturer>> {
     {
         Ok(Box::new(windows_mic::WasapiMicCapturer::new()))
     }
-    #[cfg(not(all(target_os = "windows", feature = "audio-capture")))]
+    #[cfg(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "audio-capture-pipewire"
+    ))]
+    {
+        Ok(Box::new(linux_pipewire::PipewireMicCapturer::new()))
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "audio-capture"),
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "audio-capture-pipewire"
+        ),
+    )))]
     {
         Err(crate::error::MediaError::CaptureUnavailable(
             "no microphone backend is compiled in for this target".to_owned(),
         ))
     }
+}
+
+/// Whether [`platform_mic_capturer`] has a backend on this build: asked before
+/// the mic button may say it is on (ADR 0147). macOS has none yet.
+#[must_use]
+pub const fn mic_supported() -> bool {
+    cfg!(any(
+        all(target_os = "windows", feature = "audio-capture"),
+        all(
+            target_os = "linux",
+            not(target_os = "android"),
+            feature = "audio-capture-pipewire"
+        ),
+    ))
 }
 
 /// Converts interleaved f32 samples in `-1.0..=1.0` at `input_rate` into the
@@ -325,6 +364,29 @@ mod tests {
         let out = to_wire_pcm(&input, 44_100, 1);
         assert_eq!(out.len(), SAMPLES_PER_CHUNK * 2);
         assert!(out.iter().all(|s| *s > 0));
+    }
+
+    /// A device mixing at 44.1 or 96 kHz must hand over 20 ms of its own
+    /// frames per chunk, not 960 of them: 960 frames is 21.8 ms at 44.1 kHz
+    /// (the rest of the chunk thrown away) and 10 ms at 96 kHz (half the
+    /// chunk a repeated last sample) (ADR 0147).
+    #[test]
+    fn a_chunk_is_twenty_milliseconds_of_the_devices_own_rate() {
+        assert_eq!(frames_per_chunk(AUDIO_SAMPLE_RATE_HZ), SAMPLES_PER_CHUNK);
+        assert_eq!(frames_per_chunk(44_100), 882);
+        assert_eq!(frames_per_chunk(96_000), 1_920);
+        assert_eq!(frames_per_chunk(192_000), 3_840);
+        assert_eq!(frames_per_chunk(0), 1, "never zero: the chunker divides by it");
+
+        // A 96 kHz ramp of one chunk's duration converts into a ramp that
+        // ends where the input did, not into a ramp and a flat half.
+        let frames = frames_per_chunk(96_000);
+        let input: Vec<f32> = (0..frames).map(|i| i as f32 / frames as f32).collect();
+        let out = to_wire_pcm(&input, 96_000, 1);
+        let last = f32::from(out[out.len() - 2]) / f32::from(i16::MAX);
+        let middle = f32::from(out[SAMPLES_PER_CHUNK]) / f32::from(i16::MAX);
+        assert!(last > 0.99, "the chunk ends at the input's end, got {last}");
+        assert!((middle - 0.5).abs() < 0.01, "and passes its middle halfway, got {middle}");
     }
 
     #[test]

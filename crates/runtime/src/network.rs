@@ -65,6 +65,7 @@ use lumepeer_media::capture::{
     CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
+use lumepeer_media::audio_meter::{AudioMeter, AudioMeterSnapshot};
 use lumepeer_media::encode::software_av1::{self, Readiness as SoftwareAv1Readiness};
 use lumepeer_media::encode::{
     EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, openh264_built, probe_hardware,
@@ -700,6 +701,13 @@ pub struct ConnectionStats {
     /// codec of a stream that carries nothing would describe a picture
     /// nobody is seeing.
     pub codec: Option<MediaCodec>,
+    /// Sound this side receives and plays: on a guest the host's desktop,
+    /// on a host the guest's microphone (ADR 0147). `None` where this
+    /// connection carries no media session.
+    pub audio_in: Option<AudioMeterSnapshot>,
+    /// Sound this side captures and sends: on a host its desktop, on a
+    /// guest its microphone (ADR 0147).
+    pub audio_out: Option<AudioMeterSnapshot>,
 }
 
 /// What a peer said its machine is (ADR 0121), cleaned by
@@ -1145,6 +1153,11 @@ pub enum ActorError {
     /// difference between a person understanding their machine and hunting for
     /// a fault that is not there.
     NotTheHost,
+    /// This build has no microphone capture on this platform (ADR 0147).
+    ///
+    /// Not [`Self::Unsupported`]: nothing about the peer is too old, it is
+    /// this device that cannot send its own microphone.
+    NoMicrophone,
 }
 
 /// Whether a host that went away may be returned to without **anybody** being
@@ -4511,22 +4524,33 @@ impl AudioSession {
     }
 }
 
-/// Host side: one guest-microphone playout loop, with its own stop flag
-/// (§11; ADR 0028).
+/// Guest side: the view window's own microphone, streaming to its host
+/// while the user has it on (§11; ADR 0028, ADR 0147).
 ///
-/// The guest opens the tagged `M` media stream when its user turns the mic
-/// on; this side accepts it, decodes Opus and pushes PCM into the speakers.
-/// Opt-out is the stream ending (the guest turned the mic off), which the
-/// accept loop notices by itself; the entry here only bounds the task.
+/// Held by the view it belongs to rather than by one media connection, so
+/// it lasts exactly as long as that window does: across a media redial and a
+/// parked session alike it waits for the picture's next connection and
+/// carries on, and dropping it — the toggle turned off, the window closed —
+/// ends it.
 struct MicSession {
     task: tokio::task::JoinHandle<()>,
 }
 
-impl MicSession {
-    /// Ends the playout loop.
-    fn stop(self) {
+impl Drop for MicSession {
+    fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// Host side: what one guest's session sound carried, both ways
+/// (ADR 0147). Kept across media redials, so the counters describe the
+/// session rather than its latest connection.
+#[derive(Debug, Default)]
+struct HostAudioMeters {
+    /// This desktop's sound, as captured and sent.
+    out: Arc<AudioMeter>,
+    /// The guest's microphone, as received and played.
+    mic: Arc<AudioMeter>,
 }
 
 /// Guest side: one open remote-view window and the pipeline feeding it.
@@ -4610,9 +4634,16 @@ struct ViewState {
     /// rather than as a screen one.
     surface: ViewSurface,
     /// The media connection the picture rides. Written by the media task
-    /// once dialed, read by the mic toggle; `None` until the first dial
-    /// lands and after the media task ends.
+    /// once dialed, read by the microphone's loop; `None` until the first
+    /// dial lands and while the session is parked.
     media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>>,
+    /// The host's sound as this window hears it, across every media pass
+    /// (ADR 0147).
+    audio_in: Arc<AudioMeter>,
+    /// This window's microphone while the user has it on (ADR 0147).
+    mic: Option<MicSession>,
+    /// What the microphone sent, across every time it was on.
+    mic_meter: Arc<AudioMeter>,
     /// What this window last asked of its picture — the preset's scale and
     /// frame rate, the box it draws into, the encoder it picked — said again
     /// when a session comes back into it (ADR 0144). The window says each of
@@ -4630,24 +4661,6 @@ struct PictureAsks {
     size: Option<(u32, u32)>,
     /// The encoder the window picked.
     encoder: Option<EncoderChoice>,
-}
-
-impl ViewState {
-    /// The media connection the picture rides, for a second tagged stream
-    /// (the guest's own microphone; §11; ADR 0028).
-    ///
-    /// The mic stream must ride the *same* `rd/media/1` connection as the
-    /// picture: a second connection is indistinguishable on the host from a
-    /// redial, and the host's accept path would replace the encode loop
-    /// (§4.1). `None` means the media task has not landed a dial yet — the
-    /// toolbar's mic press is refused and can be pressed again once a
-    /// picture is showing.
-    fn media_connection(&self) -> Option<PeerConnection> {
-        self.media_connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
 }
 
 /// What a spawned per-connection task reports back to the main loop.
@@ -5666,10 +5679,9 @@ struct Actor {
     /// Opt-in per §11's `AudioStart`; dies with the session like everything
     /// else per-peer.
     audio: std::collections::HashMap<NodeId, AudioSession>,
-    /// Host side: one guest-mic playout loop per peer the guest enabled their
-    /// microphone for (§11; ADR 0028). The guest opens the tagged `M` media
-    /// stream; this side accepts it and plays it on the speakers.
-    guest_mic: std::collections::HashMap<NodeId, MicSession>,
+    /// Host side: what each guest's session sound carried, both ways
+    /// (ADR 0147).
+    audio_meters: std::collections::HashMap<NodeId, HostAudioMeters>,
     /// Whether this peer's `Hello` advertised `FEATURE_REMOTE_SAS`, so a
     /// `SasAck` may be sent back to it (§9.1: never send what an older minor
     /// would decode as malformed).
@@ -9375,6 +9387,16 @@ impl Actor {
                             )
                         }),
                     ),
+                    audio_in: self
+                        .views
+                        .get(peer)
+                        .map(|view| view.audio_in.snapshot())
+                        .or_else(|| self.audio_meters.get(peer).map(|m| m.mic.snapshot())),
+                    audio_out: self
+                        .views
+                        .get(peer)
+                        .map(|view| view.mic_meter.snapshot())
+                        .or_else(|| self.audio_meters.get(peer).map(|m| m.out.snapshot())),
                 }
             })
             .collect()
@@ -9944,7 +9966,8 @@ impl Actor {
         // stream (ADR 0028), its acknowledgements of the picture (ADR 0139) —
         // is accepted by one pass that parks until it does; it is bounded by
         // the media session's own lifetime.
-        crate::view::spawn_guest_streams(connection, tag, acks);
+        let mic = Arc::clone(&self.audio_meters.entry(peer).or_default().mic);
+        crate::view::spawn_guest_streams(connection, tag, acks, mic);
     }
 
     /// Host side: tells `peer`'s guest, before the first frame, the codec its
@@ -10197,9 +10220,7 @@ impl Actor {
         if let Some(session) = self.audio.remove(&peer) {
             session.stop();
         }
-        if let Some(session) = self.guest_mic.remove(&peer) {
-            session.stop();
-        }
+        self.audio_meters.remove(&peer);
         if let Some(recorder) = self.recorders.remove(&peer) {
             recorder.write_event(0, r#"{"event":"record-stop","reason":"session-end"}"#);
             let clean = recorder.stop();
@@ -10227,6 +10248,10 @@ impl Actor {
 
     /// Guest side: opens the view window for a host that just granted, or
     /// refreshes the grants of one already open.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one window's whole setup — its feed, its media task, its state — in the order the window needs them"
+    )]
     fn start_view(&mut self, peer: NodeId, role: Role) {
         let grants = Grants::from_role(role);
         let tag = self.label_of(&peer);
@@ -10268,6 +10293,7 @@ impl Actor {
         // mic toggle can open its tagged stream on the *same* `rd/media/1`
         // the picture uses (§4.1; ADR 0028).
         let media_connection = Arc::new(std::sync::Mutex::new(None::<PeerConnection>));
+        let audio_in = Arc::new(AudioMeter::default());
         let bitstream = Arc::new(BitstreamFeed::default());
         // A terminal session dials nothing here, and that is the whole
         // mechanism: the host starts its encode loop when it accepts
@@ -10286,6 +10312,7 @@ impl Actor {
                     worker: None,
                     bitstream: Arc::clone(&bitstream),
                     connection_cell: Arc::clone(&media_connection),
+                    audio_in: Arc::clone(&audio_in),
                 },
                 Arc::clone(&slot_tx),
             )),
@@ -10349,6 +10376,9 @@ impl Actor {
                 slot_tx,
                 task,
                 media_connection,
+                audio_in,
+                mic: None,
+                mic_meter: Arc::default(),
                 surface,
                 asked: PictureAsks::default(),
             },
@@ -10385,6 +10415,11 @@ impl Actor {
         // before the next frame is served — the window stops accepting
         // input on the very next poll (§8.1).
         state.input.store(grants.input, Ordering::Relaxed);
+        // The microphone feeds the host the way input does (§8.1): a role
+        // without input ends it.
+        if !grants.input && state.mic.take().is_some() {
+            tracing::info!(peer = %self.label_of(&peer), "guest microphone off: the role has no input");
+        }
         tracing::info!(peer = %self.label_of(&peer), input = grants.input, "view grants updated");
         // What this node offers the host follows the role (ADR 0123).
         self.refresh_clipboard_watch();
@@ -10537,6 +10572,12 @@ impl Actor {
         state.role = role;
         state.grants = grants;
         state.input.store(grants.input, Ordering::Relaxed);
+        // A microphone that was on stays on into the session that came back,
+        // and opens its stream on the new media connection by itself
+        // (ADR 0147) — unless what came back may not send input.
+        if !grants.input && state.mic.take().is_some() {
+            tracing::info!(peer = %tag, "guest microphone off: the session came back without input");
+        }
         state.task = match (dialer, bitstream) {
             (Some(dialer), Some(bitstream)) if state.surface.has_picture() => {
                 Some(spawn_media_receiver(
@@ -10548,6 +10589,7 @@ impl Actor {
                         worker: None,
                         bitstream,
                         connection_cell: Arc::clone(&state.media_connection),
+                        audio_in: Arc::clone(&state.audio_in),
                     },
                     Arc::clone(&state.slot_tx),
                 ))
@@ -13036,6 +13078,7 @@ impl Actor {
             Arc::clone(&recorder),
             self.label_of(&peer),
             video_stream,
+            Arc::clone(&self.audio_meters.entry(peer).or_default().out),
         );
         self.audio.insert(
             peer,
@@ -13053,44 +13096,59 @@ impl Actor {
     ///
     /// The mic is an *input* surface — it carries the guest user's voice, not
     /// the host's screen — so it is gated on the same live `input` grant the
-    /// keyboard and pointer use, re-checked here at toggle time and by the
-    /// host per request. The stream rides the media connection the picture
-    /// already dialed; without one there is nothing to ride, which is the
-    /// same refusal `audio_toggle` gives.
+    /// keyboard and pointer use, re-checked here at toggle time and when the
+    /// grants change. The stream rides the media connection the picture
+    /// dials, whichever one that is at the moment (ADR 0147): a window with a
+    /// picture accepts the press before its first dial lands, and a terminal
+    /// window, which never dials one, refuses it. A platform with no
+    /// microphone backend refuses it too, so the button never says "on" over
+    /// nothing.
     fn on_mic_toggle(&mut self, label: &str, on: bool) -> Result<(), ActorError> {
         let peer = self.resolve(label)?;
+        let tag = self.label_of(&peer);
+        if !on {
+            // Off always works, a parked window's included: the microphone
+            // waits there for the session to come back, and the person who
+            // pressed off while it was away must not find it on again.
+            let mic = match self.views.get_mut(&peer) {
+                Some(view) => view.mic.take(),
+                None => self
+                    .parked_views
+                    .get_mut(&peer)
+                    .and_then(|parked| parked.state.mic.take()),
+            };
+            if mic.is_some() {
+                tracing::info!(peer = %label, "guest microphone streaming disabled");
+            }
+            return Ok(());
+        }
+        let view = self.views.get_mut(&peer).ok_or(ActorError::UnknownPeer)?;
         // The guest's own microphone is a surface that feeds the host, so it
         // is gated exactly like [`Self::on_input`] (§8.1): a view-only grant
         // may watch but not speak.
-        let permitted = self
-            .views
-            .get(&peer)
-            .ok_or(ActorError::UnknownPeer)?
-            .grants
-            .input;
-        if !permitted {
+        if !view.grants.input {
             return Err(ActorError::Core(CoreError::NotPermitted));
         }
-        if on {
-            if self.guest_mic.contains_key(&peer) {
-                return Ok(()); // already streaming; idempotent
-            }
-            let view = self.views.get(&peer).ok_or(ActorError::UnknownPeer)?;
-            // The mic stream rides the media connection the picture already
-            // dialed (§4.1); without one there is nothing to ride yet, and
-            // the toolbar's press is refused — a picture showing means the
-            // cell is populated.
-            let Some(connection) = view.media_connection() else {
-                tracing::debug!(peer = %label, "no media connection yet: mic press refused");
-                return Err(ActorError::UnknownPeer);
-            };
-            let task = crate::view::spawn_mic_loop(connection, self.label_of(&peer));
-            self.guest_mic.insert(peer, MicSession { task });
-            tracing::info!(peer = %label, "guest microphone streaming enabled");
-        } else if let Some(session) = self.guest_mic.remove(&peer) {
-            session.stop();
-            tracing::info!(peer = %label, "guest microphone streaming disabled");
+        if view.mic.is_some() {
+            return Ok(()); // already streaming; idempotent
         }
+        // No media connection will ever exist under a terminal or
+        // file-manager window (ADR 0101).
+        if !view.surface.has_picture() {
+            tracing::debug!(peer = %label, "no media connection to ride: mic press refused");
+            return Err(ActorError::UnknownPeer);
+        }
+        if !lumepeer_media::capture_audio::mic_supported() {
+            tracing::info!(peer = %label, "no microphone backend on this platform: mic press refused");
+            return Err(ActorError::NoMicrophone);
+        }
+        let task = crate::view::spawn_mic_loop(
+            Arc::clone(&view.media_connection),
+            tag,
+            Arc::clone(&view.mic_meter),
+        );
+        view.mic = Some(MicSession { task });
+        tracing::info!(peer = %label, "guest microphone streaming enabled");
         Ok(())
     }
 
@@ -19349,7 +19407,7 @@ pub fn spawn_actor_with(
         capture,
         media: std::collections::HashMap::new(),
         audio: std::collections::HashMap::new(),
-        guest_mic: std::collections::HashMap::new(),
+        audio_meters: std::collections::HashMap::new(),
         speaks_remote_sas: std::collections::HashSet::new(),
         recorders: HashMap::new(),
         record_requests: std::collections::HashSet::new(),

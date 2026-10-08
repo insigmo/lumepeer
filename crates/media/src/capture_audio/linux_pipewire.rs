@@ -5,6 +5,11 @@
 //! speakers. PulseAudio-only hosts reach it through `pipewire-pulse`, which
 //! exposes the same graph, so one backend covers both desktops.
 //!
+//! The guest's microphone is the same stream pointed the other way: without
+//! `stream.capture.sink` the session manager links a capture stream to the
+//! default *source* (ADR 0147). Before, a Linux guest had no microphone at
+//! all, and its mic button turned on over nothing.
+//!
 //! The blocking pull model matches [`crate::capture::linux_x11`]: the stream
 //! runs on its own thread and pushes wire-shaped chunks into a bounded
 //! channel; `next_chunk` drains that channel.
@@ -21,7 +26,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
 
 use crate::capture_audio::{
-    AudioCapturer, PcmChunk, READ_TIMEOUT, SAMPLES_PER_CHUNK, capture_timestamp_us, to_wire_pcm,
+    AudioCapturer, MicCapturer, PcmChunk, READ_TIMEOUT, SAMPLES_PER_CHUNK, capture_timestamp_us,
+    to_wire_pcm,
 };
 use crate::error::{MediaError, Result};
 use lumepeer_core::constants::AUDIO_CHANNELS;
@@ -56,8 +62,18 @@ struct StreamUserData {
     pending: Vec<f32>,
 }
 
-/// PipeWire monitor capturer of the default output sink.
-pub struct PipewireMonitorCapturer {
+/// Which end of the graph a capture stream is linked to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The default sink's monitor: what the speakers play.
+    Monitor,
+    /// The default source: the microphone.
+    Microphone,
+}
+
+/// One PipeWire capture stream on its own thread, feeding a bounded channel.
+struct PipewireCapture {
+    target: Target,
     rx: Option<Receiver<PcmChunk>>,
     handle: Option<JoinHandle<()>>,
     shutdown: Option<pipewire::channel::Sender<Shutdown>>,
@@ -65,22 +81,67 @@ pub struct PipewireMonitorCapturer {
 
 // `pipewire::channel::Sender` does not implement `Debug`, so this is written
 // by hand rather than derived, matching `PipeWireFrameThread`.
-impl std::fmt::Debug for PipewireMonitorCapturer {
+impl std::fmt::Debug for PipewireCapture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PipewireMonitorCapturer")
+        f.debug_struct("PipewireCapture")
+            .field("target", &self.target)
             .field("active", &self.rx.is_some())
             .finish_non_exhaustive()
     }
 }
 
-impl PipewireMonitorCapturer {
-    /// Builds an idle capturer; nothing opens until [`AudioCapturer::start`].
-    #[must_use]
-    pub const fn new() -> Self {
+impl PipewireCapture {
+    const fn new(target: Target) -> Self {
         Self {
+            target,
             rx: None,
             handle: None,
             shutdown: None,
+        }
+    }
+
+    fn start(&mut self) -> Result<()> {
+        if self.rx.is_some() {
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PcmChunk>(CHANNEL_DEPTH);
+        let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<Shutdown>();
+        let target = self.target;
+
+        let handle = std::thread::Builder::new()
+            .name("lumepeer-pipewire-audio".to_owned())
+            .spawn(move || {
+                if let Err(err) = Self::run(&tx, shutdown_rx, target) {
+                    tracing::warn!("pipewire audio capture thread exited: {err}");
+                }
+            })
+            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+
+        self.rx = Some(rx);
+        self.handle = Some(handle);
+        self.shutdown = Some(shutdown_tx);
+        Ok(())
+    }
+
+    fn recv(&self) -> Result<std::result::Result<PcmChunk, RecvTimeoutError>> {
+        let rx = self
+            .rx
+            .as_ref()
+            .ok_or_else(|| MediaError::CaptureInterrupted("capture not started".to_owned()))?;
+        Ok(rx.recv_timeout(READ_TIMEOUT))
+    }
+
+    fn stop(&mut self) {
+        // Order matters: the loop is told to quit first, then the receiver is
+        // dropped, then the thread is joined. Dropping the receiver alone
+        // would only unblock a *sending* thread, and this one spends its life
+        // inside `MainLoop::run`.
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(Shutdown);
+        }
+        self.rx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 
@@ -89,6 +150,7 @@ impl PipewireMonitorCapturer {
     fn run(
         tx: &SyncSender<PcmChunk>,
         shutdown_rx: pipewire::channel::Receiver<Shutdown>,
+        target: Target,
     ) -> Result<()> {
         use pipewire::spa::param::audio::AudioInfoRaw;
         use pipewire::spa::pod::Pod;
@@ -116,14 +178,28 @@ impl PipewireMonitorCapturer {
         // capture stream wants a *sink's monitor*, not a microphone. Without
         // it the session manager connects a Capture stream to the default
         // source and the guest hears the host's microphone where the desktop
-        // audio should be.
-        let props = pipewire::properties::properties! {
-            *pipewire::keys::MEDIA_TYPE => "Audio",
-            *pipewire::keys::MEDIA_CATEGORY => "Capture",
-            *pipewire::keys::MEDIA_ROLE => "Music",
-            *pipewire::keys::STREAM_CAPTURE_SINK => "true",
+        // audio should be — which is exactly what the guest's own
+        // microphone wants (ADR 0147).
+        let (props, name) = match target {
+            Target::Monitor => (
+                pipewire::properties::properties! {
+                    *pipewire::keys::MEDIA_TYPE => "Audio",
+                    *pipewire::keys::MEDIA_CATEGORY => "Capture",
+                    *pipewire::keys::MEDIA_ROLE => "Music",
+                    *pipewire::keys::STREAM_CAPTURE_SINK => "true",
+                },
+                "lumepeer-desktop-audio",
+            ),
+            Target::Microphone => (
+                pipewire::properties::properties! {
+                    *pipewire::keys::MEDIA_TYPE => "Audio",
+                    *pipewire::keys::MEDIA_CATEGORY => "Capture",
+                    *pipewire::keys::MEDIA_ROLE => "Communication",
+                },
+                "lumepeer-microphone",
+            ),
         };
-        let stream = pipewire::stream::Stream::new(&core, "lumepeer-desktop-audio", props)
+        let stream = pipewire::stream::Stream::new(&core, name, props)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         let data = StreamUserData {
@@ -274,6 +350,24 @@ fn emit_chunks(user_data: &mut StreamUserData) {
     }
 }
 
+impl Drop for PipewireCapture {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// PipeWire monitor capturer of the default output sink.
+#[derive(Debug)]
+pub struct PipewireMonitorCapturer(PipewireCapture);
+
+impl PipewireMonitorCapturer {
+    /// Builds an idle capturer; nothing opens until [`AudioCapturer::start`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(PipewireCapture::new(Target::Monitor))
+    }
+}
+
 impl Default for PipewireMonitorCapturer {
     fn default() -> Self {
         Self::new()
@@ -282,33 +376,11 @@ impl Default for PipewireMonitorCapturer {
 
 impl AudioCapturer for PipewireMonitorCapturer {
     fn start(&mut self) -> Result<()> {
-        if self.rx.is_some() {
-            return Ok(());
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel::<PcmChunk>(CHANNEL_DEPTH);
-        let (shutdown_tx, shutdown_rx) = pipewire::channel::channel::<Shutdown>();
-
-        let handle = std::thread::Builder::new()
-            .name("lumepeer-pipewire-audio".to_owned())
-            .spawn(move || {
-                if let Err(err) = Self::run(&tx, shutdown_rx) {
-                    tracing::warn!("pipewire audio capture thread exited: {err}");
-                }
-            })
-            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-
-        self.rx = Some(rx);
-        self.handle = Some(handle);
-        self.shutdown = Some(shutdown_tx);
-        Ok(())
+        self.0.start()
     }
 
     fn next_chunk(&mut self) -> Result<PcmChunk> {
-        let rx = self
-            .rx
-            .as_ref()
-            .ok_or_else(|| MediaError::CaptureInterrupted("capture not started".to_owned()))?;
-        match rx.recv_timeout(READ_TIMEOUT) {
+        match self.0.recv()? {
             Ok(chunk) => Ok(chunk),
             // An idle sink may hand its monitor nothing at all: a quiet host,
             // not a dead stream — a gone one disconnects below (ADR 0137).
@@ -320,23 +392,50 @@ impl AudioCapturer for PipewireMonitorCapturer {
     }
 
     fn stop(&mut self) {
-        // Order matters: the loop is told to quit first, then the receiver is
-        // dropped, then the thread is joined. Dropping the receiver alone
-        // would only unblock a *sending* thread, and this one spends its life
-        // inside `MainLoop::run`.
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(Shutdown);
-        }
-        self.rx = None;
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.0.stop();
     }
 }
 
-impl Drop for PipewireMonitorCapturer {
-    fn drop(&mut self) {
-        self.stop();
+/// PipeWire capturer of the default source: the guest's microphone
+/// (§11; ADR 0028, ADR 0147).
+#[derive(Debug)]
+pub struct PipewireMicCapturer(PipewireCapture);
+
+impl PipewireMicCapturer {
+    /// Builds an idle capturer; nothing opens until [`MicCapturer::start`].
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(PipewireCapture::new(Target::Microphone))
+    }
+}
+
+impl Default for PipewireMicCapturer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MicCapturer for PipewireMicCapturer {
+    fn start(&mut self) -> Result<()> {
+        self.0.start()
+    }
+
+    fn next_chunk(&mut self) -> Result<PcmChunk> {
+        match self.0.recv()? {
+            Ok(chunk) => Ok(chunk),
+            // A microphone always streams, even in a silent room, so a wait
+            // that runs out is a source that is not there (§18).
+            Err(RecvTimeoutError::Timeout) => Err(MediaError::CaptureInterrupted(
+                "the microphone delivered nothing: no input device is linked".to_owned(),
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(MediaError::CaptureInterrupted(
+                "the capture thread is gone".to_owned(),
+            )),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.0.stop();
     }
 }
 

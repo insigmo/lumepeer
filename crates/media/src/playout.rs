@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Media::Audio::{self as wasapi, IAudioClient, IAudioRenderClient};
+use windows::Win32::Media::Audio::{
+    self as wasapi, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
@@ -65,6 +67,10 @@ const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
 /// device resuming from suspend may legitimately be late once.
 #[cfg(target_os = "windows")]
 const PLAYBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a player asks Windows which output is the default (ADR 0147).
+#[cfg(target_os = "windows")]
+const DEFAULT_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Playback backend contract, the mirror of [`crate::capture_audio::AudioCapturer`].
 ///
@@ -192,14 +198,60 @@ impl Drop for ComGuard {
 
 #[cfg(target_os = "windows")]
 struct PlayoutState {
-    _com: ComGuard,
+    enumerator: IMMDeviceEnumerator,
     client: IAudioClient,
     render: IAudioRenderClient,
+    /// The endpoint this player renders to, to tell when the default moved.
+    device_id: Option<String>,
+    /// When the default was last asked about.
+    checked: std::time::Instant,
     /// Mix rate the device reported; chunks resample onto this.
     output_rate: u32,
     output_channels: usize,
     /// Set when `stop` runs, so pushes after a stop fail fast.
     running: Arc<AtomicBool>,
+    /// Last, so it is dropped after every interface above is released.
+    _com: ComGuard,
+}
+
+/// An endpoint's id, copied out of its COM allocation.
+#[cfg(target_os = "windows")]
+fn endpoint_id(device: &IMMDevice) -> Option<String> {
+    // SAFETY: `GetId` hands back a string the caller owns; it is copied and
+    // freed here, once, and never read after.
+    #[allow(
+        unsafe_code,
+        reason = "IMMDevice::GetId is raw WASAPI; its string is CoTaskMem-allocated"
+    )]
+    unsafe {
+        let id = device.GetId().ok()?;
+        let text = id.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(id.0.cast_const().cast()));
+        text
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl PlayoutState {
+    /// Whether Windows has named another output the default since this
+    /// player opened. Asked at most once per [`DEFAULT_CHECK`].
+    fn default_moved(&mut self) -> bool {
+        if self.checked.elapsed() < DEFAULT_CHECK {
+            return false;
+        }
+        self.checked = std::time::Instant::now();
+        // SAFETY: a plain query on a live enumerator.
+        #[allow(unsafe_code, reason = "IMMDeviceEnumerator is raw WASAPI")]
+        let device = unsafe {
+            self.enumerator
+                .GetDefaultAudioEndpoint(wasapi::eRender, wasapi::eConsole)
+        };
+        // No default at all is not a reason to leave the one still open.
+        device
+            .ok()
+            .and_then(|device| endpoint_id(&device))
+            .is_some_and(|now| self.device_id.as_ref() != Some(&now))
+    }
 }
 
 // The COM interface pointers cross threads only by move, never shared — the
@@ -266,6 +318,7 @@ impl WasapiPlayout {
             let device = enumerator
                 .GetDefaultAudioEndpoint(wasapi::eRender, wasapi::eConsole)
                 .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            let device_id = endpoint_id(&device);
             let client: IAudioClient = device
                 .Activate(CLSCTX_ALL, None)
                 .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
@@ -348,12 +401,15 @@ impl WasapiPlayout {
                 "WASAPI render playback started"
             );
             self.state = Some(PlayoutState {
-                _com: com,
+                enumerator,
                 client,
                 render,
+                device_id,
+                checked: std::time::Instant::now(),
                 output_rate,
                 output_channels,
                 running: Arc::new(AtomicBool::new(true)),
+                _com: com,
             });
         }
         Ok(())
@@ -369,6 +425,15 @@ impl WasapiPlayout {
     /// [`stop`](Self::stop) has run.
     pub fn push(&mut self, samples: &[i16], timestamp_us: u64) -> Result<()> {
         let _ = timestamp_us; // ordering is the sender's concern; the mixer clocks itself
+        // Where Windows sends every other program's sound now, not where it
+        // sent it when this player opened: plugging in headphones moves the
+        // default, and a player left on the speakers plays to nobody
+        // (ADR 0147). A shared-mode client does not follow by itself.
+        if self.state.as_mut().is_some_and(PlayoutState::default_moved) {
+            tracing::info!("the default output changed; playing on the new one");
+            self.stop();
+            self.start()?;
+        }
         let state = self
             .state
             .as_mut()

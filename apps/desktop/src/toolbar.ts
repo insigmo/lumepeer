@@ -1247,7 +1247,8 @@ export function mountToolbar(
           draw();
         })
         .catch(() => {
-          // Refused (no media connection yet, no grant): stay off and say so.
+          // Refused (no input grant, or no microphone capture on this
+          // device; ADR 0147): stay off and say so.
           state.micOn = false;
           draw();
         });

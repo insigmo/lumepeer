@@ -68,7 +68,9 @@ beta() {
 
 mac() {
   echo "== mac: syncing this tree to $MAC and building there"
-  local index=.git/lumepeer-sync-index-e2e tree
+  # The git dir, not .git: in a worktree .git is a file pointing at it.
+  local index tree
+  index="$(git rev-parse --git-dir)/lumepeer-sync-index-e2e"
   rm -f "$index"
   GIT_INDEX_FILE=$index git add -A
   tree=$(GIT_INDEX_FILE=$index git write-tree)

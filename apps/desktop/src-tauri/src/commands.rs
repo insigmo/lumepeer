@@ -100,6 +100,16 @@ impl IpcError {
         }
     }
 
+    /// This build has no way to capture a microphone (ADR 0147): the mic
+    /// button stays off and the window can say why, instead of turning on
+    /// over nothing.
+    fn no_microphone() -> Self {
+        Self {
+            code: "NO_MICROPHONE",
+            message: "this device cannot send its microphone yet".to_owned(),
+        }
+    }
+
     fn poisoned() -> Self {
         Self {
             code: "STATE_POISONED",
@@ -163,6 +173,7 @@ impl From<ActorError> for IpcError {
             ActorError::Unsupported => Self::unsupported(),
             ActorError::NoSpace => Self::no_space(),
             ActorError::NotTheHost => Self::not_the_host(),
+            ActorError::NoMicrophone => Self::no_microphone(),
         }
     }
 }
@@ -727,6 +738,60 @@ pub struct ConnectionStatsDto {
     /// in, on either side of it; `null` while no picture does (gap-tasks/06;
     /// ADR 0067).
     pub codec: Option<&'static str>,
+    /// Sound this machine receives and plays from the peer: the host's
+    /// desktop on a guest, the guest's microphone on a host (ADR 0147).
+    pub audio_in: Option<AudioMeterDto>,
+    /// Sound this machine captures and sends to the peer (ADR 0147).
+    pub audio_out: Option<AudioMeterDto>,
+}
+
+/// What one direction of a session's sound carried (ADR 0147): counted where
+/// it was captured or played, never estimated.
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioMeterDto {
+    /// Audio streams opened or accepted.
+    pub streams: u32,
+    /// 20 ms chunks captured, or received and decoded.
+    pub chunks: u64,
+    /// Chunks that were not digital silence.
+    pub nonzero: u64,
+    /// Chunks that peaked at −30 dBFS or louder.
+    pub loud: u64,
+    /// Chunks the playback device accepted; 0 on the sending side.
+    pub played: u64,
+    /// Chunks dropped before the device because it was behind.
+    pub dropped: u64,
+    /// Loudest sample magnitude, out of 32767.
+    pub peak: u16,
+    /// Tone of the latest loud chunk, in hertz, when it held a steady one.
+    pub loud_hz: Option<u32>,
+    /// `unopened`, `open` or `failed`.
+    pub device: &'static str,
+    /// Why the device last failed, when it did.
+    pub device_error: Option<String>,
+}
+
+impl From<lumepeer_media::audio_meter::AudioMeterSnapshot> for AudioMeterDto {
+    fn from(seen: lumepeer_media::audio_meter::AudioMeterSnapshot) -> Self {
+        use lumepeer_media::audio_meter::DeviceState;
+        let (device, device_error) = match seen.device {
+            DeviceState::Unopened => ("unopened", None),
+            DeviceState::Open => ("open", None),
+            DeviceState::Failed(error) => ("failed", Some(error)),
+        };
+        Self {
+            streams: seen.streams,
+            chunks: seen.chunks,
+            nonzero: seen.nonzero,
+            loud: seen.loud,
+            played: seen.played,
+            dropped: seen.dropped,
+            peak: seen.peak,
+            loud_hz: seen.loud_hz,
+            device,
+            device_error,
+        }
+    }
 }
 
 /// Stable identifier of a video codec for the webview, which shows the
@@ -1376,6 +1441,8 @@ pub async fn connection_stats(
             bitrate_kbps: row.bitrate_kbps,
             fps: row.fps,
             codec: row.codec.map(media_codec_code),
+            audio_in: row.audio_in.map(AudioMeterDto::from),
+            audio_out: row.audio_out.map(AudioMeterDto::from),
         })
         .collect())
 }
