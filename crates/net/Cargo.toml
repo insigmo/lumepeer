@@ -18,6 +18,10 @@ iroh.workspace = true
 # `AsyncUdpSocket` is the embedding point `obfuscate.rs` implements, since
 # iroh 1.0.2 exposes no hook to wrap its own socket (Fase 0).
 noq = "=1.2.0"
+# The engine under `noq`, for the one type its congestion-controller trait
+# names that `noq` does not re-export (`RttEstimator`): the loss-tolerant
+# controller of ADR 0144 implements that trait. Same version `noq` resolves.
+noq-proto = "=1.2.0"
 tokio.workspace = true
 serde.workspace = true
 serde-big-array.workspace = true

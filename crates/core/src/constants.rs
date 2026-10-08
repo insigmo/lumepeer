@@ -939,6 +939,18 @@ pub const MEDIA_QUEUE_SLACK_MIN_MS: u64 = 16;
 /// The most the media link may fall behind before the host stops producing
 /// frames for it, however low the frame rate (§11; ADR 0139).
 pub const MEDIA_QUEUE_SLACK_MAX_MS: u64 = 50;
+/// The most the allowance of [`MEDIA_QUEUE_SLACK_MAX_MS`] may widen for a link
+/// whose own delay varies (§11; ADR 0144).
+///
+/// The allowance is twice the link's recent jitter — how much longer its
+/// acknowledgements take than its best case, on average — whenever that is
+/// more than two frame intervals. A Wi-Fi path between two homes measured
+/// 215–311 ms a round trip within seconds on 2026-10-07, and held to 50 ms
+/// over its best case, the host stopped producing frames for every
+/// acknowledgement that came in late by chance: 5–15 frames a second on a link
+/// with room for more. Bounded, because past this a queue is latency the
+/// person at the guest feels on every click, however variable the link.
+pub const MEDIA_QUEUE_JITTER_SLACK_MAX_MS: u64 = 200;
 /// How long the quickest acknowledgement of a frame is remembered as the
 /// media link's best case (§11; ADR 0139).
 ///

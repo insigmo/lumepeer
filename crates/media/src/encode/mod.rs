@@ -464,6 +464,12 @@ pub mod software {
     pub struct OpenH264Encoder {
         inner: Encoder,
         config: EncoderConfig,
+        /// The bitrate `inner` was built with, which `config` moves away from
+        /// once a bitrate is set live (ADR 0144).
+        built_kbps: u32,
+        /// The size of the last picture `inner` was handed, `None` before the
+        /// first: `openh264` initialises itself on that one.
+        size: Option<(usize, usize)>,
     }
 
     // `openh264::encoder::Encoder` is not `Debug`, and the settings are what
@@ -483,7 +489,12 @@ pub mod software {
         /// [`MediaError::EncoderUnavailable`] if the codec refuses the settings.
         pub fn new(config: EncoderConfig) -> Result<Self> {
             let inner = Self::build(config)?;
-            Ok(Self { inner, config })
+            Ok(Self {
+                inner,
+                config,
+                built_kbps: config.bitrate_kbps,
+                size: None,
+            })
         }
 
         fn build(config: EncoderConfig) -> Result<Encoder> {
@@ -508,6 +519,54 @@ pub mod software {
             Encoder::with_api_config(openh264::OpenH264API::from_source(), h264)
                 .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))
         }
+    }
+
+    /// Moves a running `encoder` from `from_kbps` to `to_kbps` in place, so
+    /// the stream carries on with no keyframe (ADR 0144). `false` when
+    /// `openh264` refused, and nothing is known about what it kept.
+    ///
+    /// The target of the whole stream, and the maximum of its one spatial
+    /// layer, which `build` set to the same figure: left at the old maximum,
+    /// a lowered target lets the rate control spend up to the old figure on a
+    /// busy picture — exactly the frames a struggling link cannot take.
+    /// `openh264` refuses a target above the layer's maximum, so the maximum
+    /// moves first on the way up and last on the way down.
+    #[allow(
+        unsafe_code,
+        reason = "`openh264` has no safe call for a live bitrate; `SetOption` is reached through its raw API"
+    )]
+    fn set_live_bitrate(encoder: &mut Encoder, from_kbps: u32, to_kbps: u32) -> bool {
+        use openh264_sys2::{
+            ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
+            SPATIAL_LAYER_ALL,
+        };
+        let bps = std::os::raw::c_int::try_from(to_kbps.saturating_mul(BITS_PER_KBIT))
+            .unwrap_or(std::os::raw::c_int::MAX);
+        let target = (ENCODER_OPTION_BITRATE, SPATIAL_LAYER_ALL);
+        let maximum = (ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_0);
+        let order = if to_kbps > from_kbps {
+            [maximum, target]
+        } else {
+            [target, maximum]
+        };
+        order.into_iter().all(|(option, layer)| {
+            let mut info = SBitrateInfo {
+                iLayer: layer,
+                iBitrate: bps,
+            };
+            // SAFETY: `encoder` is a live `openh264` encoder that has encoded
+            // a frame, so it is initialised (the caller checks). `SetOption`
+            // reads one `SBitrateInfo` through the pointer during the call,
+            // and `info` outlives it. The bitrate is a parameter the encoder
+            // is meant to have changed while it runs — the reason `SetOption`
+            // takes it — not one the crate's wrapper relies on.
+            let status = unsafe {
+                encoder
+                    .raw_api()
+                    .set_option(option, std::ptr::from_mut(&mut info).cast())
+            };
+            status == 0
+        })
     }
 
     /// Crops to even dimensions: 4:2:0 subsampling has no odd rows or
@@ -563,6 +622,18 @@ pub mod software {
     impl VideoEncoder for OpenH264Encoder {
         fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
             let (bgra, width, height) = even_bgra(frame, "openh264 fallback")?;
+            // `openh264` re-initialises itself for a new size from the
+            // settings it was built with, which would quietly undo a bitrate
+            // set live since (ADR 0144). A new size starts on a keyframe
+            // anyway, so building afresh at the current bitrate costs nothing
+            // the size change was not already paying.
+            if self.size.is_some_and(|size| size != (width, height))
+                && self.built_kbps != self.config.bitrate_kbps
+            {
+                self.inner = Self::build(self.config)?;
+                self.built_kbps = self.config.bitrate_kbps;
+            }
+            self.size = Some((width, height));
             let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
             let bitstream = self
                 .inner
@@ -584,15 +655,24 @@ pub mod software {
             if bitrate_kbps == self.config.bitrate_kbps {
                 return Ok(());
             }
-            // `openh264` takes the bitrate at construction, so a change rebuilds
-            // the encoder. The next frame is therefore a keyframe. That is
-            // acceptable at the one adjustment per second of
-            // `ABR_ADJUST_MAX_RATE_PER_SEC` (§11, §14).
+            // Live, so the stream carries on without a keyframe (ADR 0144).
+            // This used to rebuild the encoder, and the next frame was a
+            // keyframe: tolerable at one adjustment a second on a good link,
+            // and the opposite of what a link that is already struggling
+            // needs when the bitrate comes down because of it. Rebuilt only
+            // before the first frame, when there is nothing initialised to
+            // set it on, and if `openh264` refuses.
             let config = EncoderConfig {
                 bitrate_kbps,
                 ..self.config
             };
-            self.inner = Self::build(config)?;
+            if self.size.is_none()
+                || !set_live_bitrate(&mut self.inner, self.config.bitrate_kbps, bitrate_kbps)
+            {
+                self.inner = Self::build(config)?;
+                self.built_kbps = bitrate_kbps;
+                self.size = None;
+            }
             self.config = config;
             Ok(())
         }
@@ -680,6 +760,86 @@ pub mod software {
                     .unwrap()
                     .data
                     .is_empty()
+            );
+        }
+
+        /// A still picture with a quarter of it busy — fresh detail every
+        /// frame, the way a film plays in a window: the frames need bits,
+        /// and none of them is a new scene.
+        fn noise(width: u32, height: u32, step: u32) -> Frame {
+            let mut state = step.wrapping_mul(2_654_435_761) | 1;
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let value = if x < width / 2 && y < height / 2 {
+                        state.to_le_bytes()[0]
+                    } else if (x / 8 + y / 8) % 2 == 0 {
+                        40
+                    } else {
+                        200
+                    };
+                    data.extend_from_slice(&[value, value, value, 0xFF]);
+                }
+            }
+            Frame::cpu(width, height, PixelFormat::Bgra8, 0, data)
+        }
+
+        /// Average size of the frames [`noise`] makes for `steps` at
+        /// `width`x`height`, and whether any of them was a keyframe.
+        fn encode_noise(
+            encoder: &mut OpenH264Encoder,
+            (width, height): (u32, u32),
+            steps: std::ops::Range<u32>,
+        ) -> (usize, bool) {
+            let count = steps.len();
+            let mut bytes = 0;
+            let mut keyframe = false;
+            for step in steps {
+                let output = encoder.encode(&noise(width, height, step)).unwrap();
+                bytes += output.data.len();
+                keyframe |= output.keyframe;
+            }
+            (bytes / count, keyframe)
+        }
+
+        /// ADR 0144: the bitrate moves while the encoder runs, with no
+        /// keyframe, and the frames after it are smaller.
+        #[test]
+        fn a_live_bitrate_change_shrinks_the_frames_without_a_keyframe() {
+            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            let size = (320, 180);
+            let (before, _) = encode_noise(&mut encoder, size, 0..20);
+            encoder.set_bitrate(300).unwrap();
+            let (after, keyframe) = encode_noise(&mut encoder, size, 20..40);
+            assert!(!keyframe, "the change cost a keyframe");
+            assert!(
+                after * 2 < before,
+                "frames of {after} bytes after the change against {before} before"
+            );
+        }
+
+        /// ADR 0144: `openh264` rebuilds itself for a new size from the
+        /// bitrate it was built with; a bitrate set live since survives it.
+        #[test]
+        fn a_live_bitrate_survives_a_change_of_size() {
+            let mut low = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            encode_noise(&mut low, (320, 180), 0..5);
+            low.set_bitrate(300).unwrap();
+            encode_noise(&mut low, (320, 180), 5..10);
+            let mut high = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            encode_noise(&mut high, (320, 180), 0..10);
+
+            // The first frame at the new size is a keyframe either way.
+            low.encode(&noise(256, 144, 10)).unwrap();
+            high.encode(&noise(256, 144, 10)).unwrap();
+            let (low_bytes, _) = encode_noise(&mut low, (256, 144), 11..30);
+            let (high_bytes, _) = encode_noise(&mut high, (256, 144), 11..30);
+            assert!(
+                low_bytes * 2 < high_bytes,
+                "the new size went back to the built bitrate: {low_bytes} bytes against {high_bytes}"
             );
         }
     }

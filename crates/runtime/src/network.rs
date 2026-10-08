@@ -4613,6 +4613,23 @@ struct ViewState {
     /// once dialed, read by the mic toggle; `None` until the first dial
     /// lands and after the media task ends.
     media_connection: Arc<std::sync::Mutex<Option<PeerConnection>>>,
+    /// What this window last asked of its picture — the preset's scale and
+    /// frame rate, the box it draws into, the encoder it picked — said again
+    /// when a session comes back into it (ADR 0144). The window says each of
+    /// them once, and a host that did not resume the session starts the new
+    /// one knowing none of them.
+    asked: PictureAsks,
+}
+
+/// Guest side: see [`ViewState::asked`].
+#[derive(Debug, Default, Clone, Copy)]
+struct PictureAsks {
+    /// The preset, as a scale percentage and a frame rate.
+    preset: Option<(u32, u8)>,
+    /// The box the window draws the picture into.
+    size: Option<(u32, u32)>,
+    /// The encoder the window picked.
+    encoder: Option<EncoderChoice>,
 }
 
 impl ViewState {
@@ -6039,6 +6056,11 @@ struct ReconnectWait {
     /// came back as a screen one would start an encode loop on the host that
     /// nobody asked for.
     surface: ViewSurface,
+    /// The host refused the resume (ADR 0144). It has no session to repair,
+    /// so a new one cannot race the repair, and the host has just proved it
+    /// is up: the wait dials at once instead of sitting out the rest of
+    /// [`RECONNECT_WINDOW_SECS`].
+    refused: bool,
 }
 
 /// Guest side: the view window of a session that lost its link, held open
@@ -10328,6 +10350,7 @@ impl Actor {
                 task,
                 media_connection,
                 surface,
+                asked: PictureAsks::default(),
             },
         );
         // `input: false` for a terminal or file-manager session even under
@@ -10555,6 +10578,7 @@ impl Actor {
             "the session came back into the window it left"
         );
         self.views.insert(peer, state);
+        self.repeat_picture_asks(peer);
         self.rebuild_labels_and_snapshot();
         // The same entry in `self.views` that justified the clipboard watcher
         // before the link went away justifies it again now
@@ -13218,6 +13242,15 @@ impl Actor {
         if !self.may_request_scale_to(&peer) {
             return Err(ActorError::Unsupported);
         }
+        self.send_preset(peer, scale_percent, fps);
+        if let Some(view) = self.views.get_mut(&peer) {
+            view.asked.preset = Some((scale_percent, fps));
+        }
+        Ok(())
+    }
+
+    /// Guest side: the two messages a preset is on the wire.
+    fn send_preset(&mut self, peer: NodeId, scale_percent: u32, fps: u8) {
         self.send_to(&peer, MessageKind::StreamScaleRequest { scale_percent });
         self.send_to(
             &peer,
@@ -13226,7 +13259,39 @@ impl Actor {
                 target_bitrate_kbps: 0,
             },
         );
-        Ok(())
+    }
+
+    /// Guest side: says again, to a session that came back into its window,
+    /// what the window last asked of its picture (ADR 0144).
+    ///
+    /// A host that resumed the session still knows all of it, and repeating
+    /// a value changes nothing there. A host that did not starts a new
+    /// session with none of it, and the window — which says each of them once
+    /// — never says them again: the new session ran the adaptive controller
+    /// under a preset nobody had dropped, and on a host with a software
+    /// encoder that walked the bitrate to its floor in minutes.
+    fn repeat_picture_asks(&mut self, peer: NodeId) {
+        let Some(asked) = self.views.get(&peer).map(|view| view.asked) else {
+            return;
+        };
+        if let Some((scale_percent, fps)) = asked.preset
+            && self.may_request_scale_to(&peer)
+        {
+            self.send_preset(peer, scale_percent, fps);
+        }
+        if let Some((width, height)) = asked.size
+            && self.may_request_size_to(&peer)
+        {
+            self.send_to(&peer, MessageKind::StreamSizeRequest { width, height });
+        }
+        if let Some(choice) = asked.encoder
+            && self
+                .connections
+                .get(&peer)
+                .is_some_and(|c| c.peer_minor >= ENCODER_CHOICE_MINOR)
+        {
+            self.send_to(&peer, MessageKind::EncoderSelect { choice });
+        }
     }
 
     /// Guest side: names the picture size this window will draw (§11;
@@ -13260,6 +13325,9 @@ impl Actor {
             return Err(ActorError::Unsupported);
         }
         self.send_to(&peer, MessageKind::StreamSizeRequest { width, height });
+        if let Some(view) = self.views.get_mut(&peer) {
+            view.asked.size = Some((width, height));
+        }
         Ok(())
     }
 
@@ -13510,6 +13578,9 @@ impl Actor {
             return Err(ActorError::Unsupported);
         }
         self.send_to(&peer, MessageKind::EncoderSelect { choice });
+        if let Some(view) = self.views.get_mut(&peer) {
+            view.asked.encoder = Some(choice);
+        }
         Ok(())
     }
 
@@ -16366,6 +16437,7 @@ impl Actor {
                 dialing: false,
                 dial_seq: 0,
                 surface,
+                refused: false,
             },
         );
         // A goodbye still owed to an earlier session with this host is moot:
@@ -16411,12 +16483,18 @@ impl Actor {
         };
         wait.resume = None;
         wait.dialing = false;
+        wait.refused = true;
         let host_tag = wait.host_tag.clone();
+        let generation = wait.generation;
         tracing::info!(peer = %self.label_of(&peer), "the host did not resume the session");
         if self.history.code_of(&host_tag).is_some() {
             if self.show_wait_in_form(peer, ConnectPhase::WaitingForHost) {
                 self.connect_failure = None;
             }
+            // Asked for at once (ADR 0144): the rest of the resume window was
+            // five minutes of a frozen picture at a host already known to be
+            // up, which is what 2026-10-07's session sat through.
+            self.arm_reconnect_wait(generation, 1);
             return;
         }
         // Unless the row the wait reads its invite out of has been removed in
@@ -16896,10 +16974,12 @@ impl Actor {
             self.stop_reconnect_wait(wait.peer);
             return;
         }
-        // A resume the host refused leaves a wait still inside the window,
-        // and a new session inside it is what ADR 0084 will not dial.
+        // A wait still inside the window, for a session the host has not
+        // refused, does not dial a new one: that would race the repair ADR
+        // 0084 waits for. A refused one has nothing left to repair (ADR 0144).
         let window = Duration::from_secs(RECONNECT_WINDOW_SECS);
-        if let Some(left) = window.checked_sub(wait.started_at.elapsed())
+        if !wait.refused
+            && let Some(left) = window.checked_sub(wait.started_at.elapsed())
             && !left.is_zero()
         {
             self.arm_reconnect_wait(generation, left.as_secs().max(1));
@@ -25318,6 +25398,120 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_resume_refused_before_its_hello_ack_arrives_stops_resuming() {
         a_refused_resume_stops_resuming(ResumeRefusal::BeforeHelloAck).await;
+    }
+
+    /// ADR 0144: a host that refuses the resume starts a new session with
+    /// nothing of the old one — and the window the new session comes back
+    /// into said its preset once, at mount. It now says it again. Measured on
+    /// 2026-10-07: the new session ran without one, the adaptive controller
+    /// walked a software encoder's bitrate to its floor, and a film played at
+    /// 50–120 kbit/s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_session_in_the_old_window_is_told_the_preset_again() {
+        use lumepeer_core::protocol::MessageKind;
+
+        async fn next_control(endpoint: &PeerEndpoint) -> PeerConnection {
+            loop {
+                if let Ok(connection) = endpoint.accept().await.unwrap()
+                    && connection.alpn() == lumepeer_net::ALPN_CONTROL
+                {
+                    return connection;
+                }
+            }
+        }
+
+        async fn until_preset(session: &mut ControlConnection) -> (u32, u8) {
+            let mut scale = None;
+            loop {
+                match session.recv().await.unwrap().kind {
+                    MessageKind::StreamScaleRequest { scale_percent } => {
+                        scale = Some(scale_percent);
+                    }
+                    MessageKind::QualityAdjust { target_fps, .. } => {
+                        if let Some(scale) = scale {
+                            return (scale, target_fps);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::ViewOnly,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+        let (mut session, _) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed");
+        session
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
+        guest.set_stream_scale(host_label, 67, 144).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(TIMEOUT, until_preset(&mut session))
+                .await
+                .expect("the preset never left the guest"),
+            (67, 144)
+        );
+
+        guest.sever_links().await;
+        wait_for_phase(&guest, ConnectPhase::Resuming).await;
+        let claim = tokio::time::timeout(TIMEOUT, next_control(&host))
+            .await
+            .expect("the guest never tried to resume");
+        let (refused, _) = lumepeer_net::host_handshake(claim).await.unwrap();
+        refused.close_with(&NetError::ReconnectRejected);
+
+        let (mut fresh, hello) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never asked for a new session");
+        assert_eq!(hello.resume_claim, None, "a new session, not the old one");
+        fresh
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(TIMEOUT, until_preset(&mut fresh))
+                .await
+                .expect("the new session was never told the window's preset"),
+            (67, 144)
+        );
+        assert_eq!(
+            recorder.opened().len(),
+            1,
+            "the new session came back into the old window"
+        );
     }
 
     /// ADR 0089: the guest lost its link but the host has not noticed yet. A

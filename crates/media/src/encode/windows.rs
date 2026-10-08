@@ -56,12 +56,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET,
     MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_NV12,
     MFVideoInterlace_Progressive, eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
-    eAVEncCommonRateControlMode_LowDelayVBR, eAVEncH264VProfile_High,
+    eAVEncCommonRateControlMode_LowDelayVBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
+    eAVEncH264VProfile_High,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
@@ -87,36 +88,29 @@ type D3dManager = std::convert::Infallible;
 
 /// Bits per kilobit, for the kbps of §14 against the bps of `MF_MT_AVG_BITRATE`.
 const BITS_PER_KBIT: u32 = 1_000;
-/// Probe/initial negotiation size. Real dimensions arrive with the first
-/// frame (`EncoderConfig` carries none, matching the `openh264` fallback);
-/// this is small enough that any genuine hardware H.264 encoder MFT accepts
-/// it, so a successful negotiation here is real evidence of usability rather
-/// than a guess.
-const PROBE_WIDTH: u32 = 64;
-/// See [`PROBE_WIDTH`].
-const PROBE_HEIGHT: u32 = 64;
-
-/// Probe/initial negotiation size for AV1.
+/// Probe/initial negotiation size, for every codec. Real dimensions arrive
+/// with the first frame (`EncoderConfig` carries none, matching the
+/// `openh264` fallback), so a successful negotiation here is evidence that
+/// the transform is usable rather than a guess — provided the size is one a
+/// real encoder takes.
 ///
-/// Larger than [`PROBE_WIDTH`], and not for tidiness: an AV1 encoder MFT
-/// refuses pictures the H.264 MFT sitting next to it on the same GPU
-/// accepts. Intel's AV1 encoder has a floor of its own, so a 64x64 rehearsal
-/// answers "there is no encoder" on a machine whose answer is "not at that
-/// size" — measured here on a machine whose AV1 MFT declines 64x64 and
-/// accepts this (ADR 0069).
+/// 64x64 was not (ADR 0144). AMD's H.264 encoder MFT (`AMDh264Encoder`, a
+/// Ryzen 7 5700U's Radeon) refuses 64x64 at `SetOutputType` and takes
+/// 128x128, 256x256, 720p and 1080p, with and without a Direct3D device
+/// manager; Intel's AV1 MFT has the same kind of floor (ADR 0069). Every
+/// session on that host was encoded in software, at 30–60 ms a 1080p frame,
+/// by a machine with a hardware encoder.
 ///
 /// Still small enough to cost nothing: it is negotiated once and the first
 /// real frame reconfigures to the screen's own size.
-const OPTIONAL_PROBE_WIDTH: u32 = 256;
-/// See [`OPTIONAL_PROBE_WIDTH`].
-const OPTIONAL_PROBE_HEIGHT: u32 = 256;
+const PROBE_WIDTH: u32 = 256;
+/// See [`PROBE_WIDTH`].
+const PROBE_HEIGHT: u32 = 256;
 
-/// The geometry a probe and a fresh encoder negotiate at for `codec`.
-const fn probe_dims(codec: VideoCodec) -> (u32, u32) {
-    match codec {
-        VideoCodec::H264 => (PROBE_WIDTH, PROBE_HEIGHT),
-        VideoCodec::Av1 => (OPTIONAL_PROBE_WIDTH, OPTIONAL_PROBE_HEIGHT),
-    }
+/// The geometry a probe and a fresh encoder negotiate at for `codec`: the
+/// same for every codec since ADR 0144.
+const fn probe_dims(_codec: VideoCodec) -> (u32, u32) {
+    (PROBE_WIDTH, PROBE_HEIGHT)
 }
 /// Busy-poll granularity while waiting for an async MFT event. Small enough
 /// to keep p50 latency negligible; the overall wait is still bounded by
@@ -861,7 +855,20 @@ fn activate_hardware_transform(
     for activate in enum_hardware_encoders(&input_info, &output_info)? {
         match try_activate_one(&activate, width, height, config, d3d) {
             Ok((transform, events)) => return Ok((mf, transform, events)),
-            Err(_) => {
+            Err(error) => {
+                // Said, not swallowed (ADR 0144): an AMD encoder refusing the
+                // probe's size sent every session on its host to the
+                // software fallback for months, with nothing in any log to
+                // say a hardware encoder had been there and why it was
+                // passed over.
+                tracing::info!(
+                    encoder = %friendly_name(&activate),
+                    codec = ?config.codec,
+                    width,
+                    height,
+                    %error,
+                    "a hardware encoder MFT was not usable"
+                );
                 // SAFETY: ShutdownObject releases the MFT this Activate
                 // stands for so the next candidate is not starved of the
                 // same hardware context; best-effort, `activate` is dropped
@@ -874,6 +881,26 @@ fn activate_hardware_transform(
         "no usable hardware {:?} encoder MFT is registered on this system",
         config.codec
     )))
+}
+
+/// The name an encoder MFT registered itself under, for the log, or `?`.
+fn friendly_name(activate: &IMFActivate) -> String {
+    let mut name = windows::core::PWSTR::null();
+    let mut len = 0u32;
+    // SAFETY: GetAllocatedString hands back a CoTaskMemAlloc'd copy of the
+    // attribute's string on success; it is read once and freed here, and on
+    // failure nothing was allocated.
+    unsafe {
+        if activate
+            .GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &raw mut name, &raw mut len)
+            .is_err()
+        {
+            return "?".to_owned();
+        }
+        let text = name.to_string().unwrap_or_else(|_| "?".to_owned());
+        CoTaskMemFree(Some(name.0.cast()));
+        text
+    }
 }
 
 /// Tries to activate and fully configure one candidate MFT. Any failure at
@@ -1094,9 +1121,10 @@ fn request_low_latency(transform: &IMFTransform) {
 ///   future picture. Without it an encoder is free to buffer one to three
 ///   frames before emitting anything, which is 30-100 ms of lag that no
 ///   amount of work anywhere else in the pipeline can win back.
-/// - `LowDelayVBR` (falling back to CBR): a desktop is still most of the
-///   time and interesting exactly when it is not. Constant bitrate spends the
-///   same bits on both.
+/// - Peak-constrained VBR (falling back to `LowDelayVBR`, then CBR): a
+///   desktop is still most of the time and interesting exactly when it is
+///   not. Constant bitrate spends the same bits on both, and on AMD so does
+///   `LowDelayVBR` (ADR 0144).
 /// - `MaxNumRefFrame = 1` and no B-pictures: nothing may depend on a picture
 ///   that has not been sent yet.
 /// - `GOPSize`: see [`GOP_SECONDS`] - the guest asks for an intra frame when
@@ -1117,15 +1145,24 @@ fn tune_for_low_latency(transform: &IMFTransform, config: EncoderConfig) {
     set(&CODECAPI_AVEncCommonLowLatency, VARIANT::from(true));
     set(&CODECAPI_AVEncCommonRealTime, VARIANT::from(true));
 
-    if !set(
-        &CODECAPI_AVEncCommonRateControlMode,
-        VARIANT::from(rate_control_mode(eAVEncCommonRateControlMode_LowDelayVBR)),
-    ) {
+    // The first mode the transform takes. Peak-constrained VBR first
+    // (ADR 0144): AMD's H.264 MFT accepts `LowDelayVBR` and then pads every
+    // frame to the mean bitrate exactly as it does under CBR — 33 KB a frame
+    // for a screen that does not change, measured on a Ryzen 7 5700U, against
+    // 76 bytes under this mode. Intel refuses `LowDelayVBR` outright and runs
+    // CBR without padding; it takes this mode too.
+    let _ = [
+        eAVEncCommonRateControlMode_PeakConstrainedVBR,
+        eAVEncCommonRateControlMode_LowDelayVBR,
+        eAVEncCommonRateControlMode_CBR,
+    ]
+    .into_iter()
+    .any(|mode| {
         set(
             &CODECAPI_AVEncCommonRateControlMode,
-            VARIANT::from(rate_control_mode(eAVEncCommonRateControlMode_CBR)),
-        );
-    }
+            VARIANT::from(rate_control_mode(mode)),
+        )
+    });
     set(
         &CODECAPI_AVEncCommonMeanBitRate,
         VARIANT::from(config.bitrate_kbps.saturating_mul(BITS_PER_KBIT)),
@@ -2418,6 +2455,25 @@ mod tests {
         MediaFoundationEncoder::new(EncoderConfig::default()).ok()
     }
 
+    /// ADR 0144: a screen that does not change costs next to nothing. Under
+    /// the CBR and `LowDelayVBR` modes AMD's H.264 MFT padded every frame of
+    /// a still 1080p screen to 33 KB — the mean bitrate, sent whether or not
+    /// anything moved.
+    #[test]
+    fn a_still_screen_is_not_padded_to_the_bitrate() {
+        let Some(mut encoder) = try_new_encoder() else {
+            eprintln!("skipping: no hardware H.264 encoder on this machine");
+            return;
+        };
+        let sizes: Vec<usize> = (0..6)
+            .map(|_| encoder.encode(&frame(1920, 1080, 0x50)).unwrap().data.len())
+            .collect();
+        assert!(
+            sizes[2..].iter().all(|&bytes| bytes < 2_048),
+            "a still screen encoded to {sizes:?} bytes a frame"
+        );
+    }
+
     #[test]
     fn probe_hardware_agrees_with_whether_construction_actually_works() {
         // The central "never claim hardware is available when it isn't"
@@ -2678,7 +2734,7 @@ mod tests {
             eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
             return;
         };
-        let first = encoder.encode(&frame(64, 64, 0x20)).unwrap();
+        let first = encoder.encode(&frame(256, 256, 0x20)).unwrap();
         assert!(first.keyframe, "the first frame must be decodable alone");
         assert!(!first.data.is_empty());
         assert_eq!(encoder.kind(), EncoderKind::Hardware);
@@ -2697,7 +2753,7 @@ mod tests {
             return;
         };
         for index in 0..4u64 {
-            let mut source = frame(64, 64, 0x20);
+            let mut source = frame(256, 256, 0x20);
             source.timestamp_us = index * 33_333;
             let output = encoder
                 .encode(&source)
@@ -2890,7 +2946,7 @@ mod tests {
             eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
             return;
         };
-        assert!(encoder.encode(&frame(65, 33, 0x40)).is_ok());
+        assert!(encoder.encode(&frame(257, 145, 0x40)).is_ok());
     }
 
     #[test]
@@ -2899,12 +2955,12 @@ mod tests {
             eprintln!("skipping: no hardware H.264 encoder MFT on this machine");
             return;
         };
-        encoder.encode(&frame(64, 64, 0x10)).unwrap();
+        encoder.encode(&frame(256, 256, 0x10)).unwrap();
         encoder.set_bitrate(1_500).unwrap();
         assert_eq!(encoder.config.bitrate_kbps, 1_500);
         assert!(
             !encoder
-                .encode(&frame(64, 64, 0x80))
+                .encode(&frame(256, 256, 0x80))
                 .unwrap()
                 .data
                 .is_empty()

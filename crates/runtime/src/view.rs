@@ -31,14 +31,15 @@ use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_MAX_FRAME_BYTES,
     ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
-    MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MIN_MS,
-    MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS,
-    SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS, SOFTWARE_AV1_SLOW_WINDOWS,
-    SOFTWARE_AV1_WATCH_FRAMES,
+    MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_JITTER_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MAX_MS,
+    MEDIA_QUEUE_SLACK_MIN_MS, MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS,
+    SECURE_DESKTOP_CAPTURE_INTERVAL_MS, SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS,
+    SOFTWARE_AV1_SLOW_WINDOWS, SOFTWARE_AV1_WATCH_FRAMES,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
 use lumepeer_media::abr::{
-    AbrController, QualityTarget, ReceiverFeedback, ceiling_fps, pinned_target,
+    AbrController, EncodeSpeed, FULL_SCALE_PERCENT, LinkPressure, QualityTarget, ReceiverFeedback,
+    ceiling_fps, defended_fps, pinned_target,
 };
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
@@ -1425,9 +1426,19 @@ pub(crate) fn spawn_encode_loop_with(
                 .ok()
                 .flatten();
         let max_fps = ceiling_fps(display_mode.map(|mode| mode.refresh_hz));
+        // Built for the rate of a preset the guest has already named. Built
+        // for the display's rate instead, it was rebuilt for the preset's a
+        // frame later: two keyframes where one does, and on a slow link's
+        // first seconds the second alone held the first picture back for
+        // seconds (ADR 0144).
+        let built_fps = if control.manual_cap().is_some() {
+            control.fps_cap().map_or(max_fps, |fps| fps.min(max_fps))
+        } else {
+            max_fps
+        };
         let mut encoder = match build_encoder(EncoderConfig {
             codec,
-            fps: max_fps,
+            fps: built_fps,
             ..EncoderConfig::default()
         }) {
             Ok(encoder) => encoder,
@@ -1504,7 +1515,7 @@ pub(crate) fn spawn_encode_loop_with(
         let mut software_av1_watch = SoftwareAv1Watch::default();
         // The frame rate the encoder was built for, which a preset can move
         // (ADR 0136).
-        let mut encoder_fps = max_fps;
+        let mut encoder_fps = built_fps;
         // Three knobs now, not one: the controller walks bitrate, then frame
         // rate, then picture scale (ADR 0037). The loop's own pacing is where
         // the frame rate lives, so `interval` is derived from the target
@@ -1574,6 +1585,12 @@ pub(crate) fn spawn_encode_loop_with(
         // last looked at (ADR 0139).
         let mut last_capture: Option<Instant> = None;
         let acks = control.acks();
+        // Whether this host's encoder makes the frame rate, and how much of
+        // the captured picture it is handed while it does not (ADR 0144).
+        let mut speed = EncodeSpeed::default();
+        // Whether the link carries what a preset pinned, and the bitrate the
+        // picture is held under while it does not (ADR 0144).
+        let mut link = LinkPressure::default();
 
         loop {
             if let Some(at) = last_capture {
@@ -1590,14 +1607,42 @@ pub(crate) fn spawn_encode_loop_with(
                     control.manual_cap().is_some(),
                     connection.path_snapshot(),
                     acks.best(),
+                    acks.slack(interval),
+                    speed.cap_percent(),
+                    link.cap_kbps(),
                 );
+            }
+            // A preset pins the bitrate, and a link that cannot carry it
+            // brings it down until it can; without a preset the adaptive
+            // controller has the bitrate, and any cap goes (ADR 0144).
+            let link_moved = if control.manual_cap().is_some() {
+                link.due(tick_started, target.bitrate_kbps)
+            } else {
+                link.release().then_some(target.bitrate_kbps)
+            };
+            if let Some(kbps) = link_moved {
+                match encoder.set_bitrate(kbps) {
+                    Ok(()) => tracing::info!(
+                        peer = %tag,
+                        kbps,
+                        capped = link.cap_kbps().is_some(),
+                        "the link moved the picture's bitrate"
+                    ),
+                    Err(error) => tracing::warn!(
+                        peer = %tag,
+                        %error,
+                        kbps,
+                        "encoder refused the link's bitrate"
+                    ),
+                }
             }
             // Is the link still carrying what was sent before, longer than it
             // takes when nothing is queued? Then a frame made now would only
             // wait behind them, and the picture the guest sees would be that
             // much older on every click. Wait for the guest to say what it has
             // instead, and capture what is on screen then (ADR 0139).
-            if acks.hold(queue_slack(interval), ACK_HOLD_TIMEOUT).await {
+            if acks.hold(acks.slack(interval), ACK_HOLD_TIMEOUT).await {
+                link.held(tick_started.elapsed());
                 backlog.skipped();
                 encode_stats.held();
                 continue;
@@ -1609,13 +1654,33 @@ pub(crate) fn spawn_encode_loop_with(
             // shown a picture of a moment that has already passed. Skipping
             // the whole tick - capture included - costs nothing and is what
             // the adaptive controller then reads as pressure.
+            //
+            // Waited for, up to an interval, not merely looked at (ADR 0144).
+            // The writer is woken by the frame handed to it and runs only
+            // once this task yields, and after an encode that took longer
+            // than the interval nothing between the hand-off and here does:
+            // the slot was always still taken, every such frame was followed
+            // by a skipped interval, and a host whose encoder needed 50 ms a
+            // frame made 11 frames a second where the encoder allowed 19.
             let permit = match frames_tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Full(())) => {
-                    backlog.skipped();
-                    encode_stats.skipped();
-                    sleep_for_the_rest_of(interval, tick_started).await;
-                    continue;
+                    match tokio::time::timeout(interval, frames_tx.reserve()).await {
+                        Ok(Ok(permit)) => {
+                            link.held(tick_started.elapsed());
+                            permit
+                        }
+                        Ok(Err(_closed)) => {
+                            tracing::info!(peer = %tag, "media stream ended");
+                            return;
+                        }
+                        Err(_elapsed) => {
+                            link.held(tick_started.elapsed());
+                            backlog.skipped();
+                            encode_stats.skipped();
+                            continue;
+                        }
+                    }
                 }
                 Err(mpsc::error::TrySendError::Closed(())) => {
                     tracing::info!(peer = %tag, "media stream ended");
@@ -1770,8 +1835,10 @@ pub(crate) fn spawn_encode_loop_with(
             // are never combined, because they would be two hands on the same
             // variable (D7, docs/bugs/13-stream-resolution.md). The budget
             // reduction is the hard ceiling of §15 that no choice may exceed,
-            // so it goes last and has the final say (ADR 0018).
-            let scale_percent = target.scale_percent;
+            // so it goes last and has the final say (ADR 0018). An encoder
+            // that cannot make the frame rate is handed less than either asks
+            // for (ADR 0144).
+            let scale_percent = target.scale_percent.min(speed.cap_percent());
             // Ignored while it is on trial, and for the rest of the session
             // once the encoder has refused it: see [`GuestSize`].
             let size_cap = if guest_size.honoured() {
@@ -1927,6 +1994,34 @@ pub(crate) fn spawn_encode_loop_with(
                     return;
                 }
             };
+            // Whether the encoder makes the frame rate the preset asked for,
+            // or the share of it the preset defends (ADR 0144).
+            let asked_fps = control.fps_cap().unwrap_or(target.fps);
+            let picture_percent = u32::try_from(
+                u64::from(timing.size.1) * u64::from(FULL_SCALE_PERCENT)
+                    / u64::from(captured_size.1.max(1)),
+            )
+            .unwrap_or(FULL_SCALE_PERCENT);
+            if let Some(cap) = speed.frame(
+                Instant::now(),
+                timing.scale + timing.encode,
+                picture_percent,
+                frame_interval(defended_fps(asked_fps, target.fps)),
+            ) {
+                tracing::info!(
+                    peer = %tag,
+                    scale_percent = cap,
+                    "the encoder's speed moved the picture's size"
+                );
+            }
+            // An encoder's own rate control may decide a picture is worth no
+            // bits at all: `openh264` skips frames to hold its bitrate, and
+            // hands back an empty one. Nothing to send — on the wire it was a
+            // nine-byte header the guest could only discard as malformed and
+            // count as lost (ADR 0144).
+            if bitstream.data.is_empty() {
+                continue;
+            }
             if let Some(shape) = cursor.due(captured_size, timing.size) {
                 control.send_cursor(shape);
             }
@@ -1973,6 +2068,7 @@ pub(crate) fn spawn_encode_loop_with(
                 }
             }
             sent.wrote(bitstream.data.len());
+            link.sent(bitstream.data.len());
             backlog.offered();
             // Recording rides the frame the guest is being sent (§17): the
             // container stores the same bitstream, written by the same task
@@ -2021,15 +2117,25 @@ pub(crate) fn spawn_encode_loop_with(
                 None => measured.and_then(|feedback| abr.on_feedback(feedback)),
             };
             if let Some(next) = settled {
+                // Under whatever the link holds the bitrate to (ADR 0144).
+                let next_kbps = link
+                    .cap_kbps()
+                    .map_or(next.bitrate_kbps, |cap| cap.min(next.bitrate_kbps));
                 if next.bitrate_kbps != target.bitrate_kbps
-                    && let Err(error) = encoder.set_bitrate(next.bitrate_kbps)
+                    && let Err(error) = encoder.set_bitrate(next_kbps)
                 {
                     tracing::warn!(
                         peer = %tag,
                         %error,
-                        target_kbps = next.bitrate_kbps,
+                        target_kbps = next_kbps,
                         "encoder refused a bitrate change"
                     );
+                }
+                // A preset picked anew is a new tradeoff between size and
+                // frames, and the encoder's speed is measured against it
+                // afresh (ADR 0144).
+                if preset.is_some() {
+                    speed.reset();
                 }
                 if next.fps != target.fps {
                     interval = frame_interval(next.fps);
@@ -2044,7 +2150,7 @@ pub(crate) fn spawn_encode_loop_with(
                     match build_encoder(EncoderConfig {
                         codec,
                         fps: next.fps,
-                        bitrate_kbps: next.bitrate_kbps,
+                        bitrate_kbps: next_kbps,
                     }) {
                         Ok(rebuilt) => {
                             encoder = rebuilt;
@@ -2161,6 +2267,9 @@ fn log_encode_report(
     preset: bool,
     path: Option<lumepeer_net::PathSnapshot>,
     link_best: Option<Duration>,
+    link_slack: Duration,
+    speed_cap_percent: u32,
+    link_cap_kbps: Option<u32>,
 ) {
     if report.frames == 0 && report.skipped == 0 && report.held == 0 {
         return;
@@ -2177,6 +2286,7 @@ fn log_encode_report(
         skipped = report.skipped,
         held = report.held,
         link_best_ms = ?link_best.map(|best| best.as_millis()),
+        link_slack_ms = link_slack.as_millis(),
         capture_ms = %format_args!("{:.1}/{:.1}", report.capture_ms_avg, report.capture_ms_max),
         scale_ms = %format_args!("{:.1}/{:.1}", report.scale_ms_avg, report.scale_ms_max),
         encode_ms = %format_args!("{:.1}/{:.1}", report.encode_ms_avg, report.encode_ms_max),
@@ -2184,6 +2294,8 @@ fn log_encode_report(
         target_fps = target.fps,
         target_scale = target.scale_percent,
         preset,
+        speed_cap = speed_cap_percent,
+        link_cap_kbps = ?link_cap_kbps,
         rtt_ms = ?path.map(|path| path.rtt.as_millis()),
         cwnd = ?path.map(|path| path.cwnd),
         lost_packets = ?path.map(|path| path.lost_packets),
@@ -2457,6 +2569,14 @@ struct AckState {
     /// [`MEDIA_ACK_BEST_WINDOW_MS`], as a monotonic queue: each entry is
     /// quicker than every one after it, so the front is the minimum.
     best: std::collections::VecDeque<(Instant, Duration)>,
+    /// The previous acknowledgement's delay, for [`Self::jitter`].
+    last_delay: Option<Duration>,
+    /// How much one acknowledgement's delay differs from the one before it,
+    /// as a moving average over the last eight or so — RFC 3550's
+    /// interarrival jitter, on acknowledgements (ADR 0144). A queue that
+    /// builds moves every delay up together and barely moves this; a path
+    /// whose round trip swings moves it by the swing.
+    jitter: Duration,
 }
 
 impl AckState {
@@ -2532,7 +2652,12 @@ impl FrameAcks {
                 newest = state.in_flight.pop_front();
             }
             if let Some((_, handed_over)) = newest {
-                state.note_delay(at, at.saturating_duration_since(handed_over));
+                let delay = at.saturating_duration_since(handed_over);
+                state.note_delay(at, delay);
+                if let Some(previous) = state.last_delay.replace(delay) {
+                    let swing = delay.abs_diff(previous);
+                    state.jitter = (state.jitter * 7 + swing) / 8;
+                }
             }
         }
         self.changed.notify_waiters();
@@ -2570,6 +2695,21 @@ impl FrameAcks {
     /// The link's best case right now, for the log.
     fn best(&self) -> Option<Duration> {
         self.lock().best(Instant::now())
+    }
+
+    /// How far behind its best case the link may fall at a frame interval of
+    /// `interval` before frames are held back: [`queue_slack`], widened to
+    /// twice the link's own jitter, up to [`MEDIA_QUEUE_JITTER_SLACK_MAX_MS`]
+    /// (ADR 0144).
+    ///
+    /// A link whose round trip varies by a hundred milliseconds from one
+    /// frame to the next is not falling behind every time a frame lands late,
+    /// and holding the picture back for each of them left such a link idle
+    /// most of the time.
+    fn slack(&self, interval: Duration) -> Duration {
+        let jitter = self.lock().jitter;
+        queue_slack(interval)
+            .max((jitter * 2).min(Duration::from_millis(MEDIA_QUEUE_JITTER_SLACK_MAX_MS)))
     }
 }
 
@@ -2904,6 +3044,10 @@ async fn dial_media(
 ///
 /// Returns whether at least one picture reached `slot`, which is what decides
 /// if the recovery budget is refreshed.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one pass over one received frame — count, acknowledge, report,               parse, hand to whichever side decodes — in the order it must happen"
+)]
 async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bool {
     let Some((connection, mut reader)) = dial_media(target).await else {
         return false;
@@ -2954,6 +3098,12 @@ async fn stream_once(target: &MediaTarget, slot: &watch::Sender<ViewSlot>) -> bo
         if let Some(report) = window.due() {
             send_report(target, report);
             target.bitstream.note_path(path_source.path_snapshot());
+        }
+        // A header with no picture is a frame the host's encoder skipped to
+        // hold its bitrate, which hosts before ADR 0144 still sent: nothing
+        // was lost and nothing is wrong.
+        if payload.len() == MEDIA_PAYLOAD_HEADER_BYTES {
+            continue;
         }
         let Some(encoded) = decode_media_payload(&payload) else {
             tracing::warn!(peer = %target.tag, "dropping a malformed media payload");
@@ -4947,6 +5097,48 @@ mod tests {
         );
     }
 
+    /// ADR 0144: a link whose acknowledgements arrive steadily keeps the
+    /// slack of ADR 0139; one whose round trip swings is given twice its
+    /// swing, up to the bound.
+    #[test]
+    fn a_jittery_link_widens_the_slack_up_to_its_bound() {
+        let interval = frame_interval(30);
+        let steady = FrameAcks::default();
+        steady.opened();
+        let start = Instant::now();
+        for frame in 0..40u64 {
+            let sent = start + ms(frame * 33);
+            steady.sent(sent);
+            steady.acked(frame + 1, sent + ms(110));
+        }
+        assert_eq!(steady.slack(interval), queue_slack(interval));
+
+        // 215 to 311 ms, as the 2026-10-07 path measured.
+        let jittery = FrameAcks::default();
+        jittery.opened();
+        for frame in 0..40u64 {
+            let sent = start + ms(frame * 33);
+            jittery.sent(sent);
+            let delay = if frame % 2 == 0 { 215 } else { 311 };
+            jittery.acked(frame + 1, sent + ms(delay));
+        }
+        let slack = jittery.slack(interval);
+        assert!(
+            slack > ms(MEDIA_QUEUE_SLACK_MAX_MS) && slack <= ms(MEDIA_QUEUE_JITTER_SLACK_MAX_MS),
+            "a link swinging by 96 ms got a slack of {slack:?}"
+        );
+
+        let wild = FrameAcks::default();
+        wild.opened();
+        for frame in 0..40u64 {
+            let sent = start + ms(frame * 33);
+            wild.sent(sent);
+            let delay = if frame % 2 == 0 { 100 } else { 1_100 };
+            wild.acked(frame + 1, sent + ms(delay));
+        }
+        assert_eq!(wild.slack(interval), ms(MEDIA_QUEUE_JITTER_SLACK_MAX_MS));
+    }
+
     /// A capturer whose every frame is stamped with when it was taken, against
     /// `epoch`, so the far end can tell how old a picture is when it lands.
     #[derive(Debug)]
@@ -5092,5 +5284,194 @@ mod tests {
             fresh < ms(400),
             "an acknowledging guest was shown a picture {fresh:?} old (without: {queued:?})"
         );
+    }
+
+    /// An encoder that takes `took` over every picture, and hands back an
+    /// empty frame for every `skip_every`-th — what `openh264` does when its
+    /// rate control skips one.
+    struct SlowEncoder {
+        took: Duration,
+        skip_every: u32,
+        count: u32,
+    }
+
+    impl VideoEncoder for SlowEncoder {
+        fn encode(&mut self, frame: &Frame) -> lumepeer_media::Result<EncodedFrame> {
+            std::thread::sleep(self.took);
+            self.count += 1;
+            let skipped = self.skip_every > 0 && self.count.is_multiple_of(self.skip_every);
+            Ok(EncodedFrame {
+                keyframe: self.count == 1,
+                timestamp_us: frame.timestamp_us,
+                data: if skipped { Vec::new() } else { vec![7; 2_000] },
+            })
+        }
+
+        fn set_bitrate(&mut self, _bitrate_kbps: u32) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn request_keyframe(&mut self) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn kind(&self) -> lumepeer_media::encode::EncoderKind {
+            lumepeer_media::encode::EncoderKind::SoftwareOpenH264
+        }
+    }
+
+    /// Serves a host encode loop with `encoder` to a guest that reads
+    /// `reads` payloads as fast as they come, and returns them with how long
+    /// that took.
+    async fn read_from_a_host(encoder: SlowEncoder, reads: usize) -> (Vec<Vec<u8>>, Duration) {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        let guest_side = dialed.unwrap();
+        let host_side = accepted.unwrap().unwrap();
+
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(ChangingCapturer),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let (faults, _faults_rx) = mpsc::channel(4);
+        let encoder = std::sync::Mutex::new(Some(encoder));
+        let task = spawn_encode_loop_with(
+            host_side,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            EncodeControl::new(peer, None),
+            move |_| {
+                let encoder = encoder.lock().unwrap().take().unwrap();
+                Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
+            },
+        );
+
+        let mut reader = accept_media_stream(&guest_side).await.unwrap();
+        // The first payload waits on the connection and the first capture;
+        // the clock starts once frames are flowing.
+        let mut payloads = vec![reader.read_frame().await.unwrap()];
+        let started = Instant::now();
+        while payloads.len() <= reads {
+            payloads.push(reader.read_frame().await.unwrap());
+        }
+        let took = started.elapsed();
+        task.abort();
+        (payloads, took)
+    }
+
+    /// ADR 0144: an encoder slower than the frame interval used to be
+    /// followed by a skipped interval after every frame, because the writer
+    /// it had just handed the frame to had not run yet. Now the loop waits
+    /// for it, and the frame rate is the encoder's own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_encoder_slower_than_the_interval_sets_the_frame_rate_alone() {
+        let took = ms(30);
+        let (_, elapsed) = read_from_a_host(
+            SlowEncoder {
+                took,
+                skip_every: 0,
+                count: 0,
+            },
+            30,
+        )
+        .await;
+        let per_frame = elapsed / 30;
+        eprintln!("an encoder taking {took:?} a frame delivered one every {per_frame:?}");
+        // The default 60 fps interval is 16.7 ms: a skipped interval after
+        // every frame made it 47 ms.
+        assert!(
+            per_frame < ms(40),
+            "a frame every {per_frame:?} from an encoder that takes {took:?}"
+        );
+    }
+
+    /// ADR 0144: a preset named before the stream opens is the rate the
+    /// encoder is built for, so the stream opens with one keyframe rather
+    /// than one for the display's rate and another for the preset's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_preset_named_before_the_stream_builds_the_encoder_once() {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        let guest_side = dialed.unwrap();
+        let host_side = accepted.unwrap().unwrap();
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(ChangingCapturer),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let control = EncodeControl::new(peer, None);
+        control.set_manual_cap(Some(100));
+        control.set_fps_cap(Some(30));
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        let (faults, _faults_rx) = mpsc::channel(4);
+        let task = spawn_encode_loop_with(
+            host_side,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            control,
+            move |config| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(
+                    config.fps, 30,
+                    "built for the display's rate, not the preset's"
+                );
+                Ok(Box::new(StampEncoder { bytes: 500 }) as Box<dyn VideoEncoder>)
+            },
+        );
+        let mut reader = accept_media_stream(&guest_side).await.unwrap();
+        for _ in 0..10 {
+            reader.read_frame().await.unwrap();
+        }
+        task.abort();
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
+
+    /// ADR 0144: a frame the encoder skipped is not sent at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_the_encoder_skipped_is_not_sent() {
+        let (payloads, _) = read_from_a_host(
+            SlowEncoder {
+                took: Duration::ZERO,
+                skip_every: 2,
+                count: 0,
+            },
+            10,
+        )
+        .await;
+        for payload in &payloads {
+            assert!(
+                decode_media_payload(payload).is_some(),
+                "a payload of {} bytes reached the guest",
+                payload.len()
+            );
+        }
     }
 }
