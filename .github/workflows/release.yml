@@ -425,6 +425,21 @@ jobs:
           "${PYTHON}" ci/find-libaom-asm.py \
             "target/${{ matrix.target }}/release/build/lumepeer-aom-sys-*/out/build" \
             "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
+      # ADR 0149: libopus comes out optimised on Windows only because the
+      # runner has ninja, and the build script stops a release build without
+      # it. This reads what the build left: the Release flags of every
+      # CMake-built library, libaom's included where it is built (ADR 0146).
+      - name: Check the CMake-built libraries are optimised
+        if: '!cancelled()'
+        shell: bash
+        run: |
+          BUILD="target/${{ matrix.target }}/release/build"
+          DIRS=("${BUILD}/opusic-sys-*/out/build")
+          if [ "${{ matrix.aom }}" = "true" ]; then
+            DIRS+=("${BUILD}/lumepeer-aom-sys-*/out/build")
+          fi
+          PYTHON="$(command -v python3 || command -v python)"
+          "${PYTHON}" ci/check-cmake-optimised.py "${DIRS[@]}"
       # The build signs silently or not at all, so the row says which it was:
       # a bundle whose requirement names no certificate would lose every
       # grant again on the next update (ADR 0128).

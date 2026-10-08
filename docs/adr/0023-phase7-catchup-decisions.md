@@ -3,6 +3,7 @@
 
 Status: accepted
 Date: 2026-08-22
+Amended by: ADR 0149 (§5: libopus now comes through `opusic-sys`; on Windows a release build needs `ninja` on PATH, or libopus is compiled unoptimised)
 
 ## Context
 

@@ -1,10 +1,11 @@
 //! Opus audio codec (design doc §5.1, §11; ADR 0023).
 //!
 //! §5.1 names Opus the only audio codec. The binding crate is `opus` over
-//! `audiopus_sys`, which vendors libopus and builds it with cmake — the same
+//! `opusic-sys`, which vendors libopus and builds it with cmake — the same
 //! vendored-build precedent as `openh264` — so a default workspace build
-//! needs no system SDK. The whole module sits behind the `audio-opus`
-//! feature: without it every entry point returns
+//! needs no system SDK. On Windows it must find `ninja` to come out
+//! optimised (ADR 0149; see this crate's `build.rs`). The whole module sits
+//! behind the `audio-opus` feature: without it every entry point returns
 //! [`MediaError::AudioUnavailable`] instead of silently passing silence.
 //!
 //! The wire parameters are fixed in [`crate::constants`]
