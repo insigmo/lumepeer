@@ -18,7 +18,7 @@ use tauri::Window;
 
 use crate::AppState;
 use lumepeer_runtime::net_errors::classify_net;
-use lumepeer_runtime::network::{ActorError, SessionStateDto};
+use lumepeer_runtime::network::{ActorError, ActorHandle, SessionStateDto};
 use lumepeer_runtime::view::TerminalWindow;
 
 /// Label of the window allowed to call the session/invite/license commands.
@@ -3870,6 +3870,11 @@ fn update_error(error: &tauri_plugin_updater::Error) -> IpcError {
 }
 
 /// Builds the updater against the configured channel's manifest (ADR 0042).
+///
+/// On Windows, installing hands the process to the installer and exits it on
+/// the spot. The hook is the last moment before that, after the installer is
+/// on disk: every peer is told this process is restarting (ADR 0148), so a
+/// guest dials the new one at once instead of finding out from a timeout.
 fn updater(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -3884,11 +3889,33 @@ fn updater(
         code: "UPDATE_OFF",
         message: "the configured update endpoint is not a URL".to_owned(),
     })?;
+    let network = state.network.clone();
     app.updater_builder()
         .endpoints(vec![parsed])
         .map_err(|error| update_error(&error))?
+        .on_before_exit(move || announce_restart_blocking(&network))
         .build()
         .map_err(|error| update_error(&error))
+}
+
+/// Tells every peer this process is restarting into an update, and waits for
+/// the word to leave (ADR 0148).
+async fn announce_restart(network: &ActorHandle) {
+    if let Err(error) = network.announce_restart().await {
+        tracing::warn!(
+            ?error,
+            "could not tell the peers this process is restarting"
+        );
+    }
+}
+
+/// [`announce_restart`] from the updater's synchronous hook.
+///
+/// The hook runs inside `install`, on a worker of the async runtime that the
+/// actor needs too: `block_in_place` hands this worker's other tasks on, so
+/// waiting here does not stop the actor from doing what is waited for.
+fn announce_restart_blocking(network: &ActorHandle) {
+    tokio::task::block_in_place(|| tauri::async_runtime::block_on(announce_restart(network)));
 }
 
 /// Asks the configured channel whether a newer release exists (§21; ADR 0042).
@@ -3938,6 +3965,16 @@ pub async fn update_install(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    // e2e only: what the Windows updater does once its installer is on disk —
+    // the hook, then the exit — with no release to install (ADR 0148).
+    // `silent` leaves the hook out, as every build before it did.
+    #[cfg(all(debug_assertions, feature = "pilot"))]
+    if let Some(fake) = std::env::var_os("LUMEPEER_E2E_FAKE_UPDATE") {
+        if fake != "silent" {
+            announce_restart_blocking(&state.network);
+        }
+        std::process::exit(0);
+    }
     let updater = updater(&app, &state)?;
     let Some(update) = updater
         .check()
@@ -3965,6 +4002,7 @@ pub async fn update_install(
     #[cfg(target_os = "linux")]
     {
         tracing::info!("restarting into the installed update");
+        announce_restart(&state.network).await;
         app.request_restart();
     }
     Ok(())

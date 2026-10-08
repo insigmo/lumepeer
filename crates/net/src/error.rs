@@ -134,4 +134,6 @@ pub mod close_code {
     pub const RESUME_REFUSED: &str = "RESUME_REFUSED";
     /// A guest checked the host is there and asked for nothing (ADR 0127).
     pub const PRESENCE: &str = "PRESENCE";
+    /// This process is restarting into an update (ADR 0148).
+    pub const RESTARTING: &str = "RESTARTING";
 }
