@@ -114,11 +114,21 @@ pub(crate) struct MonitorRect {
 /// guest the whole list.
 pub(crate) fn monitor_rects(connection: &RustConnection, screen: &Screen) -> Vec<MonitorRect> {
     let fallback = || {
+        // The size in the connection setup is the screen as it was when that
+        // connection opened, and X never updates it. The capturer and the
+        // injector keep theirs open through resizes, so the root is asked.
+        let (width, height) = connection
+            .get_geometry(screen.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map_or((screen.width_in_pixels, screen.height_in_pixels), |root| {
+                (root.width, root.height)
+            });
         vec![MonitorRect {
             x: 0,
             y: 0,
-            width: screen.width_in_pixels,
-            height: screen.height_in_pixels,
+            width,
+            height,
             primary: true,
         }]
     };
@@ -532,7 +542,11 @@ pub fn set_display_mode_for(
 #[derive(Debug)]
 struct Active {
     connection: RustConnection,
-    root: u32,
+    /// The connection setup's copy of the screen; its root is what
+    /// `GetImage` reads.
+    screen: Screen,
+    /// The monitor the guest asked for, re-resolved on every grab.
+    target: CaptureTarget,
     /// Left edge of the captured monitor on the root window. Non-zero on
     /// every head but the leftmost: `GetImage` reads the root, so the
     /// monitor a guest picked is a crop out of it (ADR 0028).
@@ -649,7 +663,8 @@ impl ScreenCapturer for X11Capturer {
         }
 
         self.active = Some(Active {
-            root: screen.root,
+            screen,
+            target,
             origin_x: monitor.x,
             origin_y: monitor.y,
             width: monitor.width,
@@ -757,6 +772,39 @@ impl ScreenCapturer for X11Capturer {
 }
 
 impl Active {
+    /// Re-resolves the captured monitor against the display as it is now.
+    ///
+    /// The rectangle is not a constant of the run: this host's own
+    /// display-mode switch (ADR 0048), an `xrandr` mode change or a VM window
+    /// resized under open-vm-tools' autofit all change it under a running
+    /// capture. Kept from `start`, a root that shrank turned every `GetImage`
+    /// into a `BadMatch` that ended the stream, and a monitor that changed
+    /// size went on being sent as its old crop of the root — a picture the
+    /// injector, which follows the live monitor, no longer agrees with. Two
+    /// small `RandR` round trips per frame, beside a `GetImage` of the whole
+    /// monitor.
+    fn follow_monitor(&mut self) {
+        let monitor = X11Capturer::monitor(&self.connection, &self.screen, self.target);
+        if (monitor.x, monitor.y, monitor.width, monitor.height)
+            == (self.origin_x, self.origin_y, self.width, self.height)
+        {
+            return;
+        }
+        tracing::info!(
+            x = monitor.x,
+            y = monitor.y,
+            width = monitor.width,
+            height = monitor.height,
+            "the captured monitor moved or changed size: capturing it as it is now"
+        );
+        self.origin_x = monitor.x;
+        self.origin_y = monitor.y;
+        self.width = monitor.width;
+        self.height = monitor.height;
+        // A picture of another size is a new picture, whatever it hashes to.
+        self.last_hash = None;
+    }
+
     /// One `GetImage` of the captured monitor, with the pointer read as it
     /// is now, and the hash §11.1's change check compares.
     ///
@@ -764,11 +812,12 @@ impl Active {
     /// what "changed" means: a cursor moving over an otherwise still screen
     /// is a picture the viewer sees change.
     fn grab(&mut self) -> Result<(Vec<u8>, [u8; 32])> {
+        self.follow_monitor();
         let reply = self
             .connection
             .get_image(
                 ImageFormat::Z_PIXMAP,
-                self.root,
+                self.screen.root,
                 self.origin_x,
                 self.origin_y,
                 self.width,
@@ -978,9 +1027,21 @@ const F_KEY_LOGICAL_LAST: u32 = F_KEY_LOGICAL_FIRST + F_KEY_COUNT - 1;
 #[derive(Debug)]
 pub struct X11Injector {
     connection: RustConnection,
-    root: u32,
-    width: u16,
-    height: u16,
+    /// The connection setup's copy of the screen, for its root.
+    screen: Screen,
+    /// Where moves land: the primary monitor, re-resolved on every
+    /// `PointerMove`. The monitor rather than the root window, because a
+    /// guest normalizes against the picture, and the picture is that
+    /// monitor's crop of the root ([`Active::grab`]); across a multi-head
+    /// root a move to the middle of the picture landed on the seam between
+    /// two heads. The primary rather than whichever monitor a guest picked,
+    /// because nothing tells an injector about `MonitorSelect` — the same gap
+    /// the Windows and macOS injectors have. Read once at `connect`, it went
+    /// stale at the first mode switch, and every move then landed scaled by
+    /// the old size — right at the top-left, ever further off towards the
+    /// bottom-right. [`monitor_rects`] never yields a zero-sized rectangle,
+    /// so a re-read cannot leave nothing to scale against.
+    monitor: MonitorRect,
     /// The host's own keyboard layout, as `keysym -> (keycode, shift level)`.
     /// Read once at connect: this is what lets a guest's character be typed on
     /// whatever layout the host happens to have loaded.
@@ -1027,10 +1088,10 @@ impl X11Injector {
         };
 
         let (layout, scratch) = read_layout(&connection);
+        let monitor = X11Capturer::monitor(&connection, &screen, CaptureTarget::PrimaryDisplay);
         Ok(Self {
-            root: screen.root,
-            width: screen.width_in_pixels,
-            height: screen.height_in_pixels,
+            screen,
+            monitor,
             connection,
             layout,
             scratch,
@@ -1042,7 +1103,7 @@ impl X11Injector {
         use x11rb::protocol::xtest::ConnectionExt as _;
 
         self.connection
-            .xtest_fake_input(type_, detail, 0, self.root, x, y, 0)
+            .xtest_fake_input(type_, detail, 0, self.screen.root, x, y, 0)
             .map_err(|e| MediaError::InputUnavailable(e.to_string()))?
             .check()
             .map_err(|e| MediaError::InputUnavailable(e.to_string()))?;
@@ -1053,6 +1114,14 @@ impl X11Injector {
     fn to_screen(value: u16, extent: u16) -> i16 {
         let scaled = u32::from(value) * u32::from(extent) / POINTER_RANGE;
         i16::try_from(scaled).unwrap_or(i16::MAX)
+    }
+
+    /// Maps a normalized position onto `monitor`, in root coordinates.
+    fn onto(monitor: MonitorRect, x: u16, y: u16) -> (i16, i16) {
+        (
+            monitor.x.saturating_add(Self::to_screen(x, monitor.width)),
+            monitor.y.saturating_add(Self::to_screen(y, monitor.height)),
+        )
     }
 
     /// X11 keycode for a guest scancode. Guests send physical scancodes, never
@@ -1311,12 +1380,15 @@ fn read_layout(
 impl InputInjector for X11Injector {
     fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
         match event.detail {
-            InputDetail::PointerMove { x, y } => self.fake(
-                MOTION_NOTIFY,
-                0,
-                Self::to_screen(x, self.width),
-                Self::to_screen(y, self.height),
-            ),
+            InputDetail::PointerMove { x, y } => {
+                self.monitor = X11Capturer::monitor(
+                    &self.connection,
+                    &self.screen,
+                    CaptureTarget::PrimaryDisplay,
+                );
+                let (x, y) = Self::onto(self.monitor, x, y);
+                self.fake(MOTION_NOTIFY, 0, x, y)
+            }
             InputDetail::Wheel { dx, dy } => {
                 // X11 has no wheel axis: a scroll is a button click per notch.
                 for (delta, negative, positive) in [
@@ -1540,6 +1612,17 @@ mod tests {
         assert_eq!(X11Injector::to_screen(32_767, 1920), 959);
     }
 
+    /// A move lands on the monitor the picture shows, offset to where that
+    /// monitor sits on the root — not scaled across the whole root.
+    #[test]
+    fn normalized_coordinates_map_onto_the_monitor_at_its_origin() {
+        // A 1280x1080 head to the right of a 1920-wide one.
+        let head = rect(1920, 1280, true);
+        assert_eq!(X11Injector::onto(head, 0, 0), (1920, 0));
+        assert_eq!(X11Injector::onto(head, 32_767, 32_767), (2559, 539));
+        assert_eq!(X11Injector::onto(head, u16::MAX, u16::MAX), (3200, 1080));
+    }
+
     #[test]
     fn scancodes_and_buttons_map_into_the_x11_ranges() {
         // evdev KEY_A is 30, X11 keycode 38.
@@ -1658,13 +1741,27 @@ mod tests {
 
         let before = injector
             .connection
-            .query_pointer(injector.root)
+            .query_pointer(injector.screen.root)
             .unwrap()
             .reply()
             .unwrap();
-        let normalize = |value: i16, extent: u16| -> u16 {
-            u16::try_from(u32::from(value.unsigned_abs()) * POINTER_RANGE / u32::from(extent))
-                .unwrap_or(u16::MAX)
+        let monitor = injector.monitor;
+        // Moves land on the primary monitor, so only a pointer already on it
+        // can be put back exactly where it is.
+        let offset = |value: i16, origin: i16, extent: u16| {
+            u16::try_from(value - origin)
+                .ok()
+                .filter(|offset| *offset < extent)
+        };
+        let (Some(x), Some(y)) = (
+            offset(before.root_x, monitor.x, monitor.width),
+            offset(before.root_y, monitor.y, monitor.height),
+        ) else {
+            eprintln!("skipping: the pointer is not on the primary monitor");
+            return;
+        };
+        let normalize = |value: u16, extent: u16| -> u16 {
+            u16::try_from(u32::from(value) * POINTER_RANGE / u32::from(extent)).unwrap_or(u16::MAX)
         };
         injector
             .inject(&InputEventPayload {
@@ -1672,15 +1769,15 @@ mod tests {
                 scancode: 0,
                 modifiers: 0,
                 detail: InputDetail::PointerMove {
-                    x: normalize(before.root_x, injector.width),
-                    y: normalize(before.root_y, injector.height),
+                    x: normalize(x, monitor.width),
+                    y: normalize(y, monitor.height),
                 },
             })
             .unwrap();
 
         let after = injector
             .connection
-            .query_pointer(injector.root)
+            .query_pointer(injector.screen.root)
             .unwrap()
             .reply()
             .unwrap();
@@ -1893,5 +1990,111 @@ mod tests {
             modes.contains(&current),
             "current mode {current:?} is not among the announced modes {modes:?}"
         );
+    }
+
+    /// The screen changing under a running session: this host's own
+    /// display-mode switch (ADR 0048), which moves only the CRTC; an `xrandr`
+    /// mode change or a VM window resized under open-vm-tools' autofit, which
+    /// resize the root window with it; and the way back up. The injector and
+    /// the capturer both live for the whole run, and both used to keep the
+    /// monitor's rectangle from when they started: moves landed scaled by
+    /// the old size — exact at the top-left, ever further off towards the
+    /// bottom-right — and the picture stayed the old crop, or ended on a
+    /// `BadMatch` once the root shrank under it.
+    ///
+    /// It switches the primary monitor's mode for real, so it has an opt-in
+    /// of its own, separate from `LUMEPEER_TEST_XTEST`: run it against a
+    /// disposable single-head server (`Xvnc` offers a dozen modes; `Xvfb`
+    /// cannot change any), never a desktop someone is using. The original
+    /// mode is put back before anything is asserted.
+    #[test]
+    fn moves_and_frames_follow_the_screen_through_a_mode_switch() {
+        use x11rb::protocol::randr::ConnectionExt as _;
+        use x11rb::protocol::xproto::ConnectionExt as _;
+
+        if std::env::var("LUMEPEER_TEST_X11_RESIZE").as_deref() != Ok("1") {
+            eprintln!("skipping: set LUMEPEER_TEST_X11_RESIZE=1 against a disposable X server");
+            return;
+        }
+        let target = CaptureTarget::PrimaryDisplay;
+        let original = current_display_mode_for(target).expect("the current mode");
+        let smaller = display_modes_for(target)
+            .into_iter()
+            .find(|mode| mode.width < original.width && mode.height < original.height)
+            .expect("a mode smaller than the current one");
+
+        let (connection, screen_num) = x11rb::connect(None).unwrap();
+        let root = connection.setup().roots[screen_num].root;
+        let resize_root = |mode: crate::capture::DisplayMode| {
+            let pixels = |value: u32| u16::try_from(value).unwrap();
+            // 96 dpi; the physical size is only ever shown, never used here.
+            let millimetres = |value: u32| value * 254 / 960;
+            connection
+                .randr_set_screen_size(
+                    root,
+                    pixels(mode.width),
+                    pixels(mode.height),
+                    millimetres(mode.width),
+                    millimetres(mode.height),
+                )
+                .unwrap()
+                .check()
+                .unwrap();
+        };
+
+        let mut injector = X11Injector::connect().unwrap();
+        let mut capturer = X11Capturer::new();
+        capturer.start(target).unwrap();
+        assert!(capturer.next_frame().unwrap().is_some());
+
+        // Where a move to the middle of the picture lands, and the size of
+        // the picture, as the screen is right now.
+        let mut observe = |label: &'static str, mode: crate::capture::DisplayMode| {
+            let moved = injector.inject(&InputEventPayload {
+                logical: 0,
+                scancode: 0,
+                modifiers: 0,
+                detail: InputDetail::PointerMove {
+                    x: u16::MAX / 2,
+                    y: u16::MAX / 2,
+                },
+            });
+            let pointer = connection.query_pointer(root).unwrap().reply().unwrap();
+            let frame = capturer.snapshot().map(|frame| (frame.width, frame.height));
+            (
+                label,
+                mode,
+                moved.is_ok(),
+                (pointer.root_x, pointer.root_y),
+                frame,
+            )
+        };
+
+        let mut seen = Vec::new();
+        set_display_mode_for(target, smaller).unwrap();
+        seen.push(observe("the CRTC shrank, the root did not", smaller));
+        resize_root(smaller);
+        seen.push(observe("the root shrank with it", smaller));
+        resize_root(original);
+        set_display_mode_for(target, original).unwrap();
+        seen.push(observe("both grew back", original));
+
+        for (label, mode, moved, (x, y), frame) in seen {
+            assert!(moved, "{label}: the move was refused");
+            let (cx, cy) = (
+                i32::try_from(mode.width / 2).unwrap(),
+                i32::try_from(mode.height / 2).unwrap(),
+            );
+            // Rounding through the normalized range costs at most one pixel.
+            assert!(
+                (i32::from(x) - cx).abs() <= 1 && (i32::from(y) - cy).abs() <= 1,
+                "{label}: a move to the middle landed at ({x}, {y}), not ({cx}, {cy})"
+            );
+            assert_eq!(
+                frame,
+                Some((mode.width, mode.height)),
+                "{label}: the picture is not the screen as it is now"
+            );
+        }
     }
 }
