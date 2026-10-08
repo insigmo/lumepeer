@@ -75,9 +75,18 @@ fn main() {
         // be assembled for that too (`-DPIC`), not only the C.
         aom.define("CONFIG_PIC", "1");
     }
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // With Visual Studio's generator the `cmake` crate sets
+        // `CMAKE_<LANG>_FLAGS_RELEASE` itself, to the CRT switch and nothing
+        // more, and CMake's `/O2 /Ob2 /DNDEBUG` are gone: libaom's C built
+        // unoptimised with its asserts on, the encoder twice as slow as the
+        // one measured (ADR 0146). Flags given here lead that list.
+        aom.cflag("/O2 /Ob2 /DNDEBUG").cxxflag("/O2 /Ob2 /DNDEBUG");
+    }
     let dst = aom.build();
 
     check_configuration(&dst.join("build").join("config").join("aom_config.h"));
+    check_optimised(&dst.join("build").join("CMakeCache.txt"));
 
     let include = dst.join("include");
     // Compiled before libaom is named, so a single-pass linker sees the shim
@@ -179,4 +188,23 @@ fn check_configuration(header: &Path) {
             header.display()
         );
     }
+}
+
+/// Stops the build unless libaom's C is compiled optimised and without its
+/// asserts, as the measured one was (ADR 0146).
+fn check_optimised(cache: &Path) {
+    let text = std::fs::read_to_string(cache)
+        .unwrap_or_else(|error| panic!("cannot read libaom's {}: {error}", cache.display()));
+    let flags = text
+        .lines()
+        .find_map(|line| line.strip_prefix("CMAKE_C_FLAGS_RELEASE:"))
+        .and_then(|rest| rest.split_once('='))
+        .map_or("", |(_, value)| value);
+    let has = |wanted: &[&str]| flags.split_whitespace().any(|flag| wanted.contains(&flag));
+    assert!(
+        has(&["/O2", "-O2", "-O3"]) && has(&["/DNDEBUG", "-DNDEBUG"]),
+        "libaom's release C flags are `{flags}` ({}): not optimised, or with its asserts on. \
+         The encoder would be about twice as slow as the one ADR 0141 measured.",
+        cache.display()
+    );
 }
