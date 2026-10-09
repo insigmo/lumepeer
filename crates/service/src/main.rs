@@ -20,9 +20,12 @@
 //! - **Fixed frames.** Two bytes in, two bytes out, so a short read is an
 //!   error rather than a state to reassemble.
 //!
-//! Off Windows this binary exits with an explanation. There is no SAS
-//! mechanism on Linux or macOS, so a root daemon there would hold privileges
-//! in order to do nothing, which is worse than not shipping one (ADR 0043).
+//! Off Windows there is no SAS mechanism, so a root daemon there would hold
+//! privileges in order to do nothing, which is worse than not shipping one
+//! (ADR 0043). The one exception is the Linux sign-in screen's supervisor
+//! (`--logon-supervisor`, ADR 0151), which systemd runs to decide when the
+//! logon host stands in front of the sign-in screen; without that flag this
+//! binary still exits with an explanation.
 
 #![cfg_attr(not(target_os = "windows"), forbid(unsafe_code))]
 #![allow(
@@ -36,6 +39,8 @@ mod install;
 mod logon_host_launch;
 #[cfg(target_os = "windows")]
 mod logon_screen_worker;
+#[cfg(target_os = "linux")]
+mod logon_supervisor;
 #[cfg(target_os = "windows")]
 mod secure_desktop;
 #[cfg(target_os = "windows")]
@@ -152,6 +157,14 @@ fn main() {
             return;
         }
         windows_service::dispatch();
+    }
+
+    // The sign-in screen's supervisor (ADR 0151), run by systemd as
+    // `lumepeer-logon.service`.
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == "--logon-supervisor") {
+        logon_supervisor::run();
+        return;
     }
 
     #[cfg(not(target_os = "windows"))]

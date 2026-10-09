@@ -422,7 +422,7 @@ export const en: Dictionary = {
   'unattended.totp.done': 'Done',
   'unattended.role.label': 'A device that logs in this way gets',
   'unattended.needsTrust': 'Set a device password first.',
-  'unattended.logonScreen.label': 'Also at the Windows sign-in screen',
+  'unattended.logonScreen.label': 'Also at the sign-in screen',
   'unattended.logonScreen.note':
     'After a restart or a sign-out, a guest with the device password sees the sign-in screen and can sign in. Nothing on that screen shows that somebody is connected.',
   'book.heading': 'Saved devices',

@@ -20,6 +20,13 @@ rand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# The Linux sign-in screen's supervisor (ADR 0151): who is on the other end of
+# the enrolment socket (`SO_PEERCRED`), its own euid, and a `SIGTERM` to the
+# logon host — all safe wrappers, so this side keeps `forbid(unsafe_code)`.
+# Already in the tree at this version.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["net", "process"] }
+
 # Raw Win32: a Windows service has no safe entry point — `StartServiceCtrl
 # DispatcherW` is the only way a process becomes one — and a named pipe with a
 # restrictive DACL has no safe binding either. Same major version the rest of

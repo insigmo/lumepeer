@@ -31,8 +31,10 @@ pub mod frame;
 #[cfg(target_os = "windows")]
 pub mod host_role;
 pub mod log;
+pub mod logon_enroll;
 #[cfg(target_os = "windows")]
 pub mod logon_screen;
+pub mod logon_seat;
 #[cfg(target_os = "windows")]
 pub mod machine_store;
 #[cfg(target_os = "windows")]

@@ -38,6 +38,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Directory the log file lives in, under `%ProgramData%`.
+#[cfg(target_os = "windows")]
 const DIRECTORY: &str = r"Lumepeer\logs";
 
 /// The helper service's own file (`crates/service`'s binary).
@@ -166,8 +167,9 @@ fn prepare(path: &std::path::Path) -> Option<()> {
     secured.then_some(())
 }
 
-/// Creates the directory `path` goes in. Off Windows this crate runs no
-/// service, and the directory is only ever a developer's.
+/// Creates the directory `path` goes in. Off Windows the one writer is the
+/// logon host running as `root` (ADR 0151), into a directory under `/var/log`
+/// or `/Library/Logs`, where only administrators create anything.
 #[cfg(not(target_os = "windows"))]
 fn prepare(path: &std::path::Path) -> Option<()> {
     std::fs::create_dir_all(path.parent()?).ok()
@@ -179,13 +181,26 @@ fn prepare(path: &std::path::Path) -> Option<()> {
 /// resolve to the same place, unlike anything under a user profile. The
 /// literal fallback is for the case where the variable is missing from a
 /// service's environment, which it should not be.
+#[cfg(target_os = "windows")]
 fn directory() -> PathBuf {
     std::env::var_os("ProgramData")
         .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
         .join(DIRECTORY)
 }
 
-#[cfg(test)]
+/// Where the logon host logs on macOS (ADR 0151).
+#[cfg(target_os = "macos")]
+fn directory() -> PathBuf {
+    PathBuf::from("/Library/Logs/Lumepeer")
+}
+
+/// Where the logon host logs on Linux (ADR 0151).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn directory() -> PathBuf {
+    PathBuf::from("/var/log/lumepeer")
+}
+
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
 

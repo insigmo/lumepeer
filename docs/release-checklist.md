@@ -183,6 +183,39 @@ sign-in screen" is then on by itself (ADR 0133).
 - [ ] A guest whose unattended role is view-only sees the sign-in screen and
       cannot type into it.
 
+### Hosting the sign-in screen on Linux and macOS (ADR 0151)
+
+None of this has run. On Linux the package installs and enables
+`lumepeer-logon.service`; the owner ticks "Also at the sign-in screen" from the
+settings panel, which enrols their credentials with the supervisor.
+
+- [ ] **Linux, X11 greeter** (LightDM, SDDM-on-X11, or GDM forced to Xorg).
+      With the box ticked, reboot. Before anybody signs in,
+      `/var/log/lumepeer/lumepeer-logon-host.log` says "hosting the sign-in
+      screen" and the guest's saved host connects with the device password.
+      The guest sees the greeter, moves the pointer, types the password and
+      signs in. At sign-in the host is stopped and the guest reconnects to the
+      client within a few seconds.
+- [ ] **Linux, GNOME/Wayland greeter (the known gap).** Same steps: expect the
+      guest to connect but get **no picture** (the guest is told there is no
+      capture backend). This confirms the X11 path works and the Wayland
+      greeter still needs the Mutter ScreenCast backend — not a regression.
+- [ ] **Linux, SSH login present.** With somebody logged in over SSH only (no
+      graphical session), the supervisor still hosts the greeter — an SSH login
+      must not count as "the owner is here".
+- [ ] **Linux, withdraw.** Untick the box: `logon_screen` reads false,
+      `/var/lib/lumepeer/secrets` is gone, and nothing is hosted after a reboot.
+- [ ] **Linux, uninstall.** Removing the package stops and deletes
+      `lumepeer-logon.service`; an upgrade leaves it running.
+- [ ] **macOS.** Install the LaunchWindow agent from
+      `packaging/macos-loginwindow-agent.plist` (fill in the owner's keystore
+      dir, copy to `/Library/LaunchAgents`, `chown root:wheel`). Sign out.
+      Check `/Library/Logs/Lumepeer/logon-agent.log`: does the host start, does
+      ScreenCaptureKit produce a frame of the login window on this macOS
+      version, and can a full-control guest type the password? If capture or
+      input is refused pre-login, record it — it decides whether the
+      agent+privileged-helper split (ADR 0151 "Not done") is needed.
+
 ### Locked and signed-out hosts (ADR 0133)
 
 A Windows host with a device password, and a full-control guest on another
