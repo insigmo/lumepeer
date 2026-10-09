@@ -1559,10 +1559,49 @@ fn logon_screen_status() -> Option<bool> {
         let account = crate::placement::protected_account()?;
         Some(lumepeer_service::program_data::logon_host_owner().as_deref() == Some(&*account))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
+        // The supervisor answers whether this account is the one it hosts
+        // with; a connection error means no supervisor runs, so the feature
+        // is unavailable rather than off (`None`, as on macOS below).
+        use lumepeer_service::logon_enroll::{Reply, Request, ask};
+        match ask(&Request::Status) {
+            Ok(Reply::Yours) => Some(true),
+            Ok(Reply::NotEnrolled | Reply::OtherOwner) => Some(false),
+            _ => None,
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // macOS has no runtime query for the LoginWindow agent's state yet;
+        // nothing to report here.
         None
     }
+}
+
+/// The five keystore entries a sign-in-screen host needs, read from this
+/// client's own keystore to hand to the Linux supervisor (ADR 0151).
+#[cfg(target_os = "linux")]
+fn owner_entries() -> Result<Vec<(String, Vec<u8>)>, String> {
+    use lumepeer_net::keystore::{
+        AUDIT_SALT_ENTRY, IDENTITY_ENTRY, UNATTENDED_PASSWORD_ENTRY, UNATTENDED_ROLE_ENTRY,
+        UNATTENDED_TOTP_ENTRY,
+    };
+
+    let keystore = lumepeer_net::keystore::open().map_err(|error| error.to_string())?;
+    let mut entries = Vec::new();
+    for entry in [
+        IDENTITY_ENTRY,
+        UNATTENDED_PASSWORD_ENTRY,
+        UNATTENDED_ROLE_ENTRY,
+        UNATTENDED_TOTP_ENTRY,
+        AUDIT_SALT_ENTRY,
+    ] {
+        if let Some(bytes) = keystore.load_secret(entry).map_err(|error| error.to_string())? {
+            entries.push((entry.to_owned(), bytes));
+        }
+    }
+    Ok(entries)
 }
 
 /// Argument of [`unattended_set_logon_screen`].
@@ -1628,7 +1667,33 @@ fn set_logon_screen(enabled: bool) -> Result<(), String> {
             Err("cannot save the sign-in screen setting".to_owned())
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux the credentials cannot be read at the sign-in screen (the
+        // keyring is locked until sign-in), so the client hands the
+        // supervisor a copy now (ADR 0151). Turning it off withdraws that
+        // copy. The supervisor keeps the owner across reboots, so this is a
+        // one-time choice, not something re-made every start.
+        use lumepeer_service::logon_enroll::{Reply, Request, ask};
+        let request = if enabled {
+            Request::Enroll(owner_entries()?)
+        } else {
+            Request::Withdraw
+        };
+        match ask(&request) {
+            Ok(Reply::Yours | Reply::NotEnrolled) => Ok(()),
+            Ok(Reply::OtherOwner) => {
+                Err("another account on this machine hosts the sign-in screen".to_owned())
+            }
+            Ok(Reply::Refused | Reply::Failed) => {
+                Err("the sign-in screen service refused the setting".to_owned())
+            }
+            Err(error) => Err(format!(
+                "the sign-in screen service is not running: {error}"
+            )),
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = enabled;
         Err("the sign-in screen is hosted on Windows only".to_owned())
@@ -1670,6 +1735,27 @@ pub fn host_logon_screen_unless_declined() {
                 );
             }
             None => tracing::warn!("cannot turn hosting the sign-in screen on"),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux never opts in on its own: the owner's copy can only be read
+        // while they are signed in, and enrolling silently would copy a
+        // password hash to a root-side file the owner never asked for. But
+        // if this account is *already* the one hosting it, refresh the copy
+        // so a changed password or role reaches the sign-in screen (ADR 0151).
+        use lumepeer_service::logon_enroll::{Reply, Request, ask};
+        if matches!(ask(&Request::Status), Ok(Reply::Yours)) {
+            match owner_entries() {
+                Ok(entries) => {
+                    if matches!(ask(&Request::Enroll(entries)), Ok(Reply::Yours)) {
+                        tracing::info!("refreshed the sign-in screen's copy of this account's credentials");
+                    } else {
+                        tracing::warn!("could not refresh the sign-in screen's copy");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "cannot read this account's credentials to refresh the sign-in screen copy"),
+            }
         }
     }
 }

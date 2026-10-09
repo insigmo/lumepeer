@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Lumepeer sign-in screen host for macOS (ADR 0151).
+
+  A pre-login launchd agent. launchd runs it as root in the LoginWindow
+  session when nobody is signed in, and unloads it the moment somebody signs
+  in, which is exactly the lifetime the sign-in-screen host wants. It starts
+  `lumepeer-desktop --logon-host`, which reads the owner's enrolled
+  credentials from the keystore directory named in LUMEPEER_LOGON_KEYSTORE
+  (the owner's own data directory `keystore`, ADR 0128) and hosts with that
+  identity and device password.
+
+  INSTALL (needs an administrator, so it cannot be a drag-install step):
+    1. Copy this file to /Library/LaunchAgents/io.insigmo.lumepeer.logon.plist
+    2. Replace __KEYSTORE_DIR__ below with the owner's keystore directory,
+       e.g. /Users/<owner>/Library/Application Support/io.insigmo.lumepeer/keystore
+    3. sudo chown root:wheel /Library/LaunchAgents/io.insigmo.lumepeer.logon.plist
+       sudo chmod 644       /Library/LaunchAgents/io.insigmo.lumepeer.logon.plist
+    4. It loads at the next sign-out/restart; no reboot is needed to install.
+
+  UNVERIFIED. ScreenCaptureKit pre-login is reported working from a
+  LoginWindow agent on macOS 14.4+ (Apple DTS), but was unreliable on macOS 15
+  for some developers, and is untested on this project's target (26.x). Apple
+  also advises against running a whole GUI app as root pre-login and suggests
+  an agent + privileged-helper split; if the single-process host proves
+  unworkable at the LoginWindow, that split is the fallback. See
+  docs/adr/0151-* and docs/release-checklist.md.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.insigmo.lumepeer.logon</string>
+
+    <key>LimitLoadToSessionType</key>
+    <string>LoginWindow</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Lumepeer.app/Contents/MacOS/lumepeer-desktop</string>
+        <string>--logon-host</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LUMEPEER_LOGON_KEYSTORE</key>
+        <string>__KEYSTORE_DIR__</string>
+    </dict>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/Lumepeer/logon-agent.log</string>
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/Lumepeer/logon-agent.log</string>
+</dict>
+</plist>

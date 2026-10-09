@@ -6,6 +6,34 @@
 # leave it alone.
 set -e
 
+# The sign-in screen's supervisor unit (ADR 0151), installed and enabled on
+# every install and upgrade -- a system unit, not a user choice, and inert
+# until an account opts in. See deb-postinst.sh for the full reasoning.
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    cat > /lib/systemd/system/lumepeer-logon.service <<'UNIT'
+[Unit]
+Description=Lumepeer sign-in screen host supervisor (ADR 0151)
+Documentation=https://github.com/insigmo/lumepeer
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lumepeer-service --logon-supervisor
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=lumepeer
+RuntimeDirectoryMode=0755
+StateDirectory=lumepeer
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload || true
+    systemctl enable --now lumepeer-logon.service || true
+fi
+
 if [ "$1" != "1" ]; then
     exit 0
 fi

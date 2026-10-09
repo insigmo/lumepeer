@@ -4319,6 +4319,7 @@ dependencies = [
  "percent-encoding",
  "postcard",
  "rand 0.10.2",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
@@ -4496,6 +4497,7 @@ name = "lumepeer-service"
 version = "0.0.137"
 dependencies = [
  "rand 0.10.2",
+ "rustix",
  "tracing",
  "tracing-subscriber",
  "windows 0.61.3",

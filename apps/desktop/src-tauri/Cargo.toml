@@ -125,6 +125,12 @@ winreg.workspace = true
 # depends on, so this is a new direct edge, not a new dependency version.
 clipboard-win.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `geteuid` for the sign-in screen host's "runs as root" check (ADR 0151).
+# A safe wrapper where the libc call is not, and already in the tree at this
+# version through other crates, so no new dependency enters `Cargo.lock`.
+rustix = { version = "1.1.4", features = ["process"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # `audio-capture-pipewire` sits here rather than in the shared section above
 # for the same reason `capture-x11` does: it is the Linux half of a feature

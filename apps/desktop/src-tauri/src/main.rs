@@ -21,6 +21,10 @@ mod logging;
 // signed in (ADR 0126). Windows only: the logon screen it hosts is Windows'.
 #[cfg(target_os = "windows")]
 mod logon_host;
+// This same binary, run as `root` on the sign-in screen while nobody is
+// signed in (ADR 0151). Linux and macOS: the Windows version is `logon_host`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod logon_host_unix;
 // Where the stores live: the profile, or where only administrators can write
 // (ADR 0123).
 mod placement;
@@ -753,6 +757,17 @@ fn main() {
         .any(|arg| arg == lumepeer_service::LOGON_HOST_ARG)
     {
         logon_host::run();
+    }
+    // The same flag on the other platforms (ADR 0151): this process is the
+    // sign-in screen's host, started as `root` by the system keeper while
+    // nobody is signed in. Before everything, for the reason the Windows
+    // branch is — it owns no tray, no window and no single-instance lock.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::LOGON_HOST_ARG)
+    {
+        logon_host_unix::run();
     }
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {
