@@ -106,8 +106,8 @@ fn default_output_id(enumerator: &IMMDeviceEnumerator) -> Option<String> {
         unsafe_code,
         reason = "IMMDeviceEnumerator is raw WASAPI with no safe binding"
     )]
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(wasapi::eRender, wasapi::eConsole) }
-        .ok()?;
+    let device =
+        unsafe { enumerator.GetDefaultAudioEndpoint(wasapi::eRender, wasapi::eConsole) }.ok()?;
     endpoint_id(&device)
 }
 

@@ -73,7 +73,9 @@ pub fn run() {
                 tracing::error!(%error, "cannot start the enrolment listener");
             }
         }
-        Err(error) => tracing::error!(%error, "cannot listen on {SOCKET_PATH}; no account can enroll"),
+        Err(error) => {
+            tracing::error!(%error, "cannot listen on {SOCKET_PATH}; no account can enroll")
+        }
     }
     tracing::info!("watching {SEAT} for the sign-in screen (ADR 0151)");
     supervise(&state, &changed);
@@ -150,7 +152,10 @@ fn handle(request: &Request, uid: u32, state: &Path) -> (Reply, bool) {
         },
         Request::Enroll(entries) => {
             if owner.is_some_and(|owner| owner != uid) {
-                tracing::info!(uid, "another account hosts the sign-in screen; enrolment refused");
+                tracing::info!(
+                    uid,
+                    "another account hosts the sign-in screen; enrolment refused"
+                );
                 return (Reply::OtherOwner, false);
             }
             if uid == 0 {
@@ -160,7 +165,11 @@ fn handle(request: &Request, uid: u32, state: &Path) -> (Reply, bool) {
             }
             match write_copy(state, uid, entries) {
                 Ok(()) => {
-                    tracing::info!(uid, entries = entries.len(), "the sign-in screen will be hosted with this account's copy");
+                    tracing::info!(
+                        uid,
+                        entries = entries.len(),
+                        "the sign-in screen will be hosted with this account's copy"
+                    );
                     (Reply::Yours, true)
                 }
                 Err(error) => {
@@ -391,7 +400,8 @@ fn environment(session: &Session) -> Option<Vec<(String, String)>> {
     match session.kind.as_str() {
         "x11" => {
             let servers = x_servers();
-            let server = logon_seat::pick_x_server(&servers, session.display.as_deref(), session.vt)?;
+            let server =
+                logon_seat::pick_x_server(&servers, session.display.as_deref(), session.vt)?;
             let display = session.display.clone().or_else(|| server.display.clone())?;
             environment.push(("DISPLAY".to_owned(), display));
             environment.push((
@@ -524,14 +534,20 @@ mod tests {
     fn the_first_account_owns_and_another_cannot_take_over() {
         let state = fresh("owner");
         assert_eq!(handle(&Request::Status, 1000, &state).0, Reply::NotEnrolled);
-        assert_eq!(handle(&Request::Enroll(entries()), 1000, &state), (Reply::Yours, true));
+        assert_eq!(
+            handle(&Request::Enroll(entries()), 1000, &state),
+            (Reply::Yours, true)
+        );
         assert_eq!(handle(&Request::Status, 1000, &state).0, Reply::Yours);
         assert_eq!(handle(&Request::Status, 1001, &state).0, Reply::OtherOwner);
         assert_eq!(
             handle(&Request::Enroll(entries()), 1001, &state),
             (Reply::OtherOwner, false)
         );
-        assert_eq!(handle(&Request::Withdraw, 1001, &state).0, Reply::OtherOwner);
+        assert_eq!(
+            handle(&Request::Withdraw, 1001, &state).0,
+            Reply::OtherOwner
+        );
         assert_eq!(read_owner(&state), Some(1000));
         let kept = logon_enroll::decode_entries(&std::fs::read(state.join(SECRETS_FILE)).unwrap())
             .unwrap();
@@ -544,15 +560,27 @@ mod tests {
         handle(&Request::Enroll(entries()), 1000, &state);
         assert_eq!(handle(&Request::Withdraw, 0, &state), (Reply::Yours, true));
         assert!(!enrolled(&state));
-        assert_eq!(handle(&Request::Withdraw, 1000, &state).0, Reply::NotEnrolled);
-        assert_eq!(handle(&Request::Enroll(entries()), 1001, &state).0, Reply::Yours);
-        assert_eq!(handle(&Request::Withdraw, 1001, &state), (Reply::Yours, true));
+        assert_eq!(
+            handle(&Request::Withdraw, 1000, &state).0,
+            Reply::NotEnrolled
+        );
+        assert_eq!(
+            handle(&Request::Enroll(entries()), 1001, &state).0,
+            Reply::Yours
+        );
+        assert_eq!(
+            handle(&Request::Withdraw, 1001, &state),
+            (Reply::Yours, true)
+        );
     }
 
     #[test]
     fn root_enrolls_nothing() {
         let state = fresh("root");
-        assert_eq!(handle(&Request::Enroll(entries()), 0, &state).0, Reply::Refused);
+        assert_eq!(
+            handle(&Request::Enroll(entries()), 0, &state).0,
+            Reply::Refused
+        );
         assert!(!enrolled(&state));
     }
 

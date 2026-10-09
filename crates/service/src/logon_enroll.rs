@@ -299,7 +299,13 @@ mod tests {
 
     #[test]
     fn names_outside_the_pattern_are_refused_both_ways() {
-        for name in ["", "lumepeer.", "other.entry", "lumepeer.Upper", "lumepeer.a/b"] {
+        for name in [
+            "",
+            "lumepeer.",
+            "other.entry",
+            "lumepeer.Upper",
+            "lumepeer.a/b",
+        ] {
             assert!(!valid_name(name), "{name}");
             assert!(encode_entries(&[(name.to_owned(), Vec::new())]).is_err());
         }

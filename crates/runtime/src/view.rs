@@ -30,19 +30,18 @@ use lumepeer_core::NodeId;
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::{
     ABR_FEEDBACK_INTERVAL_MS, ABR_FEEDBACK_STALE_AFTER_MS, AUDIO_CHANNELS, AUDIO_MAX_FRAME_BYTES,
-    AUDIO_SAMPLE_RATE_HZ,
-    ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS, MAX_MEDIA_FRAME_BYTES,
-    MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_JITTER_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MAX_MS,
-    MEDIA_QUEUE_SLACK_MIN_MS, MEDIA_REDIAL_BACKOFF_MS, RECONNECT_WINDOW_SECS,
-    SECURE_DESKTOP_CAPTURE_INTERVAL_MS, SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS,
-    SOFTWARE_AV1_SLOW_WINDOWS, SOFTWARE_AV1_WATCH_FRAMES,
+    AUDIO_SAMPLE_RATE_HZ, ENCODE_REFUSALS_BEFORE_FAULT, KEYFRAME_MIN_INTERVAL_MS,
+    MAX_MEDIA_FRAME_BYTES, MEDIA_ACK_BEST_WINDOW_MS, MEDIA_QUEUE_JITTER_SLACK_MAX_MS,
+    MEDIA_QUEUE_SLACK_MAX_MS, MEDIA_QUEUE_SLACK_MIN_MS, MEDIA_REDIAL_BACKOFF_MS,
+    RECONNECT_WINDOW_SECS, SECURE_DESKTOP_CAPTURE_INTERVAL_MS, SOFTWARE_AV1_MAX_FPS,
+    SOFTWARE_AV1_MAX_PIXELS, SOFTWARE_AV1_SLOW_WINDOWS, SOFTWARE_AV1_WATCH_FRAMES,
 };
 use lumepeer_core::protocol::{CursorShapeData, MediaUnavailableReason};
-use lumepeer_media::audio_meter::AudioMeter;
 use lumepeer_media::abr::{
     AbrController, EncodeSpeed, FULL_SCALE_PERCENT, LinkPressure, QualityTarget, ReceiverFeedback,
     ceiling_fps, defended_fps, pinned_target,
 };
+use lumepeer_media::audio_meter::AudioMeter;
 use lumepeer_media::capture::{CaptureController, Frame, InputInjector, PixelFormat};
 use lumepeer_media::decode::{DecodedFrame, DecoderHandle};
 use lumepeer_media::encode::{
@@ -3415,7 +3414,16 @@ pub fn spawn_audio_loop(
                 return;
             }
         };
-        run_audio_loop(capturer, connection, stop, recorder, tag, video_stream, meter).await;
+        run_audio_loop(
+            capturer,
+            connection,
+            stop,
+            recorder,
+            tag,
+            video_stream,
+            meter,
+        )
+        .await;
     })
 }
 
@@ -3897,7 +3905,11 @@ async fn run_mic_loop(
                     reopen_at = Instant::now() + MIC_REOPEN_PAUSE;
                     continue;
                 }
-                meter.observe(&chunk.samples, usize::from(AUDIO_CHANNELS), AUDIO_SAMPLE_RATE_HZ);
+                meter.observe(
+                    &chunk.samples,
+                    usize::from(AUDIO_CHANNELS),
+                    AUDIO_SAMPLE_RATE_HZ,
+                );
             }
             Err(error) => {
                 // One bad chunk is a skip, not a teardown: audio degrades
@@ -4396,7 +4408,10 @@ mod tests {
         assert!(heard.loud > 0 && heard.played > 0, "{heard:?}");
         assert_eq!(heard.device, lumepeer_media::audio_meter::DeviceState::Open);
         let hz = heard.loud_hz.unwrap();
-        assert!((418..=462).contains(&hz), "a 440 Hz tone was heard as {hz} Hz");
+        assert!(
+            (418..=462).contains(&hz),
+            "a 440 Hz tone was heard as {hz} Hz"
+        );
         let captured = sent.snapshot();
         assert_eq!(captured.streams, 1);
         assert!(captured.loud > 0, "{captured:?}");
@@ -4521,7 +4536,10 @@ mod tests {
         let Some(hz) = tone else {
             panic!("the second stream carried only silence");
         };
-        assert!((627..=693).contains(&hz), "a 660 Hz tone arrived as {hz} Hz");
+        assert!(
+            (627..=693).contains(&hz),
+            "a 660 Hz tone arrived as {hz} Hz"
+        );
         assert_eq!(sent.snapshot().streams, 2, "one stream per connection");
 
         mic.abort();

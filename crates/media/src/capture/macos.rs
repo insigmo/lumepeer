@@ -913,7 +913,13 @@ mod screen_capture_kit {
     /// Draws `shape` (premultiplied BGRA) over `data` (BGRA, `width` x
     /// `height`, tightly packed) with its hotspot at `at`, clipped to the
     /// picture.
-    fn composite_cursor(data: &mut [u8], width: u32, height: u32, at: (i32, i32), shape: &CursorShapeData) {
+    fn composite_cursor(
+        data: &mut [u8],
+        width: u32,
+        height: u32,
+        at: (i32, i32),
+        shape: &CursorShapeData,
+    ) {
         let left = i64::from(at.0) - i64::from(shape.hotspot_x);
         let top = i64::from(at.1) - i64::from(shape.hotspot_y);
         for row in 0..i64::from(shape.height) {
@@ -932,7 +938,8 @@ mod screen_capture_kit {
                 ) else {
                     continue;
                 };
-                let (Some(src), Some(dst)) = (shape.rgba.get(src..src + 4), data.get_mut(dst..dst + 4))
+                let (Some(src), Some(dst)) =
+                    (shape.rgba.get(src..src + 4), data.get_mut(dst..dst + 4))
                 else {
                     continue;
                 };

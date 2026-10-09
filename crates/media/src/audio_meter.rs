@@ -120,7 +120,8 @@ impl AudioMeter {
         *self
             .device
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = DeviceState::Failed(error.to_owned());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            DeviceState::Failed(error.to_owned());
     }
 
     /// Every counter, as of now.
@@ -230,7 +231,10 @@ mod tests {
         meter.observe(&tone(880.0, 8_000.0, 960), 2, RATE);
         let seen = meter.snapshot();
         assert_eq!(seen.chunks, 3);
-        assert_eq!(seen.nonzero, 2, "only the all-zero chunk is digital silence");
+        assert_eq!(
+            seen.nonzero, 2,
+            "only the all-zero chunk is digital silence"
+        );
         assert_eq!(seen.loud, 1, "only the tone is audible");
         let hz = seen.loud_hz.unwrap();
         assert!((870..=890).contains(&hz), "tone measured as {hz}");

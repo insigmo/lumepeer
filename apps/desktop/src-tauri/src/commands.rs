@@ -1597,7 +1597,10 @@ fn owner_entries() -> Result<Vec<(String, Vec<u8>)>, String> {
         UNATTENDED_TOTP_ENTRY,
         AUDIT_SALT_ENTRY,
     ] {
-        if let Some(bytes) = keystore.load_secret(entry).map_err(|error| error.to_string())? {
+        if let Some(bytes) = keystore
+            .load_secret(entry)
+            .map_err(|error| error.to_string())?
+        {
             entries.push((entry.to_owned(), bytes));
         }
     }
@@ -1749,12 +1752,16 @@ pub fn host_logon_screen_unless_declined() {
             match owner_entries() {
                 Ok(entries) => {
                     if matches!(ask(&Request::Enroll(entries)), Ok(Reply::Yours)) {
-                        tracing::info!("refreshed the sign-in screen's copy of this account's credentials");
+                        tracing::info!(
+                            "refreshed the sign-in screen's copy of this account's credentials"
+                        );
                     } else {
                         tracing::warn!("could not refresh the sign-in screen's copy");
                     }
                 }
-                Err(error) => tracing::warn!(%error, "cannot read this account's credentials to refresh the sign-in screen copy"),
+                Err(error) => {
+                    tracing::warn!(%error, "cannot read this account's credentials to refresh the sign-in screen copy")
+                }
             }
         }
     }

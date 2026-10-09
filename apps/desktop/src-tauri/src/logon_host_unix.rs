@@ -85,11 +85,15 @@ fn host() -> u32 {
         return lumepeer_service::LOGON_HOST_EXIT_NOT_ENABLED;
     };
     if !matches!(keystore.load_secret(IDENTITY_ENTRY), Ok(Some(_))) {
-        tracing::warn!("the enrolled copy has no identity; a new one would be a host no guest saved");
+        tracing::warn!(
+            "the enrolled copy has no identity; a new one would be a host no guest saved"
+        );
         return lumepeer_service::LOGON_HOST_EXIT_NOT_ENABLED;
     }
     if !matches!(keystore.load_secret(UNATTENDED_PASSWORD_ENTRY), Ok(Some(_))) {
-        tracing::info!("no device password in the enrolled copy; nobody could be let in; not hosting");
+        tracing::info!(
+            "no device password in the enrolled copy; nobody could be let in; not hosting"
+        );
         return lumepeer_service::LOGON_HOST_EXIT_NOT_ENABLED;
     }
 
@@ -119,14 +123,13 @@ async fn serve(keystore: MemoryKeystore) -> u32 {
     // a process on the sign-in screen cannot read; the defaults are what the
     // client ships with, as ADR 0087 §6 decided for the session-0 host.
     let settings = lumepeer_runtime::config::Settings::default();
-    let endpoint =
-        match PeerEndpoint::bind_with_lan(secret_key, settings.relay_url(), None).await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                tracing::error!(%error, "cannot bind the endpoint; not hosting");
-                return EXIT_FAILED;
-            }
-        };
+    let endpoint = match PeerEndpoint::bind_with_lan(secret_key, settings.relay_url(), None).await {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            tracing::error!(%error, "cannot bind the endpoint; not hosting");
+            return EXIT_FAILED;
+        }
+    };
 
     // Everything is in memory and lives only as long as this screen: no
     // address book file, no invite file, no audit database. The identity and
@@ -156,7 +159,9 @@ async fn serve(keystore: MemoryKeystore) -> u32 {
         async move {
             endpoint.online().await;
             online.store(true, Ordering::Relaxed);
-            tracing::info!("endpoint reached a relay; the sign-in screen is dialable from outside the LAN");
+            tracing::info!(
+                "endpoint reached a relay; the sign-in screen is dialable from outside the LAN"
+            );
         }
     });
 
@@ -247,7 +252,8 @@ mod macos {
     /// passes in. Read through the same [`FileKeystore`] the client opens it
     /// with, keyed by the secret the owner's own run minted beside it.
     pub(super) fn load() -> Option<MemoryKeystore> {
-        let directory = std::env::var_os("LUMEPEER_LOGON_KEYSTORE").map(std::path::PathBuf::from)?;
+        let directory =
+            std::env::var_os("LUMEPEER_LOGON_KEYSTORE").map(std::path::PathBuf::from)?;
         let secret = match std::fs::read(directory.join("keystore.secret")) {
             Ok(secret) => secret,
             Err(error) => {
@@ -332,11 +338,18 @@ mod tests {
     fn a_keystore_is_cloned_entry_for_entry() {
         let original = MemoryKeystore::new();
         original.store_secret(IDENTITY_ENTRY, b"id").unwrap();
-        original.store_secret(UNATTENDED_PASSWORD_ENTRY, b"pw").unwrap();
+        original
+            .store_secret(UNATTENDED_PASSWORD_ENTRY, b"pw")
+            .unwrap();
         let copy = clone_keystore(&original);
-        assert_eq!(copy.load_secret(IDENTITY_ENTRY).unwrap().as_deref(), Some(&b"id"[..]));
         assert_eq!(
-            copy.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap().as_deref(),
+            copy.load_secret(IDENTITY_ENTRY).unwrap().as_deref(),
+            Some(&b"id"[..])
+        );
+        assert_eq!(
+            copy.load_secret(UNATTENDED_PASSWORD_ENTRY)
+                .unwrap()
+                .as_deref(),
             Some(&b"pw"[..])
         );
         assert_eq!(copy.load_secret(UNATTENDED_TOTP_ENTRY).unwrap(), None);

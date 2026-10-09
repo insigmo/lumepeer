@@ -187,7 +187,8 @@ mod tests {
 
     /// What `loginctl show-session` prints for GDM's sign-in screen on
     /// Debian 13, with the properties the supervisor asks for.
-    const GDM_GREETER: &str = "Id=c1\nUser=111\nDisplay=\nVTNr=1\nState=active\nClass=greeter\nType=wayland\n";
+    const GDM_GREETER: &str =
+        "Id=c1\nUser=111\nDisplay=\nVTNr=1\nState=active\nClass=greeter\nType=wayland\n";
 
     #[test]
     fn a_wayland_greeter_is_a_sign_in_screen_and_a_user_session_is_not() {
@@ -198,15 +199,16 @@ mod tests {
         assert_eq!(greeter.vt, Some(1));
         assert!(greeter.sign_in_screen());
 
-        let user = session("Id=50\nUser=1000\nClass=user\nType=wayland\nState=active\nVTNr=2\n")
-            .unwrap();
+        let user =
+            session("Id=50\nUser=1000\nClass=user\nType=wayland\nState=active\nVTNr=2\n").unwrap();
         assert!(user.graphical());
         assert!(!user.sign_in_screen());
     }
 
     #[test]
     fn an_ssh_login_is_not_somebody_at_the_machine() {
-        let ssh = session("Id=106\nUser=1000\nClass=user\nType=tty\nState=online\nVTNr=0\n").unwrap();
+        let ssh =
+            session("Id=106\nUser=1000\nClass=user\nType=tty\nState=online\nVTNr=0\n").unwrap();
         assert!(!ssh.graphical());
         assert_eq!(ssh.vt, None);
     }
@@ -317,7 +319,10 @@ mod tests {
         assert_eq!(pick_x_server(&servers, Some(":0"), Some(1)), Some(&a));
         assert_eq!(pick_x_server(&servers, Some(":5"), Some(1)), Some(&b));
         assert_eq!(pick_x_server(&servers, None, None), None);
-        assert_eq!(pick_x_server(std::slice::from_ref(&b), None, None), Some(&b));
+        assert_eq!(
+            pick_x_server(std::slice::from_ref(&b), None, None),
+            Some(&b)
+        );
         let no_auth = XServer { auth: None, ..b };
         assert_eq!(pick_x_server(&[no_auth], None, None), None);
     }
@@ -325,7 +330,13 @@ mod tests {
     #[test]
     fn the_lowest_wayland_socket_is_chosen_and_never_its_lock() {
         assert_eq!(
-            wayland_socket(["bus", "wayland-1.lock", "wayland-1", "wayland-0.lock", "wayland-0"]),
+            wayland_socket([
+                "bus",
+                "wayland-1.lock",
+                "wayland-1",
+                "wayland-0.lock",
+                "wayland-0"
+            ]),
             Some("wayland-0".to_owned())
         );
         assert_eq!(wayland_socket(["bus", "pipewire-0"]), None);

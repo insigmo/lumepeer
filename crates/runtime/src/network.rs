@@ -62,11 +62,11 @@ use lumepeer_core::remote_path::{
 use lumepeer_core::session::{ReconnectDecision, SessionManager, SessionState, TunnelTarget};
 use lumepeer_core::unattended::{UnattendedAccess, UnattendedError};
 use lumepeer_core::{CoreError, NodeId};
+use lumepeer_media::audio_meter::{AudioMeter, AudioMeterSnapshot};
 use lumepeer_media::capture::{
     CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
-use lumepeer_media::audio_meter::{AudioMeter, AudioMeterSnapshot};
 use lumepeer_media::encode::software_av1::{self, Readiness as SoftwareAv1Readiness};
 use lumepeer_media::encode::{
     EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, openh264_built, probe_hardware,

@@ -50,8 +50,7 @@ pub const SAMPLES_PER_CHUNK: usize = AUDIO_SAMPLE_RATE_HZ as usize * AUDIO_FRAME
 /// [`to_wire_pcm`] to see exactly one chunk's worth of time (ADR 0147).
 #[must_use]
 pub fn frames_per_chunk(input_rate: u32) -> usize {
-    let frames =
-        SAMPLES_PER_CHUNK as u64 * u64::from(input_rate) / u64::from(AUDIO_SAMPLE_RATE_HZ);
+    let frames = SAMPLES_PER_CHUNK as u64 * u64::from(input_rate) / u64::from(AUDIO_SAMPLE_RATE_HZ);
     usize::try_from(frames.max(1)).unwrap_or(SAMPLES_PER_CHUNK)
 }
 
@@ -376,7 +375,11 @@ mod tests {
         assert_eq!(frames_per_chunk(44_100), 882);
         assert_eq!(frames_per_chunk(96_000), 1_920);
         assert_eq!(frames_per_chunk(192_000), 3_840);
-        assert_eq!(frames_per_chunk(0), 1, "never zero: the chunker divides by it");
+        assert_eq!(
+            frames_per_chunk(0),
+            1,
+            "never zero: the chunker divides by it"
+        );
 
         // A 96 kHz ramp of one chunk's duration converts into a ramp that
         // ends where the input did, not into a ramp and a flat half.
@@ -386,7 +389,10 @@ mod tests {
         let last = f32::from(out[out.len() - 2]) / f32::from(i16::MAX);
         let middle = f32::from(out[SAMPLES_PER_CHUNK]) / f32::from(i16::MAX);
         assert!(last > 0.99, "the chunk ends at the input's end, got {last}");
-        assert!((middle - 0.5).abs() < 0.01, "and passes its middle halfway, got {middle}");
+        assert!(
+            (middle - 0.5).abs() < 0.01,
+            "and passes its middle halfway, got {middle}"
+        );
     }
 
     #[test]
