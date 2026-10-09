@@ -61,3 +61,4 @@ installers/
 # Debian packages, local to the machine that built it.
 .cross/
 .impeccable/
+tools/codec-bench/target*

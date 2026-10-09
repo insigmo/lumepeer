@@ -962,7 +962,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lumepeer-aom-sys"
-version = "0.0.126"
+version = "0.0.137"
 dependencies = [
  "cc",
  "cmake",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.126"
+version = "0.0.137"
 dependencies = [
  "argon2",
  "blake3",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.126"
+version = "0.0.137"
 dependencies = [
  "blake3",
  "iroh-base",
@@ -1001,6 +1001,7 @@ dependencies = [
  "lumepeer-core",
  "memmap2",
  "openh264",
+ "openh264-sys2",
  "thiserror",
  "tracing",
  "windows",
