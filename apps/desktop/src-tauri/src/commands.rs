@@ -4153,13 +4153,14 @@ pub async fn update_install(
         .map_err(|error| update_error(&error))?;
     tracing::info!("update installed; restart to run it");
     // Windows' installer closes this process and starts the new one itself.
-    // On Linux nothing does: the package replaced the binary under a process
-    // that keeps running the old one until somebody quits it. Restarting
-    // here is what the user expected "install" to mean (ADR 0119).
+    // On Linux and macOS nothing does: the package (or the replaced app
+    // bundle) sits under a process that keeps running the old one until
+    // somebody quits it. Restarting here is what the user expected "install"
+    // to mean (ADR 0119, ADR 0155).
     // `request_restart`, not `restart`: it lets the exit run first, and
     // the single-instance plugin gives up its name on the way out, so the
     // new process is not turned away as a second copy of the old one.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         tracing::info!("restarting into the installed update");
         announce_restart(&state.network).await;

@@ -321,6 +321,43 @@ PICTURE_BOX_JS = """((x, y, w, h) => {
   return Array.from(d.filter((_, i) => i %% 4 !== 3));
 })(%s, %s, %s, %s)"""
 
+# Watches a box of the picture canvas for a colour, in the page, since a
+# change may take longer than a pilot call lives: when (this machine's
+# `Date.now()`) most of the box first showed it, or null if it did not
+# within `timeoutMs`. Read back with STILL_WATCH_READ_JS.
+STILL_WATCH_JS = """((x, y, w, h, rgb, timeoutMs) => {
+  const c = document.getElementById('screen');
+  const st = window.__e2eStill = { done: false, at: null };
+  const started = Date.now();
+  const near = () => {
+    const bx = Math.max(0, Math.min(c.width - w, x)), by = Math.max(0, Math.min(c.height - h, y));
+    const d = c.getContext('2d').getImageData(bx, by, w, h).data;
+    let hits = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (Math.abs(d[i] - rgb[0]) < 48 && Math.abs(d[i + 1] - rgb[1]) < 48 && Math.abs(d[i + 2] - rgb[2]) < 48) hits++;
+    }
+    return hits * 4 >= d.length * 0.8;
+  };
+  const tick = () => {
+    if (near()) { st.at = Date.now(); st.done = true; return; }
+    if (Date.now() - started > timeoutMs) { st.done = true; return; }
+    setTimeout(tick, 4);
+  };
+  tick();
+  return started;
+})(%s, %s, %s, %s, %s, %s)"""
+
+STILL_WATCH_READ_JS = "window.__e2eStill || null"
+
+# Paints the host's tracker one colour, with nothing else on the screen
+# moving: no caret blinking in it. When, by the host's `Date.now()`.
+STILL_PAINT_JS = """((colour) => {
+  const ta = document.getElementById('e2e-tracker');
+  ta.blur();
+  ta.style.background = colour;
+  return Date.now();
+})(%s)"""
+
 # Guest pointer moves along `points` at `interval` ms, the pace of a hand on
 # a mouse; when each one was dispatched, by this machine's clock.
 SWEEP_JS = """(async (points, interval) => {

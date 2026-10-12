@@ -16,6 +16,9 @@
 3c. resize: the host's screen changes resolution mid-session, through the
    product's own switch or the machine's (the Mac VM); the picture has to take
    the new shape and the three spots of 3b have to stay one.
+3d. still: the host's tracker changes colour on an otherwise still screen,
+   one change at a time; each has to reach the guest's picture by itself, a
+   network trip after it happened, not when the next change pushes it out.
 4. keys: the guest types a line of text and a set of chords into its view;
    the host's tracker has to receive the same characters and every chord.
 5. hotkeys (Windows guest): the same chords once more, pressed on the
@@ -48,8 +51,9 @@ import time
 import pytest
 
 from harness import (CURSOR_LAYER_JS, CURSOR_WATCH_JS, CURSOR_WATCH_READ_JS, GRAB_JS, KEYS_JS, PICTURE_BOX_JS,
-                     POINTER_JS, SPY_MOVE_JS, SPY_READ_JS, SWEEP_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS,
-                     TERMINAL_TYPE_JS, VIEW_GEOMETRY_JS, VIEW_GESTURE_JS, VIEW_STATE_JS, Refused, connect,
+                     POINTER_JS, SPY_MOVE_JS, SPY_READ_JS, STILL_PAINT_JS, STILL_WATCH_JS, STILL_WATCH_READ_JS,
+                     SWEEP_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS, TERMINAL_TYPE_JS, VIEW_GEOMETRY_JS,
+                     VIEW_GESTURE_JS, VIEW_STATE_JS, Refused, connect,
                      disconnect, expected, host_flags, label, os_events, parse, sessions_of, synthetic_events,
                      text_combos, with_logs)
 
@@ -580,6 +584,84 @@ def test_resize(session, request):
     if problems:
         fail(with_log(" | ".join(problems) + f" | host {original[0]}x{original[1]} at the start", s, mark))
     note(request, "; ".join(said))
+
+
+# ── 3d ──────────────────────────────────────────────────────────────────────
+
+# What the host's tracker is painted, in turn: its own colour and one far from
+# it in every channel. An even number of changes leaves it as it was.
+STILL_COLOURS = ["#202020", "#fffbe6"]
+STILL_CHANGES = 6
+# How long the host's screen is left alone before each change: nothing of the
+# last one may still be on its way, or a held picture would be pushed out by it.
+STILL_REST_S = 1.5
+# How long after the network's one-way delay a change may take to show, and
+# how long the guest watches for one before it counts as never shown.
+STILL_BUDGET_MS = 250
+STILL_TIMEOUT_MS = 4000
+
+
+def rgb(colour):
+    return [int(colour[i:i + 2], 16) for i in (1, 3, 5)]
+
+
+def test_still(session, request):
+    """One change on a still screen, shown by itself: a picture a decoder
+    holds until the next one pushes it out shows every keystroke one
+    keystroke late, and the last one not at all (ADR 0154, ADR 0155)."""
+    s = live(session)
+    g, h = s.guest, s.host
+    if s.picture_error:
+        fail(f"no picture to watch ({s.picture_error})")
+    mark = h.log_mark()
+    v = g.js(VIEW_STATE_JS, window=s.view)
+    mon = h.monitor
+    ox, oy = mon["position"]["x"], mon["position"]["y"]
+    k = v["w"] / mon["size"]["width"]  # picture pixels per host pixel
+    tx, ty = h.tracker_point()
+    side = max(8, round(40 * k))
+    box = (round((tx - ox) * k) - side // 2, round((ty - oy) * k) - side // 2, side, side)
+    host_off, host_err = h.clock_offset()
+    guest_off, guest_err = g.clock_offset(window=s.view)
+    err = host_err + guest_err
+    lags, problems = [], []
+
+    def shown():
+        r = g.js(STILL_WATCH_READ_JS, window=s.view)
+        return r if r and r["done"] else None
+
+    # The tracker has to be what the picture shows there, or nothing painted
+    # on it can be seen.
+    g.js(STILL_WATCH_JS % (*box, json.dumps(rgb(STILL_COLOURS[-1])), 1000), window=s.view)
+    if not g.wait(shown, 5, "the guest's watch never answered")["at"]:
+        fail(with_log(f"the picture at the host's tracker ({box}) is not the tracker's colour: something covers it",
+                      s, mark))
+    try:
+        for i in range(STILL_CHANGES):
+            colour = STILL_COLOURS[i % len(STILL_COLOURS)]
+            time.sleep(STILL_REST_S)
+            g.js(STILL_WATCH_JS % (*box, json.dumps(rgb(colour)), STILL_TIMEOUT_MS), window=s.view)
+            painted = h.js(STILL_PAINT_JS % json.dumps(colour))
+            seen = g.wait(shown, STILL_TIMEOUT_MS / 1000 + 5, "the guest's watch never finished")
+            if seen["at"] is None:
+                problems.append(f"change {i + 1} ({colour}) not shown within {STILL_TIMEOUT_MS}ms")
+            else:
+                lags.append((seen["at"] - guest_off) - (painted - host_off))
+    finally:
+        h.js(STILL_PAINT_JS % json.dumps(STILL_COLOURS[-1]))
+    # Read now: right after a connect the path has no round trip measured yet.
+    rtt = (g.ipc("connection_stats") or [{}])[0].get("rtt_ms") or 0
+    budget = rtt / 2 + STILL_BUDGET_MS + err
+    late = [lag for lag in lags if lag > budget]
+    if late:
+        problems.append(f"{len(late)} of {len(lags)} changes shown later than {budget:.0f}ms "
+                        f"(rtt {rtt}ms, +-{err:.0f}): {', '.join(f'{lag:.0f}' for lag in late)}ms")
+    said = (f"{len(lags)}/{STILL_CHANGES} changes shown, "
+            + (f"{min(lags):.0f}/{sorted(lags)[len(lags) // 2]:.0f}/{max(lags):.0f}ms min/p50/max " if lags else "")
+            + f"(rtt {rtt}ms, +-{err:.0f}) {s.stats()}")
+    if problems:
+        fail(with_log(" | ".join(problems) + f" | {said}", s, mark))
+    note(request, said)
 
 
 # ── 4 ───────────────────────────────────────────────────────────────────────
