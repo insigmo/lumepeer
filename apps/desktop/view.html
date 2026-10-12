@@ -27,6 +27,15 @@
         overscroll-behavior: contain;
       }
       #screen {
+        /* Placed by `applyLayout` from the window's corner (a translate), not
+           centred by the grid: the grid centres only a picture that fits, and
+           one larger than the window (1:1, zoomed in) went to the corner
+           while the pointer was mapped as if it were centred (ADR 0154).
+           Physical `left`/`top`, because pointer positions are physical: in a
+           right-to-left window `inset-inline-start` would be the right edge. */
+        position: absolute;
+        left: 0;
+        top: 0;
         /* Sized in CSS pixels by `applyLayout`, which is also why these two
            are only a starting point: the canvas *buffer* stays at the frame's
            own resolution so `putImageData` never has to scale (§11). */
@@ -321,8 +330,12 @@
       }
       #cursor {
         position: absolute;
-        inset-block-start: 0;
-        inset-inline-start: 0;
+        /* Physical, like `#screen`: `view.ts` sets `left` from the pointer's
+           client position, and with `inset-inline-start` a right-to-left
+           window (Arabic) had `right: 0` as well, which wins there — the
+           host's cursor sat at the right edge whatever the pointer did. */
+        top: 0;
+        left: 0;
         z-index: 20;
         /* Purely decorative: every event under it belongs to the picture. */
         pointer-events: none;

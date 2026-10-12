@@ -288,6 +288,12 @@ impl EncodeControl {
         self.keyframe.swap(false, Ordering::Relaxed)
     }
 
+    /// Whether a keyframe request is waiting, left for the encode that
+    /// serves it to take.
+    fn keyframe_pending(&self) -> bool {
+        self.keyframe.load(Ordering::Relaxed)
+    }
+
     /// Takes the newest receiver report, if one has not been consumed yet.
     fn take_feedback(&self) -> Option<(ReceiverFeedback, Instant)> {
         self.feedback
@@ -1712,6 +1718,24 @@ pub(crate) fn spawn_encode_loop_with(
                     Err(error) => (Err(error), false),
                 }
             };
+            // A guest that asked for a keyframe has nothing to decode against
+            // (its decoder failed, often on the first frame of a new screen
+            // size), and on a still screen no frame would ever come to carry
+            // one: the picture stayed the old screen's while the pointer went
+            // to the new one (ADR 0154). The screen as it is now carries it,
+            // taken for this loop alone.
+            let captured = match captured {
+                Ok(Ok(None)) if control.keyframe_pending() => {
+                    let shared = Arc::clone(&capture);
+                    let snapshot =
+                        tokio::task::spawn_blocking(move || lock_capture(&shared).snapshot())
+                            .await
+                            .ok()
+                            .flatten();
+                    Ok(Ok(snapshot))
+                }
+                other => other,
+            };
             let frame = match captured {
                 Ok(Ok(Some(frame))) => {
                     encode_stats.captured(capture_started.elapsed());
@@ -1929,7 +1953,19 @@ pub(crate) fn spawn_encode_loop_with(
                 let scale_took = scale_started.elapsed();
                 let mut encoder = encoder;
                 let encode_started = Instant::now();
-                let bitstream = encoder.encode(&frame);
+                let bitstream = encoder.encode(&frame).map(|mut encoded| {
+                    // Said in the stream itself, so the guest's decoder shows
+                    // each picture as it decodes it rather than holding it for
+                    // a reordering that never comes (ADR 0154).
+                    if codec == VideoCodec::H264
+                        && encoded.keyframe
+                        && let Some(data) =
+                            lumepeer_media::encode::h264_sps::without_reordering(&encoded.data)
+                    {
+                        encoded.data = data;
+                    }
+                    encoded
+                });
                 let timing = EncodeTiming {
                     scale: scale_took,
                     encode: encode_started.elapsed(),
@@ -5726,6 +5762,151 @@ mod tests {
             per_frame < ms(40),
             "a frame every {per_frame:?} from an encoder that takes {took:?}"
         );
+    }
+
+    /// A screen that changes once and then stands still: one picture, then
+    /// nothing, except to a caller that asks for the screen as it is.
+    #[derive(Debug, Default)]
+    struct StillScreen {
+        delivered: bool,
+    }
+
+    impl lumepeer_media::capture::ScreenCapturer for StillScreen {
+        fn start(
+            &mut self,
+            _target: lumepeer_media::capture::CaptureTarget,
+        ) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> lumepeer_media::Result<Option<Frame>> {
+            if std::mem::replace(&mut self.delivered, true) {
+                return Ok(None);
+            }
+            Ok(self.snapshot())
+        }
+
+        fn snapshot(&mut self) -> Option<Frame> {
+            Some(Frame::cpu(
+                64,
+                64,
+                PixelFormat::Bgra8,
+                0,
+                vec![0; 64 * 64 * 4],
+            ))
+        }
+
+        fn stop(&mut self) {}
+
+        fn input_capability(&self) -> lumepeer_media::capture::InputCapability {
+            lumepeer_media::capture::InputCapability::None
+        }
+    }
+
+    /// An encoder that makes an intra frame of its first picture and of the
+    /// one after each keyframe request, like a real one.
+    #[derive(Default)]
+    struct KeyframeEncoder {
+        started: bool,
+        asked: bool,
+    }
+
+    impl VideoEncoder for KeyframeEncoder {
+        fn encode(&mut self, frame: &Frame) -> lumepeer_media::Result<EncodedFrame> {
+            let keyframe =
+                !std::mem::replace(&mut self.started, true) || std::mem::take(&mut self.asked);
+            Ok(EncodedFrame {
+                keyframe,
+                timestamp_us: frame.timestamp_us,
+                data: vec![7; 500],
+            })
+        }
+
+        fn set_bitrate(&mut self, _bitrate_kbps: u32) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn request_keyframe(&mut self) -> lumepeer_media::Result<()> {
+            self.asked = true;
+            Ok(())
+        }
+
+        fn kind(&self) -> lumepeer_media::encode::EncoderKind {
+            lumepeer_media::encode::EncoderKind::SoftwareOpenH264
+        }
+    }
+
+    /// ADR 0154: a guest whose decoder gave up — on the first frame of a new
+    /// screen size, typically — asks for a keyframe, and on a still screen no
+    /// frame used to come to carry it: the guest kept the old screen's
+    /// picture for as long as nothing moved. The screen as it is now carries
+    /// it instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keyframe_asked_for_on_a_still_screen_still_arrives() {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        let guest_side = dialed.unwrap();
+        let host_side = accepted.unwrap().unwrap();
+
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(StillScreen::default()),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let control = EncodeControl::new(peer, None);
+        let streams = spawn_guest_streams(
+            host_side.clone(),
+            "test-peer".to_owned(),
+            control.acks(),
+            Arc::default(),
+        );
+        let (faults, _faults_rx) = mpsc::channel(4);
+        let task = spawn_encode_loop_with(
+            host_side,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            control.clone(),
+            |_| Ok(Box::new(KeyframeEncoder::default())),
+        );
+
+        let mut reader = accept_media_stream(&guest_side).await.unwrap();
+        let (received_tx, received_rx) = watch::channel(0u64);
+        let _acks = AbortOnDrop(spawn_frame_acks(
+            guest_side.clone(),
+            received_rx,
+            "test-peer".to_owned(),
+        ));
+        // Whatever the stream opens with, until the screen has stood still
+        // for a while.
+        let mut read = 0u64;
+        while let Ok(payload) = tokio::time::timeout(ms(500), reader.read_frame()).await {
+            payload.unwrap();
+            read += 1;
+            received_tx.send_replace(read);
+        }
+        assert!(read > 0, "the stream opened with no picture at all");
+
+        control.request_keyframe();
+        let Ok(payload) = tokio::time::timeout(Duration::from_secs(3), reader.read_frame()).await
+        else {
+            panic!("no frame came for a keyframe asked for on a still screen");
+        };
+        assert!(decode_media_payload(&payload.unwrap()).unwrap().keyframe);
+        task.abort();
+        streams.abort();
     }
 
     /// ADR 0144: a preset named before the stream opens is the rate the

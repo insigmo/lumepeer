@@ -375,6 +375,10 @@ pub fn select_software_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEnc
 ))]
 mod nv12;
 
+/// Telling a decoder an H.264 stream never reorders, where its encoder did
+/// not (ADR 0154). Pure byte work, for every platform's encoders.
+pub mod h264_sps;
+
 /// macOS `VideoToolbox` hardware H.264 encoder (§5.1, §11, §18/§19 phase 4;
 /// ADR 0066).
 ///

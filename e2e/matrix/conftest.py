@@ -115,7 +115,10 @@ def pytest_runtest_makereport(item, call):
 
 def build_id():
     def git(*args):
-        return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True).stdout.strip()
+        # No stdin of its own: a run started without a console has none to
+        # inherit, and the report was lost to "the handle is invalid".
+        return subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL).stdout.strip()
 
     return git("rev-parse", "--short", "HEAD") + ("+dirty" if git("status", "--porcelain") else "")
 

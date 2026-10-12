@@ -613,6 +613,24 @@ def play_tone(arg):
     return {"player": player, "secs": round(time.time() - started, 2)}
 
 
+# VMware Tools' own resolution switch inside a macOS guest: how the matrix's
+# Mac, a VM, changes its screen mid-session the way a resized or full-screen
+# VMware window does. macOS gives the app no display modes to switch (the
+# product's own switch, ADR 0048, is Windows and X11 only).
+VMWARE_RESOLUTION = "/Library/Application Support/VMware Tools/vmware-resolutionSet"
+
+
+def op_set_resolution(req):
+    """Sets the screen to `width` x `height` where this machine has a way to
+    that the app does not offer; `supported` is false everywhere else and
+    nothing changes."""
+    if MACOS and os.path.exists(VMWARE_RESOLUTION):
+        subprocess.run([VMWARE_RESOLUTION, str(int(req["width"])), str(int(req["height"]))], check=True,
+                       capture_output=True, timeout=30)
+        return {"supported": True}
+    return {"supported": False}
+
+
 QUERIES = {"foreground": foreground, "hotkeys": taken_hotkeys, "focus_window": focus_window, "press_keys": press_keys,
            "raise_exe": raise_exe, "keyboard_layout": keyboard_layout, "play_tone": play_tone}
 
@@ -790,7 +808,7 @@ def op_log(req):
 OPS = {"hello": op_hello, "start": op_start, "stop": op_stop, "alive": op_alive,
        "foreground": op_foreground, "hotkeys": op_hotkeys, "focus_window": op_focus_window,
        "press_keys": op_press_keys, "raise_exe": op_raise_exe, "keyboard_layout": op_keyboard_layout,
-       "play_tone": op_play_tone, "pilot": op_pilot, "log": op_log}
+       "play_tone": op_play_tone, "set_resolution": op_set_resolution, "pilot": op_pilot, "log": op_log}
 
 
 def main():

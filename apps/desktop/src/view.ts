@@ -42,7 +42,6 @@ import {
   decodeCursorShape,
   decodeViewFrame,
   defaultLayout,
-  displaySize,
   effectiveScale,
   FALLBACK_PICTURE_CEILING,
   frameResized,
@@ -353,9 +352,23 @@ function viewportBox(): Box {
   return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
 }
 
-/** Where the picture is on screen right now, for the pointer mapping. */
-function currentPictureBox(): Box {
-  return pictureBox(layout, frameSize, viewportBox(), window.devicePixelRatio || 1);
+/**
+ * Where the picture is on screen right now, as the page actually drew it: the
+ * box every pointer position is mapped against and the host's cursor is drawn
+ * over (ADR 0154).
+ *
+ * Measured, not computed from the layout. The two used to be the same number
+ * only by assumption, and the assumption failed exactly where the picture is
+ * larger than the window (1:1 or zoomed in): the stylesheet put the canvas at
+ * the window's corner while the mapping had it centred, so every click and
+ * the drawn cursor were off by half of what did not fit.
+ */
+function pictureOnScreen(): Box {
+  if (!canvas) {
+    return { left: 0, top: 0, width: 0, height: 0 };
+  }
+  const rect = canvas.getBoundingClientRect();
+  return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
 }
 
 /** Whether this session carries the host's cursor on its own channel. */
@@ -385,7 +398,7 @@ function placeCursor(): void {
   if (!visible || !cursor || !pointerAt) {
     return;
   }
-  const box = cursorPlacement(pointerAt, cursor, currentPictureBox(), frameSize);
+  const box = cursorPlacement(pointerAt, cursor, pictureOnScreen(), frameSize);
   const viewport = viewportBox();
   cursorLayer.style.left = `${box.left - viewport.left}px`;
   cursorLayer.style.top = `${box.top - viewport.top}px`;
@@ -447,12 +460,15 @@ function applyLayout(): void {
   const viewport = viewportBox();
   const ratio = window.devicePixelRatio || 1;
   layout = clampPan(layout, frameSize, viewport, ratio);
-  const size = displaySize(layout, frameSize, viewport, ratio);
-  canvas.style.width = `${size.width}px`;
-  canvas.style.height = `${size.height}px`;
+  const box = pictureBox(layout, frameSize, viewport, ratio);
+  canvas.style.width = `${box.width}px`;
+  canvas.style.height = `${box.height}px`;
   canvas.style.maxWidth = 'none';
   canvas.style.maxHeight = 'none';
-  canvas.style.transform = `translate(${layout.offsetX}px, ${layout.offsetY}px)`;
+  // Put where the layout says, not left to the stylesheet to centre: a grid
+  // centres only what fits, and a picture larger than the window went to its
+  // corner instead, out of reach of half the pan (ADR 0154).
+  canvas.style.transform = `translate(${box.left - viewport.left}px, ${box.top - viewport.top}px)`;
   // Only CSS knows how the picture is resampled, and only this knows the
   // scale it is being drawn at — the stylesheet's `pixelated` is right at 1:1
   // and above and wrong for every fitted window below it.
@@ -575,7 +591,7 @@ async function setFullscreen(on: boolean): Promise<void> {
   toolbar?.redraw();
 }
 
-const input = canvas ? new ViewInput(canvas, sink, document, currentPictureBox) : undefined;
+const input = canvas ? new ViewInput(canvas, sink, document, pictureOnScreen) : undefined;
 let status: ViewStatus = 'waiting';
 // Whether the host says it is recording. Repainted only on a change, like the
 // overlay: the badge is on every frame, the DOM work is not.

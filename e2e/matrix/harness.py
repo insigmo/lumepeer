@@ -191,13 +191,17 @@ SPY_JS = r"""(() => {
     }
   };
   const orig = window.fetch;
-  window.fetch = function (input) {
+  window.fetch = function (input, init) {
     const promise = orig.apply(this, arguments);
     const url = String((input && input.url) || input);
     const m = url.match(/^(?:https?:\/\/ipc\.localhost|ipc:\/\/localhost)\/((?:input|terminal)_[a-z_]+)/);
     if (m) {
       const c = sp.calls[m[1]] = sp.calls[m[1]] || { n: 0, ok: 0, err: 0 };
       c.n++;
+      // The last move the view sent, as the host receives it (0..65535).
+      if (m[1] === 'input_pointer_move') {
+        try { const a = JSON.parse(init.body).args; sp.move = [a.x, a.y]; } catch (e) { /* not JSON */ }
+      }
       promise.then(async (r) => {
         if (r.headers.get('Tauri-Response') === 'error') {
           c.err++;
@@ -314,7 +318,7 @@ PICTURE_BOX_JS = """((x, y, w, h) => {
   const c = document.getElementById('screen');
   x = Math.max(0, Math.min(c.width - w, x)); y = Math.max(0, Math.min(c.height - h, y));
   const d = c.getContext('2d').getImageData(x, y, w, h).data;
-  return Array.from(d.filter((_, i) => i % 4 !== 3));
+  return Array.from(d.filter((_, i) => i %% 4 !== 3));
 })(%s, %s, %s, %s)"""
 
 # Guest pointer moves along `points` at `interval` ms, the pace of a hand on
@@ -350,6 +354,59 @@ CURSOR_WATCH_JS = """((ms) => {
 })(%s)"""
 
 CURSOR_WATCH_READ_JS = "(() => window.__e2eCursor || null)()"
+
+# The last pointer move the guest's view sent, normalized as on the wire.
+SPY_MOVE_JS = "(() => (window.__e2eSpy && window.__e2eSpy.move) || null)()"
+
+# Everything in the guest's view that decides where a pointer lands and where
+# the host's cursor is drawn, as the page laid it out, in client (CSS)
+# pixels: the picture canvas (its buffer is the frame's size), the window's
+# area, the cursor layer, and the shape on it [width, height, hotspot x, y]
+# from the view's own `view_cursor` call (none while the host draws the
+# cursor into the picture).
+VIEW_GEOMETRY_JS = """(async () => {
+  const c = document.getElementById('screen'), v = document.getElementById('view'), l = document.getElementById('cursor');
+  const box = (e) => { const r = e.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; };
+  let shape = null;
+  try {
+    const peer = new URLSearchParams(location.search).get('peer');
+    const d = new DataView(await window.__TAURI_INTERNALS__.invoke('view_cursor', { args: { peer, since_seq: 0 } }));
+    if (d.getUint32(0, true) !== 0) shape = [1, 2, 3, 4].map((i) => d.getUint16(2 + 2 * i, true));
+  } catch (e) { /* this host has no cursor channel */ }
+  return { frame: [c.width, c.height], pic: box(c), view: box(v), layer: l.hidden ? null : box(l), shape,
+           dpr: devicePixelRatio };
+})()"""
+
+# One of the view window's own layout gestures, made the way a person makes
+# it: a Ctrl+Alt+Shift chord (0 resets to fit, M steps fit -> 1:1 -> zoom),
+# Ctrl+wheel notches over the picture (zoom in for a positive count), a
+# middle-button drag (pan), or the window's area changed to a share of it
+# and the page told, as a resize does (none restores it).
+VIEW_GESTURE_JS = """((kind, a, b) => {
+  const v = document.getElementById('view');
+  const r = v.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (kind === 'chord') {
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: a, code: b, ctrlKey: true, altKey: true,
+      shiftKey: true, bubbles: true, cancelable: true }));
+  } else if (kind === 'zoom') {
+    for (let i = 0; i < Math.abs(a); i++) {
+      v.dispatchEvent(new WheelEvent('wheel', { deltaY: a > 0 ? -100 : 100, ctrlKey: true, clientX: cx,
+        clientY: cy, bubbles: true, cancelable: true }));
+    }
+  } else if (kind === 'pan') {
+    const at = (type, x, y) => v.dispatchEvent(new PointerEvent(type, { clientX: x, clientY: y, button: 1,
+      buttons: type === 'pointerup' ? 0 : 4, pointerId: 1, pointerType: 'mouse', isPrimary: true, bubbles: true,
+      cancelable: true, composed: true }));
+    at('pointerdown', cx, cy);
+    at('pointermove', cx + a, cy + b);
+    at('pointerup', cx + a, cy + b);
+  } else if (kind === 'area') {
+    v.style.width = a ? a + '%%' : '';
+    v.style.height = b ? b + '%%' : '';
+    window.dispatchEvent(new Event('resize'));
+  }
+  return kind;
+})(%s, %s, %s)"""
 
 # On <body>, not on whatever has the focus: the view's chat box would keep
 # them. Spaced like a person types, so the test is about what arrives, not
@@ -644,6 +701,21 @@ class Host:
         time.sleep(0.3)
         return self.tracker_reset(block=False)
 
+    def refresh_monitor(self):
+        """The captured monitor as it is now, after its resolution changed."""
+        self.monitor = (self.ipc("plugin:window|primary_monitor", {"label": "main"})
+                        or self.ipc("plugin:window|current_monitor", {"label": "main"}))
+        return self.monitor
+
+    def set_resolution(self, width, height):
+        """Switches this machine's screen to `width` x `height` by a way of its
+        own that the app does not offer (a macOS VM's VMware Tools); whether
+        it could."""
+        try:
+            return bool(self.agent.call("set_resolution", timeout=60, width=width, height=height)["supported"])
+        except HostError:
+            return False
+
     def tracker_point(self):
         """A screen pixel on the tracker: the middle of the main window."""
         if self.wayland:  # no window positions there; it is maximized
@@ -739,6 +811,18 @@ class Session:
         if not (0 <= fx < 1 and 0 <= fy < 1) or v["w"] <= 1:
             return None
         return v["left"] + fx * v["width"], v["top"] + fy * v["height"]
+
+    def view_ipc(self, command, args=None):
+        """An IPC call made by the guest's view window: the commands about a
+        session's picture answer that window and no other."""
+        answer = self.guest.js(IPC_JS % (json.dumps(command), json.dumps(args or {})), window=self.view)
+        if "err" in answer:
+            raise Refused(command, answer["err"], answer.get("detail", ""))
+        return answer["ok"]
+
+    def view_peer(self):
+        """The host as the guest's view window names it in its IPC calls."""
+        return self.guest.js("new URLSearchParams(location.search).get('peer')", window=self.view)
 
     def stats(self):
         try:

@@ -9,6 +9,13 @@
    longer carries a second one a frame behind; it turns into an I-beam over
    text on a still screen; and it follows a sweep of the hand no later than
    the network makes it (ADR 0150).
+3b. layouts: the same spot under the guest's pointer, under the host's own
+   cursor and under the cursor the guest draws, in every layout of the view:
+   fit in windows of other shapes and in one smaller than the host's screen,
+   1:1, and zoomed past the window, centred and panned (ADR 0154).
+3c. resize: the host's screen changes resolution mid-session, through the
+   product's own switch or the machine's (the Mac VM); the picture has to take
+   the new shape and the three spots of 3b have to stay one.
 4. keys: the guest types a line of text and a set of chords into its view;
    the host's tracker has to receive the same characters and every chord.
 5. hotkeys (Windows guest): the same chords once more, pressed on the
@@ -41,9 +48,10 @@ import time
 import pytest
 
 from harness import (CURSOR_LAYER_JS, CURSOR_WATCH_JS, CURSOR_WATCH_READ_JS, GRAB_JS, KEYS_JS, PICTURE_BOX_JS,
-                     POINTER_JS, SPY_READ_JS, SWEEP_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS, TERMINAL_TYPE_JS,
-                     VIEW_STATE_JS, connect, disconnect, expected, host_flags, label, os_events, parse, sessions_of,
-                     synthetic_events, text_combos, with_logs)
+                     POINTER_JS, SPY_MOVE_JS, SPY_READ_JS, SWEEP_JS, TERMINAL_CLOSE_JS, TERMINAL_SCREEN_JS,
+                     TERMINAL_TYPE_JS, VIEW_GEOMETRY_JS, VIEW_GESTURE_JS, VIEW_STATE_JS, Refused, connect,
+                     disconnect, expected, host_flags, label, os_events, parse, sessions_of, synthetic_events,
+                     text_combos, with_logs)
 
 TEXT = "Hello, lumepeer 42"
 # Chords every host OS delivers to a focused webview and none of them acts
@@ -298,6 +306,279 @@ def test_cursor(session, request):
                         f"{growth:.0f}ms further behind by the end")
     if problems:
         fail(with_log(" | ".join(problems) + f" | view frame {v['w']}x{v['h']} for host {width}x{height}", s, mark))
+    note(request, "; ".join(said))
+
+
+# ── 3b, 3c ──────────────────────────────────────────────────────────────────
+
+# The layouts the guest's view shows the host's screen in, each reached the
+# way a person reaches it: the window's own fit at its size and at other
+# shapes (bars above and below, bars at the sides, smaller than the host's
+# screen so the host scales the picture down for it), 1:1, and zoomed in past
+# the window, centred and panned into a corner (ADR 0154).
+LAYOUTS = [
+    ("fit", {}),
+    ("fit-narrow", {"area": (50, None)}),
+    ("fit-flat", {"area": (None, 45)}),
+    ("fit-small", {"area": (35, 35)}),
+    ("1:1", {"modes": 1}),
+    ("zoomed", {"modes": 2, "zoom": True}),
+    ("zoomed-panned", {"modes": 2, "zoom": True, "pan": True}),
+]
+# Spots of the part of the picture the window shows, as fractions of it.
+SPOTS = [(0.1, 0.12), (0.9, 0.12), (0.5, 0.5), (0.1, 0.88), (0.9, 0.88)]
+# How much wider than the window the zoomed layouts draw the picture.
+ZOOM_PAST = 1.6
+# Screens a host is switched to mid-session where nothing offers a list of
+# its own (the Mac VM): a shape unlike the usual window first, then 4:3.
+RESIZES = [(1280, 800), (1024, 768)]
+# What goes wrong, in the order it happens on the way from the hand to the
+# screen, for the report.
+MISSES = {"sent": "the guest sent another spot than it pointed at",
+          "host": "the host's cursor is not where the guest pointed",
+          "layer": "the guest drew the host's cursor away from its own pointer",
+          "drawn": "the cursor the guest drew is not where the host's is"}
+
+
+def misshapen(frame, screen):
+    """Picture pixels by which a picture is off the shape of the screen it
+    shows. Rounding both sides down to an even size accounts for up to 3; a
+    letterboxed or stretched picture is off by tens."""
+    (fw, fh), (hw, hh) = frame, screen
+    return abs(fh - fw * hh / hw) if fw > 1 and hw else float("inf")
+
+
+def gesture(s, kind, a=None, b=None):
+    s.guest.js(VIEW_GESTURE_JS % (json.dumps(kind), json.dumps(a), json.dumps(b)), window=s.view)
+
+
+def settled(s, timeout=10.0):
+    """The view's geometry once the picture has stopped changing size and
+    place: a fitted window asks the host for a new size a quarter of a second
+    after it last changed, and frames of that size come a network trip later."""
+    deadline = time.monotonic() + timeout
+    time.sleep(0.8)
+    last = None
+    while True:
+        geo = s.guest.js(VIEW_GEOMETRY_JS, window=s.view)
+        key = (tuple(geo["frame"]), tuple(round(v) for v in geo["pic"]))
+        if key == last or time.monotonic() > deadline:
+            return geo
+        last = key
+        time.sleep(0.7)
+
+
+def lay_out(s, modes=0, area=None, zoom=False, pan=False):
+    """The guest's view in one layout, from fit over the whole window."""
+    gesture(s, "area")
+    gesture(s, "chord", "0", "Digit0")
+    if area:
+        gesture(s, "area", *area)
+    for _ in range(modes):
+        gesture(s, "chord", "M", "KeyM")
+    if zoom:
+        geo = settled(s)
+        # From 1:1 a quarter a notch, until the picture is wider than the
+        # window: where the page puts it is then its own decision.
+        want = min(4.0, ZOOM_PAST * geo["view"][2] * geo["dpr"] / max(1, geo["frame"][0]))
+        gesture(s, "zoom", max(1, math.ceil((want - 1.0) / 0.25)))
+    if pan:
+        geo = settled(s)
+        # As far as it goes: the picture's top-left corner into the window's.
+        gesture(s, "pan", geo["pic"][2], geo["pic"][3])
+    return settled(s)
+
+
+def check_layout(s, geo, layout):
+    """Points at SPOTS of the part of the picture the window shows. Each time
+    the host pixel the guest pointed at, the host's own cursor and the cursor
+    the guest drew have to be one spot, and the picture has to have the
+    shape of the host's screen. Where they part, what the guest sent and
+    where it drew the cursor against its own pointer say which side it is.
+
+    Problems found, and a summary of the layout for the report."""
+    g, h = s.guest, s.host
+    mon = h.monitor
+    ox, oy = mon["position"]["x"], mon["position"]["y"]
+    hw, hh = mon["size"]["width"], mon["size"]["height"]
+    fw, fh = geo["frame"]
+    pl, pt, pw, ph = geo["pic"]
+    vl, vt, vw, vh = geo["view"]
+    if fw <= 1 or pw <= 0:
+        return [f"{layout}: no picture"], f"{layout} no picture"
+    problems = []
+    if misshapen((fw, fh), (hw, hh)) > 3.5:
+        problems.append(f"{layout}: a {fw}x{fh} picture of a {hw}x{hh} screen")
+    if abs(pw / fw - ph / fh) * max(fw, fh) > 1.5:
+        problems.append(f"{layout}: a {fw}x{fh} picture drawn {pw:.0f}x{ph:.0f}")
+    # One picture pixel and one CSS pixel, in host pixels, and one for rounding.
+    tol = math.ceil(hw / fw + hw / pw) + 1
+    left, right = max(pl, vl) + 8, min(pl + pw, vl + vw) - 8
+    top, bottom = max(pt, vt) + 8, min(pt + ph, vt + vh) - 8
+    # None until a step could be measured at all: a host that sends no
+    # cursor shape leaves nothing drawn to compare.
+    worst = dict.fromkeys(MISSES)
+    missed = {kind: [] for kind in MISSES}
+
+    def miss(kind, off, what):
+        worst[kind] = max(worst[kind] or 0.0, off)
+        if off > tol:
+            missed[kind].append(what)
+
+    aimed, before = 0, h.cursor()
+    for fx, fy in SPOTS:
+        # The host pixel under the spot, and its middle on the guest's screen.
+        px = min(hw - 1, max(0, int((left + fx * (right - left) - pl) / pw * hw)))
+        py = min(hh - 1, max(0, int((top + fy * (bottom - top) - pt) / ph * hh)))
+        x, y = pl + (px + 0.5) / hw * pw, pt + (py + 0.5) / hh * ph
+        if g.js(POINTER_JS % (json.dumps("pointermove"), x, y), window=s.view) != "screen":
+            continue  # the toolbar is over it
+        aimed += 1
+        aim = (ox + px, oy + py)
+        got = settle(h, before)
+        before = got
+        sent = g.js(SPY_MOVE_JS, window=s.view)
+        if sent:
+            at = (ox + sent[0] / 65535 * hw, oy + sent[1] / 65535 * hh)
+            miss("sent", max(abs(at[0] - aim[0] - 0.5), abs(at[1] - aim[1] - 0.5)),
+                 f"{aim} sent as {at[0]:.0f},{at[1]:.0f}")
+        if got is not None:
+            miss("host", max(abs(got[0] - aim[0]), abs(got[1] - aim[1])), f"{aim} went to {got}")
+        now = g.js(VIEW_GEOMETRY_JS, window=s.view)
+        if now["shape"] and now["layer"]:
+            sw, sh, hx, hy = now["shape"]
+            ll, lt, lw, lh = now["layer"]
+            hot = (ll + hx * lw / sw, lt + hy * lh / sh)
+            miss("layer", max(abs(hot[0] - x), abs(hot[1] - y)) * hw / pw,
+                 f"pointer {x:.0f},{y:.0f} drawn at {hot[0]:.0f},{hot[1]:.0f} (CSS px)")
+            if got is not None:
+                drawn = (ox + (hot[0] - pl) / pw * hw, oy + (hot[1] - pt) / ph * hh)
+                miss("drawn", max(abs(drawn[0] - got[0]), abs(drawn[1] - got[1])),
+                     f"drawn at {drawn[0]:.0f},{drawn[1]:.0f}, the host's at {got}")
+        elif now["shape"] and not h.wayland:
+            missed["layer"].append(f"the guest drew no cursor at {x:.0f},{y:.0f}")
+    if not aimed:
+        problems.append(f"{layout}: nothing of the picture to point at outside the toolbar")
+    for kind, what in MISSES.items():
+        if missed[kind]:
+            problems.append(f"{layout}: {what} {len(missed[kind])}/{aimed}x, worst {worst[kind]:.0f}px "
+                            f"(tol {tol}): {missed[kind][0]}")
+    summary = (f"{layout} {fw}x{fh} drawn {pw:.0f}x{ph:.0f}: "
+               + " ".join(f"{kind} {'-' if worst[kind] is None else f'{worst[kind]:.0f}'}" for kind in MISSES)
+               + f" (tol {tol})")
+    return problems, summary
+
+
+def test_layouts(session, request):
+    s = live(session)
+    if s.picture_error:
+        fail(f"no picture to aim at ({s.picture_error})")
+    mark = s.host.log_mark()
+    problems, said = [], []
+    try:
+        for layout, how in LAYOUTS:
+            found, summary = check_layout(s, lay_out(s, **how), layout)
+            problems += found
+            said.append(summary)
+    finally:
+        lay_out(s)
+    mon = s.host.monitor["size"]
+    if problems:
+        fail(with_log(" | ".join(problems) + f" | host {mon['width']}x{mon['height']}", s, mark))
+    note(request, "; ".join(said))
+
+
+def screen_of(h):
+    size = h.refresh_monitor()["size"]
+    return size["width"], size["height"]
+
+
+def switches(s, original):
+    """How to change the host's screen mid-session, as [(width, height,
+    apply)]: the product's own switch where the host offers one (ADR 0048),
+    else the machine's own way (agent.py `set_resolution`), else none."""
+    peer = s.view_peer()
+    try:
+        offered = (s.view_ipc("host_display_modes", {"peer": peer}) or {}).get("modes") or []
+    except Refused:
+        offered = []
+    if offered:
+        by_size = {}
+        for mode in offered:
+            size = (mode["width"], mode["height"])
+            if size not in by_size or mode["refresh_hz"] > by_size[size]["refresh_hz"]:
+                by_size[size] = mode
+        shape = original[0] / original[1]
+        # Other shapes than the screen's own, the largest no wider than it
+        # first: a mode past the screen's own is a virtual adapter's guess.
+        picks = sorted((m for size, m in by_size.items() if size != original and size[0] >= 800
+                        and abs(size[0] / size[1] - shape) > 0.05),
+                       key=lambda m: (m["width"] > original[0], -m["width"]))
+        chosen, shapes = [], set()
+        for mode in picks:
+            if round(mode["width"] / mode["height"], 2) not in shapes:
+                shapes.add(round(mode["width"] / mode["height"], 2))
+                chosen.append(mode)
+        back = by_size.get(original)
+
+        def apply(mode):
+            return lambda: s.view_ipc("host_display_set_mode", {"args": {"peer": peer, "mode_id": mode["id"]}})
+
+        steps = [(m["width"], m["height"], apply(m)) for m in chosen[:2]]
+        return steps, (apply(back) if back else None)
+    if s.host.set_resolution(*original):
+        steps = [(w, h, lambda w=w, h=h: s.host.set_resolution(w, h)) for w, h in RESIZES if (w, h) != original]
+        return steps, lambda: s.host.set_resolution(*original)
+    return [], None
+
+
+def test_resize(session, request):
+    s = live(session)
+    h = s.host
+    if s.picture_error:
+        fail(f"no picture to aim at ({s.picture_error})")
+    if not h.cfg.get("resize", True):
+        pytest.skip(f"{h.name}'s screen is somebody's desk (hosts.toml resize = false)")
+    original = screen_of(h)
+    steps, restore = switches(s, original)
+    if not steps:
+        pytest.skip(f"no way to change {h.name}'s resolution: no display modes offered, no agent switch")
+    mark = h.log_mark()
+    problems, said = [], []
+    lay_out(s)
+    try:
+        for width, height, switch in steps:
+            was = screen_of(h)
+            switch()
+            deadline = time.monotonic() + 20
+            screen = was
+            while screen != (width, height) and time.monotonic() < deadline:
+                time.sleep(0.5)
+                screen = screen_of(h)
+            if screen == was:
+                problems.append(f"{width}x{height}: the host's screen stayed {screen[0]}x{screen[1]}")
+                continue
+            # A screen settles before its picture does; give it a moment more.
+            time.sleep(1.0)
+            screen = screen_of(h)
+            # The picture follows the screen: the guest gets frames of its new
+            # shape within a few seconds, or never.
+            deadline = time.monotonic() + 15
+            geo = settled(s)
+            while misshapen(geo["frame"], screen) > 3.5 and time.monotonic() < deadline:
+                geo = settled(s)
+            found, summary = check_layout(s, geo, f"{screen[0]}x{screen[1]}")
+            problems += found
+            said.append(summary)
+    finally:
+        if restore:
+            restore()
+        deadline = time.monotonic() + 20
+        while screen_of(h) != original and time.monotonic() < deadline:
+            time.sleep(0.5)
+        settled(s)
+    if problems:
+        fail(with_log(" | ".join(problems) + f" | host {original[0]}x{original[1]} at the start", s, mark))
     note(request, "; ".join(said))
 
 

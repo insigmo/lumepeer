@@ -159,6 +159,17 @@ mod screen_capture_kit {
     /// without anyone telling it from the network's own delay.
     const CURSOR_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+    /// How often a running stream compares the size it was configured for
+    /// with the captured display's size now (ADR 0154).
+    ///
+    /// A stream keeps the size it was made with and scales whatever the
+    /// display becomes into it, so a display that changed mode mid-session
+    /// (a VM's window resized or made full screen) was sent letterboxed and
+    /// stretched while input went to the display as it is. Half a second is
+    /// a resolution change nobody points at before it is followed; asking
+    /// the window server on every tick would only load a busy one more.
+    const DISPLAY_SIZE_RECHECK: Duration = Duration::from_millis(500);
+
     /// Video framerate configured on [`MacosAudioCapturer`]'s stream. That
     /// stream exists only for its audio output — nothing here ever reads a
     /// screen sample from it — but `SCStreamConfiguration` still requires a
@@ -885,6 +896,13 @@ mod screen_capture_kit {
         }
     }
 
+    /// `display`'s size in points as it is now, or `None` while it has none
+    /// (a display that has just gone away).
+    fn display_size(display: CGDirectDisplayID) -> Option<(f64, f64)> {
+        let size = CGDisplayBounds(display).size;
+        (size.width > 0.0 && size.height > 0.0).then_some((size.width, size.height))
+    }
+
     /// Where the pointer is on `display`, in the pixels of a picture
     /// `picture_width` wide, or `None` when the window server cannot say.
     #[allow(
@@ -979,6 +997,10 @@ mod screen_capture_kit {
         shared: Arc<Shared>,
         /// The captured display, for where the pointer is on it.
         display: CGDirectDisplayID,
+        /// The display's size in points when the stream was configured for
+        /// it, and when that was last compared with its size now.
+        size: Option<(f64, f64)>,
+        size_checked: Instant,
         /// Reads the cursor for as long as the stream runs.
         cursor: CursorWatcher,
         /// Number of the cursor [`ScreenCapturer::cursor_shape`] last handed
@@ -993,6 +1015,21 @@ mod screen_capture_kit {
     }
 
     impl Active {
+        /// Whether the captured display is no longer the size this stream was
+        /// configured for, asked at most every [`DISPLAY_SIZE_RECHECK`].
+        fn display_resized(&mut self) -> bool {
+            if self.size_checked.elapsed() < DISPLAY_SIZE_RECHECK {
+                return false;
+            }
+            self.size_checked = Instant::now();
+            match (self.size, display_size(self.display)) {
+                (Some(was), Some(now)) => {
+                    (was.0 - now.0).abs() >= 0.5 || (was.1 - now.1).abs() >= 0.5
+                }
+                _ => false,
+            }
+        }
+
         /// The picture to hand out for this tick: `fresh` from the stream,
         /// or the last one again when only the cursor drawn into it moved,
         /// or `None` when nothing a viewer sees has changed (§11.1).
@@ -1033,6 +1070,9 @@ mod screen_capture_kit {
     /// `ScreenCaptureKit` capturer.
     pub struct MacosCapturer {
         active: Option<Active>,
+        /// What the running stream captures, to start it again on when the
+        /// display changes size.
+        target: CaptureTarget,
         /// Whether the cursor is drawn into the frames this backend produces.
         /// Turned off when the guest has said it will draw the cursor itself
         /// (§11; `FEATURE_CURSOR_SHAPE`). Kept here rather than on the
@@ -1074,6 +1114,7 @@ mod screen_capture_kit {
         pub const fn new() -> Self {
             Self {
                 active: None,
+                target: CaptureTarget::PrimaryDisplay,
                 embed_cursor: true,
             }
         }
@@ -1198,11 +1239,14 @@ mod screen_capture_kit {
                 return Err(info.into_media_error("starting the ScreenCaptureKit stream"));
             }
 
+            self.target = target;
             self.active = Some(Active {
                 stream,
                 _sink: sink,
                 shared,
                 display: display_id,
+                size: display_size(display_id),
+                size_checked: Instant::now(),
                 cursor: CursorWatcher::spawn(),
                 reported_cursor: None,
                 clean: None,
@@ -1212,6 +1256,17 @@ mod screen_capture_kit {
         }
 
         fn next_frame(&mut self) -> Result<Option<Frame>> {
+            // Started again rather than reconfigured: a start is the path every
+            // session already takes, where `updateConfiguration` on a Mac with
+            // no Metal is what took `WindowServer` down (ADR 0152). The picture
+            // then has the display's own shape again, which is what the guest
+            // maps the pointer against and what input is scaled to (ADR 0154).
+            if self.active.as_mut().is_some_and(Active::display_resized) {
+                tracing::info!(
+                    "the captured display changed size: capturing it again at its new size"
+                );
+                self.start(self.target)?;
+            }
             let active = self
                 .active
                 .as_mut()
@@ -1244,6 +1299,17 @@ mod screen_capture_kit {
         /// picture while one is running (ADR 0139).
         fn waits_for_change(&self) -> bool {
             self.active.is_some()
+        }
+
+        /// The stream's newest picture again, as `next_frame` would hand it
+        /// out: on a still screen the stream sends nothing, and a guest whose
+        /// decoder needs a keyframe — or a loop that replaces another — would
+        /// otherwise wait for something to move (ADR 0141, ADR 0154).
+        fn snapshot(&mut self) -> Option<Frame> {
+            let embed_cursor = self.embed_cursor;
+            let active = self.active.as_mut()?;
+            let base = active.clean.clone()?;
+            active.picture(Some(base), embed_cursor)
         }
 
         fn input_capability(&self) -> InputCapability {

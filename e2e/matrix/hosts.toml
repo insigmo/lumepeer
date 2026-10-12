@@ -27,6 +27,9 @@ app = "target/e2e/win/lumepeer-desktop.exe"
 # elevated browser process, where UIPI drops every click the harness makes,
 # and no view ever gets the keyboard or arms the grab.
 env = { WEBVIEW2_USER_DATA_FOLDER = 'C:\Users\beta_win\AppData\Local\lumepeer-e2e\webview2' }
+# The screen of the machine the run is driven from: `resize` does not switch
+# its resolution under whoever is working at it.
+resize = false
 
 [hosts.beta]
 os = "windows"
