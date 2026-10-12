@@ -491,6 +491,11 @@ const CLEAR_WINDOWS: u32 = 2;
 /// Each step back up, in percent of the cap: from the floor to a preset's
 /// 8 Mbit/s in nine steps, so about ten seconds of a clear link.
 const RECOVERY_STEP_PERCENT: u32 = 150;
+/// Share of what the cap allows one frame, in percent, at and above which a
+/// window's frames were heavy enough to be what the link could not carry
+/// (ADR 0153). A still desktop's frames are a few percent of it; a software
+/// encoder that undershoots its target by two thirds still makes a third.
+const HEAVY_FRAME_PERCENT: u64 = 25;
 
 /// Lowers the bitrate a preset pinned while the link cannot carry the
 /// picture, and gives it back as the link recovers (ADR 0144).
@@ -504,6 +509,13 @@ const RECOVERY_STEP_PERCENT: u32 = 150;
 /// actually sent rather than from the target, which a software encoder
 /// undershoots by two thirds. Smaller frames get through where large ones
 /// stall.
+///
+/// Only while the picture's frames are what the link is stuck on (ADR 0153).
+/// A still desktop sends a few kilobits a second, and halving *that* threw a
+/// preset's 8 Mbit/s to the floor on any two-second stall of the network: the
+/// next thing the person did was a blur for the ten seconds the cap took to
+/// come back, and smaller frames had relieved nothing. A stall under light
+/// frames halves the cap itself, and no more.
 #[derive(Debug, Default)]
 pub struct LinkPressure {
     /// When the current window started; `None` until it is first asked.
@@ -512,6 +524,11 @@ pub struct LinkPressure {
     held: Duration,
     /// Bytes handed to the link in the window.
     bytes: u64,
+    /// Frames handed to the link in the window.
+    frames: u64,
+    /// Whether a window of the current run of pressed ones carried heavy
+    /// frames: then what was sent is the measure of the link.
+    heavy: bool,
     /// Pressed windows in a row.
     pressed: u32,
     /// Clear windows in a row.
@@ -532,9 +549,10 @@ impl LinkPressure {
         self.held = self.held.saturating_add(took);
     }
 
-    /// `bytes` of picture went to the link.
+    /// One frame of `bytes` went to the link.
     pub fn sent(&mut self, bytes: usize) {
         self.bytes = self.bytes.saturating_add(bytes as u64);
+        self.frames = self.frames.saturating_add(1);
     }
 
     /// Drops the cap and everything measured, for a session no preset pins
@@ -547,9 +565,10 @@ impl LinkPressure {
     }
 
     /// Closes the window once it has run, against the `ceiling_kbps` the
-    /// preset pinned. The bitrate to encode at from now on, when the cap
-    /// moved: the cap, or the ceiling once the cap is gone.
-    pub fn due(&mut self, now: Instant, ceiling_kbps: u32) -> Option<u32> {
+    /// preset pinned, on a picture paced at `fps`. The bitrate to encode at
+    /// from now on, when the cap moved: the cap, or the ceiling once the cap
+    /// is gone.
+    pub fn due(&mut self, now: Instant, ceiling_kbps: u32, fps: u8) -> Option<u32> {
         let started = *self.started.get_or_insert(now);
         let elapsed = now.saturating_duration_since(started);
         if elapsed < KEEP_UP_WINDOW {
@@ -557,11 +576,23 @@ impl LinkPressure {
         }
         let held = std::mem::take(&mut self.held);
         let bytes = std::mem::take(&mut self.bytes);
+        let frames = std::mem::take(&mut self.frames);
         self.started = Some(now);
 
         if held * PERCENT >= elapsed * PRESSED_HELD_PERCENT {
             self.clear = 0;
             self.pressed = self.pressed.saturating_add(1);
+            let current = self
+                .cap_kbps
+                .map_or(ceiling_kbps, |cap| cap.min(ceiling_kbps));
+            // What the cap allows one frame: kilobits a second are 125 bytes.
+            let frame_budget = u64::from(current) * 125 / u64::from(fps.max(1));
+            if frames > 0
+                && bytes.saturating_mul(u64::from(PERCENT))
+                    >= frame_budget.saturating_mul(frames) * HEAVY_FRAME_PERCENT
+            {
+                self.heavy = true;
+            }
             if self.pressed < PRESSED_WINDOWS {
                 return None;
             }
@@ -569,10 +600,12 @@ impl LinkPressure {
                 .unwrap_or(u64::MAX)
                 .max(1);
             let sent_kbps = u32::try_from(bytes.saturating_mul(8) / millis).unwrap_or(u32::MAX);
-            let current = self
-                .cap_kbps
-                .map_or(ceiling_kbps, |cap| cap.min(ceiling_kbps));
-            let lowered = (current.min(sent_kbps) / 2).max(ABR_MIN_BITRATE_KBPS);
+            let basis = if self.heavy {
+                current.min(sent_kbps)
+            } else {
+                current
+            };
+            let lowered = (basis / 2).max(ABR_MIN_BITRATE_KBPS);
             if lowered >= current {
                 return None;
             }
@@ -580,6 +613,7 @@ impl LinkPressure {
             return Some(lowered);
         }
         self.pressed = 0;
+        self.heavy = false;
         let Some(cap) = self.cap_kbps else {
             self.clear = 0;
             return None;
@@ -1014,8 +1048,11 @@ mod tests {
         );
     }
 
-    /// One second of the link, waited on for `held_ms` and carrying `kbps`,
-    /// and what closing it said.
+    /// The frame rate the link tests pace their picture at.
+    const LINK_FPS: u8 = 30;
+
+    /// One second of the link, waited on for `held_ms` and carrying `kbps`
+    /// in one frame — none when `kbps` is 0 — and what closing it said.
     fn link_window(
         link: &mut LinkPressure,
         at: &mut Instant,
@@ -1024,11 +1061,20 @@ mod tests {
         ceiling: u32,
     ) -> Option<u32> {
         // Opens the window the first time; mid-window it says nothing.
-        assert_eq!(link.due(*at, ceiling), None);
+        assert_eq!(link.due(*at, ceiling, LINK_FPS), None);
         link.held(ms(held_ms));
-        link.sent(usize::try_from(u64::from(kbps) * 1_000 / 8).expect("fits"));
+        if kbps > 0 {
+            link.sent(usize::try_from(u64::from(kbps) * 1_000 / 8).expect("fits"));
+        }
         *at += ms(1_000);
-        link.due(*at, ceiling)
+        link.due(*at, ceiling, LINK_FPS)
+    }
+
+    /// Brings `link` to the floor the way a link frozen under a picture does.
+    fn freeze_under_a_picture(link: &mut LinkPressure, at: &mut Instant) {
+        link_window(link, at, 1_000, 2_400, 8_000);
+        link_window(link, at, 1_000, 0, 8_000);
+        assert_eq!(link.cap_kbps(), Some(ABR_MIN_BITRATE_KBPS));
     }
 
     /// ADR 0144: one stalled second is a hiccup; from the second one on the
@@ -1058,17 +1104,41 @@ mod tests {
         assert_eq!(link.cap_kbps(), Some(ABR_MIN_BITRATE_KBPS));
     }
 
-    /// ADR 0144: a link that carries nothing at all goes straight to the
-    /// floor.
+    /// ADR 0144: a link that carries nothing at all after a picture goes
+    /// straight to the floor.
     #[test]
-    fn a_frozen_link_goes_straight_to_the_floor() {
+    fn a_link_frozen_under_a_picture_goes_straight_to_the_floor() {
         let mut link = LinkPressure::default();
         let mut at = Instant::now();
-        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        link_window(&mut link, &mut at, 1_000, 2_400, 8_000);
         assert_eq!(
             link_window(&mut link, &mut at, 1_000, 0, 8_000),
             Some(ABR_MIN_BITRATE_KBPS)
         );
+    }
+
+    /// ADR 0153: a network that stalls under a still desktop halves the cap
+    /// and no more — its frames were not what the link could not carry, and
+    /// the next thing the person does must not start from the floor.
+    #[test]
+    fn a_stall_under_a_still_screen_halves_the_cap_and_no_more() {
+        let mut link = LinkPressure::default();
+        let mut at = Instant::now();
+        // Eight kilobits in a second: a cursor blinking.
+        assert_eq!(link_window(&mut link, &mut at, 900, 8, 8_000), None);
+        assert_eq!(link_window(&mut link, &mut at, 900, 8, 8_000), Some(4_000));
+        assert_eq!(
+            link_window(&mut link, &mut at, 1_000, 0, 8_000),
+            Some(2_000),
+            "a stall that goes on goes on halving"
+        );
+        // Back in five clear seconds, where the floor took ten.
+        let mut clear = 0;
+        while link.cap_kbps().is_some() {
+            link_window(&mut link, &mut at, 0, 8, 8_000);
+            clear += 1;
+        }
+        assert_eq!(clear, 5);
     }
 
     /// ADR 0144: two clear seconds, then a step up every clear second, until
@@ -1078,9 +1148,7 @@ mod tests {
     fn a_clear_link_gets_its_bitrate_back_a_step_a_second() {
         let mut link = LinkPressure::default();
         let mut at = Instant::now();
-        link_window(&mut link, &mut at, 1_000, 0, 8_000);
-        link_window(&mut link, &mut at, 1_000, 0, 8_000);
-        assert_eq!(link.cap_kbps(), Some(300));
+        freeze_under_a_picture(&mut link, &mut at);
 
         assert_eq!(link_window(&mut link, &mut at, 0, 300, 8_000), None);
         assert_eq!(link_window(&mut link, &mut at, 0, 300, 8_000), Some(450));
@@ -1105,8 +1173,7 @@ mod tests {
     fn releasing_the_link_cap_forgets_it() {
         let mut link = LinkPressure::default();
         let mut at = Instant::now();
-        link_window(&mut link, &mut at, 1_000, 0, 8_000);
-        link_window(&mut link, &mut at, 1_000, 0, 8_000);
+        freeze_under_a_picture(&mut link, &mut at);
         assert!(link.release());
         assert_eq!(link.cap_kbps(), None);
         assert!(!link.release());

@@ -1617,7 +1617,7 @@ pub(crate) fn spawn_encode_loop_with(
             // brings it down until it can; without a preset the adaptive
             // controller has the bitrate, and any cap goes (ADR 0144).
             let link_moved = if control.manual_cap().is_some() {
-                link.due(tick_started, target.bitrate_kbps)
+                link.due(tick_started, target.bitrate_kbps, target.fps)
             } else {
                 link.release().then_some(target.bitrate_kbps)
             };
@@ -2315,6 +2315,7 @@ fn log_encode_report(
         cwnd = ?path.map(|path| path.cwnd),
         lost_packets = ?path.map(|path| path.lost_packets),
         congestion_events = ?path.map(|path| path.congestion_events),
+        mtu = ?path.map(|path| path.current_mtu),
         relay = ?path.map(|path| path.relay),
         "media: the last period of the encode loop (ms as avg/max)"
     );

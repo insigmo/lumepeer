@@ -36,7 +36,7 @@ use lumepeer_core::constants::{
     QUIC_MAX_IDLE_TIMEOUT_SECS,
 };
 use noq::udp::{RecvMeta, Transmit};
-use noq::{AsyncUdpSocket, IdleTimeout, TransportConfig, UdpSender, VarInt};
+use noq::{AsyncUdpSocket, IdleTimeout, MtuDiscoveryConfig, TransportConfig, UdpSender, VarInt};
 use rand::Rng as _;
 use rand::RngExt as _;
 
@@ -49,6 +49,28 @@ const NONCE_BYTES: usize = 24;
 const TAG_BYTES: usize = 16;
 /// Bytes of the little-endian payload-length header sealed inside the envelope.
 const LEN_HEADER_BYTES: usize = 2;
+/// Bytes the envelope adds to every datagram, before any padding.
+const ENVELOPE_BYTES: usize = NONCE_BYTES + LEN_HEADER_BYTES + TAG_BYTES;
+/// The largest QUIC packet [`Obfuscator::seal`] pads: QUIC's own minimum
+/// packet size (RFC 9000 §14), which every handshake proves the path carries
+/// with the padding on.
+///
+/// A larger packet exists only because MTU discovery found room for it, and
+/// discovery measures the path with probes of exactly the size it then sends.
+/// Padded at random, the probe that got through with a little padding licensed
+/// a size that the next packet's larger padding pushed past the path: on an
+/// ordinary 1500-byte path a share of every full packet of a picture never
+/// left the host, and QUIC's black-hole detection took it for a lossy link —
+/// packets of the very same size kept arriving (ADR 0153).
+const PADDED_UP_TO_BYTES: usize = 1_200;
+/// The largest QUIC packet MTU discovery may try on the obfuscated transport:
+/// `noq`'s own bound of 1452, less the envelope, so a sealed packet is never
+/// larger on the wire than a plain QUIC packet may be (ADR 0153).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "1452 less a 42-byte envelope, far inside u16"
+)]
+const MTU_UPPER_BOUND_BYTES: u16 = 1_452 - ENVELOPE_BYTES as u16;
 
 /// KDF context for the host-to-guest datagram key. Distinct per direction, so a
 /// datagram captured in one direction can never be opened as the other and the
@@ -129,7 +151,9 @@ impl Obfuscator {
     /// differ on the wire. The padding is a fresh random length in
     /// `0..=OBFUSCATE_PADDING_MAX_BYTES`, sealed inside the envelope where it is
     /// indistinguishable from ciphertext, so it only blurs the datagram length
-    /// and adds no header of its own.
+    /// and adds no header of its own. A payload larger than
+    /// [`PADDED_UP_TO_BYTES`] gets none: it is sized to the path, and padding
+    /// would make it too large for it.
     ///
     /// # Errors
     /// [`NetError::Obfuscation`] if `payload` is larger than a `u16` length
@@ -145,7 +169,11 @@ impl Obfuscator {
         let mut nonce = [0u8; NONCE_BYTES];
         rng.fill_bytes(&mut nonce);
 
-        let pad_len = rng.random_range(0..=OBFUSCATE_PADDING_MAX_BYTES);
+        let pad_len = if payload.len() > PADDED_UP_TO_BYTES {
+            0
+        } else {
+            rng.random_range(0..=OBFUSCATE_PADDING_MAX_BYTES)
+        };
         let mut padding = vec![0u8; pad_len];
         rng.fill_bytes(&mut padding);
 
@@ -627,6 +655,10 @@ pub fn obfuscated_transport_config() -> TransportConfig {
     let idle_timeout_ms =
         u32::try_from(QUIC_MAX_IDLE_TIMEOUT_SECS.saturating_mul(1000)).unwrap_or(u32::MAX);
     config.max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_timeout_ms))));
+    // Room for the envelope on top of the largest packet (ADR 0153).
+    let mut mtu_discovery = MtuDiscoveryConfig::default();
+    mtu_discovery.upper_bound(MTU_UPPER_BOUND_BYTES);
+    config.mtu_discovery_config(Some(mtu_discovery));
     // Cubic, deaf to losses that do not look like a queue (ADR 0144).
     config.congestion_controller_factory(std::sync::Arc::new(
         crate::loss_tolerant::LossTolerantConfig::default(),

@@ -523,6 +523,7 @@ mod tests {
             cwnd: 64_000,
             lost_packets: 3,
             congestion_events: 1,
+            current_mtu: 1_400,
             relay: true,
         }));
         let snapshot = stats.snapshot(start);

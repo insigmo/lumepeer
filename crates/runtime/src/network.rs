@@ -1385,6 +1385,13 @@ enum ActorCommand {
     /// would, with no session ended on purpose on either side.
     #[cfg(test)]
     SeverLinks { reply: oneshot::Sender<()> },
+    /// Tests only: this machine slept for `slept` — nothing arrived on any
+    /// connection for that long — and woke to every link gone (ADR 0153).
+    #[cfg(test)]
+    SleepAndSeverLinks {
+        slept: Duration,
+        reply: oneshot::Sender<()>,
+    },
     /// Tests only: what this host holds of `label`'s preset and window size
     /// for the encode loops of its session (ADR 0119), or `None` for none.
     #[cfg(test)]
@@ -2090,6 +2097,21 @@ impl ActorHandle {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Tests only: as if this machine had slept for `slept` and woken to
+    /// every link gone (ADR 0153).
+    #[cfg(test)]
+    pub async fn sleep_and_sever_links(&self, slept: Duration) {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(ActorCommand::SleepAndSeverLinks { slept, reply })
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
     }
 
     /// Tests only: drops every connection like a lost link (ADR 0089).
@@ -4112,6 +4134,29 @@ struct ConnectionHandle {
     /// every path that ends a session — which is exactly the kind of
     /// bookkeeping that gets forgotten on the seventh one.
     logged_route: Option<String>,
+    /// When anything last arrived on this connection, by the wall clock: a
+    /// machine that slept has not counted its sleep on a monotonic clock
+    /// everywhere, and the sleep is what this is for ([`slept_past_resume`]).
+    last_heard: std::time::SystemTime,
+}
+
+/// Whether a session last heard from at `last_heard` is one its host has
+/// certainly ended, because this machine was asleep (or cut off) for longer
+/// than the host keeps a dropped session (ADR 0153).
+///
+/// The host notices the drop one idle timeout after the last packet from
+/// here, and parks the session for [`RECONNECT_WINDOW_SECS`] from then; the
+/// last message from it may be up to a ping interval older than that packet.
+/// Past all three, a resume can only be turned away — after a closed laptop
+/// lid that was seconds of a frozen window for an answer known in advance.
+fn slept_past_resume(last_heard: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    let kept = Duration::from_secs(
+        RECONNECT_WINDOW_SECS
+            + lumepeer_core::constants::QUIC_MAX_IDLE_TIMEOUT_SECS
+            + PING_INTERVAL_SECS,
+    );
+    now.duration_since(last_heard)
+        .is_ok_and(|silent| silent > kept)
 }
 
 /// Whether this build may send `ReceiverReport` towards a peer, from the only
@@ -9564,6 +9609,7 @@ impl Actor {
                 peer_minor,
                 session_id,
                 logged_route: None,
+                last_heard: std::time::SystemTime::now(),
             },
         );
     }
@@ -11636,9 +11682,12 @@ impl Actor {
     fn on_inbound(&mut self, peer: NodeId, id: u64, kind: &MessageKind) {
         let Some(origin) = self
             .connections
-            .get(&peer)
+            .get_mut(&peer)
             .filter(|c| c.id == id)
-            .map(|c| c.origin)
+            .map(|c| {
+                c.last_heard = std::time::SystemTime::now();
+                c.origin
+            })
         else {
             return;
         };
@@ -12451,6 +12500,19 @@ impl Actor {
                 .connection
                 .closed_by_peer_with(lumepeer_net::connection::CLOSE_RESTARTING)
         });
+        // Nor is there after a sleep longer than the host keeps a session
+        // (ADR 0153): the answer to a resume is known, and the new session it
+        // ends in is dialed at once instead.
+        let slept_past_window = closed.as_ref().is_some_and(|handle| {
+            slept_past_resume(handle.last_heard, std::time::SystemTime::now())
+        });
+        if slept_past_window {
+            tracing::info!(
+                peer = %self.label_of(&peer),
+                "nothing was heard from the host for longer than it keeps a session: dialing a new one"
+            );
+        }
+        let session_over = host_restarting || slept_past_window;
         let dialing_again = self.connect_is_still_unanswered(peer, was_watching, closed.as_ref())
             && self.retry_connect_soon(peer);
         if !dialing_again {
@@ -12485,9 +12547,9 @@ impl Actor {
             self.start_reconnect_wait(
                 peer,
                 host_tag(&peer),
-                resume.filter(|_| !host_restarting),
+                resume.filter(|_| !session_over),
                 was_surface,
-                host_restarting,
+                session_over,
             );
         } else if host_restarting
             && (self.reconnect_waits.contains_key(&peer) || self.parked_views.contains_key(&peer))
@@ -12638,6 +12700,17 @@ impl Actor {
                 // A code no side reads as a decision: what the far side sees
                 // is a connection that ended, as it would on a lost link.
                 for handle in self.connections.values() {
+                    handle.connection.close(0u32.into(), b"link lost");
+                }
+                let _ = reply.send(());
+            }
+            #[cfg(test)]
+            ActorCommand::SleepAndSeverLinks { slept, reply } => {
+                for handle in self.connections.values_mut() {
+                    handle.last_heard = handle
+                        .last_heard
+                        .checked_sub(slept)
+                        .unwrap_or(std::time::UNIX_EPOCH);
                     handle.connection.close(0u32.into(), b"link lost");
                 }
                 let _ = reply.send(());
@@ -16578,18 +16651,19 @@ impl Actor {
     /// Those attempts are not new sessions, so they are what the window is
     /// for rather than a race with it.
     ///
-    /// `host_restarting` is the host having said it is restarting into an
-    /// update (ADR 0148). Then there is no repair to race: the session ended
-    /// with the process, so the wait dials a new one after
+    /// `session_over` is the host having said it is restarting into an
+    /// update (ADR 0148), or this machine having been asleep for longer than
+    /// the host keeps a session (ADR 0153). Then there is no repair to race:
+    /// the session is gone on the host, so the wait dials a new one after
     /// [`HOST_RESTART_REDIAL_SECS`], and that dial keeps knocking until the
-    /// new process answers.
+    /// host answers.
     fn start_reconnect_wait(
         &mut self,
         peer: NodeId,
         host_tag: String,
         resume: Option<[u8; 16]>,
         surface: ViewSurface,
-        host_restarting: bool,
+        session_over: bool,
     ) {
         self.reconnect_wait_generation = self.reconnect_wait_generation.wrapping_add(1);
         let generation = self.reconnect_wait_generation;
@@ -16604,7 +16678,7 @@ impl Actor {
                 dialing: false,
                 dial_seq: 0,
                 surface,
-                refused: host_restarting,
+                refused: session_over,
             },
         );
         // A goodbye still owed to an earlier session with this host is moot:
@@ -16621,7 +16695,7 @@ impl Actor {
             self.connect_retry_secs = None;
             self.connect_credentials_auto = false;
         }
-        let first_attempt_secs = if host_restarting {
+        let first_attempt_secs = if session_over {
             HOST_RESTART_REDIAL_SECS
         } else if resume.is_some() {
             RESUME_RETRY_SECS
@@ -16632,7 +16706,7 @@ impl Actor {
             peer = %self.label_of(&peer),
             first_attempt_secs,
             resuming = resume.is_some(),
-            host_restarting,
+            session_over,
             "waiting for a host to come back"
         );
         self.arm_reconnect_wait(generation, first_attempt_secs);
@@ -25780,6 +25854,113 @@ mod tests {
             recorder.opened().len(),
             1,
             "the new session came back into the old window"
+        );
+    }
+
+    /// ADR 0153: a guest that slept for longer than its host keeps a session
+    /// — a laptop whose lid was closed — dials a new session the moment it
+    /// wakes to the dead link, rather than first claiming one the host has
+    /// long since ended; and the session still comes back into its window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guest_that_slept_past_the_resume_window_dials_a_new_session_at_once() {
+        use lumepeer_core::protocol::MessageKind;
+
+        async fn next_control(endpoint: &PeerEndpoint) -> PeerConnection {
+            loop {
+                if let Ok(connection) = endpoint.accept().await.unwrap()
+                    && connection.alpn() == lumepeer_net::ALPN_CONTROL
+                {
+                    return connection;
+                }
+            }
+        }
+
+        let secret = iroh::SecretKey::generate();
+        let identity = SigningKey::from_bytes(&secret.to_bytes());
+        let host = PeerEndpoint::bind_local(secret).await.unwrap();
+        let invite = InviteTicket::issue(
+            &identity,
+            &host.addr(),
+            Role::ViewOnly,
+            unix_now(),
+            None,
+            None,
+        )
+        .unwrap();
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        guest
+            .invite_connect(invite.to_code().unwrap())
+            .await
+            .unwrap();
+        let (mut session, _) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed");
+        session
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+
+        guest
+            .sleep_and_sever_links(Duration::from_secs(RECONNECT_WINDOW_SECS * 2))
+            .await;
+        let woke = tokio::time::Instant::now();
+        let (mut fresh, hello) = tokio::time::timeout(TIMEOUT, async {
+            lumepeer_net::host_handshake(next_control(&host).await)
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("the guest never dialed the host again");
+        let took = woke.elapsed();
+        assert_eq!(
+            hello.resume_claim, None,
+            "a new session, not one the host has long since ended"
+        );
+        assert!(
+            took < Duration::from_secs(HOST_RESTART_REDIAL_SECS + 3),
+            "dialed again only {took:?} after waking"
+        );
+        fresh
+            .send(MessageKind::ConsentGrant(Role::ViewOnly))
+            .await
+            .unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        assert!(
+            recorder.closed().is_empty(),
+            "the window closed while its host was away"
+        );
+        assert_eq!(
+            recorder.opened().len(),
+            1,
+            "the new session came back into the old window"
+        );
+        drop(session);
+    }
+
+    /// ADR 0153: what the guest reads as a sleep past the resume window, and
+    /// what it does not — a link that has only just gone quiet still resumes.
+    #[test]
+    fn only_a_silence_past_what_the_host_keeps_skips_the_resume() {
+        let now = std::time::SystemTime::now();
+        let ago = |secs| now.checked_sub(Duration::from_secs(secs)).unwrap();
+        assert!(!slept_past_resume(now, now));
+        assert!(!slept_past_resume(ago(PING_INTERVAL_SECS), now));
+        assert!(!slept_past_resume(ago(RECONNECT_WINDOW_SECS), now));
+        assert!(slept_past_resume(ago(RECONNECT_WINDOW_SECS * 2), now));
+        assert!(
+            !slept_past_resume(now + Duration::from_mins(1), now),
+            "a clock wound back is not a sleep"
         );
     }
 
