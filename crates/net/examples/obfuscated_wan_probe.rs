@@ -83,11 +83,19 @@ async fn main() {
             (None, _) => Err("usage: obfuscated_wan_probe hold <invite-code> [minutes]".to_owned()),
             (_, Err(reason)) => Err(reason),
         },
+        "pull" => match (args.next(), count(args.next()), count(args.next())) {
+            (Some(code), Ok(seconds), Ok(kbps)) => pull(&code, seconds, kbps).await,
+            (None, _, _) => {
+                Err("usage: obfuscated_wan_probe pull <invite-code> [seconds] [kbps]".to_owned())
+            }
+            (_, Err(reason), _) | (_, _, Err(reason)) => Err(reason),
+        },
         "nat" => nat().await,
         _ => Err(
             "usage: obfuscated_wan_probe nat | obfuscated_wan_probe host [guests] | \
                   obfuscated_wan_probe guest <invite-code> [attempts] | \
-                  obfuscated_wan_probe hold <invite-code> [minutes]"
+                  obfuscated_wan_probe hold <invite-code> [minutes] | \
+                  obfuscated_wan_probe pull <invite-code> [seconds] [kbps]"
                 .to_owned(),
         ),
     };
@@ -226,7 +234,8 @@ async fn host(guests: u32) -> Result<(), String> {
 }
 
 /// Echoes whatever one guest sends — a `guest` ping or a `hold` session's
-/// ticks — and waits for it to hang up.
+/// ticks — and waits for it to hang up. A `pull` guest's request is answered
+/// with a picture-shaped stream instead.
 async fn serve(connection: PeerConnection) -> Result<(), String> {
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -234,6 +243,19 @@ async fn serve(connection: PeerConnection) -> Result<(), String> {
         .map_err(|e| format!("accept_bi: {e}"))?;
     let mut buf = [0u8; 1024];
     let mut echoed = 0usize;
+    let mut request = [0u8; PULL_REQUEST_BYTES];
+    if let Ok(()) = recv.read_exact(&mut request[..PULL_MAGIC.len()]).await {
+        if request[..PULL_MAGIC.len()] == *PULL_MAGIC {
+            recv.read_exact(&mut request[PULL_MAGIC.len()..])
+                .await
+                .map_err(|e| format!("pull request: {e}"))?;
+            return stream_picture(&connection, &mut send, &request).await;
+        }
+        send.write_all(&request[..PULL_MAGIC.len()])
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        echoed += PULL_MAGIC.len();
+    }
     while let Some(n) = recv
         .read(&mut buf)
         .await
@@ -363,6 +385,146 @@ async fn ping(endpoint: &GuestObfuscatedEndpoint) -> Result<(), String> {
     println!("REPLY {:?}", String::from_utf8_lossy(&reply));
     connection.close(0u32.into(), b"done");
     Ok(())
+}
+
+/// What a `pull` guest opens its stream with, ahead of the seconds and the
+/// kilobits per second it asks for (both `u32`, little-endian).
+const PULL_MAGIC: &[u8; 4] = b"PULL";
+/// The whole of a `pull` request.
+const PULL_REQUEST_BYTES: usize = 12;
+/// Frames a second of a `pull` stream, as the app's `quality` preset sends.
+const PULL_FPS: u32 = 25;
+/// A `pull` stream's arrival later than this after the previous one is a
+/// stall: a frame interval is 40 ms, and a lost packet costs at least a round
+/// trip before its retransmission lands.
+const PULL_STALL: Duration = Duration::from_millis(300);
+
+/// Host side of `pull`: frames of the asked rate for the asked time, paced as
+/// a picture is, then what QUIC saw of the path (ADR 0153).
+async fn stream_picture(
+    connection: &PeerConnection,
+    send: &mut iroh::endpoint::SendStream,
+    request: &[u8; PULL_REQUEST_BYTES],
+) -> Result<(), String> {
+    let field = |at: usize| {
+        u32::from_le_bytes([
+            request[at],
+            request[at + 1],
+            request[at + 2],
+            request[at + 3],
+        ])
+    };
+    let (seconds, kbps) = (field(4), field(8));
+    let frame_bytes = (kbps as usize * 1000 / 8 / PULL_FPS as usize).max(1);
+    let frame = vec![0x5a_u8; frame_bytes];
+    println!("PULL {seconds}s at {kbps} kbit/s: {frame_bytes} bytes x {PULL_FPS} fps");
+    let mut tick = tokio::time::interval(Duration::from_secs(1) / PULL_FPS);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let deadline = Instant::now() + Duration::from_secs(u64::from(seconds));
+    let mut frames = 0u64;
+    while Instant::now() < deadline {
+        tick.tick().await;
+        send.write_all(&frame)
+            .await
+            .map_err(|e| format!("write after {frames} frames: {e}"))?;
+        frames += 1;
+    }
+    send.finish().map_err(|e| format!("finish: {e}"))?;
+    let _ = send.stopped().await;
+    print_path("HOST", connection);
+    println!("STREAMED {frames} frames");
+    connection.closed().await;
+    Ok(())
+}
+
+/// Guest side of `pull`: asks the host for `seconds` of a `kbps` stream and
+/// reports every stall in it, then what QUIC saw of the path (ADR 0153).
+async fn pull(code: &str, seconds: u32, kbps: u32) -> Result<(), String> {
+    let ticket = InviteTicket::from_code(code).map_err(|e| format!("ticket: {e}"))?;
+    let (Some(target), Some(fingerprint)) = (ticket.obfuscated_addr, ticket.host_cert_fingerprint)
+    else {
+        return Err("this invite carries no obfuscated-transport address".to_owned());
+    };
+    let host = ticket
+        .endpoint_addr()
+        .map_err(|e| format!("ticket address: {e}"))?
+        .id;
+    let rendezvous = Rendezvous::start().map_err(|e| e.to_string())?;
+    let identity = SigningKey::from_bytes(&iroh::SecretKey::generate().to_bytes());
+    let endpoint = GuestObfuscatedEndpoint::bind(
+        &ticket.invite_id,
+        &identity,
+        host,
+        target,
+        fingerprint,
+        Some(rendezvous),
+    )
+    .map_err(|e| format!("bind: {e}"))?;
+    let connection = endpoint
+        .connect_control()
+        .await
+        .map_err(|e| format!("dial: {e}"))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|e| format!("open_bi: {e}"))?;
+    let mut request = Vec::with_capacity(PULL_REQUEST_BYTES);
+    request.extend_from_slice(PULL_MAGIC);
+    request.extend_from_slice(&seconds.to_le_bytes());
+    request.extend_from_slice(&kbps.to_le_bytes());
+    send.write_all(&request)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let started = Instant::now();
+    let mut last = Instant::now();
+    let (mut bytes, mut stalls) = (0u64, 0u32);
+    let mut worst = Duration::ZERO;
+    let mut buf = vec![0u8; 64 * 1024];
+    while let Some(n) = recv
+        .read(&mut buf)
+        .await
+        .map_err(|e| format!("read after {bytes} bytes: {e}"))?
+    {
+        let gap = last.elapsed();
+        if bytes > 0 && gap > PULL_STALL {
+            stalls += 1;
+            worst = worst.max(gap);
+            println!(
+                "STALL {}ms at +{}s",
+                gap.as_millis(),
+                started.elapsed().as_secs()
+            );
+        }
+        last = Instant::now();
+        bytes += n as u64;
+    }
+    let took = started.elapsed();
+    print_path("GUEST", &connection);
+    println!(
+        "PULLED {bytes} bytes in {}s = {} kbit/s, stalls={stalls} worst={}ms",
+        took.as_secs(),
+        u128::from(bytes) * 8 / took.as_millis().max(1),
+        worst.as_millis()
+    );
+    connection.close(0u32.into(), b"done");
+    endpoint.close().await;
+    Ok(())
+}
+
+/// One line of what QUIC knows about `connection`'s path.
+fn print_path(side: &str, connection: &PeerConnection) {
+    match connection.path_snapshot() {
+        Some(path) => println!(
+            "{side} PATH mtu={} lost_packets={} congestion_events={} rtt={}ms cwnd={}",
+            path.current_mtu,
+            path.lost_packets,
+            path.congestion_events,
+            path.rtt.as_millis(),
+            path.cwnd
+        ),
+        None => println!("{side} PATH unknown"),
+    }
 }
 
 /// Spacing of a `hold` session's ticks.

@@ -247,6 +247,8 @@ pub struct PathSnapshot {
     pub lost_packets: u64,
     /// Times the congestion controller has backed off on this path.
     pub congestion_events: u64,
+    /// The largest QUIC packet this path carries, as MTU discovery found it.
+    pub current_mtu: u16,
     /// Whether the path goes through a relay rather than straight to the peer.
     pub relay: bool,
 }
@@ -258,6 +260,7 @@ impl PathSnapshot {
             cwnd: stats.cwnd,
             lost_packets: stats.lost_packets,
             congestion_events: stats.congestion_events,
+            current_mtu: stats.current_mtu,
             relay,
         }
     }

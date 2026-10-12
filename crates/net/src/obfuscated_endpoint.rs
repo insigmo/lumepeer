@@ -2464,6 +2464,126 @@ mod tests {
         nat.tasks.abort_all();
     }
 
+    /// The largest UDP payload an ordinary Ethernet or Wi-Fi path carries:
+    /// 1500 bytes of IPv4 packet, less its 20-byte header and UDP's 8.
+    const ETHERNET_UDP_PAYLOAD_BYTES: usize = 1_472;
+
+    /// A path with an ordinary MTU between a guest and its host: a datagram
+    /// larger than [`ETHERNET_UDP_PAYLOAD_BYTES`] does not cross it, either
+    /// way. Windows does not even send one — a socket with the don't-fragment
+    /// bit set, as every QUIC socket has, is refused with `WSAEMSGSIZE`.
+    struct MtuLimitedPath {
+        entry: SocketAddr,
+        tasks: tokio::task::JoinSet<()>,
+    }
+
+    impl MtuLimitedPath {
+        async fn spawn(host: SocketAddr) -> Self {
+            let bind = || tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0));
+            let entry = Arc::new(bind().await.unwrap());
+            let inside = Arc::new(bind().await.unwrap());
+            let entry_addr = entry.local_addr().unwrap();
+            let guest: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+            let mut tasks = tokio::task::JoinSet::new();
+            {
+                let (entry, inside, guest) =
+                    (Arc::clone(&entry), Arc::clone(&inside), Arc::clone(&guest));
+                tasks.spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    while let Ok((n, from)) = entry.recv_from(&mut buf).await {
+                        *guest.lock().unwrap() = Some(from);
+                        if n <= ETHERNET_UDP_PAYLOAD_BYTES {
+                            let _ = inside.send_to(&buf[..n], host).await;
+                        }
+                    }
+                });
+            }
+            tasks.spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok((n, _)) = inside.recv_from(&mut buf).await {
+                    let to = *guest.lock().unwrap();
+                    if let Some(to) = to
+                        && n <= ETHERNET_UDP_PAYLOAD_BYTES
+                    {
+                        let _ = entry.send_to(&buf[..n], to).await;
+                    }
+                }
+            });
+            Self {
+                entry: entry_addr,
+                tasks,
+            }
+        }
+    }
+
+    /// A picture crosses an ordinary path without losing a packet to its size.
+    ///
+    /// The envelope and its random padding go on top of the QUIC packet, and
+    /// QUIC's MTU discovery has to leave room for them: a probe that got
+    /// through with little padding set a packet size the next packet's larger
+    /// padding pushed past the path, and every full packet of a picture then
+    /// had a chance of never leaving the host. The loss looked like a lossy
+    /// link — stalled frames, a bitrate thrown down to its floor — and QUIC's
+    /// own black-hole detection never saw it, because packets of the very
+    /// same size kept arriving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_packet_fits_an_ordinary_path_with_its_envelope() {
+        const PICTURE_BYTES: usize = 4 * 1024 * 1024;
+
+        let host = bind_host_via(&INVITE, &identity(1), &[], None)
+            .await
+            .unwrap();
+        let host_addr = SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            host.local_addr().unwrap().port(),
+        );
+        let fingerprint = host.cert_fingerprint;
+        let mut path = MtuLimitedPath::spawn(host_addr).await;
+
+        let host_side = tokio::spawn(async move {
+            let connection = host.accept().await.unwrap().unwrap();
+            let mut send = connection.open_uni().await.unwrap();
+            send.write_all(&vec![0x5a; PICTURE_BYTES]).await.unwrap();
+            send.finish().unwrap();
+            let _ = send.stopped().await;
+            let snapshot = connection.path_snapshot().unwrap();
+            drop(connection);
+            (host, snapshot)
+        });
+
+        let host_id = NodeId::from_bytes(&identity(1).verifying_key().to_bytes()).unwrap();
+        let guest = GuestObfuscatedEndpoint::bind(
+            &INVITE,
+            &identity(2),
+            host_id,
+            path.entry,
+            fingerprint,
+            None,
+        )
+        .unwrap();
+        let connection = guest.connect(crate::endpoint::ALPN_CONTROL).await.unwrap();
+        let mut recv = connection.accept_uni().await.unwrap();
+        let picture = tokio::time::timeout(Duration::from_mins(1), recv.read_to_end(PICTURE_BYTES))
+            .await
+            .expect("the picture must arrive")
+            .unwrap();
+        assert_eq!(picture.len(), PICTURE_BYTES);
+
+        let (_host, snapshot) = host_side.await.unwrap();
+        assert_eq!(
+            snapshot.lost_packets, 0,
+            "no packet of the picture may be too large for the path: {snapshot:?}"
+        );
+        assert!(
+            snapshot.current_mtu > 1_200,
+            "MTU discovery must still find room above QUIC's minimum: {snapshot:?}"
+        );
+
+        connection.close(noq::VarInt::from_u32(0), b"");
+        guest.close().await;
+        path.tasks.abort_all();
+    }
+
     /// ADR 0113 (B): a host that restarts presents the very certificate the
     /// invite pinned, so a restored invite can be served again — and a node
     /// with a different identity presents a different one.
