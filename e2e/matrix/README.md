@@ -137,7 +137,11 @@ target still through every redial and resume (ADR 0119).
   certificate kept in `~/Library/Keychains/lumepeer-e2e.keychain-db`, so it is
   not confused with `/Applications/Lumepeer.app` and a grant survives rebuilds.
   Grant *Lumepeer E2E* **Screen Recording** and **Accessibility** at the Mac
-  once; again only if that keychain is deleted.
+  once; again only if that keychain is deleted. The VM has no GPU, so
+  `mac-vm-tune.sh` (installed once with `sudo bash mac-vm-tune.sh install`,
+  then run as root at every boot) turns off sleep, the screen saver, automatic
+  updates, Spotlight's index, transparency and animations, and, with SIP off,
+  Apple's background services (with SIP on, launchd ignores disabling them).
 - **linux** (`beta@debian`, KDE Wayland): as a host it asks for screen-share and
   remote-control permission through the portal **on every session**
   (`PersistMode::DoNot`), so someone has to click *Share* on the VM while the

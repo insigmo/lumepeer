@@ -69,9 +69,16 @@ version until somebody quit it, exactly as on Linux before ADR 0119.
 - `still`, win → beta (a Windows host, whose SPS always said it): 6 of 6
   changes shown by themselves, 127/137/192 ms min/p50/max after they were
   painted, at a 114 ms round trip.
-- `still`, win → mac: not yet run. The Mac VM's screen was locked (display
-  sleep after 10 minutes, then the lock screen), and a locked Mac gives
-  ScreenCaptureKit nothing; it waits for the owner to unlock it.
+- `still`, win → mac, run once the owner had unlocked the Mac: 6 of 6
+  changes shown by themselves, 199/229/258 ms (a second run 191/217/296 ms).
+  The first run, on the plain debug e2e build, also showed all six but
+  301-959 ms late: unoptimised, the Mac's picture path took 110-170 ms a
+  frame to convert and encode (19 ms in the release), the speed controller
+  scaled the picture down, and the debug scaler added ~400 ms. That measured
+  the build, not the product, so `deploy.sh mac` now builds every dependency
+  and `lumepeer-media` / `lumepeer-runtime` optimised (`mac-build.toml`), two
+  jobs at a time: an optimised build with four left the 8 GB VM answering
+  nothing until it was reset.
 - The restart, on the Mac VM: a pilot build of this change at version 0.0.1,
   started from its own folder beside the installed client (stopped for the
   run, started again after), was asked for `update_install`. It logged

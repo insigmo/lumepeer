@@ -89,7 +89,9 @@ mkdir -p apps/desktop/src-tauri/binaries
 for bin in $SIDECARS; do cp "target/debug/\$bin" "apps/desktop/src-tauri/binaries/\$bin-\$triple"; done
 cd apps/desktop
 npm install --no-audit --no-fund >/dev/null
-npx tauri build --debug --bundles app --features "$MAC_FEATURES" --config ../../target-e2e-pilot.conf.json
+# Optimised where the picture goes, and two jobs at a time (mac-build.toml).
+npx tauri build --debug --bundles app --features "$MAC_FEATURES" --config ../../target-e2e-pilot.conf.json \
+  -- --config \$HOME/lumepeer/e2e/matrix/mac-build.toml
 
 # TCC keeps a Screen Recording / Accessibility grant against the app's bundle
 # id and designated requirement. Tauri leaves this bundle unsigned, which has
