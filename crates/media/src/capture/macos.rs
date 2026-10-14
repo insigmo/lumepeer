@@ -65,12 +65,14 @@ mod screen_capture_kit {
         CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType,
         CGImageAlphaInfo, CGImageByteOrderInfo, CGKeyCode, CGMainDisplayID, CGMouseButton,
         CGPreflightPostEventAccess, CGRequestPostEventAccess, CGScrollEventUnit,
+        kCGDisplayStreamYCbCrMatrix_ITU_R_601_4,
     };
     use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
-        CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
-        CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-        CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+        CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType,
+        CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
     };
     use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
     use objc2_screen_capture_kit::{
@@ -117,12 +119,23 @@ mod screen_capture_kit {
     /// `capture::linux_x11::POINTER_RANGE`.
     const POINTER_RANGE: u32 = 65_535;
 
-    /// `kCVPixelFormatType_32BGRA`, the packed little-endian BGRA format this
-    /// backend pins on the stream so frames arrive in the one layout
-    /// [`PixelFormat::Bgra8`] describes. Left to its own devices
-    /// `ScreenCaptureKit` picks a bi-planar YCbCr format on recent macOS
-    /// releases, which the rest of the pipeline does not expect.
+    /// `kCVPixelFormatType_32BGRA`, the packed little-endian BGRA format the
+    /// audio stream asks for: it reads no picture, but a stream must name one.
+    #[cfg_attr(
+        not(feature = "audio-capture-screencapturekit"),
+        allow(dead_code, reason = "only the audio stream and the tests name it")
+    )]
     const PIXEL_FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+
+    /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`: NV12 in BT.601's
+    /// video range, the layout the picture stream is pinned to (ADR 0157).
+    ///
+    /// It used to be BGRA, which the encoder then converted to NV12 on the
+    /// CPU — on a Mac with no GPU that conversion, a copy of the 4-byte
+    /// picture and a hash over it cost more of every frame than the encoder.
+    /// The window server makes NV12 itself, and the picture is then the
+    /// 1.5 bytes a pixel `VideoToolbox` takes as it is.
+    const PIXEL_FORMAT_NV12: u32 = u32::from_be_bytes(*b"420v");
 
     /// `kCVPixelBufferLock_ReadOnly`. Named rather than inlined because the
     /// lock and the matching unlock must be passed the identical flags:
@@ -132,8 +145,9 @@ mod screen_capture_kit {
     /// `kCVReturnSuccess`.
     const CV_RETURN_SUCCESS: i32 = 0;
 
-    /// Bytes per pixel in [`PIXEL_FORMAT_32BGRA`].
-    const BGRA_BYTES_PER_PIXEL: usize = 4;
+    /// Planes of a [`PIXEL_FORMAT_NV12`] pixel buffer: luma, then the
+    /// interleaved chroma at half the height.
+    const NV12_PLANES: usize = 2;
 
     /// How many frames `ScreenCaptureKit` may buffer for us. Apple's documented
     /// range is 3..=8; the low end is deliberate here, because this backend
@@ -420,7 +434,7 @@ mod screen_capture_kit {
             let Some(pixels) = (unsafe { sample.image_buffer() }) else {
                 return;
             };
-            match copy_bgra(&pixels, self.started_at) {
+            match copy_nv12(&pixels, self.started_at) {
                 Ok(frame) => self.publish(frame),
                 Err(e) => tracing::debug!("dropping a ScreenCaptureKit frame: {e}"),
             }
@@ -507,16 +521,16 @@ mod screen_capture_kit {
         }
     }
 
-    /// Copies a locked-down `CVPixelBuffer` into a tightly packed BGRA frame.
+    /// Copies a locked-down `CVPixelBuffer` into a tightly packed NV12 frame.
     ///
     /// The copy is not an optimization opportunity to skip: the pixel buffer is
     /// owned by `ScreenCaptureKit` and recycled as soon as the delegate returns,
     /// so nothing may outlive this call.
-    fn copy_bgra(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
+    fn copy_nv12(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
         let format = CVPixelBufferGetPixelFormatType(pixels);
-        if format != PIXEL_FORMAT_32BGRA {
+        if format != PIXEL_FORMAT_NV12 {
             return Err(MediaError::CaptureUnavailable(format!(
-                "ScreenCaptureKit delivered pixel format {format:#010x}, not 32BGRA"
+                "ScreenCaptureKit delivered pixel format {format:#010x}, not 420v"
             )));
         }
 
@@ -540,43 +554,52 @@ mod screen_capture_kit {
         frame
     }
 
-    /// Reads a pixel buffer whose base address the caller has already locked.
+    /// Reads a bi-planar NV12 pixel buffer whose base address the caller has
+    /// already locked, cropped to even dimensions: 4:2:0 has no odd row or
+    /// column, and nothing downstream takes one.
     fn read_locked(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
-        let width = CVPixelBufferGetWidth(pixels);
-        let height = CVPixelBufferGetHeight(pixels);
-        let stride = CVPixelBufferGetBytesPerRow(pixels);
-        let base = CVPixelBufferGetBaseAddress(pixels).cast::<u8>();
-
-        if base.is_null() || width == 0 || height == 0 {
+        let width = CVPixelBufferGetWidth(pixels) & !1;
+        let height = CVPixelBufferGetHeight(pixels) & !1;
+        if width == 0 || height == 0 {
             return Err(MediaError::CaptureUnavailable(
                 "the captured pixel buffer is empty".to_owned(),
             ));
         }
-        let row_bytes = width
-            .checked_mul(BGRA_BYTES_PER_PIXEL)
-            .ok_or_else(|| MediaError::CaptureUnavailable("frame width overflows".to_owned()))?;
-        // A stride shorter than one row of pixels would make the reads below
-        // walk off the end of the buffer, so refuse rather than trust it.
-        if stride < row_bytes {
-            return Err(MediaError::CaptureUnavailable(format!(
-                "pixel buffer stride {stride} is shorter than one {row_bytes}-byte row"
-            )));
+        if CVPixelBufferGetPlaneCount(pixels) < NV12_PLANES {
+            return Err(MediaError::CaptureUnavailable(
+                "the captured pixel buffer is not bi-planar".to_owned(),
+            ));
         }
-        let total = row_bytes
+        let total = width
             .checked_mul(height)
+            .and_then(|luma| luma.checked_add(width * (height / 2)))
             .ok_or_else(|| MediaError::CaptureUnavailable("frame size overflows".to_owned()))?;
 
         let mut data = Vec::with_capacity(total);
-        for row in 0..height {
-            // SAFETY: `base` is the locked base address of an image CoreVideo
-            // reports as `height` rows of `stride` bytes, so the whole buffer
-            // is `height * stride` bytes long. `row < height` and
-            // `row_bytes <= stride` (checked above), so
-            // `row * stride + row_bytes <= height * stride`: both the offset
-            // and the slice stay inside the buffer. The slice is only read,
-            // and only before the unlock in `copy_bgra`.
-            let source = unsafe { std::slice::from_raw_parts(base.add(row * stride), row_bytes) };
-            data.extend_from_slice(source);
+        // Luma at the picture's height, then the interleaved chroma at half
+        // of it; an even width is as many bytes a row in either plane.
+        for (plane, rows) in [(0, height), (1, height / 2)] {
+            let stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane);
+            let plane_rows = CVPixelBufferGetHeightOfPlane(pixels, plane);
+            let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane).cast::<u8>();
+            // A stride shorter than a row, or fewer rows than the picture
+            // needs, would make the reads below walk off the end of the
+            // plane, so refuse rather than trust it.
+            if base.is_null() || stride < width || plane_rows < rows {
+                return Err(MediaError::CaptureUnavailable(format!(
+                    "pixel buffer plane {plane} is {plane_rows} rows of {stride} bytes, short of {rows} of {width}"
+                )));
+            }
+            for row in 0..rows {
+                // SAFETY: `base` is the locked base address of a plane
+                // CoreVideo reports as `plane_rows` rows of `stride` bytes.
+                // `row < rows <= plane_rows` and `width <= stride` (checked
+                // above), so `row * stride + width <= plane_rows * stride`:
+                // the slice stays inside the plane. It is only read, and only
+                // before the unlock in `copy_nv12`.
+                let source = unsafe { std::slice::from_raw_parts(base.add(row * stride), width) };
+                data.extend_from_slice(source);
+            }
         }
 
         Ok(Frame {
@@ -586,7 +609,7 @@ mod screen_capture_kit {
             height: u32::try_from(height).map_err(|_| {
                 MediaError::CaptureUnavailable("frame height out of range".to_owned())
             })?,
-            format: PixelFormat::Bgra8,
+            format: PixelFormat::Nv12,
             timestamp_us: u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
             data,
         })
@@ -727,8 +750,9 @@ mod screen_capture_kit {
         }
     }
 
-    /// The stream's settings: the display's own size, BGRA, a short queue,
-    /// and never the cursor.
+    /// The stream's settings: the display's own size, NV12 in BT.601 (the
+    /// matrix the encoder's own conversion used, so colours stay what they
+    /// were; ADR 0157), a short queue, and never the cursor.
     ///
     /// The cursor is left out of every stream this file opens, the audio
     /// one included, and never switched on a running one (ADR 0152). On a
@@ -744,7 +768,8 @@ mod screen_capture_kit {
             let config = SCStreamConfiguration::new();
             config.setWidth(usize::try_from(width).unwrap_or(0));
             config.setHeight(usize::try_from(height).unwrap_or(0));
-            config.setPixelFormat(PIXEL_FORMAT_32BGRA);
+            config.setPixelFormat(PIXEL_FORMAT_NV12);
+            config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
             config.setQueueDepth(STREAM_QUEUE_DEPTH);
             config.setShowsCursor(false);
             config.setCapturesAudio(false);
@@ -998,6 +1023,92 @@ mod screen_capture_kit {
         }
     }
 
+    /// [`composite_cursor`] for an NV12 picture (`data`, `width` x `height`,
+    /// both even, tightly packed), in BT.601's video range like the stream
+    /// itself (ADR 0157).
+    ///
+    /// Premultiplied colour blends the same way in YCbCr as in RGB, because
+    /// the conversion is linear: a pixel's share of the cursor converts
+    /// without its offset, and the offset comes in with the cursor's
+    /// coverage. Luma is blended pixel by pixel; each chroma sample takes the
+    /// mean of the four cursor pixels over its 2x2 block, those off the
+    /// cursor counting as transparent.
+    fn composite_cursor_nv12(
+        data: &mut [u8],
+        width: u32,
+        height: u32,
+        at: (i32, i32),
+        shape: &CursorShapeData,
+    ) {
+        let (w, h) = (width as usize, height as usize);
+        if data.len() < w * h + w * (h / 2) {
+            return;
+        }
+        let (luma, chroma) = data.split_at_mut(w * h);
+        let left = i64::from(at.0) - i64::from(shape.hotspot_x);
+        let top = i64::from(at.1) - i64::from(shape.hotspot_y);
+        let (shape_w, shape_h) = (i64::from(shape.width), i64::from(shape.height));
+        // The cursor's premultiplied B, G, R, A at a picture pixel, if it
+        // covers it.
+        let cursor_at = |x: i64, y: i64| -> Option<[i32; 4]> {
+            let (col, row) = (x - left, y - top);
+            if !(0..shape_w).contains(&col) || !(0..shape_h).contains(&row) {
+                return None;
+            }
+            let at = usize::try_from((row * shape_w + col) * 4).ok()?;
+            let px: [u8; 4] = shape.rgba.get(at..at + 4)?.try_into().ok()?;
+            Some(px.map(i32::from))
+        };
+        let blend = |under: u8, over: i32, alpha: i32| -> u8 {
+            let mixed = over + i32::from(under) * (255 - alpha) / 255;
+            u8::try_from(mixed.clamp(0, 255)).unwrap_or(u8::MAX)
+        };
+        let (wide, high) = (i64::from(width), i64::from(height));
+
+        for y in top.max(0)..(top + shape_h).min(high) {
+            for x in left.max(0)..(left + shape_w).min(wide) {
+                let Some([b, g, r, a]) = cursor_at(x, y) else {
+                    continue;
+                };
+                if a == 0 {
+                    continue;
+                }
+                let Ok(index) = usize::try_from(y * wide + x) else {
+                    continue;
+                };
+                let over = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16 * a / 255;
+                luma[index] = blend(luma[index], over, a);
+            }
+        }
+
+        // The chroma samples whose 2x2 block the cursor touches on one axis.
+        let blocks =
+            |from: i64, len: i64, limit: i64| from.max(0) / 2..((from + len).min(limit) + 1) / 2;
+        for cy in blocks(top, shape_h, high) {
+            for cx in blocks(left, shape_w, wide) {
+                let mut sum = [0_i32; 4];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    if let Some(px) = cursor_at(cx * 2 + dx, cy * 2 + dy) {
+                        for (total, value) in sum.iter_mut().zip(px) {
+                            *total += value;
+                        }
+                    }
+                }
+                let [b, g, r, a] = sum.map(|total| total / 4);
+                if a == 0 {
+                    continue;
+                }
+                let Ok(index) = usize::try_from(cy * wide + cx * 2) else {
+                    continue;
+                };
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128 * a / 255;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128 * a / 255;
+                chroma[index] = blend(chroma[index], u, a);
+                chroma[index + 1] = blend(chroma[index + 1], v, a);
+            }
+        }
+    }
+
     /// Where the cursor sits in a picture handed out: the pixel its hotspot
     /// is drawn at and the number of the shape drawn there.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,7 +1195,18 @@ mod screen_capture_kit {
             }
             let mut frame = fresh.unwrap_or_else(|| base.clone());
             if let Some((drawn, shape)) = &cursor {
-                composite_cursor(&mut frame.data, frame.width, frame.height, drawn.at, shape);
+                match frame.format {
+                    PixelFormat::Nv12 => composite_cursor_nv12(
+                        &mut frame.data,
+                        frame.width,
+                        frame.height,
+                        drawn.at,
+                        shape,
+                    ),
+                    PixelFormat::Bgra8 => {
+                        composite_cursor(&mut frame.data, frame.width, frame.height, drawn.at, shape);
+                    }
+                }
             }
             self.drawn = now;
             Some(frame)

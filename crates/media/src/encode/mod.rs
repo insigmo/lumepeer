@@ -474,6 +474,9 @@ pub mod software {
         /// The size of the last picture `inner` was handed, `None` before the
         /// first: `openh264` initialises itself on that one.
         size: Option<(usize, usize)>,
+        /// Slices each picture is cut into, one per thread that encodes
+        /// them (ADR 0157).
+        threads: u16,
     }
 
     // `openh264::encoder::Encoder` is not `Debug`, and the settings are what
@@ -498,7 +501,68 @@ pub mod software {
                 config,
                 built_kbps: config.bitrate_kbps,
                 size: None,
+                threads: software_threads(),
             })
+        }
+
+        /// Cuts every picture of `width`x`height` into one slice per thread,
+        /// so that `openh264` encodes them side by side (ADR 0157).
+        ///
+        /// It runs one thread otherwise, however many it is given: the crate
+        /// asks for a single slice, and `openh264` runs as many threads as a
+        /// picture has slices. A Linux host with no hardware encoder made 7
+        /// to 13 frames a second of a 1280x800 screen that way, on two cores
+        /// of which one sat idle.
+        ///
+        /// The crate initialises the encoder on the first picture of a size,
+        /// so a blank one goes in first and what it makes is thrown away.
+        /// The new thread count then resets the encoder, so the real picture
+        /// after it is the keyframe a new size starts with anyway. A picture
+        /// too small for slices is left to `openh264`, which keeps it in one.
+        #[allow(
+            unsafe_code,
+            reason = "`openh264` has no safe call for its slice settings; they are reached through its raw API"
+        )]
+        fn slice_for(&mut self, width: usize, height: usize) -> Result<()> {
+            use openh264_sys2::{
+                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, SEncParamExt, SM_FIXEDSLCNUM_SLICE,
+            };
+            if self.threads <= 1 {
+                return Ok(());
+            }
+            self.inner
+                .encode(&YUVBuffer::new(width, height))
+                .map_err(|e| MediaError::Encode(e.to_string()))?;
+            let mut params = SEncParamExt::default();
+            // SAFETY: the encoder was initialised by the picture just encoded.
+            // `GetOption` copies its whole parameter block into `params` and
+            // `SetOption` reads one back from it, both during the call, and
+            // `params` is a live `SEncParamExt` for the duration of each.
+            let applied = unsafe {
+                let api = self.inner.raw_api();
+                let option = std::ptr::from_mut(&mut params).cast();
+                if api.get_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, option) == 0 {
+                    params.iMultipleThreadIdc = self.threads;
+                    let slices = &mut params.sSpatialLayers[0].sSliceArgument;
+                    slices.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
+                    slices.uiSliceNum = std::os::raw::c_uint::from(self.threads);
+                    api.set_option(
+                        ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
+                        std::ptr::from_mut(&mut params).cast(),
+                    ) == 0
+                } else {
+                    false
+                }
+            };
+            if !applied {
+                // Nothing is known about what a refused reset left behind:
+                // one slice, from a fresh encoder, is what it was before.
+                tracing::debug!("openh264 refused its slices; encoding on one thread");
+                self.inner = Self::build(self.config)?;
+                self.built_kbps = self.config.bitrate_kbps;
+                self.threads = 1;
+            }
+            Ok(())
         }
 
         fn build(config: EncoderConfig) -> Result<Encoder> {
@@ -636,6 +700,9 @@ pub mod software {
             {
                 self.inner = Self::build(self.config)?;
                 self.built_kbps = self.config.bitrate_kbps;
+            }
+            if self.size != Some((width, height)) {
+                self.slice_for(width, height)?;
             }
             self.size = Some((width, height));
             let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
@@ -823,6 +890,78 @@ pub mod software {
                 after * 2 < before,
                 "frames of {after} bytes after the change against {before} before"
             );
+        }
+
+        /// A desktop of text lines scrolled up `step` rows: every frame
+        /// differs from the one before all over, the way scrolling does.
+        fn scrolled_text(width: u32, height: u32, step: u32) -> Frame {
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for y in 0..height {
+                let line = (y + step * 3) / 18;
+                for x in 0..width {
+                    let cell = (x / 7).wrapping_mul(2_654_435_761) ^ line.wrapping_mul(40_503);
+                    let ink = (y + step * 3) % 18 < 12 && (cell >> 7) % 3 != 0 && x % 7 < 6;
+                    let value = if ink { 0x20 } else { 0xF0 };
+                    data.extend_from_slice(&[value, value, value, 0xFF]);
+                }
+            }
+            Frame::cpu(width, height, PixelFormat::Bgra8, 0, data)
+        }
+
+        /// Slice NAL units (types 1 and 5) in an Annex-B access unit.
+        fn slices_in(access_unit: &[u8]) -> usize {
+            access_unit
+                .windows(4)
+                .filter(|w| w[..3] == [0, 0, 1] && matches!(w[3] & 0x1F, 1 | 5))
+                .count()
+        }
+
+        /// ADR 0157: a picture is cut into one slice per thread, and the
+        /// stream still decodes, keyframe and the frames after it, at the
+        /// picture's size.
+        #[test]
+        fn a_sliced_stream_decodes_frame_by_frame() {
+            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            encoder.threads = 4;
+            let mut decoder = openh264::decoder::Decoder::new().unwrap();
+            for step in 0..6 {
+                let output = encoder.encode(&scrolled_text(640, 368, step)).unwrap();
+                assert_eq!(output.keyframe, step == 0, "frame {step}");
+                assert_eq!(slices_in(&output.data), 4, "frame {step}");
+                let picture = decoder
+                    .decode(&output.data)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("frame {step} decoded to nothing"));
+                assert_eq!(openh264::formats::YUVSource::dimensions(&picture), (640, 368));
+            }
+            // A new size is a new slicing, and again exactly one keyframe.
+            let output = encoder.encode(&scrolled_text(320, 192, 9)).unwrap();
+            assert!(output.keyframe);
+            assert_eq!(slices_in(&output.data), 4);
+            assert!(decoder.decode(&output.data).unwrap().is_some());
+        }
+
+        /// What slices buy on this machine, for a release build:
+        /// `cargo test -p lumepeer-media --release --lib slices_timing --
+        /// --ignored --nocapture`. Meaningless without nasm on PATH, which
+        /// the shipped builds have.
+        #[test]
+        #[ignore = "a timing, not a check"]
+        fn slices_timing() {
+            for threads in [1, 2, 4] {
+                let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+                encoder.threads = threads;
+                let frames: Vec<Frame> = (0..61).map(|s| scrolled_text(1280, 800, s)).collect();
+                encoder.encode(&frames[0]).unwrap();
+                let started = std::time::Instant::now();
+                for frame in &frames[1..] {
+                    encoder.encode(frame).unwrap();
+                }
+                eprintln!(
+                    "1280x800 scrolling, {threads} slice(s): {:?} a frame",
+                    started.elapsed() / 60
+                );
+            }
         }
 
         /// ADR 0144: `openh264` rebuilds itself for a new size from the
