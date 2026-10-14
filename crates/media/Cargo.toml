@@ -319,6 +319,8 @@ objc2-screen-capture-kit = { version = "0.3.2", optional = true, default-feature
     "dispatch2",
     "objc2-core-graphics",
     "objc2-core-media",
+    # `SCStreamConfiguration.colorMatrix`, a CFString (ADR 0157).
+    "objc2-core-foundation",
 ] }
 # The VideoToolbox compression session itself (ADR 0066), pulled in only by
 # `encode-videotoolbox`. Same objc2 0.3.2 framework-binding family, and the

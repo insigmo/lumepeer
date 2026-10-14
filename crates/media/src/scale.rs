@@ -211,7 +211,7 @@ fn reduced(frame: Frame, width: u32, height: u32) -> Frame {
     }
     // NV12 has no odd rows or columns to reduce from or to; every size this
     // module asks for is even, and a capture backend hands out none either.
-    let odd = |value: u32| value % 2 != 0;
+    let odd = |value: u32| !value.is_multiple_of(2);
     if frame.format == PixelFormat::Nv12
         && [frame.width, frame.height, width, height]
             .into_iter()
@@ -338,8 +338,9 @@ fn spans(source: usize, target: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Threads a reduction to `pixels` destination pixels is split across.
-fn workers(pixels: usize) -> usize {
+/// Threads work over a picture of `pixels` pixels is split across: a
+/// reduction here, the NV12 conversion of the hardware encoders (ADR 0157).
+pub(crate) fn workers(pixels: usize) -> usize {
     static CORES: OnceLock<usize> = OnceLock::new();
     if pixels < PARALLEL_MIN_PIXELS {
         return 1;

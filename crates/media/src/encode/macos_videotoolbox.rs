@@ -375,7 +375,18 @@ mod video_toolbox {
 
     impl VideoEncoder for VideoToolboxEncoder {
         fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-            let (nv12, width, height) = bgra_to_nv12(frame)?;
+            // The capture hands out NV12 (ADR 0157), which goes into the
+            // session's buffer as it is; anything else is converted first.
+            let converted;
+            let (nv12, width, height) = if frame.format == PixelFormat::Nv12
+                && frame.width.is_multiple_of(2)
+                && frame.height.is_multiple_of(2)
+            {
+                (frame.as_cpu()?, frame.width, frame.height)
+            } else {
+                converted = bgra_to_nv12(frame)?;
+                (converted.0.as_slice(), converted.1, converted.2)
+            };
             if self.session.dims != (width, height) {
                 // A resolution change is a rare event, and a compression
                 // session's frame size is fixed at creation, so this reopens
@@ -385,7 +396,7 @@ mod video_toolbox {
                 self.session = Session::open(width, height, self.config)?;
                 self.last_pts = -1;
             }
-            self.session.upload(&nv12, width, height)?;
+            self.session.upload(nv12, width, height)?;
 
             let force_keyframe = std::mem::take(&mut self.force_keyframe);
             let pts = self.next_pts(frame.timestamp_us);
@@ -1001,6 +1012,30 @@ mod video_toolbox {
             assert!(first.keyframe, "the first frame must be decodable alone");
             assert!(!first.data.is_empty());
             assert_eq!(encoder.kind(), EncoderKind::Hardware);
+        }
+
+        /// ADR 0157: the NV12 a Mac's capture hands out goes in as it is, and
+        /// so does BGRA after it, into the same session.
+        #[test]
+        fn an_nv12_frame_encodes_as_it_is_when_hardware_is_available() {
+            let Some(mut encoder) = try_new_encoder() else {
+                eprintln!("skipping: no usable VideoToolbox H.264 encoder on this machine");
+                return;
+            };
+            let (width, height) = (128_u32, 96_u32);
+            let mut data = vec![0x80_u8; (width * height) as usize];
+            data.extend(vec![0x80_u8; (width * height / 2) as usize]);
+            let nv12 = Frame {
+                width,
+                height,
+                format: PixelFormat::Nv12,
+                timestamp_us: 0,
+                data,
+            };
+            let first = encoder.encode(&nv12).unwrap();
+            assert!(first.keyframe && !first.data.is_empty());
+            let next = encoder.encode(&frame(width, height, 0x40)).unwrap();
+            assert!(!next.data.is_empty());
         }
 
         /// The first frame succeeding proves nothing on its own: the encode

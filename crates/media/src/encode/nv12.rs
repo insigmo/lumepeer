@@ -83,9 +83,45 @@ fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
     let mut out = vec![0u8; y_len + width * (height / 2)];
     let (y_plane, uv_plane) = out.split_at_mut(y_len);
 
-    for (block_row, uv_row) in uv_plane.chunks_exact_mut(width).enumerate() {
-        let top = block_row * 2;
-        let (y_top, y_bottom) = y_plane[top * width..][..width * 2].split_at_mut(width);
+    // Split by rows of 2x2 blocks across the cores (ADR 0157): on a Mac with
+    // no GPU this conversion runs on every frame, ahead of a software
+    // encoder, and one core did all of it.
+    let block_rows = height / 2;
+    let per_part = block_rows.div_ceil(crate::scale::workers(y_len));
+    std::thread::scope(|scope| {
+        let mut parts = y_plane
+            .chunks_mut(per_part * 2 * width)
+            .zip(uv_plane.chunks_mut(per_part * width))
+            .enumerate();
+        // This thread takes a share itself rather than waiting idle.
+        let own = parts.next();
+        for (part, (y_part, uv_part)) in parts {
+            scope.spawn(move || {
+                convert_rows(pixels, src_stride, width, part * per_part, y_part, uv_part);
+            });
+        }
+        if let Some((part, (y_part, uv_part))) = own {
+            convert_rows(pixels, src_stride, width, part * per_part, y_part, uv_part);
+        }
+    });
+
+    Ok((out, width_u32, height_u32))
+}
+
+/// Converts the rows of 2x2 blocks from `first_block_row` on, as many as
+/// `uv_plane` has rows of `width` bytes, into `y_plane` (two rows of `width`
+/// a block row) and `uv_plane`.
+fn convert_rows(
+    pixels: &[u8],
+    src_stride: usize,
+    width: usize,
+    first_block_row: usize,
+    y_plane: &mut [u8],
+    uv_plane: &mut [u8],
+) {
+    for (row, uv_row) in uv_plane.chunks_exact_mut(width).enumerate() {
+        let top = (first_block_row + row) * 2;
+        let (y_top, y_bottom) = y_plane[row * 2 * width..][..width * 2].split_at_mut(width);
 
         let src_top = &pixels[top * src_stride..][..width * 4];
         let src_bottom = &pixels[(top + 1) * src_stride..][..width * 4];
@@ -129,8 +165,6 @@ fn bgra8_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
             uv[1] = bt601_v(r, g, b);
         }
     }
-
-    Ok((out, width_u32, height_u32))
 }
 
 fn clamp_u8(v: i32) -> u8 {
@@ -173,6 +207,31 @@ mod tests {
         let (nv12, width, height) = bgra_to_nv12(&frame(66, 34, 0x7f)).unwrap();
         assert_eq!((width, height), (66, 34));
         assert_eq!(nv12.len(), nv12_size(width, height));
+    }
+
+    /// ADR 0157: a picture split across threads converts to the bytes the
+    /// one-thread pass over all of it makes, a cropped odd size included.
+    #[test]
+    fn a_picture_split_across_threads_converts_to_the_same_bytes() {
+        let (width, height) = (1282_u32, 723_u32);
+        let mut seed = 0x9e37_79b9_u32;
+        let data = (0..width * height * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .collect();
+        let frame = Frame::cpu(width, height, PixelFormat::Bgra8, 0, data);
+        let (split, out_width, out_height) = bgra_to_nv12(&frame).unwrap();
+        assert_eq!((out_width, out_height), (1282, 722));
+
+        let (w, h) = (out_width as usize, out_height as usize);
+        let mut whole = vec![0u8; w * h + w * (h / 2)];
+        let (y_plane, uv_plane) = whole.split_at_mut(w * h);
+        convert_rows(&frame.data, width as usize * 4, w, 0, y_plane, uv_plane);
+        assert!(split == whole, "the split conversion differs");
     }
 
     #[test]

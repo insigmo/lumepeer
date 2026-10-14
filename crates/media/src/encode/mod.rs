@@ -687,9 +687,40 @@ pub mod software {
         Ok((std::borrow::Cow::Owned(cropped), width, height))
     }
 
+    /// An NV12 picture as the I420 `openh264` takes: the luma as it is, the
+    /// interleaved chroma pulled apart into its two planes. A Mac's capture
+    /// hands out NV12 (ADR 0157), and a guest may pick this encoder there by
+    /// hand (ADR 0143).
+    fn i420_from_nv12(frame: &Frame) -> Result<(YUVBuffer, usize, usize)> {
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return Err(MediaError::Encode(format!(
+                "openh264 fallback takes NV12 only at an even size, got {width}x{height}"
+            )));
+        }
+        let pixels = frame.as_cpu()?;
+        let luma = width * height;
+        let Some(chroma) = pixels.get(luma..luma + luma / 2) else {
+            return Err(MediaError::Encode("NV12 frame buffer is short".to_owned()));
+        };
+        let mut yuv = Vec::with_capacity(luma + luma / 2);
+        yuv.extend_from_slice(&pixels[..luma]);
+        yuv.extend(chroma.iter().step_by(2));
+        yuv.extend(chroma.iter().skip(1).step_by(2));
+        Ok((YUVBuffer::from_vec(yuv, width, height), width, height))
+    }
+
     impl VideoEncoder for OpenH264Encoder {
         fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-            let (bgra, width, height) = even_bgra(frame, "openh264 fallback")?;
+            let (yuv, width, height) = match frame.format {
+                PixelFormat::Nv12 => i420_from_nv12(frame)?,
+                PixelFormat::Bgra8 => {
+                    let (bgra, width, height) = even_bgra(frame, "openh264 fallback")?;
+                    let yuv =
+                        YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
+                    (yuv, width, height)
+                }
+            };
             // `openh264` re-initialises itself for a new size from the
             // settings it was built with, which would quietly undo a bitrate
             // set live since (ADR 0144). A new size starts on a keyframe
@@ -705,7 +736,6 @@ pub mod software {
                 self.slice_for(width, height)?;
             }
             self.size = Some((width, height));
-            let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
             let bitstream = self
                 .inner
                 .encode(&yuv)
@@ -900,7 +930,8 @@ pub mod software {
                 let line = (y + step * 3) / 18;
                 for x in 0..width {
                     let cell = (x / 7).wrapping_mul(2_654_435_761) ^ line.wrapping_mul(40_503);
-                    let ink = (y + step * 3) % 18 < 12 && (cell >> 7) % 3 != 0 && x % 7 < 6;
+                    let ink =
+                        (y + step * 3) % 18 < 12 && !(cell >> 7).is_multiple_of(3) && x % 7 < 6;
                     let value = if ink { 0x20 } else { 0xF0 };
                     data.extend_from_slice(&[value, value, value, 0xFF]);
                 }
@@ -942,6 +973,29 @@ pub mod software {
             assert!(output.keyframe);
             assert_eq!(slices_in(&output.data), 4);
             assert!(decoder.decode(&output.data).unwrap().is_some());
+        }
+
+        /// ADR 0157: an NV12 picture, as a Mac's capture hands out, is
+        /// encoded as the picture it is — its luma and both chroma planes
+        /// come back out of the decoder where they went in.
+        #[test]
+        fn an_nv12_picture_is_encoded_as_it_is() {
+            use openh264::formats::YUVSource;
+            let (width, height) = (64_usize, 48_usize);
+            let mut data = vec![150_u8; width * height];
+            for _ in 0..width * height / 4 {
+                data.extend_from_slice(&[90, 170]);
+            }
+            let frame = Frame::cpu(64, 48, PixelFormat::Nv12, 0, data);
+            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
+            let output = encoder.encode(&frame).unwrap();
+            assert!(output.keyframe);
+            let mut decoder = openh264::decoder::Decoder::new().unwrap();
+            let picture = decoder.decode(&output.data).unwrap().unwrap();
+            let near = |plane: &[u8], value: u8| plane.iter().all(|&s| s.abs_diff(value) <= 2);
+            assert!(near(picture.y(), 150), "luma");
+            assert!(near(picture.u(), 90), "U");
+            assert!(near(picture.v(), 170), "V");
         }
 
         /// What slices buy on this machine, for a release build:
