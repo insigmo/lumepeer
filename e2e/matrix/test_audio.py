@@ -12,7 +12,9 @@
    it plays must not be digital silence, which is what a muted microphone or
    one the OS keeps from the app delivers. The guest's real microphone is
    used, so a guest machine without one fails with the reason, and so does a
-   guest whose build has no microphone capture (macOS).
+   guest whose build has no microphone capture. A Mac asks the person for the
+   microphone the first time (ADR 0156): until someone at it allows it, what
+   arrives is silence.
 
 Both run on a session of their own, connected the way test_matrix.py's are,
 so `python -m pytest e2e/matrix/test_audio.py` checks sound alone.

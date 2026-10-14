@@ -45,9 +45,9 @@ use objc2_audio_toolbox::{
 };
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
-    kAudioDevicePropertyNominalSampleRate, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
-    kAudioObjectUnknown,
+    AudioObjectPropertySelector, kAudioDevicePropertyNominalSampleRate,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioObjectUnknown,
 };
 use objc2_core_audio_types::{
     AudioStreamBasicDescription, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
@@ -173,7 +173,8 @@ impl CoreAudioPlayout {
             return Ok(());
         }
 
-        let device_rate = default_output_sample_rate()?;
+        let device_rate =
+            default_device_sample_rate(kAudioHardwarePropertyDefaultOutputDevice, "output")?;
         let bytes_per_frame = BYTES_PER_SAMPLE * u32::from(AUDIO_CHANNELS);
         let format = AudioStreamBasicDescription {
             mSampleRate: f64::from(device_rate),
@@ -402,17 +403,21 @@ impl Drop for CoreAudioPlayout {
     }
 }
 
-/// Reads the default output device's real nominal sample rate from the
-/// `CoreAudio` HAL — the same "ask, don't assume" discipline
-/// `WasapiPlayout::start`'s `GetMixFormat` call and
+/// Reads the real nominal sample rate of the default device `selector` names
+/// (`kAudioHardwarePropertyDefaultOutputDevice` here, the default input for
+/// `capture_audio::macos_mic`) from the `CoreAudio` HAL — the same "ask,
+/// don't assume" discipline `WasapiPlayout::start`'s `GetMixFormat` call and
 /// `capture_audio::linux_pipewire`'s negotiated-format handling both follow,
-/// so the queue this module opens never relies on `CoreAudio`'s own,
-/// undocumented internal resampler.
-fn default_output_sample_rate() -> Result<u32> {
+/// so the queue opened on it never relies on `CoreAudio`'s own,
+/// undocumented internal resampler. `what` names the device in errors.
+pub(crate) fn default_device_sample_rate(
+    selector: AudioObjectPropertySelector,
+    what: &str,
+) -> Result<u32> {
     let mut device_id: AudioObjectID = kAudioObjectUnknown;
     let mut size = u32::try_from(std::mem::size_of::<AudioObjectID>()).unwrap_or(0);
     let mut address = AudioObjectPropertyAddress {
-        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain,
     };
@@ -431,13 +436,13 @@ fn default_output_sample_rate() -> Result<u32> {
     };
     if status != 0 {
         return Err(MediaError::CaptureUnavailable(format!(
-            "reading the default output device failed: OSStatus {status}"
+            "reading the default {what} device failed: OSStatus {status}"
         )));
     }
     if device_id == kAudioObjectUnknown {
-        return Err(MediaError::CaptureUnavailable(
-            "no default output device is configured".to_owned(),
-        ));
+        return Err(MediaError::CaptureUnavailable(format!(
+            "no default {what} device is configured"
+        )));
     }
 
     let mut rate: f64 = 0.0;
@@ -461,7 +466,7 @@ fn default_output_sample_rate() -> Result<u32> {
     };
     if status != 0 || rate <= 0.0 {
         return Err(MediaError::CaptureUnavailable(format!(
-            "reading the default output device's nominal sample rate failed: OSStatus {status}"
+            "reading the default {what} device's nominal sample rate failed: OSStatus {status}"
         )));
     }
     #[allow(

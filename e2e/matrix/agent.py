@@ -557,9 +557,9 @@ def keyboard_layout(arg):
             "after": "%08x" % (after & 0xFFFFFFFF)}
 
 
-def tone_wav(path, hz, secs, rate=48000):
-    """A stereo 16-bit WAV of a sine at `hz`, -9 dBFS, faded in and out over
-    10 ms so it starts and ends without a click."""
+def tone_wav(path, hz, secs, rate=48000, channels=2):
+    """A 16-bit WAV of a sine at `hz` on every one of `channels`, -9 dBFS,
+    faded in and out over 10 ms so it starts and ends without a click."""
     import math
     import struct
     import wave
@@ -569,12 +569,27 @@ def tone_wav(path, hz, secs, rate=48000):
     for i in range(n):
         gain = min(1.0, i / fade, (n - i) / fade)
         v = int(11500 * gain * math.sin(2 * math.pi * hz * i / rate))
-        frames += struct.pack("<hh", v, v)
+        frames += struct.pack("<h", v) * channels
     with wave.open(path, "wb") as w:
-        w.setnchannels(2)
+        w.setnchannels(channels)
         w.setsampwidth(2)
         w.setframerate(rate)
         w.writeframes(bytes(frames))
+
+
+def macos_output_channels():
+    """Output channels of the Mac's default output device, 2 when unknown."""
+    devices = [{}]
+    for line in run(["system_profiler", "SPAudioDataType"]).splitlines():
+        key, _, value = line.strip().partition(":")
+        if value:
+            devices[-1][key] = value.strip()
+        elif key and key not in ("Audio", "Devices"):
+            devices.append({})  # the next device's block
+    for device in devices:
+        if device.get("Default Output Device") == "Yes" and device.get("Output Channels", "").isdigit():
+            return int(device["Output Channels"])
+    return 2
 
 
 def play_tone(arg):
@@ -583,7 +598,10 @@ def play_tone(arg):
     pick up (ADR 0147). `secs` in the answer is how long playing took, which
     a player that found no device makes far shorter than the tone."""
     path = os.path.join(work_dir(), "tone-%d.wav" % arg["hz"])
-    tone_wav(path, arg["hz"], arg["secs"])
+    # On every channel of a Mac's output: ScreenCaptureKit hands the app a
+    # stereo downmix of the device, and a stereo tone on a 64-channel output
+    # (BlackHole on the test VM) comes out 30 dB under (ADR 0156).
+    tone_wav(path, arg["hz"], arg["secs"], channels=macos_output_channels() if MACOS else 2)
     started = time.time()
     if WINDOWS:
         import winsound

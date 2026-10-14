@@ -22,7 +22,7 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance};
 
 use crate::capture_audio::{
-    PcmChunk, READ_TIMEOUT, SAMPLES_PER_CHUNK, capture_timestamp_us, to_wire_pcm,
+    PcmChunk, READ_TIMEOUT, capture_timestamp_us, frames_per_chunk, to_wire_pcm,
 };
 use crate::error::{MediaError, Result};
 
@@ -293,7 +293,9 @@ impl crate::capture_audio::MicCapturer for WasapiMicCapturer {
                     .map_err(|e| MediaError::CaptureInterrupted(e.to_string()))?;
             }
 
-            let needed = SAMPLES_PER_CHUNK * state.input_channels;
+            // 20 ms of the device's own frames, not 960 of them (ADR 0147,
+            // ADR 0156): at 44.1 kHz that would drop the tail of every chunk.
+            let needed = frames_per_chunk(state.input_rate) * state.input_channels;
             if state.leftover.len() >= needed {
                 let chunk_samples: Vec<f32> = state.leftover.drain(..needed).collect();
                 return Ok(PcmChunk {

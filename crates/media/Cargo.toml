@@ -63,7 +63,9 @@ audio-capture-screencapturekit = [
 # it as a direct dependency here is not a new objc2 major version.
 # `objc2-audio-toolbox` (the `AudioQueue` API itself) is genuinely new to
 # this workspace, pinned at that same 0.3.2 the rest of the objc2 framework
-# family here already uses.
+# family here already uses. It carries the microphone too (an `AudioQueue`
+# input queue, `capture_audio::macos_mic`; ADR 0156): the same binding set,
+# the way `audio-capture-pipewire` carries both directions on Linux.
 audio-playout-coreaudio = [
     "dep:objc2-audio-toolbox",
     "dep:objc2-core-audio",

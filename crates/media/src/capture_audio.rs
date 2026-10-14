@@ -36,6 +36,7 @@
         feature = "audio-capture-pipewire"
     ),
     all(target_os = "macos", feature = "audio-capture-screencapturekit"),
+    all(target_os = "macos", feature = "audio-playout-coreaudio"),
 ))]
 use std::time::Duration;
 
@@ -137,6 +138,7 @@ pub trait MicCapturer: Send + std::fmt::Debug {
         feature = "audio-capture-pipewire"
     ),
     all(target_os = "macos", feature = "audio-capture-screencapturekit"),
+    all(target_os = "macos", feature = "audio-playout-coreaudio"),
 ))]
 pub(crate) fn capture_timestamp_us() -> u64 {
     std::time::SystemTime::now()
@@ -157,6 +159,7 @@ pub(crate) fn capture_timestamp_us() -> u64 {
         feature = "audio-capture-pipewire"
     ),
     all(target_os = "macos", feature = "audio-capture-screencapturekit"),
+    all(target_os = "macos", feature = "audio-playout-coreaudio"),
 ))]
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -185,6 +188,12 @@ mod linux_pipewire;
     feature = "audio-capture-pipewire"
 ))]
 pub use linux_pipewire::{PipewireMicCapturer, PipewireMonitorCapturer};
+
+#[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+mod macos_mic;
+
+#[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+pub use macos_mic::CoreAudioMicCapturer;
 
 /// Opens the desktop-audio backend of the current platform.
 ///
@@ -242,6 +251,10 @@ pub fn platform_mic_capturer() -> Result<Box<dyn MicCapturer>> {
     {
         Ok(Box::new(linux_pipewire::PipewireMicCapturer::new()))
     }
+    #[cfg(all(target_os = "macos", feature = "audio-playout-coreaudio"))]
+    {
+        Ok(Box::new(macos_mic::CoreAudioMicCapturer::new()))
+    }
     #[cfg(not(any(
         all(target_os = "windows", feature = "audio-capture"),
         all(
@@ -249,6 +262,7 @@ pub fn platform_mic_capturer() -> Result<Box<dyn MicCapturer>> {
             not(target_os = "android"),
             feature = "audio-capture-pipewire"
         ),
+        all(target_os = "macos", feature = "audio-playout-coreaudio"),
     )))]
     {
         Err(crate::error::MediaError::CaptureUnavailable(
@@ -258,7 +272,7 @@ pub fn platform_mic_capturer() -> Result<Box<dyn MicCapturer>> {
 }
 
 /// Whether [`platform_mic_capturer`] has a backend on this build: asked before
-/// the mic button may say it is on (ADR 0147). macOS has none yet.
+/// the mic button may say it is on (ADR 0147).
 #[must_use]
 pub const fn mic_supported() -> bool {
     cfg!(any(
@@ -268,6 +282,7 @@ pub const fn mic_supported() -> bool {
             not(target_os = "android"),
             feature = "audio-capture-pipewire"
         ),
+        all(target_os = "macos", feature = "audio-playout-coreaudio"),
     ))
 }
 

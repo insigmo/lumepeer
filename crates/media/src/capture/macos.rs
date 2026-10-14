@@ -187,11 +187,10 @@ mod screen_capture_kit {
     #[cfg(feature = "audio-capture-screencapturekit")]
     const AUDIO_CHUNK_CHANNEL_DEPTH: usize = 16;
 
-    /// Upper bound on the planar audio buffers a single ScreenCaptureKit
-    /// sample carries. `channelCount` is set explicitly on the audio stream
+    /// Upper bound on the channels of a ScreenCaptureKit audio sample this
+    /// capture reads. `channelCount` is set explicitly on the audio stream
     /// (`AUDIO_CHANNELS`), so a real delivery never approaches this; it
-    /// exists so a buffer list this code did not expect is refused outright
-    /// rather than read past a fixed-size allocation.
+    /// exists so a format this code did not expect is refused outright.
     #[cfg(feature = "audio-capture-screencapturekit")]
     const MAX_AUDIO_BUFFERS: usize = 8;
 
@@ -300,6 +299,11 @@ mod screen_capture_kit {
         /// pending` does for PipeWire's buffers.
         #[cfg(feature = "audio-capture-screencapturekit")]
         audio_pending: Mutex<Vec<f32>>,
+        /// Whether a first audio buffer arrived: the host log says so once,
+        /// and what it carried, because a capture that never hears anything
+        /// otherwise looks exactly like a quiet machine (ADR 0156).
+        #[cfg(feature = "audio-capture-screencapturekit")]
+        audio_seen: AtomicBool,
     }
 
     impl Shared {
@@ -313,6 +317,8 @@ mod screen_capture_kit {
                 audio_tx: Mutex::new(None),
                 #[cfg(feature = "audio-capture-screencapturekit")]
                 audio_pending: Mutex::new(Vec::new()),
+                #[cfg(feature = "audio-capture-screencapturekit")]
+                audio_seen: AtomicBool::new(false),
             }
         }
 
@@ -329,7 +335,25 @@ mod screen_capture_kit {
         /// chunks.
         #[cfg(feature = "audio-capture-screencapturekit")]
         fn accept_audio(&self, sample: &CMSampleBuffer) {
-            match extract_audio(sample) {
+            let extracted = extract_audio(sample);
+            if !self.audio_seen.swap(true, Ordering::Relaxed) {
+                match &extracted {
+                    Ok(Some(audio)) => tracing::info!(
+                        rate = audio.rate,
+                        channels = audio.channels,
+                        "the first ScreenCaptureKit audio buffer arrived"
+                    ),
+                    Ok(None) => tracing::warn!(
+                        "the first ScreenCaptureKit audio buffer is in a format this capture cannot read"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "the first ScreenCaptureKit audio buffer is unreadable: {e}"
+                        );
+                    }
+                }
+            }
+            match extracted {
                 Ok(Some(extracted)) => self.publish_audio(&extracted),
                 Ok(None) => {}
                 Err(e) => tracing::debug!("dropping a ScreenCaptureKit audio buffer: {e}"),
@@ -1363,39 +1387,6 @@ mod screen_capture_kit {
         channels: usize,
     }
 
-    /// Backing storage for an `AudioBufferList` of up to `MAX_AUDIO_BUFFERS`
-    /// buffers. `AudioBufferList` itself declares its trailing array as a
-    /// single element (`mBuffers: [AudioBuffer; 1]`) — the C
-    /// flexible-array-member idiom for "however many `mNumberBuffers` says
-    /// follow". `header` reserves that one element and `_rest` gives the
-    /// trailing array room to grow into; nothing here is ever read as an
-    /// `AudioBufferList` *value*, only through a pointer cast onto this wider,
-    /// same-prefix layout (see [`extract_audio`]).
-    #[cfg(feature = "audio-capture-screencapturekit")]
-    #[repr(C)]
-    struct AudioBufferListStorage {
-        header: AudioBufferList,
-        _rest: [AudioBuffer; MAX_AUDIO_BUFFERS - 1],
-    }
-
-    #[cfg(feature = "audio-capture-screencapturekit")]
-    impl AudioBufferListStorage {
-        fn empty() -> Self {
-            let buffer = AudioBuffer {
-                mNumberChannels: 0,
-                mDataByteSize: 0,
-                mData: std::ptr::null_mut(),
-            };
-            Self {
-                header: AudioBufferList {
-                    mNumberBuffers: 0,
-                    mBuffers: [buffer],
-                },
-                _rest: [buffer; MAX_AUDIO_BUFFERS - 1],
-            }
-        }
-    }
-
     /// Decodes one raw PCM sample (`bytes.len() == bits / 8`) into a
     /// normalized `-1.0..=1.0` f32. Native-endian only: ScreenCaptureKit runs
     /// exclusively on little-endian Apple Silicon and `x86_64`, and a
@@ -1496,6 +1487,10 @@ mod screen_capture_kit {
     /// crashing or inventing silence for host audio that is not actually
     /// silent.
     #[cfg(feature = "audio-capture-screencapturekit")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the format, the two CoreMedia calls and the decode they feed, in the order they must happen"
+    )]
     fn extract_audio(sample: &CMSampleBuffer) -> Result<Option<ExtractedAudio>> {
         // SAFETY: `sample` is the live buffer ScreenCaptureKit just handed to
         // the delegate; `format_description` only reads it and returns an
@@ -1533,18 +1528,52 @@ mod screen_capture_kit {
             return Ok(None);
         }
 
-        let mut storage = AudioBufferListStorage::empty();
-        let list_ptr: *mut AudioBufferList = std::ptr::addr_of_mut!(storage.header);
+        // How big the list has to be is asked first, and exactly that size is
+        // passed back: CoreMedia answers kCMSampleBufferError_ArrayTooSmall
+        // (-12737) to any other size, a larger one included (measured: 40
+        // bytes needed, 40 accepted, 48 and 136 refused). A fixed 136-byte
+        // list was refused for every buffer, so every Mac host sent silence
+        // (ADR 0156).
         let mut needed_size: usize = 0;
+        // SAFETY: `sample` is the live buffer; with no list and no block
+        // buffer to fill, the call only writes `needed_size`, a local.
+        let status = unsafe {
+            sample.audio_buffer_list_with_retained_block_buffer(
+                &raw mut needed_size,
+                std::ptr::null_mut(),
+                0,
+                None,
+                None,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(MediaError::CaptureUnavailable(format!(
+                "sizing a ScreenCaptureKit audio buffer list failed: OSStatus {status}"
+            )));
+        }
+        // Whole `AudioBuffer`s, so the list is aligned like one; never less
+        // than the header and one buffer.
+        let empty = AudioBuffer {
+            mNumberChannels: 0,
+            mDataByteSize: 0,
+            mData: std::ptr::null_mut(),
+        };
+        let mut storage = vec![empty; needed_size.div_ceil(size_of::<AudioBuffer>()).max(2)];
+        let storage_size = storage.len() * size_of::<AudioBuffer>();
+        let list_ptr = storage.as_mut_ptr().cast::<AudioBufferList>();
         let mut block_buffer_ptr: *mut CMBlockBuffer = std::ptr::null_mut();
-        // SAFETY: `sample` is the live buffer; `list_ptr` points at `storage`,
-        // sized for `MAX_AUDIO_BUFFERS` planar buffers; `needed_size` and
-        // `block_buffer_ptr` are locals the call fills.
+        let list_size = needed_size;
+        // SAFETY: `sample` is the live buffer; `list_ptr` points at
+        // `storage`, at least `list_size` bytes long and aligned for an
+        // `AudioBufferList`; `needed_size` and `block_buffer_ptr` are locals
+        // the call fills.
         let status = unsafe {
             sample.audio_buffer_list_with_retained_block_buffer(
                 &raw mut needed_size,
                 list_ptr,
-                std::mem::size_of::<AudioBufferListStorage>(),
+                list_size,
                 None,
                 None,
                 0,
@@ -1553,7 +1582,10 @@ mod screen_capture_kit {
         };
         if status != 0 {
             return Err(MediaError::CaptureUnavailable(format!(
-                "reading a ScreenCaptureKit audio buffer failed: OSStatus {status}"
+                "reading a ScreenCaptureKit audio buffer failed: OSStatus {status} \
+                 ({needed_size} bytes of list needed, {list_size} given; \
+                 {channels} channel(s), format flags {:#x})",
+                asbd.mFormatFlags
             )));
         }
         let Some(block_buffer_ptr) = NonNull::new(block_buffer_ptr) else {
@@ -1570,17 +1602,20 @@ mod screen_capture_kit {
 
         // SAFETY: the call above populated `storage` as an `AudioBufferList`
         // with `mNumberBuffers` trailing buffers (a `noErr` status guarantees
-        // `needed_size` fit inside the `MAX_AUDIO_BUFFERS`-sized storage
-        // passed in); reading `mNumberBuffers` through `addr_of!` never forms
-        // a reference to the flexible trailing array itself.
+        // they fit inside the `storage_size` bytes passed in); reading
+        // `mNumberBuffers` through `addr_of!` never forms a reference to the
+        // flexible trailing array itself.
         let count = unsafe { std::ptr::addr_of!((*list_ptr).mNumberBuffers).read() };
-        let count = usize::try_from(count).unwrap_or(0).min(MAX_AUDIO_BUFFERS);
+        let fits = (storage_size - std::mem::offset_of!(AudioBufferList, mBuffers))
+            / size_of::<AudioBuffer>();
+        let count = usize::try_from(count).unwrap_or(0).min(fits);
         if count == 0 {
             return Ok(None);
         }
         // SAFETY: `count` buffers are valid starting at `mBuffers`, per the
-        // same reasoning as above; the returned slice borrows `storage`,
-        // which outlives this function.
+        // same reasoning as above, and no more than `storage` holds; the
+        // slice points into `storage`, which lives to the end of this
+        // function, past every read of it.
         let buffers: &[AudioBuffer] = unsafe {
             std::slice::from_raw_parts(std::ptr::addr_of!((*list_ptr).mBuffers).cast(), count)
         };
@@ -1713,6 +1748,10 @@ mod screen_capture_kit {
                 // `WindowServer` (ADR 0152). The default is in.
                 config.setShowsCursor(false);
                 config.setCapturesAudio(true);
+                // What this process plays is the guest's microphone
+                // (ADR 0028): captured with the rest, it would go straight
+                // back to that guest as an echo of its own voice (ADR 0156).
+                config.setExcludesCurrentProcessAudio(true);
                 config.setSampleRate(isize::try_from(AUDIO_SAMPLE_RATE_HZ).unwrap_or(isize::MAX));
                 config.setChannelCount(isize::from(AUDIO_CHANNELS));
                 (filter, config, width, height)
@@ -2199,6 +2238,122 @@ mod screen_capture_kit {
         #[test]
         fn bgra_four_char_code_matches_core_video() {
             assert_eq!(PIXEL_FORMAT_32BGRA, 0x4247_5241);
+        }
+
+        /// A buffer in ScreenCaptureKit's own audio format — two planar
+        /// float32 channels at 48 kHz, format flags 0x29 — is read, both
+        /// channels in order. `CoreMedia` hands its list back only when asked
+        /// with exactly the size it needs; while a larger list was passed,
+        /// every buffer was refused and every Mac host sent silence
+        /// (ADR 0156).
+        #[cfg(feature = "audio-capture-screencapturekit")]
+        #[test]
+        fn a_screencapturekit_audio_buffer_is_read() {
+            use objc2_core_media::{
+                CMAudioFormatDescriptionCreate, CMAudioSampleBufferCreateWithPacketDescriptions,
+                CMFormatDescription,
+            };
+
+            /// A two-buffer `AudioBufferList`: the C struct's trailing array,
+            /// one element longer.
+            #[repr(C)]
+            struct TwoBuffers {
+                list: AudioBufferList,
+                #[allow(
+                    dead_code,
+                    reason = "read by CoreMedia through `list`'s trailing array"
+                )]
+                second: AudioBuffer,
+            }
+            const FRAMES: usize = 1024;
+
+            let asbd = AudioStreamBasicDescription {
+                mSampleRate: 48_000.0,
+                mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagIsFloat
+                    | objc2_core_audio_types::kAudioFormatFlagIsPacked
+                    | kAudioFormatFlagIsNonInterleaved,
+                mBytesPerPacket: 4,
+                mFramesPerPacket: 1,
+                mBytesPerFrame: 4,
+                mChannelsPerFrame: 2,
+                mBitsPerChannel: 32,
+                mReserved: 0,
+            };
+            let mut format: *const CMFormatDescription = std::ptr::null();
+            // SAFETY: every pointer is a local or null where null is allowed.
+            let status = unsafe {
+                CMAudioFormatDescriptionCreate(
+                    None,
+                    NonNull::from(&asbd),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    None,
+                    NonNull::from(&mut format),
+                )
+            };
+            assert_eq!(status, 0);
+            // SAFETY: a +1 reference the create call just handed over.
+            let format = unsafe { CFRetained::from_raw(NonNull::new(format.cast_mut()).unwrap()) };
+
+            let mut sample: *mut CMSampleBuffer = std::ptr::null_mut();
+            // SAFETY: as above; the data buffer is attached below.
+            let status = unsafe {
+                CMAudioSampleBufferCreateWithPacketDescriptions(
+                    None,
+                    None,
+                    false,
+                    None,
+                    std::ptr::null_mut(),
+                    &format,
+                    isize::try_from(FRAMES).unwrap(),
+                    CMTime::new(0, 48_000),
+                    std::ptr::null(),
+                    NonNull::from(&mut sample),
+                )
+            };
+            assert_eq!(status, 0);
+            // SAFETY: as above.
+            let sample = unsafe { CFRetained::from_raw(NonNull::new(sample).unwrap()) };
+
+            let mut left = vec![0.5_f32; FRAMES];
+            let mut right = vec![-0.25_f32; FRAMES];
+            let bytes = u32::try_from(FRAMES * 4).unwrap();
+            let mut planar = TwoBuffers {
+                list: AudioBufferList {
+                    mNumberBuffers: 2,
+                    mBuffers: [AudioBuffer {
+                        mNumberChannels: 1,
+                        mDataByteSize: bytes,
+                        mData: left.as_mut_ptr().cast(),
+                    }],
+                },
+                second: AudioBuffer {
+                    mNumberChannels: 1,
+                    mDataByteSize: bytes,
+                    mData: right.as_mut_ptr().cast(),
+                },
+            };
+            // SAFETY: `planar` is a two-buffer list over `left` and `right`,
+            // which the call copies into a block buffer of its own.
+            let status = unsafe {
+                sample.set_data_buffer_from_audio_buffer_list(
+                    None,
+                    None,
+                    0,
+                    NonNull::from(&mut planar.list),
+                )
+            };
+            assert_eq!(status, 0);
+
+            let Some(audio) = extract_audio(&sample).unwrap() else {
+                panic!("the buffer was not readable");
+            };
+            assert_eq!((audio.rate, audio.channels), (48_000, 2));
+            assert_eq!(audio.samples.len(), FRAMES * 2);
+            assert_eq!(&audio.samples[..4], &[0.5, -0.25, 0.5, -0.25]);
         }
 
         /// Named keys map to the `kVK_*` code the guest actually means,

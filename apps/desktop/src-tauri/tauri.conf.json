@@ -43,6 +43,9 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "macOS": {
+      "entitlements": "Entitlements.plist"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine",
