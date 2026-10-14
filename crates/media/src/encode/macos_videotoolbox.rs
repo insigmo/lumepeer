@@ -1014,6 +1014,30 @@ mod video_toolbox {
             assert_eq!(encoder.kind(), EncoderKind::Hardware);
         }
 
+        /// ADR 0157: the NV12 a Mac's capture hands out goes in as it is, and
+        /// so does BGRA after it, into the same session.
+        #[test]
+        fn an_nv12_frame_encodes_as_it_is_when_hardware_is_available() {
+            let Some(mut encoder) = try_new_encoder() else {
+                eprintln!("skipping: no usable VideoToolbox H.264 encoder on this machine");
+                return;
+            };
+            let (width, height) = (128_u32, 96_u32);
+            let mut data = vec![0x80_u8; (width * height) as usize];
+            data.extend(vec![0x80_u8; (width * height / 2) as usize]);
+            let nv12 = Frame {
+                width,
+                height,
+                format: PixelFormat::Nv12,
+                timestamp_us: 0,
+                data,
+            };
+            let first = encoder.encode(&nv12).unwrap();
+            assert!(first.keyframe && !first.data.is_empty());
+            let next = encoder.encode(&frame(width, height, 0x40)).unwrap();
+            assert!(!next.data.is_empty());
+        }
+
         /// The first frame succeeding proves nothing on its own: the encode
         /// loop calls `encode()` once per captured frame on one long-lived
         /// encoder, and a session left in a completed state after frame one
