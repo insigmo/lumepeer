@@ -213,7 +213,9 @@ fn reduced(frame: Frame, width: u32, height: u32) -> Frame {
     // module asks for is even, and a capture backend hands out none either.
     let odd = |value: u32| value % 2 != 0;
     if frame.format == PixelFormat::Nv12
-        && [frame.width, frame.height, width, height].into_iter().any(odd)
+        && [frame.width, frame.height, width, height]
+            .into_iter()
+            .any(odd)
     {
         return frame;
     }
@@ -412,7 +414,10 @@ fn box_rows<const C: usize>(
             }
         }
         let divisors = divisors.for_rows(last_row - first_row);
-        for ((sum, out), divisor) in sums.chunks_exact(C).zip(out.chunks_exact_mut(C)).zip(divisors)
+        for ((sum, out), divisor) in sums
+            .chunks_exact(C)
+            .zip(out.chunks_exact_mut(C))
+            .zip(divisors)
         {
             for (byte, &total) in out.iter_mut().zip(sum) {
                 *byte = divisor.divide(total);
@@ -573,8 +578,8 @@ mod tests {
                         }
                     }
                 }
-                let count = u32::try_from((last_row - first_row) * (last_column - first_column))
-                    .unwrap();
+                let count =
+                    u32::try_from((last_row - first_row) * (last_column - first_column)).unwrap();
                 for (channel, sum) in sums.iter().enumerate() {
                     out[(y * width + x) * channels + channel] = u8::try_from(sum / count).unwrap();
                 }
@@ -621,7 +626,10 @@ mod tests {
                 u32::try_from(dh).unwrap(),
             );
             let slow = reference_downscale(&src, BGRA_BYTES, (sw, sh), (dw, dh));
-            assert!(fast == slow, "{sw}x{sh} -> {dw}x{dh} differs from the reference");
+            assert!(
+                fast == slow,
+                "{sw}x{sh} -> {dw}x{dh} differs from the reference"
+            );
         }
     }
 

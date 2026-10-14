@@ -1204,7 +1204,13 @@ mod screen_capture_kit {
                         shape,
                     ),
                     PixelFormat::Bgra8 => {
-                        composite_cursor(&mut frame.data, frame.width, frame.height, drawn.at, shape);
+                        composite_cursor(
+                            &mut frame.data,
+                            frame.width,
+                            frame.height,
+                            drawn.at,
+                            shape,
+                        );
                     }
                 }
             }

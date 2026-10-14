@@ -932,7 +932,10 @@ pub mod software {
                     .decode(&output.data)
                     .unwrap()
                     .unwrap_or_else(|| panic!("frame {step} decoded to nothing"));
-                assert_eq!(openh264::formats::YUVSource::dimensions(&picture), (640, 368));
+                assert_eq!(
+                    openh264::formats::YUVSource::dimensions(&picture),
+                    (640, 368)
+                );
             }
             // A new size is a new slicing, and again exactly one keyframe.
             let output = encoder.encode(&scrolled_text(320, 192, 9)).unwrap();
