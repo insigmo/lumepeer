@@ -55,12 +55,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MT_MPEG2_PROFILE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK, MFCreateAlignedMemoryBuffer, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET,
-    MFSampleExtension_CleanPoint, MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
+    MFSampleExtension_CleanPoint, MFShutdown, MFShutdownObject, MFStartup,
+    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH,
+    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_AV1,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    eAVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR,
     eAVEncCommonRateControlMode_LowDelayVBR, eAVEncCommonRateControlMode_PeakConstrainedVBR,
     eAVEncH264VProfile_High,
 };
@@ -296,6 +297,8 @@ pub struct MediaFoundationEncoder {
     /// What the AV1 output of the current transform needs before a decoder
     /// can use it. Unused for H.264.
     av1: Av1Stream,
+    /// Shuts `transform` down once nothing above holds it any more.
+    shutdown: TransformShutdown,
     // Keeps `MFStartup`/`MFShutdown` balanced for as long as `transform` (and
     // any COM object it produced) is alive. Order matters: this must drop
     // after `transform`, which Rust guarantees by declaration order.
@@ -341,7 +344,12 @@ impl MediaFoundationEncoder {
     /// codec is available and usable.
     pub fn new(config: EncoderConfig) -> Result<Self> {
         let (width, height) = probe_dims(config.codec);
-        let (mf, transform, events) = activate_hardware_transform(width, height, config, None)?;
+        let Activated {
+            transform,
+            events,
+            shutdown,
+            mf,
+        } = activate_hardware_transform(width, height, config, None)?;
         Ok(Self {
             transform,
             events,
@@ -356,6 +364,7 @@ impl MediaFoundationEncoder {
             #[cfg(feature = "encode-mf-zero-copy")]
             gpu_refused: false,
             av1: Av1Stream::default(),
+            shutdown,
             mf,
         })
     }
@@ -386,9 +395,17 @@ impl MediaFoundationEncoder {
     /// types are set, which is the same reason [`Self::reconfigure`] does not
     /// try to resize a streaming transform either.
     fn reactivate(&mut self, width: u32, height: u32, d3d: Option<&D3dManager>) -> Result<()> {
-        let (mf, transform, events) = activate_hardware_transform(width, height, self.config, d3d)?;
+        let Activated {
+            transform,
+            events,
+            shutdown,
+            mf,
+        } = activate_hardware_transform(width, height, self.config, d3d)?;
         self.transform = transform;
         self.events = events;
+        // Shuts the transform being replaced down, now that the two fields
+        // above no longer hold it.
+        self.shutdown = shutdown;
         self.mf = mf;
         self.dims = (width, height);
         #[cfg(feature = "encode-mf-zero-copy")]
@@ -781,6 +798,45 @@ impl Drop for MfRuntime {
     }
 }
 
+/// Shuts a hardware transform down when the last holder of it lets go.
+///
+/// Releasing the last reference is not enough for a hardware MFT. The
+/// activation object keeps the transform it created, and an asynchronous
+/// transform keeps its event queue, its worker threads and its driver
+/// session until it is shut down. Without this every encoder built and
+/// dropped stayed in the process for good — about 60 threads and 400 MB for
+/// an AV1 MFT, 6 threads and 180 MB for an H.264 one — and a host whose guest
+/// switched encoders a dozen times held 1,300 threads and 7 GB (ADR 0158).
+struct TransformShutdown {
+    transform: IMFTransform,
+    activate: IMFActivate,
+}
+
+impl Drop for TransformShutdown {
+    fn drop(&mut self) {
+        // SAFETY: both calls take an interface this struct owns a reference
+        // to. `MFShutdownObject` calls `IMFShutdown::Shutdown` on a transform
+        // that has it and is a no-op on one that does not; `ShutdownObject`
+        // releases what the activation object holds. Both are best-effort:
+        // there is nothing left to do with a transform that refuses either.
+        unsafe {
+            let _ = MFShutdownObject(&self.transform);
+            let _ = self.activate.ShutdownObject();
+        }
+    }
+}
+
+/// A hardware transform as [`activate_hardware_transform`] hands it back.
+///
+/// Field order is drop order: the caller's own references go first, then
+/// the transform is shut down, and Media Foundation itself last.
+struct Activated {
+    transform: IMFTransform,
+    events: Option<IMFMediaEventGenerator>,
+    shutdown: TransformShutdown,
+    mf: MfRuntime,
+}
+
 /// `MF_VERSION` is a linked constant in the `windows` crate's Media
 /// Foundation module; wrapped so the single call site above stays readable.
 fn mf_version() -> u32 {
@@ -824,13 +880,14 @@ fn ensure_com_initialized() -> Result<()> {
 /// Enumerates hardware encoder MFTs for `config.codec`, activates the first
 /// one that accepts NV12 input / that codec's output at `width`x`height`, and
 /// starts streaming. Returns the [`MfRuntime`] guard alongside so the caller
-/// can keep `MFStartup` balanced for as long as the transform lives.
+/// can keep `MFStartup` balanced for as long as the transform lives, and the
+/// [`TransformShutdown`] that ends the transform when it is let go.
 fn activate_hardware_transform(
     width: u32,
     height: u32,
     config: EncoderConfig,
     d3d: Option<&D3dManager>,
-) -> Result<(MfRuntime, IMFTransform, Option<IMFMediaEventGenerator>)> {
+) -> Result<Activated> {
     // Before `MFStartup`, deliberately: a build that cannot ask for this
     // codec at all must not start Media Foundation to find that out
     // (ADR 0071).
@@ -854,7 +911,18 @@ fn activate_hardware_transform(
 
     for activate in enum_hardware_encoders(&input_info, &output_info)? {
         match try_activate_one(&activate, width, height, config, d3d) {
-            Ok((transform, events)) => return Ok((mf, transform, events)),
+            Ok((transform, events)) => {
+                let shutdown = TransformShutdown {
+                    transform: transform.clone(),
+                    activate,
+                };
+                return Ok(Activated {
+                    transform,
+                    events,
+                    shutdown,
+                    mf,
+                });
+            }
             Err(error) => {
                 // Said, not swallowed (ADR 0144): an AMD encoder refusing the
                 // probe's size sent every session on its host to the
@@ -2488,6 +2556,59 @@ mod tests {
             "hardware_available reported {probed} but construction {}",
             if constructed { "succeeded" } else { "failed" }
         );
+    }
+
+    /// A dropped encoder gives back what its transform took. Until the
+    /// transform was shut down ([`TransformShutdown`]) every encoder built and
+    /// dropped kept its handles, threads and driver memory for the life of the
+    /// process: on an NVIDIA laptop about 250 handles, 60 threads and 400 MB
+    /// for AV1, 110 handles, 6 threads and 180 MB for H.264.
+    ///
+    /// Ignored because it counts the whole process's handles, and the other
+    /// tests here build encoders on parallel threads:
+    ///
+    /// ```text
+    /// cargo test -p lumepeer-media --features capture-windows,encode-mf \
+    ///   -- --ignored --test-threads=1 a_dropped_encoder_gives_its_handles_back
+    /// ```
+    #[test]
+    #[ignore = "counts the process's handles; run it alone with --test-threads=1"]
+    fn a_dropped_encoder_gives_its_handles_back() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        fn handle_count() -> u32 {
+            let mut count = 0;
+            // SAFETY: the pseudo-handle of this process and a valid out pointer.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &raw mut count) }.unwrap();
+            count
+        }
+
+        for codec in [VideoCodec::H264, VideoCodec::Av1] {
+            let config = EncoderConfig {
+                codec,
+                ..EncoderConfig::default()
+            };
+            if !hardware_available(config) {
+                eprintln!("skipping {codec:?}: no hardware encoder MFT on this machine");
+                continue;
+            }
+            let round = || {
+                let mut encoder = MediaFoundationEncoder::new(config).unwrap();
+                encoder.encode(&frame(1920, 1080, 0x40)).unwrap();
+            };
+            // The first one may load the driver and start Media Foundation's
+            // work queues for good.
+            round();
+            let before = handle_count();
+            for _ in 0..4 {
+                round();
+            }
+            let after = handle_count();
+            assert!(
+                after <= before + 40,
+                "{codec:?}: {before} handles before four more encoders, {after} after"
+            );
+        }
     }
 
     /// The AV1 half of the rule above, and one notch stricter, because that is
