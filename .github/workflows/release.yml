@@ -254,6 +254,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # ADR 0157: openh264-sys2's build script decides whether to assemble
+      # openh264's SIMD by whether nasm runs, and tells cargo nothing that
+      # would make it decide again. The cache above restores a build made
+      # before nasm was installed here, and every Linux release since shipped
+      # the openh264 fallback without its assembly: 70-110 ms a 1280x800
+      # frame on a host with no hardware encoder, where 10-14 ms was there.
+      # Built afresh each time, against the nasm the step above installed.
+      - name: Rebuild openh264 against this runner's nasm
+        shell: bash
+        run: cargo clean --release --target ${{ matrix.target }} -p openh264-sys2
       - run: npm install
         working-directory: apps/desktop
       # tauri-build validates `externalBin` at compile time: the sidecar must
@@ -424,6 +434,21 @@ jobs:
           PYTHON="$(command -v python3 || command -v python)"
           "${PYTHON}" ci/find-libaom-asm.py \
             "target/${{ matrix.target }}/release/build/lumepeer-aom-sys-*/out/build" \
+            "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
+      # ADR 0157: the same check for the openh264 fallback, which every host
+      # without a hardware encoder runs on. Its build gives up its assembly
+      # without failing, and did on every Linux release from a cached build.
+      - name: Check the binary carries openh264's assembly
+        if: matrix.aom && !cancelled()
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          PYTHON="$(command -v python3 || command -v python)"
+          "${PYTHON}" ci/find-openh264-asm.py \
+            "target/${{ matrix.target }}/release/build/openh264-sys2-*/out" \
             "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
       # ADR 0149: libopus comes out optimised on Windows only because the
       # runner has ninja, and the build script stops a release build without

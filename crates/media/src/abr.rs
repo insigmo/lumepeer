@@ -331,6 +331,11 @@ const SPEED_ROOM_WINDOWS: u32 = 10;
 /// "Room to spare": the time the next step up is predicted to take, as a
 /// percentage of the interval it has to fit.
 const SPEED_ROOM_PERCENT: u32 = 80;
+/// Share of a window, in percent, the encoder has to have been busy before
+/// its frames count as too slow (ADR 0157). Below it the screen asked for
+/// fewer frames than the encoder could make, and one slow frame among them —
+/// a keyframe, the first frame after a still minute — was the whole mean.
+const SPEED_BUSY_PERCENT: u32 = 60;
 /// The preset frame rate at and below which [`defended_fps`] gives up a third
 /// of the frames before any sharpness...
 const SPEED_SHARP_FPS: u8 = 30;
@@ -426,10 +431,12 @@ impl EncodeSpeed {
         let started = *self.started.get_or_insert(now);
         self.busy = self.busy.saturating_add(took);
         self.frames = self.frames.saturating_add(1);
-        if now.saturating_duration_since(started) < KEEP_UP_WINDOW {
+        let elapsed = now.saturating_duration_since(started);
+        if elapsed < KEEP_UP_WINDOW {
             return None;
         }
-        let mean = self.busy / self.frames.max(1);
+        let busy = self.busy;
+        let mean = busy / self.frames.max(1);
         self.started = None;
         self.busy = Duration::ZERO;
         self.frames = 0;
@@ -438,7 +445,14 @@ impl EncodeSpeed {
         // spend steps that change nothing.
         let picture = picture_percent.clamp(1, self.cap_percent);
 
-        if mean > interval {
+        // Slow only while the encoder is what holds the frames back: frames
+        // that each take longer than the interval, and enough of them to
+        // fill most of the window (ADR 0157). A mostly still desktop sends a
+        // frame or three a second, and the mean of those is whichever one
+        // was a keyframe: on a Mac VM a single 250 ms frame among them took
+        // the picture down to half its size, where the encoder had been idle
+        // for most of the second.
+        if mean > interval && busy * PERCENT >= elapsed * SPEED_BUSY_PERCENT {
             self.room = 0;
             self.slow = self.slow.saturating_add(1);
             if self.slow < SPEED_SLOW_WINDOWS {
@@ -1010,6 +1024,23 @@ mod tests {
             floor = speed.cap_percent();
         }
         assert_eq!(floor, ABR_MIN_SCALE_PERCENT);
+    }
+
+    /// ADR 0157: a mostly still screen whose few frames include a slow one —
+    /// the Mac VM's 250 ms frame among two of 25 ms — keeps its size: the
+    /// encoder was idle for most of every second.
+    #[test]
+    fn a_slow_frame_among_few_does_not_shrink_the_picture() {
+        let interval = ms(50);
+        let mut speed = EncodeSpeed::default();
+        let mut at = Instant::now();
+        for _ in 0..10 {
+            for took in [250, 25, 25] {
+                speed.frame(at, ms(took), 100, interval);
+                at += ms(400);
+            }
+        }
+        assert_eq!(speed.cap_percent(), FULL_SCALE_PERCENT);
     }
 
     /// ADR 0144: the size comes back after ten seconds with room for the next
