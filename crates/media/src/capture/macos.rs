@@ -69,10 +69,11 @@ mod screen_capture_kit {
     };
     use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
-        CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
-        CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType,
-        CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
-        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+        CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+        CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount,
+        CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+        CVPixelBufferUnlockBaseAddress,
     };
     use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
     use objc2_screen_capture_kit::{
@@ -119,23 +120,28 @@ mod screen_capture_kit {
     /// `capture::linux_x11::POINTER_RANGE`.
     const POINTER_RANGE: u32 = 65_535;
 
-    /// `kCVPixelFormatType_32BGRA`, the packed little-endian BGRA format the
-    /// audio stream asks for: it reads no picture, but a stream must name one.
-    #[cfg_attr(
-        not(feature = "audio-capture-screencapturekit"),
-        allow(dead_code, reason = "only the audio stream and the tests name it")
-    )]
+    /// `kCVPixelFormatType_32BGRA`, packed little-endian BGRA: what a picture
+    /// stream falls back to where the window server will not start one in
+    /// [`PIXEL_FORMAT_NV12`] (ADR 0157), and what the audio stream names,
+    /// which reads no picture but must name a format.
     const PIXEL_FORMAT_32BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
     /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`: NV12 in BT.601's
     /// video range, the layout the picture stream is pinned to (ADR 0157).
     ///
     /// It used to be BGRA, which the encoder then converted to NV12 on the
-    /// CPU — on a Mac with no GPU that conversion, a copy of the 4-byte
-    /// picture and a hash over it cost more of every frame than the encoder.
-    /// The window server makes NV12 itself, and the picture is then the
-    /// 1.5 bytes a pixel `VideoToolbox` takes as it is.
+    /// CPU, after the capture had copied and hashed 4 bytes a pixel. Where the
+    /// window server makes NV12 itself the picture is the 1.5 bytes a pixel
+    /// `VideoToolbox` takes as it is. A Mac with no Metal (the VM on `beta`)
+    /// refuses to start such a stream ("Start stream failed", 1003) and keeps
+    /// BGRA: see [`NV12_REFUSED`].
     const PIXEL_FORMAT_NV12: u32 = u32::from_be_bytes(*b"420v");
+
+    /// Whether `ScreenCaptureKit` refused to start an NV12 picture stream in
+    /// this process, so every stream after it asks for BGRA at once instead
+    /// of failing first (ADR 0157). A window server that cannot convert now
+    /// will not learn to before the process ends.
+    static NV12_REFUSED: AtomicBool = AtomicBool::new(false);
 
     /// `kCVPixelBufferLock_ReadOnly`. Named rather than inlined because the
     /// lock and the matching unlock must be passed the identical flags:
@@ -148,6 +154,9 @@ mod screen_capture_kit {
     /// Planes of a [`PIXEL_FORMAT_NV12`] pixel buffer: luma, then the
     /// interleaved chroma at half the height.
     const NV12_PLANES: usize = 2;
+
+    /// Bytes per pixel of the premultiplied BGRA a cursor is drawn in.
+    const BGRA_BYTES_PER_PIXEL: usize = 4;
 
     /// How many frames `ScreenCaptureKit` may buffer for us. Apple's documented
     /// range is 3..=8; the low end is deliberate here, because this backend
@@ -434,7 +443,7 @@ mod screen_capture_kit {
             let Some(pixels) = (unsafe { sample.image_buffer() }) else {
                 return;
             };
-            match copy_nv12(&pixels, self.started_at) {
+            match copy_picture(&pixels, self.started_at) {
                 Ok(frame) => self.publish(frame),
                 Err(e) => tracing::debug!("dropping a ScreenCaptureKit frame: {e}"),
             }
@@ -521,18 +530,24 @@ mod screen_capture_kit {
         }
     }
 
-    /// Copies a locked-down `CVPixelBuffer` into a tightly packed NV12 frame.
+    /// Copies a locked-down `CVPixelBuffer` into a tightly packed frame: NV12,
+    /// or BGRA from a stream the window server would not start in NV12
+    /// (ADR 0157).
     ///
     /// The copy is not an optimization opportunity to skip: the pixel buffer is
     /// owned by `ScreenCaptureKit` and recycled as soon as the delegate returns,
     /// so nothing may outlive this call.
-    fn copy_nv12(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
+    fn copy_picture(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
         let format = CVPixelBufferGetPixelFormatType(pixels);
-        if format != PIXEL_FORMAT_NV12 {
-            return Err(MediaError::CaptureUnavailable(format!(
-                "ScreenCaptureKit delivered pixel format {format:#010x}, not 420v"
-            )));
-        }
+        let read: fn(&CVPixelBuffer, Instant) -> Result<Frame> = match format {
+            PIXEL_FORMAT_NV12 => read_locked_nv12,
+            PIXEL_FORMAT_32BGRA => read_locked_bgra,
+            _ => {
+                return Err(MediaError::CaptureUnavailable(format!(
+                    "ScreenCaptureKit delivered pixel format {format:#010x}, neither 420v nor 32BGRA"
+                )));
+            }
+        };
 
         // SAFETY: locking the base address is CoreVideo's documented
         // precondition for reading it, and `pixels` is the live buffer of the
@@ -546,7 +561,7 @@ mod screen_capture_kit {
             )));
         }
 
-        let frame = read_locked(pixels, started_at);
+        let frame = read(pixels, started_at);
 
         // SAFETY: balances the successful lock above, with the same flags.
         let _ = unsafe { CVPixelBufferUnlockBaseAddress(pixels, LOCK_READ_ONLY) };
@@ -554,10 +569,63 @@ mod screen_capture_kit {
         frame
     }
 
+    /// Reads a packed BGRA pixel buffer whose base address the caller has
+    /// already locked.
+    fn read_locked_bgra(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
+        let width = CVPixelBufferGetWidth(pixels);
+        let height = CVPixelBufferGetHeight(pixels);
+        let stride = CVPixelBufferGetBytesPerRow(pixels);
+        let base = CVPixelBufferGetBaseAddress(pixels).cast::<u8>();
+
+        if base.is_null() || width == 0 || height == 0 {
+            return Err(MediaError::CaptureUnavailable(
+                "the captured pixel buffer is empty".to_owned(),
+            ));
+        }
+        let row_bytes = width
+            .checked_mul(BGRA_BYTES_PER_PIXEL)
+            .ok_or_else(|| MediaError::CaptureUnavailable("frame width overflows".to_owned()))?;
+        // A stride shorter than one row of pixels would make the reads below
+        // walk off the end of the buffer, so refuse rather than trust it.
+        if stride < row_bytes {
+            return Err(MediaError::CaptureUnavailable(format!(
+                "pixel buffer stride {stride} is shorter than one {row_bytes}-byte row"
+            )));
+        }
+        let total = row_bytes
+            .checked_mul(height)
+            .ok_or_else(|| MediaError::CaptureUnavailable("frame size overflows".to_owned()))?;
+
+        let mut data = Vec::with_capacity(total);
+        for row in 0..height {
+            // SAFETY: `base` is the locked base address of an image CoreVideo
+            // reports as `height` rows of `stride` bytes, so the whole buffer
+            // is `height * stride` bytes long. `row < height` and
+            // `row_bytes <= stride` (checked above), so
+            // `row * stride + row_bytes <= height * stride`: both the offset
+            // and the slice stay inside the buffer. The slice is only read,
+            // and only before the unlock in `copy_picture`.
+            let source = unsafe { std::slice::from_raw_parts(base.add(row * stride), row_bytes) };
+            data.extend_from_slice(source);
+        }
+
+        Ok(Frame {
+            width: u32::try_from(width).map_err(|_| {
+                MediaError::CaptureUnavailable("frame width out of range".to_owned())
+            })?,
+            height: u32::try_from(height).map_err(|_| {
+                MediaError::CaptureUnavailable("frame height out of range".to_owned())
+            })?,
+            format: PixelFormat::Bgra8,
+            timestamp_us: u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+            data,
+        })
+    }
+
     /// Reads a bi-planar NV12 pixel buffer whose base address the caller has
     /// already locked, cropped to even dimensions: 4:2:0 has no odd row or
     /// column, and nothing downstream takes one.
-    fn read_locked(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
+    fn read_locked_nv12(pixels: &CVPixelBuffer, started_at: Instant) -> Result<Frame> {
         let width = CVPixelBufferGetWidth(pixels) & !1;
         let height = CVPixelBufferGetHeight(pixels) & !1;
         if width == 0 || height == 0 {
@@ -596,7 +664,7 @@ mod screen_capture_kit {
                 // `row < rows <= plane_rows` and `width <= stride` (checked
                 // above), so `row * stride + width <= plane_rows * stride`:
                 // the slice stays inside the plane. It is only read, and only
-                // before the unlock in `copy_nv12`.
+                // before the unlock in `copy_picture`.
                 let source = unsafe { std::slice::from_raw_parts(base.add(row * stride), width) };
                 data.extend_from_slice(source);
             }
@@ -750,9 +818,10 @@ mod screen_capture_kit {
         }
     }
 
-    /// The stream's settings: the display's own size, NV12 in BT.601 (the
-    /// matrix the encoder's own conversion used, so colours stay what they
-    /// were; ADR 0157), a short queue, and never the cursor.
+    /// The stream's settings: the display's own size, `pixel_format` (NV12 in
+    /// BT.601, the matrix the encoder's own conversion uses, so colours stay
+    /// what they were; or BGRA; ADR 0157), a short queue, and never the
+    /// cursor.
     ///
     /// The cursor is left out of every stream this file opens, the audio
     /// one included, and never switched on a running one (ADR 0152). On a
@@ -761,15 +830,21 @@ mod screen_capture_kit {
     /// `WindowServer` within a second, and macOS logs the user out. When the
     /// picture has to carry the cursor, this backend draws it in itself
     /// ([`Active::picture`]).
-    fn stream_configuration(width: isize, height: isize) -> Retained<SCStreamConfiguration> {
+    fn stream_configuration(
+        width: isize,
+        height: isize,
+        pixel_format: u32,
+    ) -> Retained<SCStreamConfiguration> {
         // SAFETY: a freshly created configuration; the setters only write its
         // own properties.
         unsafe {
             let config = SCStreamConfiguration::new();
             config.setWidth(usize::try_from(width).unwrap_or(0));
             config.setHeight(usize::try_from(height).unwrap_or(0));
-            config.setPixelFormat(PIXEL_FORMAT_NV12);
-            config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
+            config.setPixelFormat(pixel_format);
+            if pixel_format == PIXEL_FORMAT_NV12 {
+                config.setColorMatrix(kCGDisplayStreamYCbCrMatrix_ITU_R_601_4);
+            }
             config.setQueueDepth(STREAM_QUEUE_DEPTH);
             config.setShowsCursor(false);
             config.setCapturesAudio(false);
@@ -1040,71 +1115,69 @@ mod screen_capture_kit {
         at: (i32, i32),
         shape: &CursorShapeData,
     ) {
-        let (w, h) = (width as usize, height as usize);
-        if data.len() < w * h + w * (h / 2) {
+        let luma_len = width as usize * height as usize;
+        if data.len() < luma_len + luma_len / 2 {
             return;
         }
-        let (luma, chroma) = data.split_at_mut(w * h);
+        let (luma, chroma) = data.split_at_mut(luma_len);
         let left = i64::from(at.0) - i64::from(shape.hotspot_x);
         let top = i64::from(at.1) - i64::from(shape.hotspot_y);
-        let (shape_w, shape_h) = (i64::from(shape.width), i64::from(shape.height));
-        // The cursor's premultiplied B, G, R, A at a picture pixel, if it
-        // covers it.
-        let cursor_at = |x: i64, y: i64| -> Option<[i32; 4]> {
-            let (col, row) = (x - left, y - top);
-            if !(0..shape_w).contains(&col) || !(0..shape_h).contains(&row) {
+        let (shape_wide, shape_high) = (i64::from(shape.width), i64::from(shape.height));
+        let (wide, high) = (i64::from(width), i64::from(height));
+        // The cursor's premultiplied blue, green, red and alpha at a picture
+        // pixel, if it covers it.
+        let cursor_at = |column: i64, line: i64| -> Option<[i32; 4]> {
+            let (col, row) = (column - left, line - top);
+            if !(0..shape_wide).contains(&col) || !(0..shape_high).contains(&row) {
                 return None;
             }
-            let at = usize::try_from((row * shape_w + col) * 4).ok()?;
-            let px: [u8; 4] = shape.rgba.get(at..at + 4)?.try_into().ok()?;
-            Some(px.map(i32::from))
+            let at = usize::try_from((row * shape_wide + col) * 4).ok()?;
+            let pixel: [u8; 4] = shape.rgba.get(at..at + 4)?.try_into().ok()?;
+            Some(pixel.map(i32::from))
         };
         let blend = |under: u8, over: i32, alpha: i32| -> u8 {
             let mixed = over + i32::from(under) * (255 - alpha) / 255;
             u8::try_from(mixed.clamp(0, 255)).unwrap_or(u8::MAX)
         };
-        let (wide, high) = (i64::from(width), i64::from(height));
 
-        for y in top.max(0)..(top + shape_h).min(high) {
-            for x in left.max(0)..(left + shape_w).min(wide) {
-                let Some([b, g, r, a]) = cursor_at(x, y) else {
+        for line in top.max(0)..(top + shape_high).min(high) {
+            for column in left.max(0)..(left + shape_wide).min(wide) {
+                let Some([blue, green, red, alpha]) = cursor_at(column, line) else {
                     continue;
                 };
-                if a == 0 {
+                let Ok(index) = usize::try_from(line * wide + column) else {
                     continue;
+                };
+                if alpha > 0 {
+                    let over = ((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16 * alpha / 255;
+                    luma[index] = blend(luma[index], over, alpha);
                 }
-                let Ok(index) = usize::try_from(y * wide + x) else {
-                    continue;
-                };
-                let over = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16 * a / 255;
-                luma[index] = blend(luma[index], over, a);
             }
         }
 
         // The chroma samples whose 2x2 block the cursor touches on one axis.
         let blocks =
             |from: i64, len: i64, limit: i64| from.max(0) / 2..((from + len).min(limit) + 1) / 2;
-        for cy in blocks(top, shape_h, high) {
-            for cx in blocks(left, shape_w, wide) {
+        for block_line in blocks(top, shape_high, high) {
+            for block_column in blocks(left, shape_wide, wide) {
                 let mut sum = [0_i32; 4];
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    if let Some(px) = cursor_at(cx * 2 + dx, cy * 2 + dy) {
-                        for (total, value) in sum.iter_mut().zip(px) {
-                            *total += value;
-                        }
+                for (across, down) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let covered = cursor_at(block_column * 2 + across, block_line * 2 + down);
+                    for (total, value) in sum.iter_mut().zip(covered.unwrap_or_default()) {
+                        *total += value;
                     }
                 }
-                let [b, g, r, a] = sum.map(|total| total / 4);
-                if a == 0 {
-                    continue;
-                }
-                let Ok(index) = usize::try_from(cy * wide + cx * 2) else {
+                let [blue, green, red, alpha] = sum.map(|total| total / 4);
+                let Ok(index) = usize::try_from(block_line * wide + block_column * 2) else {
                     continue;
                 };
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128 * a / 255;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128 * a / 255;
-                chroma[index] = blend(chroma[index], u, a);
-                chroma[index + 1] = blend(chroma[index + 1], v, a);
+                if alpha > 0 {
+                    let offset = 128 * alpha / 255;
+                    let cb = ((-38 * red - 74 * green + 112 * blue + 128) >> 8) + offset;
+                    let cr = ((112 * red - 94 * green - 18 * blue + 128) >> 8) + offset;
+                    chroma[index] = blend(chroma[index], cb, alpha);
+                    chroma[index + 1] = blend(chroma[index + 1], cr, alpha);
+                }
             }
         }
     }
@@ -1326,6 +1399,47 @@ mod screen_capture_kit {
         }
     }
 
+    /// Creates a stream of `filter` with `config` delivering to `sink` on
+    /// `queue`, and starts it.
+    fn open_stream(
+        filter: &SCContentFilter,
+        config: &SCStreamConfiguration,
+        sink: &Retained<FrameSink>,
+        queue: &DispatchQueue,
+    ) -> Result<Retained<SCStream>> {
+        // SAFETY: `filter` and `config` are live objects the caller built,
+        // `sink` outlives the stream because the caller keeps it in `Active`
+        // (a stream that fails here is dropped before it), and `queue` is a
+        // serial queue owned for the same span.
+        let stream = unsafe {
+            let stream = SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                filter,
+                config,
+                Some(ProtocolObject::from_ref(&**sink)),
+            );
+            stream
+                .addStreamOutput_type_sampleHandlerQueue_error(
+                    ProtocolObject::from_ref(&**sink),
+                    SCStreamOutputType::Screen,
+                    Some(queue),
+                )
+                .map_err(|e| {
+                    ErrorInfo::from_ns(&e).into_media_error("attaching the capture output")
+                })?;
+            stream
+        };
+
+        if let Some(info) = wait_for_completion("the stream start", |handler| {
+            // SAFETY: the handler outlives the call, since
+            // `wait_for_completion` blocks until it has run.
+            unsafe { stream.startCaptureWithCompletionHandler(Some(handler)) };
+        })? {
+            return Err(info.into_media_error("starting the ScreenCaptureKit stream"));
+        }
+        Ok(stream)
+    }
+
     impl ScreenCapturer for MacosCapturer {
         fn start(&mut self, target: CaptureTarget) -> Result<()> {
             // Starting twice must not leave an orphaned stream running: that
@@ -1350,7 +1464,6 @@ mod screen_capture_kit {
                 );
                 (filter, display.displayID(), width, height)
             };
-            let config = stream_configuration(width, height);
             if width <= 0 || height <= 0 {
                 return Err(MediaError::CaptureUnavailable(format!(
                     "ScreenCaptureKit reports a {width}x{height} display"
@@ -1361,35 +1474,38 @@ mod screen_capture_kit {
             let sink = FrameSink::new(Arc::clone(&shared));
             let queue = DispatchQueue::new("dev.lumepeer.capture.macos", None);
 
-            // SAFETY: `filter` and `config` are the objects just built, `sink`
-            // outlives the stream because `Active` holds it, and the queue is a
-            // fresh serial queue owned for the same span.
-            let stream = unsafe {
-                let stream = SCStream::initWithFilter_configuration_delegate(
-                    SCStream::alloc(),
-                    &filter,
-                    &config,
-                    Some(ProtocolObject::from_ref(&*sink)),
-                );
-                stream
-                    .addStreamOutput_type_sampleHandlerQueue_error(
-                        ProtocolObject::from_ref(&*sink),
-                        SCStreamOutputType::Screen,
-                        Some(&queue),
-                    )
-                    .map_err(|e| {
-                        ErrorInfo::from_ns(&e).into_media_error("attaching the capture output")
-                    })?;
-                stream
-            };
-
-            if let Some(info) = wait_for_completion("the stream start", |handler| {
-                // SAFETY: the handler outlives the call, since
-                // `wait_for_completion` blocks until it has run.
-                unsafe { stream.startCaptureWithCompletionHandler(Some(handler)) };
-            })? {
-                return Err(info.into_media_error("starting the ScreenCaptureKit stream"));
+            // NV12 first, BGRA where the window server will not start that
+            // (ADR 0157). Only a stream that failed to start is retried: a
+            // refused permission is the same answer in any format.
+            let mut formats = vec![PIXEL_FORMAT_32BGRA];
+            if !NV12_REFUSED.load(Ordering::Relaxed) {
+                formats.insert(0, PIXEL_FORMAT_NV12);
             }
+            let mut stream = None;
+            for pixel_format in formats {
+                let config = stream_configuration(width, height, pixel_format);
+                match open_stream(&filter, &config, &sink, &queue) {
+                    Ok(started) => {
+                        stream = Some(started);
+                        break;
+                    }
+                    Err(MediaError::CaptureUnavailable(reason))
+                        if pixel_format == PIXEL_FORMAT_NV12 =>
+                    {
+                        tracing::info!(
+                            %reason,
+                            "ScreenCaptureKit would not start an NV12 stream here; capturing BGRA (ADR 0157)"
+                        );
+                        NV12_REFUSED.store(true, Ordering::Relaxed);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(stream) = stream else {
+                return Err(MediaError::CaptureUnavailable(
+                    "ScreenCaptureKit started no stream".to_owned(),
+                ));
+            };
 
             self.target = target;
             self.active = Some(Active {
@@ -2680,10 +2796,11 @@ mod screen_capture_kit {
             };
 
             assert!(frame.width > 0 && frame.height > 0);
-            assert_eq!(frame.format, PixelFormat::Bgra8);
+            assert_eq!((frame.width % 2, frame.height % 2), (0, 0));
+            assert_eq!(frame.format, PixelFormat::Nv12);
             assert_eq!(
                 frame.data.len(),
-                (frame.width as usize) * (frame.height as usize) * BGRA_BYTES_PER_PIXEL
+                (frame.width as usize) * (frame.height as usize) * 3 / 2
             );
 
             capturer.stop();
@@ -2755,6 +2872,64 @@ mod screen_capture_kit {
             let mut data = picture();
             composite_cursor(&mut data, width, height, (-10, 50), &shape);
             assert_eq!(data, picture());
+        }
+
+        /// ADR 0157: over an NV12 picture the cursor lands where it does over
+        /// a BGRA one — opaque white is video-range white with neutral
+        /// chroma, a transparent pixel changes nothing, half-covering black
+        /// halves the luma — and nothing off the picture is written.
+        #[test]
+        fn the_cursor_is_composited_into_nv12_at_its_hotspot() {
+            let (width, height) = (4_u32, 4_u32);
+            let grey = |w: u32, h: u32| {
+                let mut data = vec![120_u8; (w * h) as usize];
+                data.extend(vec![128_u8; (w * (h / 2)) as usize]);
+                data
+            };
+            // 2x2: opaque white, half-covering black, transparent, transparent.
+            let shape = cursor_shape(
+                2,
+                2,
+                0,
+                0,
+                vec![255, 255, 255, 255, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0],
+            )
+            .unwrap();
+
+            let mut data = grey(width, height);
+            composite_cursor_nv12(&mut data, width, height, (2, 2), &shape);
+            let luma = |x: u32, y: u32| data[(y * width + x) as usize];
+            assert_eq!(luma(2, 2), 235, "opaque white");
+            // 16 * 128 / 255 of the cursor over 120 * 127 / 255 of the grey.
+            assert_eq!(luma(3, 2), 8 + 59, "half black");
+            assert_eq!(luma(2, 3), 120, "transparent");
+            assert_eq!(luma(1, 1), 120, "off the cursor");
+            // Chroma of the block at (1, 1) — white and black are both
+            // neutral, so it stays neutral.
+            let chroma = &data[(width * height) as usize..];
+            let at = (width + 2) as usize;
+            assert!((126..=130).contains(&chroma[at]), "U {}", chroma[at]);
+            assert!(
+                (126..=130).contains(&chroma[at + 1]),
+                "V {}",
+                chroma[at + 1]
+            );
+
+            // Hanging off the bottom-right corner: only (3, 3) is touched.
+            let mut data = grey(width, height);
+            composite_cursor_nv12(&mut data, width, height, (3, 3), &shape);
+            assert_eq!(data[(3 * width + 3) as usize], 235);
+            let mut untouched = grey(width, height);
+            untouched[(3 * width + 3) as usize] = 235;
+            assert_eq!(
+                data[..(width * height) as usize],
+                untouched[..(width * height) as usize]
+            );
+
+            // Entirely off the picture: nothing changes.
+            let mut data = grey(width, height);
+            composite_cursor_nv12(&mut data, width, height, (-10, 50), &shape);
+            assert_eq!(data, grey(width, height));
         }
 
         /// The cursor on screen, drawn the way the guest will draw it: at its

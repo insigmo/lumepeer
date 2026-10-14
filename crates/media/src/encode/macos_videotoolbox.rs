@@ -375,7 +375,18 @@ mod video_toolbox {
 
     impl VideoEncoder for VideoToolboxEncoder {
         fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-            let (nv12, width, height) = bgra_to_nv12(frame)?;
+            // The capture hands out NV12 (ADR 0157), which goes into the
+            // session's buffer as it is; anything else is converted first.
+            let converted;
+            let (nv12, width, height) = if frame.format == PixelFormat::Nv12
+                && frame.width.is_multiple_of(2)
+                && frame.height.is_multiple_of(2)
+            {
+                (frame.as_cpu()?, frame.width, frame.height)
+            } else {
+                converted = bgra_to_nv12(frame)?;
+                (converted.0.as_slice(), converted.1, converted.2)
+            };
             if self.session.dims != (width, height) {
                 // A resolution change is a rare event, and a compression
                 // session's frame size is fixed at creation, so this reopens
@@ -385,7 +396,7 @@ mod video_toolbox {
                 self.session = Session::open(width, height, self.config)?;
                 self.last_pts = -1;
             }
-            self.session.upload(&nv12, width, height)?;
+            self.session.upload(nv12, width, height)?;
 
             let force_keyframe = std::mem::take(&mut self.force_keyframe);
             let pts = self.next_pts(frame.timestamp_us);
