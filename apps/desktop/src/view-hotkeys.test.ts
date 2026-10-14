@@ -7,7 +7,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { HOTKEYS, HOTKEY_PREFIX, hotkeyLabel, installHotkeys, matchHotkey } from './view-hotkeys';
+import { HOTKEYS, hotkeyLabel, installHotkeys, matchHotkey } from './view-hotkeys';
 import { ViewInput, type InputSink } from './view-window';
 
 let container: HTMLElement;
@@ -57,8 +57,38 @@ describe('view hotkeys: matching', () => {
   });
 
   it('names each chord the same way the help popover does', () => {
-    expect(hotkeyLabel('KeyF')).toBe(`${HOTKEY_PREFIX}+F`);
-    expect(hotkeyLabel('Digit0')).toBe(`${HOTKEY_PREFIX}+0`);
+    expect(hotkeyLabel('KeyF', false)).toBe('Ctrl+Alt+Shift+F');
+    expect(hotkeyLabel('Digit0', false)).toBe('Ctrl+Alt+Shift+0');
+  });
+});
+
+// A Mac keyboard has no Alt and keeps an app's own chords on Command: the
+// prefix there is Control+Option+Command, written the way its menus do.
+describe('view hotkeys: on a Mac', () => {
+  function macChord(code: string, over: Partial<KeyboardEventInit> = {}): KeyboardEvent {
+    return chord(code, { shiftKey: false, metaKey: true, ...over });
+  }
+
+  it('matches every documented chord with Control+Option+Command', () => {
+    for (const entry of HOTKEYS) {
+      expect(matchHotkey(macChord(entry.code), true)).toBe(entry.action);
+    }
+  });
+
+  it('takes nothing without the full prefix', () => {
+    for (const missing of [{ ctrlKey: false }, { altKey: false }, { metaKey: false }]) {
+      expect(matchHotkey(macChord('KeyF', missing), true)).toBeNull();
+    }
+  });
+
+  it('leaves the Ctrl+Alt+Shift chord and any superset to the remote machine', () => {
+    expect(matchHotkey(chord('KeyF'), true)).toBeNull();
+    expect(matchHotkey(macChord('KeyF', { shiftKey: true }), true)).toBeNull();
+  });
+
+  it('writes the chord the way macOS menus do', () => {
+    expect(hotkeyLabel('KeyF', true)).toBe('⌃⌥⌘F');
+    expect(hotkeyLabel('Digit0', true)).toBe('⌃⌥⌘0');
   });
 });
 

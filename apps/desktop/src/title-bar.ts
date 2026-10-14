@@ -8,11 +8,18 @@
 // an element carrying it starts a window drag, and a double click toggles
 // maximize. It needs core:window:allow-start-dragging in the main window
 // capability, otherwise the drag is denied and the bar feels dead.
+//
+// Not on macOS. A Mac user reads the three coloured lights at the top left as
+// the window's controls, and the Windows-style row at the right as foreign, so
+// tauri.macos.conf.json keeps the native lights over the webview (decorations
+// with the Overlay title bar) and the strip there is only the drag surface
+// (ADR 0158).
 
 import { html, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { IS_MAC } from './platform';
 
 async function minimize(): Promise<void> {
   const { getCurrentWindow } = await import('@tauri-apps/api/window');
@@ -32,7 +39,14 @@ async function closeWindow(): Promise<void> {
 // The strip runs over the main panel only: the sidebar climbs to the top edge
 // beside it and carries the product mark, so the strip itself is just the drag
 // surface and the three controls.
-export function titleBar(locale: Locale): TemplateResult {
+export function titleBar(locale: Locale, mac: boolean = IS_MAC): TemplateResult {
+  if (mac) {
+    return html`
+      <div class="title-bar" data-tauri-drag-region>
+        <div class="title-bar-left" data-tauri-drag-region></div>
+      </div>
+    `;
+  }
   return html`
     <div class="title-bar" data-tauri-drag-region>
       <div class="title-bar-left" data-tauri-drag-region></div>

@@ -276,6 +276,9 @@ objc2-core-graphics = { version = "0.3.2", optional = true, default-features = f
     # `kCGDisplayStreamYCbCrMatrix_ITU_R_601_4`, the matrix the NV12 picture
     # stream is asked to convert with (ADR 0157).
     "CGDisplayStream",
+    # `CGPreflightScreenCaptureAccess`/`CGRequestScreenCaptureAccess`, for
+    # the app's permissions screen (`capture::macos_permissions`).
+    "CGWindow",
 ] }
 # The system cursor's image and hotspot (`NSCursor.currentSystemCursor`), so
 # the cursor can leave the picture and be drawn by the guest at its own

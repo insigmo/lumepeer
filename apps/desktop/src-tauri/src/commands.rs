@@ -4217,6 +4217,40 @@ pub fn autostart_set(
     Ok(())
 }
 
+/// Where this Mac's three permissions stand, for the permissions screen, or
+/// `null` on any other platform.
+///
+/// # Errors
+/// Rejects calls from any window but the main one.
+#[tauri::command]
+pub fn mac_permissions(
+    window: Window,
+) -> Result<Option<crate::mac_permissions::MacPermissions>, IpcError> {
+    check_window(&window)?;
+    Ok(crate::mac_permissions::read())
+}
+
+/// Argument of [`mac_permission_request`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct MacPermissionArgs {
+    /// The permission to ask for.
+    pub permission: crate::mac_permissions::MacPermission,
+}
+
+/// Asks for one macOS permission: the system's own prompt where it still has
+/// one, and System Settings at the permission's list where it does not. A
+/// no-op on any other platform.
+///
+/// # Errors
+/// Rejects calls from any window but the main one.
+#[tauri::command]
+pub fn mac_permission_request(window: Window, args: MacPermissionArgs) -> Result<(), IpcError> {
+    check_window(&window)?;
+    tracing::info!(permission = ?args.permission, "asking for a macOS permission");
+    crate::mac_permissions::request(args.permission);
+    Ok(())
+}
+
 /// Filter of one [`audit_list`] call.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditListArgs {

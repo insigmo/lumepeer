@@ -15,6 +15,7 @@ import { addressBook } from './address-book';
 import type { AuditCommands } from './audit-log';
 import { auditPanel } from './audit-log';
 import { inviteRefreshPanel } from './invite-view';
+import { macPermissionsSettingsRow } from './mac-permissions';
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
 import type { RecordingEntry, RecordingsCommands } from './recordings';
@@ -193,7 +194,8 @@ function section(panels: SettingsPanels): TemplateResult {
   switch (tab) {
     case 'system':
       // How the app itself looks and behaves on this machine.
-      return html`${systemSettings(locale, panels.systemCommands, panels.onLocaleChange)}`;
+      return html`${systemSettings(locale, panels.systemCommands, panels.onLocaleChange)}
+      ${macPermissionsSettingsRow(locale)}`;
     case 'access':
       // Who this machine lets in: how a trusted device proves it is itself,
       // which devices are trusted, and the code it hands out to invite them.

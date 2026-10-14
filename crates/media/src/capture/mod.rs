@@ -29,6 +29,9 @@ pub use pipewire_stream::DmaBuf;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod macos;
 
+#[cfg(all(target_os = "macos", feature = "capture-screencapturekit"))]
+pub mod macos_permissions;
+
 // Compiled on every platform, not only the two above: it is a table of plain
 // integers, and the host this workspace is usually built on is not a Mac
 // (ADR 0108).

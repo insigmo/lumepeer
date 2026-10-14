@@ -39,6 +39,7 @@ function toolbarHooks(): ToolbarHooks {
     fullscreen: () => false,
     toggleFullscreen: () => {},
     cursorChannel: () => false,
+    pictureCodec: () => null,
     localCursor: () => true,
     toggleLocalCursor: () => {},
     bind: () => {},

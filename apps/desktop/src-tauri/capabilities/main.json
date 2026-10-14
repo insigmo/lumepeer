@@ -78,6 +78,8 @@
     "allow-update-check",
     "allow-update-install",
     "allow-autostart-status",
-    "allow-autostart-set"
+    "allow-autostart-set",
+    "allow-mac-permissions",
+    "allow-mac-permission-request"
   ]
 }

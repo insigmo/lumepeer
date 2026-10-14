@@ -48,6 +48,8 @@ import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
 import { applyTheme } from './theme';
+import { macPermissionsView, onMacPermissionsStateChange, startMacPermissions } from './mac-permissions';
+import { IS_MAC } from './platform';
 import { titleBar } from './title-bar';
 import { onUnattendedStateChange, unattendedIndicator, type UnattendedStatus } from './unattended-settings';
 import { supportedOptionalCodecs } from './view-decoder';
@@ -268,7 +270,7 @@ function renderNow(): void {
   render(
     [
       html`
-        <div class="window-shell">
+        <div class=${IS_MAC ? 'window-shell mac' : 'window-shell'}>
           ${titleBar(locale)}
           <div class="window-body">
             <aside class="sidebar">
@@ -343,6 +345,7 @@ function renderNow(): void {
         onRefresh: () => void refresh(),
         onLocaleChange: setLocale,
       }),
+      macPermissionsView(locale),
     ],
     root as HTMLElement,
   );
@@ -517,6 +520,9 @@ onRecordingsStateChange(renderNow);
 onAuditStateChange(renderNow);
 onSystemStateChange(renderNow);
 onSettingsStateChange(renderNow);
+onMacPermissionsStateChange(renderNow);
+// Off macOS this reads `null` once and shows nothing.
+void startMacPermissions();
 
 // A card's three-dot menu is a `<details>`, which the browser opens and closes
 // by itself — except for the one thing it does not do: close when the pointer

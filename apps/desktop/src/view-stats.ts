@@ -1,4 +1,4 @@
-// Video statistics overlay of one view window (Ctrl+Alt+Shift+S).
+// Video statistics overlay of one view window (Ctrl+Alt+Shift+S, ⌃⌥⌘S on a Mac).
 //
 // For a person working out why a session is slow or soft. Everything shown
 // was measured, on this machine or on the media connection, and a figure

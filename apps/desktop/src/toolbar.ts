@@ -19,6 +19,7 @@ import type { Locale } from './i18n';
 import { t } from './i18n';
 import { SETTINGS_ICON } from './icons';
 import { CLIPBOARD_NOTE_MS } from './session-status';
+import { WireCodec } from './view-decoder';
 import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
 import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
@@ -72,6 +73,33 @@ export const ENCODER_CHOICES = [
   'av1_software',
 ] as const;
 export type EncoderChoice = (typeof ENCODER_CHOICES)[number];
+
+/** The hardware and software encoder of each codec a picture can arrive in. */
+const CODEC_ENCODERS: Partial<Record<WireCodec, readonly [EncoderChoice, EncoderChoice]>> = {
+  [WireCodec.H264]: ['h264_hardware', 'h264_software'],
+  [WireCodec.Av1]: ['av1_hardware', 'av1_software'],
+};
+
+/**
+ * What the host's "Automatic" encoder is using (ADR 0143), judged from the
+ * codec the picture arrives in and what the host offered: that codec's
+ * hardware encoder when the host has one, its software encoder otherwise,
+ * which is the host's own rule. `null` before the first picture.
+ *
+ * Without it the row said only "Automatic", and a guest whose host was
+ * already encoding AV1 in hardware read that as AV1 not being picked (ADR 0158).
+ */
+export function autoEncoder(
+  codec: WireCodec | null,
+  available: readonly EncoderChoice[],
+): EncoderChoice | null {
+  const encoders = codec === null ? undefined : CODEC_ENCODERS[codec];
+  if (!encoders) {
+    return null;
+  }
+  const [hardware, software] = encoders;
+  return available.includes(hardware) ? hardware : software;
+}
 
 /**
  * What `host_encoders` hands back: what the host offered and what it is
@@ -514,6 +542,11 @@ export interface ToolbarHooks {
   /** Asks the window to lay the picture out differently. */
   setDisplayMode(mode: DisplayMode): void;
   /**
+   * The codec the picture arrives in right now, or `null` before the first
+   * one (ADR 0067). Read, so "Automatic" can say what it resolved to.
+   */
+  pictureCodec(): WireCodec | null;
+  /**
    * The scale the picture is drawn at right now, as a whole percentage.
    *
    * Read, never held, for the same reason `displayMode` is: the window owns
@@ -622,6 +655,8 @@ export function renderToolbar(
   const hostResolutions = hostResolutionsFrom(hostDisplayModes.modes);
   // Same guard again, for the encoder list (ADR 0143).
   const hostEncoders = state.hostEncoders ?? { available: [], chosen: null };
+  const resolvedAuto =
+    hostEncoders.chosen === 'auto' ? autoEncoder(hooks.pictureCodec(), hostEncoders.available) : null;
   // Nothing picked yet means the host is still at the size it announced for
   // the monitor being watched, so that is what the select shows selected —
   // never a blank, and never the first row of a list the guest did not choose.
@@ -715,7 +750,13 @@ export function renderToolbar(
                           ?selected=${choice === hostEncoders.chosen}
                           ?disabled=${!hostEncoders.available.includes(choice)}
                         >
-                          ${t(locale, `toolbar.encoder.${choice}` as TranslationKeyAlias)}
+                          ${choice === 'auto' && resolvedAuto !== null
+                            ? t(
+                                locale,
+                                'toolbar.encoder.autoResolved',
+                                t(locale, `toolbar.encoder.${resolvedAuto}` as TranslationKeyAlias),
+                              )
+                            : t(locale, `toolbar.encoder.${choice}` as TranslationKeyAlias)}
                         </option>`,
                     )}
                   </select>`}

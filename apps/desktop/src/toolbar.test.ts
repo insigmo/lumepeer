@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { t } from './i18n';
 import {
+  autoEncoder,
   fpsFor,
   hostResolutionKey,
   hostResolutionsFrom,
@@ -20,6 +21,7 @@ import {
   type ToolbarControls,
   type ToolbarHooks,
 } from './toolbar';
+import { WireCodec } from './view-decoder';
 import { HOTKEYS, hotkeyLabel } from './view-hotkeys';
 import { DISPLAY_MODES, type DisplayMode } from './view-window';
 
@@ -86,6 +88,7 @@ type FakeHooks = ToolbarHooks & {
   isFullscreen: boolean;
   hasCursorChannel: boolean;
   drawsLocalCursor: boolean;
+  codec: WireCodec | null;
   controls: ToolbarControls | null;
 };
 
@@ -95,6 +98,7 @@ function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
     isFullscreen: false,
     hasCursorChannel: true,
     drawsLocalCursor: true,
+    codec: null,
     controls: null,
     toggleChat: () => true,
     chatVisible: () => true,
@@ -114,6 +118,7 @@ function fakeHooks(overrides: Partial<ToolbarHooks> = {}): FakeHooks {
       hooks.isFullscreen = !hooks.isFullscreen;
     },
     cursorChannel: () => hooks.hasCursorChannel,
+    pictureCodec: () => hooks.codec,
     localCursor: () => hooks.drawsLocalCursor,
     toggleLocalCursor: () => {
       hooks.drawsLocalCursor = !hooks.drawsLocalCursor;
@@ -869,6 +874,42 @@ describe('the floating session toolbar', () => {
     } finally {
       stop();
     }
+  });
+
+  // "Automatic" alone read as AV1 not being picked on a host that was
+  // already encoding AV1 in hardware: the row names what it resolved to.
+  it('names the encoder "Automatic" resolved to', async () => {
+    const commands = fakeCommands();
+    commands.hostEncoders.mockResolvedValue({
+      available: ['auto', 'h264_hardware', 'h264_software', 'av1_hardware', 'av1_software'],
+      chosen: 'auto',
+    });
+    const hooks = fakeHooks({ chatVisible: () => false });
+    hooks.codec = WireCodec.Av1;
+    const stop = mountToolbar(container, 'en', 'host-ab12', commands, hooks);
+    try {
+      container.querySelector<HTMLButtonElement>('[data-testid="toolbar-settings"]')?.click();
+      await vi.waitFor(() =>
+        expect(
+          container
+            .querySelector('[data-testid="toolbar-encoder"] option[value="auto"]')
+            ?.textContent?.trim(),
+        ).toBe('Automatic (AV1, hardware)'),
+      );
+    } finally {
+      stop();
+    }
+  });
+
+  it('resolves "Automatic" by the rule the host itself follows', () => {
+    expect(autoEncoder(null, ['auto', 'av1_hardware'])).toBeNull();
+    expect(autoEncoder(WireCodec.Av1, ['auto', 'av1_hardware', 'av1_software'])).toBe(
+      'av1_hardware',
+    );
+    expect(autoEncoder(WireCodec.Av1, ['auto', 'av1_software'])).toBe('av1_software');
+    expect(autoEncoder(WireCodec.H264, ['auto', 'h264_hardware'])).toBe('h264_hardware');
+    expect(autoEncoder(WireCodec.H264, ['auto', 'h264_software'])).toBe('h264_software');
+    expect(autoEncoder(WireCodec.Vp9, ['auto'])).toBeNull();
   });
 
   it('says the host offers no encoder choice when it announced none', async () => {

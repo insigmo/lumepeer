@@ -813,7 +813,11 @@ async function nativeTick(): Promise<void> {
     });
     needKeyframe = false;
     const chunk: ViewChunk = decodeViewChunk(response as ArrayBuffer);
-    lastCodec = chunk.codec;
+    if (chunk.codec !== lastCodec) {
+      lastCodec = chunk.codec;
+      // The encoder row's "Automatic" names the codec it is on.
+      toolbar?.redraw();
+    }
     applySessionFlags(chunk);
     if (chunk.desync) {
       // Frames were lost or the media connection was redialled: everything
@@ -960,6 +964,7 @@ async function main(): Promise<void> {
       },
       displayMode: () => layout.mode,
       setDisplayMode,
+      pictureCodec: () => lastCodec,
       zoomPercent: () =>
         Math.round(
           effectiveScale(layout, frameSize, viewportBox(), window.devicePixelRatio || 1) * 100,

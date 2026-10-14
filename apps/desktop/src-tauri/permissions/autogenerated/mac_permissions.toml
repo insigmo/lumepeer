@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mac-permissions"
+description = "Enables the mac_permissions command without any pre-configured scope."
+commands.allow = ["mac_permissions"]
+
+[[permission]]
+identifier = "deny-mac-permissions"
+description = "Denies the mac_permissions command without any pre-configured scope."
+commands.deny = ["mac_permissions"]

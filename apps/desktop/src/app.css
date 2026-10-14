@@ -312,6 +312,14 @@ select option {
   user-select: none;
 }
 
+/* macOS keeps its own window controls (tauri.macos.conf.json), and they sit
+   at the top left — over this row in a left-to-right layout, where the mark
+   moves right of them. Right to left, the sidebar is on the other side and the
+   lights land on the empty title strip instead. */
+:root[dir='ltr'] .window-shell.mac .brand-row {
+  padding-inline-start: 70px;
+}
+
 .brand-row .brand-name {
   font-size: var(--fs-emphasis);
   font-weight: 700;
@@ -1166,6 +1174,7 @@ button.peer-card-face:disabled {
   .peer-menu-list,
   .settings-backdrop,
   .settings-panel,
+  .settings-backdrop .mac-perms,
   .consent-backdrop,
   .consent-backdrop .consent,
   .credentials-backdrop,
@@ -1770,6 +1779,98 @@ button.peer-card-face:disabled {
   height: min(620px, 100%);
   overflow: hidden;
   animation: dialog-in 220ms var(--ease-out);
+}
+
+/* ---------- macOS permissions (mac-permissions.ts) ----------
+   A short sheet over the settings backdrop: three rows, each saying where its
+   permission stands and, while it is off, the one button that asks for it. */
+.settings-backdrop .mac-perms {
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  width: min(560px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 22px 24px 18px;
+  animation: dialog-in 220ms var(--ease-out);
+}
+
+.mac-perms h2 {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 6px;
+}
+
+.mac-perms-lead,
+.mac-perms-note {
+  font-size: var(--fs-body);
+  color: var(--text-2);
+  margin: 0;
+}
+
+.mac-perms-list {
+  list-style: none;
+  margin: 16px 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--group-bg);
+}
+
+.mac-perm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.mac-perm + .mac-perm {
+  border-block-start: 1px solid var(--border);
+}
+
+.mac-perm-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mac-perm-title {
+  font-weight: 600;
+}
+
+.mac-perm-body {
+  font-size: var(--fs-micro);
+  color: var(--text-3);
+}
+
+.mac-perm-state {
+  font-size: var(--fs-micro);
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--amber);
+}
+
+.mac-perm[data-state='granted'] .mac-perm-state {
+  color: var(--green-text);
+}
+
+.mac-perm[data-state='denied'] .mac-perm-state {
+  color: var(--red);
+}
+
+/* The granted row has no button: its state takes the button's column too. */
+.mac-perm[data-state='granted'] .mac-perm-state {
+  grid-column: 2 / -1;
+}
+
+.mac-perms-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-block-start: 16px;
 }
 
 .settings-head {

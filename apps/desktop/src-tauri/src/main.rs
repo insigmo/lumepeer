@@ -17,6 +17,8 @@ mod commands;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
 mod logging;
+// The macOS permissions screen: Screen Recording, Accessibility, Microphone.
+mod mac_permissions;
 // This same binary, run as `LocalSystem` on the logon screen while nobody is
 // signed in (ADR 0126). Windows only: the logon screen it hosts is Windows'.
 #[cfg(target_os = "windows")]
@@ -377,6 +379,16 @@ fn install_tray(app: &tauri::App) -> tauri::Result<bool> {
     let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
     let mut tray = TrayIconBuilder::new();
+    // On macOS the menu bar draws a template image: only its alpha counts,
+    // tinted for a light or a dark bar. The app icon is an opaque tile, so as
+    // a template it was a solid square; the Mac gets the glyph alone (ADR 0158).
+    #[cfg(target_os = "macos")]
+    {
+        tray = tray
+            .icon(tauri::include_image!("icons/tray-template.png"))
+            .icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         tray = tray.icon(icon);
     } else {
@@ -384,10 +396,6 @@ fn install_tray(app: &tauri::App) -> tauri::Result<bool> {
     }
 
     tray.menu(&tray_menu)
-        // Carried over from the removed `app.trayIcon` block: on macOS the
-        // icon is a monochrome mask tinted by the menu bar, and elsewhere this
-        // is a no-op.
-        .icon_as_template(true)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => app.exit(0),
@@ -673,6 +681,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::update_install,
         commands::autostart_status,
         commands::autostart_set,
+        commands::mac_permissions,
+        commands::mac_permission_request,
         commands::host_bar_expand,
         commands::host_bar_focus_main,
         commands::host_bar_open_chat,

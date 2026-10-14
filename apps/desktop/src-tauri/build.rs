@@ -99,6 +99,8 @@ const COMMANDS: &[&str] = &[
     "update_install",
     "autostart_status",
     "autostart_set",
+    "mac_permissions",
+    "mac_permission_request",
     "host_bar_expand",
     "host_bar_focus_main",
     "host_bar_open_chat",
