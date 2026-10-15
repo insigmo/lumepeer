@@ -585,12 +585,7 @@ pub mod portal {
         )> {
             let mut steps = Vec::with_capacity(PORTAL_CALL_ORDER.len());
 
-            let remote = RemoteDesktop::new()
-                .await
-                .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-            let screencast = Screencast::new()
-                .await
-                .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            let (remote, screencast) = connect().await?;
 
             // 1. CreateSession. Its options type is private in ashpd, so the
             // default is the only thing that can be passed here.
@@ -715,6 +710,28 @@ pub mod portal {
         }
     }
 
+    /// The two portal interfaces one session talks to, on a session-bus
+    /// connection of that session's own (ADR 0159).
+    ///
+    /// ashpd's plain constructors share one connection for the whole process,
+    /// and zbus reads a connection on the runtime it was opened on. That was
+    /// the first guest's [`PortalRuntime`], shut down when that guest left, so
+    /// every later handshake waited for an answer nobody read and its guest
+    /// never got a picture. A connection of its own lives and dies with its
+    /// session, and closing it also tells the portal the session is over.
+    async fn connect() -> Result<(RemoteDesktop, Screencast)> {
+        let connection = ashpd::zbus::Connection::session()
+            .await
+            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+        let remote = RemoteDesktop::with_connection(connection.clone())
+            .await
+            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+        let screencast = Screencast::with_connection(connection)
+            .await
+            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+        Ok((remote, screencast))
+    }
+
     /// A dismissed dialog is the user declining, everything else is the portal
     /// being unavailable (§18).
     fn map_portal_error(error: ashpd::Error) -> MediaError {
@@ -730,7 +747,8 @@ pub mod portal {
     mod tests {
         #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
-        use super::PortalRuntime;
+        use super::{PortalRuntime, connect, map_portal_error};
+        use crate::error::MediaError;
 
         /// Capture starts and input arrives on the network actor, a task on a
         /// worker of the app's runtime: the portal runtime has to run and shut
@@ -746,6 +764,46 @@ pub mod portal {
                 .unwrap();
             assert_eq!(answer, 42);
             drop(runtime);
+        }
+
+        /// Each guest's handshake runs on a runtime of its own, shut down when
+        /// the guest leaves, and the next guest still has to reach the portal:
+        /// a connection read on the first guest's runtime left every later
+        /// handshake waiting for an answer nobody read (ADR 0159). Opt-in: it
+        /// needs a desktop session bus with xdg-desktop-portal, though no
+        /// dialog comes up (`CreateSession` asks nobody).
+        #[test]
+        fn a_second_guest_reaches_the_portal_after_the_first_one_left() {
+            if std::env::var("LUMEPEER_TEST_PORTAL_BUS").as_deref() != Ok("1") {
+                return;
+            }
+            for guest in 1..=2 {
+                let runtime = PortalRuntime::new().unwrap();
+                let reached = runtime
+                    .block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            let (remote, screencast) = connect().await?;
+                            #[allow(
+                                clippy::default_trait_access,
+                                reason = "ashpd keeps CreateSessionOptions private"
+                            )]
+                            let session = remote
+                                .create_session(Default::default())
+                                .await
+                                .map_err(map_portal_error)?;
+                            Ok::<_, MediaError>((remote, screencast, session))
+                        })
+                        .await
+                    })
+                    .unwrap();
+                let Ok(Ok(kept)) = reached else {
+                    panic!("guest {guest} never reached the portal: {reached:?}");
+                };
+                // Let go in `PortalHandle`'s order: the runtime first, then
+                // the proxies, on a thread with no runtime of its own.
+                drop(runtime);
+                drop(kept);
+            }
         }
     }
 }
