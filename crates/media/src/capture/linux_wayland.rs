@@ -706,16 +706,25 @@ pub mod portal {
             let (remote, screencast) = connect().await?;
 
             if let Some(token) = grant.load() {
+                let asked = std::time::Instant::now();
                 match Self::ask(&remote, &screencast, grant, Some(&token)).await {
                     Ok(granted) if granted.node_id.is_some() => {
-                        // xdg-desktop-portal hands a restored grant its own
-                        // token back; a new one means it no longer knew the
-                        // token and somebody at this screen answered the
-                        // dialog instead.
+                        // xdg-desktop-portal gives a token it still knew back
+                        // unchanged, even when the desktop showed its dialog
+                        // anyway (KDE does, for a grant GNOME made); a new one
+                        // means it no longer knew the token and somebody here
+                        // answered the dialog. Only the time tells a restored
+                        // grant from a dialog answered quickly.
+                        let answered_in_ms =
+                            u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
                         if granted.restore_token.as_deref() == Some(token.as_str()) {
-                            tracing::info!("the portal restored the remembered screen grant");
+                            tracing::info!(
+                                answered_in_ms,
+                                "the portal took the remembered screen grant"
+                            );
                         } else {
                             tracing::info!(
+                                answered_in_ms,
                                 "the portal no longer knew the remembered screen grant; this screen answered its dialog"
                             );
                         }
@@ -731,9 +740,9 @@ pub mod portal {
                         );
                         let _ = granted.session.close().await;
                     }
-                    // The portal only shows a dialog to a token it no longer
-                    // knows, so this is a person's answer: asking again would
-                    // put the same question to them twice.
+                    // Only a dialog answers "cancelled", so this is a
+                    // person's answer: asking again would put the same
+                    // question to them twice.
                     Err(MediaError::PermissionDenied) => {
                         grant.forget();
                         return Err(MediaError::PermissionDenied);
@@ -1181,14 +1190,15 @@ mod tests {
         for guest in 1..=3 {
             let offered = std::fs::read_to_string(&path).unwrap_or_default();
             // A person may have to answer the first round's dialog; nobody
-            // answers the later ones, so they must not raise it at all.
+            // answers the later ones, so they must not raise it at all, and a
+            // restored grant answers in well under a second.
             let patience = if offered == unknown {
                 eprintln!(
                     "guest {guest}: click Share on the host's screen, with Remember this selection ticked"
                 );
                 std::time::Duration::from_mins(10)
             } else {
-                std::time::Duration::from_secs(20)
+                std::time::Duration::from_secs(5)
             };
             let (mut capturer, _injector) = WaylandPortalCapturer::paired_with_injector(
                 portal::RememberedGrant::at(path.clone()),
@@ -1218,11 +1228,14 @@ mod tests {
             assert!(frame.width > 0 && frame.height > 0);
             assert_ne!(kept, unknown, "guest {guest}: the unknown token was kept");
             assert!(!kept.is_empty(), "guest {guest}: the portal kept no grant");
-            // xdg-desktop-portal gives a restored grant its own token back,
-            // and only a restored one: the same token is the proof that no
-            // dialog came up.
+            // xdg-desktop-portal gives a token it still knew back unchanged;
+            // that it was restored, not answered, is what the patience above
+            // says.
             if offered != unknown {
-                assert_eq!(kept, offered, "guest {guest}: the grant was not restored");
+                assert_eq!(
+                    kept, offered,
+                    "guest {guest}: the portal no longer knew the grant"
+                );
             }
             capturer.stop();
         }

@@ -101,9 +101,12 @@ tags `debian` runs and checked against its installed binaries:
   Settings. Deleting `portal-grant` makes lumepeer ask again; the grant itself
   stays in the permission store (table `remote-desktop`) until it is deleted
   there.
-- The host's log tells a restored grant (`the portal restored the remembered
-  screen grant`) from a dialog somebody answered: xdg-desktop-portal hands a
-  restored grant its own token back, and a new one otherwise.
+- The host's log says whether the portal still knew the kept token (`the
+  portal took the remembered screen grant`) or not (`… this screen answered
+  its dialog`), with how long `Start` took. The token alone cannot say whether
+  a dialog came up: xdg-desktop-portal gives a token it still knew back
+  unchanged even when the desktop showed its dialog anyway, as KDE does for a
+  grant GNOME made. A restored grant answers in well under a second.
 - Not covered: the sign-in-screen host still asks for every guest.
 
 ## Verified
@@ -122,14 +125,15 @@ screen for the first round only:
   `WaylandPortalCapturer`, one process. Guest 1 offered a token the portal had
   never seen: the dialog came up, the owner clicked *Share* after 35 s, a new
   token was kept. Guests 2 and 3 offered it back and had their first frame
-  (1280×800) after 0.38 s and 0.43 s, the same token returned both times — no
-  dialog.
+  (1280×800) after 0.38 s and 0.43 s, too soon for any dialog, the same token
+  coming back both times.
 - Then the e2e build of the app (`e2e/matrix/deploy.sh linux`), a new process
   reading the token that test left in its grant file: three guests in a row
   from the Windows machine through the matrix harness (invite, grant, view).
-  Picture after 1.5 s, 0.3 s and 0.3 s; the host logged `the portal restored
-  the remembered screen grant` for each, and the permission store's
-  `remote-desktop` table held that one grant and nothing else.
+  Picture after 1.5 s, 0.3 s and 0.3 s; the host logged that the portal knew
+  the kept token for each (that build's wording: `the portal restored the
+  remembered screen grant`), and the permission store's `remote-desktop`
+  table held that one grant and nothing else.
 - Again with nobody at the screen, 09:57–10:01 UTC: five guests in one host
   process (picture 0.3–0.6 s after the grant), then a restarted host with two
   more (1.0 s each), all restored, the token unchanged throughout.
@@ -137,10 +141,29 @@ screen for the first round only:
   parent window` for every dialog it opens for a caller with no parent window,
   as ours; its journal has none in that window.
 
+Live on `debian` switched to Plasma 6.3.5 on Wayland, the same day:
+
+- The kept grant was GNOME's. The portal still knew the token and passed its
+  restore data on, KDE refused data that was not its own and showed its dialog
+  (its journal: `MegaAuth: Failed to lookup permissions`, logged only on the
+  way to the dialog); the owner clicked *Share* with *Allow restoring on
+  future sessions* left ticked, and the portal saved KDE's grant under the
+  same token. So a token coming back unchanged does not mean no dialog came
+  up, which is why the log line now carries how long `Start` took.
+- `a_remembered_grant_brings_the_picture_back_without_a_dialog`, built with
+  `capture-portal` alone: three guests restored, first frame (1920×1080)
+  after 0.30, 0.24 and 0.14 s, and no dialog line in KDE's journal.
+
 ## Not verified
 
 - GNOME restoring a grant whose monitor is gone (devices, no stream): read
   from xdg-desktop-portal-gnome 48.0's `restore_screen_cast_streams` and
   `restore_from_data`, not produced on a machine.
-- KDE: read from xdg-desktop-portal-kde 6.3.5's `remotedesktop.cpp`, not tried
-  live (`debian`'s seat0 was GNOME).
+- A KDE guest's picture end to end. The grant is restored on KDE, but a
+  build with `encode-vaapi-zero-copy` (the release builds) gets no picture
+  there at all, restored or not: the stream offers DMA-BUF whenever the
+  feature is compiled in, KWin takes it with the linear modifier, and the
+  stream renegotiates its buffers some 25 times a second (3,351 times in two
+  minutes) without delivering a frame. The same test built with that feature
+  fails on its first guest. That is ADR 0088's path, untouched here, and its
+  own fix.
