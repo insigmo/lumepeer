@@ -942,10 +942,15 @@ pub type PlatformBackend = (Box<dyn ScreenCapturer>, Option<Box<dyn InputInjecto
 /// with no input adapter still run view-only instead of failing the session
 /// (§18).
 ///
+/// `portal_grant` is the file a Wayland host keeps the portal's grant in, so
+/// that only its first guest needs somebody at its screen (ADR 0160); `None`
+/// raises the portal's dialog for every guest. No other backend has a grant
+/// to keep.
+///
 /// # Errors
 /// [`MediaError::CaptureUnavailable`] when no capture backend is compiled in
 /// for this target.
-pub fn platform_backend() -> Result<PlatformBackend> {
+pub fn platform_backend(portal_grant: Option<std::path::PathBuf>) -> Result<PlatformBackend> {
     // Before any backend is tried: inside ChromeOS's container the X11 path
     // would open and send Xwayland's own empty root window, which is a
     // picture of nothing presented as the screen (gap-tasks/05).
@@ -963,13 +968,22 @@ pub fn platform_backend() -> Result<PlatformBackend> {
             detect_session_type(),
             SessionType::Wayland | SessionType::Unknown
         ) {
-            let (capturer, injector) = linux_wayland::WaylandPortalCapturer::paired_with_injector();
+            let (capturer, injector) = linux_wayland::WaylandPortalCapturer::paired_with_injector(
+                portal_grant
+                    .map_or_else(Default::default, linux_wayland::portal::RememberedGrant::at),
+            );
             return Ok((
                 Box::new(capturer) as Box<dyn ScreenCapturer>,
                 Some(Box::new(injector) as Box<dyn InputInjector>),
             ));
         }
     }
+    #[cfg(not(all(
+        target_os = "linux",
+        not(target_os = "android"),
+        feature = "capture-portal"
+    )))]
+    drop(portal_grant);
     Ok((platform_capturer()?, None))
 }
 

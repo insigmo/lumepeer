@@ -130,7 +130,7 @@ async fn host(stopping: &AtomicBool) {
     // so this resolves to the stub capturer and to `MediaHealth::
     // without_capture` — the honest state for a process with no screen, and
     // what a guest is told until an agent attaches.
-    let mut media = default_capture();
+    let mut media = default_capture(None);
     // The injector is the exception, and the one place this host reaches a
     // desktop at all. It is not an injector: it forwards an event the actor
     // already authorized to the agent, which performs it as the signed-in user

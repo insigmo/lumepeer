@@ -99,6 +99,7 @@ pub async fn spawn_actor(
     let identity = SigningKey::from_bytes(&secret_key.to_bytes());
     let relay = settings.relay_url();
     let relay_cache = relay_cache_path(&app);
+    let portal_grant = portal_grant_path(&app);
     // Relay-only is a WAN test, never the default: with the IP transports
     // cleared every session lives or dies with one relay link, and a client
     // whose relay flaps cannot connect at all (ADR 0026).
@@ -139,7 +140,7 @@ pub async fn spawn_actor(
         endpoint.clone(),
         identity,
         Arc::new(crate::view_windows::TauriViewWindows::new(app)),
-        default_capture(),
+        default_capture(portal_grant),
         lumepeer_runtime::clipboard_os::platform_clipboard(),
         stores,
         policy,
@@ -243,6 +244,23 @@ fn relay_cache_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         Ok(dir) => Some(dir.join("relays.json")),
         Err(error) => {
             tracing::warn!(%error, "cannot resolve the app data directory; the relay measurement will not persist");
+            None
+        }
+    }
+}
+
+/// Where a Wayland host keeps the portal's screen grant between guests
+/// (ADR 0160).
+///
+/// Beside the relay measurement, and for the same reason: nobody edits it, it
+/// is what this desktop's portal said about this app. `None` raises the
+/// portal's dialog for every guest, as every Wayland host did before.
+fn portal_grant_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager as _;
+    match app.path().app_local_data_dir() {
+        Ok(dir) => Some(dir.join("portal-grant")),
+        Err(error) => {
+            tracing::warn!(%error, "cannot resolve the app data directory; every guest of a Wayland host will need somebody at its screen");
             None
         }
     }

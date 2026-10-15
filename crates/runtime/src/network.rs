@@ -19217,8 +19217,12 @@ pub fn invite_path(host: &ed25519_dalek::VerifyingKey) -> Option<std::path::Path
 /// §18 forbids. So the absence is recorded in [`MediaHealth`], where this
 /// host's own status screen and the guest's `MediaUnavailable` both read it
 /// (docs/adr/0024).
+///
+/// `portal_grant` is where a Wayland host keeps the portal's grant between
+/// guests (ADR 0160): the application passes a file, everything that must not
+/// share one with it passes `None`.
 #[must_use]
-pub fn default_capture() -> HostMedia {
+pub fn default_capture(portal_grant: Option<std::path::PathBuf>) -> HostMedia {
     fn controller(capturer: Box<dyn lumepeer_media::capture::ScreenCapturer>) -> SharedCapture {
         Arc::new(std::sync::Mutex::new(CaptureController::new(
             capturer,
@@ -19226,7 +19230,7 @@ pub fn default_capture() -> HostMedia {
         )))
     }
 
-    match platform_backend() {
+    match platform_backend(portal_grant) {
         Ok((capturer, injector)) => HostMedia {
             capture: controller(capturer),
             health: Arc::new(MediaHealth::healthy()),

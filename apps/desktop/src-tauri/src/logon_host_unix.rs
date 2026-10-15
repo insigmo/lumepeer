@@ -148,7 +148,7 @@ async fn serve(keystore: MemoryKeystore) -> u32 {
         endpoint.clone(),
         identity,
         Arc::new(LogonScreen),
-        default_capture(),
+        default_capture(None),
         lumepeer_runtime::clipboard_os::platform_clipboard(),
         stores,
         ActorPolicy::hosting(settings.obfuscated()),

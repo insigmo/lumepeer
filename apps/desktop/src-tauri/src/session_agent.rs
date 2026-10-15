@@ -288,7 +288,7 @@ impl Capture {
             tracing::error!("the host has not published a frame mapping for this agent");
             return Err(CaptureUnavailableReason::Failed);
         };
-        let (mut capturer, _) = platform_backend().map_err(|error| {
+        let (mut capturer, _) = platform_backend(None).map_err(|error| {
             tracing::warn!(%error, "this build has no capture backend");
             CaptureUnavailableReason::NoBackend
         })?;

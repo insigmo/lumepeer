@@ -194,7 +194,7 @@ async fn serve(placement: Placement, releases: Option<&ReleaseRequests>) -> u32 
         endpoint.clone(),
         identity,
         Arc::new(LogonScreen),
-        default_capture(),
+        default_capture(None),
         lumepeer_runtime::clipboard_os::platform_clipboard(),
         stores,
         ActorPolicy::hosting(settings.obfuscated()),

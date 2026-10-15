@@ -18,6 +18,12 @@
 //! [`WaylandPortalInjector`] hold the same `Arc<Mutex<Option<PortalHandle>>>`
 //! rather than negotiating independently. Use
 //! [`WaylandPortalCapturer::paired_with_injector`] to build both at once.
+//!
+//! A host that remembers its grant ([`portal::RememberedGrant`]) asks the
+//! portal to keep it and offers the restore token back on the next handshake,
+//! so only the first guest needs somebody at the host's screen (ADR 0160).
+//! A token the portal no longer honours costs one dialog, never a session that
+//! waits for nothing: the handshake forgets it and asks again.
 
 #[cfg(feature = "capture-portal")]
 use std::sync::{Arc, Mutex};
@@ -59,6 +65,9 @@ pub struct WaylandPortalCapturer {
     /// portal's dialog.
     #[cfg(feature = "capture-portal")]
     negotiating: Option<std::sync::mpsc::Receiver<Result<portal::PortalHandle>>>,
+    /// Where the portal's grant is kept between handshakes (ADR 0160).
+    #[cfg(feature = "capture-portal")]
+    grant: portal::RememberedGrant,
 }
 
 impl WaylandPortalCapturer {
@@ -70,15 +79,18 @@ impl WaylandPortalCapturer {
 
     /// Builds a capturer and injector that share one portal session. Both
     /// negotiate lazily: nothing happens until the capturer's first `start`.
+    /// Every handshake offers `grant`'s token and keeps the one it gets back
+    /// (ADR 0160).
     #[cfg(feature = "capture-portal")]
     #[must_use]
-    pub fn paired_with_injector() -> (Self, WaylandPortalInjector) {
+    pub fn paired_with_injector(grant: portal::RememberedGrant) -> (Self, WaylandPortalInjector) {
         let shared = Arc::new(Mutex::new(None));
         (
             Self {
                 shared: Arc::clone(&shared),
                 stream: None,
                 negotiating: None,
+                grant,
             },
             WaylandPortalInjector::new(shared),
         )
@@ -135,12 +147,13 @@ impl ScreenCapturer for WaylandPortalCapturer {
             // up its answer.
             if self.negotiating.is_none() {
                 let (answer, negotiating) = std::sync::mpsc::channel();
+                let grant = self.grant.clone();
                 std::thread::Builder::new()
                     .name("wayland-portal".to_owned())
                     .spawn(move || {
                         // Nobody is waiting any more if the capturer was
                         // stopped meanwhile; the session is dropped here.
-                        let _ = answer.send(portal::PortalHandle::negotiate());
+                        let _ = answer.send(portal::PortalHandle::negotiate(&grant));
                     })
                     .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
                 self.negotiating = Some(negotiating);
@@ -473,6 +486,107 @@ pub mod portal {
     /// answered (ADR 0028).
     static LAST_STREAM_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Where a host keeps the portal's grant between handshakes (ADR 0160).
+    ///
+    /// A Wayland host shows nothing until somebody at its screen answers the
+    /// portal's dialog, so a host nobody sits at never showed a guest
+    /// anything. Asked to persist, the portal hands a restore token back from
+    /// `Start` once the dialog's "Remember this selection" is left ticked, and a
+    /// later handshake that offers it gets the same screen and devices with no
+    /// dialog at all. The token is single-use: each `Start` returns the one to
+    /// offer next time, which is why every handshake writes it back.
+    ///
+    /// Not a secret: the portal counts every unsandboxed program of this user
+    /// as one and the same app, and any of them can list the portal's stored
+    /// grants itself. So it is a plain file beside the app's other state, not
+    /// a keystore entry — and a locked keyring on a host that started with
+    /// nobody there must not be what stops its picture.
+    ///
+    /// The default keeps nothing: the dialog comes up every time, as before.
+    #[derive(Debug, Clone, Default)]
+    pub struct RememberedGrant {
+        path: Option<std::path::PathBuf>,
+    }
+
+    impl RememberedGrant {
+        /// A grant kept in the file at `path`.
+        #[must_use]
+        pub const fn at(path: std::path::PathBuf) -> Self {
+            Self { path: Some(path) }
+        }
+
+        /// What `SelectDevices` asks the portal to do with the grant.
+        fn persist_mode(&self) -> PersistMode {
+            if self.path.is_some() {
+                PersistMode::ExplicitlyRevoked
+            } else {
+                PersistMode::DoNot
+            }
+        }
+
+        /// The token to offer, if one was kept and still looks like one.
+        ///
+        /// xdg-desktop-portal refuses `SelectDevices` outright for a token
+        /// that is not a UUID, so a damaged file would fail every handshake
+        /// instead of costing one dialog.
+        fn load(&self) -> Option<String> {
+            let text = std::fs::read_to_string(self.path.as_ref()?).ok()?;
+            let token = text.trim();
+            is_uuid(token).then(|| token.to_owned())
+        }
+
+        /// Keeps the token `Start` returned, or forgets the old one when it
+        /// returned none: the person unticked "Remember", or the portal is too
+        /// old to persist a remote-desktop session.
+        fn keep(&self, token: Option<&str>) {
+            let (Some(path), Some(token)) = (self.path.as_ref(), token) else {
+                self.forget();
+                return;
+            };
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(path)?
+                        .write_all(token.as_bytes())
+                });
+            if let Err(error) = written {
+                tracing::warn!(%error, path = %path.display(), "cannot keep the screen grant; the next guest needs somebody at this screen");
+            }
+        }
+
+        /// Drops the kept token.
+        fn forget(&self) {
+            let Some(path) = self.path.as_ref() else {
+                return;
+            };
+            match std::fs::remove_file(path) {
+                Ok(()) => tracing::info!("forgot the remembered screen grant"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "cannot forget the screen grant");
+                }
+            }
+        }
+    }
+
+    /// Whether `text` is a UUID in its usual 8-4-4-4-12 hex form, the only
+    /// shape of restore token xdg-desktop-portal accepts.
+    fn is_uuid(text: &str) -> bool {
+        text.len() == 36
+            && text.char_indices().all(|(at, c)| match at {
+                8 | 13 | 18 | 23 => c == '-',
+                _ => c.is_ascii_hexdigit(),
+            })
+    }
+
     /// The negotiated portal stream's size, or `None` before the first frame
     /// of the first session has fixed a format.
     #[must_use]
@@ -536,6 +650,18 @@ pub mod portal {
         }
     }
 
+    /// What one handshake got from the portal, before [`PortalHandle`] wraps
+    /// it with the runtime the session is driven on.
+    struct Granted {
+        session: Session<RemoteDesktop>,
+        node_id: Option<u32>,
+        input: InputCapability,
+        steps: Vec<PortalStep>,
+        /// The token to offer next time, when the portal agreed to keep the
+        /// grant (ADR 0160).
+        restore_token: Option<String>,
+    }
+
     /// Live portal session: the negotiated grant plus everything needed to
     /// keep injecting input and consuming frames for the session's duration.
     #[derive(Debug)]
@@ -553,39 +679,87 @@ pub mod portal {
         /// Runs the handshake in the order §11 fixes and keeps the session
         /// alive for both capture and input.
         ///
+        /// Offers `grant`'s token first. A token the portal no longer honours
+        /// is forgotten and the handshake runs once more without it, which
+        /// raises the dialog: the host asks again rather than waiting for a
+        /// picture that cannot come (ADR 0160).
+        ///
         /// # Errors
         /// [`MediaError::PermissionDenied`] when the user dismisses the
         /// dialog, [`MediaError::CaptureUnavailable`] when no portal is
         /// reachable.
-        pub fn negotiate() -> Result<Self> {
+        pub fn negotiate(grant: &RememberedGrant) -> Result<Self> {
             let runtime = PortalRuntime::new()?;
-            let (remote, session, node_id, input, steps) =
-                runtime.block_on(Self::negotiate_async())??;
+            let (remote, granted) = runtime.block_on(Self::negotiate_async(grant))??;
             Ok(Self {
                 runtime,
                 remote,
-                session,
-                node_id,
-                input,
-                steps,
+                session: granted.session,
+                node_id: granted.node_id,
+                input: granted.input,
+                steps: granted.steps,
                 stream_size: std::sync::Arc::new(StreamSize::new()),
             })
         }
 
-        #[allow(
-            clippy::type_complexity,
-            reason = "internal handshake result, not a public signature"
-        )]
-        async fn negotiate_async() -> Result<(
-            RemoteDesktop,
-            Session<RemoteDesktop>,
-            Option<u32>,
-            InputCapability,
-            Vec<PortalStep>,
-        )> {
-            let mut steps = Vec::with_capacity(PORTAL_CALL_ORDER.len());
-
+        async fn negotiate_async(grant: &RememberedGrant) -> Result<(RemoteDesktop, Granted)> {
             let (remote, screencast) = connect().await?;
+
+            if let Some(token) = grant.load() {
+                match Self::ask(&remote, &screencast, grant, Some(&token)).await {
+                    Ok(granted) if granted.node_id.is_some() => {
+                        // xdg-desktop-portal hands a restored grant its own
+                        // token back; a new one means it no longer knew the
+                        // token and somebody at this screen answered the
+                        // dialog instead.
+                        if granted.restore_token.as_deref() == Some(token.as_str()) {
+                            tracing::info!("the portal restored the remembered screen grant");
+                        } else {
+                            tracing::info!(
+                                "the portal no longer knew the remembered screen grant; this screen answered its dialog"
+                            );
+                        }
+                        grant.keep(granted.restore_token.as_deref());
+                        return Ok((remote, granted));
+                    }
+                    // GNOME restores the devices alone once the remembered
+                    // monitor is gone, and keeps the grant that way: every
+                    // later guest would get input and no picture.
+                    Ok(granted) => {
+                        tracing::warn!(
+                            "the remembered screen grant restored no screen; asking on this screen again"
+                        );
+                        let _ = granted.session.close().await;
+                    }
+                    // The portal only shows a dialog to a token it no longer
+                    // knows, so this is a person's answer: asking again would
+                    // put the same question to them twice.
+                    Err(MediaError::PermissionDenied) => {
+                        grant.forget();
+                        return Err(MediaError::PermissionDenied);
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "the portal refused the remembered screen grant; asking on this screen again"
+                    ),
+                }
+                grant.forget();
+            }
+
+            let granted = Self::ask(&remote, &screencast, grant, None).await?;
+            grant.keep(granted.restore_token.as_deref());
+            Ok((remote, granted))
+        }
+
+        /// One run of the §11 order on a session of its own, closed again if
+        /// the portal refuses any step.
+        async fn ask(
+            remote: &RemoteDesktop,
+            screencast: &Screencast,
+            grant: &RememberedGrant,
+            token: Option<&str>,
+        ) -> Result<Granted> {
+            let mut steps = Vec::with_capacity(PORTAL_CALL_ORDER.len());
 
             // 1. CreateSession. Its options type is private in ashpd, so the
             // default is the only thing that can be passed here.
@@ -599,40 +773,57 @@ pub mod portal {
                 .map_err(map_portal_error)?;
             steps.push(PortalStep::CreateSession);
 
-            // 2. SelectDevices, strictly before SelectSources (§11).
-            remote
-                .select_devices(
-                    &session,
-                    SelectDevicesOptions::default()
-                        .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .map_err(map_portal_error)?;
-            steps.push(PortalStep::SelectDevices);
+            let answer = async {
+                // 2. SelectDevices, strictly before SelectSources (§11). A
+                // combined session persists here (RemoteDesktop v2) and
+                // nowhere else.
+                remote
+                    .select_devices(
+                        &session,
+                        SelectDevicesOptions::default()
+                            .set_devices(DeviceType::Keyboard | DeviceType::Pointer)
+                            .set_persist_mode(grant.persist_mode())
+                            .set_restore_token(token),
+                    )
+                    .await
+                    .map_err(map_portal_error)?;
+                steps.push(PortalStep::SelectDevices);
 
-            // 3. SelectSources on the same session.
-            screencast
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
-                        .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::DoNot),
-                )
-                .await
-                .map_err(map_portal_error)?;
-            steps.push(PortalStep::SelectSources);
+                // 3. SelectSources on the same session. xdg-desktop-portal
+                // refuses any persist mode but none here on a remote-desktop
+                // session ("Remote desktop sessions cannot persist").
+                screencast
+                    .select_sources(
+                        &session,
+                        SelectSourcesOptions::default()
+                            .set_cursor_mode(CursorMode::Embedded)
+                            .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
+                            .set_multiple(false)
+                            .set_persist_mode(PersistMode::DoNot),
+                    )
+                    .await
+                    .map_err(map_portal_error)?;
+                steps.push(PortalStep::SelectSources);
 
-            // 4. Start raises the dialog and returns what the user allowed.
-            let response = remote
-                .start(&session, None, StartOptions::default())
-                .await
-                .map_err(map_portal_error)?
-                .response()
-                .map_err(map_portal_error)?;
-            steps.push(PortalStep::Start);
+                // 4. Start raises the dialog, unless the token restored an
+                // earlier answer, and returns what the user allowed.
+                let response = remote
+                    .start(&session, None, StartOptions::default())
+                    .await
+                    .map_err(map_portal_error)?
+                    .response()
+                    .map_err(map_portal_error)?;
+                steps.push(PortalStep::Start);
+                Ok(response)
+            }
+            .await;
+            let response = match answer {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = session.close().await;
+                    return Err(error);
+                }
+            };
 
             let devices = response.devices();
             // An empty device mask is a decision, not a failure (§18).
@@ -647,7 +838,13 @@ pub mod portal {
                 .first()
                 .map(ashpd::desktop::screencast::Stream::pipe_wire_node_id);
 
-            Ok((remote, session, node_id, input, steps))
+            Ok(Granted {
+                session,
+                node_id,
+                input,
+                steps,
+                restore_token: response.restore_token().map(ToOwned::to_owned),
+            })
         }
 
         /// The granted PipeWire stream's node id, if any stream was granted.
@@ -747,7 +944,9 @@ pub mod portal {
     mod tests {
         #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
-        use super::{PortalRuntime, connect, map_portal_error};
+        use super::{
+            PersistMode, PortalRuntime, RememberedGrant, connect, is_uuid, map_portal_error,
+        };
         use crate::error::MediaError;
 
         /// Capture starts and input arrives on the network actor, a task on a
@@ -764,6 +963,84 @@ pub mod portal {
                 .unwrap();
             assert_eq!(answer, 42);
             drop(runtime);
+        }
+
+        /// A directory of the calling test's own under the system temp dir.
+        fn scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "lumepeer-portal-grant-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            dir
+        }
+
+        /// xdg-desktop-portal fails `SelectDevices` for a token that is not a
+        /// UUID, so only that shape may ever be offered (ADR 0160).
+        #[test]
+        fn only_a_uuid_counts_as_a_restore_token() {
+            assert!(is_uuid("3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0d"));
+            assert!(is_uuid("3F2C1B9A-7D4E-4C21-9A0B-5E6F7A8B9C0D"));
+            assert!(!is_uuid(""));
+            assert!(!is_uuid("3f2c1b9a7d4e4c219a0b5e6f7a8b9c0d"));
+            assert!(!is_uuid("3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0g"));
+            assert!(!is_uuid(" 3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0"));
+        }
+
+        /// The token `Start` returns is the one offered next time, and a
+        /// handshake that returns none drops the old one: a single-use token
+        /// kept past its use would only ever cost a dialog.
+        #[test]
+        fn a_kept_grant_is_offered_back_until_a_handshake_returns_none() {
+            let dir = scratch("kept");
+            let grant = RememberedGrant::at(dir.join("nested").join("portal-grant"));
+            assert_eq!(grant.persist_mode(), PersistMode::ExplicitlyRevoked);
+            assert_eq!(grant.load(), None);
+
+            grant.keep(Some("3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0d"));
+            assert_eq!(
+                grant.load().as_deref(),
+                Some("3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0d")
+            );
+            grant.keep(Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"));
+            assert_eq!(
+                grant.load().as_deref(),
+                Some("0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
+            );
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(dir.join("nested").join("portal-grant"))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "only this user reads the grant");
+            }
+
+            grant.keep(None);
+            assert_eq!(grant.load(), None);
+            assert!(!dir.join("nested").join("portal-grant").exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A damaged file costs one dialog, not every handshake.
+        #[test]
+        fn a_damaged_grant_file_offers_nothing() {
+            let dir = scratch("damaged");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("portal-grant");
+            std::fs::write(&path, b"not a token").unwrap();
+            assert_eq!(RememberedGrant::at(path).load(), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The default keeps nothing and asks the portal to keep nothing: the
+        /// dialog comes up for every guest, as before ADR 0160.
+        #[test]
+        fn the_default_grant_persists_nothing() {
+            let grant = RememberedGrant::default();
+            assert_eq!(grant.persist_mode(), PersistMode::DoNot);
+            grant.keep(Some("3f2c1b9a-7d4e-4c21-9a0b-5e6f7a8b9c0d"));
+            assert_eq!(grant.load(), None);
         }
 
         /// Each guest's handshake runs on a runtime of its own, shut down when
@@ -878,6 +1155,77 @@ mod tests {
             capturer.input_capability(),
             InputCapability::PortalRemoteDesktop
         );
+    }
+
+    /// The picture of a host nobody sits at (ADR 0160): after one grant, every
+    /// later guest's handshake is restored from the kept token and frames flow
+    /// with no dialog. Opt-in like the test above, and it needs a person once:
+    /// for the first round, unless `LUMEPEER_TEST_PORTAL_GRANT` names a file
+    /// an earlier run already filled. The first round also starts from a token
+    /// the portal has never seen, which must cost exactly that one dialog and
+    /// never a handshake that waits for nothing.
+    #[cfg(feature = "capture-portal")]
+    #[test]
+    fn a_remembered_grant_brings_the_picture_back_without_a_dialog() {
+        if std::env::var("LUMEPEER_TEST_PORTAL_RESTORE").as_deref() != Ok("1") {
+            return;
+        }
+        let path = std::env::var_os("LUMEPEER_TEST_PORTAL_GRANT").map_or_else(
+            || std::env::temp_dir().join(format!("lumepeer-portal-grant-{}", std::process::id())),
+            std::path::PathBuf::from,
+        );
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        if std::fs::read_to_string(&path).is_err() {
+            std::fs::write(&path, unknown).unwrap();
+        }
+        for guest in 1..=3 {
+            let offered = std::fs::read_to_string(&path).unwrap_or_default();
+            // A person may have to answer the first round's dialog; nobody
+            // answers the later ones, so they must not raise it at all.
+            let patience = if offered == unknown {
+                eprintln!(
+                    "guest {guest}: click Share on the host's screen, with Remember this selection ticked"
+                );
+                std::time::Duration::from_mins(10)
+            } else {
+                std::time::Duration::from_secs(20)
+            };
+            let (mut capturer, _injector) = WaylandPortalCapturer::paired_with_injector(
+                portal::RememberedGrant::at(path.clone()),
+            );
+            let began = std::time::Instant::now();
+            capturer.start(CaptureTarget::PrimaryDisplay).unwrap();
+            let frame = loop {
+                match capturer.next_frame() {
+                    Ok(Some(frame)) => break frame,
+                    Ok(None) => {}
+                    Err(error) => panic!("guest {guest}: {error}"),
+                }
+                assert!(
+                    began.elapsed() < patience,
+                    "guest {guest}: no picture after {:?} (offered {offered:?})",
+                    began.elapsed()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let kept = std::fs::read_to_string(&path).unwrap_or_default();
+            eprintln!(
+                "guest {guest}: {}x{} after {:?}, offered {offered:?}, kept {kept:?}",
+                frame.width,
+                frame.height,
+                began.elapsed()
+            );
+            assert!(frame.width > 0 && frame.height > 0);
+            assert_ne!(kept, unknown, "guest {guest}: the unknown token was kept");
+            assert!(!kept.is_empty(), "guest {guest}: the portal kept no grant");
+            // xdg-desktop-portal gives a restored grant its own token back,
+            // and only a restored one: the same token is the proof that no
+            // dialog came up.
+            if offered != unknown {
+                assert_eq!(kept, offered, "guest {guest}: the grant was not restored");
+            }
+            capturer.stop();
+        }
     }
 
     #[cfg(feature = "capture-portal")]
