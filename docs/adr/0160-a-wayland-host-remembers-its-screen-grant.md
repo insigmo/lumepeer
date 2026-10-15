@@ -166,4 +166,6 @@ Live on `debian` switched to Plasma 6.3.5 on Wayland, the same day:
   stream renegotiates its buffers some 25 times a second (3,351 times in two
   minutes) without delivering a frame. The same test built with that feature
   fails on its first guest. That is ADR 0088's path, untouched here, and its
-  own fix.
+  own fix: [ADR 0161](0161-a-portal-stream-offers-dma-buf-only-where-it-is-taken.md)
+  (the cause is KWin fixating a modifier the stream never offered, not the
+  linear one).

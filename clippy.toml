@@ -3,6 +3,7 @@
 doc-valid-idents = [
     "AppContainer",
     "ChromeOS",
+    "KWin",
     "MediaCodec",
     "OpenTelemetry",
     "PipeWire",

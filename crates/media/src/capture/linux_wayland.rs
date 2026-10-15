@@ -1241,6 +1241,67 @@ mod tests {
         }
     }
 
+    /// ADR 0161, against a real compositor: a stream that offers DMA-BUF gets
+    /// a picture however the compositor answers — as a DMA-BUF where it hands
+    /// over a buffer this side takes, in shared memory where it never settles
+    /// on one (KWin on a GPU without explicit modifiers), once the offer is
+    /// withdrawn. The offer is forced, so the withdrawal runs even on a
+    /// machine whose encoder would never have asked for DMA-BUF. Opt-in like
+    /// the restore test above, and it takes that test's grant file
+    /// (`LUMEPEER_TEST_PORTAL_GRANT`); without one, a person answers the
+    /// dialog.
+    #[cfg(feature = "encode-vaapi-zero-copy")]
+    #[test]
+    fn a_stream_offered_dmabuf_gets_a_picture_however_the_compositor_answers() {
+        if std::env::var("LUMEPEER_TEST_PORTAL_DMABUF").as_deref() != Ok("1") {
+            return;
+        }
+        let grant = std::env::var_os("LUMEPEER_TEST_PORTAL_GRANT")
+            .map_or_else(portal::RememberedGrant::default, |path| {
+                portal::RememberedGrant::at(path.into())
+            });
+        let handle = portal::PortalHandle::negotiate(&grant).unwrap();
+        let stream = crate::capture::pipewire_stream::PipeWireFrameThread::spawn_offering(
+            handle.node_id().unwrap(),
+            handle.stream_size_handle(),
+            true,
+        )
+        .unwrap();
+        // Generous: what this tells apart is a picture from none at all —
+        // the loop of ADR 0161 never delivers one — not a fast one from a
+        // slow one on a loaded machine.
+        let began = std::time::Instant::now();
+        let frame = loop {
+            if let Some(frame) = stream.try_recv_frame() {
+                break frame;
+            }
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(30),
+                "offered DMA-BUF, no picture after {:?}",
+                began.elapsed()
+            );
+        };
+        eprintln!(
+            "{}x{} after {:?}, as {}",
+            frame.width,
+            frame.height,
+            began.elapsed(),
+            if frame.dmabuf.is_some() {
+                "a DMA-BUF"
+            } else {
+                "shared memory"
+            }
+        );
+        assert!(frame.width > 0 && frame.height > 0);
+        if frame.dmabuf.is_none() {
+            assert_eq!(
+                frame.data.len(),
+                frame.width as usize * frame.height as usize * 4
+            );
+        }
+        drop((frame, stream, handle));
+    }
+
     #[cfg(feature = "capture-portal")]
     #[test]
     fn normalized_coordinates_map_onto_the_stream() {

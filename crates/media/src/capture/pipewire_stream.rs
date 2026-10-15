@@ -6,14 +6,17 @@
 //! for the life of the capture (`MainLoop::run` does not return until
 //! something calls `quit()`).
 //!
-//! With `encode-vaapi-zero-copy` built in, the stream first offers to take the
+//! With `encode-vaapi-zero-copy` built in, on a machine whose VA-API encoder
+//! imports DMA-BUF (ADR 0161), the stream first offers to take the
 //! compositor's buffers as DMA-BUF (ADR 0088), the way PipeWire's own
 //! DMA-BUF sharing procedure lays out for a consumer: one `EnumFormat` with a
 //! modifier list the producer fixates, one without for shared memory. A
 //! compositor that takes the first hands over its rendered buffer itself, and
 //! the frame carries it to the VA-API encoder without a byte of it passing
-//! through main memory. A compositor that does not — or a build without the
-//! feature — goes exactly the way this module always went.
+//! through main memory. A compositor that does not, one that never settles on
+//! a buffer this side can take (the offer is then withdrawn), a machine with
+//! no such encoder, or a build without the feature, goes exactly the way this
+//! module always went.
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -129,8 +132,21 @@ impl PipeWireFrameThread {
     /// returns — the thread publishes the negotiated width/height into it
     /// from `param_changed` so `WaylandPortalInjector` can scale pointer
     /// coordinates correctly.
+    ///
+    /// DMA-BUF is offered only where an encoder on this machine imports it
+    /// (ADR 0161): a build with `encode-vaapi-zero-copy` running where VA-API
+    /// does not encode takes shared memory, exactly as a build without the
+    /// feature does.
     pub(crate) fn spawn(node_id: u32, stream_size: Arc<StreamSize>) -> Result<Self> {
-        Self::spawn_offering(node_id, stream_size, true)
+        #[cfg(feature = "encode-vaapi-zero-copy")]
+        let offer_dmabuf = crate::encode::linux_vaapi::takes_dmabuf();
+        #[cfg(not(feature = "encode-vaapi-zero-copy"))]
+        let offer_dmabuf = false;
+        tracing::info!(
+            offer_dmabuf,
+            "the portal stream asks for its frames (ADR 0088, ADR 0161)"
+        );
+        Self::spawn_offering(node_id, stream_size, offer_dmabuf)
     }
 
     /// [`Self::spawn`], saying whether to offer DMA-BUF at all.
@@ -138,7 +154,9 @@ impl PipeWireFrameThread {
     /// `false` is the shared-memory stream every build without
     /// `encode-vaapi-zero-copy` negotiates, which is what a test needs in
     /// order to show that path still carries the picture on the same
-    /// compositor (ADR 0088). Inert without the feature.
+    /// compositor (ADR 0088); `true` is what a test needs to drive the offer
+    /// on a machine whose encoder would not take it (ADR 0161). Inert
+    /// without the feature.
     pub(crate) fn spawn_offering(
         node_id: u32,
         stream_size: Arc<StreamSize>,
@@ -177,11 +195,9 @@ impl PipeWireFrameThread {
         stream_size: &Arc<StreamSize>,
         offer_dmabuf: bool,
     ) -> Result<()> {
-        use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
-        use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
-        use pipewire::spa::pod::serialize::PodSerializer;
-        use pipewire::spa::pod::{Pod, Value};
-        use pipewire::spa::utils::{Direction, SpaTypes};
+        use pipewire::spa::param::video::VideoInfoRaw;
+        use pipewire::spa::pod::Pod;
+        use pipewire::spa::utils::Direction;
         use pipewire::stream::StreamFlags;
 
         pipewire::init();
@@ -300,24 +316,7 @@ impl PipeWireFrameThread {
             .register()
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
-        // Request a fixed BGRx format — no negotiation of alternates (§11,
-        // per the design's non-goals). Built via the `object!`/`property!`
-        // macros the same way pipewire-rs's own `examples/streams.rs` builds
-        // an EnumFormat pod: safer than hand-rolling `libspa-sys` constant
-        // names, which this crate cannot verify by compiling on this
-        // (Windows) machine.
-        let format_obj = pipewire::spa::pod::object!(
-            SpaTypes::ObjectParamFormat,
-            pipewire::spa::param::ParamType::EnumFormat,
-            pipewire::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-            pipewire::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-            pipewire::spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRx),
-        );
-        let values: Vec<u8> =
-            PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(format_obj))
-                .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?
-                .0
-                .into_inner();
+        let values = shared_memory_format()?;
         let format_pod = Pod::from_bytes(&values).ok_or_else(|| {
             MediaError::CaptureUnavailable("could not build format pod".to_owned())
         })?;
@@ -366,6 +365,35 @@ impl PipeWireFrameThread {
     pub(crate) fn try_recv_frame(&self) -> Option<Frame> {
         self.frames.take_within(frame_wait())
     }
+}
+
+/// The `EnumFormat` for shared memory: a fixed `BGRx`, no negotiation of
+/// alternates (§11, per the design's non-goals).
+///
+/// Built via the `object!`/`property!` macros the same way pipewire-rs's own
+/// `examples/streams.rs` builds an `EnumFormat` pod: safer than hand-rolling
+/// `libspa-sys` constant names. Also what a stream falls back to when the
+/// compositor never settles on a DMA-BUF it can take (ADR 0161).
+fn shared_memory_format() -> Result<Vec<u8>> {
+    use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+    use pipewire::spa::param::video::VideoFormat;
+    use pipewire::spa::pod::Value;
+    use pipewire::spa::pod::serialize::PodSerializer;
+    use pipewire::spa::utils::SpaTypes;
+
+    let format_obj = pipewire::spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        pipewire::spa::param::ParamType::EnumFormat,
+        pipewire::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pipewire::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        pipewire::spa::pod::property!(FormatProperties::VideoFormat, Id, VideoFormat::BGRx),
+    );
+    Ok(
+        PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(format_obj))
+            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?
+            .0
+            .into_inner(),
+    )
 }
 
 /// Packs a shared-memory buffer into a frame and offers it to the consumer.
@@ -451,6 +479,20 @@ mod dmabuf {
     /// kernel asks callers to retry on `EINTR` and `EAGAIN`; a few times is
     /// that, and a bound is what keeps a wedged exporter from being a loop.
     const SYNC_ATTEMPTS: u32 = 8;
+    /// How many DMA-BUF formats a stream takes with no DMA-BUF buffer
+    /// arriving before it gives the offer up (ADR 0161).
+    ///
+    /// PipeWire's procedure needs two: the format the producer still has to
+    /// fixate, then the fixated one, and buffers follow. KWin on a GPU whose
+    /// buffers carry no explicit modifier fixates one this stream never
+    /// offered, and the two sides then hand the unfixated format back and
+    /// forth some 25 times a second without a buffer. Four leaves room for a
+    /// producer that renegotiates once more on its way.
+    const UNSETTLED_FORMATS: u32 = 4;
+    const _: () = assert!(
+        UNSETTLED_FORMATS >= 2,
+        "PipeWire's own procedure takes two formats before a buffer"
+    );
 
     /// The DRM format of a SPA video format this stream takes as DMA-BUF, or
     /// `None` for one it does not.
@@ -611,12 +653,41 @@ mod dmabuf {
         }
     }
 
+    /// Whether the producer is getting anywhere with the DMA-BUF this stream
+    /// offered (ADR 0161): DMA-BUF formats negotiated since the last DMA-BUF
+    /// buffer arrived.
+    #[derive(Debug, Default)]
+    pub(crate) struct Settling {
+        unsettled: u32,
+    }
+
+    impl Settling {
+        /// A DMA-BUF format was negotiated. `false` once too many came with no
+        /// buffer between them: the offer has to go.
+        pub(crate) fn format(&mut self) -> bool {
+            self.unsettled = self.unsettled.saturating_add(1);
+            self.unsettled <= UNSETTLED_FORMATS
+        }
+
+        /// A DMA-BUF buffer arrived: whatever came before was a negotiation
+        /// that ended.
+        pub(crate) fn buffer(&mut self) {
+            self.unsettled = 0;
+        }
+    }
+
     /// Everything the stream's callbacks need about DMA-BUF.
     pub(crate) struct StreamState {
         offered: bool,
         /// The DRM format and modifier of the negotiated stream, when it is
         /// DMA-BUF.
         negotiated: Option<(u32, u64)>,
+        /// Whether this stream ever asked the producer for DMA-BUF buffers.
+        /// Until it has, the buffers are the producer's call, exactly as in a
+        /// build without the feature (ADR 0161); once it has, shared memory
+        /// has to be asked for by name to replace that request.
+        asked_for_dmabuf: bool,
+        settling: Settling,
         live: Rc<RefCell<LiveBuffers>>,
         requeue: pipewire::channel::Sender<Requeue>,
     }
@@ -628,6 +699,8 @@ mod dmabuf {
                 Self {
                     offered,
                     negotiated: None,
+                    asked_for_dmabuf: false,
+                    settling: Settling::default(),
                     live: Rc::default(),
                     requeue,
                 },
@@ -672,7 +745,12 @@ mod dmabuf {
             self.live.borrow_mut().removed(buffer as usize);
         }
 
-        /// Answers a negotiated format with the buffers it needs.
+        /// Answers a negotiated format with the buffers it needs: DMA-BUF for
+        /// one that carries a modifier this stream offered, shared memory for
+        /// one that does not once DMA-BUF was asked for, and nothing at all
+        /// before that, as a build without the feature answers. A DMA-BUF
+        /// format the producer keeps sending with no buffer ever following
+        /// withdraws the offer instead (ADR 0161).
         pub(crate) fn format_changed(
             &mut self,
             stream: &pipewire::stream::StreamRef,
@@ -681,22 +759,29 @@ mod dmabuf {
             modifier: u64,
         ) {
             let dmabuf = self.offered && has_modifier(format);
+            if dmabuf && !self.settling.format() {
+                self.withdraw(stream);
+                return;
+            }
             self.negotiated = if dmabuf {
                 drm_format(video_format).map(|drm_format| (drm_format, modifier))
             } else {
                 None
-            };
-            let data_types = if self.negotiated.is_some() {
-                1 << pipewire::spa::sys::SPA_DATA_DmaBuf
-            } else {
-                (1 << pipewire::spa::sys::SPA_DATA_MemFd)
-                    | (1 << pipewire::spa::sys::SPA_DATA_MemPtr)
             };
             tracing::info!(
                 dmabuf = self.negotiated.is_some(),
                 modifier,
                 "the portal stream negotiated its buffers (ADR 0088)"
             );
+            let data_types = if self.negotiated.is_some() {
+                self.asked_for_dmabuf = true;
+                1 << pipewire::spa::sys::SPA_DATA_DmaBuf
+            } else if self.asked_for_dmabuf {
+                (1 << pipewire::spa::sys::SPA_DATA_MemFd)
+                    | (1 << pipewire::spa::sys::SPA_DATA_MemPtr)
+            } else {
+                return;
+            };
             let Ok(bytes) = buffers_param(data_types) else {
                 return;
             };
@@ -705,6 +790,28 @@ mod dmabuf {
             };
             if let Err(error) = stream.update_params(&mut [pod]) {
                 tracing::warn!(%error, "the stream refused its buffer parameters");
+            }
+        }
+
+        /// Takes the DMA-BUF offer back (ADR 0161): the stream's formats
+        /// become the shared-memory one alone, which the producer offered all
+        /// along beside its DMA-BUF ones, and the negotiation this starts
+        /// lands there.
+        fn withdraw(&mut self, stream: &pipewire::stream::StreamRef) {
+            self.offered = false;
+            self.negotiated = None;
+            tracing::warn!(
+                formats = UNSETTLED_FORMATS + 1,
+                "the compositor never settled on a DMA-BUF this stream can take; asking for shared memory instead (ADR 0161)"
+            );
+            let Ok(bytes) = super::shared_memory_format() else {
+                return;
+            };
+            let Some(pod) = Pod::from_bytes(&bytes) else {
+                return;
+            };
+            if let Err(error) = stream.update_params(&mut [pod]) {
+                tracing::warn!(%error, "the stream refused to drop its DMA-BUF format");
             }
         }
     }
@@ -746,6 +853,7 @@ mod dmabuf {
         };
 
         if data.type_() == DataType::DmaBuf {
+            user_data.zero_copy.settling.buffer();
             match (
                 user_data.zero_copy.negotiated,
                 dmabuf_frame(user_data, data, raw),
@@ -1113,6 +1221,41 @@ mod dmabuf {
         fn the_offered_formats_serialize() {
             assert!(enum_format().is_ok_and(|bytes| Pod::from_bytes(&bytes).is_some()));
             assert!(buffers_param(1 << 3).is_ok_and(|bytes| Pod::from_bytes(&bytes).is_some()));
+            assert!(
+                super::super::shared_memory_format().is_ok_and(
+                    |bytes| Pod::from_bytes(&bytes).is_some_and(|pod| !has_modifier(pod))
+                )
+            );
+        }
+
+        /// ADR 0161: PipeWire's DMA-BUF procedure — the format the producer
+        /// still fixates, the fixated one, then buffers — keeps the offer,
+        /// however often a stream goes through it.
+        #[test]
+        fn a_producer_that_settles_keeps_the_dmabuf_offer() {
+            let mut settling = Settling::default();
+            for _resize in 0..10 {
+                assert!(settling.format(), "the format to fixate");
+                assert!(settling.format(), "the fixated format");
+                settling.buffer();
+            }
+            // One that renegotiates a couple more times on its way still
+            // gets there.
+            for _ in 0..UNSETTLED_FORMATS {
+                assert!(settling.format());
+            }
+            settling.buffer();
+            assert!(settling.format());
+        }
+
+        /// ADR 0161: KWin on a GPU without explicit modifiers fixates one this
+        /// stream never offered, and the unfixated format comes back again and
+        /// again with no buffer. That gives the offer up, and early.
+        #[test]
+        fn a_producer_that_never_settles_loses_the_dmabuf_offer() {
+            let mut settling = Settling::default();
+            let kept = (0..25).take_while(|_| settling.format()).count();
+            assert_eq!(kept, UNSETTLED_FORMATS as usize);
         }
 
         #[test]
@@ -1193,6 +1336,58 @@ mod dmabuf {
                     "the stream delivered no frame"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        /// ADR 0161, against any compositor's screen cast: the stream the
+        /// product spawns, and one offering DMA-BUF whatever this machine's
+        /// encoder, both deliver a picture. Opt-in through
+        /// `LUMEPEER_TEST_PIPEWIRE_NODE`, the PipeWire node of a cast made
+        /// any way that asks nobody — GNOME's own
+        /// `org.gnome.Mutter.ScreenCast` does, a headless gnome-shell's too.
+        #[test]
+        fn a_screen_cast_node_gives_a_picture_offered_dmabuf_or_not() {
+            let Some(node) = std::env::var("LUMEPEER_TEST_PIPEWIRE_NODE")
+                .ok()
+                .and_then(|node| node.parse().ok())
+            else {
+                eprintln!("skipping: set LUMEPEER_TEST_PIPEWIRE_NODE to a screen cast's node");
+                return;
+            };
+            for offer in [None, Some(true)] {
+                let size = Arc::new(StreamSize::default());
+                let stream = match offer {
+                    None => PipeWireFrameThread::spawn(node, size),
+                    Some(offer) => PipeWireFrameThread::spawn_offering(node, size, offer),
+                }
+                .unwrap();
+                // Generous, as a picture or none is the question (ADR 0161).
+                let began = std::time::Instant::now();
+                let frame = loop {
+                    if let Some(frame) = stream.try_recv_frame() {
+                        break frame;
+                    }
+                    assert!(
+                        began.elapsed() < std::time::Duration::from_secs(30),
+                        "offer {offer:?}: no picture after {:?}",
+                        began.elapsed()
+                    );
+                };
+                eprintln!(
+                    "offer {offer:?}: {}x{} after {:?}, as {}",
+                    frame.width,
+                    frame.height,
+                    began.elapsed(),
+                    if frame.dmabuf.is_some() {
+                        "a DMA-BUF"
+                    } else {
+                        "shared memory"
+                    }
+                );
+                assert!(frame.width > 0 && frame.height > 0);
+                assert!(frame.as_cpu().is_ok_and(
+                    |pixels| pixels.len() == frame.width as usize * frame.height as usize * 4
+                ));
             }
         }
 

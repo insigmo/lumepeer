@@ -166,6 +166,21 @@ pub(super) fn hardware_available(config: EncoderConfig) -> bool {
     }
 }
 
+/// Whether a portal stream on this machine should ask for its frames as
+/// DMA-BUF at all (ADR 0161): only where the encoder [`super::select_encoder`]
+/// builds for an H.264 session is this one, which imports them.
+///
+/// Anywhere else a DMA-BUF frame buys nothing and costs a readback, and on a
+/// compositor that cannot hand over a linear buffer it cost the whole
+/// picture. Asked once per process, at the first stream: the stream starts
+/// before its session's encoder exists, and the answer belongs to the
+/// machine, not to the session.
+#[cfg(feature = "encode-vaapi-zero-copy")]
+pub(crate) fn takes_dmabuf() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| hardware_available(EncoderConfig::default()))
+}
+
 /// Opens an encoder at the probe geometry and pushes one frame through it.
 fn rehearse(config: EncoderConfig) -> Result<()> {
     let mut encoder = VaapiEncoder::open(PROBE_WIDTH, PROBE_HEIGHT, config)?;
