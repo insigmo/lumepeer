@@ -18,9 +18,10 @@ gave its guest no picture. The portal granted the stream, then
 0088) dmabuf=true modifier=0` 3,351 times in two minutes and never delivered
 a frame. A build with `capture-portal` alone got its first frame in
 0.14–0.30 s. The installed v0.0.152 did the same to a trusted device's guest
-admitted at 11:05 UTC. It was still at it half an hour later, with the
-PipeWire daemon at 99% CPU, which slowed every other stream on the machine
-about fivefold.
+admitted at 11:05 UTC. It kept at it through two reconnections until the
+guest left at 18:33 UTC: 25,554 renegotiations and close to four hours of the
+PipeWire daemon's CPU. While it ran, every other stream on the machine was
+slowed about fivefold.
 
 What the two sides said, logged on the stream (every `param_changed`, every
 buffer) and with `pw-mon` on the graph:
@@ -123,13 +124,23 @@ grant ADR 0160 left in the e2e app's `portal-grant`:
   `pw-mon` shows its `EnumFormat` reduced to `BGRx` alone and the node
   running.
 
-All of these ran while the installed v0.0.152 on the same machine was still
-in the loop with its own guest and held the PipeWire daemon at 90–110% CPU.
-Every PipeWire step took about a second instead of milliseconds, so the times
-measured that, not the fix: 8 s to the stream's first format in the e2e
-host, 7.9–15.3 s to the forced test's first frame. For the same reason the
-restore test above, whose 5 s bound tells a restored grant from a dialog,
-still timed out. It is to be run again once that host is stopped.
+Those two ran while the installed v0.0.152 on the same machine was still in
+the loop with its own guest and held the PipeWire daemon at 90–110% CPU.
+Every PipeWire step took about a second instead of milliseconds: 8 s to the
+stream's first format in the e2e host, 7.9–15.3 s to the forced test's first
+frame. The restore test, whose 5 s bound tells a restored grant from a
+dialog, timed out under that load.
+
+Run again on 2026-10-16, once that guest had left and the daemon was idle
+(0% CPU before and after):
+
+- `a_remembered_grant_brings_the_picture_back_without_a_dialog`: **passes**.
+  Three guests got 1920x1080 after 1.25, 0.50 and 0.40 s, the first including
+  the process's one VA-API rehearsal, and the same token was kept throughout.
+- The forced-offer test: a 1920x1080 picture in shared memory after 136 ms.
+  `pw-mon` shows the unfixated DMA-BUF formats, then the `EnumFormat` reduced
+  to `BGRx` alone and the node running. Unloaded, KWin's loop turns fast
+  enough that the five rounds cost well under 100 ms.
 
 GNOME, without the owner at the screen (the VM's seat runs Plasma): a
 headless gnome-shell 48.7 (`--headless --virtual-monitor 1600x900`, private
