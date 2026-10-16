@@ -39,10 +39,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
     KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
-    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME,
-    VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB,
-    VK_UP,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
+    SendInput, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_SHIFT, VK_TAB, VK_UP,
 };
 
 use lumepeer_service::protocol::InjectAction;
@@ -281,9 +281,11 @@ fn press(logical: u32, pressed: bool) -> bool {
     }
 }
 
-/// `x`/`y` are normalized `0..=65535` over the captured surface, which is
-/// `MOUSEEVENTF_ABSOLUTE`'s coordinate space, so no scaling is needed — the
-/// same reasoning `WindowsInjector::move_to` gives.
+/// `x`/`y` are normalized `0..=65535` over the whole virtual desktop, which the
+/// host mapped them onto from the monitor its guest is looking at
+/// (`lumepeer_media::capture::for_injection`, ADR 0162) — exactly what
+/// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` reads, so no scaling is
+/// needed here, as in `WindowsInjector::move_to`.
 fn move_to(x: u16, y: u16) -> bool {
     send(&[INPUT {
         r#type: INPUT_MOUSE,
@@ -292,7 +294,7 @@ fn move_to(x: u16, y: u16) -> bool {
                 dx: i32::from(x),
                 dy: i32::from(y),
                 mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
                 dwExtraInfo: 0,
             },

@@ -36,7 +36,7 @@
 //! under different licence terms, and is deliberately not reached from here:
 //! `nvidia-vaapi-driver` bridges VA-API to NVDEC (decode) and offers no
 //! encode entrypoint, so an NVIDIA host correctly probes `false` here and
-//! falls back to `openh264` rather than half-working.
+//! falls back to libaom rather than half-working (ADR 0162).
 //!
 //! `cros-libva` is a safe wrapper over libva, so this module — unlike the
 //! Media Foundation one — needs no `unsafe` of its own beyond the `Send`
@@ -1808,7 +1808,7 @@ mod tests {
     /// alone would have said yes (ADR 0088). What it may never do is say yes
     /// where construction fails. On CI and on every virtual machine tried so
     /// far both are `false`, which is the case that matters most: a host with
-    /// libva installed and no encode-capable GPU must fall back to `openh264`
+    /// libva installed and no encode-capable GPU must fall back to libaom
     /// rather than fail the session (§18).
     #[test]
     fn probe_hardware_never_claims_more_than_construction_delivers() {
@@ -2071,81 +2071,6 @@ mod tests {
         );
     }
 
-    /// ADR 0088, on the hardware itself: a VA-API encoder that probes
-    /// available produces a stream that an independent decoder turns back into
-    /// the picture that went in — IDR, P-frames and a crop included.
-    ///
-    /// A machine without a VA-API encoder has nothing to say here and passes;
-    /// the probe tests above hold it to not pretending otherwise.
-    #[cfg(feature = "encode-openh264")]
-    #[test]
-    fn a_hardware_stream_decodes_back_to_the_picture_that_went_in() {
-        use openh264::formats::YUVSource as _;
-
-        if !hardware_available(EncoderConfig::default()) {
-            eprintln!("no VA-API H.264 encoder on this machine; nothing to check");
-            return;
-        }
-        // Neither dimension a multiple of 16, so the crop is exercised.
-        let (width, height) = (320u32, 184u32);
-        let mut hardware = VaapiEncoder::new(EncoderConfig::default()).unwrap();
-        let mut software = openh264::decoder::Decoder::new().unwrap();
-
-        for index in 0..30u32 {
-            let mut bgra = vec![0u8; (width * height * 4) as usize];
-            for y in 0..height {
-                for x in 0..width {
-                    let at = ((y * width + x) * 4) as usize;
-                    bgra[at] = u8::try_from((x + index * 3) % 256).unwrap();
-                    bgra[at + 1] = u8::try_from((y * 2) % 256).unwrap();
-                    bgra[at + 2] = u8::try_from((x + y + index) % 256).unwrap();
-                    bgra[at + 3] = 255;
-                }
-            }
-            let frame = Frame::cpu(width, height, PixelFormat::Bgra8, u64::from(index), bgra);
-            let (expected, _, _) = bgra_to_nv12(&frame).unwrap();
-            let bitstream = hardware.encode(&frame).unwrap();
-            assert_eq!(bitstream.keyframe, index == 0);
-
-            let picture = software
-                .decode(&bitstream.data)
-                .unwrap()
-                .unwrap_or_else(|| panic!("frame {index} decoded to nothing"));
-            assert_eq!(
-                picture.dimensions(),
-                (width as usize, height as usize),
-                "the crop did not come back out"
-            );
-            let psnr = luma_psnr(&picture, &expected, width, height);
-            assert!(psnr > 35.0, "frame {index} came back at {psnr:.1} dB");
-        }
-    }
-
-    /// Peak signal-to-noise ratio of a decoded picture's luma against the one
-    /// expected, over the visible `width` x `height`.
-    #[cfg(feature = "encode-openh264")]
-    fn luma_psnr(
-        picture: &openh264::decoder::DecodedYUV<'_>,
-        expected: &[u8],
-        width: u32,
-        height: u32,
-    ) -> f64 {
-        use openh264::formats::YUVSource as _;
-
-        let (stride, _, _) = picture.strides();
-        let luma = picture.y();
-        let mut squared_error = 0f64;
-        for row in 0..height as usize {
-            for column in 0..width as usize {
-                let difference = f64::from(luma[row * stride + column])
-                    - f64::from(expected[row * width as usize + column]);
-                squared_error += difference * difference;
-            }
-        }
-        let mse = squared_error / f64::from(width * height);
-        10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
-    }
-
     /// A `BGRx` picture the GPU itself holds, exported as a DMA-BUF the way a
     /// compositor would hand one over, and the pixels that were written.
     #[cfg(feature = "encode-vaapi-zero-copy")]
@@ -2212,73 +2137,10 @@ mod tests {
         (std::sync::Arc::new(dmabuf), bgra)
     }
 
-    /// BT.709 luma in studio range, which the driver's own conversion of a
-    /// `BGRx` surface is measured to produce (ADR 0088).
-    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
-    fn bt709_luma(bgra: &[u8]) -> Vec<u8> {
-        bgra.chunks_exact(4)
-            .map(|pixel| {
-                let (b, g, r) = (
-                    f64::from(pixel[0]),
-                    f64::from(pixel[1]),
-                    f64::from(pixel[2]),
-                );
-                let y = 16.0 + 219.0 * (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-                // In 16..=235 by construction.
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "in 16..=235"
-                )]
-                let y = y.round() as u8;
-                y
-            })
-            .collect()
-    }
-
-    /// ADR 0088, on the hardware: a frame that exists only as a DMA-BUF is
-    /// encoded without being read back, and decodes to the picture the GPU
-    /// held, converted with the matrix the SPS names.
-    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
-    #[test]
-    fn a_frame_that_never_left_the_gpu_encodes_and_decodes_back() {
-        if !hardware_available(EncoderConfig::default()) {
-            eprintln!("no VA-API H.264 encoder on this machine; nothing to check");
-            return;
-        }
-        let (width, height) = (320u32, 184u32);
-        let mut hardware = VaapiEncoder::new(EncoderConfig::default()).unwrap();
-        let mut software = openh264::decoder::Decoder::new().unwrap();
-
-        for index in 0..10u32 {
-            let (dmabuf, bgra) = exported_picture(width, height, index);
-            let mut frame = Frame::cpu(
-                width,
-                height,
-                PixelFormat::Bgra8,
-                u64::from(index),
-                Vec::new(),
-            );
-            frame.dmabuf = Some(dmabuf);
-            let bitstream = hardware.encode(&frame).unwrap();
-            assert!(!hardware.gpu_refused, "the driver refused its own buffer");
-            assert_eq!(hardware.input, Some(InputKind::DmaBufImport));
-            assert!(frame.data.is_empty(), "the frame was read back");
-            assert_eq!(bitstream.keyframe, index == 0);
-
-            let picture = software
-                .decode(&bitstream.data)
-                .unwrap()
-                .unwrap_or_else(|| panic!("frame {index} decoded to nothing"));
-            let psnr = luma_psnr(&picture, &bt709_luma(&bgra), width, height);
-            assert!(psnr > 35.0, "frame {index} came back at {psnr:.1} dB");
-        }
-    }
-
     /// ADR 0088: switching between a buffer the driver imports and a picture
     /// this side uploads starts a new sequence, because the two are converted
     /// with different matrices and one SPS can name only one.
-    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
+    #[cfg(feature = "encode-vaapi-zero-copy")]
     #[test]
     fn changing_how_pictures_arrive_starts_a_new_sequence() {
         if !hardware_available(EncoderConfig::default()) {
@@ -2323,90 +2185,5 @@ mod tests {
                 .collect()
         };
         assert_eq!(rgb(pixels), rgb(&bgra));
-    }
-
-    /// Processor time this process has used, in milliseconds, from
-    /// `/proc/self/stat`: user and system time, in the kernel's fixed
-    /// `USER_HZ` of 100 ticks a second.
-    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
-    fn process_cpu_ms() -> f64 {
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-        // The command name is parenthesized and may hold spaces; the fields
-        // count from after it, where `utime` and `stime` are the 12th and 13th.
-        let after_name = &stat[stat.rfind(')').unwrap() + 2..];
-        let ticks: u32 = after_name
-            .split(' ')
-            .skip(11)
-            .take(2)
-            .map(|field| field.parse::<u32>().unwrap())
-            .sum();
-        f64::from(ticks) * 10.0
-    }
-
-    /// ADR 0088's numbers: processor time per 1080p frame for each way a
-    /// desktop frame can be encoded on this machine. A measurement, not a
-    /// check, so it runs only when asked for:
-    /// `cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-openh264
-    /// --lib -- --ignored --nocapture cpu_per_frame`.
-    #[cfg(all(feature = "encode-vaapi-zero-copy", feature = "encode-openh264"))]
-    #[test]
-    #[ignore = "a measurement for ADR 0088, not a check"]
-    fn cpu_per_frame_of_each_encode_path() {
-        const FRAMES: u32 = 600;
-        let (width, height) = (1920u32, 1080u32);
-        if !hardware_available(EncoderConfig::default()) {
-            eprintln!("no VA-API H.264 encoder on this machine; nothing to measure");
-            return;
-        }
-        let pictures: Vec<_> = (0..8)
-            .map(|index| exported_picture(width, height, index))
-            .collect();
-
-        let mut zero_copy = VaapiEncoder::new(EncoderConfig::default()).unwrap();
-        let started = process_cpu_ms();
-        for index in 0..FRAMES {
-            let (dmabuf, _) = &pictures[index as usize % pictures.len()];
-            let mut frame = Frame::cpu(
-                width,
-                height,
-                PixelFormat::Bgra8,
-                u64::from(index),
-                Vec::new(),
-            );
-            frame.dmabuf = Some(std::sync::Arc::clone(dmabuf));
-            zero_copy.encode(&frame).unwrap();
-        }
-        assert!(!zero_copy.gpu_refused);
-        let zero_copy_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
-
-        // What the readback path starts from: the pixels already in main
-        // memory, as the compositor's shared-memory buffers deliver them.
-        let frames: Vec<_> = pictures
-            .iter()
-            .map(|(_, bgra)| Frame::cpu(width, height, PixelFormat::Bgra8, 0, bgra.clone()))
-            .collect();
-        let mut upload = VaapiEncoder::new(EncoderConfig::default()).unwrap();
-        let started = process_cpu_ms();
-        for index in 0..FRAMES {
-            upload
-                .encode(&frames[index as usize % frames.len()])
-                .unwrap();
-        }
-        let upload_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
-
-        let mut software =
-            crate::encode::software::OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-        let started = process_cpu_ms();
-        for index in 0..FRAMES {
-            software
-                .encode(&frames[index as usize % frames.len()])
-                .unwrap();
-        }
-        let software_ms = (process_cpu_ms() - started) / f64::from(FRAMES);
-
-        eprintln!(
-            "1080p CPU ms/frame: VA-API from DMA-BUF {zero_copy_ms:.2}, \
-             VA-API from main memory {upload_ms:.2}, openh264 {software_ms:.2}"
-        );
     }
 }

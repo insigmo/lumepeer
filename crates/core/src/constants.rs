@@ -701,38 +701,21 @@ pub const ENCODE_DEFAULT_FPS: u8 = 60;
 /// more than the display presents anyway, so this only binds a panel faster
 /// than 144 Hz.
 pub const ENCODE_MAX_FPS: u8 = 144;
-/// Ceiling on the worker threads the software H.264 encoder may use (§11,
-/// ADR 0027).
-///
-/// Only the fallback encoder needs this: a hardware MFT does its own
-/// scheduling. What it bounds is a host with no hardware encoder, where
-/// `openh264` on one thread produced single-digit frame rates at 1080p while
-/// the rest of the machine sat idle. Capped rather than "all cores" because
-/// the host is someone's working machine, not a transcoding farm, and §15
-/// budgets the session, not the box.
-pub const ENCODE_MAX_SOFTWARE_THREADS: u16 = 4;
-/// Highest frame rate the software AV1 encoder is chosen for, and runs at
-/// (§11; ADR 0141).
+/// Highest frame rate the software AV1 encoder runs at (§11; ADR 0141,
+/// ADR 0162).
 ///
 /// The `quality` preset's rate. Measured on the reference host without a
 /// hardware encoder (Ryzen 7 5700U), libaom's realtime speed 10 keeps a 1080p
 /// desktop at 30 frames a second with room to spare and a 60 fps one with
-/// none: `balance` and `performance` stay on H.264.
+/// none, so `balance` and `performance` run at this on such a host too: with
+/// no software H.264 left, there is nothing faster to give them.
 pub const SOFTWARE_AV1_MAX_FPS: u8 = 30;
-/// Largest captured picture the software AV1 encoder is chosen for, in pixels
-/// (§11; ADR 0141).
-///
-/// 1080p, as in [`MAX_PICTURE_PIXELS`], but its own figure: this one says
-/// what was measured, not what a decode slot holds. At 1440p libaom's
-/// realtime mode stopped spending bits on a scrolling page, and 4K took 39 ms
-/// a frame on the faster of the two machines.
-pub const SOFTWARE_AV1_MAX_PIXELS: usize = 1920 * 1080;
 /// The software AV1 encoder's bitrate target, as a share of the H.264 target
 /// the session asks for, in per cent (§11; ADR 0141).
 ///
 /// From the stage-1 BD-rate (docs/research/software-av1.md): libaom realtime
-/// needs 46% (VMAF) to 61% (PSNR-Y) fewer bits than the `openh264` fallback
-/// for the same desktop picture, and 55% fewer on a game. Half sits inside
+/// needed 46% (VMAF) to 61% (PSNR-Y) fewer bits than the `openh264` fallback
+/// it replaced (ADR 0162) for the same desktop picture, and 55% fewer on a game. Half sits inside
 /// that range on every metric, and a lower target is also a faster encode:
 /// 17.4 ms at p95 instead of 20.0 for the `quality` preset's 8 Mbit/s on the
 /// reference host.
@@ -749,36 +732,6 @@ pub const SOFTWARE_AV1_SPEED: i32 = 10;
 /// What was measured. libaom's row-based threading over four tile columns
 /// kept 1.1–1.2 cores busy on a desktop and 2.3–3.2 on a game at 1080p.
 pub const SOFTWARE_AV1_MAX_THREADS: usize = 8;
-/// Longest p95 frame time — BGRA to I420 conversion plus encode — the
-/// software AV1 encoder may take in its measurement on a host before it is
-/// chosen there (§11; ADR 0141).
-///
-/// The owner's threshold: the whole 30 fps frame interval, the line a live
-/// session is held to as well. The same measurement also has to come in no
-/// slower than the `openh264` fallback on the same machine. It was two thirds
-/// of the interval, 22 ms, until the reference host measured 23–25 ms idle
-/// and 26–27 ms beside a running session — against 27.7 ms for the
-/// `openh264` it was left on (ADR 0142).
-pub const SOFTWARE_AV1_FRAME_BUDGET_MS: u64 = 33;
-/// Seconds after a host starts before it measures software AV1 (ADR 0143).
-///
-/// At the start, so the answer is there before the first session rather than
-/// racing it, and measured on a machine no session is loading yet; not at
-/// the very first second, when the same process is still building its
-/// windows and finding the network.
-pub const SOFTWARE_AV1_MEASURE_DELAY_SECS: u64 = 10;
-/// Encoded frames per window over which a live software AV1 session checks
-/// that it keeps up (§11; ADR 0141): three seconds at
-/// [`SOFTWARE_AV1_MAX_FPS`].
-pub const SOFTWARE_AV1_WATCH_FRAMES: usize = 90;
-/// Windows in a row whose p95 frame time exceeds the frame interval before a
-/// live software AV1 session gives up on this host and falls back to H.264
-/// for the rest of the process (§11; ADR 0141).
-///
-/// Two, so a single burst — a game loading, an antivirus scan — is not
-/// enough, and a machine that genuinely cannot keep 30 frames a second is
-/// found within six seconds.
-pub const SOFTWARE_AV1_SLOW_WINDOWS: u32 = 2;
 /// Lowest quantizer the VA-API encoder's own rate control may choose when the
 /// driver offers only constant-QP encoding (§11; ADR 0088).
 ///

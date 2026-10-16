@@ -21,7 +21,7 @@ use lumepeer_media::capture::{
     platform_capturer,
 };
 use lumepeer_media::decode::DecoderHandle;
-use lumepeer_media::encode::{EncoderConfig, EncoderKind, select_encoder};
+use lumepeer_media::encode::{EncoderConfig, EncoderKind, VideoCodec, select_encoder};
 use lumepeer_media::error::MediaError;
 
 /// Path of the decoder worker built into the same target directory.
@@ -89,8 +89,14 @@ fn a_captured_frame_reaches_the_guest_through_the_sandboxed_decoder() {
         Box::new(MovingCapturer::default()),
         CaptureTarget::PrimaryDisplay,
     );
-    let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
-    assert_eq!(encoder.kind(), EncoderKind::SoftwareOpenH264);
+    // AV1 from libaom, the one software encoder, which the worker decodes
+    // with libaom too (ADR 0162).
+    let mut encoder = select_encoder(EncoderConfig {
+        codec: VideoCodec::Av1,
+        ..EncoderConfig::default()
+    })
+    .unwrap();
+    assert_eq!(encoder.kind(), EncoderKind::SoftwareAv1);
 
     let mut decoder = match DecoderHandle::spawn_with(&worker_binary()) {
         Ok(decoder) => decoder,
@@ -128,7 +134,7 @@ fn a_captured_frame_reaches_the_guest_through_the_sandboxed_decoder() {
     controller.add_viewer(peer(1)).unwrap();
     assert!(controller.is_capturing());
 
-    // openh264 needs a few frames before it hands back a complete picture.
+    // A decoder may need a few frames before it hands back a complete picture.
     let mut received = None;
     for _ in 0..10 {
         let frame = controller.next_frame().unwrap().unwrap();
@@ -257,6 +263,19 @@ fn an_oversized_bitstream_is_refused_by_the_ring() {
     decoder.shutdown();
 }
 
+/// The encoder a session on this machine gets: hardware H.264 where there is
+/// one, libaom's AV1 otherwise — the one software encoder (ADR 0162).
+fn this_machines_encoder() -> Box<dyn lumepeer_media::encode::VideoEncoder> {
+    select_encoder(EncoderConfig::default())
+        .or_else(|_| {
+            select_encoder(EncoderConfig {
+                codec: VideoCodec::Av1,
+                ..EncoderConfig::default()
+            })
+        })
+        .unwrap()
+}
+
 /// §11: receiver feedback drives the encoder's quality target, clamped to the
 /// ABR range of §14 and applied at most once per second.
 #[test]
@@ -267,7 +286,7 @@ fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
     use lumepeer_media::abr::{AbrController, ReceiverFeedback};
 
     let mut controller = AbrController::new();
-    let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
+    let mut encoder = this_machines_encoder();
     let mut capturer = MovingCapturer::default();
     capturer.start(CaptureTarget::PrimaryDisplay).unwrap();
 
@@ -301,7 +320,7 @@ fn receiver_feedback_moves_the_encoder_bitrate_inside_the_abr_range() {
 /// side effect of some other setting (ADR 0037).
 #[test]
 fn a_keyframe_request_reaches_whichever_encoder_this_machine_has() {
-    let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
+    let mut encoder = this_machines_encoder();
     let mut capturer = MovingCapturer::default();
     capturer.start(CaptureTarget::PrimaryDisplay).unwrap();
 

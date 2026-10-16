@@ -261,12 +261,15 @@ fn inject(command: AgentCommand) {
             return;
         }
     };
-    if let Err(error) = injector.inject(&InputEventPayload {
+    // Onto the monitor this agent captures, as the host does in its own
+    // process (ADR 0162).
+    let event = lumepeer_media::capture::for_injection(&InputEventPayload {
         logical,
         scancode: 0,
         modifiers: 0,
         detail,
-    }) {
+    });
+    if let Err(error) = injector.inject(&event) {
         tracing::warn!(%error, "an authorized input event was refused by this desktop");
     }
 }

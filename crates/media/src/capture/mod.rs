@@ -800,6 +800,27 @@ pub fn platform_injector() -> Result<Box<dyn InputInjector>> {
     }
 }
 
+/// `event` in the coordinates this platform's injectors take (ADR 0162).
+///
+/// A guest normalizes its pointer over the picture (§9.1), and the picture is
+/// whichever monitor it picked. On Windows the injector that performs the move
+/// may be another process (ADR 0114), with no capture of its own to say which
+/// monitor that is, so the position is mapped here, in the process that
+/// captures, onto the whole virtual desktop. Everywhere else the injector maps
+/// onto the captured monitor itself, and the event passes through as it is.
+#[must_use]
+pub fn for_injection(event: &InputEventPayload) -> InputEventPayload {
+    #[cfg(all(target_os = "windows", feature = "capture-windows"))]
+    if let lumepeer_core::protocol::InputDetail::PointerMove { x, y } = event.detail {
+        let (x, y) = windows::onto_virtual_desktop(x, y);
+        return InputEventPayload {
+            detail: lumepeer_core::protocol::InputDetail::PointerMove { x, y },
+            ..event.clone()
+        };
+    }
+    event.clone()
+}
+
 /// Capturer that produces nothing. Used in phase 0/1, where the consent and
 /// transport paths are exercised without any platform SDK.
 #[derive(Debug, Default)]

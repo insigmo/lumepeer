@@ -387,6 +387,19 @@ export async function supportedOptionalCodecs(): Promise<WireCodec[]> {
 }
 
 /**
+ * Whether a picture in `codec` has to go to the sandboxed decoder worker of
+ * §11.3 rather than to this `WebView`'s own decoder (ADR 0162): an optional
+ * codec the `WebView` did not say it decodes, which `native` lists. A host
+ * with no hardware encoder sends AV1 from libaom to every guest, its one
+ * software encoder since `openh264` went. H.264 never does: only a hardware
+ * encoder makes it, every `WebView` on the native path decodes it, and the
+ * worker no longer can.
+ */
+export function needsWorker(codec: WireCodec, native: readonly WireCodec[]): boolean {
+  return codec !== WireCodec.H264 && !native.includes(codec);
+}
+
+/**
  * The `VideoDecoder` config string for `codec`, given the keyframe that is
  * about to configure a decoder for it (ADR 0067).
  *

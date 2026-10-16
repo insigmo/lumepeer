@@ -1,13 +1,19 @@
 //! Builds the vendored libaom (`libaom/`, release 3.15.1) as a static library
-//! with its x86 assembly, and the C shim over it (ADR 0141).
+//! with its SIMD, encoder and decoder both, and the C shim over it (ADR 0141,
+//! ADR 0162).
 //!
-//! The assembly is not optional. `openh264-sys2` silently builds without its
-//! SIMD when it cannot find `nasm`, and the measurement that found it timed
-//! that build at four to eight times slower than the real one
-//! (docs/research/software-av1.md). A software encoder that is only fit to
-//! ship because it is fast must not be able to come out slow without anyone
-//! noticing, so a build with no usable `nasm` stops here with the reason,
-//! and a build whose configuration did not come out with AVX2 and runtime CPU
+//! For x86-64 and 64-bit Arm, on Windows, Linux and macOS: since ADR 0162
+//! libaom is the one software video codec every build carries, the host's
+//! encoder where it has no hardware one and the decoder worker's where a
+//! guest's webview cannot decode AV1.
+//!
+//! The SIMD is not optional. A C-only build was timed at four to eight times
+//! slower than the real one (docs/research/software-av1.md), and a software
+//! encoder that is only fit to ship because it is fast must not be able to
+//! come out slow without anyone noticing. On x86-64 that SIMD is nasm's, so a
+//! build with no usable `nasm` stops here with the reason; on Arm it is NEON
+//! intrinsics, which the compiler builds. Either way a build whose
+//! configuration did not come out with those kernels and runtime CPU
 //! detection stops right after libaom's own configure step.
 //!
 //! `NASM` may name the assembler to use; otherwise `nasm` is looked up on
@@ -25,6 +31,46 @@ use std::process::Command;
 /// The oldest nasm libaom's configure step accepts (`cmake/aom_optimization.cmake`).
 const NASM_MIN: (u32, u32) = (2, 14);
 
+/// The processors libaom is built for here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cpu {
+    X86_64,
+    Arm64,
+}
+
+impl Cpu {
+    /// `AOM_TARGET_CPU`'s name for it.
+    const fn libaom_name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Arm64 => "arm64",
+        }
+    }
+
+    /// `CMAKE_OSX_ARCHITECTURES`' name for it.
+    const fn apple_name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Arm64 => "arm64",
+        }
+    }
+
+    /// What libaom's `aom_config.h` has to say for this processor's kernels
+    /// to be in the build.
+    const fn wanted(self) -> &'static [&'static str] {
+        match self {
+            Self::X86_64 => &[
+                "AOM_ARCH_X86_64 1",
+                "HAVE_SSE2 1",
+                "HAVE_SSSE3 1",
+                "HAVE_SSE4_1 1",
+                "HAVE_AVX2 1",
+            ],
+            Self::Arm64 => &["AOM_ARCH_AARCH64 1", "HAVE_NEON 1"],
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shim/aom_shim.c");
@@ -38,25 +84,28 @@ fn main() {
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let cpu = match arch.as_str() {
+        "x86_64" => Cpu::X86_64,
+        "aarch64" => Cpu::Arm64,
+        _ => panic!(
+            "lumepeer-aom-sys is built for x86-64 and 64-bit Arm (ADR 0162); this target is \
+             {arch}-{os}"
+        ),
+    };
     assert!(
-        arch == "x86_64" && (os == "windows" || os == "linux"),
-        "lumepeer-aom-sys is built for x86-64 Windows and Linux only (ADR 0141): \
-         software AV1 was measured nowhere else. This target is {arch}-{os}; \
-         `encode-aom` should not have pulled this crate in."
+        matches!(os.as_str(), "windows" | "linux" | "macos"),
+        "lumepeer-aom-sys is built for Windows, Linux and macOS (ADR 0162); this target is \
+         {arch}-{os}"
     );
-
-    let nasm = find_nasm();
-    let nasm_dir = nasm.parent().map_or_else(PathBuf::new, Path::to_path_buf);
 
     let mut aom = cmake::Config::new("libaom");
     // Always optimised, whatever the cargo profile: a debug libaom is far
     // too slow to test a realtime encoder against.
     aom.profile("Release")
-        .define("AOM_TARGET_CPU", "x86_64")
-        .define("ENABLE_NASM", "1")
+        .define("AOM_TARGET_CPU", cpu.libaom_name())
         .define("CONFIG_RUNTIME_CPU_DETECT", "1")
         .define("CONFIG_REALTIME_ONLY", "1")
-        .define("CONFIG_AV1_DECODER", "0")
+        .define("CONFIG_AV1_DECODER", "1")
         .define("CONFIG_LIBYUV", "0")
         .define("CONFIG_WEBM_IO", "0")
         .define("ENABLE_APPS", "0")
@@ -65,15 +114,28 @@ fn main() {
         .define("ENABLE_TESTDATA", "0")
         .define("ENABLE_TESTS", "0")
         .define("ENABLE_TOOLS", "0")
-        .define("CMAKE_INSTALL_LIBDIR", "lib")
+        .define("CMAKE_INSTALL_LIBDIR", "lib");
+    if cpu == Cpu::X86_64 {
+        let nasm = find_nasm();
+        let nasm_dir = nasm.parent().map_or_else(PathBuf::new, Path::to_path_buf);
         // libaom's configure step drops any assembler it was handed when
         // ENABLE_NASM is on and runs its own `find_program(nasm $ENV{NASM_PATH})`,
         // so the one found above is passed the way it reads it.
-        .env("NASM_PATH", &nasm_dir);
-    if os == "linux" {
+        aom.define("ENABLE_NASM", "1").env("NASM_PATH", &nasm_dir);
+    }
+    if os == "linux" || os == "macos" {
         // Rust links position-independent executables; the assembly has to
         // be assembled for that too (`-DPIC`), not only the C.
         aom.define("CONFIG_PIC", "1");
+    }
+    if os == "macos" {
+        // Both Mac rows build on Apple silicon, the x86-64 one for the other
+        // processor: libaom picks its kernels from the processor CMake says
+        // it targets, so that is named rather than left to the build
+        // machine's own.
+        aom.define("CMAKE_SYSTEM_NAME", "Darwin")
+            .define("CMAKE_SYSTEM_PROCESSOR", cpu.libaom_name())
+            .define("CMAKE_OSX_ARCHITECTURES", cpu.apple_name());
     }
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // With Visual Studio's generator the `cmake` crate sets
@@ -85,7 +147,7 @@ fn main() {
     }
     let dst = aom.build();
 
-    check_configuration(&dst.join("build").join("config").join("aom_config.h"));
+    check_configuration(&dst.join("build").join("config").join("aom_config.h"), cpu);
     check_optimised(&dst.join("build").join("CMakeCache.txt"));
 
     let include = dst.join("include");
@@ -168,23 +230,21 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 /// Stops the build unless libaom configured itself for what was measured:
-/// x86-64, AVX2 kernels compiled in and chosen at run time.
-fn check_configuration(header: &Path) {
+/// this processor's SIMD kernels compiled in and chosen at run time, the
+/// realtime encoder and the decoder.
+fn check_configuration(header: &Path, cpu: Cpu) {
     let config = std::fs::read_to_string(header)
         .unwrap_or_else(|error| panic!("cannot read libaom's {}: {error}", header.display()));
-    for wanted in [
-        "AOM_ARCH_X86_64 1",
-        "HAVE_SSE2 1",
-        "HAVE_SSSE3 1",
-        "HAVE_SSE4_1 1",
-        "HAVE_AVX2 1",
+    let always = [
         "CONFIG_RUNTIME_CPU_DETECT 1",
         "CONFIG_REALTIME_ONLY 1",
-    ] {
+        "CONFIG_AV1_DECODER 1",
+    ];
+    for wanted in cpu.wanted().iter().chain(&always) {
         assert!(
             config.contains(&format!("#define {wanted}")),
             "libaom configured without `{wanted}` ({}); the build would not be the one \
-             ADR 0141 measured",
+             ADR 0141 and ADR 0162 describe",
             header.display()
         );
     }

@@ -24,8 +24,8 @@ echo "== building frontend =="
 
 echo "== building debug app with pilot =="
 case "$SESSION_TYPE" in
-  x11|stand) MEDIA_FEATURES="capture-x11,encode-openh264,decode-openh264" ;;
-  wayland)   MEDIA_FEATURES="encode-openh264,decode-openh264" ;; # portal capture is opt-in at runtime
+  x11|stand) MEDIA_FEATURES="capture-x11,encode-aom" ;;
+  wayland)   MEDIA_FEATURES="encode-aom" ;; # portal capture is opt-in at runtime
   *) echo "unknown session type: $SESSION_TYPE" >&2; exit 2 ;;
 esac
 cargo build -p lumepeer-desktop --features pilot,"$MEDIA_FEATURES"

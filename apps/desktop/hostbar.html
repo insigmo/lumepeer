@@ -29,7 +29,8 @@
         box-sizing: border-box;
         padding: 6px 8px 8px;
         background: #23303a;
-        border: 1px solid rgb(255 255 255 / 14%);
+        /* No border of its own: on the transparent window macOS and Linux
+           give the bar, a light one read as a white outline round the card. */
         border-radius: 8px;
       }
       /* Collapsed: the tab is the whole window, so the padding and the

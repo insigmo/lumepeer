@@ -1,10 +1,11 @@
-//! Raw bindings to the libaom shim (`shim/aom_shim.c`; ADR 0141).
+//! Raw bindings to the libaom shim (`shim/aom_shim.c`; ADR 0141, ADR 0162).
 //!
-//! Declarations only. Every call is `unsafe`, and the one caller,
-//! `lumepeer_media::encode::aom`, carries the `SAFETY:` reasoning for each of
-//! them. The shim, not libaom itself, is what is bound: it owns the
-//! `aom_codec_enc_cfg_t` and `aom_image_t` layouts, so no libaom struct has to
-//! be mirrored here and kept in step with the vendored release by hand.
+//! Declarations only. Every call is `unsafe`, and the two callers,
+//! `lumepeer_media::encode::aom` and `lumepeer_media::decode::aom`, carry the
+//! `SAFETY:` reasoning for each of them. The shim, not libaom itself, is what
+//! is bound: it owns the `aom_codec_enc_cfg_t`, `aom_codec_dec_cfg_t` and
+//! `aom_image_t` layouts, so no libaom struct has to be mirrored here and kept
+//! in step with the vendored release by hand.
 //!
 //! The declarations resolve only with the `vendored` feature, which builds and
 //! links libaom; without it nothing may call them.
@@ -16,6 +17,14 @@ use std::ffi::{c_char, c_int};
 #[repr(C)]
 #[derive(Debug)]
 pub struct AomShim {
+    _private: [u8; 0],
+}
+
+/// One decoder: libaom's context and its last error (ADR 0162). Opaque; only
+/// ever handled by pointer.
+#[repr(C)]
+#[derive(Debug)]
+pub struct AomShimDec {
     _private: [u8; 0],
 }
 
@@ -81,4 +90,36 @@ unsafe extern "C" {
 
     /// libaom's version string. Static.
     pub fn aom_shim_version() -> *const c_char;
+
+    /// Opens an AV1 decoder on `threads` threads (ADR 0162).
+    ///
+    /// Returns null on failure, with a NUL-terminated reason in `err`
+    /// (`errlen` bytes long).
+    pub fn aom_shim_dec_open(threads: c_int, err: *mut c_char, errlen: c_int) -> *mut AomShimDec;
+
+    /// Decodes one temporal unit of `len` bytes at `data`.
+    ///
+    /// On success (0) `*got` says whether a picture came out; if one did, the
+    /// planes of that 8-bit 4:2:0 picture are owned by the decoder and valid
+    /// until the next call on it. On failure (-1) the reason is in
+    /// [`aom_shim_dec_error`].
+    pub fn aom_shim_dec_decode(
+        dec: *mut AomShimDec,
+        data: *const u8,
+        len: usize,
+        got: *mut c_int,
+        y: *mut *const u8,
+        u: *mut *const u8,
+        v: *mut *const u8,
+        y_stride: *mut c_int,
+        uv_stride: *mut c_int,
+        width: *mut c_int,
+        height: *mut c_int,
+    ) -> c_int;
+
+    /// The decoder's last error. Owned by the decoder.
+    pub fn aom_shim_dec_error(dec: *const AomShimDec) -> *const c_char;
+
+    /// Destroys a decoder opened by [`aom_shim_dec_open`].
+    pub fn aom_shim_dec_close(dec: *mut AomShimDec);
 }

@@ -30,6 +30,8 @@ import {
   decodeViewChunk,
   NativeDecoder,
   nativeDecodingAvailable,
+  needsWorker,
+  supportedOptionalCodecs,
   type ViewChunk,
   type WireCodec,
 } from './view-decoder';
@@ -607,6 +609,11 @@ let lastPaintedUs = 0;
 // fallback: the Rust side decodes into RGBA in the sandboxed worker of §11.3
 // and this window polls for pixels, which is what it always did.
 let nativeDecoder: NativeDecoder | null = null;
+// The codecs beyond H.264 that decoder decodes, asked once when it is made —
+// beside the first frames rather than ahead of them, since the answer can take
+// a probe decode. A host's picture in any other goes to the worker instead
+// (ADR 0162).
+let nativeCodecs: Promise<WireCodec[]> = Promise.resolve([]);
 // Whether the next chunk request also asks the host for an intra frame. Set
 // on the very first request — nothing can be decoded before one — and again
 // whenever the decoder loses its footing.
@@ -813,6 +820,14 @@ async function nativeTick(): Promise<void> {
     });
     needKeyframe = false;
     const chunk: ViewChunk = decodeViewChunk(response as ArrayBuffer);
+    if (needsWorker(chunk.codec, await nativeCodecs)) {
+      // The host sends a codec this `WebView` cannot decode — AV1 from a host
+      // with nothing but libaom (ADR 0162) — so the sandboxed worker of §11.3
+      // decodes this window's picture from here on. These frames are dropped:
+      // the worker starts on a keyframe it asks for itself.
+      toWorkerPath();
+      return;
+    }
     if (chunk.codec !== lastCodec) {
       lastCodec = chunk.codec;
       // The encoder row's "Automatic" names the codec it is on.
@@ -836,9 +851,22 @@ async function nativeTick(): Promise<void> {
   }
 }
 
+/**
+ * Moves this window's picture from its own decoder to the worker's RGBA, for
+ * good (ADR 0162). The worker's slot is the smaller ceiling again (ADR 0060).
+ */
+function toWorkerPath(): void {
+  nativeDecoder?.close();
+  nativeDecoder = null;
+  pictureCeiling = FALLBACK_PICTURE_CEILING;
+  syncStreamSize();
+  loop();
+}
+
 function nativeLoop(): void {
   void nativeTick().finally(() => {
-    if (!stopped) {
+    // Not once the picture moved to the worker: its own loop runs then.
+    if (!stopped && nativeDecoder) {
       // Straight back in, not through `requestAnimationFrame`: the wait is
       // already inside the call, and an animation frame would add a tick of
       // its own and stop the stream entirely whenever the window is hidden.
@@ -1143,6 +1171,7 @@ async function main(): Promise<void> {
     // at its own size (ADR 0058, ADR 0060).
     pictureCeiling = NATIVE_PICTURE_CEILING;
     syncStreamSize();
+    nativeCodecs = supportedOptionalCodecs();
     nativeDecoder = new NativeDecoder(
       canvas,
       (width, height) => {

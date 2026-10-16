@@ -113,7 +113,9 @@ pub const DESKTOP_INJECT_PAYLOAD_LEN: usize = 17;
 /// `lumepeer_core::protocol::InputEventPayload::logical` carries, so the
 /// worker's `SendInput` reproduces what the ordinary in-session injector would
 /// have done, only on `Winlogon`. `x`/`y` are normalized `0..=65535` over the
-/// captured surface, which is `MOUSEEVENTF_ABSOLUTE`'s own coordinate space.
+/// whole virtual desktop, `MOUSEEVENTF_VIRTUALDESK`'s coordinate space, which
+/// the host mapped them onto from the monitor its guest is looking at (ADR
+/// 0162). [`DesktopInjectDetail::Move`] carries the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectAction {
     /// Move the pointer to an absolute, normalized point.

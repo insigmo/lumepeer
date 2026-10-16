@@ -20,7 +20,7 @@ lumepeer-net.workspace = true
 lumepeer-media = { workspace = true, features = [
     "capture-x11",
     "capture-portal",
-    "encode-openh264",
+    "encode-aom",
 ] }
 iroh-base.workspace = true
 ed25519-dalek.workspace = true

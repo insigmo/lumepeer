@@ -474,8 +474,8 @@ fn give_the_chords_to_the_remote_machine(window: &tauri::WebviewWindow) {
 fn open_host_bar(app: &tauri::AppHandle) {
     // Docked to the right edge of the primary screen, halfway down, which is
     // where its collapsed tab lives. A monitor that cannot be read is not a
-    // reason to skip the bar: Tauri centres what it cannot place, and a bar
-    // in the middle of the screen is still a bar the host can drag.
+    // reason to skip the bar: Tauri centres what it cannot place, and
+    // `keep_host_bar_docked` moves it to the edge once it can read one.
     let placement = app.primary_monitor().ok().flatten().map(|monitor| {
         let scale = monitor.scale_factor();
         let size = monitor.size().to_logical::<f64>(scale);
@@ -512,8 +512,79 @@ fn open_host_bar(app: &tauri::AppHandle) {
             .min_inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT)
             .max_inner_size(HOST_BAR_WIDTH, HOST_BAR_HEIGHT);
     }
+    // The card is rounded, and an opaque window round it showed its white
+    // corners as an outline on macOS and Linux. Windows 11 rounds an
+    // undecorated window itself, so it keeps the window it had.
+    #[cfg(not(target_os = "windows"))]
+    {
+        builder = builder.transparent(true);
+    }
     match builder.build() {
-        Ok(_) => tracing::info!("host session bar opened"),
+        Ok(_) => {
+            tracing::info!("host session bar opened");
+            keep_host_bar_docked(app);
+        }
         Err(error) => tracing::warn!(%error, "cannot open the host session bar"),
     }
+}
+
+/// How often the session bar checks that it is still flush with the right
+/// edge of its screen.
+const HOST_BAR_DOCK_CHECK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Keeps the session bar against the right edge of the screen it is on, for
+/// as long as it is up.
+///
+/// The host may still slide it up and down that edge, but not away from it: a
+/// bar dragged into the middle of the screen goes back to the edge once it is
+/// let go, and one left behind when the screen changed size — a virtual
+/// machine's display going full screen, a resolution switched — follows the
+/// new edge. "Let go" is a position that held still for one check, so a drag
+/// in progress is never fought over.
+fn keep_host_bar_docked(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let app = app.clone();
+    // Called from the main thread, outside any runtime, where a bare
+    // `tokio::spawn` would panic.
+    let runtime = app.state::<tokio::runtime::Runtime>().handle().clone();
+    runtime.spawn(async move {
+        let mut seen = None;
+        loop {
+            tokio::time::sleep(HOST_BAR_DOCK_CHECK).await;
+            let Some(bar) = app.get_webview_window(HOST_BAR_LABEL) else {
+                return;
+            };
+            let Some((now, docked)) = docked_position(&bar) else {
+                continue;
+            };
+            if now != docked && seen == Some(now) {
+                let _ = bar.set_position(tauri::PhysicalPosition::new(docked.0, docked.1));
+            }
+            seen = Some(now);
+        }
+    });
+}
+
+/// Where the bar is now, and where it would be flush with the right edge of
+/// its screen at the same height, both in physical pixels.
+///
+/// Read in the frame `set_position` writes: the window itself on Linux, the
+/// outer frame elsewhere (ADR 0118).
+fn docked_position(bar: &tauri::WebviewWindow) -> Option<((i32, i32), (i32, i32))> {
+    #[cfg(target_os = "linux")]
+    let (position, size) = (bar.inner_position().ok()?, bar.inner_size().ok()?);
+    #[cfg(not(target_os = "linux"))]
+    let (position, size) = (bar.outer_position().ok()?, bar.outer_size().ok()?);
+    let monitor = bar.current_monitor().ok().flatten()?;
+    let (left, top) = (monitor.position().x, monitor.position().y);
+    let right = left.checked_add(i32::try_from(monitor.size().width).ok()?)?;
+    let bottom = top.checked_add(i32::try_from(monitor.size().height).ok()?)?;
+    let width = i32::try_from(size.width).ok()?;
+    let height = i32::try_from(size.height).ok()?;
+    let docked = (
+        (right - width).max(left),
+        position.y.clamp(top, (bottom - height).max(top)),
+    );
+    Some(((position.x, position.y), docked))
 }

@@ -7,30 +7,29 @@ vars:
   INSTALLERS_DIR: installers
   # Media backends each client links in. Kept here rather than as defaults in
   # apps/desktop/src-tauri/Cargo.toml so `cargo build --workspace` still
-  # needs no platform SDK (X11 headers, DXGI/D3D11 bindings, openh264); a
+  # needs no platform SDK (X11 headers, DXGI/D3D11 bindings, libaom); a
   # client built without them starts, pairs and consents normally and
   # reports "no capture backend" instead of showing a picture (§18).
   # Both capture paths in one binary: `capture::detect_session_type` picks at
   # runtime, so a single .deb has to carry X11 and the Wayland portal (ADR
   # 0010, ADR 0039). Dropping either one leaves half the Linux desktops with
   # no picture.
-  LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
-  # x86-64 adds libaom's software AV1 for a host with no hardware encoder
-  # (ADR 0141), exactly as release.yml's amd64 rows do. Building it needs nasm
-  # on PATH (or NASM pointing at it); without one the build stops and says so.
-  LINUX_AMD64_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom
-  # Both encoders: Media Foundation needs hardware support the host may not
-  # have, and without the openh264 software fallback such a host reports
-  # "no usable encoder" and the guest never gets a picture.
-  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
-  # See LINUX_AMD64_MEDIA_FEATURES.
-  WINDOWS_AMD64_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264,encode-aom
-  # Both encoders, for the same reason Windows carries both: VideoToolbox
-  # (ADR 0066) is what an Apple host should encode with, but its probe opens
-  # a real session and pushes a frame through it before it says so, and a Mac
-  # where that fails has to keep running on the openh264 software fallback —
-  # without it select_encoder errors and the guest sits on "waiting for the
-  # remote screen" until it gives up.
+  #
+  # Every platform carries libaom's software AV1 (encode-aom; ADR 0141, ADR
+  # 0162) next to its hardware encoder: the one software encoder since
+  # openh264 was removed, and without it a host with no hardware encoder
+  # reports "no usable encoder" and the guest never gets a picture. Building
+  # it for x86-64 needs nasm on PATH (or NASM pointing at it); without one the
+  # build stops and says so.
+  LINUX_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
+  LINUX_AMD64_MEDIA_FEATURES: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
+  WINDOWS_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-aom
+  WINDOWS_AMD64_MEDIA_FEATURES: capture-windows,encode-mf,encode-mf-zero-copy,encode-aom
+  # VideoToolbox (ADR 0066) is what an Apple host should encode with, but its
+  # probe opens a real session and pushes a frame through it before it says
+  # so, and a Mac where that fails has to keep running on libaom — without it
+  # select_encoder errors and the guest sits on "waiting for the remote
+  # screen" until it gives up.
   # audio-capture-screencapturekit is what makes a macOS host capture its
   # desktop audio at all (docs/gap-tasks/01-macos-monitors-and-audio-capture.md);
   # without it a macOS host streams no sound (matches .github/workflows/
@@ -38,7 +37,7 @@ vars:
   # audio-playout-coreaudio is the other half of that pair — without it a
   # macOS host plays back none of the guest's microphone audio
   # (docs/gap-tasks/02-macos-audio-playout.md).
-  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
+  MACOS_MEDIA_FEATURES: capture-screencapturekit,encode-videotoolbox,encode-aom,audio-capture-screencapturekit,audio-playout-coreaudio
   # Unpacked aarch64 cross toolchain + arm64 sysroot the linux-arm64 target
   # links against, provisioned by ci/provision-linux-arm64-cross.sh (see
   # cross:linux-arm64 below). Gitignored and local to whichever machine built

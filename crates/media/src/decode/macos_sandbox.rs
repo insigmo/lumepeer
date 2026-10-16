@@ -3,7 +3,7 @@
 //! The macOS counterpart of the Linux seccomp filter in
 //! `crates/decoder-worker/src/main.rs`: a running process fences *itself* in,
 //! after it has opened everything it will ever need (the ring buffer of
-//! §11.3, its stdin/stdout pipes and the `openh264` decoder) and before it
+//! §11.3, its stdin/stdout pipes and the libaom decoder) and before it
 //! touches the first attacker-controlled byte. Unlike Windows `AppContainer`
 //! (see `windows_sandbox`) nothing has to happen in the parent: the ordering
 //! §11.3 asks for — map the ring, *then* confine, then decode — holds here
