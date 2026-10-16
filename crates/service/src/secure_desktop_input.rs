@@ -265,7 +265,7 @@ fn send(inputs: &[INPUT]) -> bool {
         tracing::warn!(
             sent,
             offered = inputs.len(),
-            error = %windows::core::Error::from_win32(),
+            error = %windows::core::Error::from_thread(),
             "the OS refused a secure-desktop input event"
         );
     }

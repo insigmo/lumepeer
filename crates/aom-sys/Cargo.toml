@@ -30,4 +30,4 @@ vendored = []
 # Both are already in the lock file: `cmake` for opusic-sys's vendored
 # libopus, `cc` for the shim and half the workspace's other C.
 cmake = "0.1.58"
-cc = "1.4"
+cc = "1.8"

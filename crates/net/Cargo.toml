@@ -17,11 +17,11 @@ iroh.workspace = true
 # (task 17 increment 1, ADR 0052) so the two never diverge — `noq`'s own
 # `AsyncUdpSocket` is the embedding point `obfuscate.rs` implements, since
 # iroh 1.0.2 exposes no hook to wrap its own socket (Fase 0).
-noq = "=1.2.0"
+noq = "=1.3.0"
 # The engine under `noq`, for the one type its congestion-controller trait
 # names that `noq` does not re-export (`RttEstimator`): the loss-tolerant
 # controller of ADR 0144 implements that trait. Same version `noq` resolves.
-noq-proto = "=1.2.0"
+noq-proto = "=1.3.0"
 tokio.workspace = true
 serde.workspace = true
 serde-big-array.workspace = true
@@ -46,7 +46,7 @@ rcgen = "0.14"
 # the plain `AudioChunk` struct and the constants, which build without any
 # feature.
 lumepeer-media.workspace = true
-iroh-mainline-address-lookup = "=0.5.0"
+iroh-mainline-address-lookup = "=0.6.0"
 # The stream combinators iroh's own address-lookup API hands back (ADR 0099).
 # Already in the dependency tree transitively via `iroh`; pinned here to the
 # exact version it resolves to, for the same reason `noq` is — the `Stream`
@@ -55,7 +55,7 @@ n0-future = "=0.3.2"
 # The DHT the obfuscated transport's rendezvous records live in (ADR 0113).
 # Already in the dependency tree via `iroh-mainline-address-lookup`; pinned to
 # the exact version it resolves to, so the process runs one DHT implementation.
-n0-mainline = "=0.6.0"
+n0-mainline = "=0.7.1"
 # Push signalling for the rendezvous over public Nostr relays (ADR 0116): a
 # WebSocket client and its TLS, both already in the tree via iroh-relay, the
 # web PKI roots the relays' certificates chain to, and the BIP-340 Schnorr
@@ -69,8 +69,8 @@ tokio-websockets = { version = "0.13", default-features = false, features = [
 ] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "1"
-k256 = { version = "0.13", default-features = false, features = ["schnorr", "std"] }
-sha2 = "0.10"
+k256 = { version = "0.14", default-features = false, features = ["schnorr", "std"] }
+sha2 = "0.11"
 
 [dev-dependencies]
 proptest.workspace = true
@@ -84,14 +84,17 @@ tokio-websockets = { version = "0.13", default-features = false, features = ["se
 tracing-subscriber.workspace = true
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
-secret-service = { version = "5.1.0", features = ["rt-tokio-crypto-rust"], optional = true }
+secret-service = { version = "5.2.0", features = ["rt-tokio-crypto-rust"], optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = "3"
 security-framework-sys = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["windows-native"], optional = true }
+# `v1` is keyring 4's drop-in for the 3.x `Entry`: on Windows it is the
+# `windows-native-keyring-store` with 3.x's defaults (target `{user}.{service}`,
+# enterprise persistence), so the identity already stored there still loads.
+keyring = { version = "4", default-features = false, features = ["v1"], optional = true }
 
 [features]
 secret-service = ["dep:secret-service"]

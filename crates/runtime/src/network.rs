@@ -737,7 +737,10 @@ impl PeerDevice {
 
     /// This machine, as it describes itself to a peer.
     fn local() -> Option<Self> {
-        Self::from_wire(&whoami::devicename(), std::env::consts::OS)
+        // The host name when there is no "pretty" device name, which on Linux
+        // means no `/etc/machine-info`: the fallback whoami 1.x did itself.
+        let name = whoami::devicename().or_else(|_| whoami::hostname()).ok()?;
+        Self::from_wire(&name, std::env::consts::OS)
     }
 }
 

@@ -275,7 +275,7 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
         );
         if dc.is_invalid() {
             tracing::warn!(
-                error = %windows::core::Error::from_win32(),
+                error = %windows::core::Error::from_thread(),
                 "no device context for the secure desktop's display"
             );
             return None;
@@ -306,7 +306,7 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
             tracing::warn!(
                 width = target_width,
                 height = target_height,
-                error = %windows::core::Error::from_win32(),
+                error = %windows::core::Error::from_thread(),
                 "no DIB section for the secure desktop's frame"
             );
             let _ = DeleteDC(dc);
@@ -356,7 +356,7 @@ fn gdi_snapshot() -> Option<(u32, u32, Vec<u8>)> {
                 target = format_args!("{target_width}x{target_height}"),
                 blitted,
                 have_bits = !bits.is_null(),
-                error = %windows::core::Error::from_win32(),
+                error = %windows::core::Error::from_thread(),
                 "the secure desktop would not blit"
             );
             None

@@ -21,7 +21,7 @@ lumepeer-terminal.workspace = true
 # ConPTY, the process-thread attribute list and the job object. Same version
 # the rest of the workspace resolves to, so no second `windows` tree appears.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",

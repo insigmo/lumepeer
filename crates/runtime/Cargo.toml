@@ -53,12 +53,12 @@ anyhow.workspace = true
 # (ADR 0077). `statvfs` and `GetDiskFreeSpaceExW` are FFI and therefore
 # `unsafe`, which this crate forbids crate-wide; this carries that unsafe in
 # its own compiled crate, exactly as `keyring` does for the Windows keystore.
-fs4 = "0.13"
+fs4 = "1.1"
 # This machine's own name for the other side of a session to show (ADR 0121):
 # the pretty computer name on macOS, the DNS host name on Windows,
 # PRETTY_HOSTNAME or the host name on Linux. Already in the tree through sqlx,
 # and it carries the FFI this crate forbids, the same way fs4 does.
-whoami = "1.6"
+whoami = "2.1"
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -83,7 +83,7 @@ lumepeer-media = { workspace = true, features = [
     "audio-capture-screencapturekit",
     "audio-playout-coreaudio",
 ] }
-objc2 = "0.6.4"
+objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSString",

@@ -30,7 +30,7 @@ use lumepeer_media::capture::{CaptureTarget, Frame, InputCapability, PixelFormat
 #[cfg(target_os = "linux")]
 use lumepeer_media::decode::DecoderHandle;
 #[cfg(target_os = "linux")]
-use lumepeer_media::encode::{EncoderConfig, select_encoder};
+use lumepeer_media::encode::{EncoderConfig, VideoCodec, select_encoder};
 #[cfg(target_os = "linux")]
 use lumepeer_media::error::MediaError;
 
@@ -172,7 +172,12 @@ fn the_decoder_worker_stays_within_the_active_extra_rss_gate() {
             Err(e) => panic!("decoder worker did not start: {e}"),
         };
 
-        let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
+        // AV1 from libaom: the only codec the worker decodes (ADR 0162).
+        let mut encoder = select_encoder(EncoderConfig {
+            codec: VideoCodec::Av1,
+            ..EncoderConfig::default()
+        })
+        .unwrap();
         let mut capturer = MovingCapturer::default();
         capturer.start(CaptureTarget::PrimaryDisplay).unwrap();
 

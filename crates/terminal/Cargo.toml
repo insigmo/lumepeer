@@ -38,7 +38,7 @@ nix = { version = "0.28", features = ["signal", "process"] }
 # `Win32_System_Console` is not here. Same major version `lumepeer-service`
 # already resolves to, so no second `windows` tree appears.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",

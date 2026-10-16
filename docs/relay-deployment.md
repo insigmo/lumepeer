@@ -82,7 +82,7 @@ that can decrypt anything.
   `/metrics` serves Prometheus counters (connections, bytes relayed) if you
   enable it with `--metrics`.
 - **Version pinning**: the compose file pins the image tag to the `iroh`
-  version of the workspace manifest (`=1.0.2` today). This is not cosmetic —
+  version of the workspace manifest (`=1.3.0` today). This is not cosmetic —
   the relay protocol changed across the 0.9x → 1.0 line, so a mismatched relay
   does not serve these clients at all. Bump both in one PR, as §5 requires of
   every iroh pin. Relays are otherwise stateless, so a restart drops only the

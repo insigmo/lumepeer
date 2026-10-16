@@ -89,7 +89,7 @@ tauri.workspace = true
 tauri-plugin-dialog.workspace = true
 tauri-plugin-single-instance.workspace = true
 tauri-plugin-updater.workspace = true
-tauri-plugin-pilot = { version = "0.7.2", optional = true }
+tauri-plugin-pilot = { version = "0.8.1", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -103,7 +103,7 @@ anyhow.workspace = true
 # (ADR 0077). `statvfs` and `GetDiskFreeSpaceExW` are FFI and therefore
 # `unsafe`, which this crate forbids crate-wide; this carries that unsafe in
 # its own compiled crate, exactly as `keyring` does for the Windows keystore.
-fs4 = "0.13"
+fs4 = "1.1"
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -128,7 +128,7 @@ clipboard-win.workspace = true
 # `geteuid` for the sign-in screen host's "runs as root" check (ADR 0151).
 # A safe wrapper where the libc call is not, and already in the tree at this
 # version through other crates, so no new dependency enters `Cargo.lock`.
-rustix = { version = "1.1.4", features = ["process"] }
+rustix = { version = "1.1.5", features = ["process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `audio-capture-pipewire` sits here rather than in the shared section above
@@ -193,7 +193,7 @@ lumepeer-media = { workspace = true, features = [
 # `arboard`'s own macOS text backend and `lumepeer-media`'s
 # `capture-screencapturekit` already pull in, at the same pinned versions, so
 # this adds no new dependency version to `Cargo.lock`.
-objc2 = "0.6.4"
+objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std",
     "NSString",

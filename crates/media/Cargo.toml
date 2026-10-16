@@ -238,7 +238,7 @@ lumepeer-aom-sys = { workspace = true, optional = true }
 # already resolves to, checked against Cargo.lock, so enabling the feature
 # adds three framework crates rather than a duplicate objc2 major version.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.6.4", optional = true }
+objc2 = { version = "0.6.5", optional = true }
 objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
     "std",
     "CFCGTypes",
@@ -385,11 +385,11 @@ objc2-audio-toolbox = { version = "0.3.2", optional = true, default-features = f
 # encoder (ADR 0011) reuses the same dependency rather than pulling in a
 # second `windows` major version. AppContainer can only be applied at
 # process creation, so the worker is launched by hand through
-# `CreateProcessW` rather than `std::process::Command`. Version 0.61.3
+# `CreateProcessW` rather than `std::process::Command`. Version 0.62.2
 # matches what `apps/desktop/src-tauri`'s dependency tree (tauri,
 # webview2-com, tao) already resolves to (checked against Cargo.lock).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",

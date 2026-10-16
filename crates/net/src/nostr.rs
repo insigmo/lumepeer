@@ -240,7 +240,7 @@ fn random_key() -> SigningKey {
         rand::rng().fill_bytes(&mut bytes);
         // Fails only for zero or a value above the group order: a chance of
         // about 2^-128 per draw.
-        if let Ok(key) = SigningKey::from_bytes(&bytes) {
+        if let Ok(key) = SigningKey::from_slice(&bytes) {
             return key;
         }
     }
@@ -585,7 +585,7 @@ mod tests {
         let signature = HEXLOWER
             .decode(event["sig"].as_str().unwrap().as_bytes())
             .unwrap();
-        let verifying = VerifyingKey::from_bytes(&pubkey).unwrap();
+        let verifying = VerifyingKey::from_slice(&pubkey).unwrap();
         let signature = Signature::try_from(signature.as_slice()).unwrap();
         verifying.verify_raw(&id, &signature).unwrap();
     }

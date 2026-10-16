@@ -312,7 +312,7 @@ fn accept_and_serve(
         // `ERROR_PIPE_CONNECTED` means a client arrived before the wait
         // started, which is a connection, not a failure. Every other error
         // ends the loop.
-        let error = windows::core::Error::from_win32();
+        let error = windows::core::Error::from_thread();
         if error.code() != windows::core::HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) {
             tracing::warn!(?error, "the service endpoint stopped accepting");
             return false;

@@ -235,7 +235,7 @@ fn the_platform_backend_captures_the_real_screen_when_one_exists() {
     };
     assert!(frame.width >= 2 && frame.height >= 2);
 
-    let mut encoder = select_encoder(EncoderConfig::default()).unwrap();
+    let mut encoder = this_machines_encoder();
     let bitstream = encoder.encode(&frame).unwrap();
     assert!(bitstream.keyframe);
     assert!(!bitstream.data.is_empty());

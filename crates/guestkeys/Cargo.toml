@@ -26,7 +26,7 @@ tracing.workspace = true
 # is a `unsafe fn` COM method. Same `windows` version the rest of the
 # workspace resolves to, so no second `windows` tree appears.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
@@ -35,5 +35,5 @@ windows = { version = "0.61.3", features = [
 # `AreBrowserAcceleratorKeysEnabled`. The exact crate — and version — Tauri's
 # own `PlatformWebview::controller()` hands back, so this is a new edge onto a
 # dependency the desktop app already links, not a new dependency.
-webview2-com = "0.38"
-windows-core = "0.61"
+webview2-com = "0.39"
+windows-core = "0.62"
