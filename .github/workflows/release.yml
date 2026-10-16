@@ -161,25 +161,21 @@ jobs:
       # then never produces a picture — the guest sits on "waiting for the
       # remote screen" until its recovery window elapses (§18).
       #
-      # Windows carries *both* encoders on purpose. `encode-mf` is Media
-      # Foundation, which needs a hardware encoder the machine may simply not
-      # have; without the `encode-openh264` software fallback next to it,
-      # `select_encoder` fails on such a host with "no usable encoder" and the
-      # session stays blank forever. That is not hypothetical: it is what
-      # v0.0.14 did on a desktop with no hardware H.264 encoder.
+      # Every row carries `encode-aom` next to its hardware encoder on
+      # purpose: libaom's realtime AV1, the one software encoder since the
+      # `openh264` fallback was removed (ADR 0141, ADR 0162). A hardware
+      # encoder is one the machine may simply not have — Media Foundation's,
+      # VA-API's, or a VideoToolbox probe that declines (ADR 0066) — and
+      # without a software one next to it `select_encoder` fails on such a
+      # host with "no usable encoder" and the session stays blank forever.
+      # That is not hypothetical: it is what v0.0.14 did on a desktop with no
+      # hardware H.264 encoder.
       #
-      # macOS carries both for the same reason (ADR 0066).
-      # `encode-videotoolbox` probes by opening a real compression session and
-      # encoding a frame through it, so a Mac where that fails declines
-      # honestly — and then has to land on `encode-openh264` rather than on
-      # nothing.
-      #
-      # The two x86-64 rows on Windows and Linux also carry `encode-aom`:
-      # libaom's realtime AV1, in software, for a host with no hardware
-      # encoder at all (ADR 0141). Only there — those are the machines it was
-      # measured on, and the feature is inert on every other target anyway.
-      # `aom: true` is what installs nasm for it and, after the build, checks
-      # that libaom's assembly actually reached the binary: a libaom without
+      # `nasm: true` is what installs nasm on the x86-64 rows, whose libaom
+      # build refuses to go on without it; the Arm rows build NEON intrinsics
+      # with the compiler alone. `aom: true` then checks, after the build, that
+      # libaom's assembly actually reached the binary — on the ELF and COFF
+      # rows, which is what `ci/find-libaom-asm.py` reads: a libaom without
       # its SIMD is several times slower, which is exactly what the openh264
       # fallback turned out to ship as whenever its build found no nasm.
       matrix:
@@ -187,29 +183,32 @@ jobs:
           - name: linux-amd64 (deb/rpm)
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom
+            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
+            nasm: true
             aom: true
           - name: linux-arm64 (deb/rpm)
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264
+            features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264,encode-aom
+            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-aom
+            nasm: true
             aom: true
           - name: windows-arm64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
-            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-openh264
+            features: capture-windows,encode-mf,encode-mf-zero-copy,encode-aom
           - name: macos-arm64
             os: macos-14
             target: aarch64-apple-darwin
-            features: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
+            features: capture-screencapturekit,encode-videotoolbox,encode-aom,audio-capture-screencapturekit,audio-playout-coreaudio
           - name: macos-amd64
             os: macos-14
             target: x86_64-apple-darwin
-            features: capture-screencapturekit,encode-videotoolbox,encode-openh264,audio-capture-screencapturekit,audio-playout-coreaudio
+            features: capture-screencapturekit,encode-videotoolbox,encode-aom,audio-capture-screencapturekit,audio-playout-coreaudio
+            nasm: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -225,19 +224,24 @@ jobs:
           # the Linux rows of this matrix fail to build (ADR 0039). libva-dev
           # is for encode-vaapi-zero-copy: `cros-libva` links libva and libva-drm.
           # nasm assembles libaom's x86 kernels (encode-aom; ADR 0141), whose
-          # build fails without it — and openh264's, which until now built
-          # without them on Linux, silently.
+          # build fails without it.
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev rpm libpipewire-0.3-dev libclang-dev libva-dev nasm
       # The Windows image has no nasm. libaom's build refuses to go on
-      # without one (ADR 0141), and openh264's quietly loses its assembly.
+      # without one (ADR 0141).
       - name: Install nasm
-        if: matrix.aom && runner.os == 'Windows'
+        if: matrix.nasm && runner.os == 'Windows'
         shell: pwsh
         run: |
           if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
             choco install nasm --no-progress -y
             "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
+      # Nor has the Mac image, and the x86-64 Mac row assembles libaom's x86
+      # kernels on an Apple silicon runner (ADR 0162): Homebrew's nasm writes
+      # x86-64 Mach-O wherever it runs.
+      - name: Install nasm
+        if: matrix.nasm && runner.os == 'macOS'
+        run: brew install nasm
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -254,16 +258,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      # ADR 0157: openh264-sys2's build script decides whether to assemble
-      # openh264's SIMD by whether nasm runs, and tells cargo nothing that
-      # would make it decide again. The cache above restores a build made
-      # before nasm was installed here, and every Linux release since shipped
-      # the openh264 fallback without its assembly: 70-110 ms a 1280x800
-      # frame on a host with no hardware encoder, where 10-14 ms was there.
-      # Built afresh each time, against the nasm the step above installed.
-      - name: Rebuild openh264 against this runner's nasm
-        shell: bash
-        run: cargo clean --release --target ${{ matrix.target }} -p openh264-sys2
       - run: npm install
         working-directory: apps/desktop
       # tauri-build validates `externalBin` at compile time: the sidecar must
@@ -435,21 +429,6 @@ jobs:
           "${PYTHON}" ci/find-libaom-asm.py \
             "target/${{ matrix.target }}/release/build/lumepeer-aom-sys-*/out/build" \
             "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
-      # ADR 0157: the same check for the openh264 fallback, which every host
-      # without a hardware encoder runs on. Its build gives up its assembly
-      # without failing, and did on every Linux release from a cached build.
-      - name: Check the binary carries openh264's assembly
-        if: matrix.aom && !cancelled()
-        shell: bash
-        run: |
-          case "$RUNNER_OS" in
-            Windows) EXE=.exe ;;
-            *) EXE= ;;
-          esac
-          PYTHON="$(command -v python3 || command -v python)"
-          "${PYTHON}" ci/find-openh264-asm.py \
-            "target/${{ matrix.target }}/release/build/openh264-sys2-*/out" \
-            "target/${{ matrix.target }}/release/lumepeer-desktop${EXE}"
       # ADR 0149: libopus comes out optimised on Windows only because the
       # runner has ninja, and the build script stops a release build without
       # it. This reads what the build left: the Release flags of every
@@ -459,10 +438,7 @@ jobs:
         shell: bash
         run: |
           BUILD="target/${{ matrix.target }}/release/build"
-          DIRS=("${BUILD}/opusic-sys-*/out/build")
-          if [ "${{ matrix.aom }}" = "true" ]; then
-            DIRS+=("${BUILD}/lumepeer-aom-sys-*/out/build")
-          fi
+          DIRS=("${BUILD}/opusic-sys-*/out/build" "${BUILD}/lumepeer-aom-sys-*/out/build")
           PYTHON="$(command -v python3 || command -v python)"
           "${PYTHON}" ci/check-cmake-optimised.py "${DIRS[@]}"
       # The build signs silently or not at all, so the row says which it was:

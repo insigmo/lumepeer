@@ -40,21 +40,21 @@ use lumepeer_core::constants::{
     RECONNECT_WINDOW_SECS, RESTART_CLOSE_FLUSH_MS, RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS,
     RESUME_RETRY_SECS, RTT_EWMA_ALPHA, RTT_MAX_PLAUSIBLE_MS, SAVED_HOST_ADDRS,
     SAVED_HOST_FIRST_REFRESH_SECS, SAVED_HOST_LOOKUP_TIMEOUT_SECS, SAVED_HOST_REFRESH_SECS,
-    SAVED_HOSTS_PER_REFRESH, SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_PIXELS,
-    SOFTWARE_AV1_MEASURE_DELAY_SECS, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
+    SAVED_HOSTS_PER_REFRESH, STREAM_SCALE_MAX_PERCENT, STREAM_SIZE_MIN_PX,
     TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS,
     TUNNEL_IDLE_TIMEOUT_SECS,
 };
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, EncoderChoice, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1,
-    FEATURE_CODEC_VP9, FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER, FEATURE_DISPLAY_MODE,
-    FEATURE_FILE_BROWSE, FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER, FEATURE_MEDIA_UNAVAILABLE,
-    FEATURE_REBOOT, FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS, FEATURE_STREAM_SCALE,
-    FEATURE_STREAM_SIZE, FEATURE_TERMINAL, FEATURE_TERMINAL_ONLY, FEATURE_TUNNEL,
-    FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF, FileFetchRefusal, FileOp, FileOpRefusal,
-    InputDetail, InputEventPayload, ManifestEntry, MediaCodec, MediaUnavailableReason, MessageKind,
-    MonitorInfo, ProofKdf, RebootMode, TerminalRefusal, TunnelRefusal, UnattendedRejection,
+    FEATURE_CODEC_AV1_WORKER, FEATURE_CODEC_VP9, FEATURE_CURSOR_SHAPE, FEATURE_DIR_TRANSFER,
+    FEATURE_DISPLAY_MODE, FEATURE_FILE_BROWSE, FEATURE_FILE_MANAGE, FEATURE_FILE_TRANSFER,
+    FEATURE_MEDIA_UNAVAILABLE, FEATURE_REBOOT, FEATURE_RECEIVER_REPORT, FEATURE_SESSION_GRANTS,
+    FEATURE_STREAM_SCALE, FEATURE_STREAM_SIZE, FEATURE_TERMINAL, FEATURE_TERMINAL_ONLY,
+    FEATURE_TUNNEL, FEATURE_UNATTENDED, FEATURE_UNATTENDED_PROOF, FileFetchRefusal, FileOp,
+    FileOpRefusal, InputDetail, InputEventPayload, ManifestEntry, MediaCodec,
+    MediaUnavailableReason, MessageKind, MonitorInfo, ProofKdf, RebootMode, TerminalRefusal,
+    TunnelRefusal, UnattendedRejection,
 };
 use lumepeer_core::remote_path::{
     is_safe_component, relative_components, safe_browse_path, safe_relative_path, split_entry_path,
@@ -67,10 +67,10 @@ use lumepeer_media::capture::{
     CaptureController, CaptureTarget, InputInjector, StubCapturer, platform_backend,
     platform_injector,
 };
-use lumepeer_media::encode::software_av1::{self, Readiness as SoftwareAv1Readiness};
+use lumepeer_media::encode::software_av1;
 use lumepeer_media::encode::{
-    EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, openh264_built, probe_hardware,
-    select_encoder, select_software_encoder,
+    EncoderConfig, EncoderKind, VideoCodec, VideoEncoder, probe_hardware, select_encoder,
+    select_software_encoder,
 };
 use lumepeer_net::file_transfer::{
     ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
@@ -4229,17 +4229,30 @@ struct DisplayModeFeature {
 /// connection.
 #[derive(Debug, Clone, Copy, Default)]
 struct GuestCodecSupport {
-    /// AV1: [`FEATURE_CODEC_AV1`].
+    /// AV1, in the guest's own `WebView`: [`FEATURE_CODEC_AV1`].
     av1: bool,
     /// VP9: [`FEATURE_CODEC_VP9`].
     vp9: bool,
+    /// AV1, in the guest's sandboxed decoder worker when its `WebView` cannot
+    /// (ADR 0162): [`FEATURE_CODEC_AV1_WORKER`]. Every guest built since says
+    /// so, since libaom is the one software encoder a host has.
+    av1_worker: bool,
 }
 
 impl GuestCodecSupport {
+    /// Guest side: what this build decodes before its `WebView` has said
+    /// anything — AV1 in its decoder worker (ADR 0162).
+    const THIS_BUILD: Self = Self {
+        av1: false,
+        vp9: false,
+        av1_worker: true,
+    };
+
     fn from_features(features: &[String]) -> Self {
         Self {
             av1: features.iter().any(|f| f == FEATURE_CODEC_AV1),
             vp9: features.iter().any(|f| f == FEATURE_CODEC_VP9),
+            av1_worker: features.iter().any(|f| f == FEATURE_CODEC_AV1_WORKER),
         }
     }
 
@@ -4251,12 +4264,14 @@ impl GuestCodecSupport {
     /// answer from a binary that has never heard of that codec is "no" — it
     /// could not name it in a `Hello` even if it wanted to. `MediaCodec::H264`
     /// is ignored for the same reason it has no feature string: every peer
-    /// decodes it and there is nothing to advertise.
+    /// decodes it and there is nothing to advertise. The decoder worker's AV1
+    /// is this build's, whatever the `WebView` said (ADR 0162).
     fn from_wire_bytes(codecs: &[u8]) -> Self {
         let advertised = |codec: MediaCodec| codecs.contains(&codec.to_wire());
         Self {
             av1: advertised(MediaCodec::Av1),
             vp9: advertised(MediaCodec::Vp9),
+            ..Self::THIS_BUILD
         }
     }
 
@@ -4270,15 +4285,24 @@ impl GuestCodecSupport {
         if self.vp9 {
             features.push(FEATURE_CODEC_VP9.to_owned());
         }
+        if self.av1_worker {
+            features.push(FEATURE_CODEC_AV1_WORKER.to_owned());
+        }
         features
     }
 
     /// Whether this guest advertised understanding of codec negotiation at
     /// all — the gate for sending it `MessageKind::MediaCodec` in the first
-    /// place (§9.1): a guest that advertised none of the three strings would
+    /// place (§9.1): a guest that advertised none of the strings would
     /// decode the discriminant as unknown and close the connection.
     const fn understands_negotiation(self) -> bool {
-        self.av1 || self.vp9
+        self.av1 || self.vp9 || self.av1_worker
+    }
+
+    /// Whether this guest can be sent AV1 at all: in its `WebView`, or in its
+    /// decoder worker (ADR 0162).
+    const fn decodes_av1(self) -> bool {
+        self.av1 || self.av1_worker
     }
 }
 
@@ -4308,99 +4332,43 @@ impl HelloExtras {
     }
 }
 
-/// Host side: what a session's picture is known to be when its codec is
-/// chosen (§11; ADR 0141).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct SessionPicture {
-    /// The frame rate the guest's preset names, once it has named one.
-    ///
-    /// `None` is not "unknown, so refuse": a guest names its preset as soon
-    /// as its window opens, often after its media connection is already
-    /// accepted, and the preset it opens with is `quality` — 30 (ADR 0136).
-    /// So a session whose media connection beats that message is chosen for
-    /// as the 30 it is about to ask for, and [`Actor::recheck_media_codec`]
-    /// restarts it if it asks for more.
-    fps: Option<u8>,
-    /// The size of the last picture this peer's encode loop captured, if one
-    /// has — before any reduction for the guest's window. `None` is chosen
-    /// for optimistically, for the same reason: the encode loop ends a
-    /// software AV1 stream at its first larger picture, and the redial is
-    /// chosen for with the size known.
-    captured: Option<(u32, u32)>,
-}
-
-/// Host side: why a guest that decodes AV1, on a host with no hardware AV1
-/// encoder, is given H.264 rather than software AV1 (§11; ADR 0141).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SoftwareAv1Refusal {
-    /// The host's own answer: not in this build, a processor without AVX2,
-    /// a hardware H.264 encoder, not measured yet, measured too slow, or
-    /// given up on by a session that could not keep up.
-    Host(SoftwareAv1Readiness),
-    /// The preset asks for more frames a second than software AV1 runs at.
-    FrameRate(u8),
-    /// The screen is larger than software AV1 was measured for.
-    PictureSize(u32, u32),
-}
-
-/// Host side: whether a session may be given software AV1, and if not, why
-/// (§11; ADR 0141). Every condition of ADR 0141 that is not about the guest
-/// or about hardware AV1 is here, in the order of the ADR; `None` means
-/// every one of them holds.
-fn software_av1_refusal(
-    host: SoftwareAv1Readiness,
-    picture: SessionPicture,
-) -> Option<SoftwareAv1Refusal> {
-    if !host.is_ready() {
-        return Some(SoftwareAv1Refusal::Host(host));
-    }
-    if let Some(fps) = picture.fps.filter(|&fps| fps > SOFTWARE_AV1_MAX_FPS) {
-        return Some(SoftwareAv1Refusal::FrameRate(fps));
-    }
-    if let Some((width, height)) = picture.captured.filter(|&(width, height)| {
-        u64::from(width) * u64::from(height) > SOFTWARE_AV1_MAX_PIXELS as u64
-    }) {
-        return Some(SoftwareAv1Refusal::PictureSize(width, height));
-    }
-    None
-}
-
-/// Host side: what this host could show as `MediaCodec.codec` to a guest with
-/// `support`, given what this host can actually encode right now (§11; ADR
-/// 0067).
+/// Host side: what this host shows as `MediaCodec.codec` to a guest with
+/// `support` (§11; ADR 0067, ADR 0141, ADR 0162).
 ///
 /// A codec above the baseline is chosen with mutual hardware support, asked
 /// through [`probe_hardware`] by the caller — the exact question
 /// `select_encoder` asks again later when it actually builds the encoder,
 /// rather than a second opinion that could disagree with it (§11's
-/// mutual-hardware-support rule; ADR 0069). `hardware_av1` is that answer.
-/// VP9 has no encoder anywhere in this workspace yet (batch 09), so it is
-/// never chosen no matter what a guest advertises: an honest "not yet", not
-/// an unverified assumption that a path works — the same shape of mistake
-/// the comment above the build matrix in `.github/workflows/release.yml`
-/// records from v0.0.14, where a release shipped without the
-/// `encode-openh264` fallback next to `encode-mf` and a host with no hardware
-/// encoder went permanently blank because nothing had confirmed a usable
-/// encoder actually existed before relying on one.
+/// mutual-hardware-support rule; ADR 0069). `hardware_av1` and
+/// `hardware_h264` are those answers. VP9 has no encoder anywhere in this
+/// workspace yet (batch 09), so it is never chosen no matter what a guest
+/// advertises.
 ///
-/// AV1 is asked about first and taken whenever the answer is yes: it is the
-/// codec this project prefers, and the only one above the baseline it will
-/// ever choose (ADR 0072). The one exception to "hardware on both sides" is
-/// ADR 0141's: a guest that decodes AV1, a host with no hardware encoder at
-/// all whose own measurement passed, the 30 fps preset and a screen of at
-/// most 1080p — [`software_av1_refusal`] — and the host encodes AV1 in
-/// software. H.264 is what remains when any of that fails — a baseline, not
-/// a preference.
-fn choose_media_codec(
+/// In order:
+///
+/// 1. AV1 when the guest's `WebView` decodes it and this host has a hardware
+///    encoder for it — the codec this project prefers (ADR 0072).
+/// 2. H.264 when this host has a hardware encoder for it: cheaper on the host
+///    than libaom, and every `WebView` decodes it.
+/// 3. AV1 in software, libaom, for a guest that decodes AV1 at all — in its
+///    `WebView`, or in its decoder worker when that cannot (ADR 0162). Since
+///    `openh264` is gone this is the only picture a host with no hardware
+///    encoder has.
+/// 4. H.264 for a guest from before ADR 0162 that decodes nothing else,
+///    which `select_encoder` then cannot build on such a host: the session
+///    says it has no encoder rather than sending what the guest cannot show.
+const fn choose_media_codec(
     support: GuestCodecSupport,
     hardware_av1: bool,
-    software: SoftwareAv1Readiness,
-    picture: SessionPicture,
+    hardware_h264: bool,
 ) -> VideoCodec {
-    if !support.av1 {
+    if support.av1 && hardware_av1 {
+        return VideoCodec::Av1;
+    }
+    if hardware_h264 {
         return VideoCodec::H264;
     }
-    if hardware_av1 || software_av1_refusal(software, picture).is_none() {
+    if support.decodes_av1() {
         return VideoCodec::Av1;
     }
     VideoCodec::H264
@@ -5000,9 +4968,6 @@ enum ActorEvent {
         /// Whether the host finished a QUIC handshake on any transport.
         online: bool,
     },
-    /// Host side: this host's software AV1 measurement has an answer
-    /// (ADR 0143), so every live session's codec is chosen again.
-    SoftwareAv1Settled,
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -5735,14 +5700,11 @@ struct Actor {
     cursors_rx: mpsc::Receiver<(NodeId, CursorShapeData)>,
     /// What this host knows about its own ability to produce a picture.
     health: Arc<MediaHealth>,
-    /// Where this host stands on software AV1 (ADR 0141); see
-    /// [`HostMedia::software_av1`].
-    software_av1: fn() -> SoftwareAv1Readiness,
-    /// Starts that measurement (ADR 0143); see
-    /// [`HostMedia::measure_software_av1`].
-    measure_software_av1: fn() -> bool,
-    /// Whether a hardware H.264 encoder answered its probe, asked once, the
-    /// first time a guest's encoder options are worked out (ADR 0143).
+    /// Asks whether a hardware H.264 encoder answers its probe; see
+    /// [`HostMedia::hardware_h264`].
+    hardware_h264_probe: fn() -> bool,
+    /// What [`Self::hardware_h264_probe`] answered, asked once, the first
+    /// time a guest's codec is chosen (ADR 0143, ADR 0162).
     hardware_h264: Option<bool>,
     notify: broadcast::Sender<ActorNotification>,
     /// Host side: the single "capture only with a viewer" gate of §8.1/§11,
@@ -6393,7 +6355,6 @@ impl Actor {
         let mut keep_awake = tokio::time::interval(Duration::from_secs(HOST_KEEP_AWAKE_SECS));
         keep_awake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         self.rebind_restored_obfuscated();
-        self.start_software_av1_measurement();
         loop {
             tokio::select! {
                 command = self.rx.recv() => {
@@ -6455,30 +6416,6 @@ impl Actor {
         }
         // Nothing is being served any more, so nothing is left to show.
         self.windows.set_host_bar(false);
-    }
-
-    /// Host side: measures software AV1 once, soon after this host starts
-    /// (ADR 0143), and chooses every live session's codec again when the
-    /// answer is in.
-    ///
-    /// At the start rather than when the first guest that decodes AV1 says
-    /// `Hello`: a guest let in at once won that race every time, got H.264,
-    /// and the measurement then ran beside its encode loop, which cost
-    /// software AV1 the comparison with `openh264` on the reference host.
-    fn start_software_av1_measurement(&self) {
-        let start = self.measure_software_av1;
-        let readiness = self.software_av1;
-        let events = self.events_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(SOFTWARE_AV1_MEASURE_DELAY_SECS)).await;
-            if !start() {
-                return;
-            }
-            while readiness() == SoftwareAv1Readiness::Unmeasured {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let _ = events.send(ActorEvent::SoftwareAv1Settled).await;
-        });
     }
 
     /// Keeps this machine out of idle sleep while it hosts anybody.
@@ -7000,18 +6937,16 @@ impl Actor {
             .get(&peer)
             .copied()
             .unwrap_or_default();
-        let Some((hardware_av1, captured, now)) = self.media.get(&peer).map(|session| {
-            (
-                session.hardware_av1,
-                session.control.captured_size(),
-                (session.codec, session.encoder),
-            )
-        }) else {
+        let Some((hardware_av1, now)) = self
+            .media
+            .get(&peer)
+            .map(|session| (session.hardware_av1, (session.codec, session.encoder)))
+        else {
             return;
         };
-        // A guest that decodes nothing but H.264 and picked nothing is
-        // chosen H.264 here again, so it is never restarted for nothing.
-        let wanted = self.decide_codec(peer, support, hardware_av1, captured);
+        // A guest that picked nothing is chosen what it was chosen before
+        // here again, so it is never restarted for nothing.
+        let wanted = self.decide_codec(peer, support, hardware_av1);
         if (wanted.codec, wanted.encoder) == now {
             return;
         }
@@ -9902,15 +9837,6 @@ impl Actor {
                 tracing::debug!(peer = %host_tag, online, "checked whether a saved host is there");
                 self.presence.insert(host_tag, online);
             }
-            ActorEvent::SoftwareAv1Settled => {
-                tracing::info!(
-                    readiness = ?(self.software_av1)(),
-                    "software AV1 measured; choosing every live session's codec again (ADR 0143)"
-                );
-                for peer in self.media.keys().copied().collect::<Vec<_>>() {
-                    self.recheck_media_codec(peer);
-                }
-            }
         }
     }
 
@@ -9943,13 +9869,8 @@ impl Actor {
             return;
         }
         // A redial replaces the previous stream rather than adding a second
-        // encode loop against the same capture. What that stream last
-        // captured is what this one's codec is chosen for (ADR 0141).
-        let previous = self.media.remove(&peer);
-        let captured = previous
-            .as_ref()
-            .and_then(|previous| previous.control.captured_size());
-        if let Some(previous) = previous {
+        // encode loop against the same capture.
+        if let Some(previous) = self.media.remove(&peer) {
             previous.stop();
         }
         // §18: a host that cannot produce a picture says so, instead of
@@ -9974,12 +9895,6 @@ impl Actor {
             .contains(&peer)
             .then(|| self.cursors_tx.clone());
         let control = EncodeControl::new(peer, cursors);
-        // What the stream this one replaces knew about the screen, kept for
-        // the next choice too: a redial onto a screen that does not change
-        // may never capture a frame to learn it from (ADR 0141).
-        if let Some(size) = captured {
-            control.note_captured(size);
-        }
         // What the guest already asked of this session's picture, before this
         // connection existed (ADR 0119). The window says it once; this loop
         // may be the second or the tenth to serve it.
@@ -10013,12 +9928,9 @@ impl Actor {
             .get(&peer)
             .copied()
             .unwrap_or_default();
-        let choice = self.choose_codec_for(peer, codec_support, captured);
+        let choice = self.choose_codec_for(peer, codec_support);
         let codec = choice.codec;
         self.announce_codec(peer, codec_support, &choice);
-        if choice.encoder != EncoderChoice::Auto {
-            control.pin_encoder();
-        }
         let task = spawn_encode_loop_with(
             connection.clone(),
             Arc::clone(&self.capture),
@@ -10092,39 +10004,30 @@ impl Actor {
 
     /// Host side: the codec and encoder `peer`'s new media stream gets, and
     /// whether a hardware AV1 encoder answered its probe (§11; ADR 0067,
-    /// ADR 0141, ADR 0143). `captured` is what the stream this one replaces
-    /// last captured, if there was one.
+    /// ADR 0141, ADR 0143, ADR 0162).
     ///
-    /// Logs why a guest that decodes AV1 is given H.264 when the host chose.
-    fn choose_codec_for(
-        &mut self,
-        peer: NodeId,
-        support: GuestCodecSupport,
-        captured: Option<(u32, u32)>,
-    ) -> CodecChoice {
+    /// Logs when the host chose libaom, which is the one choice a guest's
+    /// picture quality and this host's processor both feel.
+    fn choose_codec_for(&mut self, peer: NodeId, support: GuestCodecSupport) -> CodecChoice {
         // Asked only for a guest that could take the answer: on Windows the
         // AV1 probe pushes a frame through a hardware encoder (ADR 0069).
         let hardware_av1 = support.av1 && hardware_encodes(VideoCodec::Av1);
-        let choice = self.decide_codec(peer, support, hardware_av1, captured);
-        if choice.encoder == EncoderChoice::Auto && support.av1 && !hardware_av1 {
-            let tag = self.label_of(&peer);
-            let picture = SessionPicture {
-                fps: self.stream_caps.get(&peer).and_then(|caps| caps.fps),
-                captured,
-            };
-            match software_av1_refusal((self.software_av1)(), picture) {
-                None => tracing::info!(
-                    peer = %tag,
-                    "no hardware AV1 encoder: encoding AV1 in software (ADR 0141)"
-                ),
-                Some(refusal) => tracing::info!(
-                    peer = %tag,
-                    ?refusal,
-                    "the guest decodes AV1 but this session gets H.264 (ADR 0141)"
-                ),
-            }
+        let choice = self.decide_codec(peer, support, hardware_av1);
+        if choice.encoder == EncoderChoice::Auto && choice.codec == VideoCodec::Av1 && !hardware_av1
+        {
+            tracing::info!(
+                peer = %self.label_of(&peer),
+                webview = support.av1,
+                "no hardware encoder for this guest: encoding AV1 in software (ADR 0162)"
+            );
         }
         choice
+    }
+
+    /// Whether this host has a hardware H.264 encoder, asked once.
+    fn hardware_h264(&mut self) -> bool {
+        let probe = self.hardware_h264_probe;
+        *self.hardware_h264.get_or_insert_with(probe)
     }
 
     /// Host side: what `peer`'s picture is encoded with (ADR 0143): the
@@ -10136,7 +10039,6 @@ impl Actor {
         peer: NodeId,
         support: GuestCodecSupport,
         hardware_av1: bool,
-        captured: Option<(u32, u32)>,
     ) -> CodecChoice {
         let available = self.encoder_options_for(support, hardware_av1);
         let caps = self.stream_caps.get(&peer).copied().unwrap_or_default();
@@ -10149,12 +10051,9 @@ impl Actor {
                 available,
             };
         }
-        let picture = SessionPicture {
-            fps: caps.fps,
-            captured,
-        };
+        let hardware_h264 = self.hardware_h264();
         CodecChoice {
-            codec: choose_media_codec(support, hardware_av1, (self.software_av1)(), picture),
+            codec: choose_media_codec(support, hardware_av1, hardware_h264),
             hardware_av1,
             encoder: EncoderChoice::Auto,
             available,
@@ -10164,25 +10063,20 @@ impl Actor {
     /// Host side: the encoders a guest with `support` may pick from on this
     /// host (ADR 0143). [`EncoderChoice::Auto`] always; a hardware encoder
     /// only when its probe answered; AV1 only for a guest that decodes it.
+    /// [`EncoderChoice::H264Software`] never: `openh264` is gone (ADR 0162).
     fn encoder_options_for(
         &mut self,
         support: GuestCodecSupport,
         hardware_av1: bool,
     ) -> Vec<EncoderChoice> {
         let mut available = vec![EncoderChoice::Auto];
-        let hardware_h264 = *self
-            .hardware_h264
-            .get_or_insert_with(|| hardware_encodes(VideoCodec::H264));
-        if hardware_h264 {
+        if self.hardware_h264() {
             available.push(EncoderChoice::H264Hardware);
-        }
-        if openh264_built() {
-            available.push(EncoderChoice::H264Software);
         }
         if support.av1 && hardware_av1 {
             available.push(EncoderChoice::Av1Hardware);
         }
-        if support.av1 && software_av1::built() && software_av1::cpu_supported() {
+        if support.decodes_av1() && software_av1::built() {
             available.push(EncoderChoice::Av1Software);
         }
         available
@@ -10840,6 +10734,10 @@ impl Actor {
             tracing::warn!(peer = %tag, %error, "dropping an unauthorized input event");
             return;
         }
+        // Onto the monitor the guest is looking at, before any injector sees
+        // it: on Windows that injector may be another process, which cannot
+        // know (ADR 0162).
+        let event = &lumepeer_media::capture::for_injection(event);
         // When the host is showing this guest its secure desktop, ordinary
         // `SendInput` cannot reach `Winsta0\Winlogon` — no integrity level puts
         // this process's thread on that desktop (ADR 0057). Route the event
@@ -19235,8 +19133,7 @@ pub fn default_capture(portal_grant: Option<std::path::PathBuf>) -> HostMedia {
             capture: controller(capturer),
             health: Arc::new(MediaHealth::healthy()),
             injector,
-            software_av1: software_av1::readiness,
-            measure_software_av1: software_av1::start_measurement,
+            hardware_h264: || hardware_encodes(VideoCodec::H264),
         },
         Err(error) => {
             tracing::warn!(%error, "no capture backend on this platform: sessions stay blank");
@@ -19244,8 +19141,7 @@ pub fn default_capture(portal_grant: Option<std::path::PathBuf>) -> HostMedia {
                 capture: controller(Box::new(StubCapturer::default())),
                 health: Arc::new(MediaHealth::without_capture()),
                 injector: None,
-                software_av1: software_av1::readiness,
-                measure_software_av1: software_av1::start_measurement,
+                hardware_h264: || hardware_encodes(VideoCodec::H264),
             }
         }
     }
@@ -19483,8 +19379,7 @@ pub fn spawn_actor_with(
         capture,
         health,
         injector,
-        software_av1,
-        measure_software_av1,
+        hardware_h264: hardware_h264_probe,
     } = media;
     let (tx, rx) = mpsc::channel(32);
     let (events_tx, events_rx) = mpsc::channel(32);
@@ -19535,7 +19430,7 @@ pub fn spawn_actor_with(
         stream_size: std::collections::HashMap::new(),
         display_mode: std::collections::HashMap::new(),
         guest_codec_support: std::collections::HashMap::new(),
-        own_codec_support: GuestCodecSupport::default(),
+        own_codec_support: GuestCodecSupport::THIS_BUILD,
         display_mode_state: None,
         display_mode_generation: 0,
         speaks_cursor_shape: std::collections::HashSet::new(),
@@ -19591,8 +19486,7 @@ pub fn spawn_actor_with(
         cursors_tx,
         cursors_rx,
         health: Arc::clone(&health),
-        software_av1,
-        measure_software_av1,
+        hardware_h264_probe,
         hardware_h264: None,
         notify: notify.clone(),
         capture,
@@ -20145,190 +20039,66 @@ mod tests {
     fn a_guest_that_advertised_no_codec_string_gets_h264_and_no_negotiation() {
         let support = GuestCodecSupport::default();
         assert!(!support.understands_negotiation());
-        // Not even a host with every encoder there is moves it.
+        // Not even a host with every encoder there is moves it, and a host
+        // with none is left without a picture for it rather than sending one
+        // it could not show.
+        assert_eq!(choose_media_codec(support, true, true), VideoCodec::H264);
+        assert_eq!(choose_media_codec(support, false, false), VideoCodec::H264);
+    }
+
+    /// A guest whose `WebView` decodes AV1.
+    const AV1_GUEST: GuestCodecSupport = GuestCodecSupport {
+        av1: true,
+        vp9: false,
+        av1_worker: true,
+    };
+
+    /// A guest whose `WebView` cannot decode AV1 but whose decoder worker can
+    /// (ADR 0162): every guest of this build before its `WebView` says more.
+    const WORKER_GUEST: GuestCodecSupport = GuestCodecSupport::THIS_BUILD;
+
+    /// ADR 0162: a host with no hardware encoder at all encodes AV1 in
+    /// software, for a guest that decodes it in its `WebView` and for one
+    /// that can only in its decoder worker — libaom is all it has.
+    #[test]
+    fn a_host_without_hardware_encodes_av1_in_software_for_every_guest_of_this_build() {
+        assert_eq!(choose_media_codec(AV1_GUEST, false, false), VideoCodec::Av1);
         assert_eq!(
-            choose_media_codec(support, true, ready(), SessionPicture::default()),
+            choose_media_codec(WORKER_GUEST, false, false),
+            VideoCodec::Av1
+        );
+    }
+
+    /// Hardware AV1 is the rule of ADR 0069: a `WebView` that decodes it gets
+    /// it, hardware H.264 or not.
+    #[test]
+    fn hardware_av1_is_chosen_for_a_webview_that_decodes_it() {
+        assert_eq!(choose_media_codec(AV1_GUEST, true, true), VideoCodec::Av1);
+        assert_eq!(choose_media_codec(AV1_GUEST, true, false), VideoCodec::Av1);
+    }
+
+    /// ADR 0162: a hardware H.264 encoder comes before libaom — cheaper on
+    /// the host, and decoded by every `WebView` — and a guest that decodes AV1
+    /// only in its worker never gets hardware AV1 it would have to turn into
+    /// pixels there.
+    #[test]
+    fn hardware_h264_comes_before_software_av1() {
+        assert_eq!(choose_media_codec(AV1_GUEST, false, true), VideoCodec::H264);
+        assert_eq!(
+            choose_media_codec(WORKER_GUEST, false, true),
             VideoCodec::H264
         );
     }
 
-    /// A guest that decodes AV1.
-    const AV1_GUEST: GuestCodecSupport = GuestCodecSupport {
-        av1: true,
-        vp9: false,
-    };
-
-    /// A host that passed its own software AV1 measurement (ADR 0141).
-    fn ready() -> SoftwareAv1Readiness {
-        SoftwareAv1Readiness::Ready(software_av1::Measurement {
-            av1_p95_us: 17_400,
-            h264_p95_us: 24_800,
-        })
-    }
-
-    /// The `quality` preset on a 1080p screen: everything ADR 0141 asks of
-    /// the session itself.
-    const QUALITY_1080P: SessionPicture = SessionPicture {
-        fps: Some(SOFTWARE_AV1_MAX_FPS),
-        captured: Some((1920, 1080)),
-    };
-
-    /// ADR 0141, the branch the whole exception exists for: a guest that
-    /// decodes AV1, a host with no hardware AV1 that passed its measurement,
-    /// the `quality` preset and a 1080p screen — AV1, in software.
-    #[test]
-    fn a_host_without_hardware_that_passed_its_measurement_encodes_av1_for_quality() {
-        assert_eq!(software_av1_refusal(ready(), QUALITY_1080P), None);
-        assert_eq!(
-            choose_media_codec(AV1_GUEST, false, ready(), QUALITY_1080P),
-            VideoCodec::Av1
-        );
-    }
-
-    /// Hardware AV1 is the rule of ADR 0069 and needs none of ADR 0141's
-    /// conditions: no measurement, any preset, any screen.
-    #[test]
-    fn hardware_av1_is_chosen_whatever_the_software_conditions_say() {
-        let anything = SessionPicture {
-            fps: Some(144),
-            captured: Some((3840, 2160)),
-        };
-        assert_eq!(
-            choose_media_codec(AV1_GUEST, true, SoftwareAv1Readiness::NotBuilt, anything),
-            VideoCodec::Av1
-        );
-    }
-
-    /// ADR 0141: every way the host itself can say no — not built, no
-    /// AVX2, a hardware H.264 encoder, not measured yet, measured too slow,
-    /// given up on mid-session — gives H.264, and names itself as the reason.
-    #[test]
-    fn every_host_side_refusal_gives_h264_and_says_which() {
-        let slow = software_av1::Measurement {
-            av1_p95_us: 25_000,
-            h264_p95_us: 24_000,
-        };
-        for host in [
-            SoftwareAv1Readiness::NotBuilt,
-            SoftwareAv1Readiness::UnsupportedCpu,
-            SoftwareAv1Readiness::HardwareEncoder,
-            SoftwareAv1Readiness::Unmeasured,
-            SoftwareAv1Readiness::TooSlow(slow),
-            SoftwareAv1Readiness::Demoted,
-        ] {
-            assert_eq!(
-                software_av1_refusal(host, QUALITY_1080P),
-                Some(SoftwareAv1Refusal::Host(host))
-            );
-            assert_eq!(
-                choose_media_codec(AV1_GUEST, false, host, QUALITY_1080P),
-                VideoCodec::H264,
-                "{host:?} still got AV1"
-            );
-        }
-    }
-
-    /// ADR 0141: the `quality` preset's 30 fps and nothing faster.
-    /// `balance` (60) and `performance` (144) stay on H.264.
-    #[test]
-    fn only_the_thirty_fps_preset_gets_software_av1() {
-        for fps in [15, 24, SOFTWARE_AV1_MAX_FPS] {
-            let picture = SessionPicture {
-                fps: Some(fps),
-                ..QUALITY_1080P
-            };
-            assert_eq!(
-                choose_media_codec(AV1_GUEST, false, ready(), picture),
-                VideoCodec::Av1,
-                "{fps} fps"
-            );
-        }
-        for fps in [SOFTWARE_AV1_MAX_FPS + 1, 60, ENCODE_MAX_FPS] {
-            let picture = SessionPicture {
-                fps: Some(fps),
-                ..QUALITY_1080P
-            };
-            assert_eq!(
-                software_av1_refusal(ready(), picture),
-                Some(SoftwareAv1Refusal::FrameRate(fps))
-            );
-            assert_eq!(
-                choose_media_codec(AV1_GUEST, false, ready(), picture),
-                VideoCodec::H264,
-                "{fps} fps"
-            );
-        }
-    }
-
-    /// ADR 0141: at most 1080p of pixels, in either orientation; a 16:10
-    /// 1920x1200 panel is already over, and so is anything larger.
-    #[test]
-    fn only_a_screen_of_at_most_1080p_gets_software_av1() {
-        for size in [(1920, 1080), (1080, 1920), (1366, 768), (1280, 720)] {
-            let picture = SessionPicture {
-                captured: Some(size),
-                ..QUALITY_1080P
-            };
-            assert_eq!(
-                choose_media_codec(AV1_GUEST, false, ready(), picture),
-                VideoCodec::Av1,
-                "{size:?}"
-            );
-        }
-        for (width, height) in [(1920, 1200), (2560, 1440), (3840, 2160)] {
-            let picture = SessionPicture {
-                captured: Some((width, height)),
-                ..QUALITY_1080P
-            };
-            assert_eq!(
-                software_av1_refusal(ready(), picture),
-                Some(SoftwareAv1Refusal::PictureSize(width, height))
-            );
-            assert_eq!(
-                choose_media_codec(AV1_GUEST, false, ready(), picture),
-                VideoCodec::H264
-            );
-        }
-    }
-
-    /// ADR 0141: a session accepted before its guest named a preset, or
-    /// before any loop captured a picture, is chosen for as the `quality`
-    /// session on a screen that fits it — the preset every guest opens with.
-    /// What it then turns out to be is corrected by a restart: the preset by
-    /// `recheck_media_codec`, the screen by the encode loop itself.
-    #[test]
-    fn a_session_not_yet_described_is_chosen_for_as_the_default_preset() {
-        assert_eq!(
-            choose_media_codec(AV1_GUEST, false, ready(), SessionPicture::default()),
-            VideoCodec::Av1
-        );
-    }
-
-    /// ADR 0141: the host's own answer is asked first, so a host that cannot
-    /// do it says so even for a session that would not have fitted anyway.
-    #[test]
-    fn the_hosts_own_refusal_comes_before_the_sessions() {
-        let too_much = SessionPicture {
-            fps: Some(60),
-            captured: Some((3840, 2160)),
-        };
-        assert_eq!(
-            software_av1_refusal(SoftwareAv1Readiness::Unmeasured, too_much),
-            Some(SoftwareAv1Refusal::Host(SoftwareAv1Readiness::Unmeasured))
-        );
-        assert_eq!(
-            software_av1_refusal(ready(), too_much),
-            Some(SoftwareAv1Refusal::FrameRate(60))
-        );
-    }
-
     /// `GuestCodecSupport::from_features` reads exactly the strings ADR 0067
-    /// defines and nothing else, and any one of them alone is enough to prove
-    /// this guest understands the message.
+    /// and ADR 0162 define and nothing else, and any one of them alone is
+    /// enough to prove this guest understands the message.
     #[test]
     fn from_features_reads_each_codec_string_independently() {
         assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_AV1.to_owned()]).av1);
         assert!(GuestCodecSupport::from_features(&[FEATURE_CODEC_VP9.to_owned()]).vp9);
+        let worker = GuestCodecSupport::from_features(&[FEATURE_CODEC_AV1_WORKER.to_owned()]);
+        assert!(worker.av1_worker && !worker.av1);
         assert!(
             !GuestCodecSupport::from_features(&["something-unrelated".to_owned()])
                 .understands_negotiation()
@@ -20336,40 +20106,28 @@ mod tests {
         for features in [
             vec![FEATURE_CODEC_AV1.to_owned()],
             vec![FEATURE_CODEC_VP9.to_owned()],
+            vec![FEATURE_CODEC_AV1_WORKER.to_owned()],
         ] {
             assert!(GuestCodecSupport::from_features(&features).understands_negotiation());
         }
     }
 
-    /// AV1 is chosen only with mutual hardware support (§11; ADR 0069): a
-    /// guest claiming AV1 gets it exactly when this machine's own probe says
-    /// there is a hardware AV1 encoder, and gets the H.264 fallback
-    /// otherwise. Written against the probe's live answer rather than against
-    /// a constant so it runs identically on a machine with AV1 hardware and
-    /// on one without — the claim is that the two agree, not that either is
-    /// true here.
+    /// AV1 is chosen with mutual hardware support (§11; ADR 0069): a guest
+    /// whose `WebView` decodes AV1, on a host with a hardware H.264 encoder,
+    /// gets AV1 exactly when this machine's own probe says there is a
+    /// hardware AV1 encoder. Written against the probe's live answer rather
+    /// than against a constant so it runs identically on a machine with AV1
+    /// hardware and on one without — the claim is that the two agree, not
+    /// that either is true here.
     #[test]
     fn av1_is_chosen_exactly_when_the_hardware_probe_says_so() {
-        let support = GuestCodecSupport {
-            av1: true,
-            vp9: false,
-        };
         let hardware = hardware_encodes(VideoCodec::Av1);
         let expected = if hardware {
             VideoCodec::Av1
         } else {
             VideoCodec::H264
         };
-        // With software AV1 out of the picture, only the probe decides.
-        assert_eq!(
-            choose_media_codec(
-                support,
-                hardware,
-                SoftwareAv1Readiness::NotBuilt,
-                QUALITY_1080P
-            ),
-            expected
-        );
+        assert_eq!(choose_media_codec(AV1_GUEST, hardware, true), expected);
         assert_eq!(
             hardware,
             probe_hardware(EncoderConfig {
@@ -20381,10 +20139,11 @@ mod tests {
     }
 
     /// §11, ADR 0070: a guest advertises only what its own `WebView` said yes
-    /// to, and the strings it sends are read back by the host half of the
-    /// same type. A byte no `MediaCodec` names — a webview bundle newer than
-    /// this binary — is dropped rather than turned into a feature string this
-    /// build cannot name.
+    /// to, plus its decoder worker's AV1 (ADR 0162), and the strings it sends
+    /// are read back by the host half of the same type. A byte no
+    /// `MediaCodec` names — a webview bundle newer than this binary — is
+    /// dropped rather than turned into a feature string this build cannot
+    /// name.
     #[test]
     fn the_codecs_a_webview_reports_are_the_strings_a_hello_advertises() {
         let reported = GuestCodecSupport::from_wire_bytes(&[
@@ -20394,21 +20153,30 @@ mod tests {
         ]);
         assert_eq!(
             reported.features(),
-            vec![FEATURE_CODEC_AV1.to_owned(), FEATURE_CODEC_VP9.to_owned()]
+            vec![
+                FEATURE_CODEC_AV1.to_owned(),
+                FEATURE_CODEC_VP9.to_owned(),
+                FEATURE_CODEC_AV1_WORKER.to_owned()
+            ]
         );
         let seen_by_the_host = GuestCodecSupport::from_features(&reported.features());
         assert!(seen_by_the_host.av1);
         assert!(seen_by_the_host.vp9);
+        assert!(seen_by_the_host.av1_worker);
     }
 
-    /// H.264 is the baseline every peer decodes and has no feature string, so
-    /// a webview that reports it and nothing else advertises nothing at all —
-    /// and a host therefore never sends it `MediaCodec` (ADR 0067).
+    /// H.264 has no feature string, so a `WebView` that reports it and
+    /// nothing else advertises only the decoder worker's AV1 (ADR 0162) —
+    /// enough for a host with nothing but libaom to send it a picture.
     #[test]
-    fn reporting_only_h264_advertises_nothing_and_negotiates_nothing() {
+    fn reporting_only_h264_advertises_the_workers_av1_alone() {
         let reported = GuestCodecSupport::from_wire_bytes(&[MediaCodec::H264.to_wire()]);
-        assert!(reported.features().is_empty());
-        assert!(!reported.understands_negotiation());
+        assert_eq!(
+            reported.features(),
+            vec![FEATURE_CODEC_AV1_WORKER.to_owned()]
+        );
+        assert!(reported.understands_negotiation());
+        assert!(!reported.av1);
     }
 
     /// VP9 has no encoder anywhere in this workspace yet (batch 09): claiming
@@ -20418,11 +20186,9 @@ mod tests {
         let support = GuestCodecSupport {
             av1: false,
             vp9: true,
+            av1_worker: false,
         };
-        assert_eq!(
-            choose_media_codec(support, true, ready(), QUALITY_1080P),
-            VideoCodec::H264
-        );
+        assert_eq!(choose_media_codec(support, true, true), VideoCodec::H264);
     }
 
     /// ADR 0072: AV1 and the H.264 baseline are the whole set a host can
@@ -20434,23 +20200,27 @@ mod tests {
         // sending it names a codec this build has no `MediaCodec` for.
         let reported = GuestCodecSupport::from_wire_bytes(&[2, MediaCodec::Vp9.to_wire()]);
         assert!(!reported.av1);
-        assert_eq!(reported.features(), vec![FEATURE_CODEC_VP9.to_owned()]);
         assert_eq!(
-            choose_media_codec(reported, true, ready(), QUALITY_1080P),
-            VideoCodec::H264
+            reported.features(),
+            vec![
+                FEATURE_CODEC_VP9.to_owned(),
+                FEATURE_CODEC_AV1_WORKER.to_owned()
+            ]
         );
+        assert_eq!(choose_media_codec(reported, true, true), VideoCodec::H264);
 
         let everything = GuestCodecSupport {
             av1: true,
             vp9: true,
+            av1_worker: true,
         };
-        for (hardware, software, expected) in [
-            (true, SoftwareAv1Readiness::NotBuilt, VideoCodec::Av1),
-            (false, ready(), VideoCodec::Av1),
-            (false, SoftwareAv1Readiness::NotBuilt, VideoCodec::H264),
+        for (hardware_av1, hardware_h264, expected) in [
+            (true, true, VideoCodec::Av1),
+            (false, true, VideoCodec::H264),
+            (false, false, VideoCodec::Av1),
         ] {
             assert_eq!(
-                choose_media_codec(everything, hardware, software, QUALITY_1080P),
+                choose_media_codec(everything, hardware_av1, hardware_h264),
                 expected
             );
         }
@@ -20719,8 +20489,7 @@ mod tests {
             capture: Arc::clone(capture),
             health: Arc::new(MediaHealth::healthy()),
             injector: None,
-            software_av1: software_av1::readiness,
-            measure_software_av1: || false,
+            hardware_h264: || hardware_encodes(VideoCodec::H264),
         }
     }
 
@@ -27005,8 +26774,7 @@ mod tests {
                 capture: Arc::clone(&capture),
                 health: Arc::new(MediaHealth::without_capture()),
                 injector: None,
-                software_av1: software_av1::readiness,
-                measure_software_av1: || false,
+                hardware_h264: || hardware_encodes(VideoCodec::H264),
             },
         )
         .await;
@@ -27576,9 +27344,7 @@ mod tests {
     /// [`ScreenCapturer::snapshot`] where the platform takes them (Windows,
     /// X11), which counts as that first picture if no poll took it yet.
     /// `reports_mode` is whether it can say its size before the first frame
-    /// (Windows, X11) or not (Wayland), and `mode` a display mode that
-    /// differs from what it captures. `pictures` counts every picture it
-    /// hands out, polled or snapshot.
+    /// (Windows, X11) or not (Wayland).
     #[cfg(feature = "encode-aom")]
     #[derive(Debug)]
     #[allow(
@@ -27590,9 +27356,7 @@ mod tests {
         fresh: bool,
         size: (u32, u32),
         reports_mode: bool,
-        mode: Option<(u32, u32)>,
         snapshots: bool,
-        pictures: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(feature = "encode-aom")]
@@ -27603,30 +27367,11 @@ mod tests {
                 fresh: false,
                 size,
                 reports_mode,
-                mode: None,
                 snapshots,
-                pictures: Arc::default(),
             }
         }
 
-        /// The same capturer, reporting a display mode of `size` while it
-        /// captures its own: an X11 monitor whose CRTC runs a larger mode
-        /// than the area captured, under `xrandr --scale`.
-        fn with_mode(mut self, size: (u32, u32)) -> Self {
-            self.mode = Some(size);
-            self
-        }
-
-        /// The same capturer, counting the pictures it hands out into
-        /// `pictures`.
-        fn counting(mut self, pictures: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
-            self.pictures = Arc::clone(pictures);
-            self
-        }
-
         fn picture(&self) -> Frame {
-            self.pictures
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (width, height) = self.size;
             let mut data = Vec::with_capacity((width * height * 4) as usize);
             for y in 0..height {
@@ -27677,7 +27422,7 @@ mod tests {
             &self,
             _target: CaptureTarget,
         ) -> Option<lumepeer_media::capture::DisplayMode> {
-            let (width, height) = self.mode.unwrap_or(self.size);
+            let (width, height) = self.size;
             self.reports_mode
                 .then_some(lumepeer_media::capture::DisplayMode {
                     width,
@@ -27695,27 +27440,25 @@ mod tests {
         }
     }
 
-    /// A host with software AV1 ready, capturing through `capturer`, and a
-    /// guest that decodes AV1 watching it; returns both and the label the
-    /// guest knows the host by.
+    /// A host with no hardware H.264 encoder, capturing through `capturer`,
+    /// and a guest watching it whose `WebView` reported `codecs`; returns both
+    /// and the label the guest knows the host by.
     #[cfg(feature = "encode-aom")]
     async fn software_av1_pair(
         capturer: Box<dyn ScreenCapturer>,
+        codecs: Vec<u8>,
     ) -> (ActorHandle, ActorHandle, String, Vec<PeerEndpoint>) {
         let capture: SharedCapture = Arc::new(std::sync::Mutex::new(CaptureController::new(
             capturer,
             CaptureTarget::PrimaryDisplay,
         )));
         let mut media = test_media(&capture);
-        media.software_av1 = measured_and_ready;
+        media.hardware_h264 = || false;
         let (host, host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
         let recorder = Arc::new(RecordingWindows::default());
         let (guest, guest_endpoint, _guest_capture, _windows) =
             actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
-        guest
-            .report_decoder_codecs(vec![MediaCodec::H264.to_wire(), MediaCodec::Av1.to_wire()])
-            .await
-            .unwrap();
+        guest.report_decoder_codecs(codecs).await.unwrap();
         let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
         guest.invite_connect(invite.code).await.unwrap();
         let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
@@ -27730,142 +27473,45 @@ mod tests {
         (host, guest, peer_label, vec![host_endpoint, guest_endpoint])
     }
 
-    /// ADR 0141: a preset change restarts the stream in the other codec, and
-    /// on a screen that does not change at all the new stream still opens
-    /// with a picture — the loop takes a snapshot of the screen as it is
-    /// now. Without that the guest sat on "reconnecting" until something on
-    /// the host moved.
+    /// What a `WebView` that decodes AV1 reports.
+    #[cfg(feature = "encode-aom")]
+    fn decodes_av1() -> Vec<u8> {
+        vec![MediaCodec::H264.to_wire(), MediaCodec::Av1.to_wire()]
+    }
+
+    /// Whether this machine can run the software AV1 path at all: libaom
+    /// built in, and no hardware AV1 encoder to win over it.
+    #[cfg(feature = "encode-aom")]
+    fn software_av1_runs_here() -> bool {
+        if !software_av1::built() || hardware_encodes(VideoCodec::Av1) {
+            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+            return false;
+        }
+        true
+    }
+
+    /// ADR 0141, ADR 0143: a restart on a screen that does not change at all
+    /// still opens with a picture — the loop takes a snapshot of the screen
+    /// as it is now. Without that the guest sat on "reconnecting" until
+    /// something on the host moved.
     #[cfg(feature = "encode-aom")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_restart_on_a_still_screen_still_shows_the_guest_a_picture() {
-        if !(software_av1::built() && software_av1::cpu_supported())
-            || hardware_encodes(VideoCodec::Av1)
-        {
-            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
+        if !software_av1_runs_here() {
             return;
         }
-        let (_host, guest, label, _endpoints) =
-            software_av1_pair(Box::new(StillCapturer::new((640, 360), true, true))).await;
-        guest
-            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
+        let (_host, guest, label, _endpoints) = software_av1_pair(
+            Box::new(StillCapturer::new((640, 360), true, true)),
+            decodes_av1(),
+        )
+        .await;
         assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
+        // The guest's pick restarts the stream, on the same screen.
         guest
-            .set_stream_scale(label.clone(), 100, 60)
+            .host_encoder_select(label.clone(), EncoderChoice::Av1Software)
             .await
             .unwrap();
-        assert!(first_frame_in(&guest, &label, MediaCodec::H264).await.0);
-        guest
-            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
-        assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
-    }
-
-    /// ADR 0141: a screen above 1080p whose size the platform reports gets
-    /// H.264 from its very first picture: the software AV1 stream the actor
-    /// chose before it knew the size ends before taking one, so the only
-    /// picture of the still screen is the snapshot the H.264 stream that
-    /// replaces it takes. A later `quality` preset then leaves the host on
-    /// H.264, restarting nothing.
-    #[cfg(feature = "encode-aom")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_screen_above_1080p_is_h264_from_its_first_picture_and_stays_there() {
-        use std::sync::atomic::Ordering;
-        if !(software_av1::built() && software_av1::cpu_supported())
-            || hardware_encodes(VideoCodec::Av1)
-        {
-            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
-            return;
-        }
-        let pictures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (host, guest, label, _endpoints) = software_av1_pair(Box::new(
-            StillCapturer::new((2560, 1440), true, true).counting(&pictures),
-        ))
-        .await;
-        let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
-        assert!(keyframe && (unit.starts_with(&[0, 0, 0, 1]) || unit.starts_with(&[0, 0, 1])));
-        assert_eq!(
-            pictures.load(Ordering::Relaxed),
-            1,
-            "the software AV1 stream took a picture before it ended"
-        );
-        guest
-            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            assert_eq!(
-                host_codec(&host).await,
-                Some(MediaCodec::H264),
-                "the quality preset moved a 1440p screen to software AV1"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(
-            pictures.load(Ordering::Relaxed),
-            1,
-            "the quality preset restarted the stream"
-        );
-    }
-
-    /// ADR 0141: where the size is not known before the first frame but a
-    /// snapshot can be taken — a display-mode query that answers nothing, as
-    /// on an X server without `RandR` — the software AV1 stream finds out
-    /// from its picture and ends, and the H.264 stream that replaces it
-    /// takes a snapshot of its own of the unchanged screen. Wayland, which
-    /// can do neither, is `the_screen_size_outlives_a_redial_that_captures_nothing`.
-    #[cfg(feature = "encode-aom")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_screen_above_1080p_found_by_its_first_frame_still_reaches_the_guest() {
-        use std::sync::atomic::Ordering;
-        if !(software_av1::built() && software_av1::cpu_supported())
-            || hardware_encodes(VideoCodec::Av1)
-        {
-            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
-            return;
-        }
-        let pictures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (_host, guest, label, _endpoints) = software_av1_pair(Box::new(
-            StillCapturer::new((2560, 1440), false, true).counting(&pictures),
-        ))
-        .await;
-        let (keyframe, _unit) = first_frame_in(&guest, &label, MediaCodec::H264).await;
-        assert!(keyframe);
-        assert_eq!(
-            pictures.load(Ordering::Relaxed),
-            2,
-            "one picture for the stream that ended, one for its replacement"
-        );
-    }
-
-    /// ADR 0141: a display mode larger than what is captured — an X11
-    /// monitor scaled with `xrandr --scale`, whose CRTC runs 4K for a 1080p
-    /// screen — sizes only a stream with no picture to go by. Once a frame
-    /// has said 1080p, the `quality` preset's software AV1 stream runs; read
-    /// over that size, the mode ended every one of them, and the guest
-    /// bounced back to H.264 on each preset.
-    #[cfg(feature = "encode-aom")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_display_mode_larger_than_the_capture_does_not_outrank_its_frames() {
-        if !(software_av1::built() && software_av1::cpu_supported())
-            || hardware_encodes(VideoCodec::Av1)
-        {
-            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
-            return;
-        }
-        let (_host, guest, label, _endpoints) = software_av1_pair(Box::new(
-            StillCapturer::new((1920, 1080), true, true).with_mode((3840, 2160)),
-        ))
-        .await;
-        // No picture yet, so the mode sizes the first stream: H.264.
-        assert!(first_frame_in(&guest, &label, MediaCodec::H264).await.0);
-        guest
-            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
+        announced_encoders(&guest, &label, EncoderChoice::Av1Software).await;
         assert!(first_frame_in(&guest, &label, MediaCodec::Av1).await.0);
     }
 
@@ -27877,49 +27523,6 @@ mod tests {
             .unwrap()
             .first()
             .and_then(|stats| stats.codec)
-    }
-
-    /// ADR 0141: once a stream has learned the screen is above 1080p, the
-    /// size outlives the redial — even onto a stream that never captures a
-    /// frame of its own, as on a Wayland host whose screen does not change —
-    /// so a later `quality` preset does not restart it into software AV1.
-    #[cfg(feature = "encode-aom")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_screen_size_outlives_a_redial_that_captures_nothing() {
-        if !(software_av1::built() && software_av1::cpu_supported())
-            || hardware_encodes(VideoCodec::Av1)
-        {
-            eprintln!("skipping: no libaom here, or a hardware AV1 encoder wins");
-            return;
-        }
-        let (host, guest, label, _endpoints) =
-            software_av1_pair(Box::new(StillCapturer::new((2560, 1440), false, false))).await;
-        // The first stream is AV1 until its first frame says 1440p; the
-        // redial is H.264 and, on this screen, never gets a frame.
-        wait_until_async("the host never settled on H.264", || async {
-            host_codec(&host).await == Some(MediaCodec::H264)
-        })
-        .await;
-        guest
-            .set_stream_scale(label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while tokio::time::Instant::now() < deadline {
-            assert_eq!(
-                host_codec(&host).await,
-                Some(MediaCodec::H264),
-                "the quality preset moved a 1440p screen to software AV1"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// A host that passed its software AV1 measurement (ADR 0141), without
-    /// depending on how fast this test build measures.
-    #[cfg(feature = "encode-aom")]
-    fn measured_and_ready() -> SoftwareAv1Readiness {
-        ready()
     }
 
     /// The codec byte of a `view_chunk` answer and whether it carried a
@@ -27991,166 +27594,96 @@ mod tests {
         false
     }
 
-    /// ADR 0141 end to end, with the real libaom: a host with no hardware
-    /// encoder that passed its measurement streams AV1 to a guest that
-    /// decodes it, on the `quality` preset; switching the guest to
-    /// `balance` (60 fps) restarts the stream in H.264, and switching back
-    /// restarts it in AV1 again — every frame tagged with the codec it is in.
+    /// ADR 0162 end to end, with the real libaom: a host with no hardware
+    /// encoder streams AV1 to a guest that decodes it, from a keyframe a
+    /// decoder can start from, and stays on AV1 whatever preset the guest
+    /// picks — there is no H.264 without hardware to move it to.
     #[cfg(feature = "encode-aom")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_host_without_hardware_streams_software_av1_and_follows_the_preset() {
-        if !(software_av1::built() && software_av1::cpu_supported()) {
-            eprintln!("skipping: libaom is not usable on this processor");
+    async fn a_host_without_hardware_streams_software_av1_whatever_the_preset() {
+        if !software_av1_runs_here() {
             return;
         }
-        if hardware_encodes(VideoCodec::Av1) {
-            eprintln!("skipping: this machine has a hardware AV1 encoder, which wins");
-            return;
-        }
-        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(CaptureController::new(
-            Box::new(MovingCapturer::default()),
-            CaptureTarget::PrimaryDisplay,
-        )));
-        let mut media = test_media(&capture);
-        media.software_av1 = measured_and_ready;
-        let (host, _host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
-        let recorder = Arc::new(RecordingWindows::default());
-        let (guest, _guest_endpoint, _guest_capture, _windows) =
-            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
-        // What the guest's webview would report: it decodes AV1.
-        guest
-            .report_decoder_codecs(vec![MediaCodec::H264.to_wire(), MediaCodec::Av1.to_wire()])
-            .await
-            .unwrap();
-
-        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
-        guest.invite_connect(invite.code).await.unwrap();
-        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
-            .await
-            .unwrap();
-        host.grant(label, Role::ViewOnly).await.unwrap();
-        wait_until("no view window was opened", || {
-            !recorder.opened().is_empty()
-        })
-        .await;
-        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
-
-        // `quality`: AV1, and a keyframe a decoder can start from.
-        guest
-            .set_stream_scale(peer_label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
-        let (keyframe, unit) = first_frame_in(&guest, &peer_label, MediaCodec::Av1).await;
+        let (host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(MovingCapturer::default()), decodes_av1()).await;
+        let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::Av1).await;
         assert!(
             keyframe,
             "the first AV1 frame the guest saw was not a keyframe"
         );
         assert!(carries_av1_sequence_header(&unit));
 
-        // `balance`: past what software AV1 is chosen for — H.264.
+        // `balance`, at 60 fps: still AV1, and no restart into anything else.
         guest
-            .set_stream_scale(peer_label.clone(), 100, 60)
+            .set_stream_scale(label.clone(), 100, 60)
             .await
             .unwrap();
-        let (keyframe, unit) = first_frame_in(&guest, &peer_label, MediaCodec::H264).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(host_codec(&host).await, Some(MediaCodec::Av1));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            keyframe,
-            "the first H.264 frame after the switch was not a keyframe"
+            !first_frame_in(&guest, &label, MediaCodec::Av1)
+                .await
+                .1
+                .is_empty()
         );
-        assert!(unit.starts_with(&[0, 0, 0, 1]) || unit.starts_with(&[0, 0, 1]));
+    }
 
-        // Back to `quality`: AV1 again.
-        guest
-            .set_stream_scale(peer_label.clone(), 100, SOFTWARE_AV1_MAX_FPS)
-            .await
-            .unwrap();
-        let (keyframe, unit) = first_frame_in(&guest, &peer_label, MediaCodec::Av1).await;
+    /// ADR 0162: a guest whose `WebView` decodes nothing but H.264 is still
+    /// sent a picture by a host that has only libaom — AV1, which its decoder
+    /// worker turns into pixels — where before it had `openh264`'s H.264.
+    #[cfg(feature = "encode-aom")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_webview_without_av1_still_gets_a_software_hosts_picture() {
+        if !software_av1_runs_here() {
+            return;
+        }
+        let (_host, guest, label, _endpoints) = software_av1_pair(
+            Box::new(MovingCapturer::default()),
+            vec![MediaCodec::H264.to_wire()],
+        )
+        .await;
+        let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::Av1).await;
         assert!(keyframe);
         assert!(carries_av1_sequence_header(&unit));
     }
 
-    /// A host whose software AV1 measurement failed, so it chooses H.264 for
-    /// itself (ADR 0141).
-    #[cfg(feature = "encode-aom")]
-    fn measured_too_slow() -> SoftwareAv1Readiness {
-        SoftwareAv1Readiness::TooSlow(software_av1::Measurement {
-            av1_p95_us: 40_000,
-            h264_p95_us: 30_000,
-        })
-    }
-
-    /// ADR 0143 end to end, with the real libaom: the host offers the
-    /// encoders it has, a guest that picks software AV1 gets it — at the
-    /// 60 fps preset and on a host whose own measurement failed, where the
-    /// host would choose H.264 — and picking `Auto` gives the choice back.
+    /// ADR 0143, ADR 0162 end to end, with the real libaom: a host with no
+    /// hardware encoder offers `Auto` and software AV1 and nothing else — no
+    /// `openh264` — a guest that picks software AV1 gets it, and picking
+    /// `Auto` gives the choice back.
     #[cfg(feature = "encode-aom")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_guest_picks_the_hosts_encoder_and_can_give_the_choice_back() {
-        if !(software_av1::built() && software_av1::cpu_supported()) {
-            eprintln!("skipping: libaom is not usable on this processor");
+        if !software_av1_runs_here() {
             return;
         }
-        if hardware_encodes(VideoCodec::Av1) {
-            eprintln!("skipping: this machine has a hardware AV1 encoder, which wins");
-            return;
-        }
-        let capture: SharedCapture = Arc::new(std::sync::Mutex::new(CaptureController::new(
-            Box::new(MovingCapturer::default()),
-            CaptureTarget::PrimaryDisplay,
-        )));
-        let mut media = test_media(&capture);
-        media.software_av1 = measured_too_slow;
-        let (host, _host_endpoint) = actor_with_media(Arc::new(DetachedViewWindows), media).await;
-        let recorder = Arc::new(RecordingWindows::default());
-        let (guest, _guest_endpoint, _guest_capture, _windows) =
-            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
-        guest
-            .report_decoder_codecs(vec![MediaCodec::H264.to_wire(), MediaCodec::Av1.to_wire()])
-            .await
-            .unwrap();
+        let (_host, guest, label, _endpoints) =
+            software_av1_pair(Box::new(MovingCapturer::default()), decodes_av1()).await;
+        first_frame_in(&guest, &label, MediaCodec::Av1).await;
+        let announced = announced_encoders(&guest, &label, EncoderChoice::Auto).await;
+        assert_eq!(
+            announced,
+            vec![EncoderChoice::Auto, EncoderChoice::Av1Software]
+        );
 
-        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
-        guest.invite_connect(invite.code).await.unwrap();
-        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
-            .await
-            .unwrap();
-        host.grant(label, Role::ViewOnly).await.unwrap();
-        wait_until("no view window was opened", || {
-            !recorder.opened().is_empty()
-        })
-        .await;
-        let (_window, peer_label, _input, _surface) = recorder.opened().remove(0);
-
-        // `balance`, on a host that failed its measurement: H.264, by the
-        // host's own choice.
         guest
-            .set_stream_scale(peer_label.clone(), 100, 60)
+            .host_encoder_select(label.clone(), EncoderChoice::Av1Software)
             .await
             .unwrap();
-        first_frame_in(&guest, &peer_label, MediaCodec::H264).await;
-        let announced = announced_encoders(&guest, &peer_label, EncoderChoice::Auto).await;
-        assert!(announced.contains(&EncoderChoice::Auto));
-        assert!(announced.contains(&EncoderChoice::H264Software));
-        assert!(announced.contains(&EncoderChoice::Av1Software));
-        assert!(!announced.contains(&EncoderChoice::Av1Hardware));
-
-        // The guest's pick wins over all of that.
-        guest
-            .host_encoder_select(peer_label.clone(), EncoderChoice::Av1Software)
-            .await
-            .unwrap();
-        let (keyframe, unit) = first_frame_in(&guest, &peer_label, MediaCodec::Av1).await;
+        let (keyframe, unit) = first_frame_in(&guest, &label, MediaCodec::Av1).await;
         assert!(keyframe);
         assert!(carries_av1_sequence_header(&unit));
-        announced_encoders(&guest, &peer_label, EncoderChoice::Av1Software).await;
+        announced_encoders(&guest, &label, EncoderChoice::Av1Software).await;
 
-        // And `Auto` hands the choice back to the host: H.264 again.
         guest
-            .host_encoder_select(peer_label.clone(), EncoderChoice::Auto)
+            .host_encoder_select(label.clone(), EncoderChoice::Auto)
             .await
             .unwrap();
-        first_frame_in(&guest, &peer_label, MediaCodec::H264).await;
-        announced_encoders(&guest, &peer_label, EncoderChoice::Auto).await;
+        first_frame_in(&guest, &label, MediaCodec::Av1).await;
+        announced_encoders(&guest, &label, EncoderChoice::Auto).await;
     }
 
     /// The encoders the host announced to `guest` for `label`, once it says

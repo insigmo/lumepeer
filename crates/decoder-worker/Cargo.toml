@@ -14,8 +14,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-lumepeer-media.workspace = true
-openh264.workspace = true
+# libaom's AV1 decoder (ADR 0162), which replaced `openh264`'s H.264 one.
+lumepeer-media = { workspace = true, features = ["decode-aom"] }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

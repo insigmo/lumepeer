@@ -12,13 +12,19 @@
 // so the bitrate can move without a new encoder (`aom_shim_set_bitrate`,
 // `aom_codec_enc_config_set`), and errors and refused controls are kept for
 // the caller to log instead of going to stderr.
+//
+// The decoder at the end (`aom_shim_dec_*`, ADR 0162) is the decoder worker's:
+// it turns a host's AV1 into an 8-bit 4:2:0 picture for a guest whose webview
+// cannot, and refuses anything else.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "aom/aom_decoder.h"
 #include "aom/aom_encoder.h"
 #include "aom/aomcx.h"
+#include "aom/aomdx.h"
 
 typedef struct aom_shim {
   aom_codec_ctx_t ctx;
@@ -191,3 +197,71 @@ void aom_shim_close(aom_shim *s) {
 }
 
 const char *aom_shim_version(void) { return aom_codec_version_str(); }
+
+typedef struct aom_shim_dec {
+  aom_codec_ctx_t ctx;
+  // The last error, for the caller to log.
+  char error[256];
+} aom_shim_dec;
+
+aom_shim_dec *aom_shim_dec_open(int threads, char *err, int errlen) {
+  aom_codec_dec_cfg_t cfg;
+  memset(&cfg, 0, sizeof cfg);
+  cfg.threads = (unsigned)threads;
+  // An 8-bit stream decodes into 8-bit planes, not 16-bit ones.
+  cfg.allow_lowbitdepth = 1;
+  aom_shim_dec *d = (aom_shim_dec *)calloc(1, sizeof(aom_shim_dec));
+  if (!d) {
+    snprintf(err, errlen, "out of memory");
+    return NULL;
+  }
+  if (aom_codec_dec_init(&d->ctx, aom_codec_av1_dx(), &cfg, 0) != AOM_CODEC_OK) {
+    snprintf(err, errlen, "aom_codec_dec_init failed: %s", aom_codec_error(&d->ctx));
+    free(d);
+    return NULL;
+  }
+  return d;
+}
+
+// Decodes one temporal unit. Returns 0 with *got = 1 and the last picture it
+// produced (planes owned by the decoder, valid until the next call), 0 with
+// *got = 0 when it produced none, and -1 on failure — a picture that is not
+// 8-bit 4:2:0 included, since nothing on the far side could show it.
+int aom_shim_dec_decode(aom_shim_dec *d, const uint8_t *data, size_t len, int *got,
+                        const uint8_t **y, const uint8_t **u, const uint8_t **v, int *y_stride,
+                        int *uv_stride, int *w, int *h) {
+  *got = 0;
+  if (aom_codec_decode(&d->ctx, data, len, NULL) != AOM_CODEC_OK) {
+    const char *detail = aom_codec_error_detail(&d->ctx);
+    snprintf(d->error, sizeof d->error, "aom_codec_decode: %s%s%s", aom_codec_error(&d->ctx),
+             detail ? ": " : "", detail ? detail : "");
+    return -1;
+  }
+  aom_codec_iter_t iter = NULL;
+  aom_image_t *img;
+  aom_image_t *last = NULL;
+  while ((img = aom_codec_get_frame(&d->ctx, &iter)) != NULL) last = img;
+  if (!last) return 0;
+  if (last->fmt != AOM_IMG_FMT_I420 || last->bit_depth != 8 || last->monochrome) {
+    snprintf(d->error, sizeof d->error, "a picture in format %d at %u bits, not 8-bit 4:2:0",
+             (int)last->fmt, last->bit_depth);
+    return -1;
+  }
+  *y = last->planes[AOM_PLANE_Y];
+  *u = last->planes[AOM_PLANE_U];
+  *v = last->planes[AOM_PLANE_V];
+  *y_stride = last->stride[AOM_PLANE_Y];
+  *uv_stride = last->stride[AOM_PLANE_U];
+  *w = (int)last->d_w;
+  *h = (int)last->d_h;
+  *got = 1;
+  return 0;
+}
+
+const char *aom_shim_dec_error(const aom_shim_dec *d) { return d->error; }
+
+void aom_shim_dec_close(aom_shim_dec *d) {
+  if (!d) return;
+  aom_codec_destroy(&d->ctx);
+  free(d);
+}

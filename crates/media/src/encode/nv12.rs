@@ -8,21 +8,35 @@
 //! get BT.601 subtly different on one of them, and the tests below then only
 //! ever run on whichever machine built that backend.
 //!
-//! Cropping to even dimensions matches what the `openh264` fallback's
-//! `even_bgra` does, and for the same reason: 4:2:0 subsampling has no odd
-//! rows or columns.
+//! libaom takes the same picture as planar I420 ([`to_i420`]; ADR 0162), so
+//! the one software encoder converts with the very arithmetic the hardware
+//! ones do.
+//!
+//! Frames are cropped to even dimensions: 4:2:0 subsampling has no odd rows
+//! or columns.
 
 use crate::capture::{Frame, PixelFormat};
 use crate::error::{MediaError, Result};
 
-/// Converts a captured frame to NV12, cropping to even dimensions the same
-/// way the `openh264` fallback's `even_bgra` does: 4:2:0 subsampling has no
-/// odd rows or columns.
+/// Converts a captured frame to NV12, cropping to even dimensions: 4:2:0
+/// subsampling has no odd rows or columns.
 pub(super) fn bgra_to_nv12(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
     match frame.format {
         PixelFormat::Nv12 => nv12_passthrough(frame),
         PixelFormat::Bgra8 => bgra8_to_nv12(frame),
     }
+}
+
+/// A captured frame as the planar I420 libaom takes (ADR 0162): its NV12,
+/// with the interleaved chroma pulled apart into the two planes.
+#[cfg(feature = "encode-aom")]
+pub(super) fn to_i420(frame: &Frame) -> Result<(Vec<u8>, u32, u32)> {
+    let (mut picture, width, height) = bgra_to_nv12(frame)?;
+    let chroma = picture.split_off(width as usize * height as usize);
+    picture.reserve(chroma.len());
+    picture.extend(chroma.iter().step_by(2));
+    picture.extend(chroma.iter().skip(1).step_by(2));
+    Ok((picture, width, height))
 }
 
 pub(super) fn nv12_size(width: u32, height: u32) -> usize {
@@ -257,6 +271,20 @@ mod tests {
             "V sample was {}",
             nv12[uv_start + 1]
         );
+    }
+
+    /// I420 is NV12 with its chroma pulled apart: the luma as it was, every
+    /// U sample and then every V sample, in order (ADR 0162).
+    #[test]
+    #[cfg(feature = "encode-aom")]
+    fn i420_is_nv12_with_its_chroma_split() {
+        let mut nv12 = frame(4, 2, 0);
+        nv12.format = PixelFormat::Nv12;
+        // Luma 0..8, then the one row of chroma: U V U V.
+        nv12.data = vec![0, 1, 2, 3, 4, 5, 6, 7, 10, 20, 11, 21];
+        let (i420, width, height) = to_i420(&nv12).unwrap();
+        assert_eq!((width, height), (4, 2));
+        assert_eq!(i420, [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 20, 21]);
     }
 
     /// NV12 straight from a capturer that already produces it must survive

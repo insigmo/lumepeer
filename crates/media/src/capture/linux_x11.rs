@@ -581,6 +581,20 @@ pub struct X11Capturer {
     active: Option<Active>,
 }
 
+/// What this process last started capturing (ADR 0162). The injector maps a
+/// guest's pointer onto it: the guest normalizes against the picture, and the
+/// picture is whichever monitor it picked, which `MonitorSelect` tells the
+/// capturer and nothing else.
+static CAPTURED_TARGET: std::sync::Mutex<CaptureTarget> =
+    std::sync::Mutex::new(CaptureTarget::PrimaryDisplay);
+
+/// [`CAPTURED_TARGET`] as it is now.
+fn captured_target() -> CaptureTarget {
+    CAPTURED_TARGET
+        .lock()
+        .map_or(CaptureTarget::PrimaryDisplay, |target| *target)
+}
+
 impl X11Capturer {
     /// Creates a capturer that connects on [`ScreenCapturer::start`].
     #[must_use]
@@ -647,6 +661,9 @@ impl ScreenCapturer for X11Capturer {
         })?;
         let screen = connection.setup().roots[screen_num].clone();
         let monitor = Self::monitor(&connection, &screen, target);
+        if let Ok(mut captured) = CAPTURED_TARGET.lock() {
+            *captured = target;
+        }
 
         // XFIXES is what makes the pointer visible at all here. A display
         // without it is a display whose frames simply have no cursor in them:
@@ -1029,18 +1046,18 @@ pub struct X11Injector {
     connection: RustConnection,
     /// The connection setup's copy of the screen, for its root.
     screen: Screen,
-    /// Where moves land: the primary monitor, re-resolved on every
+    /// Where moves land: the captured monitor, re-resolved on every
     /// `PointerMove`. The monitor rather than the root window, because a
     /// guest normalizes against the picture, and the picture is that
     /// monitor's crop of the root ([`Active::grab`]); across a multi-head
     /// root a move to the middle of the picture landed on the seam between
-    /// two heads. The primary rather than whichever monitor a guest picked,
-    /// because nothing tells an injector about `MonitorSelect` — the same gap
-    /// the Windows and macOS injectors have. Read once at `connect`, it went
-    /// stale at the first mode switch, and every move then landed scaled by
-    /// the old size — right at the top-left, ever further off towards the
-    /// bottom-right. [`monitor_rects`] never yields a zero-sized rectangle,
-    /// so a re-read cannot leave nothing to scale against.
+    /// two heads. The captured monitor rather than the primary one, because a
+    /// guest that picked another screen had its moves land on the primary
+    /// one (ADR 0162). Read once at `connect`, it went stale at the first mode
+    /// switch, and every move then landed scaled by the old size — right at
+    /// the top-left, ever further off towards the bottom-right.
+    /// [`monitor_rects`] never yields a zero-sized rectangle, so a re-read
+    /// cannot leave nothing to scale against.
     monitor: MonitorRect,
     /// The host's own keyboard layout, as `keysym -> (keycode, shift level)`.
     /// Read once at connect: this is what lets a guest's character be typed on
@@ -1088,7 +1105,7 @@ impl X11Injector {
         };
 
         let (layout, scratch) = read_layout(&connection);
-        let monitor = X11Capturer::monitor(&connection, &screen, CaptureTarget::PrimaryDisplay);
+        let monitor = X11Capturer::monitor(&connection, &screen, captured_target());
         Ok(Self {
             screen,
             monitor,
@@ -1381,11 +1398,8 @@ impl InputInjector for X11Injector {
     fn inject(&mut self, event: &InputEventPayload) -> Result<()> {
         match event.detail {
             InputDetail::PointerMove { x, y } => {
-                self.monitor = X11Capturer::monitor(
-                    &self.connection,
-                    &self.screen,
-                    CaptureTarget::PrimaryDisplay,
-                );
+                self.monitor =
+                    X11Capturer::monitor(&self.connection, &self.screen, captured_target());
                 let (x, y) = Self::onto(self.monitor, x, y);
                 self.fake(MOTION_NOTIFY, 0, x, y)
             }

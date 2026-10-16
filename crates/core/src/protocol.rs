@@ -597,6 +597,18 @@ pub const FEATURE_CODEC_AV1: &str = "codec-av1";
 /// (ADR 0067). Same compatibility shape as [`FEATURE_CODEC_AV1`].
 pub const FEATURE_CODEC_VP9: &str = "codec-vp9";
 
+/// `Hello.features` string a guest sends to say its sandboxed decoder worker
+/// decodes AV1 (§11.3; ADR 0162), whatever its `WebView` does.
+///
+/// Not a reason to prefer AV1: the worker turns every picture into pixels
+/// that then cross the IPC boundary, which costs far more than a `WebView`'s
+/// own decoder (ADR 0058). It is what lets a host with nothing but libaom —
+/// the one software encoder since ADR 0162 — send AV1 to a guest whose
+/// `WebView` cannot decode it, where it would otherwise have no picture at
+/// all. A host that never saw it sends such a guest nothing but H.264, as it
+/// always did.
+pub const FEATURE_CODEC_AV1_WORKER: &str = "codec-av1-worker";
+
 /// `Hello.features` string a guest sends to say it understands
 /// [`MessageKind::SessionGrants`] (ADR 0123).
 ///
@@ -1478,7 +1490,9 @@ pub enum EncoderChoice {
     Auto,
     /// H.264 on the host's hardware encoder.
     H264Hardware,
-    /// H.264 in software, `openh264`.
+    /// H.264 in software, `openh264`. Never offered since ADR 0162 removed
+    /// it; kept so the wire's discriminants do not move, and refused like any
+    /// other choice a host cannot make.
     H264Software,
     /// AV1 on the host's hardware encoder.
     Av1Hardware,

@@ -53,22 +53,23 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,encode-openh264 -- -D warnings
+      - run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,encode-aom -- -D warnings
       - run: cargo build -p lumepeer-decoder-worker
       - run: cargo clippy -p lumepeer-media --all-targets --features capture-portal -- -D warnings
       - run: cargo clippy -p lumepeer-net --all-targets --features secret-service -- -D warnings
       - name: Clippy the whole shipped Linux feature set
-        run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,encode-aom,audio-opus,audio-capture-pipewire -- -D warnings
-      # Software AV1 (ADR 0141): the vendored libaom builds from source with
-      # its assembly, encodes, and a host and a guest negotiate it, follow the
-      # preset off it and back. Then the two things a release must never do
-      # quietly: build without nasm, or link without the assembly.
+        run: cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom,decode-aom,audio-opus,audio-capture-pipewire -- -D warnings
+      # Software AV1 (ADR 0141, ADR 0162): the vendored libaom builds from
+      # source with its assembly, encodes and decodes, and a host and a guest
+      # negotiate it — the guest's webview or its worker. Then the two things
+      # a release must never do quietly: build without nasm, or link without
+      # the assembly.
       - name: Clippy and test software AV1
         run: |
           cargo clippy -p lumepeer-aom-sys --all-targets -- -D warnings
           cargo clippy -p lumepeer-runtime --all-targets --features encode-aom -- -D warnings
-          cargo test -p lumepeer-media --features encode-aom --lib encode::
-          cargo test -p lumepeer-runtime --features encode-aom --lib software_av1
+          cargo test -p lumepeer-media --features encode-aom,decode-aom --lib -- encode:: decode::aom
+          cargo test -p lumepeer-runtime --features encode-aom --lib -- codec software a_guest_picks a_restart_on_a_still_screen
       - name: A build without nasm fails rather than losing libaom's assembly
         run: |
           if NASM=/nonexistent/nasm CARGO_TARGET_DIR=target/no-nasm cargo build -p lumepeer-aom-sys --features vendored 2> no-nasm.log; then
@@ -87,13 +88,13 @@ jobs:
       - name: Clippy and test the VA-API encoder
         run: |
           cargo clippy -p lumepeer-media --all-targets --features encode-vaapi -- -D warnings
-          cargo test -p lumepeer-media --features encode-vaapi,encode-openh264 --lib encode::
+          cargo test -p lumepeer-media --features encode-vaapi,encode-aom --lib encode::
       - name: Clippy and test the zero-copy VA-API path
         run: |
-          cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,audio-opus,audio-capture-pipewire,encode-vaapi-zero-copy -- -D warnings
-          cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-openh264 --lib
+          cargo clippy -p lumepeer-media --all-targets --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom,audio-opus,audio-capture-pipewire,encode-vaapi-zero-copy -- -D warnings
+          cargo test -p lumepeer-media --features encode-vaapi-zero-copy,encode-aom --lib
       - name: Test the media pipeline under Xvfb
-        run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,audio-opus,audio-capture-pipewire
+        run: xvfb-run -a env LUMEPEER_TEST_XTEST=1 cargo test -p lumepeer-media --features capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom,audio-opus,audio-capture-pipewire
       - name: Capture, encode and sandboxed decode end to end
         run: xvfb-run -a cargo test -p lumepeer-integration-tests --test media_pipeline
       - name: Error matrix (§18)

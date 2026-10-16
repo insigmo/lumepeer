@@ -8,6 +8,7 @@ import {
   decodeViewChunk,
   NativeDecoder,
   nativeDecodingAvailable,
+  needsWorker,
   supportedOptionalCodecs,
   WireCodec,
 } from './view-decoder';
@@ -248,6 +249,18 @@ describe('configStringFor', () => {
 
   it('answers nothing for a codec byte it has no config for, rather than guessing', () => {
     expect(configStringFor(99 as WireCodec, keyframe([0]))).toBeNull();
+  });
+});
+
+describe('needsWorker', () => {
+  it('sends AV1 the WebView cannot decode to the worker (ADR 0162)', () => {
+    expect(needsWorker(WireCodec.Av1, [])).toBe(true);
+    expect(needsWorker(WireCodec.Av1, [WireCodec.Vp9])).toBe(true);
+  });
+
+  it('keeps AV1 the WebView decodes, and H.264 always, in the WebView', () => {
+    expect(needsWorker(WireCodec.Av1, [WireCodec.Av1])).toBe(false);
+    expect(needsWorker(WireCodec.H264, [])).toBe(false);
   });
 });
 

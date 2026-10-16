@@ -42,7 +42,7 @@
 #[cfg(feature = "encode-mf-zero-copy")]
 pub use dxgi::GpuTexture;
 #[cfg(feature = "capture-windows")]
-pub use dxgi::{WindowsCapturer, WindowsInjector};
+pub use dxgi::{WindowsCapturer, WindowsInjector, onto_virtual_desktop};
 #[cfg(all(test, feature = "encode-mf-zero-copy"))]
 pub(crate) use dxgi::{gpu_test_frame, gpu_test_frame_of};
 #[cfg(not(feature = "capture-windows"))]
@@ -90,7 +90,10 @@ mod dxgi {
         D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
         ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_ROTATE90,
+        DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE270, DXGI_SAMPLE_DESC,
+    };
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED,
         DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_NOT_CURRENTLY_AVAILABLE, DXGI_ERROR_NOT_FOUND,
@@ -118,19 +121,19 @@ mod dxgi {
         KEYEVENTF_UNICODE, LASTINPUTINFO, MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX, MOUSE_EVENT_FLAGS,
         MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT,
-        MapVirtualKeyExW, MapVirtualKeyW, SendInput, ToUnicodeEx, VIRTUAL_KEY, VK_ADD, VK_APPS,
-        VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE, VK_DIVIDE, VK_DOWN, VK_END,
-        VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN,
-        VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0, VK_NUMPAD9, VK_OEM_1, VK_OEM_2,
-        VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS,
-        VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-        VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
-        VkKeyScanExW,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MapVirtualKeyExW, MapVirtualKeyW, SendInput, ToUnicodeEx,
+        VIRTUAL_KEY, VK_ADD, VK_APPS, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DECIMAL, VK_DELETE,
+        VK_DIVIDE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
+        VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_MULTIPLY, VK_NEXT, VK_NUMLOCK, VK_NUMPAD0,
+        VK_NUMPAD9, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
+        VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR,
+        VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SCROLL, VK_SHIFT,
+        VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP, VkKeyScanExW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN,
-        SM_CYSCREEN,
+        SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
     use windows::core::{Interface as _, PCWSTR, PWSTR};
 
@@ -296,6 +299,87 @@ mod dxgi {
                 .field("height", &self.height())
                 .finish_non_exhaustive()
         }
+    }
+
+    /// A rectangle in virtual-screen pixels: `left, top, right, bottom`.
+    type DesktopRect = (i32, i32, i32, i32);
+
+    /// Where on the desktop the monitor this process last opened a
+    /// duplication of sits (ADR 0162).
+    ///
+    /// A guest normalizes its pointer against the picture, and the picture is
+    /// whichever monitor it picked. The injectors mapped every position onto
+    /// the primary monitor whatever the picture showed, so a guest that
+    /// switched to a second screen moved the host's cursor about on the first.
+    /// `None` until a duplication opens, when a position maps onto the primary
+    /// monitor — the one a session's first picture shows.
+    static CAPTURED_MONITOR: std::sync::Mutex<Option<DesktopRect>> = std::sync::Mutex::new(None);
+
+    /// A pointer position normalized over the captured monitor (§9.1), as
+    /// `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` reads one: normalized
+    /// over the whole virtual desktop (ADR 0162).
+    ///
+    /// Done in the process that captures, because that is the one that knows
+    /// which monitor the guest is looking at: the injector that performs the
+    /// move may be another process altogether (ADR 0114).
+    pub fn onto_virtual_desktop(x: u16, y: u16) -> (u16, u16) {
+        let monitor = CAPTURED_MONITOR
+            .lock()
+            .ok()
+            .and_then(|captured| *captured)
+            .unwrap_or_else(primary_rect);
+        normalize_onto(x, y, monitor, virtual_screen())
+    }
+
+    /// The primary monitor: its upper-left corner is the virtual screen's
+    /// origin (see [`Monitor::is_primary`]).
+    fn primary_rect() -> DesktopRect {
+        // SAFETY: `GetSystemMetrics` takes an index by value and returns an
+        // `i32`; it borrows nothing and answers 0 for an index it does not
+        // know.
+        let (width, height) =
+            unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        (0, 0, width, height)
+    }
+
+    /// The bounding rectangle of every monitor, which is what
+    /// `MOUSEEVENTF_VIRTUALDESK` normalizes over.
+    fn virtual_screen() -> DesktopRect {
+        // SAFETY: as `primary_rect`.
+        let (left, top, width, height) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        (
+            left,
+            top,
+            left.saturating_add(width),
+            top.saturating_add(height),
+        )
+    }
+
+    /// The pure half of [`onto_virtual_desktop`]: the pixel `x`/`y` names on
+    /// `monitor`, normalized over `desktop`.
+    fn normalize_onto(x: u16, y: u16, monitor: DesktopRect, desktop: DesktopRect) -> (u16, u16) {
+        let axis = |value: u16, (low, high): (i32, i32), (desk_low, desk_high): (i32, i32)| {
+            let span = (high - low).max(1);
+            let pixel = low + i32::from(value) * (span - 1) / ABSOLUTE_RANGE;
+            let desk_span = i64::from((desk_high - desk_low).max(2) - 1);
+            // Rounded up, so reading it back the way `absolute_pixels` does,
+            // rounding down, names the same pixel.
+            let normalized = (i64::from(pixel - desk_low) * i64::from(ABSOLUTE_RANGE) + desk_span
+                - 1)
+                / desk_span;
+            u16::try_from(normalized.clamp(0, i64::from(ABSOLUTE_RANGE))).unwrap_or(u16::MAX)
+        };
+        (
+            axis(x, (monitor.0, monitor.2), (desktop.0, desktop.2)),
+            axis(y, (monitor.1, monitor.3), (desktop.1, desktop.3)),
+        )
     }
 
     /// Every monitor currently attached to the desktop, in DXGI enumeration
@@ -467,6 +551,12 @@ mod dxgi {
         /// drives delivery (§11.1).
         awaiting_first_frame: bool,
         started_at: Instant,
+        /// How the monitor is turned (ADR 0162). Desktop Duplication hands the
+        /// desktop back as the panel scans it out, so a monitor turned to
+        /// portrait arrives landscape, on its side, and has to be turned back
+        /// before anybody sees it. A change of it is a mode change, which
+        /// loses the duplication and opens a new one.
+        rotation: DXGI_MODE_ROTATION,
     }
 
     // As `Monitor` above: COM state is not printable and must never be logged.
@@ -483,6 +573,12 @@ mod dxgi {
         /// Opens a duplication of the monitor `target` names.
         fn open(target: CaptureTarget) -> Result<Self> {
             let monitor = select(attached_monitors()?, target)?;
+            // Before the duplication itself, which a secure desktop can refuse:
+            // the monitor is the one the guest picked either way.
+            let area = monitor.desc.DesktopCoordinates;
+            if let Ok(mut captured) = CAPTURED_MONITOR.lock() {
+                *captured = Some((area.left, area.top, area.right, area.bottom));
+            }
 
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
@@ -589,7 +685,18 @@ mod dxgi {
                 device_name: output_desc.DeviceName,
                 awaiting_first_frame: true,
                 started_at: Instant::now(),
+                rotation: desc.Rotation,
             })
+        }
+
+        /// The size of the picture as the desktop shows it: the duplicated
+        /// surface's, turned upright (ADR 0162).
+        const fn picture_size(&self) -> (u32, u32) {
+            if quarter_turns(self.rotation) % 2 == 1 {
+                (self.staging.height, self.staging.width)
+            } else {
+                (self.staging.width, self.staging.height)
+            }
         }
 
         /// One `AcquireNextFrame`/`ReleaseFrame` cycle.
@@ -601,11 +708,10 @@ mod dxgi {
             // snapshot answers that; from here on duplication drives
             // delivery.
             if self.awaiting_first_frame {
-                let data = gdi_snapshot(
-                    &self.device_name,
-                    self.staging.width.cast_signed(),
-                    self.staging.height.cast_signed(),
-                )?;
+                let data = {
+                    let (width, height) = self.picture_size();
+                    gdi_snapshot(&self.device_name, width.cast_signed(), height.cast_signed())?
+                };
                 self.last_frame_data = Some(data.clone());
                 self.awaiting_first_frame = false;
                 return Ok(self.finish_frame(data));
@@ -701,11 +807,8 @@ mod dxgi {
             if let Acquired::Present(Some(frame)) = self.acquire(0)? {
                 return Ok(Some(frame));
             }
-            let data = gdi_snapshot(
-                &self.device_name,
-                self.staging.width.cast_signed(),
-                self.staging.height.cast_signed(),
-            )?;
+            let (width, height) = self.picture_size();
+            let data = gdi_snapshot(&self.device_name, width.cast_signed(), height.cast_signed())?;
             self.last_frame_data = Some(data.clone());
             let data = self.with_cursor(data);
             self.last_hash = Some(*blake3::hash(&data).as_bytes());
@@ -808,8 +911,11 @@ mod dxgi {
             // so is the hash that answers §11.1. A guest that draws its own
             // cursor (`FEATURE_CURSOR_SHAPE`) has already turned the first
             // one off, and the second goes with it.
+            //
+            // A turned monitor stays on this path too: turning the picture
+            // back is a CPU pass as well (ADR 0162).
             #[cfg(feature = "encode-mf-zero-copy")]
-            if self.gpu_ready && !self.embed_cursor {
+            if self.gpu_ready && !self.embed_cursor && quarter_turns(self.rotation) == 0 {
                 return self.gpu_frame(&texture, width, height);
             }
 
@@ -821,7 +927,12 @@ mod dxgi {
                 self.context.CopyResource(&self.staging.texture, &texture);
             }
 
-            let data = read_back(&self.context, &self.staging.texture, width, height)?;
+            let data = turn_upright(
+                read_back(&self.context, &self.staging.texture, width, height)?,
+                width,
+                height,
+                quarter_turns(self.rotation),
+            );
             // Cached cursor-free, so a later pointer-only update (above) has
             // a clean base to redraw the cursor onto instead of compositing
             // on top of wherever it last was.
@@ -861,13 +972,8 @@ mod dxgi {
                 && let (Some(pos), Some(shape)) =
                     (self.pointer_position, self.pointer_shape.as_ref())
             {
-                composite_pointer(
-                    &mut data,
-                    self.staging.width,
-                    self.staging.height,
-                    pos,
-                    shape,
-                );
+                let (width, height) = self.picture_size();
+                composite_pointer(&mut data, width, height, pos, shape);
             }
             data
         }
@@ -876,13 +982,8 @@ mod dxgi {
         fn cpu_frame(&self, data: Vec<u8>) -> Frame {
             let timestamp_us =
                 u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            Frame::cpu(
-                self.staging.width,
-                self.staging.height,
-                PixelFormat::Bgra8,
-                timestamp_us,
-                data,
-            )
+            let (width, height) = self.picture_size();
+            Frame::cpu(width, height, PixelFormat::Bgra8, timestamp_us, data)
         }
 
         /// Hands the acquired desktop surface on as a GPU texture, without it
@@ -1755,6 +1856,61 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
                 "desktop duplication mapped an unusable frame buffer".to_owned(),
             )
         })
+    }
+
+    /// How many quarter turns clockwise take a duplicated surface of a monitor
+    /// turned by `rotation` to the desktop as it is shown (ADR 0162).
+    ///
+    /// Desktop Duplication hands the surface back unturned, the way the panel
+    /// scans it out: Microsoft's duplication sample draws a `ROTATE90`
+    /// surface's top-left corner at the desktop's top-right, so `ROTATE90` is
+    /// one quarter turn clockwise and `ROTATE270` three.
+    const fn quarter_turns(rotation: DXGI_MODE_ROTATION) -> u8 {
+        match rotation {
+            DXGI_MODE_ROTATION_ROTATE90 => 1,
+            DXGI_MODE_ROTATION_ROTATE180 => 2,
+            DXGI_MODE_ROTATION_ROTATE270 => 3,
+            // `IDENTITY`, and `UNSPECIFIED`, which a duplication never reports.
+            _ => 0,
+        }
+    }
+
+    /// A tightly packed BGRA8 picture `width` x `height`, turned `turns`
+    /// quarter turns clockwise. A picture with no turn comes back as it was.
+    fn turn_upright(data: Vec<u8>, width: u32, height: u32, turns: u8) -> Vec<u8> {
+        /// Pixels per side of the square the copy walks in, so both the rows
+        /// it reads and the rows it writes stay in cache.
+        const TILE: usize = 64;
+
+        if turns.is_multiple_of(4) {
+            return data;
+        }
+        let (width, height) = (width as usize, height as usize);
+        let (out_width, out_height) = if turns % 2 == 1 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let mut out = vec![0u8; data.len()];
+        for tile_y in (0..out_height).step_by(TILE) {
+            for tile_x in (0..out_width).step_by(TILE) {
+                for y in tile_y..(tile_y + TILE).min(out_height) {
+                    for x in tile_x..(tile_x + TILE).min(out_width) {
+                        // The source pixel the upright one at `x`, `y` is.
+                        let (from_x, from_y) = match turns % 4 {
+                            1 => (y, height - 1 - x),
+                            2 => (width - 1 - x, height - 1 - y),
+                            _ => (width - 1 - y, x),
+                        };
+                        let from = (from_y * width + from_x) * BYTES_PER_PIXEL;
+                        let to = (y * out_width + x) * BYTES_PER_PIXEL;
+                        out[to..to + BYTES_PER_PIXEL]
+                            .copy_from_slice(&data[from..from + BYTES_PER_PIXEL]);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A cursor bitmap as `GetFramePointerShape` hands it back: still in
@@ -3551,10 +3707,6 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
             }])
         }
 
-        /// `x`/`y` are already normalized to 0..=65535 of the captured surface
-        /// (§9.1), which is exactly `MOUSEEVENTF_ABSOLUTE`'s coordinate space
-        /// for the primary monitor — the same surface `CaptureTarget::
-        /// PrimaryDisplay` captures — so no scaling is needed here.
         /// One mouse event carrying `dx`/`dy` under `flags`.
         fn mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> Result<()> {
             Self::send(&[INPUT {
@@ -3572,23 +3724,26 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
             }])
         }
 
-        /// Where a normalized position lands on the primary display.
+        /// Where a position normalized over the virtual desktop lands, in
+        /// virtual-screen pixels — the coordinates `GetCursorPos` answers in.
         ///
-        /// The primary display and not the virtual desktop, because that is
-        /// what `MOUSEEVENTF_ABSOLUTE` without `MOUSEEVENTF_VIRTUALDESK`
-        /// normalizes to — this is the read-back of the very mapping
-        /// `Self::mouse` is about to use, so it has to be the same one.
+        /// The virtual desktop, because that is what `MOUSEEVENTF_ABSOLUTE`
+        /// with `MOUSEEVENTF_VIRTUALDESK` normalizes to, and the host has
+        /// already mapped the guest's position onto it from the monitor the
+        /// guest is looking at ([`onto_virtual_desktop`], ADR 0162) — this is
+        /// the read-back of the very mapping `Self::mouse` is about to use,
+        /// so it has to be the same one.
         fn absolute_pixels(x: u16, y: u16) -> (i32, i32) {
-            // SAFETY: `GetSystemMetrics` takes an index by value and returns
-            // an `i32`. It borrows nothing and answers 0 for an index it does
-            // not know, which the `max(1)` below turns into a harmless
-            // one-pixel screen rather than a division by zero.
-            let (width, height) =
-                unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            let (left, top, right, bottom) = virtual_screen();
+            // A metric that could not be read is a one-pixel screen here
+            // rather than a division by zero.
             let across = |value: u16, span: i32| {
                 (i32::from(value) * (span.max(1) - 1).max(1)) / ABSOLUTE_RANGE
             };
-            (across(x, width), across(y, height))
+            (
+                left + across(x, right - left),
+                top + across(y, bottom - top),
+            )
         }
 
         /// Where the pointer actually is, or `None` when this desktop will
@@ -3640,7 +3795,7 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
             Self::mouse(
                 i32::from(x),
                 i32::from(y),
-                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
             )?;
             // A desktop that will not report the cursor tells this nothing
             // either way, so it changes nothing either way.
@@ -3767,6 +3922,79 @@ float4 reduce(float4 position : SV_Position) : SV_Target {
         use std::sync::Mutex;
 
         use super::*;
+
+        /// A guest's position lands on the monitor it is looking at, wherever
+        /// that monitor sits on the virtual desktop (ADR 0162).
+        #[test]
+        fn a_pointer_lands_on_the_captured_monitor() {
+            // The pixel `onto` names, read back the way `absolute_pixels` reads
+            // a virtual-desktop position.
+            let back = |(x, y): (u16, u16), desktop: DesktopRect| {
+                let across =
+                    |value: u16, span: i32| (i32::from(value) * (span - 1)) / ABSOLUTE_RANGE;
+                (
+                    desktop.0 + across(x, desktop.2 - desktop.0),
+                    desktop.1 + across(y, desktop.3 - desktop.1),
+                )
+            };
+            let close = |(ax, ay): (i32, i32), (bx, by): (i32, i32)| {
+                (ax - bx).abs() <= 1 && (ay - by).abs() <= 1
+            };
+            // One monitor: the virtual desktop is the monitor, and nothing moves.
+            let single = (0, 0, 1920, 1080);
+            assert_eq!(normalize_onto(0, 0, single, single), (0, 0));
+            assert_eq!(
+                normalize_onto(u16::MAX, u16::MAX, single, single),
+                (u16::MAX, u16::MAX)
+            );
+            // A second monitor to the right of a 4K primary, and one above-left.
+            let desktop = (-1080, -1920, 3840 + 2560, 2160);
+            let right = (3840, 0, 3840 + 2560, 1440);
+            let above_left = (-1080, -1920, 0, 0);
+            for (monitor, (x, y), pixel) in [
+                (right, (0, 0), (3840, 0)),
+                (right, (u16::MAX, u16::MAX), (3840 + 2559, 1439)),
+                (right, (32_768, 32_768), (3840 + 1279, 719)),
+                (above_left, (0, 0), (-1080, -1920)),
+                (above_left, (u16::MAX, u16::MAX), (-1, -1)),
+            ] {
+                let landed = back(normalize_onto(x, y, monitor, desktop), desktop);
+                assert!(
+                    close(landed, pixel),
+                    "{monitor:?} {x},{y}: {landed:?}, not {pixel:?}"
+                );
+            }
+        }
+
+        /// A monitor turned to portrait comes out portrait, the right way up
+        /// (ADR 0162): the duplicated surface is the panel's, on its side.
+        #[test]
+        fn a_turned_monitor_is_turned_back_upright() {
+            // 3 x 2, each pixel's first byte its index: 0 1 2 / 3 4 5.
+            let surface: Vec<u8> = (0u8..6).flat_map(|index| [index, 0, 0, 255]).collect();
+            let firsts =
+                |picture: &[u8]| picture.chunks(4).map(|pixel| pixel[0]).collect::<Vec<_>>();
+            assert_eq!(quarter_turns(DXGI_MODE_ROTATION_ROTATE90), 1);
+            assert_eq!(quarter_turns(DXGI_MODE_ROTATION_ROTATE270), 3);
+            assert_eq!(
+                quarter_turns(windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION_IDENTITY),
+                0
+            );
+            // A quarter turn clockwise: the top-left corner ends up top-right.
+            assert_eq!(
+                firsts(&turn_upright(surface.clone(), 3, 2, 1)),
+                [3, 0, 4, 1, 5, 2]
+            );
+            assert_eq!(
+                firsts(&turn_upright(surface.clone(), 3, 2, 2)),
+                [5, 4, 3, 2, 1, 0]
+            );
+            assert_eq!(
+                firsts(&turn_upright(surface.clone(), 3, 2, 3)),
+                [2, 5, 1, 4, 0, 3]
+            );
+            assert_eq!(turn_upright(surface.clone(), 3, 2, 0), surface);
+        }
 
         /// The keep-awake never wakes a desktop that may have gone idle, never
         /// piles onto input that just happened, and does nothing when it

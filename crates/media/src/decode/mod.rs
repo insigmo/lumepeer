@@ -44,6 +44,21 @@ pub use self::shm::{RING_SLOTS, SLOT_PAYLOAD_BYTES, SharedRing, Slot};
 #[cfg(windows)]
 pub use self::windows_sandbox::verify_confined as windows_verify_confined;
 
+/// libaom's AV1 decoder, which the worker decodes with (ADR 0162).
+///
+/// `unsafe` for the same reason `encode::aom` is: every libaom call crosses
+/// into C through `lumepeer-aom-sys`'s shim, and each block carries its
+/// `SAFETY:` note (§21).
+#[cfg(all(
+    feature = "decode-aom",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+#[allow(
+    unsafe_code,
+    reason = "libaom is C; every call through lumepeer-aom-sys is `unsafe`. See ADR 0162."
+)]
+pub mod aom;
 #[cfg(target_os = "macos")]
 mod macos_sandbox;
 #[cfg(windows)]

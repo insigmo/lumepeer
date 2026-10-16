@@ -39,7 +39,7 @@ image.
 
 The workspace's own release pipeline (`.github/workflows/release.yml`)
 already publishes a `linux-arm64 (deb/rpm)` row built on `ubuntu-24.04-arm`
-with `capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264`. Rather than cross-compile
+with `capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom`. Rather than cross-compile
 locally under this session's own disk constraints, the **prebuilt release
 artifact** was used: `Lumepeer_0.0.62_arm64.deb` from
 [release v0.0.62](https://github.com/insigmo/lumepeer/releases/tag/v0.0.62),
@@ -170,7 +170,7 @@ honestly for what they reached given the keystore gate above:
 would be needed to reach a live capture session — this session could not
 get a keyring unlocked (see above), so the **X11 capture/encode path itself**
 was verified independently, directly through `lumepeer-media`
-(`capture-x11,encode-openh264` features), not through the full desktop app —
+(`capture-x11,encode-aom` features), not through the full desktop app —
 see "Software `openh264` numbers" below. This is a real, on-hardware
 measurement of the same `X11Capturer`/`select_encoder` code path the app
 uses; it is just not wrapped in the app's own network/session layer.
@@ -221,7 +221,7 @@ was missing.
 Because the full app could not get past the keystore gate, real numbers for
 the capture→encode path were measured directly against
 `lumepeer-media`'s own public API (`X11Capturer` + `select_encoder`,
-`capture-x11,encode-openh264` features), built **natively on the Pi**
+`capture-x11,encode-aom` features), built **natively on the Pi**
 (`rustup` stable 1.98.1/aarch64, `cmake`/`build-essential` installed for
 `openh264-sys2`'s vendored C++ build, which compiled with
 `HAVE_NEON_AARCH64` — the real NEON-optimized path, not a generic fallback).

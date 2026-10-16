@@ -4406,11 +4406,10 @@ pub struct HostBarExpandArgs {
 /// exists because the window is undecorated: there is no chrome for the user
 /// to resize it by, so the page asks for the size its own state needs.
 ///
-/// The right edge stays where it is across the change, so a bar the host
-/// dragged somewhere stays there and one docked to the screen edge does not
-/// walk inwards every time it is opened. The result is clamped to the monitor
-/// the bar is on, so a collapse near the left edge cannot push the open card
-/// off the screen.
+/// The right edge stays where it is across the change, so the bar docked to
+/// the screen edge (`keep_host_bar_docked`) does not walk inwards every time
+/// it is opened. The result is clamped to the monitor the bar is on, so the
+/// open card cannot end up partly off the screen.
 ///
 /// # Errors
 /// Rejects calls from any window but the bar itself. A bar that is not up is

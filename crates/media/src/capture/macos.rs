@@ -49,7 +49,7 @@ mod screen_capture_kit {
         reason = "every ScreenCaptureKit/CoreMedia/CoreVideo entry point in the objc2 bindings is an `unsafe fn` because it crosses into Objective-C, and the SCStreamOutput delegate must be a real Objective-C class. Every block below carries a SAFETY note, per §21. See ADR 0013."
     )]
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
     use std::time::{Duration, Instant};
 
@@ -62,10 +62,9 @@ mod screen_capture_kit {
     use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{
         CGBitmapContextCreate, CGColorSpace, CGContext, CGDirectDisplayID, CGDisplayBounds,
-        CGDisplayPixelsHigh, CGDisplayPixelsWide, CGEvent, CGEventTapLocation, CGEventType,
-        CGImageAlphaInfo, CGImageByteOrderInfo, CGKeyCode, CGMainDisplayID, CGMouseButton,
-        CGPreflightPostEventAccess, CGRequestPostEventAccess, CGScrollEventUnit,
-        kCGDisplayStreamYCbCrMatrix_ITU_R_601_4,
+        CGEvent, CGEventTapLocation, CGEventType, CGImageAlphaInfo, CGImageByteOrderInfo,
+        CGKeyCode, CGMainDisplayID, CGMouseButton, CGPreflightPostEventAccess,
+        CGRequestPostEventAccess, CGScrollEventUnit, kCGDisplayStreamYCbCrMatrix_ITU_R_601_4,
     };
     use objc2_core_media::{CMSampleBuffer, CMTime};
     use objc2_core_video::{
@@ -142,6 +141,12 @@ mod screen_capture_kit {
     /// of failing first (ADR 0157). A window server that cannot convert now
     /// will not learn to before the process ends.
     static NV12_REFUSED: AtomicBool = AtomicBool::new(false);
+
+    /// The display this process last started capturing, 0 before the first
+    /// (ADR 0162). The injector maps a guest's pointer onto it: the guest
+    /// normalizes against the picture, and the picture is whichever display it
+    /// picked, which `MonitorSelect` tells the capturer and nothing else.
+    static CAPTURED_DISPLAY: AtomicU32 = AtomicU32::new(0);
 
     /// `kCVPixelBufferLock_ReadOnly`. Named rather than inlined because the
     /// lock and the matching unlock must be passed the identical flags:
@@ -1508,6 +1513,7 @@ mod screen_capture_kit {
             };
 
             self.target = target;
+            CAPTURED_DISPLAY.store(display_id, Ordering::Relaxed);
             self.active = Some(Active {
                 stream,
                 _sink: sink,
@@ -2195,21 +2201,16 @@ mod screen_capture_kit {
         }
     }
 
-    /// The primary display's size in points as it is now, or `None` while it
-    /// reads 0x0.
-    fn main_display_size() -> Option<(f64, f64)> {
-        let display = CGMainDisplayID();
-        let width = CGDisplayPixelsWide(display);
-        let height = CGDisplayPixelsHigh(display);
-        // A real display's pixel width/height is nowhere near f64's 2^52
-        // exact-integer ceiling, so the precision this could lose in
-        // principle never actually happens.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "display pixel counts stay far below f64's 52-bit exact-integer range"
-        )]
-        let size = (width as f64, height as f64);
-        (width > 0 && height > 0).then_some(size)
+    /// Where the captured display sits as it is now, in the global points
+    /// `CGEvent` positions are given in, or `None` while it has no size. The
+    /// primary display before anything was captured (ADR 0162).
+    fn captured_display_area() -> Option<CGRect> {
+        let display = match CAPTURED_DISPLAY.load(Ordering::Relaxed) {
+            0 => CGMainDisplayID(),
+            display => display,
+        };
+        let area = CGDisplayBounds(display);
+        (area.size.width > 0.0 && area.size.height > 0.0).then_some(area)
     }
 
     /// Input injection through `CGEvent`, posted at the HID tap so it reaches
@@ -2225,14 +2226,16 @@ mod screen_capture_kit {
     /// own (§18).
     #[derive(Debug)]
     pub struct MacosInjector {
-        /// Primary display size in points, re-read on every `PointerMove`
-        /// (the last nonzero answer is kept). Read once at `connect` only, it
-        /// went stale the moment the display changed mode: a VM leaving full
-        /// screen goes from 1920x1080 to 1718x920 under a running host, and
-        /// every move then landed scaled by the old size — right at the
-        /// top-left corner, ever further off towards the bottom-right.
-        width: f64,
-        height: f64,
+        /// The captured display's place in global points, re-read on every
+        /// `PointerMove` (the last nonzero answer is kept). Read once at
+        /// `connect` only, it went stale the moment the display changed mode:
+        /// a VM leaving full screen goes from 1920x1080 to 1718x920 under a
+        /// running host, and every move then landed scaled by the old size —
+        /// right at the top-left corner, ever further off towards the
+        /// bottom-right. The captured display rather than the primary one,
+        /// because a guest that picked another screen had its moves land on
+        /// the primary one (ADR 0162).
+        area: CGRect,
         /// Wherever `PointerMove` last put the pointer. `Press`/`Release`
         /// carry no coordinate of their own (`view-window.ts`'s `sink.press`
         /// takes no x/y at all — the guest always moves, then clicks), and
@@ -2257,18 +2260,17 @@ mod screen_capture_kit {
 
     impl MacosInjector {
         /// # Errors
-        /// [`MediaError::InputUnavailable`] if the primary display's size
+        /// [`MediaError::InputUnavailable`] if the captured display's size
         /// cannot be read — implausible on a running desktop, but this keeps
         /// `PointerMove` from ever scaling against a size it never checked.
         pub fn connect() -> Result<Self> {
-            let Some((width, height)) = main_display_size() else {
+            let Some(area) = captured_display_area() else {
                 return Err(MediaError::InputUnavailable(
-                    "cannot read the primary display's size".to_owned(),
+                    "cannot read the captured display's size".to_owned(),
                 ));
             };
             Ok(Self {
-                width,
-                height,
+                area,
                 last_position: CGPoint { x: 0.0, y: 0.0 },
                 held: None,
                 may_post: may_post_events(),
@@ -2395,12 +2397,15 @@ mod screen_capture_kit {
 
         /// `x`/`y` are normalized to 0..=65535 of the captured surface
         /// (§9.1); `CGEvent`'s mouse position is in points from the primary
-        /// display's top-left, so this scales by the size `inject` just read
-        /// — the same role `X11Injector::to_screen` plays.
+        /// display's top-left, so this scales by the captured display's size
+        /// `inject` just read and moves to where that display sits — the same
+        /// role `X11Injector::onto` plays.
         fn point(&self, x: u16, y: u16) -> CGPoint {
             CGPoint {
-                x: f64::from(x) * self.width / f64::from(POINTER_RANGE),
-                y: f64::from(y) * self.height / f64::from(POINTER_RANGE),
+                x: self.area.origin.x
+                    + f64::from(x) * self.area.size.width / f64::from(POINTER_RANGE),
+                y: self.area.origin.y
+                    + f64::from(y) * self.area.size.height / f64::from(POINTER_RANGE),
             }
         }
 
@@ -2431,9 +2436,8 @@ mod screen_capture_kit {
             }
             match event.detail {
                 InputDetail::PointerMove { x, y } => {
-                    if let Some((width, height)) = main_display_size() {
-                        self.width = width;
-                        self.height = height;
+                    if let Some(area) = captured_display_area() {
+                        self.area = area;
                     }
                     self.last_position = self.point(x, y);
                     let (event_type, button) = match self.held {
@@ -2655,8 +2659,11 @@ mod screen_capture_kit {
                 scancode: 0,
                 modifiers: 0,
                 detail: InputDetail::PointerMove {
-                    x: normalize(current.x, injector.width),
-                    y: normalize(current.y, injector.height),
+                    x: normalize(current.x - injector.area.origin.x, injector.area.size.width),
+                    y: normalize(
+                        current.y - injector.area.origin.y,
+                        injector.area.size.height,
+                    ),
                 },
             };
             match injector.inject(&payload) {

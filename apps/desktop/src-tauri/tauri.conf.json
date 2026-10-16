@@ -11,6 +11,7 @@
     "beforeBundleCommand": "npm run glibc-floor"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",

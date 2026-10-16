@@ -4231,7 +4231,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumepeer-aom-sys"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "cc",
  "cmake",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-broker"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "anyhow",
  "axum",
@@ -4259,7 +4259,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-core"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "argon2",
  "blake3",
@@ -4283,12 +4283,11 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-decoder-worker"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "anyhow",
  "libc",
  "lumepeer-media",
- "openh264",
  "seccompiler",
  "tracing",
  "tracing-subscriber",
@@ -4296,7 +4295,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-desktop"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4341,7 +4340,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-guestkeys"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "lumepeer-core",
  "tracing",
@@ -4352,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-host"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "lumepeer-core",
@@ -4368,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-integration-tests"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -4386,7 +4385,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-media"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "ashpd",
  "blake3",
@@ -4410,8 +4409,6 @@ dependencies = [
  "objc2-foundation",
  "objc2-screen-capture-kit",
  "objc2-video-toolbox",
- "openh264",
- "openh264-sys2",
  "opus",
  "pipewire",
  "scap",
@@ -4424,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-net"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -4462,7 +4459,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-runtime"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4494,7 +4491,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-service"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "rand 0.10.2",
  "rustix",
@@ -4505,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-terminal"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "nix 0.28.0",
  "portable-pty",
@@ -4515,7 +4512,7 @@ dependencies = [
 
 [[package]]
 name = "lumepeer-terminal-worker"
-version = "0.0.145"
+version = "0.0.152"
 dependencies = [
  "lumepeer-terminal",
  "windows 0.61.3",
@@ -4775,15 +4772,6 @@ dependencies = [
  "derive_more",
  "n0-error",
  "n0-future",
-]
-
-[[package]]
-name = "nasm-rs"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "706bf8a5e8c8ddb99128c3291d31bd21f4bcde17f0f4c20ec678d85c74faa149"
-dependencies = [
- "log",
 ]
 
 [[package]]
@@ -5650,27 +5638,6 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
-name = "openh264"
-version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcc9071a0b5f9c501ddd01066c2600d922cc799dc450a52975222bcda7755a08"
-dependencies = [
- "openh264-sys2",
- "wide",
-]
-
-[[package]]
-name = "openh264-sys2"
-version = "0.9.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ada29a4cadc13d4d326737af87c13e224210d7d99fe47594e9f3f9b0102fd70"
-dependencies = [
- "cc",
- "nasm-rs",
- "walkdir",
-]
 
 [[package]]
 name = "openssl-probe"
@@ -6902,15 +6869,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safe_arch"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42c6efa15875e6ecb39ca61fb0b0c1a40b84fac5a5ffe71eef7d1000c8eb3f5f"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "same-file"
@@ -9579,16 +9537,6 @@ dependencies = [
  "libredox",
  "wasite",
  "web-sys",
-]
-
-[[package]]
-name = "wide"
-version = "1.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cf05ca94c9fba0c51316899caa1d1e74a064fc310a5efa7375e614343d415be"
-dependencies = [
- "bytemuck",
- "safe_arch",
 ]
 
 [[package]]

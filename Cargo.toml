@@ -82,7 +82,6 @@ winreg = "0.56.0"
 config = "0.15.25"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md
 scap = "=0.1.0-beta.1" # `scap = "0.1"` in §5 does not resolve: only pre-releases exist
-openh264 = "0.9"       # §5 says 0.6; 0.6 is long unmaintained
 # Not named in §5; see docs/adr/0004-phase-1-transport-dependencies.md.
 rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)
@@ -113,7 +112,12 @@ memmap2 = "0.9"         # shared memory ring buffer for decoder IPC (§11.3)
 seccompiler = "0.5"     # seccomp-BPF filter for the decoder worker (§11.3)
 libc = "0.2"            # syscall numbers for that filter
 
-tauri = { version = "2", features = ["tray-icon"] }
+# `macos-private-api`: a transparent window on macOS is behind Tauri's
+# private-API switch, and the host's session bar is one — without it the
+# corners its rounding leaves were drawn white round the card (ADR 0162).
+# `tauri.conf.json` turns on the same switch (`macOSPrivateApi`), which
+# `tauri-build` checks against this feature; both do nothing off macOS.
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-updater = "2"
 # Native file/directory pickers for §9.2, used **only** from Rust. The

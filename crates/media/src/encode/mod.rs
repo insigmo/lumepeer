@@ -1,11 +1,12 @@
 //! Encoder selection: hardware first, software fallback second (design doc
 //! §11, §18).
 //!
-//! H.264 baseline/main is the mandatory desktop baseline, and AV1 is what a
+//! H.264 is the desktop baseline a hardware encoder gives, and AV1 is what a
 //! session prefers whenever both sides have hardware for it (ADR 0069, ADR
-//! 0072). The one exception to "hardware on both sides" is software AV1 on a
-//! host with no hardware encoder at all, under the conditions of ADR 0141
-//! that `choose_media_codec` checks. Opus is the only audio codec.
+//! 0072). The one software encoder is libaom's AV1, for a host with no
+//! hardware encoder for the session (ADR 0141, ADR 0162): the `openh264`
+//! H.264 fallback is gone, so there is no H.264 without hardware. Opus is the
+//! only audio codec.
 
 use lumepeer_core::constants::{ENCODE_DEFAULT_BITRATE_KBPS, ENCODE_DEFAULT_FPS};
 
@@ -19,11 +20,11 @@ use crate::error::{MediaError, Result};
 /// encoder's own name for the same closed set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
-    /// Mandatory desktop baseline.
+    /// The desktop baseline, from a hardware encoder only (ADR 0162).
     H264,
-    /// Preferred over the baseline, but only with mutual hardware support
-    /// (ADR 0069, ADR 0072) — or, on a host with no hardware encoder, in
-    /// software under ADR 0141's conditions.
+    /// Preferred over the baseline with mutual hardware support (ADR 0069,
+    /// ADR 0072), and the one codec a host encodes in software: libaom, where
+    /// it has no hardware encoder for the session (ADR 0141, ADR 0162).
     Av1,
 }
 
@@ -32,10 +33,8 @@ pub enum VideoCodec {
 pub enum EncoderKind {
     /// Platform hardware encoder.
     Hardware,
-    /// `openh264` software fallback, allowed only past the resource gate.
-    SoftwareOpenH264,
-    /// libaom's realtime AV1 in software, for a host with no hardware
-    /// encoder that passed its own measurement (ADR 0141).
+    /// libaom's realtime AV1 in software, the one software encoder (ADR 0141,
+    /// ADR 0162).
     SoftwareAv1,
 }
 
@@ -186,8 +185,8 @@ pub fn probe_hardware(config: EncoderConfig) -> Option<EncoderKind> {
     None
 }
 
-/// Selects an encoder: hardware if available, otherwise the software fallback
-/// when it passes the resource gate (§18).
+/// Selects an encoder: hardware if available, otherwise libaom for AV1
+/// (§18; ADR 0162).
 ///
 /// # Errors
 /// [`MediaError::EncoderUnavailable`] when neither path is usable; the UI must
@@ -197,33 +196,13 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
     // it is computed once rather than once per branch below.
     let hardware = probe_hardware(config);
 
-    if config.codec != VideoCodec::H264 && hardware != Some(EncoderKind::Hardware) {
-        // ADR 0141: the one software encoder above the baseline. Whether a
-        // session may have it — a guest that decodes AV1, no hardware
-        // encoder here, the 30 fps preset, a picture of at most 1080p, and a
-        // measurement this host passed — is `choose_media_codec`'s rule, and
-        // it is the only caller that ever asks for AV1. What is checked here
-        // is only what is fixed for the life of the process, so the answer
-        // cannot change between the codec being announced on the wire and
-        // the encoder being built for it.
-        if config.codec == VideoCodec::Av1 && software_av1::built() && software_av1::cpu_supported()
-        {
-            #[cfg(all(
-                feature = "encode-aom",
-                target_arch = "x86_64",
-                any(target_os = "windows", target_os = "linux")
-            ))]
-            {
-                tracing::info!("no hardware AV1 encoder, using libaom in software (ADR 0141)");
-                return aom::AomEncoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>);
-            }
-        }
-        // §11: otherwise an optional codec is only ever used with mutual
-        // hardware support.
-        return Err(MediaError::EncoderUnavailable(format!(
-            "{:?} needs hardware support on both sides, and this host has no software encoder for it",
-            config.codec
-        )));
+    if config.codec == VideoCodec::Av1 && hardware != Some(EncoderKind::Hardware) {
+        // The one software encoder (ADR 0141, ADR 0162). When a session gets
+        // it is `choose_media_codec`'s rule; what is checked here is only
+        // what is fixed for the life of the process, so the answer cannot
+        // change between the codec being announced on the wire and the
+        // encoder being built for it.
+        return select_software_encoder(config);
     }
 
     if let Some(EncoderKind::Hardware) = hardware {
@@ -242,13 +221,12 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
             tracing::info!("hardware H.264 encoder available, using VA-API (§18)");
             // Deliberately not `?`: a probe that succeeded and a constructor
             // that then failed is a driver that changed its mind between two
-            // calls a microsecond apart — rare, but a session is worth more
-            // than being right about it, so it falls through to openh264
-            // below with a log line rather than failing (§18, ADR 0040).
+            // calls a microsecond apart — rare, and the error below says so
+            // (§18, ADR 0040).
             match linux_vaapi::VaapiEncoder::new(config) {
                 Ok(encoder) => return Ok(Box::new(encoder) as Box<dyn VideoEncoder>),
                 Err(error) => {
-                    tracing::info!(%error, "the VA-API encoder probed available but would not build; falling back to openh264");
+                    tracing::info!(%error, "the VA-API encoder probed available but would not build");
                 }
             }
         }
@@ -259,19 +237,17 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
             // is not: the probe has already opened a session and encoded a
             // frame through it, so a constructor that then fails is the
             // framework changing its mind between two calls a microsecond
-            // apart. A session is worth more than being right about that, so
-            // it falls through to openh264 with a log line (§18, ADR 0066).
+            // apart (§18, ADR 0066).
             match macos_videotoolbox::VideoToolboxEncoder::new(config) {
                 Ok(encoder) => return Ok(Box::new(encoder) as Box<dyn VideoEncoder>),
                 Err(error) => {
-                    tracing::info!(%error, "the VideoToolbox encoder probed available but would not build; falling back to openh264");
+                    tracing::info!(%error, "the VideoToolbox encoder probed available but would not build");
                 }
             }
         }
         // A platform whose `probe_hardware` above can return `Hardware` but
-        // that has no constructor wired up here would silently encode with
-        // the software fallback while reporting hardware. This arm exists so
-        // that mistake is an error instead.
+        // that has no constructor wired up here would report hardware it is
+        // not using. This arm exists so that mistake is an error instead.
         #[cfg(not(any(
             all(target_os = "windows", feature = "encode-mf"),
             all(
@@ -289,81 +265,44 @@ pub fn select_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
         }
     }
 
-    // The backstop for the other half of the rule above: the probe said
-    // hardware was there and the constructor then failed, so control fell
-    // through to the software fallback — which is H.264 and nothing else
-    // (§11). Encoding H.264 into a session that has already announced another
-    // codec on the wire would be a black window with no error anywhere, so
-    // this fails instead.
-    if config.codec != VideoCodec::H264 {
-        return Err(MediaError::EncoderUnavailable(format!(
-            "the hardware encoder for {:?} probed available but would not build, and there is no software fallback for it",
-            config.codec
-        )));
-    }
-
-    #[cfg(feature = "encode-openh264")]
-    {
-        tracing::info!("no hardware encoder available, falling back to openh264 (§18)");
-        software::OpenH264Encoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>)
-    }
-    #[cfg(not(feature = "encode-openh264"))]
-    {
-        Err(MediaError::EncoderUnavailable(
-            "no hardware encoder and the openh264 fallback is not built in".to_owned(),
-        ))
-    }
-}
-
-/// Whether the `openh264` fallback is compiled into this build.
-#[must_use]
-pub const fn openh264_built() -> bool {
-    cfg!(feature = "encode-openh264")
+    // No H.264 without hardware (ADR 0162): the probe found none, or the one
+    // it found would not build. Encoding the AV1 libaom makes into a session
+    // that announced H.264 would be a black window with no error anywhere,
+    // so this fails instead, and the caller says why.
+    Err(MediaError::EncoderUnavailable(format!(
+        "no hardware encoder for {:?} on this host, and {:?} has no software encoder (ADR 0162)",
+        config.codec, config.codec
+    )))
 }
 
 /// Builds the software encoder for `config.codec` even where a hardware one
-/// exists: `openh264` for H.264, libaom for AV1. For a guest that picked one
-/// by hand (ADR 0143); [`select_encoder`] is what every other session gets.
+/// exists: libaom, for AV1, the only codec with one (ADR 0162). For a guest
+/// that picked it by hand (ADR 0143), and for [`select_encoder`] on a host
+/// with no hardware AV1 encoder.
 ///
 /// # Errors
-/// [`MediaError::EncoderUnavailable`] when this build or this processor has
-/// no software encoder for the codec.
+/// [`MediaError::EncoderUnavailable`] for H.264, which has no software
+/// encoder any more, and for AV1 in a build without libaom.
 pub fn select_software_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEncoder>> {
-    match config.codec {
-        VideoCodec::H264 => {
-            #[cfg(feature = "encode-openh264")]
-            {
-                tracing::info!("openh264 picked by the guest (ADR 0143)");
-                software::OpenH264Encoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>)
-            }
-            #[cfg(not(feature = "encode-openh264"))]
-            {
-                Err(MediaError::EncoderUnavailable(
-                    "the openh264 fallback is not built in".to_owned(),
-                ))
-            }
-        }
-        VideoCodec::Av1 => {
-            if software_av1::built() && software_av1::cpu_supported() {
-                #[cfg(all(
-                    feature = "encode-aom",
-                    target_arch = "x86_64",
-                    any(target_os = "windows", target_os = "linux")
-                ))]
-                {
-                    tracing::info!("libaom picked by the guest (ADR 0143)");
-                    return aom::AomEncoder::new(config)
-                        .map(|e| Box::new(e) as Box<dyn VideoEncoder>);
-                }
-            }
-            Err(MediaError::EncoderUnavailable(
-                "software AV1 is not built in or this processor lacks AVX2".to_owned(),
-            ))
+    if config.codec == VideoCodec::Av1 && software_av1::built() {
+        #[cfg(all(
+            feature = "encode-aom",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            any(target_os = "windows", target_os = "linux", target_os = "macos")
+        ))]
+        {
+            tracing::info!("encoding AV1 in software, with libaom (ADR 0141, ADR 0162)");
+            return aom::AomEncoder::new(config).map(|e| Box::new(e) as Box<dyn VideoEncoder>);
         }
     }
+    Err(MediaError::EncoderUnavailable(format!(
+        "this build has no software encoder for {:?} (ADR 0162)",
+        config.codec
+    )))
 }
 
-/// BGRA/NV12 conversion shared by every hardware backend.
+/// BGRA/NV12 conversion shared by every encoder: the hardware backends take
+/// NV12, and libaom the I420 it splits into (ADR 0162).
 #[cfg(any(
     all(target_os = "windows", feature = "encode-mf"),
     all(
@@ -372,6 +311,7 @@ pub fn select_software_encoder(config: EncoderConfig) -> Result<Box<dyn VideoEnc
         feature = "encode-vaapi"
     ),
     all(target_os = "macos", feature = "encode-videotoolbox"),
+    feature = "encode-aom",
 ))]
 mod nv12;
 
@@ -413,637 +353,24 @@ pub mod linux_vaapi;
 )]
 pub mod windows;
 
-/// Whether this host may encode AV1 in software, and the one measurement
-/// per process that decides it (§11; ADR 0141).
+/// Whether this build can encode AV1 in software (§11; ADR 0141, ADR 0162).
 pub mod software_av1;
 
-/// libaom's realtime AV1 encoder, in software (§11; ADR 0141).
+/// libaom's realtime AV1 encoder, in software (§11; ADR 0141, ADR 0162).
 ///
 /// The third module of the encoder that needs `unsafe`: every libaom call
 /// crosses into C through `lumepeer-aom-sys`'s shim. Each `unsafe` block
 /// carries a `SAFETY:` note, as §21 requires.
 #[cfg(all(
     feature = "encode-aom",
-    target_arch = "x86_64",
-    any(target_os = "windows", target_os = "linux")
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
 ))]
 #[allow(
     unsafe_code,
     reason = "libaom is C; every call through lumepeer-aom-sys is `unsafe`. See ADR 0141."
 )]
 pub mod aom;
-
-/// `openh264` software fallback (§5.1, §18).
-///
-/// Kept as an inline module so the file list of §6 stays exact.
-#[cfg(feature = "encode-openh264")]
-pub mod software {
-    use lumepeer_core::constants::ENCODE_MAX_SOFTWARE_THREADS;
-    use openh264::encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig as H264Config, FrameRate, FrameType, UsageType,
-    };
-    use openh264::formats::{BgraSliceU8, YUVBuffer};
-
-    use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoEncoder};
-    use crate::capture::{Frame, PixelFormat};
-    use crate::error::{MediaError, Result};
-
-    /// Bits per kilobit, for the kbps of §14 against the bps of the codec API.
-    const BITS_PER_KBIT: u32 = 1000;
-
-    /// Encoder threads to ask for: what the machine has, capped by
-    /// [`ENCODE_MAX_SOFTWARE_THREADS`] (§14).
-    ///
-    /// Never 0, which openh264 reads as "decide for me" and which in practice
-    /// left the encoder single-threaded on a machine with plenty of cores —
-    /// the difference between a usable picture and a slideshow on a host with
-    /// no hardware encoder (ADR 0027).
-    fn software_threads() -> u16 {
-        let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let available = u16::try_from(available).unwrap_or(u16::MAX);
-        available.clamp(1, ENCODE_MAX_SOFTWARE_THREADS)
-    }
-
-    /// H.264 encoder backed by Cisco's `openh264`.
-    pub struct OpenH264Encoder {
-        inner: Encoder,
-        config: EncoderConfig,
-        /// The bitrate `inner` was built with, which `config` moves away from
-        /// once a bitrate is set live (ADR 0144).
-        built_kbps: u32,
-        /// The size of the last picture `inner` was handed, `None` before the
-        /// first: `openh264` initialises itself on that one.
-        size: Option<(usize, usize)>,
-        /// Slices each picture is cut into, one per thread that encodes
-        /// them (ADR 0157).
-        threads: u16,
-    }
-
-    // `openh264::encoder::Encoder` is not `Debug`, and the settings are what
-    // matters for logs anyway; the codec state must never be printed.
-    impl std::fmt::Debug for OpenH264Encoder {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("OpenH264Encoder")
-                .field("config", &self.config)
-                .finish_non_exhaustive()
-        }
-    }
-
-    impl OpenH264Encoder {
-        /// Builds an encoder for `config`.
-        ///
-        /// # Errors
-        /// [`MediaError::EncoderUnavailable`] if the codec refuses the settings.
-        pub fn new(config: EncoderConfig) -> Result<Self> {
-            let inner = Self::build(config)?;
-            Ok(Self {
-                inner,
-                config,
-                built_kbps: config.bitrate_kbps,
-                size: None,
-                threads: software_threads(),
-            })
-        }
-
-        /// Cuts every picture of `width`x`height` into one slice per thread,
-        /// so that `openh264` encodes them side by side (ADR 0157).
-        ///
-        /// It runs one thread otherwise, however many it is given: the crate
-        /// asks for a single slice, and `openh264` runs as many threads as a
-        /// picture has slices. A Linux host with no hardware encoder made 7
-        /// to 13 frames a second of a 1280x800 screen that way, on two cores
-        /// of which one sat idle.
-        ///
-        /// The crate initialises the encoder on the first picture of a size,
-        /// so a blank one goes in first and what it makes is thrown away.
-        /// The new thread count then resets the encoder, so the real picture
-        /// after it is the keyframe a new size starts with anyway. A picture
-        /// too small for slices is left to `openh264`, which keeps it in one.
-        #[allow(
-            unsafe_code,
-            reason = "`openh264` has no safe call for its slice settings; they are reached through its raw API"
-        )]
-        fn slice_for(&mut self, width: usize, height: usize) -> Result<()> {
-            use openh264_sys2::{
-                ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, SEncParamExt, SM_FIXEDSLCNUM_SLICE,
-            };
-            if self.threads <= 1 {
-                return Ok(());
-            }
-            self.inner
-                .encode(&YUVBuffer::new(width, height))
-                .map_err(|e| MediaError::Encode(e.to_string()))?;
-            let mut params = SEncParamExt::default();
-            // SAFETY: the encoder was initialised by the picture just encoded.
-            // `GetOption` copies its whole parameter block into `params` and
-            // `SetOption` reads one back from it, both during the call, and
-            // `params` is a live `SEncParamExt` for the duration of each.
-            let applied = unsafe {
-                let api = self.inner.raw_api();
-                let option = std::ptr::from_mut(&mut params).cast();
-                if api.get_option(ENCODER_OPTION_SVC_ENCODE_PARAM_EXT, option) == 0 {
-                    params.iMultipleThreadIdc = self.threads;
-                    let slices = &mut params.sSpatialLayers[0].sSliceArgument;
-                    slices.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
-                    slices.uiSliceNum = std::os::raw::c_uint::from(self.threads);
-                    api.set_option(
-                        ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
-                        std::ptr::from_mut(&mut params).cast(),
-                    ) == 0
-                } else {
-                    false
-                }
-            };
-            if !applied {
-                // Nothing is known about what a refused reset left behind:
-                // one slice, from a fresh encoder, is what it was before.
-                tracing::debug!("openh264 refused its slices; encoding on one thread");
-                self.inner = Self::build(self.config)?;
-                self.built_kbps = self.config.bitrate_kbps;
-                self.threads = 1;
-            }
-            Ok(())
-        }
-
-        fn build(config: EncoderConfig) -> Result<Encoder> {
-            let h264 = H264Config::new()
-                .bitrate(BitRate::from_bps(
-                    config.bitrate_kbps.saturating_mul(BITS_PER_KBIT),
-                ))
-                .max_frame_rate(FrameRate::from_hz(f32::from(config.fps)))
-                // What this encoder is actually looking at. The default,
-                // `CameraVideoRealTime`, tunes for a noisy camera image:
-                // motion search and rate control that a desktop — flat fills,
-                // sharp text, most of the screen identical between frames —
-                // pays for and gets nothing from. `ScreenContentRealTime` is
-                // the mode openh264 has for exactly this, and it is both
-                // faster and sharper on text (ADR 0027).
-                .usage_type(UsageType::ScreenContentRealTime)
-                // A remote desktop is a latency product. Medium complexity
-                // buys quality per bit that nobody watching their own machine
-                // from another country would trade a frame rate for.
-                .complexity(Complexity::Low)
-                .num_threads(software_threads());
-            Encoder::with_api_config(openh264::OpenH264API::from_source(), h264)
-                .map_err(|e| MediaError::EncoderUnavailable(e.to_string()))
-        }
-    }
-
-    /// Moves a running `encoder` from `from_kbps` to `to_kbps` in place, so
-    /// the stream carries on with no keyframe (ADR 0144). `false` when
-    /// `openh264` refused, and nothing is known about what it kept.
-    ///
-    /// The target of the whole stream, and the maximum of its one spatial
-    /// layer, which `build` set to the same figure: left at the old maximum,
-    /// a lowered target lets the rate control spend up to the old figure on a
-    /// busy picture — exactly the frames a struggling link cannot take.
-    /// `openh264` refuses a target above the layer's maximum, so the maximum
-    /// moves first on the way up and last on the way down.
-    #[allow(
-        unsafe_code,
-        reason = "`openh264` has no safe call for a live bitrate; `SetOption` is reached through its raw API"
-    )]
-    fn set_live_bitrate(encoder: &mut Encoder, from_kbps: u32, to_kbps: u32) -> bool {
-        use openh264_sys2::{
-            ENCODER_OPTION_BITRATE, ENCODER_OPTION_MAX_BITRATE, SBitrateInfo, SPATIAL_LAYER_0,
-            SPATIAL_LAYER_ALL,
-        };
-        let bps = std::os::raw::c_int::try_from(to_kbps.saturating_mul(BITS_PER_KBIT))
-            .unwrap_or(std::os::raw::c_int::MAX);
-        let target = (ENCODER_OPTION_BITRATE, SPATIAL_LAYER_ALL);
-        let maximum = (ENCODER_OPTION_MAX_BITRATE, SPATIAL_LAYER_0);
-        let order = if to_kbps > from_kbps {
-            [maximum, target]
-        } else {
-            [target, maximum]
-        };
-        order.into_iter().all(|(option, layer)| {
-            let mut info = SBitrateInfo {
-                iLayer: layer,
-                iBitrate: bps,
-            };
-            // SAFETY: `encoder` is a live `openh264` encoder that has encoded
-            // a frame, so it is initialised (the caller checks). `SetOption`
-            // reads one `SBitrateInfo` through the pointer during the call,
-            // and `info` outlives it. The bitrate is a parameter the encoder
-            // is meant to have changed while it runs — the reason `SetOption`
-            // takes it — not one the crate's wrapper relies on.
-            let status = unsafe {
-                encoder
-                    .raw_api()
-                    .set_option(option, std::ptr::from_mut(&mut info).cast())
-            };
-            status == 0
-        })
-    }
-
-    /// Crops to even dimensions: 4:2:0 subsampling has no odd rows or
-    /// columns, and the conversion asserts on them. `encoder` names the
-    /// caller in the error.
-    ///
-    /// Borrows when the picture is already even, which every real screen
-    /// mode is: the copy this used to make unconditionally was a full
-    /// frame — 8 MiB at 1080p — on the encoder's own hot path, spent to
-    /// produce a byte-for-byte duplicate (ADR 0027).
-    ///
-    /// Shared with the software AV1 encoder (ADR 0141), which takes the same
-    /// BGRA through the same conversion.
-    pub(super) fn even_bgra<'a>(
-        frame: &'a Frame,
-        encoder: &str,
-    ) -> Result<(std::borrow::Cow<'a, [u8]>, usize, usize)> {
-        if frame.format != PixelFormat::Bgra8 {
-            return Err(MediaError::Encode(format!(
-                "{encoder} expects BGRA8 input, got {:?}",
-                frame.format
-            )));
-        }
-        let width = (frame.width as usize) & !1;
-        let height = (frame.height as usize) & !1;
-        if width == 0 || height == 0 {
-            return Err(MediaError::Encode("frame is smaller than 2x2".to_owned()));
-        }
-
-        // Through `as_cpu`, never `data`: a zero-copy capture frame
-        // (ADR 0073) has its pixels only on the GPU.
-        let pixels = frame.as_cpu()?;
-        let src_stride = frame.width as usize * 4;
-        let dst_stride = width * 4;
-        if pixels.len() < src_stride * height {
-            return Err(MediaError::Encode("frame buffer is short".to_owned()));
-        }
-        if src_stride == dst_stride {
-            return Ok((
-                std::borrow::Cow::Borrowed(&pixels[..dst_stride * height]),
-                width,
-                height,
-            ));
-        }
-        let mut cropped = Vec::with_capacity(dst_stride * height);
-        for row in 0..height {
-            let start = row * src_stride;
-            cropped.extend_from_slice(&pixels[start..start + dst_stride]);
-        }
-        Ok((std::borrow::Cow::Owned(cropped), width, height))
-    }
-
-    /// An NV12 picture as the I420 `openh264` takes: the luma as it is, the
-    /// interleaved chroma pulled apart into its two planes. A Mac's capture
-    /// hands out NV12 (ADR 0157), and a guest may pick this encoder there by
-    /// hand (ADR 0143).
-    fn i420_from_nv12(frame: &Frame) -> Result<(YUVBuffer, usize, usize)> {
-        let (width, height) = (frame.width as usize, frame.height as usize);
-        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(MediaError::Encode(format!(
-                "openh264 fallback takes NV12 only at an even size, got {width}x{height}"
-            )));
-        }
-        let pixels = frame.as_cpu()?;
-        let luma = width * height;
-        let Some(chroma) = pixels.get(luma..luma + luma / 2) else {
-            return Err(MediaError::Encode("NV12 frame buffer is short".to_owned()));
-        };
-        let mut yuv = Vec::with_capacity(luma + luma / 2);
-        yuv.extend_from_slice(&pixels[..luma]);
-        yuv.extend(chroma.iter().step_by(2));
-        yuv.extend(chroma.iter().skip(1).step_by(2));
-        Ok((YUVBuffer::from_vec(yuv, width, height), width, height))
-    }
-
-    impl VideoEncoder for OpenH264Encoder {
-        fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-            let (yuv, width, height) = match frame.format {
-                PixelFormat::Nv12 => i420_from_nv12(frame)?,
-                PixelFormat::Bgra8 => {
-                    let (bgra, width, height) = even_bgra(frame, "openh264 fallback")?;
-                    let yuv =
-                        YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
-                    (yuv, width, height)
-                }
-            };
-            // `openh264` re-initialises itself for a new size from the
-            // settings it was built with, which would quietly undo a bitrate
-            // set live since (ADR 0144). A new size starts on a keyframe
-            // anyway, so building afresh at the current bitrate costs nothing
-            // the size change was not already paying.
-            if self.size.is_some_and(|size| size != (width, height))
-                && self.built_kbps != self.config.bitrate_kbps
-            {
-                self.inner = Self::build(self.config)?;
-                self.built_kbps = self.config.bitrate_kbps;
-            }
-            if self.size != Some((width, height)) {
-                self.slice_for(width, height)?;
-            }
-            self.size = Some((width, height));
-            let bitstream = self
-                .inner
-                .encode(&yuv)
-                .map_err(|e| MediaError::Encode(e.to_string()))?;
-            Ok(EncodedFrame {
-                keyframe: matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I),
-                timestamp_us: frame.timestamp_us,
-                data: bitstream.to_vec(),
-            })
-        }
-
-        fn request_keyframe(&mut self) -> Result<()> {
-            self.inner.force_intra_frame();
-            Ok(())
-        }
-
-        fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
-            if bitrate_kbps == self.config.bitrate_kbps {
-                return Ok(());
-            }
-            // Live, so the stream carries on without a keyframe (ADR 0144).
-            // This used to rebuild the encoder, and the next frame was a
-            // keyframe: tolerable at one adjustment a second on a good link,
-            // and the opposite of what a link that is already struggling
-            // needs when the bitrate comes down because of it. Rebuilt only
-            // before the first frame, when there is nothing initialised to
-            // set it on, and if `openh264` refuses.
-            let config = EncoderConfig {
-                bitrate_kbps,
-                ..self.config
-            };
-            if self.size.is_none()
-                || !set_live_bitrate(&mut self.inner, self.config.bitrate_kbps, bitrate_kbps)
-            {
-                self.inner = Self::build(config)?;
-                self.built_kbps = bitrate_kbps;
-                self.size = None;
-            }
-            self.config = config;
-            Ok(())
-        }
-
-        fn kind(&self) -> EncoderKind {
-            EncoderKind::SoftwareOpenH264
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #![allow(clippy::unwrap_used)]
-
-        use super::*;
-        use crate::capture::PixelFormat;
-
-        fn frame(width: u32, height: u32, fill: u8) -> Frame {
-            Frame::cpu(
-                width,
-                height,
-                PixelFormat::Bgra8,
-                0,
-                vec![fill; (width as usize) * (height as usize) * 4],
-            )
-        }
-
-        #[test]
-        fn encodes_a_frame_and_starts_with_a_keyframe() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            let first = encoder.encode(&frame(64, 64, 0x20)).unwrap();
-            assert!(first.keyframe, "the first frame must be decodable alone");
-            assert!(!first.data.is_empty());
-            assert_eq!(encoder.kind(), EncoderKind::SoftwareOpenH264);
-        }
-
-        #[test]
-        fn odd_dimensions_are_cropped_rather_than_panicking() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            assert!(encoder.encode(&frame(65, 33, 0x40)).is_ok());
-        }
-
-        /// A host with no hardware encoder still gets GPU frames from the
-        /// zero-copy capture as soon as the guest draws its own cursor
-        /// (ADR 0073). Reading `Frame::data` directly refused every one of
-        /// them as "frame buffer is short": the guest kept the first picture
-        /// and never got another.
-        #[test]
-        #[cfg(all(target_os = "windows", feature = "encode-mf-zero-copy"))]
-        fn a_frame_that_stayed_on_the_gpu_is_read_back_and_encoded() {
-            let Some(source) = crate::capture::windows::gpu_test_frame(64, 64, 0x60) else {
-                eprintln!("skipping: no Direct3D 11 hardware device on this machine");
-                return;
-            };
-            assert!(source.data.is_empty(), "the test frame has to be GPU-only");
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            let output = encoder
-                .encode(&source)
-                .unwrap_or_else(|error| panic!("a GPU frame failed to encode: {error}"));
-            assert!(!output.data.is_empty());
-        }
-
-        #[test]
-        fn a_requested_keyframe_actually_arrives_on_the_next_frame() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            // The first frame of a stream is a keyframe on its own, so the
-            // claim is only testable from the second one onwards.
-            assert!(encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe);
-            assert!(!encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe);
-            encoder.request_keyframe().unwrap();
-            assert!(
-                encoder.encode(&frame(64, 64, 0x10)).unwrap().keyframe,
-                "the encoder ignored a keyframe request"
-            );
-        }
-
-        #[test]
-        fn a_bitrate_change_is_accepted_and_encoding_continues() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            encoder.encode(&frame(64, 64, 0x10)).unwrap();
-            encoder.set_bitrate(1_500).unwrap();
-            assert_eq!(encoder.config.bitrate_kbps, 1_500);
-            assert!(
-                !encoder
-                    .encode(&frame(64, 64, 0x80))
-                    .unwrap()
-                    .data
-                    .is_empty()
-            );
-        }
-
-        /// A still picture with a quarter of it busy — fresh detail every
-        /// frame, the way a film plays in a window: the frames need bits,
-        /// and none of them is a new scene.
-        fn noise(width: u32, height: u32, step: u32) -> Frame {
-            let mut state = step.wrapping_mul(2_654_435_761) | 1;
-            let mut data = Vec::with_capacity((width * height * 4) as usize);
-            for y in 0..height {
-                for x in 0..width {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    let value = if x < width / 2 && y < height / 2 {
-                        state.to_le_bytes()[0]
-                    } else if (x / 8 + y / 8) % 2 == 0 {
-                        40
-                    } else {
-                        200
-                    };
-                    data.extend_from_slice(&[value, value, value, 0xFF]);
-                }
-            }
-            Frame::cpu(width, height, PixelFormat::Bgra8, 0, data)
-        }
-
-        /// Average size of the frames [`noise`] makes for `steps` at
-        /// `width`x`height`, and whether any of them was a keyframe.
-        fn encode_noise(
-            encoder: &mut OpenH264Encoder,
-            (width, height): (u32, u32),
-            steps: std::ops::Range<u32>,
-        ) -> (usize, bool) {
-            let count = steps.len();
-            let mut bytes = 0;
-            let mut keyframe = false;
-            for step in steps {
-                let output = encoder.encode(&noise(width, height, step)).unwrap();
-                bytes += output.data.len();
-                keyframe |= output.keyframe;
-            }
-            (bytes / count, keyframe)
-        }
-
-        /// ADR 0144: the bitrate moves while the encoder runs, with no
-        /// keyframe, and the frames after it are smaller.
-        #[test]
-        fn a_live_bitrate_change_shrinks_the_frames_without_a_keyframe() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            let size = (320, 180);
-            let (before, _) = encode_noise(&mut encoder, size, 0..20);
-            encoder.set_bitrate(300).unwrap();
-            let (after, keyframe) = encode_noise(&mut encoder, size, 20..40);
-            assert!(!keyframe, "the change cost a keyframe");
-            assert!(
-                after * 2 < before,
-                "frames of {after} bytes after the change against {before} before"
-            );
-        }
-
-        /// A desktop of text lines scrolled up `step` rows: every frame
-        /// differs from the one before all over, the way scrolling does.
-        fn scrolled_text(width: u32, height: u32, step: u32) -> Frame {
-            let mut data = Vec::with_capacity((width * height * 4) as usize);
-            for y in 0..height {
-                let line = (y + step * 3) / 18;
-                for x in 0..width {
-                    let cell = (x / 7).wrapping_mul(2_654_435_761) ^ line.wrapping_mul(40_503);
-                    let ink =
-                        (y + step * 3) % 18 < 12 && !(cell >> 7).is_multiple_of(3) && x % 7 < 6;
-                    let value = if ink { 0x20 } else { 0xF0 };
-                    data.extend_from_slice(&[value, value, value, 0xFF]);
-                }
-            }
-            Frame::cpu(width, height, PixelFormat::Bgra8, 0, data)
-        }
-
-        /// Slice NAL units (types 1 and 5) in an Annex-B access unit.
-        fn slices_in(access_unit: &[u8]) -> usize {
-            access_unit
-                .windows(4)
-                .filter(|w| w[..3] == [0, 0, 1] && matches!(w[3] & 0x1F, 1 | 5))
-                .count()
-        }
-
-        /// ADR 0157: a picture is cut into one slice per thread, and the
-        /// stream still decodes, keyframe and the frames after it, at the
-        /// picture's size.
-        #[test]
-        fn a_sliced_stream_decodes_frame_by_frame() {
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            encoder.threads = 4;
-            let mut decoder = openh264::decoder::Decoder::new().unwrap();
-            for step in 0..6 {
-                let output = encoder.encode(&scrolled_text(640, 368, step)).unwrap();
-                assert_eq!(output.keyframe, step == 0, "frame {step}");
-                assert_eq!(slices_in(&output.data), 4, "frame {step}");
-                let picture = decoder
-                    .decode(&output.data)
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("frame {step} decoded to nothing"));
-                assert_eq!(
-                    openh264::formats::YUVSource::dimensions(&picture),
-                    (640, 368)
-                );
-            }
-            // A new size is a new slicing, and again exactly one keyframe.
-            let output = encoder.encode(&scrolled_text(320, 192, 9)).unwrap();
-            assert!(output.keyframe);
-            assert_eq!(slices_in(&output.data), 4);
-            assert!(decoder.decode(&output.data).unwrap().is_some());
-        }
-
-        /// ADR 0157: an NV12 picture, as a Mac's capture hands out, is
-        /// encoded as the picture it is — its luma and both chroma planes
-        /// come back out of the decoder where they went in.
-        #[test]
-        fn an_nv12_picture_is_encoded_as_it_is() {
-            use openh264::formats::YUVSource;
-            let (width, height) = (64_usize, 48_usize);
-            let mut data = vec![150_u8; width * height];
-            for _ in 0..width * height / 4 {
-                data.extend_from_slice(&[90, 170]);
-            }
-            let frame = Frame::cpu(64, 48, PixelFormat::Nv12, 0, data);
-            let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            let output = encoder.encode(&frame).unwrap();
-            assert!(output.keyframe);
-            let mut decoder = openh264::decoder::Decoder::new().unwrap();
-            let picture = decoder.decode(&output.data).unwrap().unwrap();
-            let near = |plane: &[u8], value: u8| plane.iter().all(|&s| s.abs_diff(value) <= 2);
-            assert!(near(picture.y(), 150), "luma");
-            assert!(near(picture.u(), 90), "U");
-            assert!(near(picture.v(), 170), "V");
-        }
-
-        /// What slices buy on this machine, for a release build:
-        /// `cargo test -p lumepeer-media --release --lib slices_timing --
-        /// --ignored --nocapture`. Meaningless without nasm on PATH, which
-        /// the shipped builds have.
-        #[test]
-        #[ignore = "a timing, not a check"]
-        fn slices_timing() {
-            for threads in [1, 2, 4] {
-                let mut encoder = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-                encoder.threads = threads;
-                let frames: Vec<Frame> = (0..61).map(|s| scrolled_text(1280, 800, s)).collect();
-                encoder.encode(&frames[0]).unwrap();
-                let started = std::time::Instant::now();
-                for frame in &frames[1..] {
-                    encoder.encode(frame).unwrap();
-                }
-                eprintln!(
-                    "1280x800 scrolling, {threads} slice(s): {:?} a frame",
-                    started.elapsed() / 60
-                );
-            }
-        }
-
-        /// ADR 0144: `openh264` rebuilds itself for a new size from the
-        /// bitrate it was built with; a bitrate set live since survives it.
-        #[test]
-        fn a_live_bitrate_survives_a_change_of_size() {
-            let mut low = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            encode_noise(&mut low, (320, 180), 0..5);
-            low.set_bitrate(300).unwrap();
-            encode_noise(&mut low, (320, 180), 5..10);
-            let mut high = OpenH264Encoder::new(EncoderConfig::default()).unwrap();
-            encode_noise(&mut high, (320, 180), 0..10);
-
-            // The first frame at the new size is a keyframe either way.
-            low.encode(&noise(256, 144, 10)).unwrap();
-            high.encode(&noise(256, 144, 10)).unwrap();
-            let (low_bytes, _) = encode_noise(&mut low, (256, 144), 11..30);
-            let (high_bytes, _) = encode_noise(&mut high, (256, 144), 11..30);
-            assert!(
-                low_bytes * 2 < high_bytes,
-                "the new size went back to the built bitrate: {low_bytes} bytes against {high_bytes}"
-            );
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1060,17 +387,16 @@ mod tests {
     /// §11's mutual-hardware-support rule and its one exception, checked
     /// mechanically rather than by inspection so it runs the same on every
     /// machine: AV1 is served by genuine hardware when the probe says there
-    /// is some; otherwise by libaom exactly when this build has it and this
-    /// processor can run it (ADR 0141); otherwise refused — and never by the
-    /// `openh264` fallback (ADR 0069).
+    /// is some; otherwise by libaom exactly when this build has it (ADR 0141,
+    /// ADR 0162); otherwise refused.
     #[test]
-    fn av1_is_served_by_hardware_then_by_libaom_and_never_by_openh264() {
+    fn av1_is_served_by_hardware_then_by_libaom() {
         let config = EncoderConfig {
             codec: VideoCodec::Av1,
             ..EncoderConfig::default()
         };
         let hardware = probe_hardware(config) == Some(EncoderKind::Hardware);
-        let software = software_av1::built() && software_av1::cpu_supported();
+        let software = software_av1::built();
         match select_encoder(config) {
             Ok(encoder) if hardware => assert_eq!(encoder.kind(), EncoderKind::Hardware),
             Ok(encoder) => {
@@ -1082,13 +408,30 @@ mod tests {
                     !hardware,
                     "AV1 was refused even though the probe reported hardware"
                 );
-                assert!(
-                    !software,
-                    "AV1 was refused even though libaom is built in and runs here"
-                );
+                assert!(!software, "AV1 was refused even though libaom is built in");
             }
             Err(other) => panic!("unexpected error selecting an AV1 encoder: {other}"),
         }
+    }
+
+    /// No H.264 without hardware (ADR 0162): a host whose probe finds none is
+    /// refused, never handed a software encoder of another codec.
+    #[test]
+    fn h264_is_served_by_hardware_or_not_at_all() {
+        let config = EncoderConfig::default();
+        let hardware = probe_hardware(config) == Some(EncoderKind::Hardware);
+        match select_encoder(config) {
+            Ok(encoder) => {
+                assert!(hardware, "H.264 was served with no hardware encoder");
+                assert_eq!(encoder.kind(), EncoderKind::Hardware);
+            }
+            Err(MediaError::EncoderUnavailable(_)) => {}
+            Err(other) => panic!("unexpected error selecting an H.264 encoder: {other}"),
+        }
+        assert!(matches!(
+            select_software_encoder(config),
+            Err(MediaError::EncoderUnavailable(_))
+        ));
     }
 
     /// The software AV1 branch builds an encoder that actually produces a

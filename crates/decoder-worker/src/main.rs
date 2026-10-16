@@ -277,43 +277,71 @@ fn run(mut ring: SharedRing, decoder: &mut Decoder) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+use lumepeer_media::decode::aom::Picture;
+
+/// AV1 decoder: libaom's (ADR 0162). Since `openh264` was removed this
+/// worker decodes AV1 only — the codec a host with no hardware encoder sends —
+/// and a guest's webview decodes H.264, which only a hardware encoder makes,
+/// itself (ADR 0058).
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+struct Decoder {
+    inner: lumepeer_media::decode::aom::AomDecoder,
+}
+
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+impl Decoder {
+    fn new() -> anyhow::Result<Self> {
+        let inner = lumepeer_media::decode::aom::AomDecoder::new()
+            .map_err(|e| anyhow::anyhow!("cannot create the decoder: {e}"))?;
+        Ok(Self { inner })
+    }
+
+    fn decode(&mut self, bitstream: &[u8]) -> anyhow::Result<Option<Picture>> {
+        self.inner
+            .decode(bitstream)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 /// One decoded picture in RGBA8.
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+)))]
 struct Picture {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
 }
 
-/// H.264 decoder. Software `openh264` for now; the platform hardware decoders
-/// of §5.1 arrive with the rest of the platform work in phase 4.
-struct Decoder {
-    inner: openh264::decoder::Decoder,
-}
+/// No libaom for this target, so no decoder: refusing is the honest answer.
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+)))]
+struct Decoder;
 
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+)))]
 impl Decoder {
     fn new() -> anyhow::Result<Self> {
-        let inner = openh264::decoder::Decoder::new()
-            .map_err(|e| anyhow::anyhow!("cannot create the decoder: {e}"))?;
-        Ok(Self { inner })
+        anyhow::bail!("this build has no AV1 decoder (ADR 0162)")
     }
 
-    fn decode(&mut self, bitstream: &[u8]) -> anyhow::Result<Option<Picture>> {
-        use openh264::formats::YUVSource as _;
-
-        let Some(yuv) = self
-            .inner
-            .decode(bitstream)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        else {
-            return Ok(None);
-        };
-        let (width, height) = yuv.dimensions();
-        let mut rgba = vec![0u8; width * height * 4];
-        yuv.write_rgba8(&mut rgba);
-        Ok(Some(Picture {
-            width: u32::try_from(width)?,
-            height: u32::try_from(height)?,
-            rgba,
-        }))
+    #[allow(clippy::unused_self, reason = "the libaom half needs the decoder")]
+    fn decode(&mut self, _bitstream: &[u8]) -> anyhow::Result<Option<Picture>> {
+        anyhow::bail!("this build has no AV1 decoder (ADR 0162)")
     }
 }

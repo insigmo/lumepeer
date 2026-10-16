@@ -32,10 +32,10 @@ for bin in lumepeer-decoder-worker lumepeer-service lumepeer-terminal-worker; do
 done
 
 # Optimised where the picture goes, as on the Mac (mac-build.toml, ADR 0155):
-# the `debian` VM has no hardware encoder, and an unoptimised openh264 and
+# the `debian` VM has no hardware encoder, and an unoptimised encoder and
 # scaler measure the debug build rather than the product (ADR 0157).
 cargo build -p lumepeer-desktop \
-  --features pilot,tauri/custom-protocol,capture-x11,capture-portal,encode-vaapi-zero-copy,encode-openh264,decode-openh264 \
+  --features pilot,tauri/custom-protocol,capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom \
   --config 'profile.dev.package."*".opt-level = 3' \
   --config 'profile.dev.package.lumepeer-media.opt-level = 3' \
   --config 'profile.dev.package.lumepeer-runtime.opt-level = 3'

@@ -1,5 +1,5 @@
 //! Software AV1: libaom's realtime encoder for a host with no hardware
-//! encoder (§11; ADR 0141).
+//! encoder — the one software video encoder (§11; ADR 0141, ADR 0162).
 //!
 //! The configuration is the one the stage-1 measurement ran
 //! (docs/research/software-av1.md): `cpu-used` 10, WebRTC's RTC settings, the
@@ -8,11 +8,12 @@
 //! `lumepeer-aom-sys`, with its assembly, so an installed host carries all of
 //! it and needs nothing on the machine.
 //!
-//! Pixels go through the same BGRA-to-I420 conversion as the `openh264`
-//! fallback — `openh264::formats::YUVBuffer`, the converter the measurement
-//! timed for both — and are read through [`Frame::as_cpu`], never
-//! [`Frame::data`], so a zero-copy capture frame (ADR 0073) encodes like any
-//! other.
+//! Pixels go through the hardware encoders' BT.601 conversion to NV12, its
+//! chroma split into I420's two planes (`nv12::to_i420`; ADR 0162) — the same
+//! arithmetic as the `openh264` converter the measurement timed — and are read
+//! through [`Frame::as_cpu`], never [`Frame::data`], so a zero-copy capture
+//! frame (ADR 0073) encodes like any other. A capture that hands out NV12 (a
+//! Mac's, ADR 0157) is split without a conversion.
 //!
 //! The encoder is opened at the first frame, because libaom fixes the
 //! picture size at initialisation, and opened again when the size changes.
@@ -21,17 +22,15 @@
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::NonNull;
 
+use super::nv12::to_i420;
+use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoEncoder};
+use crate::capture::Frame;
+use crate::error::{MediaError, Result};
 use lumepeer_aom_sys as sys;
 use lumepeer_core::constants::{
     SOFTWARE_AV1_BITRATE_PERCENT, SOFTWARE_AV1_MAX_FPS, SOFTWARE_AV1_MAX_THREADS,
     SOFTWARE_AV1_SPEED,
 };
-use openh264::formats::{BgraSliceU8, YUVBuffer, YUVSource};
-
-use super::software::even_bgra;
-use super::{EncodedFrame, EncoderConfig, EncoderKind, VideoEncoder};
-use crate::capture::Frame;
-use crate::error::{MediaError, Result};
 
 /// Four tile columns, as measured: the columns are what row threading
 /// spreads across cores.
@@ -138,25 +137,33 @@ impl Shim {
             .into_owned()
     }
 
-    fn encode(&mut self, yuv: &YUVBuffer, pts: i64, keyframe: bool) -> Result<(Vec<u8>, bool)> {
-        let (y_stride, u_stride, _) = yuv.strides();
+    fn encode(&mut self, i420: &[u8], pts: i64, keyframe: bool) -> Result<(Vec<u8>, bool)> {
+        let (y_stride, uv_stride) = (self.width, self.width / 2);
+        let luma = self.width * self.height;
+        let chroma = luma / 4;
+        if i420.len() < luma + 2 * chroma {
+            return Err(MediaError::Encode("I420 picture is short".to_owned()));
+        }
+        let (y, rest) = i420.split_at(luma);
+        let (u, v) = rest.split_at(chroma);
         let stride = |value: usize| {
             c_int::try_from(value).map_err(|_| MediaError::Encode("stride too large".to_owned()))
         };
         let (mut out, mut out_len, mut is_key) = (std::ptr::null(), 0usize, 0 as c_int);
         // SAFETY: `raw` is live and exclusively ours (`&mut self`). The three
-        // planes belong to `yuv`, which outlives the call, and hold an I420
-        // picture of exactly `width`x`height` at the strides passed — the
-        // size this encoder was opened at, which `AomEncoder::encode`
-        // checked. The shim writes the three out-parameters and nothing else.
+        // planes are slices of `i420`, which outlives the call, and hold an
+        // I420 picture of exactly `width`x`height` at the strides passed (the
+        // length is checked above) — the size this encoder was opened at,
+        // which `AomEncoder::encode` checked. The shim writes the three
+        // out-parameters and nothing else.
         let status = unsafe {
             sys::aom_shim_encode(
                 self.raw.as_ptr(),
-                yuv.y().as_ptr(),
-                yuv.u().as_ptr(),
-                yuv.v().as_ptr(),
+                y.as_ptr(),
+                u.as_ptr(),
+                v.as_ptr(),
                 stride(y_stride)?,
-                stride(u_stride)?,
+                stride(uv_stride)?,
                 pts,
                 c_int::from(keyframe),
                 &raw mut out,
@@ -239,8 +246,8 @@ impl AomEncoder {
     ///
     /// `config.bitrate_kbps` is the session's H.264 figure; libaom is asked
     /// for [`av1_kbps`] of it. `config.fps` above [`SOFTWARE_AV1_MAX_FPS`] is
-    /// held to it: this encoder is only chosen for the 30 fps preset, and the
-    /// encode loop paces such a session at 30 whatever it asked for.
+    /// held to it: the encode loop paces a software AV1 session at 30
+    /// whatever its preset asked for.
     ///
     /// Nothing is opened until the first frame says how large the picture
     /// is, so this cannot fail on its own; it returns `Result` like every
@@ -274,8 +281,8 @@ impl AomEncoder {
 
 impl VideoEncoder for AomEncoder {
     fn encode(&mut self, frame: &Frame) -> Result<EncodedFrame> {
-        let (bgra, width, height) = even_bgra(frame, "the software AV1 encoder")?;
-        let yuv = YUVBuffer::from_bgra8_source(BgraSliceU8::new(&bgra, (width, height)));
+        let (i420, width, height) = to_i420(frame)?;
+        let (width, height) = (width as usize, height as usize);
         let reopen = self
             .shim
             .as_ref()
@@ -297,7 +304,7 @@ impl VideoEncoder for AomEncoder {
                 "the libaom encoder is not open".to_owned(),
             ));
         };
-        let (data, keyframe) = shim.encode(&yuv, self.pts, self.keyframe)?;
+        let (data, keyframe) = shim.encode(&i420, self.pts, self.keyframe)?;
         self.pts += 1;
         if keyframe {
             self.keyframe = false;
@@ -314,7 +321,7 @@ impl VideoEncoder for AomEncoder {
             return Ok(());
         }
         // Through `aom_codec_enc_config_set`: the stream carries on, with no
-        // keyframe, unlike the `openh264` fallback, which is rebuilt.
+        // keyframe.
         if let Some(shim) = self.shim.as_mut() {
             shim.set_bitrate(av1_kbps(bitrate_kbps))?;
         }
@@ -466,12 +473,14 @@ mod tests {
         assert!(version().contains("3.15.1"), "libaom {}", version());
     }
 
+    /// A Mac's capture hands out NV12 (ADR 0157), and libaom is that host's
+    /// software encoder too (ADR 0162).
     #[test]
-    fn a_frame_that_is_not_bgra_is_refused_with_a_reason() {
+    fn an_nv12_picture_is_encoded_as_it_is() {
         let mut encoder = AomEncoder::new(config()).unwrap();
-        let nv12 = Frame::cpu(64, 64, PixelFormat::Nv12, 0, vec![0; 64 * 64 * 3 / 2]);
-        let error = encoder.encode(&nv12).unwrap_err();
-        assert!(error.to_string().contains("BGRA8"), "{error}");
+        let nv12 = Frame::cpu(64, 64, PixelFormat::Nv12, 0, vec![0x80; 64 * 64 * 3 / 2]);
+        let first = encoder.encode(&nv12).unwrap();
+        assert!(first.keyframe && !first.data.is_empty());
     }
 
     /// A host with no hardware encoder still gets GPU frames from the

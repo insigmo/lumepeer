@@ -74,25 +74,22 @@ audio-playout-coreaudio = [
 # xdg-desktop-portal negotiation and PipeWire frame consumption for the
 # Wayland path (§11).
 capture-portal = ["dep:ashpd", "dep:tokio", "dep:pipewire"]
-encode-openh264 = ["dep:openh264", "dep:openh264-sys2"]
-# libaom's realtime AV1 encoder in software, for a host with no hardware
-# encoder at all (§11; ADR 0141) — the one exception to "an optional codec
-# needs hardware on both sides". libaom is vendored in `lumepeer-aom-sys` and
-# built from source, statically, with its x86 assembly; the build fails
-# without nasm rather than producing the several-times-slower C-only library
-# `openh264-sys2` silently falls back to. x86-64 Windows and Linux only: the
-# dependency is declared in that target table below, so on every other target
-# this feature is inert, exactly like encode-vaapi off Linux. Needs
-# `encode-openh264` for the BGRA-to-I420 conversion the measurement timed,
-# and for the `openh264` fallback each host measures software AV1 against
-# before it is ever chosen.
-encode-aom = ["encode-openh264", "dep:lumepeer-aom-sys", "lumepeer-aom-sys/vendored"]
+# libaom's realtime AV1 encoder in software: the one software video encoder,
+# for a host with no hardware one (§11; ADR 0141, ADR 0162). It replaced the
+# `openh264` H.264 fallback, which was built from source here and so outside
+# the royalty cover of Cisco's own binary. libaom is vendored in
+# `lumepeer-aom-sys` and built from source, statically, with its SIMD; on
+# x86-64 the build fails without nasm rather than producing the several-times-
+# slower C-only library. x86-64 and 64-bit Arm on Windows, Linux and macOS:
+# the dependency is declared in that target table below, so on every other
+# target this feature is inert, exactly like encode-vaapi off Linux.
+encode-aom = ["dep:lumepeer-aom-sys", "lumepeer-aom-sys/vendored"]
 # VA-API hardware H.264 encoder for Linux (§5.1, §11, §18/§19 phase 4; ADR
 # 0031). Same convention as encode-mf: `cargo build --workspace` needs no
 # platform SDK, and `cros-libva` is declared optional in the Linux target
 # table so the feature is inert everywhere else. Deliberately NOT part of the
 # shipped Linux feature set: a .deb must install and run on a machine with no
-# VA-API at all, falling back to openh264 (§18).
+# VA-API at all, falling back to libaom (§18; ADR 0162).
 encode-vaapi = ["dep:cros-libva"]
 # Hands a Wayland portal frame to the VA-API encoder as the compositor's own
 # DMA-BUF instead of as bytes in main memory (§11, backlog item 33; ADR 0088).
@@ -111,7 +108,7 @@ encode-vaapi-zero-copy = ["encode-vaapi", "capture-portal", "dep:libc"]
 # crates are never built) on every other platform. It names the objc2
 # framework crates it uses itself rather than free-riding on
 # capture-screencapturekit's list, so a build that wants the encoder without
-# ScreenCaptureKit still gets them. Ships *alongside* encode-openh264 on
+# ScreenCaptureKit still gets them. Ships *alongside* encode-aom on
 # macOS, never instead of it: a Mac whose probe declines has to keep running
 # on the software fallback (§18).
 encode-videotoolbox = [
@@ -121,7 +118,7 @@ encode-videotoolbox = [
     "dep:objc2-video-toolbox",
 ]
 # Opus audio encode/decode (§5.1; ADR 0023). opusic-sys vendors libopus and
-# builds it with cmake — the same precedent as openh264-sys — so the default
+# builds it with cmake — the same precedent as lumepeer-aom-sys — so the default
 # build still needs no platform SDK; on Windows a release build also needs
 # ninja (ADR 0149, build.rs). Without this feature every audio entry
 # point is inert and the session runs video-only.
@@ -138,11 +135,13 @@ audio-capture = ["windows/Win32_Media_Audio"]
 # crate. Declaring nothing here and free-riding on `capture-portal` is what
 # made this feature unbuildable on its own.
 audio-capture-pipewire = ["dep:pipewire"]
-# The decoder worker links openh264 itself; this only affects the media crate.
-decode-openh264 = ["dep:openh264"]
+# libaom's AV1 decoder, for the sandboxed decoder worker of §11.3 (ADR 0162):
+# what a guest whose webview cannot decode AV1 shows a software host's
+# picture with. The same vendored library as `encode-aom`.
+decode-aom = ["dep:lumepeer-aom-sys", "lumepeer-aom-sys/vendored"]
 # Windows Media Foundation hardware H.264 encoder MFT (§5.1, §11, §18/§19
 # phase 4; ADR 0011). Kept behind a feature, matching capture-x11/
-# encode-openh264, so `cargo build --workspace` needs no platform SDK. The
+# encode-aom, so `cargo build --workspace` needs no platform SDK. The
 # `windows` crate itself is not optional (the AppContainer decoder sandbox
 # of `decode::windows_sandbox` needs it unconditionally on Windows - see
 # below), so this feature only gates the encoder module itself.
@@ -195,10 +194,6 @@ tokio = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 scap = { workspace = true, optional = true }
-openh264 = { workspace = true, optional = true }
-# The constants and struct `openh264`'s raw API takes for a live bitrate
-# (ADR 0144); the same build `openh264` already links, nothing more.
-openh264-sys2 = { version = "=0.9.8", default-features = false, optional = true }
 opus = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
@@ -229,9 +224,10 @@ cros-libva = { version = "0.0.13", optional = true }
 # decoder sandbox's seccomp filter.
 libc = { workspace = true, optional = true }
 
-# The vendored libaom behind `encode-aom` (ADR 0141). Only where software AV1
-# was measured — the build of libaom itself refuses every other target.
-[target.'cfg(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))'.dependencies]
+# The vendored libaom behind `encode-aom` and `decode-aom` (ADR 0141, ADR
+# 0162). Only where libaom is built — the build of libaom itself refuses
+# every other target.
+[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "windows", target_os = "linux", target_os = "macos")))'.dependencies]
 lumepeer-aom-sys = { workspace = true, optional = true }
 
 # ScreenCaptureKit and the CoreMedia/CoreVideo types it hands frames back in
