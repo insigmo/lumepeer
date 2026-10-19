@@ -40,6 +40,12 @@ lumepeer-media = { workspace = true, features = ["audio-opus", "audio-capture"] 
 lumepeer-service.workspace = true
 lumepeer-terminal.workspace = true
 ed25519-dalek.workspace = true
+# License tokens arrive base32 and carry a BLAKE3 device binding (ADR 0006),
+# and the broker is spoken to over blocking HTTPS (ADR 0163). All three are
+# already in the tree through lumepeer-core and the integration tests.
+blake3.workspace = true
+data-encoding.workspace = true
+ureq.workspace = true
 iroh.workspace = true
 postcard.workspace = true
 rand.workspace = true

@@ -35,6 +35,8 @@ const COMMANDS: &[&str] = &[
     "network_status",
     "connection_stats",
     "license_status",
+    "license_activate",
+    "license_deactivate",
     "invite_create",
     "invite_current",
     "invite_connect",

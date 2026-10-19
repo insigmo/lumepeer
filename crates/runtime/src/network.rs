@@ -44,6 +44,7 @@ use lumepeer_core::constants::{
     TERMINAL_OUTPUT_MAX_BYTES, TERMINAL_SCROLLBACK_BYTES, TRANSPORT_PROBE_ATTEMPTS,
     TUNNEL_IDLE_TIMEOUT_SECS,
 };
+use lumepeer_core::license::Plan;
 use lumepeer_core::protocol::{
     ClipboardFileEntry, CursorShapeData, DirEntry, DirListRefusal, DisplayModeInfo,
     DisplayModeUnavailableReason, EncoderChoice, FEATURE_CLIPBOARD_FILES, FEATURE_CODEC_AV1,
@@ -1743,6 +1744,8 @@ enum ActorCommand {
         remember: bool,
         reply: oneshot::Sender<Result<(), ActorError>>,
     },
+    /// Replaces the plan the license layer says is in force (§12; ADR 0163).
+    SetPlan { plan: Plan },
 }
 
 /// Thin handle IPC commands hold. Cloneable: every command gets its own
@@ -3293,6 +3296,20 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)?
+    }
+
+    /// Replaces the plan sessions are admitted under (§12; ADR 0163).
+    ///
+    /// Sessions already running keep going; the new ceiling applies to the
+    /// next one admitted.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn set_plan(&self, plan: Plan) -> Result<(), ActorError> {
+        self.tx
+            .send(ActorCommand::SetPlan { plan })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)
     }
 
     /// Guest side: answers the host's credential challenge (§8; ADR 0033).
@@ -12955,6 +12972,12 @@ impl Actor {
                 reply,
             } => {
                 let _ = reply.send(self.on_unattended_submit(&password, code, remember));
+            }
+            ActorCommand::SetPlan { plan } => {
+                if self.sessions.plan() != plan {
+                    tracing::info!(plan = plan.as_str(), "license plan in force");
+                    self.sessions.set_plan(plan);
+                }
             }
         }
     }

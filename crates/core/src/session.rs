@@ -193,11 +193,11 @@ impl Default for SessionManager {
 }
 
 impl SessionManager {
-    /// Creates a manager on the trial plan; the license layer replaces the
-    /// plan once a token is validated (§12).
+    /// Creates a manager on the free plan; the license layer replaces the
+    /// plan once a token is validated (§12, ADR 0163).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_plan(Plan::Trial)
+        Self::with_plan(Plan::Free)
     }
 
     /// Creates a manager for an explicit plan.

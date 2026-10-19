@@ -55,6 +55,8 @@
     "allow-network-status",
     "allow-connection-stats",
     "allow-license-status",
+    "allow-license-activate",
+    "allow-license-deactivate",
     "allow-invite-create",
     "allow-invite-current",
     "allow-invite-connect",

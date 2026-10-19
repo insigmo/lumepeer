@@ -16,6 +16,7 @@ mod bootstrap;
 mod commands;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
+mod license;
 mod logging;
 // The macOS permissions screen: Screen Recording, Accessibility, Microphone.
 mod mac_permissions;
@@ -80,6 +81,8 @@ pub struct AppState {
     /// of closing it — and with no tray there would be nothing left to bring
     /// it back from.
     pub tray: bool,
+    /// The license sessions are admitted under (ADR 0163).
+    pub license: std::sync::Arc<license::License>,
 }
 
 /// The platform's host-role guard, or a placeholder where there is none.
@@ -490,12 +493,17 @@ fn setup_app(
     // is part of that state: the window-close handler has to know whether
     // hiding a window leaves anything to bring it back.
     let tray = install_tray(app)?;
+    // Before the state, so the first heartbeat round has already told the
+    // actor the plan by the time a guest can knock (ADR 0163).
+    let license = license::License::load(app.handle());
+    license::spawn_heartbeat(&runtime, std::sync::Arc::clone(&license), network.clone());
     app.manage(AppState {
         network,
         update_url,
         autostart,
         host_role,
         tray,
+        license,
     });
     // Managed separately from `AppState` because it needs an `AppHandle` of
     // its own to reach the actor from the grab's drain task, and `AppState`
@@ -617,6 +625,8 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::network_status,
         commands::connection_stats,
         commands::license_status,
+        commands::license_activate,
+        commands::license_deactivate,
         commands::invite_create,
         commands::invite_current,
         commands::invite_connect,

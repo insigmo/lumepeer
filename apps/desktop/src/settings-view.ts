@@ -15,6 +15,7 @@ import { addressBook } from './address-book';
 import type { AuditCommands } from './audit-log';
 import { auditPanel } from './audit-log';
 import { inviteRefreshPanel } from './invite-view';
+import { licenseSettings } from './license-settings';
 import { macPermissionsSettingsRow } from './mac-permissions';
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
@@ -211,8 +212,9 @@ function section(panels: SettingsPanels): TemplateResult {
         ${auditPanel(locale, panels.auditCommands)}
       `;
     case 'about':
-      // Which build this is, and whether a newer one exists.
-      return html`${updateSettings(locale, panels.systemCommands)}`;
+      // Which build this is, whether a newer one exists, and which plan it
+      // runs on (ADR 0163).
+      return html`${updateSettings(locale, panels.systemCommands)} ${licenseSettings(locale)}`;
   }
 }
 

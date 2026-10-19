@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Window;
 
 use crate::AppState;
+use lumepeer_runtime::license_client::{LicenseError, LicenseStatus};
 use lumepeer_runtime::net_errors::classify_net;
 use lumepeer_runtime::network::{ActorError, ActorHandle, SessionStateDto};
 use lumepeer_runtime::view::TerminalWindow;
@@ -821,15 +822,50 @@ pub struct TransportFallbackDto {
     pub failure: &'static str,
 }
 
-/// License state for the UI.
+/// License state for the UI (ADR 0163).
 #[derive(Debug, Clone, Serialize)]
 pub struct LicenseStatusDto {
-    /// Plan name.
-    pub plan: String,
-    /// Seconds left in the current license window, if bounded.
+    /// Plan in force: `free`, `trial`, `pro` or `team`.
+    pub plan: &'static str,
+    /// Whether a paid license is held and honoured.
+    pub licensed: bool,
+    /// Seconds left on the current token, if one is honoured.
     pub seconds_left: Option<u64>,
-    /// Whether the app is currently running on cached license data (§12.4).
+    /// A license is held but the last contact with the server failed (§12.4).
     pub offline: bool,
+    /// Why a held license is not honoured or was dropped; safe to show.
+    pub reason: Option<String>,
+    /// Whether this build can activate a license at all.
+    pub activation_available: bool,
+}
+
+impl From<LicenseStatus> for LicenseStatusDto {
+    fn from(status: LicenseStatus) -> Self {
+        Self {
+            plan: status.plan.as_str(),
+            licensed: status.licensed,
+            seconds_left: status.seconds_left,
+            offline: status.offline,
+            reason: status.reason,
+            activation_available: status.activation_available,
+        }
+    }
+}
+
+impl From<LicenseError> for IpcError {
+    fn from(error: LicenseError) -> Self {
+        let code = match &error {
+            LicenseError::NotConfigured => "LICENSE_NOT_CONFIGURED",
+            LicenseError::Rejected { .. } => "LICENSE_REJECTED",
+            LicenseError::Unreachable => "LICENSE_UNREACHABLE",
+            LicenseError::InvalidToken => "LICENSE_INVALID",
+            LicenseError::Storage => "LICENSE_STORAGE",
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Grants a role. The decision is taken by the actor, never in the webview
@@ -1873,15 +1909,64 @@ pub async fn unattended_submit(
 /// # Errors
 /// Rejects calls from other windows.
 #[tauri::command]
-pub fn license_status(window: Window) -> Result<LicenseStatusDto, IpcError> {
+pub fn license_status(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<LicenseStatusDto, IpcError> {
     check_window(&window)?;
-    // Phase 3 fills these from a verified license token (§12.1, §12.4); the
-    // plan is Trial until then, same default `SessionManager::new()` used.
-    Ok(LicenseStatusDto {
-        plan: "trial".to_owned(),
-        seconds_left: None,
-        offline: true,
-    })
+    Ok(state.license.snapshot().into())
+}
+
+/// Argument of [`license_activate`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct LicenseActivateArgs {
+    /// The account key the buyer was given.
+    pub key: String,
+}
+
+/// Activates a license on this device and puts its plan in force.
+///
+/// # Errors
+/// Rejects calls from other windows and an empty key; otherwise what the
+/// license server or the token check said.
+#[tauri::command]
+pub async fn license_activate(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: LicenseActivateArgs,
+) -> Result<LicenseStatusDto, IpcError> {
+    check_window(&window)?;
+    if args.key.trim().is_empty() {
+        return Err(IpcError {
+            code: "BAD_ARGS",
+            message: "the license key is empty".to_owned(),
+        });
+    }
+    let license = std::sync::Arc::clone(&state.license);
+    let status = tauri::async_runtime::spawn_blocking(move || license.activate(&args.key))
+        .await
+        .map_err(|_| IpcError::from(LicenseError::Storage))??;
+    state.network.set_plan(status.plan).await?;
+    Ok(status.into())
+}
+
+/// Gives this device's license seat back and returns it to the free plan.
+///
+/// # Errors
+/// Rejects calls from other windows; [`LicenseError::Storage`] if the cached
+/// license cannot be removed.
+#[tauri::command]
+pub async fn license_deactivate(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<LicenseStatusDto, IpcError> {
+    check_window(&window)?;
+    let license = std::sync::Arc::clone(&state.license);
+    let status = tauri::async_runtime::spawn_blocking(move || license.deactivate())
+        .await
+        .map_err(|_| IpcError::from(LicenseError::Storage))??;
+    state.network.set_plan(status.plan).await?;
+    Ok(status.into())
 }
 
 /// Argument of [`view_next_frame`].

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lumepeer_core::constants::TRIAL_SESSION_LIMIT_SECS;
 use lumepeer_core::license::{LicenseDecision, LicenseGuard, LicenseToken, Plan};
+use lumepeer_runtime::license_client::{HttpBroker, LicenseClient, LicenseConfig, LicenseError};
 
 /// Hex of the Ed25519 key the test broker signs tokens with.
 const SIGNING_KEY_HEX: &str = "0505050505050505050505050505050505050505050505050505050505050505";
@@ -36,7 +37,9 @@ fn broker_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
     path.pop();
-    path.push("lumepeer-broker");
+    // With the platform's suffix: without it every test here found no
+    // binary on Windows and returned early as if it had passed.
+    path.push(format!("lumepeer-broker{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -465,6 +468,47 @@ fn revoke_stops_the_heartbeat_and_the_refresh() {
         serde_json::json!({ "device_id": "dev-7" }),
     );
     assert_eq!(status, 403);
+}
+
+/// ADR 0163: the client the app runs speaks the broker's wire format — a
+/// fresh install is free, a key without a license is refused, a good key
+/// activates, a heartbeat keeps it, an old token refreshes, and deactivating
+/// gives the seat back.
+#[test]
+fn the_app_license_client_round_trips_against_the_broker() {
+    let Some(broker) = Broker::start() else {
+        return;
+    };
+    let now = now_secs();
+    broker.grant("acct-9", "lic-9", Plan::Pro, now + 30 * 86_400);
+    let config = LicenseConfig {
+        broker_url: Some(broker.base.clone()),
+        verifying_key: Some(verifying_key()),
+    };
+    let http = HttpBroker::new(broker.base.clone());
+    let mut client = LicenseClient::load(&config, Some(Box::new(http)), None, now);
+    assert_eq!(client.status(now).plan, Plan::Free);
+
+    let refused = client.activate("acct-nobody", now).unwrap_err();
+    assert!(
+        matches!(refused, LicenseError::Rejected { ref code, .. } if code == "NO_ACTIVE_LICENSE"),
+        "{refused:?}"
+    );
+
+    let status = client.activate("acct-9", now).unwrap();
+    assert_eq!(status.plan, Plan::Pro);
+    assert!(status.licensed);
+
+    let status = client.tick(now);
+    assert!(status.licensed && !status.offline, "{status:?}");
+    // Thirteen hours on, the 24 hour token is inside the refresh window.
+    let later = now + 13 * 60 * 60;
+    let status = client.tick(later);
+    assert!(status.licensed && !status.offline, "{status:?}");
+
+    let status = client.deactivate(later).unwrap();
+    assert_eq!(status.plan, Plan::Free);
+    assert!(!status.licensed);
 }
 
 fn trial_token() -> LicenseToken {

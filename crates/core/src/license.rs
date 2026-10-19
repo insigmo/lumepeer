@@ -7,9 +7,10 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::constants::{
-    CLOCK_ROLLBACK_ACTIVE_SESSION_CUTOFF_SECS, LICENSE_WARN_BEFORE_SECS, MAX_CONCURRENT_GUESTS_PRO,
-    MAX_CONCURRENT_GUESTS_TEAM, MAX_CONCURRENT_GUESTS_TRIAL, OFFLINE_GRACE_PRO_DAYS,
-    OFFLINE_GRACE_TEAM_DAYS, TRIAL_SESSION_LIMIT_SECS,
+    CLOCK_ROLLBACK_ACTIVE_SESSION_CUTOFF_SECS, LICENSE_WARN_BEFORE_SECS,
+    MAX_CONCURRENT_GUESTS_FREE, MAX_CONCURRENT_GUESTS_PRO, MAX_CONCURRENT_GUESTS_TEAM,
+    MAX_CONCURRENT_GUESTS_TRIAL, OFFLINE_GRACE_PRO_DAYS, OFFLINE_GRACE_TEAM_DAYS,
+    TRIAL_SESSION_LIMIT_SECS,
 };
 use crate::error::{CoreError, Result};
 
@@ -29,6 +30,10 @@ pub enum Plan {
     Pro,
     /// Up to 5 concurrent guests, 3 days of offline grace.
     Team,
+    /// No token at all: single guest, no time limit, nothing to refresh
+    /// (ADR 0163). Also what a paid plan falls back to once its token stops
+    /// being honoured.
+    Free,
 }
 
 impl Plan {
@@ -39,16 +44,17 @@ impl Plan {
             Self::Trial => MAX_CONCURRENT_GUESTS_TRIAL,
             Self::Pro => MAX_CONCURRENT_GUESTS_PRO,
             Self::Team => MAX_CONCURRENT_GUESTS_TEAM,
+            Self::Free => MAX_CONCURRENT_GUESTS_FREE,
         }
     }
 
     /// Days the plan may run without a successful heartbeat (§12.3, §12.4).
     /// The trial plan has no offline grace: it is bounded by cumulative
-    /// session time instead.
+    /// session time instead. The free plan has no token to keep alive.
     #[must_use]
     pub const fn offline_grace_days(self) -> Option<u64> {
         match self {
-            Self::Trial => None,
+            Self::Trial | Self::Free => None,
             Self::Pro => Some(OFFLINE_GRACE_PRO_DAYS),
             Self::Team => Some(OFFLINE_GRACE_TEAM_DAYS),
         }
@@ -59,6 +65,7 @@ impl Plan {
             0 => Some(Self::Trial),
             1 => Some(Self::Pro),
             2 => Some(Self::Team),
+            3 => Some(Self::Free),
             _ => None,
         }
     }
@@ -82,6 +89,18 @@ impl Plan {
             Self::Trial => 0,
             Self::Pro => 1,
             Self::Team => 2,
+            Self::Free => 3,
+        }
+    }
+
+    /// Stable lowercase name, for the UI and the logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trial => "trial",
+            Self::Pro => "pro",
+            Self::Team => "team",
+            Self::Free => "free",
         }
     }
 }
@@ -246,11 +265,24 @@ pub enum LicenseDecision {
         /// Hard cap for any session still running.
         cutoff_secs: u64,
     },
-    /// Nothing may run: `LicenseDeny` goes out and every session ends (§18).
+    /// The token is not honoured: the install runs on [`Plan::Free`] until an
+    /// online check brings a valid one back (ADR 0163).
     Deny {
         /// Reason, safe for the UI and free of secrets (§15).
         reason: &'static str,
     },
+}
+
+impl LicenseDecision {
+    /// Plan sessions run under: the token's plan while it is allowed,
+    /// [`Plan::Free`] otherwise (ADR 0163).
+    #[must_use]
+    pub const fn plan_in_force(&self) -> Plan {
+        match self {
+            Self::Allow { plan, .. } => *plan,
+            Self::DenyNewSession { .. } | Self::Deny { .. } => Plan::Free,
+        }
+    }
 }
 
 /// Seconds in a day, for the offline grace of §12.3 expressed in days.
@@ -341,9 +373,12 @@ impl LicenseGuard {
             self.high_water_wall = now;
         }
 
+        // No token is the free plan, not a failure: there is nothing to
+        // expire, refresh or roll back (ADR 0163).
         let Some(token) = self.token.as_ref() else {
-            return LicenseDecision::Deny {
-                reason: "no license token; an online check is required",
+            return LicenseDecision::Allow {
+                plan: Plan::Free,
+                seconds_left: None,
             };
         };
 
@@ -509,9 +544,34 @@ mod tests {
     }
 
     #[test]
-    fn no_token_denies() {
+    fn no_token_is_the_free_plan_without_a_time_limit() {
         let mut guard = LicenseGuard::new(None, 0);
-        assert!(matches!(guard.evaluate(0), LicenseDecision::Deny { .. }));
+        let decision = guard.evaluate(0);
+        assert_eq!(
+            decision,
+            LicenseDecision::Allow {
+                plan: Plan::Free,
+                seconds_left: None
+            }
+        );
+        // Neither a year offline nor a clock rollback ends it.
+        assert_eq!(
+            guard.evaluate(365 * SECS_PER_DAY).plan_in_force(),
+            Plan::Free
+        );
+        assert!(!matches!(
+            guard.evaluate(5),
+            LicenseDecision::DenyNewSession { .. }
+        ));
+    }
+
+    #[test]
+    fn a_denied_paid_token_falls_back_to_free() {
+        let mut guard = LicenseGuard::new(Some(token(Plan::Team, 0, 1_000)), 0);
+        assert_eq!(guard.evaluate(500).plan_in_force(), Plan::Team);
+        let expired = guard.evaluate(2_000);
+        assert!(matches!(expired, LicenseDecision::Deny { .. }));
+        assert_eq!(expired.plan_in_force(), Plan::Free);
     }
 
     #[test]
@@ -596,7 +656,10 @@ mod tests {
         assert_eq!(Plan::Trial.max_concurrent_guests(), 1);
         assert_eq!(Plan::Pro.max_concurrent_guests(), 1);
         assert_eq!(Plan::Team.max_concurrent_guests(), 5);
+        assert_eq!(Plan::Free.max_concurrent_guests(), 1);
         assert_eq!(Plan::Trial.offline_grace_days(), None);
+        assert_eq!(Plan::Free.offline_grace_days(), None);
+        assert_eq!(Plan::from_wire_or_trial(Plan::Free.to_wire()), Plan::Free);
     }
 
     #[test]

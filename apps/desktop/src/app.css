@@ -2447,6 +2447,7 @@ input[type='checkbox'].switch:disabled {
 }
 
 .unattended-password,
+.license-activate,
 .credentials-form {
   display: flex;
   flex-wrap: wrap;
@@ -2456,6 +2457,7 @@ input[type='checkbox'].switch:disabled {
 }
 
 .unattended-password input,
+.license-activate input,
 .credentials-form input:not([type='checkbox']) {
   flex: 1 1 160px;
   min-width: 0;

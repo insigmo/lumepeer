@@ -38,6 +38,7 @@ import {
   onSystemStateChange,
   tauriSystemCommands,
 } from './system-settings';
+import { onLicenseStateChange } from './license-settings';
 import { logoMark } from './logo';
 import { PresenceSchedule, probeSavedHosts } from './presence';
 import { onRecordingsStateChange, tauriRecordingsCommands, type RecordingEntry } from './recordings';
@@ -519,6 +520,7 @@ onAddressBookStateChange(renderNow);
 onRecordingsStateChange(renderNow);
 onAuditStateChange(renderNow);
 onSystemStateChange(renderNow);
+onLicenseStateChange(renderNow);
 onSettingsStateChange(renderNow);
 onMacPermissionsStateChange(renderNow);
 // Off macOS this reads `null` once and shows nothing.

@@ -17,6 +17,8 @@ workspace = true
 [dev-dependencies]
 lumepeer-core.workspace = true
 lumepeer-net.workspace = true
+# The app's license client, driven against the real broker (ADR 0163).
+lumepeer-runtime.workspace = true
 lumepeer-media = { workspace = true, features = [
     "capture-x11",
     "capture-portal",

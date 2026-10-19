@@ -39,6 +39,7 @@ pub mod config;
 pub mod connection_history;
 pub mod disk;
 pub mod invite_store;
+pub mod license_client;
 pub mod media_stats;
 pub mod net_errors;
 pub mod network;

@@ -365,6 +365,9 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 180;
 pub const OFFLINE_GRACE_PRO_DAYS: u64 = 7;
 /// Offline grace without a successful heartbeat, Team plan (§12.3).
 pub const OFFLINE_GRACE_TEAM_DAYS: u64 = 3;
+/// Concurrent guest connections allowed on the free plan, the one an install
+/// without a license token runs on (ADR 0163).
+pub const MAX_CONCURRENT_GUESTS_FREE: u8 = 1;
 /// Concurrent guest connections allowed on the trial plan (§8.2).
 pub const MAX_CONCURRENT_GUESTS_TRIAL: u8 = 1;
 /// Concurrent guest connections allowed on the Pro plan (§8.2).
