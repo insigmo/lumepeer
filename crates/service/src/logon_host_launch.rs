@@ -198,7 +198,8 @@ const fn stopped_with(code: Option<u32>, service_stopping: bool) -> Ended {
 /// The guest on the logon host has just signed the console in and is dialing
 /// again: starts the client it is dialing for (ADR 0164).
 fn hand_over_to_client() {
-    let Some(session) = console_session().filter(|&session| anybody_signed_in(session) == Some(true))
+    let Some(session) =
+        console_session().filter(|&session| anybody_signed_in(session) == Some(true))
     else {
         tracing::info!("the logon host handed over, but nobody is signed in at the console now");
         return;

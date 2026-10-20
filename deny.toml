@@ -27,6 +27,13 @@ ignore = [
     "RUSTSEC-2025-0081", # unic-char-range, unmaintained
     "RUSTSEC-2025-0098", # unic-ucd-version, unmaintained
     "RUSTSEC-2025-0100", # unic-ucd-ident, unmaintained
+    # zbus 6 folded these three crates into itself, but everything here that
+    # talks D-Bus (secret-service, tauri-plugin-single-instance,
+    # zbus-secret-service-keyring-store) still requires zbus 5. Unmaintained
+    # only, no CVE; drop them once those move to zbus 6.
+    "RUSTSEC-2026-0370", # zvariant, unmaintained
+    "RUSTSEC-2026-0371", # zbus_names, unmaintained
+    "RUSTSEC-2026-0372", # zvariant_derive, unmaintained
 ]
 
 [licenses]

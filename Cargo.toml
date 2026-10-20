@@ -119,7 +119,12 @@ libc = "0.2"            # syscall numbers for that filter
 # `tauri-build` checks against this feature; both do nothing off macOS.
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-build = { version = "2", features = [] }
-tauri-plugin-updater = "2"
+# Default features minus `zip`, which only unpacks Tauri v1 `.zip` updates on
+# Windows and `.AppImage.tar.gz` on Linux. We publish neither (the manifest in
+# release.yml serves .msi/-setup.exe, a bare .AppImage and macOS's
+# .app.tar.gz, which the plugin unpacks without this feature), and leaving it
+# out keeps zip 4.x and its RUSTSEC-2026-0367..0369 out of the binary.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 # Native file/directory pickers for §9.2, used **only** from Rust. The
 # webview never gets `dialog:` or `fs:` permissions: `capabilities/view.json`
 # says the view window has no filesystem rights, and a picker that ran in the

@@ -97,7 +97,10 @@ fn verdict(owner: Option<&str>, signed_in: &str, role_held: bool) -> Verdict {
 #[must_use]
 pub fn start_owner_client(session: u32) -> bool {
     let Some(user) = user_token_once_signed_in(session) else {
-        tracing::warn!(session, "cannot start the client: no token for whoever signed in");
+        tracing::warn!(
+            session,
+            "cannot start the client: no token for whoever signed in"
+        );
         return false;
     };
     let started = start_as(user, session);
@@ -126,7 +129,10 @@ fn user_token_once_signed_in(session: u32) -> Option<HANDLE> {
 /// [`start_owner_client`] once the user's token is in hand.
 fn start_as(user: HANDLE, session: u32) -> bool {
     let Some(sid) = sid_of_token(user) else {
-        tracing::warn!(session, "cannot start the client: cannot read who signed in");
+        tracing::warn!(
+            session,
+            "cannot start the client: cannot read who signed in"
+        );
         return false;
     };
     let owner = crate::program_data::logon_host_owner();
@@ -174,7 +180,9 @@ fn client_path() -> Option<String> {
     }
     let client = client.to_string_lossy().into_owned();
     if client.contains('"') {
-        tracing::warn!("cannot start the client: refusing an executable path that contains a quote");
+        tracing::warn!(
+            "cannot start the client: refusing an executable path that contains a quote"
+        );
         return None;
     }
     Some(client)
