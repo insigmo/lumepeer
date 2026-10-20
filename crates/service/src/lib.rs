@@ -25,6 +25,8 @@ pub mod agent_launch;
 pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
+pub mod client_launch;
+#[cfg(target_os = "windows")]
 pub mod desktop_input_channel;
 #[cfg(target_os = "windows")]
 pub mod frame;
@@ -147,3 +149,11 @@ pub const LOGON_HOST_EXIT_NOT_ENABLED: u32 = 3;
 /// user switch (ADR 0085 §4, ADR 0126). Waited out like
 /// [`LOGON_HOST_EXIT_NOT_ENABLED`], for the same reason.
 pub const LOGON_HOST_EXIT_ROLE_TAKEN: u32 = 4;
+
+/// Exit code of a logon host that had a guest when it was asked to leave
+/// (ADR 0164).
+///
+/// That guest has just signed the machine in and is dialing again; the service
+/// reads this as "start the owner's client", so the dial has somebody to reach
+/// whether or not autostart is on.
+pub const LOGON_HOST_EXIT_HANDED_OVER: u32 = 5;

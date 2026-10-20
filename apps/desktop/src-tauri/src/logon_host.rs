@@ -22,7 +22,9 @@
 //! - **There is no banner.** The only desktop to draw one on is `Winlogon`
 //!   (ADR 0088 §3, the known gap). The person who signs in gets the client's
 //!   own, because the moment they do the service asks this process to give the
-//!   host role up, it exits, and the client takes over.
+//!   host role up, it exits, and the client takes over. Its guests are told to
+//!   dial again, and a guest still here is what the service starts the client
+//!   for (ADR 0164).
 //!
 //! It refuses — with [`LOGON_HOST_EXIT_NOT_ENABLED`] — unless the feature is
 //! on, the owner's store already holds an identity (a new one would be a
@@ -41,7 +43,9 @@ use lumepeer_net::keystore::{IDENTITY_ENTRY, UNATTENDED_PASSWORD_ENTRY, load_or_
 use lumepeer_runtime::network::{ActorPolicy, ActorStores, default_capture, spawn_actor_with};
 use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::host_role::{HostRoleClaim, ReleaseRequests};
-use lumepeer_service::{LOGON_HOST_EXIT_NOT_ENABLED, LOGON_HOST_EXIT_ROLE_TAKEN};
+use lumepeer_service::{
+    LOGON_HOST_EXIT_HANDED_OVER, LOGON_HOST_EXIT_NOT_ENABLED, LOGON_HOST_EXIT_ROLE_TAKEN,
+};
 
 use crate::placement::Placement;
 
@@ -217,8 +221,31 @@ async fn serve(placement: Placement, releases: Option<&ReleaseRequests>) -> u32 
             tracing::info!(
                 "asked to give the host role up: somebody signed in, or the client wants it"
             );
-            return 0;
+            return hand_over(&handle).await;
         }
+    }
+}
+
+/// Leaves the guests to the client (ADR 0164): each is told, in the close of
+/// its connection, to dial a new session at once rather than wait out a dead
+/// link and resume one the client never heard of (ADR 0148). The exit code
+/// says whether there was anybody, which is what the service starts the
+/// client for.
+async fn hand_over(handle: &lumepeer_runtime::network::ActorHandle) -> u32 {
+    let guests = handle.status().await.map_or(0, |sessions| sessions.len());
+    if let Err(error) = handle.announce_restart().await {
+        tracing::warn!(?error, "cannot tell the guests to dial again");
+    }
+    tracing::info!(guests, "handing the machine over to the client");
+    exit_code_for(guests)
+}
+
+/// The exit code of a logon host that leaves with `guests` on it.
+const fn exit_code_for(guests: usize) -> u32 {
+    if guests > 0 {
+        LOGON_HOST_EXIT_HANDED_OVER
+    } else {
+        0
     }
 }
 
@@ -262,6 +289,14 @@ impl ViewWindows for LogonScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Leaving with a guest asks the service for the client; leaving with
+    /// nobody is an ordinary exit.
+    #[test]
+    fn a_guest_on_the_way_out_asks_for_the_client() {
+        assert_eq!(exit_code_for(1), LOGON_HOST_EXIT_HANDED_OVER);
+        assert_eq!(exit_code_for(0), 0);
+    }
 
     /// The logon screen asks nobody, is always the secure desktop, and is an
     /// empty machine — the three answers the actor's admission, input gate and

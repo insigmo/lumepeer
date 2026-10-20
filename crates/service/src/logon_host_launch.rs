@@ -6,7 +6,8 @@
 //! identity, the device password and the address book of the account that
 //! turned the feature on — so a guest reaches the same saved host at the logon
 //! screen as after it. The moment somebody signs in, it is asked to give the
-//! host role up and stopped, and the ordinary client takes over.
+//! host role up and stopped, and the ordinary client takes over — started
+//! here, when the logon host leaves with a guest still on it (ADR 0164).
 //!
 //! The service decides only *when*: somebody signed in or not. Whether the
 //! feature is on, and whose store to open, is the logon host's own question,
@@ -36,7 +37,10 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 
 use lumepeer_service::agent_launch::{anybody_signed_in, console_session};
-use lumepeer_service::{LOGON_HOST_ARG, LOGON_HOST_EXIT_NOT_ENABLED, LOGON_HOST_EXIT_ROLE_TAKEN};
+use lumepeer_service::{
+    LOGON_HOST_ARG, LOGON_HOST_EXIT_HANDED_OVER, LOGON_HOST_EXIT_NOT_ENABLED,
+    LOGON_HOST_EXIT_ROLE_TAKEN,
+};
 
 /// The logon screen's desktop, as a path for `STARTUPINFOW.lpDesktop`.
 ///
@@ -115,6 +119,7 @@ pub fn supervise(stopping: &AtomicBool) {
             Ended::Refused => parked = Some((session, Instant::now())),
             Ended::Crashed => std::thread::sleep(RELAUNCH_BACKOFF),
             Ended::Stopped => {}
+            Ended::HandedOver => hand_over_to_client(),
         }
     }
     tracing::info!("logon host supervisor stopped");
@@ -140,6 +145,9 @@ enum Ended {
     /// The supervisor stopped it: somebody signed in, the console moved, or
     /// the service is stopping.
     Stopped,
+    /// The supervisor stopped it because somebody signed in or the console
+    /// moved, and it had a guest on it (ADR 0164).
+    HandedOver,
 }
 
 /// What an exit code the supervisor did not cause means.
@@ -171,11 +179,31 @@ fn watch(host: LogonHost, stopping: &AtomicBool) -> Ended {
         };
         if let Some(reason) = leave {
             tracing::info!(pid = host.pid, reason, "stopping the logon host");
-            host.stop();
-            return Ended::Stopped;
+            let code = host.stop();
+            return stopped_with(code, stopping.load(Ordering::SeqCst));
         }
         std::thread::sleep(SUPERVISION_TICK);
     }
+}
+
+/// How a logon host the supervisor stopped ended: handed over when it left on
+/// its own saying it had a guest, unless the service itself is going away.
+const fn stopped_with(code: Option<u32>, service_stopping: bool) -> Ended {
+    match code {
+        Some(LOGON_HOST_EXIT_HANDED_OVER) if !service_stopping => Ended::HandedOver,
+        _ => Ended::Stopped,
+    }
+}
+
+/// The guest on the logon host has just signed the console in and is dialing
+/// again: starts the client it is dialing for (ADR 0164).
+fn hand_over_to_client() {
+    let Some(session) = console_session().filter(|&session| anybody_signed_in(session) == Some(true))
+    else {
+        tracing::info!("the logon host handed over, but nobody is signed in at the console now");
+        return;
+    };
+    let _ = lumepeer_service::client_launch::start_owner_client(session);
 }
 
 /// A running logon host.
@@ -236,8 +264,9 @@ impl LogonHost {
     }
 
     /// Asks the logon host to give the host role up and leave, and terminates
-    /// it if it has not within [`LOGON_HOST_STOP_TIMEOUT_MS`].
-    fn stop(self) {
+    /// it if it has not within [`LOGON_HOST_STOP_TIMEOUT_MS`]; the exit code
+    /// when it left on its own.
+    fn stop(self) -> Option<u32> {
         // The request the desktop client makes too (ADR 0085 §4): the host
         // ends its sessions and releases the role on its own.
         let asked = lumepeer_service::host_role::request_release();
@@ -258,7 +287,9 @@ impl LogonHost {
             unsafe {
                 let _ = TerminateProcess(self.process, 1);
             }
+            return None;
         }
+        self.exit_code()
     }
 }
 
@@ -337,6 +368,23 @@ mod tests {
         assert_eq!(serve_now(Some(1), None), None);
         assert_eq!(serve_now(None, Some(false)), None);
         assert_eq!(serve_now(None, None), None);
+    }
+
+    /// A stopped host that says it had a guest hands over to the client,
+    /// unless the service is stopping; one that was terminated, or had nobody,
+    /// is simply stopped.
+    #[test]
+    fn a_stopped_host_with_a_guest_hands_over() {
+        assert_eq!(
+            stopped_with(Some(LOGON_HOST_EXIT_HANDED_OVER), false),
+            Ended::HandedOver
+        );
+        assert_eq!(
+            stopped_with(Some(LOGON_HOST_EXIT_HANDED_OVER), true),
+            Ended::Stopped
+        );
+        assert_eq!(stopped_with(Some(0), false), Ended::Stopped);
+        assert_eq!(stopped_with(None, false), Ended::Stopped);
     }
 
     /// A host that refused parks the console; anything else it exits with is

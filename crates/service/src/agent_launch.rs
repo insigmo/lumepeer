@@ -195,7 +195,7 @@ pub fn user_sid(session: u32) -> Option<String> {
 ///
 /// Needs `SeTcbPrivilege`, which `LocalSystem` holds and an ordinary process
 /// does not. The handle is the caller's to close.
-fn query_user_token(session: u32) -> Option<HANDLE> {
+pub(crate) fn query_user_token(session: u32) -> Option<HANDLE> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a local that outlives the call and is only written.
     unsafe { WTSQueryUserToken(session, &raw mut token) }
@@ -428,7 +428,7 @@ impl Drop for SessionAgent {
 
 /// Turns the impersonation token `WTSQueryUserToken` hands back into a primary
 /// token, which is the only kind `CreateProcessAsUserW` accepts.
-fn primary_token_of(user: HANDLE) -> Option<HANDLE> {
+pub(crate) fn primary_token_of(user: HANDLE) -> Option<HANDLE> {
     let mut primary = HANDLE::default();
     // SAFETY: `user` is a live token handle; `primary` is a local that
     // outlives the call and is only written.

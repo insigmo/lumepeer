@@ -172,10 +172,13 @@ sign-in screen" is then on by itself (ADR 0133).
       device password.
 - [ ] The guest sees the sign-in screen, moves the pointer, types the Windows
       password and signs in. The audit log records an `EmptyMachineLogin`.
-- [ ] At sign-in the logon host leaves ("asked to give the host role up") and
-      the guest reconnects to the client within a few seconds. If the client
-      did not start on its own, write that down: it is ADR 0126's open
-      autostart question.
+- [ ] At sign-in the logon host leaves ("handing the machine over to the
+      client guests=1"), the service log says "started the owner's client for
+      the guest who signed in (ADR 0164)", and the guest's view window stays
+      open and shows the desktop again within a few seconds. Do this once
+      with autostart off: the client must still start.
+- [ ] Sign in at the machine itself with no guest connected and autostart
+      off: no client starts (ADR 0164 §2).
 - [ ] With the checkbox off, or with no device password, the logon host log
       says so and nothing listens; the helper does not relaunch it until the
       console changes.
