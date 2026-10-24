@@ -332,10 +332,17 @@ pub mod secret_service_backend {
             let service = SecretService::connect(EncryptionType::Dh)
                 .await
                 .map_err(|e| NetError::Keystore(e.to_string()))?;
-            let collection = service
-                .get_default_collection()
-                .await
-                .map_err(|e| NetError::Keystore(e.to_string()))?;
+            // A fresh account often has gnome-keyring's `default` alias
+            // pointing at a `login` collection that was never created (no
+            // PAM unlock at sign-in), so the lookup fails. Create it then:
+            // the keyring asks the user for its password itself.
+            let collection = match service.get_default_collection().await {
+                Ok(collection) => collection,
+                Err(_) => service
+                    .create_collection("Login", "default")
+                    .await
+                    .map_err(|e| NetError::Keystore(e.to_string()))?,
+            };
             collection
                 .unlock()
                 .await

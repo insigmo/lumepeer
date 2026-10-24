@@ -55,13 +55,13 @@
     },
     "linux": {
       "deb": {
-        "depends": ["libpipewire-0.3-0", "libayatana-appindicator3-1", "libva2", "libva-drm2"],
+        "depends": ["libpipewire-0.3-0", "libayatana-appindicator3-1", "libva2", "libva-drm2", "gnome-keyring | kwallet6"],
         "recommends": ["xdg-desktop-portal", "pipewire"],
         "postInstallScript": "packaging/deb-postinst.sh",
         "preRemoveScript": "packaging/deb-prerm.sh"
       },
       "rpm": {
-        "depends": ["pipewire-libs", "libayatana-appindicator-gtk3", "libva"],
+        "depends": ["pipewire-libs", "libayatana-appindicator-gtk3", "libva", "gnome-keyring"],
         "recommends": ["xdg-desktop-portal", "pipewire"],
         "postInstallScript": "packaging/rpm-post.sh",
         "preRemoveScript": "packaging/rpm-preun.sh"
