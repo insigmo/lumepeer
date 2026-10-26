@@ -8,6 +8,13 @@ pub enum MediaError {
     #[error("capture backend unavailable: {0}")]
     CaptureUnavailable(String),
 
+    /// The desktop offers nothing to capture its screen with: on Wayland, no
+    /// xdg-desktop-portal that implements `ScreenCast` and `RemoteDesktop`
+    /// (ADR 0166). A fact about this desktop session rather than a passing
+    /// failure, so the guest is told instead of redialing.
+    #[error("this desktop offers no screen capture: {0}")]
+    CaptureUnsupported(String),
+
     /// The user declined the system capture or input prompt. Not an error
     /// condition of ours: fall back to a narrower capability (§18).
     #[error("capture permission denied by the user")]

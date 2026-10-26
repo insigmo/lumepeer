@@ -43,7 +43,7 @@ SESSION_VARS = (
 # `gsd-`/`csd-media-keys`: GNOME and Cinnamon on Wayland, whose compositors
 # carry no display variables of their own; their settings daemons do.
 SESSION_PROCESSES = ("plasmashell", "kwin_wayland", "gnome-shell", "xfce4-session", "labwc", "Xorg", "gsd-media-keys",
-                     "csd-media-keys")
+                     "csd-media-keys", "cinnamon")
 
 
 class State:

@@ -1767,6 +1767,18 @@ pub(crate) fn spawn_encode_loop_with(
                         .await;
                     return;
                 }
+                // Nothing on this desktop can capture its screen: Cinnamon on
+                // Wayland has no portal for it. That is as lasting as a build
+                // with no backend, and ending the loop alone left the guest
+                // redialing about once a second for as long as its window
+                // stayed open (ADR 0166).
+                Ok(Err(MediaError::CaptureUnsupported(reason))) => {
+                    tracing::warn!(peer = %tag, %reason, "this desktop offers no screen capture: this session stays blank");
+                    let _ = faults
+                        .send((peer, MediaUnavailableReason::NoCaptureBackend))
+                        .await;
+                    return;
+                }
                 Ok(Err(error)) => {
                     tracing::info!(peer = %tag, %error, "capture ended: stopping the encode loop");
                     return;
@@ -4932,6 +4944,83 @@ mod tests {
             .unwrap();
         assert_eq!(fault, Some((peer, MediaUnavailableReason::EncoderFailed)));
         // And having said so, the loop is over rather than still encoding.
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A capturer on a desktop that has nothing to capture its screen with,
+    /// as the Wayland portal capturer is on Cinnamon (ADR 0166).
+    #[derive(Debug)]
+    struct UncapturableCapturer;
+
+    impl lumepeer_media::capture::ScreenCapturer for UncapturableCapturer {
+        fn start(
+            &mut self,
+            _target: lumepeer_media::capture::CaptureTarget,
+        ) -> lumepeer_media::Result<()> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> lumepeer_media::Result<Option<Frame>> {
+            Err(MediaError::CaptureUnsupported(
+                "A portal frontend implementing `org.freedesktop.portal.RemoteDesktop` was not found"
+                    .to_owned(),
+            ))
+        }
+
+        fn stop(&mut self) {}
+
+        fn input_capability(&self) -> lumepeer_media::capture::InputCapability {
+            lumepeer_media::capture::InputCapability::None
+        }
+    }
+
+    /// ADR 0166: a desktop with no portal to capture through ended the loop
+    /// in silence, and its guest redialed about once a second for as long as
+    /// its window stayed open. The loop now says this host cannot capture.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_desktop_that_offers_no_capture_ends_the_loop_and_says_so() {
+        let host = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let guest = lumepeer_net::PeerEndpoint::bind_local(iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let (dialed, accepted) = tokio::join!(
+            guest.connect(host.addr(), lumepeer_net::ALPN_MEDIA),
+            host.accept()
+        );
+        let _guest_side = dialed.unwrap();
+        let connection = accepted.unwrap().unwrap();
+
+        let peer = guest.node_id();
+        let capture: SharedCapture = Arc::new(Mutex::new(CaptureController::new(
+            Box::new(UncapturableCapturer),
+            lumepeer_media::capture::CaptureTarget::PrimaryDisplay,
+        )));
+        lock_capture(&capture).add_viewer(peer).unwrap();
+        let (faults, mut faults_rx) = mpsc::channel(4);
+        let task = spawn_encode_loop_with(
+            connection,
+            capture,
+            Arc::new(Mutex::new(None)),
+            "test-peer".to_owned(),
+            VideoCodec::H264,
+            peer,
+            faults,
+            EncodeControl::new(peer, None),
+            |_| Ok(Box::new(RefusingEncoder)),
+        );
+
+        let fault = tokio::time::timeout(Duration::from_secs(10), faults_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(
+            fault,
+            Some((peer, MediaUnavailableReason::NoCaptureBackend))
+        );
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .unwrap()

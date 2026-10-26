@@ -931,21 +931,48 @@ pub mod portal {
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
         let remote = RemoteDesktop::with_connection(connection.clone())
             .await
-            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            .map_err(map_portal_error)?;
         let screencast = Screencast::with_connection(connection)
             .await
-            .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
+            .map_err(map_portal_error)?;
         Ok((remote, screencast))
     }
 
-    /// A dismissed dialog is the user declining, everything else is the portal
-    /// being unavailable (§18).
+    /// A dismissed dialog is the user declining, a desktop with no portal to
+    /// capture through is that desktop's limit (ADR 0166), and everything else
+    /// is the portal being unavailable (§18).
     fn map_portal_error(error: ashpd::Error) -> MediaError {
         match error {
             ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled) => {
                 MediaError::PermissionDenied
             }
+            // Cinnamon 6.4 on Wayland: its portals implement neither
+            // interface, and nothing else on that desktop can capture it.
+            ashpd::Error::PortalNotFound(_) => MediaError::CaptureUnsupported(error.to_string()),
+            error if no_portal_frontend(&error) => {
+                MediaError::CaptureUnsupported(error.to_string())
+            }
             other => MediaError::CaptureUnavailable(other.to_string()),
+        }
+    }
+
+    /// Whether the session bus has no portal frontend at all: no
+    /// xdg-desktop-portal installed. The bus answers `ServiceUnknown` only for
+    /// a name nothing owns and nothing can be started for; an installed
+    /// portal that fails to start answers otherwise.
+    fn no_portal_frontend(error: &ashpd::Error) -> bool {
+        use ashpd::zbus;
+        let (ashpd::Error::Zbus(inner) | ashpd::Error::Portal(ashpd::PortalError::ZBus(inner))) =
+            error
+        else {
+            return false;
+        };
+        match inner {
+            zbus::Error::MethodError(name, _, _) => {
+                name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown"
+            }
+            zbus::Error::FDO(fdo) => matches!(**fdo, zbus::fdo::Error::ServiceUnknown(_)),
+            _ => false,
         }
     }
 
@@ -954,9 +981,60 @@ pub mod portal {
         #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
 
         use super::{
-            PersistMode, PortalRuntime, RememberedGrant, connect, is_uuid, map_portal_error,
+            PersistMode, PortalHandle, PortalRuntime, RememberedGrant, connect, is_uuid,
+            map_portal_error,
         };
         use crate::error::MediaError;
+
+        /// ADR 0166: only a portal interface or a portal frontend that is not
+        /// there means this desktop cannot be captured; a portal that failed a
+        /// call is still a portal, and the next guest may find it working.
+        #[test]
+        fn a_missing_portal_is_the_desktops_limit() {
+            use ashpd::zbus;
+            let missing = ashpd::Error::PortalNotFound(
+                zbus::names::OwnedInterfaceName::try_from("org.freedesktop.portal.RemoteDesktop")
+                    .unwrap(),
+            );
+            assert!(matches!(
+                map_portal_error(missing),
+                MediaError::CaptureUnsupported(_)
+            ));
+            let no_frontend = ashpd::Error::Portal(ashpd::PortalError::ZBus(zbus::Error::FDO(
+                Box::new(zbus::fdo::Error::ServiceUnknown(
+                    "The name org.freedesktop.portal.Desktop was not provided by any .service files"
+                        .to_owned(),
+                )),
+            )));
+            assert!(matches!(
+                map_portal_error(no_frontend),
+                MediaError::CaptureUnsupported(_)
+            ));
+            assert!(matches!(
+                map_portal_error(ashpd::Error::NoResponse),
+                MediaError::CaptureUnavailable(_)
+            ));
+        }
+
+        /// ADR 0166, against a real session bus: a portal frontend whose
+        /// backends implement neither `RemoteDesktop` nor `ScreenCast`
+        /// (Cinnamon 6.4 on Wayland), or no frontend at all, ends the
+        /// handshake as the desktop's limit, not as a passing failure.
+        /// Opt-in: it needs such a bus — `dbus-run-session` in WSL, where only
+        /// xdg-desktop-portal-gtk is installed, is the first; the same with a
+        /// `--config-file` that lists no service directory is the second —
+        /// and would raise the real dialog anywhere else.
+        #[test]
+        fn a_desktop_without_a_capture_portal_says_so() {
+            if std::env::var("LUMEPEER_TEST_NO_CAPTURE_PORTAL").as_deref() != Ok("1") {
+                return;
+            }
+            let refused = PortalHandle::negotiate(&RememberedGrant::default());
+            assert!(
+                matches!(refused, Err(MediaError::CaptureUnsupported(_))),
+                "{refused:?}"
+            );
+        }
 
         /// Capture starts and input arrives on the network actor, a task on a
         /// worker of the app's runtime: the portal runtime has to run and shut
