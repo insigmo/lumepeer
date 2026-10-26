@@ -147,6 +147,11 @@ export const ja: Dictionary = {
   'history.forgetPassword.hint':
     'このデバイスはそのホストに自動的にサインインします。保存済みのパスワードを忘れさせると、次回は改めて入力を求められます。',
   'history.forgetPassword.confirm': (name) => `${name} 用に保存されたパスワードを忘れますか？`,
+  'history.check': '接続を確認',
+  'history.check.hint': 'ハンドシェイクまでホストに到達し、往復時間を測定します。ホストには何も求めず、画面にも何も表示されません。',
+  'history.check.running': '接続を確認しています…',
+  'history.check.dialing': '現在接続中です',
+  'history.check.failed': '接続を確認できませんでした',
   'status.lastSeenJustNow': '最終オンライン: たった今',
   'status.lastSeenMinutesAgo': (n) => `最終オンライン: ${n} 分前`,
   'status.lastSeenHoursAgo': (n) => `最終オンライン: ${n} 時間前`,

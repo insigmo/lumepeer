@@ -148,6 +148,11 @@ export const uk: Dictionary = {
   'history.forgetPassword.hint':
     'Цей пристрій входить на той хост автоматично. Забудьте збережений пароль, щоб його запитували знову.',
   'history.forgetPassword.confirm': (name) => `Забути пароль, збережений для ${name}?`,
+  'history.check': 'Перевірити з’єднання',
+  'history.check.hint': 'Доходить до комп’ютера до рукостискання й вимірює час туди-назад. Комп’ютер ні про що не питають, на його екрані нічого не з’являється.',
+  'history.check.running': 'Перевірка з’єднання…',
+  'history.check.dialing': 'Саме зараз іде підключення до нього',
+  'history.check.failed': 'Не вдалося перевірити з’єднання',
   'status.lastSeenJustNow': 'Востаннє в мережі щойно',
   'status.lastSeenMinutesAgo': (n) => `Востаннє в мережі ${n} хв тому`,
   'status.lastSeenHoursAgo': (n) => `Востаннє в мережі ${n} год тому`,

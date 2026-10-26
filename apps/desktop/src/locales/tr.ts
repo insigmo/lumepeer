@@ -148,6 +148,11 @@ export const tr: Dictionary = {
   'history.forgetPassword.hint':
     'Bu cihaz o ana bilgisayara otomatik olarak oturum açıyor. Kaydedilmiş parolayı unutun ki yeniden sorulsun.',
   'history.forgetPassword.confirm': (name) => `${name} için kaydedilmiş parola unutulsun mu?`,
+  'history.check': 'Bağlantıyı denetle',
+  'history.check.hint': 'Ana bilgisayara el sıkışmaya kadar ulaşır ve gidiş-dönüş süresini ölçer. Ana bilgisayara hiçbir şey sorulmaz, ekranında hiçbir şey görünmez.',
+  'history.check.running': 'Bağlantı denetleniyor…',
+  'history.check.dialing': 'Şu anda ona bağlanılıyor',
+  'history.check.failed': 'Bağlantı denetlenemedi',
   'status.lastSeenJustNow': 'Az önce çevrimiçiydi',
   'status.lastSeenMinutesAgo': (n) => `${n} dk önce çevrimiçiydi`,
   'status.lastSeenHoursAgo': (n) => `${n} sa önce çevrimiçiydi`,

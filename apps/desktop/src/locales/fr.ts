@@ -148,6 +148,11 @@ export const fr: Dictionary = {
   'history.forgetPassword.hint':
     'Cet appareil se connecte automatiquement à cet hôte. Oubliez le mot de passe enregistré pour qu\'il vous soit redemandé.',
   'history.forgetPassword.confirm': (name) => `Oublier le mot de passe enregistré pour ${name} ?`,
+  'history.check': 'Vérifier la connexion',
+  'history.check.hint': 'Joint l’hôte jusqu’à la poignée de main et mesure le temps aller-retour. Rien n’est demandé à l’hôte et rien ne s’affiche sur son écran.',
+  'history.check.running': 'Vérification de la connexion…',
+  'history.check.dialing': 'Connexion en cours avec lui',
+  'history.check.failed': 'Impossible de vérifier la connexion',
   'status.lastSeenJustNow': 'Vu à l\'instant',
   'status.lastSeenMinutesAgo': (n) => `Vu il y a ${n} min`,
   'status.lastSeenHoursAgo': (n) => `Vu il y a ${n} h`,

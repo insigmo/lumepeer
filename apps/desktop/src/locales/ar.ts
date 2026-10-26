@@ -147,6 +147,11 @@ export const ar: Dictionary = {
   'history.forgetPassword.hint':
     'يسجّل هذا الجهاز الدخول إلى ذلك المضيف تلقائيًا. انسَ كلمة المرور المحفوظة ليُطلب إدخالها من جديد.',
   'history.forgetPassword.confirm': (name) => `نسيان كلمة المرور المحفوظة لـ ${name}؟`,
+  'history.check': 'فحص الاتصال',
+  'history.check.hint': 'يصل إلى المضيف حتى المصافحة ويقيس زمن الذهاب والإياب. لا يُطلب من المضيف شيء ولا يظهر شيء على شاشته.',
+  'history.check.running': 'جارٍ فحص الاتصال…',
+  'history.check.dialing': 'جارٍ الاتصال به الآن',
+  'history.check.failed': 'تعذّر فحص الاتصال',
   'status.lastSeenJustNow': 'آخر ظهور قبل قليل',
   'status.lastSeenMinutesAgo': (n) => `آخر ظهور قبل ${n} د`,
   'status.lastSeenHoursAgo': (n) => `آخر ظهور قبل ${n} س`,

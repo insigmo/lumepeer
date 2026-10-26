@@ -349,6 +349,15 @@ pub const PRESENCE_ATTEMPT_TIMEOUT_SECS: u64 = 10;
 /// of those in one breath. Four keeps a short list instant and a long one to
 /// a few rounds of [`PRESENCE_ATTEMPT_TIMEOUT_SECS`].
 pub const PRESENCE_PROBES_AT_ONCE: usize = 4;
+/// How long a requested check of one saved host holds the handshake it got,
+/// waiting for iroh to move off a relay, before reading the path (ADR 0167).
+///
+/// A handshake often lands on the relay first and moves to a direct path once
+/// a punch does, usually within a second; a check that read the first path
+/// would report the relay a session leaves almost at once. Far inside
+/// [`CONTROL_HANDSHAKE_TIMEOUT_SECS`], which is how long the host waits for
+/// the `Hello` this connection never sends.
+pub const HOST_CHECK_SETTLE_MS: u64 = 2_000;
 /// Handshakes the host will run concurrently (§3.2). Beyond this the one that
 /// has waited longest is dropped to make room (ADR 0123), so the bound caps
 /// the work a flood can cause without letting a few stalled connections

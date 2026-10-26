@@ -8,7 +8,7 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke }));
 
 import { rememberThumbnail, thumbnailOf } from './peer-thumbnails';
-import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
+import { HOST_CHECK_SHOWN_MS, sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 
 let container: HTMLElement;
 
@@ -459,5 +459,90 @@ describe('remembered-host presence dot', () => {
     expect(face?.getAttribute('aria-label')).toBe('Connect again: host-ab12, Offline');
     renderWith(null);
     expect(face?.getAttribute('aria-label')).toBe('Connect again: host-ab12');
+  });
+});
+
+// ADR 0167: "Check connection" in a remembered host's menu.
+describe('checking a remembered host', () => {
+  /** A label of its own per test: running checks and answers outlive a render. */
+  function renderHost(peer: string, onRefresh: () => void = () => {}, reconnectDisabled = false): void {
+    render(
+      sessionStatus([], 'en', onRefresh, [{ ...ENTRY, peer_label: peer }], () => {}, reconnectDisabled),
+      container,
+    );
+  }
+
+  const checkButton = (): HTMLButtonElement | null =>
+    container.querySelector<HTMLButtonElement>('[data-testid="history-check"]');
+  const note = (): string | undefined =>
+    container.querySelector('[data-testid="history-check-result"]')?.textContent?.trim();
+
+  it('asks the actor for that host and shows the round trip and the path on the card', async () => {
+    invoke.mockResolvedValue({ outcome: 'online', rtt_ms: 42, path: 'direct', transport: 'iroh' });
+    const onRefresh = vi.fn();
+    renderHost('host-check-online', onRefresh);
+    const menu = container.querySelector<HTMLDetailsElement>('.history-row .peer-menu');
+    menu?.setAttribute('open', '');
+    checkButton()?.click();
+
+    expect(menu?.hasAttribute('open')).toBe(false);
+    renderHost('host-check-online', onRefresh);
+    expect(note()).toBe('Checking connection…');
+    expect(checkButton()?.disabled).toBe(true);
+
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(2));
+    expect(invoke).toHaveBeenCalledWith('history_check', { args: { peer: 'host-check-online' } });
+    renderHost('host-check-online', onRefresh);
+    expect(note()).toBe('Online · 42 ms · Direct');
+    expect(checkButton()?.disabled).toBe(false);
+  });
+
+  it('says a relay, the obfuscated transport and silence in words', async () => {
+    const cases: [string, unknown, string][] = [
+      ['host-check-relay', { outcome: 'online', rtt_ms: 120, path: 'relay', transport: 'iroh' }, 'Online · 120 ms · Via relay'],
+      ['host-check-obf', { outcome: 'online', rtt_ms: 9, path: 'direct', transport: 'obfuscated' }, 'Online · 9 ms · Obfuscated direct'],
+      ['host-check-off', { outcome: 'offline', rtt_ms: null, path: 'unknown', transport: null }, 'Offline'],
+      ['host-check-dial', { outcome: 'dialing', rtt_ms: null, path: 'unknown', transport: null }, 'Connecting to it right now'],
+    ];
+    for (const [peer, answer, text] of cases) {
+      invoke.mockResolvedValue(answer);
+      const onRefresh = vi.fn();
+      renderHost(peer, onRefresh);
+      checkButton()?.click();
+      await vi.waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(2));
+      renderHost(peer, onRefresh);
+      expect(note()).toBe(text);
+    }
+  });
+
+  it('says so when the check itself could not run', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    invoke.mockRejectedValue(new Error('UnknownPeer'));
+    const onRefresh = vi.fn();
+    renderHost('host-check-failed', onRefresh);
+    checkButton()?.click();
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(2));
+    renderHost('host-check-failed', onRefresh);
+    expect(note()).toBe('Could not check the connection');
+  });
+
+  it('takes the answer off the card once it is a minute old', async () => {
+    invoke.mockResolvedValue({ outcome: 'online', rtt_ms: 42, path: 'direct', transport: 'iroh' });
+    const onRefresh = vi.fn();
+    renderHost('host-check-old', onRefresh);
+    checkButton()?.click();
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(2));
+    const answeredAt = Date.now();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(answeredAt + HOST_CHECK_SHOWN_MS - 1000);
+    renderHost('host-check-old', onRefresh);
+    expect(note()).toBe('Online · 42 ms · Direct');
+    now.mockReturnValue(answeredAt + HOST_CHECK_SHOWN_MS + 1000);
+    renderHost('host-check-old', onRefresh);
+    expect(note()).toBeUndefined();
+  });
+
+  it('is not offered while a connect is in progress', () => {
+    renderHost('host-check-busy', () => {}, true);
+    expect(checkButton()?.disabled).toBe(true);
   });
 });

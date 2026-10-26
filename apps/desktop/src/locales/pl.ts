@@ -148,6 +148,11 @@ export const pl: Dictionary = {
   'history.forgetPassword.hint':
     'To urządzenie loguje się do tego hosta automatycznie. Zapomnij zapisane hasło, aby było pytane ponownie.',
   'history.forgetPassword.confirm': (name) => `Zapomnieć hasło zapisane dla ${name}?`,
+  'history.check': 'Sprawdź połączenie',
+  'history.check.hint': 'Dociera do hosta aż do uzgodnienia połączenia i mierzy czas w obie strony. Host o nic nie jest pytany, na jego ekranie nic się nie pojawia.',
+  'history.check.running': 'Sprawdzanie połączenia…',
+  'history.check.dialing': 'Właśnie trwa łączenie z nim',
+  'history.check.failed': 'Nie udało się sprawdzić połączenia',
   'status.lastSeenJustNow': 'Ostatnio widziano przed chwilą',
   'status.lastSeenMinutesAgo': (n) => `Ostatnio widziano ${n} min temu`,
   'status.lastSeenHoursAgo': (n) => `Ostatnio widziano ${n} godz. temu`,

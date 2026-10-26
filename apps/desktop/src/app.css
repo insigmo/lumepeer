@@ -1206,6 +1206,13 @@ button.peer-card-face:disabled {
   font-size: var(--fs-micro);
 }
 
+/* What "check connection" found on a remembered host (ADR 0167). Plain
+   text rather than a pill: on a narrow card it wraps, and a pill does not. */
+.connections-list .host-check-note {
+  color: var(--text-2);
+  font-size: var(--fs-micro);
+}
+
 /* The fact that a clipboard synced, never its content (§15). */
 .connections-list .clipboard-note {
   color: var(--text-2);

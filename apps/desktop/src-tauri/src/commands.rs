@@ -19,7 +19,7 @@ use tauri::Window;
 use crate::AppState;
 use lumepeer_runtime::license_client::{LicenseError, LicenseStatus};
 use lumepeer_runtime::net_errors::classify_net;
-use lumepeer_runtime::network::{ActorError, ActorHandle, SessionStateDto};
+use lumepeer_runtime::network::{ActorError, ActorHandle, SessionStateDto, TransportKind};
 use lumepeer_runtime::view::TerminalWindow;
 
 /// Label of the window allowed to call the session/invite/license commands.
@@ -518,6 +518,28 @@ pub struct HistoryRemoveArgs {
 pub struct HistoryForgetPasswordArgs {
     /// Label of the remembered host, as `connection_history` handed it out.
     pub peer: String,
+}
+
+/// Argument of [`history_check`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryCheckArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+}
+
+/// What checking one remembered host found (ADR 0167).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostCheckDto {
+    /// `online`, `offline`, or `dialing` when this node is connecting to that
+    /// host right now and the check was not run.
+    pub outcome: &'static str,
+    /// Round trip of the path that answered, in milliseconds; `null` when
+    /// nothing did.
+    pub rtt_ms: Option<u32>,
+    /// `direct`, `relay` or `unknown`: the path carrying packets, never `mixed`.
+    pub path: &'static str,
+    /// `iroh` or `obfuscated`; `null` when nothing answered.
+    pub transport: Option<&'static str>,
 }
 
 /// Guest-side state of this node's own outgoing connect attempt (§21
@@ -1161,6 +1183,33 @@ pub async fn history_probe(
     check_window(&window)?;
     state.network.history_probe().await?;
     Ok(())
+}
+
+/// Checks one remembered host now — "check connection" on its card — and
+/// answers whether it is there, how long a round trip to it takes and which
+/// way it was reached (ADR 0167).
+///
+/// Asks the host for nothing, like [`history_probe`]: the dial stops at the
+/// QUIC handshake. Answers when the check is over, which for a host that is
+/// not there is after the whole plan's attempts.
+///
+/// # Errors
+/// Rejects calls from other windows; [`IpcError`] for a label that names no
+/// remembered host, a saved code that no longer verifies, or a gone actor.
+#[tauri::command]
+pub async fn history_check(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: HistoryCheckArgs,
+) -> Result<HostCheckDto, IpcError> {
+    check_window(&window)?;
+    let check = state.network.history_check(args.peer).await?;
+    Ok(HostCheckDto {
+        outcome: check.outcome.code(),
+        rtt_ms: check.rtt_ms,
+        path: check.path.code(),
+        transport: check.transport.map(TransportKind::code),
+    })
 }
 
 /// What a `RebootRequest` asks for, as the webview names it (ADR 0084).

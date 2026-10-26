@@ -31,10 +31,10 @@ use lumepeer_core::constants::{
     DIAL_ATTEMPTS, DIAL_RETRY_BACKOFF_JITTER_MS, DIAL_RETRY_BACKOFF_MS,
     DISPLAY_MODE_CONFIRM_TIMEOUT_SECS, ENCODE_MAX_FPS, FILE_OFFER_LEGACY_MAX_BYTES,
     FILE_OFFER_MAX_BYTES, FILE_RESUME_ATTEMPTS, FILE_TRANSFER_START_TIMEOUT_SECS,
-    HOST_KEEP_AWAKE_SECS, HOST_RESTART_REDIAL_SECS, INCOMING_ACCEPT_TIMEOUT_SECS,
-    KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS, MAX_DIR_ENTRIES_PER_RESPONSE,
-    MAX_DIR_MANIFEST_ENTRIES, MAX_FILE_OPS_IN_FLIGHT, MAX_INFLIGHT_HANDSHAKES,
-    MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
+    HOST_CHECK_SETTLE_MS, HOST_KEEP_AWAKE_SECS, HOST_RESTART_REDIAL_SECS,
+    INCOMING_ACCEPT_TIMEOUT_SECS, KEYFRAME_MIN_INTERVAL_MS, MAX_CONCURRENT_FILE_TRANSFERS,
+    MAX_DIR_ENTRIES_PER_RESPONSE, MAX_DIR_MANIFEST_ENTRIES, MAX_FILE_OPS_IN_FLIGHT,
+    MAX_INFLIGHT_HANDSHAKES, MAX_PENDING_FILE_OFFERS, MAX_STREAM_PIXELS, MAX_TERMINALS_PER_SESSION,
     MAX_TUNNEL_STREAMS_PER_SESSION, PING_INTERVAL_SECS, PRESENCE_ATTEMPT_TIMEOUT_SECS,
     PRESENCE_PROBES_AT_ONCE, REBOOT_WAIT_CEILING_SECS, REBOOT_WAIT_RETRY_SECS, REBOOT_WARNING_SECS,
     RECONNECT_WINDOW_SECS, RESTART_CLOSE_FLUSH_MS, RESUME_ATTEMPT_TIMEOUT_SECS, RESUME_ATTEMPTS,
@@ -420,6 +420,83 @@ impl PathKind {
             Self::Relay => "relay",
             Self::Mixed => "mixed",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What checking one saved host found, because somebody asked (ADR 0167).
+///
+/// One reading, taken the way a presence check takes it (ADR 0127): as far as
+/// a finished QUIC handshake and never a `Hello`, so the host has nothing to
+/// decide. The round trip is QUIC's own measurement of the path that answered
+/// rather than a run of echoes — an echo needs a session on the host, and
+/// asking for one is exactly what a check must not do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostCheck {
+    /// Whether the host answered.
+    pub outcome: HostCheckOutcome,
+    /// Round trip of the path that answered, in milliseconds; `None` when
+    /// nothing did.
+    pub rtt_ms: Option<u32>,
+    /// Whether that path goes straight to the host or through a relay —
+    /// the one carrying packets, never [`PathKind::Mixed`].
+    pub path: PathKind,
+    /// Which transport answered; `None` when none did.
+    pub transport: Option<TransportKind>,
+}
+
+/// How a [`HostCheck`] came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostCheckOutcome {
+    /// The host finished a QUIC handshake, or this node holds a live
+    /// connection to it.
+    Online,
+    /// No transport of the plan finished one.
+    Offline,
+    /// This node is dialing that host right now. That dial's own outcome is
+    /// the answer, and a second dial would only race its punch (ADR 0127).
+    Dialing,
+}
+
+impl HostCheckOutcome {
+    /// Stable identifier for the webview, which turns it into localized text.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+            Self::Dialing => "dialing",
+        }
+    }
+}
+
+impl HostCheck {
+    /// A check that has no path to report.
+    const fn without_path(outcome: HostCheckOutcome) -> Self {
+        Self {
+            outcome,
+            rtt_ms: None,
+            path: PathKind::Unknown,
+            transport: None,
+        }
+    }
+
+    /// What `connection` says about the path carrying it right now.
+    ///
+    /// `rtt_ms` is a round trip measured some better way — a live session's
+    /// own `Ping`/`Pong` — and QUIC's estimate is the fallback.
+    fn of(connection: &PeerConnection, rtt_ms: Option<u32>) -> Self {
+        let snapshot = connection.path_snapshot();
+        Self {
+            outcome: HostCheckOutcome::Online,
+            rtt_ms: rtt_ms
+                .or_else(|| snapshot.and_then(|path| u32::try_from(path.rtt.as_millis()).ok())),
+            path: match snapshot {
+                Some(path) if path.relay => PathKind::Relay,
+                Some(_) => PathKind::Direct,
+                None => PathKind::Unknown,
+            },
+            transport: Some(transport_of(connection)),
         }
     }
 }
@@ -1335,6 +1412,12 @@ enum ActorCommand {
     /// of them for a session (ADR 0127). Answers once the checks are started;
     /// what they find arrives in the history rows.
     HistoryProbe { reply: oneshot::Sender<()> },
+    /// Guest side: check one remembered host now and answer how it was
+    /// reached (ADR 0167). Answers when the check is over.
+    HistoryCheck {
+        label: String,
+        reply: oneshot::Sender<Result<HostCheck, ActorError>>,
+    },
     /// Guest side: ask the watched host to restart or shut down (ADR 0084).
     RebootRequest {
         label: String,
@@ -1960,6 +2043,27 @@ impl ActorHandle {
             .await
             .map_err(|_| ActorError::ChannelClosed)?;
         rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
+    /// Guest side: checks one remembered host now, without asking it for a
+    /// session, and answers whether it is there and how it was reached
+    /// (ADR 0167).
+    ///
+    /// Returns when the check is over: within a second or two for a host that
+    /// is there, after the whole plan's attempts for one that is not. What it
+    /// found is also the `online` of the next [`Self::history`].
+    ///
+    /// # Errors
+    /// [`ActorError::UnknownPeer`] when `label` names no remembered host;
+    /// [`ActorError::Net`] when its saved code no longer verifies or leaves no
+    /// transport to dial; [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn history_check(&self, label: String) -> Result<HostCheck, ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryCheck { label, reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
     /// Guest side: asks the watched host to restart or shut down (§4.1;
@@ -4988,6 +5092,17 @@ enum ActorEvent {
         /// Whether the host finished a QUIC handshake on any transport.
         online: bool,
     },
+    /// Guest side: a check somebody asked for finished (ADR 0167).
+    ///
+    /// Not [`Self::HostProbed`]: a requested check is not one of the sweep's,
+    /// and must not clear the mark that keeps a sweep from dialing a host
+    /// twice.
+    HostChecked {
+        /// The row of the remembered-hosts list this is about.
+        host_tag: String,
+        /// Whether the host finished a QUIC handshake on any transport.
+        online: bool,
+    },
 }
 
 /// Outcome of one accepted incoming connection, before the actor sees it.
@@ -6628,6 +6743,64 @@ impl Actor {
                     .await;
             });
         }
+    }
+
+    /// Guest side: checks one saved host now, because somebody asked, and
+    /// answers how it was reached (ADR 0167).
+    ///
+    /// The presence check of [`Self::probe_saved_hosts`] for one row, with
+    /// the answer handed to the caller as well as to the row's dot. The host
+    /// is asked for nothing, exactly as there.
+    fn check_saved_host(
+        &self,
+        host_tag: String,
+        reply: oneshot::Sender<Result<HostCheck, ActorError>>,
+    ) {
+        let plan = match self.host_check_plan(&host_tag) {
+            Ok(plan) => plan,
+            Err(answer) => {
+                let _ = reply.send(answer);
+                return;
+            }
+        };
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let check = check_host(plan).await;
+            let online = check.outcome == HostCheckOutcome::Online;
+            let _ = events
+                .send(ActorEvent::HostChecked { host_tag, online })
+                .await;
+            let _ = reply.send(Ok(check));
+        });
+    }
+
+    /// The dial a check of `host_tag` needs — or, when it needs none, the
+    /// answer to give instead.
+    ///
+    /// Verified exactly as a connect verifies it (ADR 0122). A host this node
+    /// is connected to is answered from that connection, and one it is
+    /// already dialing is not dialed twice (ADR 0127).
+    fn host_check_plan(&self, host_tag: &str) -> Result<DialPlan, Result<HostCheck, ActorError>> {
+        let code = self
+            .history
+            .code_of(host_tag)
+            .ok_or(Err(ActorError::UnknownPeer))?;
+        let ticket = InviteTicket::from_code(code).map_err(|error| Err(ActorError::Net(error)))?;
+        let addr = ticket
+            .verify_issuer()
+            .map_err(|error| Err(ActorError::Net(error)))?;
+        if let Some(handle) = self.connections.get(&addr.id) {
+            let rtt = self.rtt.get(&addr.id).and_then(RttTracker::smoothed);
+            return Err(Ok(HostCheck::of(&handle.connection, rtt)));
+        }
+        if self.connect_peer == Some(addr.id) || self.reconnect_waits.contains_key(&addr.id) {
+            return Err(Ok(HostCheck::without_path(HostCheckOutcome::Dialing)));
+        }
+        self.dial_plan(&ticket, &addr).ok_or_else(|| {
+            Err(ActorError::Net(NetError::Dial(
+                "no transport to dial this host over".to_owned(),
+            )))
+        })
     }
 
     /// Says in the log how each live session is actually reaching its peer —
@@ -9857,6 +10030,10 @@ impl Actor {
                 tracing::debug!(peer = %host_tag, online, "checked whether a saved host is there");
                 self.presence.insert(host_tag, online);
             }
+            ActorEvent::HostChecked { host_tag, online } => {
+                tracing::info!(peer = %host_tag, online, "checked a saved host on request");
+                self.presence.insert(host_tag, online);
+            }
         }
     }
 
@@ -12546,6 +12723,7 @@ impl Actor {
                 self.probe_saved_hosts();
                 let _ = reply.send(());
             }
+            ActorCommand::HistoryCheck { label, reply } => self.check_saved_host(label, reply),
             ActorCommand::HistoryConnect {
                 label,
                 surface,
@@ -18819,6 +18997,39 @@ fn close_as_leaving(control: &ControlConnection) {
 /// [`PRESENCE_ATTEMPT_TIMEOUT_SECS`] each: a single lost packet is no more
 /// evidence that a host is off than it is against a transport.
 async fn probe_host(plan: DialPlan) -> bool {
+    let Some((_dialer, connection)) = first_handshake(plan).await else {
+        return false;
+    };
+    close_as_presence(&connection);
+    true
+}
+
+/// One check of one saved host somebody asked for (ADR 0167): the dial of
+/// [`probe_host`], and a reading of the path that answered before it closes.
+///
+/// While iroh is still carrying the connection on a relay it is held for up
+/// to [`HOST_CHECK_SETTLE_MS`] for a punch to land, so the answer names the
+/// path a session would actually use. The obfuscated transport is one direct
+/// path and is read at once.
+async fn check_host(plan: DialPlan) -> HostCheck {
+    let Some((_dialer, connection)) = first_handshake(plan).await else {
+        return HostCheck::without_path(HostCheckOutcome::Offline);
+    };
+    let settled = tokio::time::Instant::now() + Duration::from_millis(HOST_CHECK_SETTLE_MS);
+    while connection.path_snapshot().is_none_or(|path| path.relay)
+        && tokio::time::Instant::now() < settled
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let check = HostCheck::of(&connection, None);
+    close_as_presence(&connection);
+    check
+}
+
+/// The transports of `plan` in order, until one of them finishes a QUIC
+/// handshake with the host, as [`probe_host`] describes; that connection, and
+/// the dialer it came through, kept alive beside it.
+async fn first_handshake(plan: DialPlan) -> Option<(HostDialer, PeerConnection)> {
     for stage in std::iter::once(plan.first).chain(plan.rest) {
         for attempt in 1..=TRANSPORT_PROBE_ATTEMPTS {
             let dialed = tokio::time::timeout(
@@ -18827,15 +19038,20 @@ async fn probe_host(plan: DialPlan) -> bool {
             )
             .await;
             if let Ok(Ok(connection)) = dialed {
-                connection.close(
-                    lumepeer_net::connection::CLOSE_PRESENCE.into(),
-                    lumepeer_net::error::close_code::PRESENCE.as_bytes(),
-                );
-                return true;
+                return Some((stage.dialer, connection));
             }
         }
     }
-    false
+    None
+}
+
+/// Closes a connection that only checked the host is there, before any
+/// stream: the host reads it as that and nothing else (ADR 0127).
+fn close_as_presence(connection: &PeerConnection) {
+    connection.close(
+        lumepeer_net::connection::CLOSE_PRESENCE.into(),
+        lumepeer_net::error::close_code::PRESENCE.as_bytes(),
+    );
 }
 
 async fn dial_over_plan(
@@ -24881,6 +25097,105 @@ mod tests {
             PRESENCE_ATTEMPT_TIMEOUT_SECS * u64::from(TRANSPORT_PROBE_ATTEMPTS) * 2,
         ) + TIMEOUT;
         wait_for_presence(&guest, Some(false), whole_check).await;
+    }
+
+    /// ADR 0167: checking one saved host on request says it is there and how
+    /// it was reached, asks it for nothing, and paints its dot the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checking_a_saved_host_answers_its_round_trip_without_asking_it_for_a_session() {
+        let (host, host_endpoint, _capture) = actor().await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+
+        let scratch = Scratch::new("host-check");
+        let history_path = scratch.join("history.json");
+        let label = host_tag(&host_endpoint.addr().id);
+        ConnectionHistory::open(Some(history_path.clone())).record(
+            label.clone(),
+            Role::ViewOnly,
+            invite.code,
+            None,
+            Vec::new(),
+        );
+        let secret = iroh::SecretKey::generate();
+        let guest_endpoint = PeerEndpoint::bind_local(secret.clone()).await.unwrap();
+        let guest_capture = test_capture();
+        let guest = spawn_actor_with(
+            guest_endpoint,
+            SigningKey::from_bytes(&secret.to_bytes()),
+            Arc::new(DetachedViewWindows),
+            test_media(&guest_capture),
+            crate::clipboard_os::no_clipboard(),
+            ActorStores {
+                history_path: Some(history_path),
+                ..ActorStores::in_memory()
+            },
+            ActorPolicy::hosting(false),
+        );
+        wait_for_presence(&guest, None, TIMEOUT).await;
+
+        let check = tokio::time::timeout(TIMEOUT, guest.history_check(label))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(check.outcome, HostCheckOutcome::Online);
+        assert!(
+            check.rtt_ms.is_some(),
+            "a host that answered has a round trip"
+        );
+        assert_eq!(
+            check.path,
+            PathKind::Direct,
+            "two local endpoints reach each other directly"
+        );
+        assert!(check.transport.is_some());
+        assert!(
+            host.status().await.unwrap().is_empty(),
+            "a check must never become a consent request or a session"
+        );
+        assert_eq!(
+            guest.connect_state().await.unwrap().phase,
+            ConnectPhase::Idle
+        );
+        wait_for_presence(&guest, Some(true), TIMEOUT).await;
+
+        assert!(
+            matches!(
+                guest.history_check("no-such-host".to_owned()).await,
+                Err(ActorError::UnknownPeer)
+            ),
+            "a label that names no remembered host must dial nothing"
+        );
+    }
+
+    /// ADR 0167: a host this node is connected to is answered from that
+    /// connection, without a second dial at it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checking_a_connected_host_reads_the_live_connection() {
+        let (host, host_endpoint, _capture) = actor().await;
+        let (guest, _guest_endpoint, _guest_capture) = actor().await;
+
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let session = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(session, Role::ViewOnly).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+
+        let check = tokio::time::timeout(
+            TIMEOUT,
+            guest.history_check(host_tag(&host_endpoint.addr().id)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(check.outcome, HostCheckOutcome::Online);
+        assert!(check.transport.is_some());
+        assert_eq!(
+            guest.connect_state().await.unwrap().phase,
+            ConnectPhase::Connected,
+            "checking a connected host must leave its session alone"
+        );
     }
 
     /// ADR 0127: a connect answers the question too, and the answer outlives

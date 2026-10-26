@@ -573,6 +573,15 @@ async fn watch_for_window_raising_notifications(
 /// grows, and it was already what was pushing `main` over clippy's
 /// `too_many_lines` threshold — extracting it fixes that at the source
 /// instead of suppressing the lint.
+///
+/// The list itself has since passed the threshold (ADR 0167 added the
+/// hundredth line). It is one command per line and nothing else, and one
+/// `generate_handler!` is the only way to build it: two tables cannot be
+/// chained, since each rejects a command it does not know.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat dispatch table, one IPC command per line"
+)]
 fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
     tauri::generate_handler![
         commands::session_grant,
@@ -596,6 +605,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::history_forget_password,
         commands::history_set_trusted,
         commands::history_probe,
+        commands::history_check,
         commands::connect_status,
         commands::connect_cancel,
         commands::report_decoder_codecs,

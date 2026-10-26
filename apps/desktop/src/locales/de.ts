@@ -148,6 +148,11 @@ export const de: Dictionary = {
   'history.forgetPassword.hint':
     'Dieses Gerät meldet sich automatisch bei diesem Host an. Vergessen Sie das gespeicherte Passwort, damit es erneut abgefragt wird.',
   'history.forgetPassword.confirm': (name) => `Das für ${name} gespeicherte Passwort vergessen?`,
+  'history.check': 'Verbindung prüfen',
+  'history.check.hint': 'Erreicht den Host bis zum Handshake und misst die Umlaufzeit. Der Host wird nichts gefragt, auf seinem Bildschirm erscheint nichts.',
+  'history.check.running': 'Verbindung wird geprüft…',
+  'history.check.dialing': 'Wird gerade verbunden',
+  'history.check.failed': 'Verbindung konnte nicht geprüft werden',
   'status.lastSeenJustNow': 'Zuletzt gerade eben online',
   'status.lastSeenMinutesAgo': (n) => `Zuletzt vor ${n} Min. online`,
   'status.lastSeenHoursAgo': (n) => `Zuletzt vor ${n} Std. online`,

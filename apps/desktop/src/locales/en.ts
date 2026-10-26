@@ -154,6 +154,11 @@ export const en: Dictionary = {
   'history.forgetPassword.hint':
     'This device signs in to that host automatically. Forget the saved password and be asked for it again.',
   'history.forgetPassword.confirm': (name) => `Forget the password saved for ${name}?`,
+  'history.check': 'Check connection',
+  'history.check.hint': 'Reaches the host as far as a handshake and measures the round trip. The host is not asked for anything and nothing appears on its screen.',
+  'history.check.running': 'Checking connection…',
+  'history.check.dialing': 'Connecting to it right now',
+  'history.check.failed': 'Could not check the connection',
   'status.lastSeenJustNow': 'Last seen just now',
   'status.lastSeenMinutesAgo': (n) => `Last seen ${n}m ago`,
   'status.lastSeenHoursAgo': (n) => `Last seen ${n}h ago`,

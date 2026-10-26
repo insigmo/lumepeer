@@ -220,6 +220,109 @@ async function forgetPassword(peer: string): Promise<void> {
 }
 
 /**
+ * What "check connection" found for one remembered host (ADR 0167), as
+ * `history_check` answers it.
+ */
+export interface HostCheck {
+  /** `dialing`: this node is connecting to that host right now, so no check ran. */
+  outcome: 'online' | 'offline' | 'dialing';
+  /** Round trip of the path that answered, in milliseconds; `null` when nothing did. */
+  rtt_ms: number | null;
+  /** The path carrying packets: never `mixed`. */
+  path: 'direct' | 'relay' | 'unknown';
+  transport: 'iroh' | 'obfuscated' | null;
+}
+
+/**
+ * How long a check's answer stays on its card: long enough to read, short
+ * enough that the card never shows a round trip from a while ago as today's.
+ */
+export const HOST_CHECK_SHOWN_MS = 60_000;
+
+/**
+ * Checks running, and answers still shown, by host label — `failed` when the
+ * check itself could not run. `at` is when the answer came, or when a running
+ * check started.
+ *
+ * Here rather than in a caller's variable because the panel is rebuilt every
+ * second and a check outlives many of those; an offline answer takes the
+ * whole dial plan's attempts.
+ */
+const hostChecks = new Map<string, { answer: HostCheck | 'running' | 'failed'; at: number }>();
+
+/** Checks one remembered host (ADR 0167). The host is asked for nothing. */
+async function checkHost(peer: string): Promise<HostCheck> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return (await invoke('history_check', { args: { peer } })) as HostCheck;
+}
+
+/** Runs one check and re-polls once it starts and once it answers, whatever it answered. */
+function startHostCheck(peer: string, onChange: () => void): void {
+  hostChecks.set(peer, { answer: 'running', at: Date.now() });
+  onChange();
+  void checkHost(peer).then(
+    (answer) => {
+      hostChecks.set(peer, { answer, at: Date.now() });
+      onChange();
+    },
+    (error: unknown) => {
+      console.error('history_check failed:', error);
+      hostChecks.set(peer, { answer: 'failed', at: Date.now() });
+      onChange();
+    },
+  );
+}
+
+/** One check's answer in words: "Online · 42 ms · Direct". */
+function hostCheckText(answer: HostCheck, locale: Locale): string {
+  if (answer.outcome === 'dialing') {
+    return t(locale, 'history.check.dialing');
+  }
+  if (answer.outcome === 'offline') {
+    return t(locale, 'connections.offline');
+  }
+  const path =
+    answer.transport === 'obfuscated'
+      ? t(locale, 'quality.path.obfuscated')
+      : answer.path === 'unknown'
+        ? null
+        : t(locale, answer.path === 'direct' ? 'quality.path.direct' : 'quality.path.relay');
+  return [
+    t(locale, 'connections.online'),
+    answer.rtt_ms === null ? null : t(locale, 'quality.ms', String(answer.rtt_ms)),
+    path,
+  ]
+    .filter((part) => part !== null)
+    .join(' · ');
+}
+
+/** The line a check leaves on its card, while it runs and for a minute after. */
+function hostCheckNote(peer: string, locale: Locale): TemplateResult | '' {
+  const check = hostChecks.get(peer);
+  if (check === undefined || (check.answer !== 'running' && Date.now() - check.at >= HOST_CHECK_SHOWN_MS)) {
+    return '';
+  }
+  const { answer } = check;
+  const text =
+    answer === 'running'
+      ? t(locale, 'history.check.running')
+      : answer === 'failed'
+        ? t(locale, 'history.check.failed')
+        : hostCheckText(answer, locale);
+  return html`
+    <div class="peer-card-status">
+      <span
+        class="host-check-note"
+        role="status"
+        data-testid="history-check-result"
+        data-outcome=${typeof answer === 'string' ? answer : answer.outcome}
+        >${text}</span
+      >
+    </div>
+  `;
+}
+
+/**
  * Moves one independent grant on a running session (§8.2).
  *
  * The host no longer has a switch per grant: a session starts with exactly
@@ -821,6 +924,22 @@ export function sessionStatus(
                         </button>
                       `,
                       html`
+                        <button
+                          type="button"
+                          class="peer-menu-item history-check"
+                          role="menuitem"
+                          data-testid="history-check"
+                          ?disabled=${reconnectDisabled || hostChecks.get(entry.peer_label)?.answer === 'running'}
+                          title=${t(locale, 'history.check.hint')}
+                          @click=${(event: Event) => {
+                            closeMenu(event);
+                            startHostCheck(entry.peer_label, onRefresh);
+                          }}
+                        >
+                          ${t(locale, 'history.check')}
+                        </button>
+                      `,
+                      html`
                         <label
                           class="peer-menu-item history-autoreconnect"
                           role="menuitem"
@@ -886,6 +1005,7 @@ export function sessionStatus(
                       `,
                     ])}
                   </div>
+                  ${hostCheckNote(entry.peer_label, locale)}
                 </li>
               `;
             })}

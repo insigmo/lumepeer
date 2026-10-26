@@ -206,6 +206,13 @@ export type TranslationKey =
   | 'history.forgetPassword'
   | 'history.forgetPassword.hint'
   | 'history.forgetPassword.confirm'
+  // "Check connection" on a remembered host's card (ADR 0167): the menu item,
+  // why it disturbs nobody, and the line it leaves on the card.
+  | 'history.check'
+  | 'history.check.hint'
+  | 'history.check.running'
+  | 'history.check.dialing'
+  | 'history.check.failed'
   | 'status.lastSeenJustNow'
   | 'status.lastSeenMinutesAgo'
   | 'status.lastSeenHoursAgo'

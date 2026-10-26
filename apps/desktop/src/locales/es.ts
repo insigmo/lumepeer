@@ -148,6 +148,11 @@ export const es: Dictionary = {
   'history.forgetPassword.hint':
     'Este dispositivo inicia sesión en ese host automáticamente. Olvide la contraseña guardada para que se le vuelva a pedir.',
   'history.forgetPassword.confirm': (name) => `¿Olvidar la contraseña guardada para ${name}?`,
+  'history.check': 'Comprobar conexión',
+  'history.check.hint': 'Llega al equipo hasta el handshake y mide el tiempo de ida y vuelta. Al equipo no se le pide nada y en su pantalla no aparece nada.',
+  'history.check.running': 'Comprobando la conexión…',
+  'history.check.dialing': 'Conectando con él ahora mismo',
+  'history.check.failed': 'No se pudo comprobar la conexión',
   'status.lastSeenJustNow': 'Visto en línea justo ahora',
   'status.lastSeenMinutesAgo': (n) => `Visto en línea hace ${n} min`,
   'status.lastSeenHoursAgo': (n) => `Visto en línea hace ${n} h`,
