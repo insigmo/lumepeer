@@ -295,7 +295,7 @@ const SOFTWARE_GL: &str = "LIBGL_ALWAYS_SOFTWARE";
 /// virtual GPU and nobody has chosen a renderer (ADR 0129).
 ///
 /// `WebKitGTK` composites every page through EGL whatever its hardware
-/// acceleration policy says ([`draw_in_software`]), and on `VMware`'s `vmwgfx`
+/// acceleration policy says, and on `VMware`'s `vmwgfx`
 /// creating the fence it asks for after a frame never returns: Mesa resubmits
 /// for as long as the kernel answers busy, the page's thread waits on the
 /// compositor, and the window stays white. Only an environment variable reaches the web
@@ -320,29 +320,6 @@ fn restart_on_software_gl() {
         .env(SOFTWARE_GL, "1")
         .exec();
     eprintln!("cannot restart on Mesa's software renderer: {error}");
-}
-
-/// Turns one webview's GPU drawing off, so `WebKitGTK` paints it in software
-/// (ADR 0125).
-///
-/// For a virtual GPU only. The same setting `WEBKIT_DISABLE_COMPOSITING_MODE`
-/// makes, set through the API because this crate forbids the `unsafe` that
-/// setting an environment variable now is. It moves the painting of the page
-/// to the CPU but not its compositing, which still goes through EGL; on
-/// `vmwgfx` that alone left every window white, and what keeps the windows
-/// drawn is [`restart_on_software_gl`] (ADR 0129).
-#[cfg(target_os = "linux")]
-fn draw_in_software(webview: &tauri::Webview) {
-    use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt as _, WebViewExt as _};
-
-    let queued = webview.with_webview(|platform| {
-        if let Some(settings) = platform.inner().settings() {
-            settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
-        }
-    });
-    if let Err(error) = queued {
-        tracing::warn!(%error, "cannot reach a webview to turn its GPU drawing off");
-    }
 }
 
 /// Installs the tray icon and its menu, and answers whether one went up.
@@ -876,20 +853,17 @@ fn main() {
         builder = builder.plugin(tauri_plugin_pilot::init());
     }
 
-    // Every webview, as its page starts loading and before it has drawn
-    // anything: the main window, each view and file manager, the two bars.
+    // The webviews keep WebKit's default acceleration policy: on WebKitGTK
+    // 2.54 turning it to `Never` as a page starts leaves the window white, and
+    // the software renderer the restart above chose is what draws them
+    // (ADR 0165).
     #[cfg(target_os = "linux")]
     if let Some(driver) = virtual_gpu() {
         tracing::info!(
             %driver,
             software_gl = %std::env::var(SOFTWARE_GL).unwrap_or_default(),
-            "a virtual GPU: the windows are drawn in software (ADR 0125, ADR 0129)"
+            "a virtual GPU: the windows are drawn in software (ADR 0129, ADR 0165)"
         );
-        builder = builder.on_page_load(|webview, payload| {
-            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started) {
-                draw_in_software(webview);
-            }
-        });
     }
 
     builder

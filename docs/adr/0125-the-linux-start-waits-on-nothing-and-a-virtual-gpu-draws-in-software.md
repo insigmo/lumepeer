@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-09-28
 Amended: 2026-09-29 by [ADR 0129](0129-a-virtual-gpu-composites-on-mesas-software-renderer.md), which found that section 2's fix alone left the windows white on VMware.
+Amended: 2026-10-26 by [ADR 0165](0165-a-virtual-gpu-keeps-webkits-default-acceleration-policy.md), which removes section 2's `HardwareAccelerationPolicy::Never`.
 
 Two reports from the Debian VM, both about the first seconds of a run.
 

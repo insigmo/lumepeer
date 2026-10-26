@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-29
+Amended: 2026-10-26 by [ADR 0165](0165-a-virtual-gpu-keeps-webkits-default-acceleration-policy.md), which drops the kept `HardwareAccelerationPolicy::Never`: on WebKitGTK 2.54 it leaves the windows white.
 
 Amends section 2 of [ADR 0125](0125-the-linux-start-waits-on-nothing-and-a-virtual-gpu-draws-in-software.md),
 whose fix was written without a VMware VM to run it on and did not work there.
