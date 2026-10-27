@@ -4,14 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Lumepeer — remote terminal</title>
+    <link rel="stylesheet" href="/src/tokens.css" />
+    <link rel="stylesheet" href="/src/terminal-chrome.css" />
     <style>
+      /* Follows the app's light or dark (ADR 0168); the shell's palette is
+         terminal.ts's, matched to --term-bg. */
       html,
       body {
         margin: 0;
         height: 100%;
-        background: #000;
-        color: #f2f2f5;
-        font-family: system-ui, sans-serif;
+        background: var(--term-bg);
+        color: var(--text);
+        font-family: var(--font-ui);
+        -webkit-font-smoothing: antialiased;
       }
       /* The shell is the window (ADR 0131), laid out like the terminal-only
          view window of ADR 0101: its own header on top, the emulator below
@@ -25,20 +30,7 @@
       #terminal-screen {
         flex: 1;
         min-height: 0;
-      }
-      .term-head {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.35rem 0.5rem;
-      }
-      .term-head h3 {
-        margin: 0;
-        font-size: 0.9rem;
-      }
-      .term-state {
-        flex: 1;
-        opacity: 0.8;
+        padding: 0.35rem 0.6rem;
       }
     </style>
   </head>

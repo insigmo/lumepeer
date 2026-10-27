@@ -48,7 +48,7 @@ import type { FileTransfers } from './file-transfers';
 import type { ConnectionStats } from './connection-quality';
 import { sessionStatus, type HistoryEntry, type SessionStatus } from './session-status';
 import { statusPill } from './status-pill';
-import { applyTheme } from './theme';
+import { followTheme } from './theme';
 import { macPermissionsView, onMacPermissionsStateChange, startMacPermissions } from './mac-permissions';
 import { IS_MAC } from './platform';
 import { titleBar } from './title-bar';
@@ -174,7 +174,8 @@ function openChat(peer: string): void {
     close.type = 'button';
     close.className = 'host-chat-close';
     close.setAttribute('aria-label', t(locale, 'chat.close'));
-    close.textContent = '×';
+    close.innerHTML =
+      '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>';
     close.addEventListener('click', closeChat);
     head.append(close);
     chatPanel.append(head, body);
@@ -512,7 +513,7 @@ export function setLocale(next: Locale): void {
 }
 
 // Before the first render, so a window set to dark never paints light first.
-applyTheme();
+followTheme();
 
 onInviteStateChange(renderNow);
 onUnattendedStateChange(renderNow);

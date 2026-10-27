@@ -14,7 +14,7 @@ import { render } from 'lit-html';
 import { FileManager, renderFileManager, tauriFileManagerCommands, type DropTarget, type Side } from './file-manager';
 import { tauriFileCommands } from './file-transfers';
 import { dirOf, resolveLocale, t, type Locale } from './i18n';
-import { applyTheme } from './theme';
+import { followTheme } from './theme';
 
 /** How often the window re-reads the session while something is moving. */
 const BUSY_POLL_MS = 400;
@@ -37,7 +37,7 @@ const locale: Locale = resolveLocale(navigator);
 document.documentElement.lang = locale;
 document.documentElement.dir = dirOf(locale);
 document.title = `Lumepeer — ${t(locale, 'fileManager.heading')}`;
-applyTheme();
+followTheme();
 
 // Where each pane was left, kept per viewer: a convenience, and only ever
 // read back as a place to start — a folder that is gone falls back to home

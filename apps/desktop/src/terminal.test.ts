@@ -18,7 +18,7 @@ import {
   terminalChrome,
   terminalClipboardKey,
   terminalMenu,
-  TERMINAL_THEME,
+  terminalTheme,
   TerminalSession,
   type TerminalCommands,
   type TerminalEvent,
@@ -370,7 +370,7 @@ describe('how it looks', () => {
     const root = document.createElement('div');
     const chrome = document.createElement('div');
     const controls = await mountTerminal(root, chrome, 'en', PEER, () => {}, commands());
-    expect(emulator.options).toMatchObject({ theme: TERMINAL_THEME });
+    expect(emulator.options).toMatchObject({ theme: terminalTheme() });
     controls.stop();
   });
 

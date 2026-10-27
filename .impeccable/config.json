@@ -11,6 +11,69 @@
         ],
         "createdAt": "2026-08-28T22:15:54.860Z",
         "reason": "pre-existing .unattended-indicator rule, git blame dd92e456 2026-08-27 predates this session; docs/bugs/02 and 03 tasks never touched this selector, only shifted its line number by adding unrelated CSS earlier in the file — out of scope per project's surgical-changes rule"
+      },
+      {
+        "rule": "border-accent-on-rounded",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/assigned.html"
+        ],
+        "createdAt": "2026-10-27T22:00:23.736Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "low-contrast",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/assigned.html"
+        ],
+        "createdAt": "2026-10-27T22:00:24.144Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/model-pick.html"
+        ],
+        "createdAt": "2026-10-27T22:00:24.510Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "low-contrast",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/model-pick.html"
+        ],
+        "createdAt": "2026-10-27T22:00:24.895Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "tiny-text",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/model-pick.html"
+        ],
+        "createdAt": "2026-10-27T22:00:25.308Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/challenger-splitflap.html"
+        ],
+        "createdAt": "2026-10-27T22:00:25.656Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
+      },
+      {
+        "rule": "low-contrast",
+        "value": "*",
+        "files": [
+          ".impeccable/mocks/decision/challenger-splitflap.html"
+        ],
+        "createdAt": "2026-10-27T22:00:25.989Z",
+        "reason": "agent: decision-round sketch, gitignored under .impeccable/mocks, never shipped"
       }
     ]
   }

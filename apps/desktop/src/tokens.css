@@ -1,63 +1,86 @@
-/* Design tokens shared by every window that follows the app's theme: the
-   main window (app.css) and the file manager (files.css; ADR 0124). Light on
-   :root, dark under `prefers-color-scheme: dark`, and `data-theme` on <html>
+/* Design tokens shared by every window (ADR 0124, ADR 0168). Light on :root,
+   dark under `prefers-color-scheme: dark`, and `data-theme` on <html>
    (theme.ts) overriding the system either way (ADR 0117). A colour written
-   anywhere else is a colour that will be wrong in one of the two themes. */
+   anywhere else is a colour that will be wrong in one of the two themes.
+
+   The look is a household appliance (DESIGN.md): a satin body, faceplates one
+   step lighter, a charcoal readout window for live values, and colour only
+   where it signals — yellow for the one action, green for live, red for stop,
+   amber for a warning. */
 
 :root {
   color-scheme: light;
 
   /* Surfaces, from the back of the window to the front. */
-  --bg: #ffffff;
-  --surface-1: #f6f7f9;
-  --surface-2: #eff1f5;
-  --surface-3: #e6e9ef;
+  --bg: #f4f4f2;
+  --surface-1: #ececea;
+  --surface-2: #e5e5e1;
+  --surface-3: #dbdbd6;
   --raised: #ffffff;
-  --group-bg: #f8f9fb;
+  --group-bg: #fafaf8;
   --control-bg: #ffffff;
-  --hover: rgb(15 23 42 / 5%);
-  --hover-strong: rgb(15 23 42 / 9%);
+  --hover: rgb(28 28 30 / 5%);
+  --hover-strong: rgb(28 28 30 / 9%);
 
-  --border: #e3e7ed;
-  --border-strong: #cdd3dc;
+  --border: #e0e0db;
+  --border-strong: #c8c8c2;
 
-  --text: #0b1220;
-  --text-2: #4b5568;
-  --text-3: #667085;
-  --text-disabled: #9aa1b1;
+  --text: #1c1c1e;
+  --text-2: #4d4d48;
+  --text-3: #66665f;
+  --text-disabled: #a3a39d;
 
-  --accent: #3564e4;
-  --accent-hover: #2b55d0;
-  --accent-text: #2b55d0;
-  --accent-soft: #edf2fe;
-  --accent-soft-strong: #dfe8fd;
-  --accent-ring: rgb(53 100 228 / 26%);
-  --on-accent: #ffffff;
-  --selection: rgb(53 100 228 / 20%);
+  /* The one action: the yellow key. Text on it is charcoal in both themes. */
+  --accent: #f2a31b;
+  --accent-hover: #e6950e;
+  --accent-text: #8a5a00;
+  --accent-soft: #fcf0d6;
+  --accent-soft-strong: #f8e2b0;
+  --accent-ring: rgb(242 163 27 / 38%);
+  --on-accent: #1c1c1e;
+  --selection: rgb(242 163 27 / 30%);
+  /* Focus and the keyboard cursor are drawn in ink, not in the key's yellow,
+     which is too light against the body to be seen as an outline. */
+  --focus: #1c1c1e;
 
-  --green: #2fb57a;
-  --green-soft: #e8f7f0;
-  --green-text: #11774c;
-  --red: #d63345;
-  --red-soft: #fdeef0;
-  --danger-solid: #d63345;
-  --amber: #9a5b00;
-  --amber-dot: #e39b17;
-  --amber-soft: #fdf4e3;
+  --green: #3fa34d;
+  --green-soft: #e5f3e6;
+  --green-text: #23702f;
+  --red: #b8321f;
+  --red-soft: #fbe9e6;
+  --danger-solid: #c8372a;
+  --on-danger: #ffffff;
+  --amber: #8f5b00;
+  --amber-dot: #e8a21c;
+  --amber-soft: #fcf0d6;
 
-  --switch-off: #cdd3dc;
-  --scrollbar: rgb(15 23 42 / 18%);
+  /* The readout: a dark window set into the body for a value that is live —
+     an invite code, a session's running time. Dark in both themes. */
+  --readout-bg: #232325;
+  --readout-text: #f1f1ec;
+  --readout-dim: #a5a59f;
+  --readout-hover: #2e2e31;
+  --readout-inset: inset 0 1px 3px rgb(0 0 0 / 45%), 0 1px 0 rgb(255 255 255 / 80%);
+
+  /* The shell's own ground (terminal.ts keeps the matching palette). */
+  --term-bg: #fafaf8;
+
+  --switch-off: #c8c8c2;
+  --scrollbar: rgb(28 28 30 / 20%);
   --logo-ring: transparent;
 
-  --shadow-sm: 0 1px 2px rgb(16 24 40 / 6%);
-  --shadow-md: 0 6px 16px -4px rgb(16 24 40 / 12%), 0 2px 4px -2px rgb(16 24 40 / 6%);
-  --shadow-lg: 0 28px 56px -12px rgb(16 24 40 / 30%), 0 0 0 1px rgb(16 24 40 / 4%);
-  --scrim: rgb(11 18 32 / 42%);
+  /* Moulded rather than floating: a hard 1px lower edge, then a soft fall. */
+  --shadow-sm: 0 1px 0 rgb(28 28 30 / 7%), 0 1px 2px rgb(28 28 30 / 5%);
+  --shadow-md: 0 1px 0 rgb(28 28 30 / 6%), 0 10px 24px -10px rgb(28 28 30 / 22%);
+  --shadow-lg: 0 28px 56px -18px rgb(28 28 30 / 32%), 0 0 0 1px rgb(28 28 30 / 6%);
+  --scrim: rgb(20 20 22 / 40%);
 
   --radius-sm: 6px;
-  --radius: 9px;
-  --radius-lg: 12px;
-  --radius-xl: 16px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  /* Keys are round-ended: every button, never a rectangle. */
+  --radius-key: 999px;
 
   --font-ui:
     'Segoe UI Variable Text', 'Segoe UI', -apple-system, BlinkMacSystemFont, system-ui, 'Helvetica Neue',
@@ -80,96 +103,110 @@
   :root:not([data-theme='light']) {
     color-scheme: dark;
 
-    --bg: #13161c;
-    --surface-1: #0e1115;
-    --surface-2: #1b1f27;
-    --surface-3: #242a34;
-    --raised: #191d25;
-    --group-bg: #1d2129;
-    --control-bg: #20252e;
+    --bg: #1b1b1c;
+    --surface-1: #151516;
+    --surface-2: #262628;
+    --surface-3: #303033;
+    --raised: #232325;
+    --group-bg: #262628;
+    --control-bg: #2a2a2d;
     --hover: rgb(255 255 255 / 6%);
     --hover-strong: rgb(255 255 255 / 10%);
 
-    --border: #272c36;
-    --border-strong: #373e4b;
+    --border: #2e2e31;
+    --border-strong: #3f3f43;
 
-    --text: #e9ecf2;
-    --text-2: #aab1bf;
-    --text-3: #8d95a5;
-    --text-disabled: #5e6676;
+    --text: #ededea;
+    --text-2: #b5b5af;
+    --text-3: #92928c;
+    --text-disabled: #5f5f5a;
 
-    --accent: #3d6be6;
-    --accent-hover: #4a77ee;
-    --accent-text: #8aa9ff;
-    --accent-soft: rgb(79 123 240 / 15%);
-    --accent-soft-strong: rgb(79 123 240 / 24%);
-    --accent-ring: rgb(110 145 245 / 40%);
-    --selection: rgb(110 145 245 / 35%);
+    --accent: #f2a31b;
+    --accent-hover: #f7b23a;
+    --accent-text: #f5b544;
+    --accent-soft: rgb(242 163 27 / 14%);
+    --accent-soft-strong: rgb(242 163 27 / 24%);
+    --accent-ring: rgb(242 163 27 / 42%);
+    --selection: rgb(242 163 27 / 32%);
+    --focus: #ededea;
 
-    --green: #3ccf8e;
-    --green-soft: rgb(60 207 142 / 13%);
-    --green-text: #62dca5;
-    --red: #ff6d7b;
-    --red-soft: rgb(255 109 123 / 13%);
+    --green: #4cbb5b;
+    --green-soft: rgb(76 187 91 / 14%);
+    --green-text: #74d081;
+    --red: #ff6b5b;
+    --red-soft: rgb(255 107 91 / 14%);
     --amber: #f2b441;
     --amber-dot: #f2b441;
-    --amber-soft: rgb(242 180 65 / 13%);
+    --amber-soft: rgb(242 180 65 / 14%);
 
-    --switch-off: #3a414e;
+    --readout-bg: #0f0f10;
+    --readout-dim: #92928c;
+    --readout-hover: #1d1d1f;
+    --readout-inset: inset 0 1px 3px rgb(0 0 0 / 60%), 0 1px 0 rgb(255 255 255 / 5%);
+
+    --term-bg: #151516;
+    --switch-off: #45454a;
     --scrollbar: rgb(255 255 255 / 16%);
-    --logo-ring: rgb(255 255 255 / 9%);
+    --logo-ring: rgb(255 255 255 / 10%);
 
-    --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
-    --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
-    --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
-    --scrim: rgb(3 5 9 / 62%);
+    --shadow-sm: 0 1px 0 rgb(0 0 0 / 40%);
+    --shadow-md: 0 1px 0 rgb(0 0 0 / 35%), 0 12px 28px -12px rgb(0 0 0 / 65%);
+    --shadow-lg: 0 32px 64px -18px rgb(0 0 0 / 72%), 0 0 0 1px rgb(255 255 255 / 6%);
+    --scrim: rgb(0 0 0 / 60%);
   }
 }
 
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg: #13161c;
-  --surface-1: #0e1115;
-  --surface-2: #1b1f27;
-  --surface-3: #242a34;
-  --raised: #191d25;
-  --group-bg: #1d2129;
-  --control-bg: #20252e;
+  --bg: #1b1b1c;
+  --surface-1: #151516;
+  --surface-2: #262628;
+  --surface-3: #303033;
+  --raised: #232325;
+  --group-bg: #262628;
+  --control-bg: #2a2a2d;
   --hover: rgb(255 255 255 / 6%);
   --hover-strong: rgb(255 255 255 / 10%);
 
-  --border: #272c36;
-  --border-strong: #373e4b;
+  --border: #2e2e31;
+  --border-strong: #3f3f43;
 
-  --text: #e9ecf2;
-  --text-2: #aab1bf;
-  --text-3: #8d95a5;
-  --text-disabled: #5e6676;
+  --text: #ededea;
+  --text-2: #b5b5af;
+  --text-3: #92928c;
+  --text-disabled: #5f5f5a;
 
-  --accent: #3d6be6;
-  --accent-hover: #4a77ee;
-  --accent-text: #8aa9ff;
-  --accent-soft: rgb(79 123 240 / 15%);
-  --accent-soft-strong: rgb(79 123 240 / 24%);
-  --accent-ring: rgb(110 145 245 / 40%);
-  --selection: rgb(110 145 245 / 35%);
+  --accent: #f2a31b;
+  --accent-hover: #f7b23a;
+  --accent-text: #f5b544;
+  --accent-soft: rgb(242 163 27 / 14%);
+  --accent-soft-strong: rgb(242 163 27 / 24%);
+  --accent-ring: rgb(242 163 27 / 42%);
+  --selection: rgb(242 163 27 / 32%);
+  --focus: #ededea;
 
-  --green: #3ccf8e;
-  --green-soft: rgb(60 207 142 / 13%);
-  --green-text: #62dca5;
-  --red: #ff6d7b;
-  --red-soft: rgb(255 109 123 / 13%);
+  --green: #4cbb5b;
+  --green-soft: rgb(76 187 91 / 14%);
+  --green-text: #74d081;
+  --red: #ff6b5b;
+  --red-soft: rgb(255 107 91 / 14%);
   --amber: #f2b441;
   --amber-dot: #f2b441;
-  --amber-soft: rgb(242 180 65 / 13%);
+  --amber-soft: rgb(242 180 65 / 14%);
 
-  --switch-off: #3a414e;
+  --readout-bg: #0f0f10;
+  --readout-dim: #92928c;
+  --readout-hover: #1d1d1f;
+  --readout-inset: inset 0 1px 3px rgb(0 0 0 / 60%), 0 1px 0 rgb(255 255 255 / 5%);
+
+  --term-bg: #151516;
+  --switch-off: #45454a;
   --scrollbar: rgb(255 255 255 / 16%);
-  --logo-ring: rgb(255 255 255 / 9%);
+  --logo-ring: rgb(255 255 255 / 10%);
 
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 40%);
-  --shadow-md: 0 8px 20px -6px rgb(0 0 0 / 55%), 0 2px 4px -2px rgb(0 0 0 / 40%);
-  --shadow-lg: 0 32px 64px -12px rgb(0 0 0 / 70%), 0 0 0 1px rgb(255 255 255 / 5%);
-  --scrim: rgb(3 5 9 / 62%);
+  --shadow-sm: 0 1px 0 rgb(0 0 0 / 40%);
+  --shadow-md: 0 1px 0 rgb(0 0 0 / 35%), 0 12px 28px -12px rgb(0 0 0 / 65%);
+  --shadow-lg: 0 32px 64px -18px rgb(0 0 0 / 72%), 0 0 0 1px rgb(255 255 255 / 6%);
+  --scrim: rgb(0 0 0 / 60%);
 }

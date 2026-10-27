@@ -1,0 +1,136 @@
+/* The terminal's chrome, in the view window's panel and in a terminal window
+   of its own (ADR 0131, ADR 0168): one header, one state lamp, one menu, drawn
+   from the shared tokens so it follows the app's light or dark. */
+
+.term-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.5rem 0.4rem 0.85rem;
+  background: var(--raised);
+  border-block-end: 1px solid var(--border);
+}
+
+.term-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.term-state {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+/* What the shell is doing, at a glance: amber while the host is asked,
+   green while it runs, red when it was refused, an unlit lamp once it is over
+   (ADR 0132). The words beside it stay the whole message. */
+.term-state::before {
+  content: '';
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-inline-end: 0.45rem;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--text-3);
+}
+
+.term-state[data-status='opening']::before {
+  background: var(--amber-dot);
+  box-shadow: none;
+  animation: term-pulse 0.9s ease-in-out infinite alternate;
+}
+
+.term-state[data-status='open']::before {
+  background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-soft);
+}
+
+.term-state[data-status='refused']::before {
+  background: var(--red);
+  box-shadow: none;
+}
+
+.term-close {
+  appearance: none;
+  flex: none;
+  min-height: 26px;
+  padding: 2px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-key);
+  background: var(--control-bg);
+  color: var(--text);
+  box-shadow: var(--shadow-sm);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.term-close:hover {
+  background: var(--surface-2);
+}
+
+.term-close:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+/* The terminal's right-click menu (ADR 0132): fixed, because it opens at the
+   pointer. */
+.term-menu {
+  position: fixed;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 11rem;
+  padding: 0.25rem;
+  background: var(--raised);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  font-size: 0.85rem;
+}
+
+.term-menu-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 0.35rem 0.6rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: start;
+}
+
+.term-menu-item:hover:not(:disabled),
+.term-menu-item:focus-visible {
+  background: var(--hover-strong);
+  outline: none;
+}
+
+.term-menu-item:disabled {
+  color: var(--text-disabled);
+}
+
+.term-menu-item kbd {
+  font: inherit;
+  color: var(--text-3);
+}
+
+@keyframes term-pulse {
+  to {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .term-state[data-status='opening']::before {
+    animation: none;
+  }
+}

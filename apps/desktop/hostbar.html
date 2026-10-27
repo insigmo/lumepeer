@@ -4,19 +4,22 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Lumepeer</title>
+    <link rel="stylesheet" href="/src/tokens.css" />
     <style>
       /* The bar has no window chrome and no scrollbars of its own: it is a
          small always-on-top card over somebody's desktop, and every pixel it
-         takes is one it took from the application underneath. */
+         takes is one it took from the application underneath. It follows the
+         app's light or dark like every other window (ADR 0168). */
       html,
       body {
         margin: 0;
         height: 100%;
         overflow: hidden;
         background: transparent;
-        color: #f2f2f5;
-        font-family: system-ui, sans-serif;
+        color: var(--text);
+        font-family: var(--font-ui);
         font-size: 12px;
+        -webkit-font-smoothing: antialiased;
         /* Nothing here is a document to select from, and a stray drag that
            highlights the peer label instead of moving the window is the one
            thing a drag handle must not do. */
@@ -27,24 +30,26 @@
         flex-direction: column;
         height: 100%;
         box-sizing: border-box;
-        padding: 6px 8px 8px;
-        background: #23303a;
-        /* No border of its own: on the transparent window macOS and Linux
-           give the bar, a light one read as a white outline round the card. */
-        border-radius: 8px;
+        padding: 8px 10px 10px;
+        background: var(--raised);
+        /* An inset edge in the theme's own hairline, never a light outline:
+           on the transparent window macOS and Linux give the bar, a light
+           border read as a white ring round a dark card. */
+        box-shadow: inset 0 0 0 1px var(--border);
+        border-radius: 12px;
       }
       /* Collapsed: the tab is the whole window, so the padding and the
          rounding on the docked edge both go away. */
       #hostbar.is-collapsed {
         padding: 0;
-        border-radius: 6px;
+        border-radius: 8px;
         justify-content: center;
         align-items: center;
       }
       .bar-head {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 7px;
         /* The drag handle. Everything on this row carries
            data-tauri-drag-region, so the bar moves from its whole header
            rather than from one invisible strip of it. */
@@ -57,6 +62,8 @@
         display: block;
         width: 18px;
         height: 18px;
+        border-radius: 22%;
+        box-shadow: 0 0 0 1px var(--logo-ring);
       }
       .bar-name {
         flex: 1;
@@ -68,13 +75,13 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 18px;
-        height: 18px;
+        width: 20px;
+        height: 20px;
         padding: 0;
         background: transparent;
-        color: inherit;
+        color: var(--text-2);
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-key);
         cursor: pointer;
       }
       #hostbar.is-collapsed .tab-btn {
@@ -83,17 +90,18 @@
         border-radius: 0;
       }
       .tab-btn:hover {
-        background: rgb(255 255 255 / 14%);
+        background: var(--hover-strong);
+        color: var(--text);
       }
       .tab-btn:focus-visible {
-        outline: 2px solid #9fd0ff;
+        outline: 2px solid var(--focus);
         outline-offset: -2px;
       }
       .tab-btn svg {
         width: 13px;
         height: 13px;
       }
-      /* Unread chat, on the collapsed tab: the same yellow as the mark on the
+      /* Unread chat, on the collapsed tab: the same amber as the mark on the
          row and on the guest's toolbar. */
       .tab-dot {
         position: absolute;
@@ -103,13 +111,15 @@
         height: 8px;
         margin-inline-start: -4px;
         border-radius: 50%;
-        background: #f2b441;
+        background: var(--amber-dot);
       }
+      /* A legend, printed small and lowercase like every legend in the app. */
       .bar-heading {
-        margin: 8px 0 4px;
-        color: #a9b7c2;
+        margin: 8px 0 2px;
+        color: var(--text-3);
         font-size: 11px;
-        font-weight: 600;
+        font-weight: 500;
+        text-transform: lowercase;
       }
       .bar-list {
         flex: 1;
@@ -118,19 +128,27 @@
         padding: 0;
         list-style: none;
         overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--scrollbar) transparent;
       }
       .bar-row {
         display: flex;
         align-items: center;
-        gap: 6px;
+        gap: 7px;
         padding: 3px 0;
       }
+      .bar-row + .bar-row {
+        border-block-start: 1px solid var(--border);
+      }
+      /* The guest's on-light: lit green, with the halo a live session has
+         everywhere in the app. */
       .bar-dot {
         flex: none;
         width: 7px;
         height: 7px;
         border-radius: 50%;
-        background: #4ade80;
+        background: var(--green);
+        box-shadow: 0 0 0 3px var(--green-soft);
       }
       .bar-peer {
         flex: 1;
@@ -138,59 +156,58 @@
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-family: var(--font-mono);
       }
       /* A machine name is words, not an identifier (ADR 0121). */
       .bar-peer[data-named='true'] {
         font-family: inherit;
+        font-weight: 600;
       }
       .bar-role {
         flex: none;
-        color: #a9b7c2;
-        font-size: 10px;
+        color: var(--text-3);
+        font-size: 11px;
       }
       /* A shell running on this machine (ADR 0079 decision 3). Red, like
          every other "this is happening right now" mark, and nothing hides
          it. */
       .bar-terminal {
         flex: none;
-        max-width: 8rem;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: #ff9d9d;
-        font-size: 10px;
-        font-weight: 600;
+        display: flex;
+        color: var(--red);
       }
+      /* Ending a guest's session is the stop key: red, round-ended. */
       .bar-revoke {
         flex: none;
-        padding: 1px 6px;
+        padding: 2px 8px;
         background: transparent;
-        color: #ff9d9d;
-        border: 1px solid rgb(255 157 157 / 55%);
-        border-radius: 999px;
-        font-size: 10px;
+        color: var(--red);
+        border: 1px solid var(--red);
+        border-radius: var(--radius-key);
+        font: inherit;
+        font-size: 11px;
+        font-weight: 600;
         cursor: pointer;
       }
       .bar-revoke:hover {
-        background: rgb(255 157 157 / 14%);
+        background: var(--red-soft);
       }
       .bar-chat {
         flex: none;
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 22px;
+        width: 24px;
         height: 20px;
         padding: 0;
-        background: rgb(242 180 65 / 14%);
-        color: inherit;
-        border: 1px solid rgb(242 180 65 / 55%);
-        border-radius: 999px;
+        background: var(--amber-soft);
+        color: var(--text);
+        border: 1px solid var(--amber-dot);
+        border-radius: var(--radius-key);
         cursor: pointer;
       }
       .bar-chat:hover {
-        background: rgb(242 180 65 / 26%);
+        background: var(--accent-soft-strong);
       }
       .bar-chat svg {
         width: 14px;
@@ -199,21 +216,25 @@
       .bar-revoke:focus-visible,
       .bar-chat:focus-visible,
       .bar-open:focus-visible {
-        outline: 2px solid #9fd0ff;
+        outline: 2px solid var(--focus);
         outline-offset: 1px;
       }
       .bar-open {
         margin-block-start: 6px;
-        padding: 4px 8px;
-        background: rgb(255 255 255 / 8%);
-        color: inherit;
-        border: 1px solid rgb(255 255 255 / 18%);
-        border-radius: 5px;
-        font-size: 11px;
+        min-height: 28px;
+        padding: 4px 10px;
+        background: var(--control-bg);
+        color: var(--text);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-key);
+        box-shadow: var(--shadow-sm);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
         cursor: pointer;
       }
       .bar-open:hover {
-        background: rgb(255 255 255 / 16%);
+        background: var(--surface-2);
       }
     </style>
   </head>

@@ -48,3 +48,40 @@ export function applyTheme(choice: ThemeChoice = getStoredTheme()): void {
     document.documentElement.dataset.theme = choice;
   }
 }
+
+/** Whether this window is drawing dark right now, by choice or by the system. */
+export function isDarkTheme(choice: ThemeChoice = getStoredTheme()): boolean {
+  if (choice !== 'system') {
+    return choice === 'dark';
+  }
+  return typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches;
+}
+
+const themeListeners = new Set<(dark: boolean) => void>();
+
+/** Called when this window's theme changes; for what CSS cannot reach. */
+export function onThemeChange(listener: (dark: boolean) => void): void {
+  themeListeners.add(listener);
+}
+
+/**
+ * Applies the stored theme and keeps applying it: every window of the app
+ * shares one origin and so one `localStorage`, and a choice made in the main
+ * window's settings reaches the others as a `storage` event (ADR 0168).
+ */
+export function followTheme(): void {
+  applyTheme();
+  const changed = (): void => {
+    applyTheme();
+    const dark = isDarkTheme();
+    themeListeners.forEach((listener) => listener(dark));
+  };
+  window.addEventListener('storage', (event) => {
+    if (event.key === THEME_STORAGE_KEY || event.key === null) {
+      changed();
+    }
+  });
+  if (typeof matchMedia === 'function') {
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', changed);
+  }
+}

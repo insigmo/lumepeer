@@ -1402,7 +1402,11 @@ function renderPane(fm: FileManager, side: Side, locale: Locale): TemplateResult
       <button type="button" class="fm-sort" @click=${() => fm.sortBy(side, key)}>
         ${t(locale, label)}
         <span class="fm-sort-mark" aria-hidden="true"
-          >${pane.sort === key ? (pane.ascending ? '▲' : '▼') : ''}</span
+          >${pane.sort === key
+            ? html`<svg viewBox="0 0 10 10" width="9" height="9" class=${pane.ascending ? '' : 'is-descending'}>
+                <path d="M2 6.5 5 3.5 8 6.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>`
+            : ''}</span
         >
       </button>
     </th>

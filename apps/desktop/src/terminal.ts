@@ -23,6 +23,7 @@ import { styleMap } from 'lit-html/directives/style-map.js';
 
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
+import { isDarkTheme, onThemeChange } from './theme';
 
 /**
  * How much history one shell keeps in this window, in lines.
@@ -181,11 +182,11 @@ export function decodeTerminalPoll(buffer: ArrayBufferLike): TerminalEvent[] {
  * background; `black` is the one programs paint *behind* text with.
  */
 export const TERMINAL_THEME: ITheme = {
-  background: '#0e1115',
-  foreground: '#e9ecf2',
-  cursor: '#8aa9ff',
-  cursorAccent: '#0e1115',
-  selectionBackground: 'rgba(110, 145, 245, 0.35)',
+  background: '#151516',
+  foreground: '#ededea',
+  cursor: '#f5b544',
+  cursorAccent: '#151516',
+  selectionBackground: 'rgba(242, 163, 27, 0.32)',
   black: '#2a303b',
   red: '#ff6d7b',
   green: '#3ccf8e',
@@ -203,6 +204,39 @@ export const TERMINAL_THEME: ITheme = {
   brightCyan: '#79dbe7',
   brightWhite: '#f5f7fa',
 };
+
+/**
+ * The same sixteen colours for a light window (ADR 0168): the body's satin
+ * ground, charcoal text, and each hue dark enough to read on it.
+ */
+export const TERMINAL_THEME_LIGHT: ITheme = {
+  background: '#fafaf8',
+  foreground: '#1c1c1e',
+  cursor: '#8a5a00',
+  cursorAccent: '#fafaf8',
+  selectionBackground: 'rgba(242, 163, 27, 0.32)',
+  black: '#1c1c1e',
+  red: '#b3261e',
+  green: '#23702f',
+  yellow: '#8a5a00',
+  blue: '#1f4fbf',
+  magenta: '#7b3fb0',
+  cyan: '#0b6e7a',
+  white: '#6b6b65',
+  brightBlack: '#55554f',
+  brightRed: '#c8372a',
+  brightGreen: '#2e8a3c',
+  brightYellow: '#a06a00',
+  brightBlue: '#3564e4',
+  brightMagenta: '#9450cc',
+  brightCyan: '#0f8494',
+  brightWhite: '#3a3a36',
+};
+
+/** The palette for a window drawing dark, or light. */
+export function terminalTheme(dark: boolean = isDarkTheme()): ITheme {
+  return dark ? TERMINAL_THEME : TERMINAL_THEME_LIGHT;
+}
 
 /** The app's `--font-mono`, which `xterm.js` cannot read from CSS. */
 const TERMINAL_FONT = "ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace";
@@ -576,7 +610,7 @@ export async function mountTerminal(
     // Announcing every byte would make a build log unusable with a screen
     // reader; announcing the line the cursor is on is what a terminal is.
     screenReaderMode: true,
-    theme: TERMINAL_THEME,
+    theme: terminalTheme(),
     fontFamily: TERMINAL_FONT,
     fontSize: 13,
     lineHeight: 1.2,
@@ -588,6 +622,10 @@ export async function mountTerminal(
   // emulator's default 80×24 in whatever size of window it sat in. A fit is
   // at most once a frame, because dragging a window edge resizes on every
   // pixel and each fit that changes the grid is a resize sent to the host.
+  // The window's theme can change under a running shell (ADR 0168).
+  onThemeChange((dark) => {
+    emulator.options.theme = terminalTheme(dark);
+  });
   const fit = new FitAddon();
   emulator.loadAddon(fit);
   emulator.open(root);

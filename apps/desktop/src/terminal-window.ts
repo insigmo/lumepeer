@@ -14,6 +14,7 @@ import '@xterm/xterm/css/xterm.css';
 
 import { detectLocale, dirOf } from './i18n';
 import { mountTerminal, type TerminalControls } from './terminal';
+import { followTheme } from './theme';
 
 const params = new URLSearchParams(window.location.search);
 /** Pseudonymized label of the session this window's shells ride (§15). */
@@ -22,6 +23,7 @@ const locale = detectLocale(navigator);
 
 document.documentElement.lang = locale;
 document.documentElement.dir = dirOf(locale);
+followTheme();
 
 let terminal: TerminalControls | null = null;
 

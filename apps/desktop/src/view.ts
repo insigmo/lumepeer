@@ -25,6 +25,7 @@ import { tauriFileCommands } from './file-transfers';
 import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { rememberThumbnail, thumbnailFrom } from './peer-thumbnails';
 import { mountTerminal, type TerminalControls } from './terminal';
+import { followTheme } from './theme';
 import { mountToolbar, tauriToolbarCommands, type ToolbarControls } from './toolbar';
 import {
   decodeViewChunk,
@@ -131,6 +132,7 @@ const locale: Locale = detectLocale(navigator);
 
 document.documentElement.lang = locale;
 document.documentElement.dir = dirOf(locale);
+followTheme();
 canvas?.setAttribute('role', 'img');
 canvas?.setAttribute('aria-label', t(locale, 'view.canvasLabel'));
 

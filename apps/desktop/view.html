@@ -4,14 +4,23 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Lumepeer — remote screen</title>
+    <link rel="stylesheet" href="/src/tokens.css" />
+    <link rel="stylesheet" href="/src/terminal-chrome.css" />
     <style>
+      /* The chrome around somebody else's screen follows the app's light or
+         dark like every other window (ADR 0168); the picture itself is never
+         recoloured. */
       html,
       body {
         margin: 0;
         height: 100%;
-        background: #101014;
-        color: #f2f2f5;
-        font-family: system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--font-ui);
+        -webkit-font-smoothing: antialiased;
+      }
+      ::selection {
+        background: var(--selection);
       }
       #view {
         position: relative;
@@ -61,13 +70,25 @@
            on screen. */
         cursor: default;
       }
+      /* A status line ("waiting", "reconnecting") as a plate in the middle
+         of the window rather than a strip along the top: the toolbar starts
+         at the top edge, and a strip there ran its words beneath the
+         buttons. */
       .view-banner {
         position: absolute;
-        inset-inline: 0;
-        inset-block-start: 0;
+        inset-block-start: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        box-sizing: border-box;
+        max-width: calc(100% - 2rem);
         margin: 0;
-        padding: 0.5rem 1rem;
-        background: rgb(0 0 0 / 70%);
+        padding: 0.45rem 1rem;
+        background: var(--raised);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-key);
+        box-shadow: var(--shadow-md);
+        font-size: 13px;
         text-align: center;
       }
       /* Recording indicator (§17). Top-centre, above everything, and with no
@@ -83,7 +104,8 @@
         gap: 0.4rem;
         margin: 0;
         padding: 0.35rem 1rem;
-        background: rgb(150 20 30 / 88%);
+        background: var(--danger-solid);
+        color: var(--on-danger);
         font-size: 0.85rem;
         font-weight: 600;
         pointer-events: none;
@@ -91,15 +113,18 @@
       /* Video statistics (Ctrl+Alt+Shift+S). Bottom corner, clear of the
          toolbar at the top, and transparent to the pointer: it sits over the
          remote screen, and a click on it belongs to the host. */
+      /* A readout window, dark in both themes like every live value. */
       .view-stats {
         position: absolute;
         inset-inline-start: 0.75rem;
         inset-block-end: 0.75rem;
         z-index: 30;
         margin: 0;
-        padding: 0.5rem 0.75rem;
-        border-radius: 0.5rem;
-        background: rgb(0 0 0 / 72%);
+        padding: 0.6rem 0.8rem;
+        border-radius: var(--radius);
+        background: var(--readout-bg);
+        color: var(--readout-text);
+        box-shadow: var(--shadow-md);
         font-size: 0.75rem;
         line-height: 1.35;
         font-variant-numeric: tabular-nums;
@@ -117,7 +142,7 @@
         margin: 0;
       }
       .view-stats-rows dt {
-        opacity: 0.75;
+        color: var(--readout-dim);
       }
       .view-stats-rows dd {
         margin: 0;
@@ -127,8 +152,8 @@
         width: 0.6rem;
         height: 0.6rem;
         border-radius: 50%;
-        background: #ff5a5a;
-        box-shadow: 0 0 0.4rem #ff5a5a;
+        background: var(--on-danger);
+        box-shadow: 0 0 0 3px rgb(255 255 255 / 30%);
       }
       #chat-panel {
         position: absolute;
@@ -138,8 +163,12 @@
         max-height: 45%;
         display: flex;
         flex-direction: column;
-        background: rgb(0 0 0 / 72%);
-        border-start-start-radius: 0.5rem;
+        background: var(--raised);
+        border: 1px solid var(--border);
+        border-inline-end: 0;
+        border-block-end: 0;
+        border-start-start-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
         font-size: 0.85rem;
       }
       /* Without this the panel cannot be hidden at all: the browser's own
@@ -159,9 +188,10 @@
         height: min(22rem, 50%);
         display: flex;
         flex-direction: column;
-        /* The emulator's own background (`TERMINAL_THEME`, ADR 0132), so the
+        /* The emulator's own background (`terminalTheme`, ADR 0132), so the
            chrome and the shell read as one surface. */
-        background: rgb(14 17 21 / 94%);
+        background: var(--term-bg);
+        border-block-start: 1px solid var(--border);
         font-size: 0.85rem;
       }
       /* Same specificity problem `#chat-panel[hidden]` has, same answer. */
@@ -175,7 +205,8 @@
       #view.is-terminal-only #terminal-panel {
         inset: 0;
         height: auto;
-        background: rgb(14 17 21 / 100%);
+        border: 0;
+        background: var(--term-bg);
       }
       /* The "reconnecting" banner of a terminal window. The panel fills the
          window and comes later in the document, so without this it would
@@ -184,97 +215,13 @@
       #view.is-terminal-only .view-banner {
         z-index: 1;
         inset-block-start: auto;
-        inset-block-end: 0;
+        inset-block-end: 0.75rem;
+        transform: translateX(-50%);
       }
       #terminal-screen {
         flex: 1;
         min-height: 0;
         padding: 0.25rem 0.5rem;
-      }
-      .term-head {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.35rem 0.5rem;
-      }
-      .term-head h3 {
-        margin: 0;
-        font-size: 0.9rem;
-      }
-      .term-state {
-        flex: 1;
-        opacity: 0.8;
-      }
-      /* What the shell is doing, at a glance: amber while the host is asked,
-         green while it runs, red when it was refused, grey once it is over
-         (ADR 0132). The words beside it stay the whole message. */
-      .term-state::before {
-        content: '';
-        display: inline-block;
-        width: 0.5rem;
-        height: 0.5rem;
-        margin-inline-end: 0.4rem;
-        border-radius: 50%;
-        background: #7a8293;
-      }
-      .term-state[data-status='opening']::before {
-        background: #f2b441;
-        animation: term-pulse 0.9s ease-in-out infinite alternate;
-      }
-      .term-state[data-status='open']::before {
-        background: #3ccf8e;
-      }
-      .term-state[data-status='refused']::before {
-        background: #ff6d7b;
-      }
-      /* The terminal's right-click menu (ADR 0132): fixed, because it opens
-         at the pointer, and in the terminal's own palette. */
-      .term-menu {
-        position: fixed;
-        z-index: 10;
-        display: flex;
-        flex-direction: column;
-        min-width: 11rem;
-        padding: 0.25rem;
-        background: #1b1f27;
-        border: 1px solid #373e4b;
-        border-radius: 8px;
-        box-shadow: 0 8px 20px -6px rgb(0 0 0 / 55%);
-        font-size: 0.85rem;
-      }
-      .term-menu-item {
-        display: flex;
-        justify-content: space-between;
-        gap: 1.5rem;
-        padding: 0.35rem 0.6rem;
-        border: 0;
-        border-radius: 5px;
-        background: none;
-        color: #e9ecf2;
-        font: inherit;
-        text-align: start;
-      }
-      .term-menu-item:hover:not(:disabled),
-      .term-menu-item:focus-visible {
-        background: rgb(255 255 255 / 8%);
-        outline: none;
-      }
-      .term-menu-item:disabled {
-        color: #5e6676;
-      }
-      .term-menu-item kbd {
-        font: inherit;
-        color: #8d95a5;
-      }
-      @keyframes term-pulse {
-        to {
-          opacity: 0.3;
-        }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .term-state[data-status='opening']::before {
-          animation: none;
-        }
       }
       .chat-log {
         flex: 1;
@@ -289,33 +236,46 @@
       }
       .chat-out {
         text-align: end;
-        color: #9fd0ff;
+        color: var(--accent-text);
       }
       .chat-in {
         text-align: start;
-        color: #f2f2f5;
+        color: var(--text);
       }
       .chat-compose {
         display: flex;
-        gap: 0.25rem;
-        padding: 0.35rem;
-        border-block-start: 1px solid rgb(255 255 255 / 18%);
+        gap: 0.35rem;
+        padding: 0.5rem;
+        border-block-start: 1px solid var(--border);
       }
       .chat-input {
         flex: 1;
         min-width: 0;
-        background: #1c1c22;
+        background: var(--control-bg);
         color: inherit;
-        border: 1px solid rgb(255 255 255 / 25%);
-        border-radius: 0.25rem;
-        padding: 0.25rem 0.4rem;
+        caret-color: var(--accent-text);
+        border: 1px solid var(--border-strong);
+        border-radius: var(--radius-key);
+        padding: 0.35rem 0.75rem;
+        font: inherit;
+      }
+      .chat-input:focus-visible {
+        outline: none;
+        border-color: var(--focus);
+        box-shadow: 0 0 0 3px var(--accent-ring);
       }
       .chat-send {
-        background: #2b2b33;
-        color: inherit;
-        border: 1px solid rgb(255 255 255 / 25%);
-        border-radius: 0.25rem;
-        padding: 0.25rem 0.6rem;
+        background: var(--accent);
+        color: var(--on-accent);
+        border: 0;
+        border-radius: var(--radius-key);
+        padding: 0.35rem 0.85rem;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .chat-send:hover {
+        background: var(--accent-hover);
       }
       .view-modal {
         position: absolute;
@@ -324,9 +284,12 @@
         width: min(28rem, 90%);
         height: fit-content;
         padding: 1.5rem;
-        border-radius: 0.5rem;
-        background: #1c1c22;
-        box-shadow: 0 0 0 100vmax rgb(0 0 0 / 60%);
+        border-radius: var(--radius-xl);
+        background: var(--raised);
+        color: var(--text);
+        box-shadow:
+          0 0 0 100vmax var(--scrim),
+          var(--shadow-lg);
       }
       #cursor {
         position: absolute;
@@ -370,8 +333,10 @@
       }
       .toolbar-pop-heading {
         margin: 0.7rem 0 0.3rem;
-        font-size: 0.8rem;
-        font-weight: 600;
+        color: var(--text-3);
+        font-size: 12px;
+        font-weight: 500;
+        text-transform: lowercase;
       }
       .toolbar-hotkeys {
         display: grid;
@@ -381,23 +346,26 @@
         font-size: 0.75rem;
       }
       .toolbar-hotkeys dt {
-        color: #9fd0ff;
+        color: var(--accent-text);
         white-space: nowrap;
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-family: var(--font-mono);
       }
       .toolbar-hotkeys dd {
         margin: 0;
-        color: #d6d6dd;
+        color: var(--text-2);
       }
       .toolbar {
         display: inline-flex;
         align-items: center;
         gap: 0.15rem;
-        padding: 0.2rem;
-        background: rgb(16 16 20 / 88%);
-        border: 1px solid rgb(255 255 255 / 18%);
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+        padding: 0.25rem;
+        /* Glyphs on a plate, nothing else over the picture: the remote screen
+           owns this window. */
+        background: color-mix(in srgb, var(--raised) 94%, transparent);
+        color: var(--text-2);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-key);
+        box-shadow: var(--shadow-md);
       }
       .toolbar-btn {
         display: inline-flex;
@@ -407,20 +375,22 @@
         height: 2rem;
         padding: 0;
         background: transparent;
-        color: #f2f2f5;
+        color: var(--text-2);
         border: none;
-        border-radius: 0.35rem;
+        border-radius: var(--radius-key);
         cursor: pointer;
       }
       .toolbar-btn:hover:not(.is-disabled) {
-        background: rgb(255 255 255 / 12%);
+        background: var(--hover-strong);
+        color: var(--text);
       }
       .toolbar-btn:focus-visible {
-        outline: 2px solid #9fd0ff;
+        outline: 2px solid var(--focus);
         outline-offset: 1px;
       }
       .toolbar-btn.is-active {
-        background: rgb(159 208 255 / 22%);
+        background: var(--accent-soft-strong);
+        color: var(--text);
       }
       .toolbar-btn.is-disabled {
         opacity: 0.4;
@@ -432,12 +402,13 @@
         display: inline-flex;
         align-items: center;
         margin-inline-start: 0.2rem;
-        padding: 1px 8px;
-        border: 1px solid rgb(255 255 255 / 18%);
-        border-radius: 999px;
-        background: rgb(16 16 20 / 88%);
-        color: #9fd0ff;
-        font-size: 0.7rem;
+        padding: 2px 10px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-key);
+        background: var(--raised);
+        color: var(--green-text);
+        box-shadow: var(--shadow-sm);
+        font-size: 12px;
         white-space: nowrap;
       }
       .toolbar-handle {
@@ -456,11 +427,12 @@
         inset-block-start: calc(100% + 0.4rem);
         inset-inline-start: 0;
         min-width: 12rem;
-        padding: 0.6rem;
-        background: rgb(16 16 20 / 96%);
-        border: 1px solid rgb(255 255 255 / 18%);
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+        padding: 0.75rem;
+        background: var(--raised);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-lg);
         font-size: 0.85rem;
       }
       .toolbar-pop-row {
@@ -478,20 +450,23 @@
       }
       .toolbar-power button {
         flex: 1;
-        padding: 0.35rem 0.5rem;
-        background: rgb(255 90 90 / 16%);
-        color: #ffb3b3;
-        border: 1px solid rgb(255 90 90 / 45%);
-        border-radius: 0.25rem;
+        padding: 0.4rem 0.6rem;
+        background: var(--red-soft);
+        color: var(--red);
+        border: 1px solid var(--red);
+        border-radius: var(--radius-key);
         cursor: pointer;
-        font-size: 0.8rem;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
         line-height: 1.2;
       }
       .toolbar-power button:hover {
-        background: rgb(255 90 90 / 28%);
+        background: var(--danger-solid);
+        color: var(--on-danger);
       }
       .toolbar-power button:focus-visible {
-        outline: 2px solid #9fd0ff;
+        outline: 2px solid var(--focus);
         outline-offset: 1px;
       }
       /* The zoom stepper, shown only while the picture size is "Zoom". */
@@ -504,18 +479,18 @@
         width: 1.4rem;
         height: 1.4rem;
         padding: 0;
-        background: rgb(255 255 255 / 10%);
+        background: var(--surface-2);
         color: inherit;
         border: none;
-        border-radius: 0.25rem;
+        border-radius: var(--radius-key);
         cursor: pointer;
         line-height: 1;
       }
       .toolbar-zoom button:hover {
-        background: rgb(255 255 255 / 20%);
+        background: var(--surface-3);
       }
       .toolbar-zoom button:focus-visible {
-        outline: 2px solid #9fd0ff;
+        outline: 2px solid var(--focus);
         outline-offset: 1px;
       }
       .toolbar-zoom output {
@@ -525,8 +500,8 @@
       }
       .toolbar-pop-note {
         margin: 0.5rem 0 0;
-        color: #9a9aa5;
-        font-size: 0.75rem;
+        color: var(--text-3);
+        font-size: 12px;
       }
       .toolbar-monitor-list {
         margin: 0;
@@ -536,9 +511,10 @@
         gap: 0.25rem;
       }
       .toolbar-monitor-size {
-        color: #9a9aa5;
+        color: var(--text-3);
         margin-inline-start: 0.4rem;
-        font-size: 0.75rem;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
       }
       .toolbar-monitor-list button {
         width: 100%;
@@ -547,14 +523,16 @@
         background: transparent;
         color: inherit;
         border: 1px solid transparent;
-        border-radius: 0.35rem;
+        border-radius: var(--radius);
         cursor: pointer;
+        font: inherit;
       }
       .toolbar-monitor-list button:hover {
-        background: rgb(255 255 255 / 12%);
+        background: var(--hover-strong);
       }
       .toolbar-monitor-list button.is-active {
-        border-color: #9fd0ff;
+        border-color: var(--focus);
+        background: var(--accent-soft);
       }
     </style>
   </head>

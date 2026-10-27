@@ -16,9 +16,12 @@ import { detectLocale, dirOf, t, type Locale } from './i18n';
 import { logoMark } from './logo';
 import { peerDisplayName } from './peer-name';
 import type { SessionStatus } from './session-status';
+import { followTheme } from './theme';
 
 const root = document.querySelector<HTMLElement>('#hostbar');
 const locale: Locale = detectLocale(navigator);
+
+followTheme();
 
 /** How often the bar re-asks the actor who is connected. */
 const POLL_MS = 1000;
@@ -156,7 +159,11 @@ function draw(): void {
                     role="status"
                     data-testid="hostbar-terminal"
                     title=${t(locale, 'status.terminal.active')}
-                    >${t(locale, 'status.terminal.active')}</span
+                    aria-label=${t(locale, 'status.terminal.active')}
+                    ><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                      <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" />
+                      <path d="M4.5 6l2 2-2 2M8.5 10.5h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg></span
                   >`
                 : ''}
               <!-- The guest wrote and nobody here has read it. The chat itself
