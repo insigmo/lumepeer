@@ -14,6 +14,8 @@
 mod autostart;
 mod bootstrap;
 mod commands;
+// The channel between the session host and this client (ADR 0169 §4).
+mod host_panel;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
 mod license;
@@ -36,6 +38,13 @@ mod service_control;
 // only: there is no session-0 host on the other platforms to launch one.
 #[cfg(target_os = "windows")]
 mod session_agent;
+// This same binary, run as `LocalSystem` on the signed-in desktop as this
+// machine's host (ADR 0169). Windows only, like the logon host it pairs with.
+#[cfg(target_os = "windows")]
+mod session_host;
+// What the logon host and the session host share.
+#[cfg(target_os = "windows")]
+mod system_host;
 // This same binary, run as a machine's `LocalSystem` desktop injector
 // (ADR 0114). Windows only, for the same reason the agent is.
 #[cfg(target_os = "windows")]
@@ -73,6 +82,14 @@ pub struct AppState {
                   actor was already told at spawn time"
     )]
     pub host_role: Option<HostRoleGuard>,
+    /// Whether this process hosts this machine (ADR 0085 §4) — `false` when
+    /// something else does, which the window then says (ADR 0169).
+    pub hosting: bool,
+    /// The session host's channel, while it — not this process — hosts this
+    /// machine (ADR 0169 §4): what the host panel, the session list and the
+    /// host's chat read, and what their buttons narrow. `None` while this
+    /// process hosts, and off Windows.
+    pub host_panel: Option<std::sync::Arc<host_panel::HostPanel>>,
     /// Whether this process actually put a tray icon up.
     ///
     /// `false` only on a Linux desktop with no ayatana-appindicator library
@@ -118,6 +135,21 @@ fn claim_host_role() -> (Option<HostRoleGuard>, bool) {
     {
         use lumepeer_service::host_role::HostRoleClaim;
 
+        // Where ADR 0169 is on, the service's session host is this machine's
+        // host and this window is its guest and its panel: not a second host,
+        // and not the one to ask it to leave. Only for a run that would host
+        // with the protected stores the session host serves — an unelevated
+        // development run still asks below, is refused by the role's access
+        // list, and reads the role as taken.
+        if lumepeer_service::program_data::session_host_enabled()
+            && crate::placement::protected_account().is_some()
+        {
+            tracing::info!(
+                "this machine is hosted by the Lumepeer service (ADR 0169); this window connects \
+                 out and views other machines, and is not a second host"
+            );
+            return (None, false);
+        }
         // The person at the machine wins the tie (ADR 0085 §4): whoever holds
         // the role — the logon host, still leaving after a sign-in (ADR 0126) —
         // is asked to give it up, and it is waited for before this run settles
@@ -470,6 +502,18 @@ fn setup_app(
     // is part of that state: the window-close handler has to know whether
     // hiding a window leaves anything to bring it back.
     let tray = install_tray(app)?;
+    // Not the host: attach to the one that is, for as long as this runs, so
+    // its sessions are seen here and its endpoint knows somebody is (ADR 0169
+    // §1, §7). A thread of its own: the channel blocks.
+    let host_panel = (!may_host)
+        .then(host_panel::HostPanel::for_this_user)
+        .flatten()
+        .map(std::sync::Arc::new);
+    if let Some(panel) = &host_panel {
+        let panel = std::sync::Arc::clone(panel);
+        let app = app.handle().clone();
+        std::thread::spawn(move || host_panel::stay_attached(&panel, &app));
+    }
     // Before the state, so the first heartbeat round has already told the
     // actor the plan by the time a guest can knock (ADR 0163).
     let license = license::License::load(app.handle());
@@ -479,6 +523,8 @@ fn setup_app(
         update_url,
         autostart,
         host_role,
+        hosting: may_host,
+        host_panel,
         tray,
         license,
     });
@@ -724,15 +770,12 @@ fn second_instance_allowed() -> bool {
     }
 }
 
-fn main() {
-    // `--enable-autostart` / `--disable-autostart`: a headless call into the
-    // same autostart mechanism the settings panel's toggle uses, for
-    // packaging scripts that have an install/remove hook but no window to
-    // click through (see `autostart_cli_flag`). Checked before anything else
-    // starts — no config loaded, no log file opened, no webview built —
-    // mirroring the equivalent `--install`/`--uninstall` short-circuit at the
-    // top of `crates/service`'s own `main.rs`.
-    let args: Vec<String> = std::env::args().collect();
+/// Becomes the process the service, or a platform's system keeper, launched
+/// this binary as, if `args` names one; returns only when it names none.
+///
+/// Its own function, like [`invoke_handler`], because the list of such roles
+/// only grows and was what pushed `main` over clippy's `too_many_lines`.
+fn run_as_a_launched_role(args: &[String]) {
     // Before everything: this process is a session agent, not a client
     // (ADR 0085 §1). Checked first so it can never be confused with a normal
     // run — an agent that got as far as the single-instance check, the tray or
@@ -765,6 +808,16 @@ fn main() {
     {
         logon_host::run();
     }
+    // And again (ADR 0169): this process is the signed-in desktop's host,
+    // launched by the service as `LocalSystem`, with no tray, no window and no
+    // single-instance lock — the client beside it owns those.
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::SESSION_HOST_ARG)
+    {
+        session_host::run();
+    }
     // The same flag on the other platforms (ADR 0151): this process is the
     // sign-in screen's host, started as `root` by the system keeper while
     // nobody is signed in. Before everything, for the reason the Windows
@@ -776,6 +829,20 @@ fn main() {
     {
         logon_host_unix::run();
     }
+}
+
+fn main() {
+    // `--enable-autostart` / `--disable-autostart`: a headless call into the
+    // same autostart mechanism the settings panel's toggle uses, for
+    // packaging scripts that have an install/remove hook but no window to
+    // click through (see `autostart_cli_flag`). Checked before anything else
+    // starts — no config loaded, no log file opened, no webview built —
+    // mirroring the equivalent `--install`/`--uninstall` short-circuit at the
+    // top of `crates/service`'s own `main.rs`.
+    let args: Vec<String> = std::env::args().collect();
+    // Before everything else: one of the processes the service launches this
+    // binary as, never a client. Each of them returns only by exiting.
+    run_as_a_launched_role(&args);
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {
             Ok(()) => return,

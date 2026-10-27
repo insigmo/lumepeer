@@ -169,6 +169,8 @@ export const fr: Dictionary = {
     "Cet appareil exécute Linux dans ChromeOS, et les applications qui s'y trouvent ne peuvent pas voir l'écran de ChromeOS, les personnes invitées ne verront donc rien. Se connecter à d'autres appareils depuis celui-ci fonctionne normalement.",
   'status.noEncoder':
     "Cet appareil n'a pas d'encodeur vidéo, les personnes invitées ne verront donc rien. Les sessions se connectent tout de même, et la saisie fonctionne toujours.",
+  'status.hostedByService':
+    "Cet appareil est hébergé par le service Lumepeer, pas par cette fenêtre. Vous pouvez toujours vous connecter à d'autres appareils d'ici.",
   'titlebar.minimize': 'Réduire',
   'titlebar.maximize': 'Agrandir',
   'titlebar.close': 'Fermer',

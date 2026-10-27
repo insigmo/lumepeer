@@ -81,6 +81,19 @@ pub fn choose(
     if std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file")
         && let Some((sid, true)) = lumepeer_service::program_data::this_process()
     {
+        // Where ADR 0169 is on, the service's session host hosts with this
+        // account's protected stores, identity included, and this window is
+        // its guest. Two endpoints with one key fight over the relay and the
+        // DHT record (ADR 0169 §3), so this one keeps an identity of its own
+        // in the profile and writes no policy — the stores an unelevated run
+        // keeps. Moving the remembered hosts across is pack 07's.
+        if lumepeer_service::program_data::session_host_enabled() {
+            tracing::info!(
+                "the Lumepeer service hosts with this account's stores; this window keeps a \
+                 guest identity of its own in the profile (ADR 0169)"
+            );
+            return without_policy(profile, open_profile_keystore);
+        }
         if let Some(placement) = protected::open(&sid, &profile, open_profile_keystore) {
             tracing::info!(
                 directory = ?placement.invite_dir,
@@ -92,14 +105,7 @@ pub fn choose(
             "cannot secure this account's store under %ProgramData%\\Lumepeer\\users: \
              running with unattended access off and no device trusted"
         );
-        return Ok(Placement {
-            keystore: Box::new(WithoutPolicy(open_profile_keystore()?)),
-            remembered: open_profile_keystore()?,
-            address_book: None,
-            invite_dir: profile.invite_dir,
-            history: profile.history,
-            audit: profile.audit,
-        });
+        return without_policy(profile, open_profile_keystore);
     }
     // The login keychain binds an item to the exact build that wrote it when
     // the app carries no Apple team id, so every update asked for the login
@@ -139,8 +145,28 @@ pub fn choose(
     })
 }
 
+/// The profile's stores with the policy taken out: no device password, role
+/// or second factor read or written, no trusted devices. What an elevated run
+/// keeps when it must not decide who gets in — it cannot protect its own
+/// store, or the session host decides (ADR 0169).
+#[cfg(target_os = "windows")]
+fn without_policy(
+    profile: Profile,
+    open_profile_keystore: &dyn Fn() -> Result<Box<dyn Keystore>, NetError>,
+) -> Result<Placement, NetError> {
+    Ok(Placement {
+        keystore: Box::new(WithoutPolicy(open_profile_keystore()?)),
+        remembered: open_profile_keystore()?,
+        address_book: None,
+        invite_dir: profile.invite_dir,
+        history: profile.history,
+        audit: profile.audit,
+    })
+}
+
 /// The account whose protected stores this run keeps, or `None` when it keeps
-/// the profile (ADR 0123) — the same conditions [`choose`] reads.
+/// the profile (ADR 0123) — the same conditions [`choose`] reads, except that
+/// where ADR 0169 is on the session host is the one keeping them for it.
 #[cfg(target_os = "windows")]
 pub fn protected_account() -> Option<String> {
     if std::env::var("LUMEPEER_KEYSTORE").as_deref() == Ok("file") {
@@ -153,12 +179,13 @@ pub fn protected_account() -> Option<String> {
 }
 
 /// The stores of the account `sid`, where its elevated client keeps them, for
-/// the logon host (ADR 0126); `None` when that directory cannot be opened.
+/// the logon host (ADR 0126) and the session host (ADR 0169); `None` when
+/// that directory cannot be opened.
 ///
-/// Nothing is moved out of a profile here: the logon host runs as
-/// `LocalSystem` and has no profile of the owner's to move from.
+/// Nothing is moved out of a profile here: both run as `LocalSystem` and have
+/// no profile of the account's to move from.
 #[cfg(target_os = "windows")]
-pub fn for_logon_host(sid: &str) -> Option<Placement> {
+pub fn for_system_host(sid: &str) -> Option<Placement> {
     protected::existing(sid)
 }
 

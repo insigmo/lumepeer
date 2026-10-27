@@ -271,4 +271,22 @@ describe('media warning (gap-tasks/05)', () => {
     const warning = app().querySelector('.media-warning');
     expect(warning?.textContent).toBe(t('en', 'status.noCapture'));
   });
+
+  it('says the service hosts this machine when this window is not its host (ADR 0169)', async () => {
+    RESPONSES.network_status = {
+      ready: true,
+      can_capture: true,
+      can_encode: true,
+      capture_unavailable_reason: null,
+      hosted_by_service: true,
+    };
+    await boot();
+    const notice = app().querySelector('[data-testid="hosted-notice"]');
+    expect(notice?.textContent?.trim()).toBe(t('en', 'status.hostedByService'));
+  });
+
+  it('says nothing about the service while this window is the host', async () => {
+    await boot();
+    expect(app().querySelector('[data-testid="hosted-notice"]')).toBeNull();
+  });
 });

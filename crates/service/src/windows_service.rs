@@ -139,14 +139,20 @@ extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     // `--console` shares that function, and an unelevated console run can
     // launch nothing onto `Winlogon`.
     let logon_host = std::thread::spawn(|| crate::logon_host_launch::supervise(&STOPPING));
+    // The signed-in console's host (ADR 0169), the same way and for the same
+    // reason.
+    let session_host = std::thread::spawn(|| crate::session_host_launch::supervise(&STOPPING));
 
     serve_until_stopped(&STOPPING);
 
-    // Joined, so no logon host outlives the service that started it. The flag
-    // is set here too because the accept loop can also give up on its own.
+    // Joined, so no host outlives the service that started it. The flag is
+    // set here too because the accept loop can also give up on its own.
     STOPPING.store(true, Ordering::SeqCst);
     if logon_host.join().is_err() {
         tracing::warn!("the logon host supervisor panicked on its way out");
+    }
+    if session_host.join().is_err() {
+        tracing::warn!("the session host supervisor panicked on its way out");
     }
 
     report(handle, SERVICE_STOPPED, 0);

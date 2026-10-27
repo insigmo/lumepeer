@@ -1220,6 +1220,17 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     /// for them to come back to. A machine at its logon screen has no desktop
     /// to put one on, and an admission to it is audited as its own kind.
     fn nobody_signed_in(&self) -> bool;
+    /// Whether this host already performs input as `LocalSystem` on the
+    /// signed-in desktop, where the service's desktop injector would stand
+    /// (ADR 0114, ADR 0169 §1).
+    ///
+    /// Only the session host says yes. Its own `SendInput` reaches elevated
+    /// windows and a `VMware` guest already, so asking the service to start a
+    /// second `LocalSystem` process to do the same would be a detour, not a
+    /// gain.
+    fn injects_as_system(&self) -> bool {
+        false
+    }
 }
 
 /// [`ViewWindows`] that does nothing, for driving the actor without a webview.

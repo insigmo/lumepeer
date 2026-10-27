@@ -930,6 +930,16 @@ pub const MEDIA_ACK_BEST_WINDOW_MS: u64 = 5_000;
 /// `MAX_CONTROL_FRAME_BYTES`.
 pub const CHAT_MAX_BYTES: usize = 4_096;
 
+/// How long the session host waits, after a session starts with no client of
+/// the person's attached, for the client it starts to attach (ADR 0169 §7).
+///
+/// The client is the only thing that shows the person at the machine somebody
+/// is on it — the host bar, the session list — so a session that nobody here
+/// can see after this long is ended rather than left running hidden (§2.2).
+/// Long enough for a cold start of the client on a slow machine; short enough
+/// that a hidden session is a matter of seconds.
+pub const SESSION_INDICATOR_DEADLINE_SECS: u64 = 10;
+
 /// Maximum pixel area of one cursor shape update (§11). A cursor is UI
 /// chrome, never a second video channel; anything larger is malformed.
 pub const MAX_CURSOR_SHAPE_PIXELS: usize = 128 * 128;

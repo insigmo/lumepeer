@@ -11076,7 +11076,9 @@ impl Actor {
         // Not when this host's own screen is the secure desktop (ADR 0126): that
         // injector lives on `Default`, so an event it took would land on a
         // desktop nobody is looking at while the logon screen waited for it.
+        // Nor when this host stands where that injector would (ADR 0169).
         let via_service = !self.windows.on_secure_desktop()
+            && !self.windows.injects_as_system()
             && lumepeer_service::client::inject_desktop(desktop_inject_event(event));
         // The two injectors keep separate books on which keys are down, and
         // only one of them reaches a `VMware` guest, so a session whose input
@@ -11145,7 +11147,8 @@ impl Actor {
             modifiers: 0,
             detail: lumepeer_service::protocol::DesktopInjectDetail::KeepAwake,
         };
-        if lumepeer_service::client::inject_desktop(keep_awake) {
+        if !self.windows.injects_as_system() && lumepeer_service::client::inject_desktop(keep_awake)
+        {
             return;
         }
         if self.injector.is_none() {
