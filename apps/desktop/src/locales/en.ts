@@ -142,6 +142,9 @@ export const en: Dictionary = {
     'Only asks whether a newer release exists. Nothing is downloaded or installed until you press Install.',
   'system.installNote': 'Installing may close Lumepeer and end any session in progress.',
   'system.updateOff': 'This build has no update channel configured.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'The Lumepeer service installs this update. Lumepeer closes while it does and opens again.',
+  'system.installingByService': 'The Lumepeer service is installing the update. Lumepeer will close and open again.',
   'status.clipboardSynced': 'Clipboard synced',
   'status.reconnect': 'Connect again',
   'status.reconnectTerminal': 'Connect to terminal',

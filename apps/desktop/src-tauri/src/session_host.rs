@@ -30,6 +30,11 @@
 //! attached, it starts the person's client, and if none attaches within
 //! [`SESSION_INDICATOR_DEADLINE_SECS`] it ends every session (§7).
 //!
+//! It also installs this machine's updates ([`crate::host_update`], §8): when
+//! nobody is at the machine or a client asks, it tells every guest it is
+//! restarting, starts the installer and leaves with
+//! [`SESSION_HOST_EXIT_UPDATING`].
+//!
 //! Until the consent dialog is its own (pack 04), nobody here can be asked:
 //! a guest gets in with the device password, or is refused and told why.
 //!
@@ -50,7 +55,7 @@ use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::host_role::ReleaseRequests;
 use lumepeer_service::{
     SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_NOT_ENABLED,
-    SESSION_HOST_EXIT_ROLE_TAKEN,
+    SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
 };
 
 use crate::host_panel::Served;
@@ -125,6 +130,15 @@ fn host() -> u32 {
     } else {
         tracing::error!("no channel for the client: it cannot attach");
     }
+    // Updates are this host's to install (ADR 0169 §8), open or closed; the
+    // client the last update closed is started again first.
+    runtime.spawn({
+        let served = Arc::clone(&served);
+        async move {
+            crate::host_update::relaunch_client_if_asked(session).await;
+            crate::host_update::keep_up_to_date(served).await;
+        }
+    });
     let code = runtime.block_on(serve(
         placement,
         &directory,
@@ -153,6 +167,9 @@ async fn serve(
     loop {
         if system_host::released(releases) {
             return 0;
+        }
+        if served.updates().leaving() {
+            return SESSION_HOST_EXIT_UPDATING;
         }
         if wanted() {
             break;
@@ -183,6 +200,10 @@ async fn serve(
         tokio::time::sleep(TICK).await;
         if system_host::released(releases) {
             return system_host::hand_over(&handle, |_| 0).await;
+        }
+        // Every guest has been told already (ADR 0148), by the update itself.
+        if served.updates().leaving() {
+            return SESSION_HOST_EXIT_UPDATING;
         }
         let sessions = handle.status().await.map_or(0, |sessions| sessions.len());
         match unseen.next(sessions > 0, served.anybody_attached(), Instant::now()) {

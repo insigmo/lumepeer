@@ -135,6 +135,9 @@ export const ja: Dictionary = {
     '新しいリリースがあるかを確認するだけです。「インストール」を押すまで、何もダウンロードもインストールもされません。',
   'system.installNote': 'インストールすると Lumepeer が終了し、進行中のセッションが終わることがあります。',
   'system.updateOff': 'このビルドにはアップデートチャネルが設定されていません。',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'このアップデートは Lumepeer サービスがインストールします。その間 Lumepeer は終了し、再び起動します。',
+  'system.installingByService': 'Lumepeer サービスがアップデートをインストールしています。Lumepeer は終了し、再び起動します。',
   'status.clipboardSynced': 'クリップボードを同期しました',
   'status.reconnect': '再接続',
   'status.reconnectTerminal': 'ターミナルに接続',

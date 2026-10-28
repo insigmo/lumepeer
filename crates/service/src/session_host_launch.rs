@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use lumepeer_service::agent_launch::{anybody_signed_in, console_session};
 use lumepeer_service::{
     SESSION_HOST_ARG, SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE,
-    SESSION_HOST_EXIT_NOT_ENABLED, SESSION_HOST_EXIT_ROLE_TAKEN,
+    SESSION_HOST_EXIT_NOT_ENABLED, SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
 };
 
 use crate::host_process::HostProcess;
@@ -118,10 +118,15 @@ enum Ended {
 /// What an exit code the supervisor did not cause means.
 const fn ended_by(code: Option<u32>) -> Ended {
     match code {
+        // A host that left for its installer is parked as a refusal is
+        // (ADR 0169 §8): the installer stops this service and starts the new
+        // one, and a host from the old binary in between would only be closed
+        // by it.
         Some(
             SESSION_HOST_EXIT_NOT_ENABLED
             | SESSION_HOST_EXIT_NO_STORE
-            | SESSION_HOST_EXIT_ROLE_TAKEN,
+            | SESSION_HOST_EXIT_ROLE_TAKEN
+            | SESSION_HOST_EXIT_UPDATING,
         ) => Ended::Refused,
         Some(SESSION_HOST_EXIT_CLOSED) => Ended::Closed,
         _ => Ended::Crashed,
@@ -187,6 +192,11 @@ mod tests {
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_NO_STORE)), Ended::Refused);
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_ROLE_TAKEN)), Ended::Refused);
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_CLOSED)), Ended::Closed);
+        assert_eq!(
+            ended_by(Some(SESSION_HOST_EXIT_UPDATING)),
+            Ended::Refused,
+            "a host that left for its installer is not started again from the old binary"
+        );
         assert_eq!(ended_by(Some(0)), Ended::Crashed);
         assert_eq!(ended_by(Some(1)), Ended::Crashed);
         assert_eq!(ended_by(None), Ended::Crashed);
@@ -216,6 +226,7 @@ mod tests {
             SESSION_HOST_EXIT_NO_STORE,
             SESSION_HOST_EXIT_ROLE_TAKEN,
             SESSION_HOST_EXIT_CLOSED,
+            SESSION_HOST_EXIT_UPDATING,
         ] {
             assert!(!logon.contains(&code), "{code} is the logon host's too");
             assert!(code > 1, "{code} collides with an ordinary failure");

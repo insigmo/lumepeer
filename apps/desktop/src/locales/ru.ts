@@ -136,6 +136,9 @@ export const ru: Dictionary = {
     'Только спрашивает, есть ли новый выпуск. Ничего не скачивается и не устанавливается, пока вы не нажмёте «Установить».',
   'system.installNote': 'Установка может закрыть Lumepeer и завершить текущие сессии.',
   'system.updateOff': 'В этой сборке не настроен канал обновлений.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Это обновление устанавливает служба Lumepeer. На это время Lumepeer закроется и откроется снова.',
+  'system.installingByService': 'Служба Lumepeer устанавливает обновление. Lumepeer закроется и откроется снова.',
   'status.clipboardSynced': 'Буфер обмена синхронизирован',
   'status.reconnect': 'Подключиться снова',
   'status.reconnectTerminal': 'Подключиться к терминалу',

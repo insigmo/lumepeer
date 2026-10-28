@@ -4280,6 +4280,21 @@ pub struct UpdateDto {
     pub current: String,
     /// Release notes as the manifest carries them, or empty.
     pub notes: String,
+    /// Whether the Lumepeer service installs it rather than this window
+    /// (ADR 0169 §8).
+    pub by_service: bool,
+}
+
+/// Where the session host's updates stand, when there is a session host and
+/// it installs updates; `None` sends the window down its own path, as before
+/// ADR 0169 §8.
+async fn host_updates(state: &AppState) -> Option<crate::host_panel::HostUpdate> {
+    let panel = session_host(state)?;
+    let snapshot = tauri::async_runtime::spawn_blocking(move || panel.snapshot())
+        .await
+        .ok()
+        .flatten()?;
+    (snapshot.update != crate::host_panel::HostUpdate::Off).then_some(snapshot.update)
 }
 
 /// Turns an updater failure into an IPC error without leaking a URL.
@@ -4360,6 +4375,38 @@ pub async fn update_check(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<UpdateDto>, IpcError> {
     check_window(&window)?;
+    // The session host installs this machine's updates: what it found is
+    // what this window shows (ADR 0169 §8).
+    let by_service = match host_updates(&state).await {
+        Some(update) => {
+            use crate::host_panel::HostUpdate;
+
+            let current = app.package_info().version.to_string();
+            match update {
+                HostUpdate::Available { version, notes } => {
+                    return Ok(Some(UpdateDto {
+                        version,
+                        current,
+                        notes,
+                        by_service: true,
+                    }));
+                }
+                HostUpdate::Downloading { version } | HostUpdate::Installing { version } => {
+                    return Ok(Some(UpdateDto {
+                        version,
+                        current,
+                        notes: String::new(),
+                        by_service: true,
+                    }));
+                }
+                HostUpdate::Current => return Ok(None),
+                // Not asked yet: this window asks the channel itself, which
+                // only reads; installing is still the host's.
+                HostUpdate::Unknown | HostUpdate::Off => true,
+            }
+        }
+        None => false,
+    };
     let updater = updater(&app, &state)?;
     let found = updater
         .check()
@@ -4369,6 +4416,7 @@ pub async fn update_check(
         version: update.version.clone(),
         current: update.current_version.clone(),
         notes: update.body.clone().unwrap_or_default(),
+        by_service,
     }))
 }
 
@@ -4400,6 +4448,18 @@ pub async fn update_install(
             announce_restart_blocking(&state.network);
         }
         std::process::exit(0);
+    }
+    // The session host installs this machine's updates (ADR 0169 §8): this
+    // window only asks it to, and names nothing. Its own installer is never
+    // run while the host does that.
+    if host_updates(&state).await.is_some()
+        && let Some(panel) = session_host(&state)
+    {
+        tracing::info!("asking the Lumepeer service to install the update");
+        return tauri::async_runtime::spawn_blocking(move || panel.install_update())
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
     }
     let updater = updater(&app, &state)?;
     let Some(update) = updater

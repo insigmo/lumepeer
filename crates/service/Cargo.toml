@@ -47,6 +47,9 @@ windows = { version = "0.62.2", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Services",
     "Win32_System_StationsAndDesktops",
+    # `GetTickCount`, against which `console_idle` reads the last input time
+    # (ADR 0169 §8). Already on in the media crate's `windows`.
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",

@@ -136,6 +136,9 @@ export const uk: Dictionary = {
     'Лише запитує, чи є новіший випуск. Нічого не завантажується й не встановлюється, доки ви не натиснете «Встановити».',
   'system.installNote': 'Встановлення може закрити Lumepeer і завершити поточні сесії.',
   'system.updateOff': 'У цій збірці не налаштовано канал оновлень.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Це оновлення встановлює служба Lumepeer. На цей час Lumepeer закриється і відкриється знову.',
+  'system.installingByService': 'Служба Lumepeer встановлює оновлення. Lumepeer закриється і відкриється знову.',
   'status.clipboardSynced': 'Буфер обміну синхронізовано',
   'status.reconnect': 'Підключитися знову',
   'status.reconnectTerminal': 'Підключитися до термінала',

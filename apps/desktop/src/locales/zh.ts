@@ -134,6 +134,9 @@ export const zh: Dictionary = {
     '只询问是否有更新的版本。在你点击“安装”之前，不会下载或安装任何内容。',
   'system.installNote': '安装可能会关闭 Lumepeer 并结束正在进行的会话。',
   'system.updateOff': '此版本未配置更新渠道。',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': '此更新由 Lumepeer 服务安装。安装期间 Lumepeer 会关闭，然后重新打开。',
+  'system.installingByService': 'Lumepeer 服务正在安装更新。Lumepeer 将关闭并重新打开。',
   'status.clipboardSynced': '剪贴板已同步',
   'status.reconnect': '重新连接',
   'status.reconnectTerminal': '连接到终端',

@@ -26,6 +26,10 @@ pub mod agent_protocol;
 pub mod client;
 #[cfg(target_os = "windows")]
 pub mod client_launch;
+// How long the console has been left alone: when the session host may
+// install an update nobody asked for (ADR 0169 §8).
+#[cfg(target_os = "windows")]
+pub mod console_idle;
 #[cfg(target_os = "windows")]
 pub mod desktop_input_channel;
 #[cfg(target_os = "windows")]
@@ -202,3 +206,12 @@ pub const SESSION_HOST_EXIT_ROLE_TAKEN: u32 = 8;
 /// closes the endpoint, because a process that never bound one is the only
 /// kind sure to answer nothing.
 pub const SESSION_HOST_EXIT_CLOSED: u32 = 9;
+
+/// Exit code of a session host that started the installer of an update and
+/// left for it (ADR 0169 §8).
+///
+/// Waited out like a refusal, not restarted at once: the installer stops this
+/// service within seconds, replaces both binaries and starts the service
+/// again, and a session host started from the old binary in between would
+/// only be closed by it.
+pub const SESSION_HOST_EXIT_UPDATING: u32 = 10;

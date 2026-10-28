@@ -136,6 +136,9 @@ export const fr: Dictionary = {
     'Demande seulement si une version plus récente existe. Rien n\'est téléchargé ni installé tant que vous n\'appuyez pas sur Installer.',
   'system.installNote': 'L\'installation peut fermer Lumepeer et mettre fin aux sessions en cours.',
   'system.updateOff': 'Cette version n\'a aucun canal de mise à jour configuré.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Le service Lumepeer installe cette mise à jour. Lumepeer se ferme pendant ce temps puis se rouvre.',
+  'system.installingByService': 'Le service Lumepeer installe la mise à jour. Lumepeer va se fermer puis se rouvrir.',
   'status.clipboardSynced': 'Presse-papiers synchronisé',
   'status.reconnect': 'Se reconnecter',
   'status.reconnectTerminal': 'Se connecter au terminal',

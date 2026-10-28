@@ -136,6 +136,9 @@ export const it: Dictionary = {
     'Chiede solo se esiste una versione più recente. Nulla viene scaricato o installato finché non premi Installa.',
   'system.installNote': 'L\'installazione può chiudere Lumepeer e terminare le sessioni in corso.',
   'system.updateOff': 'Questa build non ha un canale di aggiornamento configurato.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Il servizio Lumepeer installa questo aggiornamento. Lumepeer si chiude nel frattempo e si riapre.',
+  'system.installingByService': 'Il servizio Lumepeer sta installando l\'aggiornamento. Lumepeer si chiuderà e si riaprirà.',
   'status.clipboardSynced': 'Appunti sincronizzati',
   'status.reconnect': 'Connetti di nuovo',
   'status.reconnectTerminal': 'Connetti al terminale',

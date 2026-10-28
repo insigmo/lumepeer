@@ -160,6 +160,25 @@ describe('system settings', () => {
     expect(container.querySelector('[data-testid="update-installed"]')).not.toBeNull();
   });
 
+  // ADR 0169 §8: when the Lumepeer service installs updates, the window says
+  // so — before the press and after it — instead of "restart to run it".
+  it('says the service installs an update it found', async () => {
+    checkMock.mockResolvedValue({ ...update, by_service: true });
+    mount();
+    await settle();
+    (container.querySelector('[data-testid="update-check"]') as HTMLButtonElement).click();
+    await settle();
+    expect(container.textContent).toContain(t('en', 'system.installNoteService'));
+    expect(container.textContent).not.toContain(t('en', 'system.installNote'));
+
+    (container.querySelector('[data-testid="update-install"]') as HTMLButtonElement).click();
+    await settle();
+    expect(installMock).toHaveBeenCalledTimes(1);
+    expect(container.querySelector('[data-testid="update-installed"]')?.textContent).toBe(
+      t('en', 'system.installingByService'),
+    );
+  });
+
   // The Ctrl+Alt+Del helper is registered at start-up and removed by the
   // uninstaller (`service_control.rs::ensure_installed`). It is not a
   // permission and it admits nobody, so this panel offers nothing about it.
