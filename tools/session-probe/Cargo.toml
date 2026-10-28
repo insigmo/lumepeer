@@ -1,0 +1,53 @@
+[package]
+name = "session-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Throwaway pack-01 probe (docs/unelevated-client/01-system-in-session-probe.md): measures what a LocalSystem process launched into the console session on WinSta0\\Default can do, for ADR 0169. Not part of the lumepeer workspace or any release build."
+
+# Standalone on purpose, exactly like tools/codec-bench: a measurement tool,
+# not a workspace member, its own lockfile, never in a release build or
+# `cargo test --workspace`.
+[workspace]
+
+[dependencies]
+# The product's own capture/audio backends, so 2.2 (DXGI) and 2.3 (WASAPI
+# loopback) measure exactly what the session host would use — a failure then
+# means "LocalSystem on Default cannot capture", not "the probe is buggy".
+lumepeer-media = { path = "../../crates/media", features = [
+    "capture-windows",
+    "audio-capture",
+] }
+tracing = "0.1"
+# One-shot PNG writer for the 2.2 proof frame.
+png = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+# Embeds an application manifest with the Common-Controls v6 dependency so
+# TaskDialogIndirect (2.5) resolves at load, and suppresses rustc's default
+# manifest so the two do not collide in mt.exe. Pure std, no network at build.
+embed-manifest = "1.4"
+
+[profile.release]
+debug = 1
