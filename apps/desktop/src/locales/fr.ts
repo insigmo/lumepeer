@@ -27,6 +27,8 @@ export const fr: Dictionary = {
   'invite.denied': "L'autre appareil a refusé la demande.",
   'invite.failed': "La connexion s'est terminée avant d'être acceptée.",
   'invite.sessionNotResumed': "La session n'a pas pu être reprise. Connectez-vous à nouveau pour en demander une nouvelle.",
+  'invite.newGuestKey':
+    "Cet ordinateur a une nouvelle clé d'invité, cet appareil ne le reconnaît donc plus. Dès que quelqu'un sur place vous laisse entrer et enregistre cet appareil, le mot de passe mémorisé vous connecte de nouveau tout seul.",
   'invite.unreachable':
     "Impossible de joindre cet appareil. Il est peut-être hors ligne, ou son code d'invitation n'est plus à jour — demandez-en un nouveau.",
   'invite.badTicket': "Ce code d'invitation n'est pas valide ou a expiré.",

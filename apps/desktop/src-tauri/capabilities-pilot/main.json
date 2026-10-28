@@ -48,6 +48,7 @@
     "allow-history-connect",
     "allow-history-remove",
     "allow-history-forget-password",
+    "allow-guest-key-hint",
     "allow-history-set-trusted",
     "allow-history-probe",
     "allow-reboot-pending",

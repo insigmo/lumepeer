@@ -7,7 +7,13 @@
 //! ([`crate::system_host`]), with the stores of the person signed in — the
 //! directory under `%ProgramData%\Lumepeer\users\<SID>` their elevated client
 //! fills (ADR 0123) — so the identity every guest saved is the one it serves,
-//! and nothing moves.
+//! and none of the host's stores moves.
+//!
+//! The guest's stores in that directory — the hosts the person remembered and
+//! the passwords remembered for them — are not this host's: it never dials
+//! out. It hosts without them ([`crate::placement::for_session_host`]) and
+//! hands them to the person's client once, over the channel, deleting its
+//! copy when the client says it has kept them (ADR 0169 §3).
 //!
 //! What its position buys, measured before any of this was written
 //! (`docs/research/session-host-probe.md`): DXGI capture of the desktop and
@@ -95,9 +101,9 @@ fn host() -> u32 {
         tracing::warn!("cannot tell who is signed in to this session; not hosting");
         return EXIT_FAILED;
     };
-    let (Some(directory), Some(placement)) = (
+    let (Some(directory), Some((placement, guest_stores))) = (
         lumepeer_service::program_data::user_directory(&sid),
-        crate::placement::for_system_host(&sid),
+        crate::placement::for_session_host(&sid),
     ) else {
         tracing::warn!("the signed-in person has no store this host can open");
         return SESSION_HOST_EXIT_NO_STORE;
@@ -120,6 +126,7 @@ fn host() -> u32 {
         return EXIT_FAILED;
     };
     let served = Served::new(runtime.handle().clone());
+    served.keeps_guest_stores(guest_stores);
     if let Some(channel) = lumepeer_service::host_channel::HostChannel::new(&sid) {
         crate::host_panel::serve(channel, &served);
     } else {

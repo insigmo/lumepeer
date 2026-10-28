@@ -29,6 +29,8 @@ export const en: Dictionary = {
   'invite.denied': 'The other device declined the request.',
   'invite.failed': 'The connection ended before it was accepted.',
   'invite.sessionNotResumed': 'The session could not be resumed. Connect again to ask for a new one.',
+  'invite.newGuestKey':
+    'This computer got a new guest key, so that device no longer recognises it. Once someone there lets you in and saves this device, the remembered password signs you in by itself again.',
   'invite.unreachable':
     'Could not reach that device. It may be offline, or its invite code may be out of date — ask for a fresh one.',
   'invite.badTicket': 'That invite code is not valid, or it has expired.',

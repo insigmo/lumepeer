@@ -374,6 +374,41 @@ impl ConnectionHistory {
         removed
     }
 
+    /// Takes in rows this list was kept in somewhere else — the admin tree a
+    /// Windows session host serves from, before the client kept its guest
+    /// stores in the profile (ADR 0169 §3) — and persists the list.
+    ///
+    /// A host already listed here keeps its own row: it is the one this
+    /// client has been using, trust flag and all. The rest join it in order
+    /// of when they were last seen, newest first, within the list's bound.
+    ///
+    /// Returns whether the list is on disk with them: `false` with no path to
+    /// keep it at, or for a write that did not land. The caller must then not
+    /// let the other copy go.
+    pub fn adopt(&mut self, rows: Vec<HistoryEntry>) -> bool {
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        let before = self.entries.len();
+        for row in rows {
+            if !self
+                .entries
+                .iter()
+                .any(|entry| entry.peer_label == row.peer_label)
+            {
+                self.entries.push(row);
+            }
+        }
+        if self.entries.len() == before {
+            return true;
+        }
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.last_seen_at));
+        self.entries.truncate(MAX_ENTRIES);
+        self.save();
+        Self::load(&path).len() == self.entries.len()
+    }
+
     /// Best-effort: a write failure here must never take the session down
     /// with it, only leave the sidebar's history stale until the next
     /// successful save.
@@ -914,6 +949,59 @@ mod tests {
         let reopened = ConnectionHistory::open(Some(path));
         assert_eq!(reopened.entries()[0].device.as_ref(), Some(&beta));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// ADR 0169 §3: rows kept elsewhere join the list newest first, a host
+    /// already listed keeps its own row, and the result is on disk — with no
+    /// path to keep it at, nothing is said to be kept.
+    #[test]
+    fn adopted_rows_join_the_list_and_never_replace_a_row_here() {
+        let dir =
+            std::env::temp_dir().join(format!("lumepeer-history-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("connection_history.json");
+        let row = |label: &str, code: &str, last_seen_at: u64, trusted: bool| HistoryEntry {
+            peer_label: label.to_owned(),
+            role: Role::ViewOnly,
+            last_seen_at,
+            code: code.to_owned(),
+            transport: None,
+            addrs: Vec::new(),
+            has_password: false,
+            online: None,
+            trusted,
+            device: None,
+        };
+
+        let mut history = ConnectionHistory::open(Some(path.clone()));
+        history.record(
+            "host-here".to_owned(),
+            Role::FullControl,
+            "code-here".to_owned(),
+            None,
+            Vec::new(),
+        );
+        assert!(history.adopt(vec![
+            row("host-old", "code-old", 10, true),
+            row("host-here", "code-elsewhere", u64::MAX, false),
+            row("host-older", "code-older", 5, false),
+        ]));
+
+        let reopened = ConnectionHistory::open(Some(path));
+        let labels: Vec<&str> = reopened
+            .entries()
+            .iter()
+            .map(|entry| entry.peer_label.as_str())
+            .collect();
+        assert_eq!(labels, ["host-here", "host-old", "host-older"]);
+        assert_eq!(reopened.code_of("host-here"), Some("code-here"));
+        assert!(
+            reopened.is_trusted("host-old"),
+            "the user's decision travels"
+        );
+
+        assert!(!ConnectionHistory::open(None).adopt(vec![row("h", "c", 1, false)]));
         let _ = fs::remove_dir_all(dir);
     }
 }

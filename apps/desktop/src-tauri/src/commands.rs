@@ -1221,6 +1221,31 @@ pub async fn history_forget_password(
     Ok(())
 }
 
+/// Argument of [`guest_key_hint`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuestKeyHintArgs {
+    /// Label of the remembered host, as `connection_history` handed it out.
+    pub peer: String,
+}
+
+/// Whether to tell the person why the remembered host `peer` asked its own
+/// person, or turned this computer away, instead of taking the remembered
+/// password: this computer has a new guest key since that host last saw it
+/// (ADR 0169 §3). `true` once per host that knew the old key, never again.
+///
+/// # Errors
+/// Rejects calls from other windows. An unknown label is `false`.
+#[tauri::command]
+pub fn guest_key_hint(
+    window: Window,
+    app: tauri::AppHandle,
+    args: GuestKeyHintArgs,
+) -> Result<bool, IpcError> {
+    check_window(&window)?;
+    Ok(crate::bootstrap::guest_key_hint_path(&app)
+        .is_some_and(|path| crate::placement::take_guest_key_hint(&path, &args.peer)))
+}
+
 /// Argument of [`history_set_trusted`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistorySetTrustedArgs {

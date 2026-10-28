@@ -468,3 +468,52 @@ describe('remembered hosts', () => {
     view.setConnectPhase('connected');
   });
 });
+
+// ADR 0169 §3, pack 07: a remembered host that no longer takes the remembered
+// password because this computer has a new guest key gets one line saying so.
+describe('a new guest key', () => {
+  function hint(): Element | null {
+    return container.querySelector('[data-testid="guest-key-hint"]');
+  }
+
+  it('is explained when a remembered host asks its person instead', async () => {
+    invoke.mockImplementation(async (command: string) => command === 'guest_key_hint');
+    const view = await load();
+    await view.reconnect('host-ab12');
+    view.setConnectPhase('awaiting_consent');
+    await settle();
+    expect(invoke).toHaveBeenCalledWith('guest_key_hint', { args: { peer: 'host-ab12' } });
+    render(view.connectPanel('en'), container);
+    expect(hint()?.textContent).toContain('new guest key');
+    view.setConnectPhase('connected');
+  });
+
+  it('is asked about once per attempt, and only for a remembered host', async () => {
+    const view = await load();
+    render(view.connectPanel('en'), container);
+    submit('lumepeer1:code');
+    await settle();
+    view.setConnectPhase('awaiting_consent');
+    await settle();
+    expect(invoke).not.toHaveBeenCalledWith('guest_key_hint', expect.anything());
+
+    view.setConnectPhase('idle');
+    await view.reconnect('host-ab12');
+    view.setConnectPhase('failed', 'REJECTED');
+    view.setConnectPhase('denied');
+    await settle();
+    const asks = invoke.mock.calls.filter(([command]) => command === 'guest_key_hint');
+    expect(asks).toHaveLength(1);
+    render(view.connectPanel('en'), container);
+    expect(hint()).toBeNull();
+  });
+
+  it('is not asked about when the host took the password as before', async () => {
+    const view = await load();
+    await view.reconnect('host-ab12');
+    view.setConnectPhase('awaiting_credentials', null, false, null, true);
+    view.setConnectPhase('connected');
+    await settle();
+    expect(invoke).not.toHaveBeenCalledWith('guest_key_hint', expect.anything());
+  });
+});

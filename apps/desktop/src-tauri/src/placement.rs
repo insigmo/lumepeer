@@ -18,6 +18,19 @@
 //! access off and no device trusted, rather than on stores anybody could have
 //! written.
 //!
+//! Where ADR 0169 is on for the machine, that directory is the session host's:
+//! a `LocalSystem` process hosts this machine with it, identity included, and
+//! this application — elevated or not — is only a guest and the host's panel.
+//! So it keeps the guest's stores and nothing else ([`session_host_guest`]):
+//! a guest identity of its own, the remembered-hosts list and the passwords
+//! remembered for those hosts, all in the profile, and no device password,
+//! trusted devices, invite or audit log at all. Its own identity because two
+//! endpoints with one key fight over the relay and the DHT record; in the
+//! profile because a guest decodes what remote hosts send, which belongs at
+//! the person's level (ADR 0169 §3). The remembered hosts and their passwords
+//! that the admin directory still holds come across once, through the session
+//! host's channel ([`guest_stores`]); the host's half never moves.
+//!
 //! Everything else — an unelevated development run, `LUMEPEER_KEYSTORE=file`
 //! for the headless end-to-end rigs, Linux and macOS — keeps the profile, as
 //! before: there is no account boundary below this process to put anything
@@ -66,6 +79,13 @@ pub struct Profile {
     pub history: Option<PathBuf>,
     /// `%LOCALAPPDATA%\…\audit.db`.
     pub audit: Option<PathBuf>,
+    /// `%LOCALAPPDATA%\…\guest-key-renewed.json`: the hosts that knew this
+    /// computer as a guest by a key it no longer has (ADR 0169 §3).
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(dead_code, reason = "only the Windows guest layout writes it")
+    )]
+    pub guest_key_hint: Option<PathBuf>,
 }
 
 /// Chooses where this run keeps its stores; `open_profile_keystore` opens the
@@ -77,23 +97,28 @@ pub fn choose(
     profile: Profile,
     open_profile_keystore: &dyn Fn() -> Result<Box<dyn Keystore>, NetError>,
 ) -> Result<Placement, NetError> {
+    // Where ADR 0169 is on, the service's session host hosts with this
+    // account's protected stores, identity included, and this window is its
+    // guest, elevated or not: the guest's stores only, in the profile.
+    #[cfg(target_os = "windows")]
+    if session_host_guest() {
+        tracing::info!(
+            "the Lumepeer service hosts this machine with this account's stores; this window \
+             is its guest, with a guest identity and guest stores of its own (ADR 0169 §3)"
+        );
+        let placement = guest_only(&profile, open_profile_keystore)?;
+        let panel = crate::host_panel::HostPanel::for_this_user();
+        guest_stores::settle(
+            &placement,
+            profile.guest_key_hint.as_deref(),
+            &mut |request| panel.as_ref()?.request(request),
+        );
+        return Ok(placement);
+    }
     #[cfg(target_os = "windows")]
     if std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file")
         && let Some((sid, true)) = lumepeer_service::program_data::this_process()
     {
-        // Where ADR 0169 is on, the service's session host hosts with this
-        // account's protected stores, identity included, and this window is
-        // its guest. Two endpoints with one key fight over the relay and the
-        // DHT record (ADR 0169 §3), so this one keeps an identity of its own
-        // in the profile and writes no policy — the stores an unelevated run
-        // keeps. Moving the remembered hosts across is pack 07's.
-        if lumepeer_service::program_data::session_host_enabled() {
-            tracing::info!(
-                "the Lumepeer service hosts with this account's stores; this window keeps a \
-                 guest identity of its own in the profile (ADR 0169)"
-            );
-            return without_policy(profile, open_profile_keystore);
-        }
         if let Some(placement) = protected::open(&sid, &profile, open_profile_keystore) {
             tracing::info!(
                 directory = ?placement.invite_dir,
@@ -187,6 +212,442 @@ pub fn protected_account() -> Option<String> {
 #[cfg(target_os = "windows")]
 pub fn for_system_host(sid: &str) -> Option<Placement> {
     protected::existing(sid)
+}
+
+/// Whether this run is the session host's guest and panel rather than a host
+/// (ADR 0169 §2, §3): ADR 0169 is turned on for this machine, and this is not
+/// an end-to-end rig on the file keystore, which keeps hosting in process.
+///
+/// Elevated or not: either way the session host is this machine's host, and
+/// this window keeps the guest's stores only ([`choose`]).
+#[cfg(target_os = "windows")]
+pub fn session_host_guest() -> bool {
+    std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file")
+        && lumepeer_service::program_data::session_host_enabled()
+}
+
+/// The stores of a run that is only ever a guest (ADR 0169 §3): its own guest
+/// identity, the remembered hosts and their passwords, all in the profile —
+/// and none of a host's.
+#[cfg(target_os = "windows")]
+fn guest_only(
+    profile: &Profile,
+    open_profile_keystore: &dyn Fn() -> Result<Box<dyn Keystore>, NetError>,
+) -> Result<Placement, NetError> {
+    Ok(Placement {
+        keystore: Box::new(GuestIdentity(open_profile_keystore()?)),
+        remembered: open_profile_keystore()?,
+        address_book: None,
+        invite_dir: None,
+        history: profile.history.clone(),
+        audit: None,
+    })
+}
+
+/// The stores of the account `sid` for the session host (ADR 0169 §1, §3):
+/// its own as a host — identity, device password, trusted devices, invite,
+/// audit — and no guest's; then, apart, the guest stores still in that
+/// directory, to hand to the person's client once.
+///
+/// A session host never dials out, so it has no use for remembered hosts, and
+/// an actor holding them would write the list back after the client has
+/// taken it: its saved-host lookups rewrite it. `None` when the directory
+/// cannot be opened.
+#[cfg(target_os = "windows")]
+pub fn for_session_host(sid: &str) -> Option<(Placement, guest_stores::InAdminTree)> {
+    let Placement {
+        keystore,
+        remembered,
+        address_book,
+        invite_dir,
+        history,
+        audit,
+    } = protected::existing(sid)?;
+    let host = Placement {
+        keystore,
+        remembered: Box::new(lumepeer_net::keystore::MemoryKeystore::new()),
+        address_book,
+        invite_dir,
+        history: None,
+        audit,
+    };
+    Some((host, guest_stores::InAdminTree::new(history, remembered)))
+}
+
+/// Keystore entry of a guest-only run's endpoint identity (ADR 0169 §3).
+#[cfg(any(target_os = "windows", test))]
+const GUEST_IDENTITY_ENTRY: &str = "lumepeer.guest.identity";
+
+/// The profile keystore of a run that is only ever a guest (ADR 0169 §3).
+///
+/// Its endpoint identity is kept under an entry of its own, which no host
+/// identity has ever been written to, and the unattended credentials are not
+/// there at all — read as absent, refused on write, as [`WithoutPolicy`].
+///
+/// The separate entry is what makes "never the host's key" hold whatever the
+/// profile still has: a copy of the identity the admin directory keeps — an
+/// ADR 0123 move whose delete did not land — or one a build from before it
+/// minted. The host's key in a second endpoint would fight the session host
+/// for the relay and the DHT record. So the first start of this layout mints
+/// a key of its own, once.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug)]
+struct GuestIdentity(Box<dyn Keystore>);
+
+#[cfg(any(target_os = "windows", test))]
+impl GuestIdentity {
+    /// The entry `entry` is kept under here.
+    fn slot(entry: &str) -> &str {
+        if entry == lumepeer_net::keystore::IDENTITY_ENTRY {
+            GUEST_IDENTITY_ENTRY
+        } else {
+            entry
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl Keystore for GuestIdentity {
+    fn load_secret(&self, entry: &str) -> lumepeer_net::error::Result<Option<Vec<u8>>> {
+        if WithoutPolicy::is_policy(entry) {
+            return Ok(None);
+        }
+        self.0.load_secret(Self::slot(entry))
+    }
+
+    fn store_secret(&self, entry: &str, bytes: &[u8]) -> lumepeer_net::error::Result<()> {
+        if WithoutPolicy::is_policy(entry) {
+            return Err(NetError::Keystore(
+                "a guest of the session host keeps no device password".to_owned(),
+            ));
+        }
+        self.0.store_secret(Self::slot(entry), bytes)
+    }
+
+    fn delete_secret(&self, entry: &str) -> lumepeer_net::error::Result<()> {
+        if WithoutPolicy::is_policy(entry) {
+            return Ok(());
+        }
+        self.0.delete_secret(Self::slot(entry))
+    }
+}
+
+/// Name of the file, beside the remembered-hosts list, that lists the hosts
+/// which knew this computer as a guest by a key it no longer has.
+pub const GUEST_KEY_HINT_FILE: &str = "guest-key-renewed.json";
+
+/// Whether to tell the person that the remembered host `host` did not let
+/// this computer in by itself because this computer has a new guest key
+/// (ADR 0169 §3): `true` once for each host that knew the old key, and never
+/// again for it. `path` is [`Profile::guest_key_hint`].
+pub fn take_guest_key_hint(path: &std::path::Path, host: &str) -> bool {
+    let mut noted = read_guest_key_hint(path);
+    let before = noted.len();
+    noted.retain(|noted| noted != host);
+    if noted.len() == before {
+        return false;
+    }
+    write_guest_key_hint(path, &noted);
+    true
+}
+
+/// Adds `hosts` to the ones [`take_guest_key_hint`] answers for.
+#[cfg(any(target_os = "windows", test))]
+fn note_new_guest_key(path: &std::path::Path, hosts: Vec<String>) {
+    if hosts.is_empty() {
+        return;
+    }
+    let mut noted = read_guest_key_hint(path);
+    for host in hosts {
+        if !noted.contains(&host) {
+            noted.push(host);
+        }
+    }
+    write_guest_key_hint(path, &noted);
+}
+
+/// The hosts noted at `path`; none for a file that is missing or unreadable —
+/// a hint not shown costs a sentence, nothing more.
+fn read_guest_key_hint(path: &std::path::Path) -> Vec<String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Writes `noted` to `path`, or removes the file once nothing is left in it.
+fn write_guest_key_hint(path: &std::path::Path, noted: &[String]) {
+    let written = if noted.is_empty() {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    } else {
+        path.parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, serde_json::to_vec(noted).unwrap_or_default()))
+    };
+    if let Err(error) = written {
+        tracing::warn!(path = %path.display(), %error, "cannot keep the new-guest-key hint");
+    }
+}
+
+/// The one-time move of the person's guest stores out of the admin directory
+/// to their client, through the session host's channel (ADR 0169 §3) — both
+/// ends of it.
+///
+/// The session host reads them out in one reply ([`InAdminTree::collect`]);
+/// the client keeps them in the profile ([`take`]) and only then confirms;
+/// the session host deletes them on that confirmation
+/// ([`InAdminTree::remove`]). Whatever fails half-way leaves the admin copy in
+/// place, and the next attach hands it over again: a host or password already
+/// kept here wins over the copy, so a second pass changes nothing that the
+/// first one kept.
+#[cfg(any(target_os = "windows", test))]
+pub mod guest_stores {
+    use std::path::{Path, PathBuf};
+
+    use lumepeer_net::keystore::{IDENTITY_ENTRY, Keystore};
+    use lumepeer_runtime::connection_history::{ConnectionHistory, HistoryEntry};
+    use lumepeer_runtime::remembered_password::{RememberedPasswordStore, entry_name};
+    use lumepeer_service::host_channel_protocol::{Reply, Request};
+    use serde::{Deserialize, Serialize};
+
+    use super::Placement;
+
+    /// What the session host hands over, as JSON on the channel.
+    #[derive(Default, Serialize, Deserialize)]
+    pub struct GuestStores {
+        /// The remembered hosts, as the admin directory's list holds them.
+        pub hosts: Vec<HistoryEntry>,
+        /// The passwords remembered for those hosts.
+        pub passwords: Vec<RememberedPassword>,
+    }
+
+    impl std::fmt::Debug for GuestStores {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("GuestStores")
+                .field("hosts", &self.hosts.len())
+                .field("passwords", &self.passwords.len())
+                .finish()
+        }
+    }
+
+    /// One remembered password and the host it is for.
+    #[derive(Serialize, Deserialize)]
+    pub struct RememberedPassword {
+        /// The host's history label.
+        pub host: String,
+        /// The device password remembered for it.
+        pub password: String,
+    }
+
+    impl std::fmt::Debug for RememberedPassword {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RememberedPassword")
+                .field("host", &self.host)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// The guest stores still in one account's admin directory, as the
+    /// session host reaches them.
+    #[derive(Debug)]
+    pub struct InAdminTree {
+        history: Option<PathBuf>,
+        passwords: RememberedPasswordStore,
+    }
+
+    impl InAdminTree {
+        /// The list at `history` and the passwords in `keystore`.
+        #[must_use]
+        pub fn new(history: Option<PathBuf>, keystore: Box<dyn Keystore>) -> Self {
+            Self {
+                history,
+                passwords: RememberedPasswordStore::new(keystore),
+            }
+        }
+
+        /// Everything to hand over; `None` when a remembered password cannot
+        /// be read, because handing over the rest and then deleting all of it
+        /// would lose that one.
+        #[must_use]
+        pub fn collect(&self) -> Option<GuestStores> {
+            let history = ConnectionHistory::open(self.history.clone());
+            let mut passwords = Vec::new();
+            for entry in history.entries() {
+                match self.passwords.load(&entry.peer_label) {
+                    Ok(Some(password)) => passwords.push(RememberedPassword {
+                        host: entry.peer_label.clone(),
+                        password,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot read a remembered password to hand over");
+                        return None;
+                    }
+                }
+            }
+            Some(GuestStores {
+                hosts: history.entries().to_vec(),
+                passwords,
+            })
+        }
+
+        /// Takes the guest stores out of the admin directory; whether all of
+        /// them went. The passwords first and the list last: the list is what
+        /// names the passwords, so a delete that stops half-way is finished
+        /// by the next hand-over.
+        #[must_use]
+        pub fn remove(&self) -> bool {
+            let history = ConnectionHistory::open(self.history.clone());
+            for entry in history.entries() {
+                if let Err(error) = self.passwords.forget(&entry.peer_label) {
+                    tracing::warn!(%error, "cannot delete a remembered password the client took");
+                    return false;
+                }
+            }
+            let Some(path) = &self.history else {
+                return true;
+            };
+            match std::fs::remove_file(path) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot delete the remembered-hosts list the client took");
+                    false
+                }
+            }
+        }
+    }
+
+    /// Everything a guest-only start settles before its actor reads its
+    /// stores: the guest stores the admin directory still holds taken across
+    /// ([`take`]), and the hosts that knew this computer by another key noted
+    /// for the hint (`hint`, [`super::take_guest_key_hint`]).
+    ///
+    /// `ask` puts one request to the session host; `None` is no answer.
+    pub fn settle(
+        placement: &Placement,
+        hint: Option<&Path>,
+        ask: &mut dyn FnMut(&Request) -> Option<Reply>,
+    ) {
+        // Read before the actor mints it: a first start of this layout.
+        let minting = matches!(placement.keystore.load_secret(IDENTITY_ENTRY), Ok(None));
+        let moved = take(placement, ask);
+        // A new key is new to every host this computer reached with a
+        // password; afterwards, only the hosts whose password just came
+        // across had known this computer by the other key.
+        let renewed = if minting {
+            hosts_with_passwords(placement)
+        } else {
+            moved
+        };
+        if minting {
+            tracing::info!(
+                hosts = renewed.len(),
+                "this computer gets a guest identity of its own; hosts that trusted it as a \
+                 guest see a new key once (ADR 0169 §3)"
+            );
+        }
+        if let Some(hint) = hint {
+            super::note_new_guest_key(hint, renewed);
+        }
+    }
+
+    /// Asks the session host for the guest stores it still keeps, keeps them
+    /// in `placement`'s profile stores, and has it let them go; the hosts
+    /// whose remembered password is now kept here.
+    ///
+    /// Nothing is confirmed unless all of it is kept here, because what is
+    /// confirmed is deleted over there. Nothing here stops the start: a
+    /// session host that does not answer is asked again at the next one.
+    pub fn take(
+        placement: &Placement,
+        ask: &mut dyn FnMut(&Request) -> Option<Reply>,
+    ) -> Vec<String> {
+        let stores = match ask(&Request::GuestStores) {
+            Some(Reply::GuestStores(json)) => match serde_json::from_slice::<GuestStores>(&json) {
+                Ok(stores) => stores,
+                Err(error) => {
+                    tracing::warn!(%error, "the session host's remembered hosts do not parse");
+                    return Vec::new();
+                }
+            },
+            Some(_) => {
+                tracing::warn!(
+                    "the session host would not hand over the remembered hosts; asking again next start"
+                );
+                return Vec::new();
+            }
+            None => {
+                tracing::info!(
+                    "no session host answers yet; its remembered hosts are asked for next start"
+                );
+                return Vec::new();
+            }
+        };
+        if stores.hosts.is_empty() && stores.passwords.is_empty() {
+            return Vec::new();
+        }
+        let mut moved = Vec::new();
+        for RememberedPassword { host, password } in &stores.passwords {
+            let entry = entry_name(host);
+            // One remembered here already is the one typed here last: kept.
+            let kept = match placement.remembered.load_secret(&entry) {
+                Ok(Some(_)) => true,
+                Ok(None) => placement
+                    .remembered
+                    .store_secret(&entry, password.as_bytes())
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !kept {
+                tracing::warn!(
+                    "cannot keep a remembered password in the profile; the session host keeps its copy"
+                );
+                return Vec::new();
+            }
+            moved.push(host.clone());
+        }
+        let hosts = stores.hosts.len();
+        if !ConnectionHistory::open(placement.history.clone()).adopt(stores.hosts) {
+            tracing::warn!(
+                "cannot keep the remembered hosts in the profile; the session host keeps its copy"
+            );
+            return Vec::new();
+        }
+        if ask(&Request::GuestStoresTaken) == Some(Reply::Done) {
+            tracing::info!(
+                hosts,
+                passwords = moved.len(),
+                "moved the remembered hosts and their passwords out of the admin directory (ADR 0169 §3)"
+            );
+            moved
+        } else {
+            tracing::warn!(
+                "the session host did not let go of its copy of the remembered hosts; it is handed over again next start"
+            );
+            Vec::new()
+        }
+    }
+
+    /// The remembered hosts with a password kept for them in `placement`.
+    fn hosts_with_passwords(placement: &Placement) -> Vec<String> {
+        ConnectionHistory::open(placement.history.clone())
+            .entries()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    placement
+                        .remembered
+                        .load_secret(&entry_name(&entry.peer_label)),
+                    Ok(Some(_))
+                )
+            })
+            .map(|entry| entry.peer_label.clone())
+            .collect()
+    }
 }
 
 /// A profile keystore with the unattended credentials taken out of it: read
@@ -442,6 +903,7 @@ mod protected {
                 invite_dir: Some(old_dir.clone()),
                 history: Some(old_dir.join("connection_history.json")),
                 audit: Some(old_dir.join("audit.db")),
+                guest_key_hint: None,
             };
             std::fs::write(old_dir.join("address_book.json"), b"{}").unwrap();
             std::fs::write(old_dir.join("invite-0011.json"), b"{}").unwrap();
@@ -901,6 +1363,9 @@ mod tests {
     use lumepeer_net::keystore::{
         AUDIT_SALT_ENTRY, IDENTITY_ENTRY, MemoryKeystore, UNATTENDED_PASSWORD_ENTRY,
     };
+    use lumepeer_runtime::connection_history::ConnectionHistory;
+    use lumepeer_runtime::remembered_password::entry_name;
+    use lumepeer_service::host_channel_protocol::{Reply, Request};
 
     use super::*;
 
@@ -939,7 +1404,9 @@ mod tests {
     #[test]
     fn an_unelevated_or_non_windows_run_keeps_the_profile() {
         #[cfg(target_os = "windows")]
-        if lumepeer_service::program_data::this_process().is_some_and(|(_, elevated)| elevated) {
+        if lumepeer_service::program_data::this_process().is_some_and(|(_, elevated)| elevated)
+            || session_host_guest()
+        {
             return;
         }
         let profile = Profile {
@@ -947,9 +1414,298 @@ mod tests {
             invite_dir: Some(PathBuf::from("dir")),
             history: None,
             audit: None,
+            guest_key_hint: None,
         };
         let placement = choose(profile, &|| Ok(Box::new(MemoryKeystore::new()))).unwrap();
         assert_eq!(placement.address_book, Some(PathBuf::from("book.json")));
         assert_eq!(placement.invite_dir, Some(PathBuf::from("dir")));
+    }
+
+    /// ADR 0169 §3: a guest-only run never reads the host's key, whatever the
+    /// profile still holds, mints one of its own under its own entry, and
+    /// keeps no device password.
+    #[test]
+    fn a_guest_identity_is_never_the_host_identity() {
+        let profile = std::sync::Arc::new(MemoryKeystore::new());
+        profile.store_secret(IDENTITY_ENTRY, &[7; 32]).unwrap();
+        let guest = GuestIdentity(Box::new(Shared(std::sync::Arc::clone(&profile))));
+
+        assert_eq!(guest.load_secret(IDENTITY_ENTRY).unwrap(), None);
+        let key = lumepeer_net::keystore::load_or_create(&guest).unwrap();
+        assert_ne!(key.to_bytes(), [7; 32]);
+        assert_eq!(
+            profile.load_secret(GUEST_IDENTITY_ENTRY).unwrap(),
+            Some(key.to_bytes().to_vec())
+        );
+        assert_eq!(
+            profile.load_secret(IDENTITY_ENTRY).unwrap(),
+            Some(vec![7; 32]),
+            "the other entry is not touched"
+        );
+        assert_eq!(
+            lumepeer_net::keystore::load_or_create(&guest)
+                .unwrap()
+                .to_bytes(),
+            key.to_bytes(),
+            "minted once"
+        );
+
+        profile
+            .store_secret(UNATTENDED_PASSWORD_ENTRY, b"$argon2id$planted")
+            .unwrap();
+        assert_eq!(guest.load_secret(UNATTENDED_PASSWORD_ENTRY).unwrap(), None);
+        assert!(guest.store_secret(UNATTENDED_PASSWORD_ENTRY, b"x").is_err());
+    }
+
+    /// One in-memory keystore behind every handle, the way every handle on
+    /// the Credential Manager or a protected directory sees the same entries.
+    #[derive(Debug, Clone, Default)]
+    struct Shared(std::sync::Arc<MemoryKeystore>);
+
+    impl Keystore for Shared {
+        fn load_secret(&self, entry: &str) -> lumepeer_net::Result<Option<Vec<u8>>> {
+            self.0.load_secret(entry)
+        }
+        fn store_secret(&self, entry: &str, bytes: &[u8]) -> lumepeer_net::Result<()> {
+            self.0.store_secret(entry, bytes)
+        }
+        fn delete_secret(&self, entry: &str) -> lumepeer_net::Result<()> {
+            self.0.delete_secret(entry)
+        }
+    }
+
+    /// A keystore that refuses every write, as a Credential Manager that will
+    /// not take an entry.
+    #[derive(Debug, Default)]
+    struct Unwritable;
+
+    impl Keystore for Unwritable {
+        fn load_secret(&self, _entry: &str) -> lumepeer_net::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn store_secret(&self, _entry: &str, _bytes: &[u8]) -> lumepeer_net::Result<()> {
+            Err(NetError::Keystore("refused".to_owned()))
+        }
+        fn delete_secret(&self, _entry: &str) -> lumepeer_net::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The person's account on both sides of the move: an admin directory as
+    /// the session host keeps it, and a profile as the client does.
+    struct Account {
+        base: PathBuf,
+        admin: Shared,
+        admin_history: PathBuf,
+        profile: Shared,
+    }
+
+    impl Account {
+        fn new(name: &str) -> Self {
+            let base = std::env::temp_dir().join(format!(
+                "lumepeer-guest-stores-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(base.join("admin")).unwrap();
+            std::fs::create_dir_all(base.join("profile")).unwrap();
+            let admin_history = base.join("admin").join("connection_history.json");
+            let mut history = ConnectionHistory::open(Some(admin_history.clone()));
+            for host in ["host-ab12", "host-cd34"] {
+                history.record(
+                    host.to_owned(),
+                    lumepeer_core::consent::Role::FullControl,
+                    format!("code-{host}"),
+                    None,
+                    Vec::new(),
+                );
+            }
+            let admin = Shared::default();
+            admin.store_secret(IDENTITY_ENTRY, &[7; 32]).unwrap();
+            admin
+                .store_secret(UNATTENDED_PASSWORD_ENTRY, b"$argon2id$hash")
+                .unwrap();
+            admin
+                .store_secret(&entry_name("host-ab12"), b"ab12 password")
+                .unwrap();
+            Self {
+                base,
+                admin,
+                admin_history,
+                profile: Shared::default(),
+            }
+        }
+
+        fn in_admin_tree(&self) -> guest_stores::InAdminTree {
+            guest_stores::InAdminTree::new(
+                Some(self.admin_history.clone()),
+                Box::new(self.admin.clone()),
+            )
+        }
+
+        /// The client's guest-only placement, over `remembered`.
+        fn client(&self, remembered: Box<dyn Keystore>, history: bool) -> Placement {
+            Placement {
+                keystore: Box::new(GuestIdentity(Box::new(self.profile.clone()))),
+                remembered,
+                address_book: None,
+                invite_dir: None,
+                history: history.then(|| self.profile_history()),
+                audit: None,
+            }
+        }
+
+        fn profile_history(&self) -> PathBuf {
+            self.base.join("profile").join("connection_history.json")
+        }
+
+        fn hint(&self) -> PathBuf {
+            self.base.join("profile").join(GUEST_KEY_HINT_FILE)
+        }
+    }
+
+    impl Drop for Account {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    /// The session host's side of the channel, as `host_panel::Served`
+    /// answers it: a letting-go is honoured only after a hand-over on the same
+    /// connection.
+    fn session_host(
+        admin: &guest_stores::InAdminTree,
+    ) -> impl FnMut(&Request) -> Option<Reply> + '_ {
+        let mut handed = false;
+        move |request| {
+            Some(match request {
+                Request::GuestStores => {
+                    handed = true;
+                    admin
+                        .collect()
+                        .and_then(|stores| serde_json::to_vec(&stores).ok())
+                        .map_or(Reply::Refused, Reply::GuestStores)
+                }
+                Request::GuestStoresTaken if handed && admin.remove() => Reply::Done,
+                _ => Reply::Refused,
+            })
+        }
+    }
+
+    /// ADR 0169 §3, pack 07: the remembered hosts and their passwords move
+    /// from the admin directory to the profile once, the admin copy goes, the
+    /// host's own stores stay, and the hint names the host whose password
+    /// came across — once.
+    #[test]
+    fn the_guest_stores_move_once_and_the_host_stores_stay() {
+        let account = Account::new("move");
+        let admin = account.in_admin_tree();
+        let client = account.client(Box::new(account.profile.clone()), true);
+        let hint = account.hint();
+
+        guest_stores::settle(&client, Some(&hint), &mut session_host(&admin));
+
+        let kept = ConnectionHistory::open(client.history.clone());
+        let mut labels: Vec<&str> = kept
+            .entries()
+            .iter()
+            .map(|e| e.peer_label.as_str())
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(labels, ["host-ab12", "host-cd34"]);
+        assert_eq!(kept.code_of("host-ab12"), Some("code-host-ab12"));
+        assert_eq!(
+            account
+                .profile
+                .load_secret(&entry_name("host-ab12"))
+                .unwrap(),
+            Some(b"ab12 password".to_vec())
+        );
+
+        assert!(!account.admin_history.exists(), "the admin list is gone");
+        assert_eq!(
+            account.admin.load_secret(&entry_name("host-ab12")).unwrap(),
+            None
+        );
+        assert_eq!(
+            account.admin.load_secret(IDENTITY_ENTRY).unwrap(),
+            Some(vec![7; 32]),
+            "the host's identity stays"
+        );
+        assert!(
+            account
+                .admin
+                .load_secret(UNATTENDED_PASSWORD_ENTRY)
+                .unwrap()
+                .is_some(),
+            "the device password stays"
+        );
+
+        assert!(take_guest_key_hint(&hint, "host-ab12"));
+        assert!(!take_guest_key_hint(&hint, "host-ab12"), "once");
+        assert!(
+            !take_guest_key_hint(&hint, "host-cd34"),
+            "no password, so it never let this computer in by itself"
+        );
+        assert!(!hint.exists(), "nothing left to say");
+
+        // A second start finds nothing over there and changes nothing here.
+        guest_stores::settle(&client, Some(&hint), &mut session_host(&admin));
+        assert_eq!(
+            ConnectionHistory::open(client.history.clone())
+                .entries()
+                .len(),
+            2
+        );
+    }
+
+    /// What is let go over there is deleted, so nothing is let go unless all
+    /// of it is kept here: a password the profile will not take, or no list
+    /// to keep the hosts in, leaves the admin copy whole for the next start.
+    #[test]
+    fn nothing_is_let_go_unless_all_of_it_is_kept() {
+        for (name, history) in [("unwritable", true), ("no-list", false)] {
+            let account = Account::new(name);
+            let admin = account.in_admin_tree();
+            let remembered: Box<dyn Keystore> = if history {
+                Box::new(Unwritable)
+            } else {
+                Box::new(account.profile.clone())
+            };
+            let client = account.client(remembered, history);
+            assert!(guest_stores::take(&client, &mut session_host(&admin)).is_empty());
+            assert!(
+                account.admin_history.exists(),
+                "{name}: the admin list stays"
+            );
+            assert!(
+                account
+                    .admin
+                    .load_secret(&entry_name("host-ab12"))
+                    .unwrap()
+                    .is_some(),
+                "{name}: the admin password stays"
+            );
+        }
+    }
+
+    /// A letting-go nobody was handed anything for is refused, and a session
+    /// host that does not answer is simply asked again next start.
+    #[test]
+    fn an_absent_or_refusing_session_host_moves_nothing() {
+        let account = Account::new("absent");
+        let admin = account.in_admin_tree();
+        let mut host = session_host(&admin);
+        assert_eq!(host(&Request::GuestStoresTaken), Some(Reply::Refused));
+        assert!(account.admin_history.exists());
+
+        let client = account.client(Box::new(account.profile.clone()), true);
+        guest_stores::settle(&client, Some(&account.hint()), &mut |_| None);
+        assert!(
+            ConnectionHistory::open(client.history.clone())
+                .entries()
+                .is_empty()
+        );
+        assert!(account.admin_history.exists());
     }
 }

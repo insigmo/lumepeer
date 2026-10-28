@@ -86,6 +86,7 @@ export type TranslationKey =
   | 'invite.denied'
   | 'invite.failed'
   | 'invite.sessionNotResumed'
+  | 'invite.newGuestKey'
   | 'invite.unreachable'
   | 'invite.badTicket'
   | 'invite.offline'

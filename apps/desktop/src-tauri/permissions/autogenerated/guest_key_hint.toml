@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-guest-key-hint"
+description = "Enables the guest_key_hint command without any pre-configured scope."
+commands.allow = ["guest_key_hint"]
+
+[[permission]]
+identifier = "deny-guest-key-hint"
+description = "Denies the guest_key_hint command without any pre-configured scope."
+commands.deny = ["guest_key_hint"]

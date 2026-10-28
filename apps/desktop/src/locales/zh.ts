@@ -27,6 +27,8 @@ export const zh: Dictionary = {
   'invite.denied': '对方设备已拒绝该请求。',
   'invite.failed': '连接在被接受之前已结束。',
   'invite.sessionNotResumed': '无法恢复会话。请重新连接以请求新的会话。',
+  'invite.newGuestKey':
+    '此电脑已获得新的访客密钥，因此对方设备不再识别它。对方有人允许你进入并保存此设备后，记住的密码会再次自动登录。',
   'invite.unreachable': '无法联系到该设备。它可能处于离线状态，或者邀请代码已过期——请索取新的代码。',
   'invite.badTicket': '该邀请代码无效或已过期。',
   'invite.offline': '此设备目前尚无法从互联网访问。请等待状态变为就绪后再试。',
