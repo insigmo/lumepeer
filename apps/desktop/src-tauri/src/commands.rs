@@ -1108,6 +1108,76 @@ pub async fn session_set_grant(
     Ok(())
 }
 
+/// What [`session_ask_host`] may ask the session host to put to the person
+/// at this machine (pack 04): the channel's own closed list, as the webview
+/// spells it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WideningArg {
+    /// View only becoming full control.
+    Control,
+    /// Answering administrator prompts and the lock screen.
+    SecureDesktopInput,
+    /// Saving the guest's device as trusted (ADR 0120).
+    TrustDevice,
+}
+
+impl From<WideningArg> for lumepeer_service::host_channel_protocol::Widening {
+    fn from(widening: WideningArg) -> Self {
+        match widening {
+            WideningArg::Control => Self::Control,
+            WideningArg::SecureDesktopInput => Self::SecureDesktopInput,
+            WideningArg::TrustDevice => Self::TrustDevice,
+        }
+    }
+}
+
+/// Argument of [`session_ask_host`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionAskHostArgs {
+    /// The session's label, as the session host's snapshot gave it.
+    pub peer: String,
+    /// What to ask about.
+    pub widening: WideningArg,
+}
+
+/// Asks the session host to put a question to the person at this machine, in
+/// its own dialog: whether `peer`'s session may have one more thing
+/// (ADR 0169 §5; pack 04).
+///
+/// Grants nothing: the answer is given in a window this process cannot press,
+/// and only a yes there widens the session. Main window only.
+///
+/// # Errors
+/// Rejects calls from other windows; `NOT_HOSTED_BY_SERVICE` when this
+/// process hosts the machine itself; the channel's errors otherwise — among
+/// them a refusal when there is nothing to ask (no such session, it already
+/// has that, a question about it is already up).
+#[tauri::command]
+pub async fn session_ask_host(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+    args: SessionAskHostArgs,
+) -> Result<(), IpcError> {
+    use lumepeer_service::host_channel_protocol::Request;
+
+    check_window(&window)?;
+    let Some(panel) = session_host(&state) else {
+        return Err(IpcError {
+            code: "NOT_HOSTED_BY_SERVICE",
+            message: "this window hosts the machine itself; there is no service to ask".to_owned(),
+        });
+    };
+    panel_act(
+        panel,
+        Request::AskToWiden {
+            peer: args.peer,
+            widening: args.widening.into(),
+        },
+    )
+    .await
+}
+
 /// Lists hosts this node has connected to before, most recent first (§21
 /// punch-list item 5).
 ///

@@ -193,6 +193,7 @@ mod served {
 
     use super::HostSnapshot;
     use crate::commands::{ChatEntryDto, session_status_dto};
+    use crate::session_host_consent::Consents;
 
     /// What the session host's channel threads and its own loop share.
     #[derive(Debug)]
@@ -205,6 +206,9 @@ mod served {
         /// Connections open right now that have not turned hosting off: the
         /// clients that keep the endpoint open (ADR 0169 §1).
         wanting: AtomicUsize,
+        /// Who puts a question the client asked for in front of the person
+        /// at this machine (pack 04); none until the endpoint is open.
+        consents: Mutex<Option<Arc<Consents>>>,
     }
 
     impl Served {
@@ -216,7 +220,20 @@ mod served {
                 actor: Mutex::new(None),
                 connected: AtomicUsize::new(0),
                 wanting: AtomicUsize::new(0),
+                consents: Mutex::new(None),
             })
+        }
+
+        /// The session host's own dialog, which a client's
+        /// [`Request::AskToWiden`] puts up (pack 04).
+        pub fn asks_with(&self, consents: Arc<Consents>) {
+            if let Ok(mut slot) = self.consents.lock() {
+                *slot = Some(consents);
+            }
+        }
+
+        fn consents(&self) -> Option<Arc<Consents>> {
+            self.consents.lock().ok()?.clone()
         }
 
         /// The endpoint is open, and this is its actor.
@@ -328,6 +345,16 @@ mod served {
                 Request::SendChat { peer, text } => {
                     done(runtime.block_on(actor.chat_send(peer, text)).is_ok())
                 }
+                // Puts the question up and gives nothing: the person's yes in
+                // the session host's own window is what widens (pack 04).
+                Request::AskToWiden { peer, widening } => {
+                    let sessions = runtime.block_on(actor.status()).unwrap_or_default();
+                    done(
+                        self.consents().is_some_and(|consents| {
+                            consents.ask_to_widen(&sessions, &peer, widening)
+                        }),
+                    )
+                }
             }
         }
     }
@@ -391,6 +418,23 @@ mod served {
             assert_eq!(
                 served.answer(Request::EndSession {
                     peer: "p".to_owned()
+                }),
+                Reply::Refused
+            );
+        }
+
+        /// Pack 04: a closed host has nobody to ask about, so an ask to widen
+        /// is refused, and puts nothing up.
+        #[test]
+        fn a_closed_host_asks_nobody_anything() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let served = Served::new(runtime.handle().clone());
+            assert_eq!(
+                served.answer(Request::AskToWiden {
+                    peer: "p".to_owned(),
+                    widening: lumepeer_service::host_channel_protocol::Widening::Control,
                 }),
                 Reply::Refused
             );

@@ -171,6 +171,10 @@ export const es: Dictionary = {
     'Este dispositivo no tiene codificador de vídeo, por lo que quien invite no verá nada. Las sesiones se conectan igualmente y la entrada sigue funcionando.',
   'status.hostedByService':
     'Este dispositivo lo atiende el servicio de Lumepeer, no esta ventana. Desde aquí puede seguir conectándose a otros dispositivos.',
+  'consent.answerInSystemWindow': (peer) => `${peer} quiere conectarse. Responda en la ventana del sistema de Lumepeer.`,
+  'status.askHost.control': 'Dar el control… (pregunta en una ventana del sistema)',
+  'status.askHost.secureDesktopInput': 'Permitir avisos de administrador… (pregunta en una ventana del sistema)',
+  'status.askHost.trustDevice': 'Guardar este dispositivo… (pregunta en una ventana del sistema)',
   'titlebar.minimize': 'Minimizar',
   'titlebar.maximize': 'Maximizar',
   'titlebar.close': 'Cerrar',

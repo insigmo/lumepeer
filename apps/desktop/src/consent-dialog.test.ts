@@ -7,6 +7,7 @@ import { render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { consentDialog } from './consent-dialog';
+import { t } from './i18n';
 import type { SessionStatus } from './session-status';
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn().mockResolvedValue(undefined) }));
@@ -53,12 +54,16 @@ function actions(): string[] {
 }
 
 describe('consent dialog', () => {
-  it('offers only "no" when the Lumepeer service hosts this machine (ADR 0169)', () => {
-    render(consentDialog(REQUEST, 'en', true), container);
-    expect(actions()).toEqual(['consent-action-deny']);
+  it('points at the system dialog, with no buttons, when the service hosts this machine (pack 04)', () => {
+    render(consentDialog({ ...REQUEST, device_name: 'Laptop' }, 'en', true), container);
+    expect(actions()).toEqual([]);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    const line = container.querySelector('[data-testid="consent-elsewhere"]');
+    expect(line?.textContent?.trim()).toBe(t('en', 'consent.answerInSystemWindow', 'Laptop'));
 
     render(consentDialog({ ...REQUEST, terminal_only: true }, 'en', true), container);
-    expect(actions()).toEqual(['consent-action-deny']);
+    expect(actions()).toEqual([]);
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it('offers a screen request the view and full-control answers', () => {

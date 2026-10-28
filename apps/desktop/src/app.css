@@ -1676,6 +1676,25 @@ button.peer-card-face:disabled {
   margin: 0 0 20px;
 }
 
+/* While the Lumepeer service hosts this machine, a guest's request is
+   answered in the service's own system dialog (ADR 0169 §5): this window only
+   says so, in a line that covers nothing. */
+.consent-elsewhere {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 120;
+  max-width: calc(100% - 32px);
+  margin: 0;
+  padding: 10px 16px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--fs-body);
+}
+
 .consent-actions {
   display: flex;
   flex-direction: column;

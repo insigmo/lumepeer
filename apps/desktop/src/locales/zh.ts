@@ -163,6 +163,10 @@ export const zh: Dictionary = {
   'status.noEncoder': '此设备没有视频编码器，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
   'status.hostedByService':
     '此设备由 Lumepeer 服务托管，而不是此窗口。你仍可以从这里连接到其他设备。',
+  'consent.answerInSystemWindow': (peer) => `${peer} 请求连接。请在 Lumepeer 系统窗口中回答。`,
+  'status.askHost.control': '授予控制…（在系统窗口中询问）',
+  'status.askHost.secureDesktopInput': '允许回应管理员提示…（在系统窗口中询问）',
+  'status.askHost.trustDevice': '保存此设备…（在系统窗口中询问）',
   'titlebar.minimize': '最小化',
   'titlebar.maximize': '最大化',
   'titlebar.close': '关闭',

@@ -171,6 +171,10 @@ export const fr: Dictionary = {
     "Cet appareil n'a pas d'encodeur vidéo, les personnes invitées ne verront donc rien. Les sessions se connectent tout de même, et la saisie fonctionne toujours.",
   'status.hostedByService':
     "Cet appareil est hébergé par le service Lumepeer, pas par cette fenêtre. Vous pouvez toujours vous connecter à d'autres appareils d'ici.",
+  'consent.answerInSystemWindow': (peer) => `${peer} souhaite se connecter. Répondez dans la fenêtre système de Lumepeer.`,
+  'status.askHost.control': 'Donner le contrôle… (demande dans une fenêtre système)',
+  'status.askHost.secureDesktopInput': 'Autoriser les invites administrateur… (demande dans une fenêtre système)',
+  'status.askHost.trustDevice': 'Enregistrer cet appareil… (demande dans une fenêtre système)',
   'titlebar.minimize': 'Réduire',
   'titlebar.maximize': 'Agrandir',
   'titlebar.close': 'Fermer',

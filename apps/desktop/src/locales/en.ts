@@ -177,6 +177,10 @@ export const en: Dictionary = {
     'This device has no video encoder, so anyone you invite will see nothing. Sessions still connect, and input still works.',
   'status.hostedByService':
     'This device is hosted by the Lumepeer service, not by this window. You can still connect to other devices from here.',
+  'consent.answerInSystemWindow': (peer) => `${peer} wants to connect. Answer in the Lumepeer system window.`,
+  'status.askHost.control': 'Give control… (asks in a system window)',
+  'status.askHost.secureDesktopInput': 'Allow administrator prompts… (asks in a system window)',
+  'status.askHost.trustDevice': 'Save this device… (asks in a system window)',
   'titlebar.minimize': 'Minimize',
   'titlebar.maximize': 'Maximize',
   'titlebar.close': 'Close',

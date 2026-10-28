@@ -42,6 +42,10 @@ mod session_agent;
 // machine's host (ADR 0169). Windows only, like the logon host it pairs with.
 #[cfg(target_os = "windows")]
 mod session_host;
+// The session host's own consent dialog: what it asks and what an answer does
+// (ADR 0169 §5).
+#[cfg(target_os = "windows")]
+mod session_host_consent;
 // What the logon host and the session host share.
 #[cfg(target_os = "windows")]
 mod system_host;
@@ -634,6 +638,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::session_revoke,
         commands::session_status,
         commands::session_set_grant,
+        commands::session_ask_host,
         commands::address_book_list,
         commands::address_book_upsert,
         commands::address_book_remove,

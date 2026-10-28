@@ -171,6 +171,10 @@ export const uk: Dictionary = {
     'На цьому пристрої немає відеокодера, тож запрошені нічого не побачать. Сеанси все одно підключаються, а введення й далі працює.',
   'status.hostedByService':
     'Цей пристрій обслуговує служба Lumepeer, а не це вікно. Підключатися звідси до інших пристроїв і далі можна.',
+  'consent.answerInSystemWindow': (peer) => `${peer} хоче підключитися. Дайте відповідь у системному вікні Lumepeer.`,
+  'status.askHost.control': 'Надати керування… (запитає в системному вікні)',
+  'status.askHost.secureDesktopInput': 'Дозволити запити адміністратора… (запитає в системному вікні)',
+  'status.askHost.trustDevice': 'Зберегти цей пристрій… (запитає в системному вікні)',
   'titlebar.minimize': 'Згорнути',
   'titlebar.maximize': 'Розгорнути',
   'titlebar.close': 'Закрити',

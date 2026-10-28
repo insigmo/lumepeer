@@ -12,6 +12,7 @@ const COMMANDS: &[&str] = &[
     "session_revoke",
     "session_status",
     "session_set_grant",
+    "session_ask_host",
     "address_book_list",
     "address_book_upsert",
     "address_book_remove",

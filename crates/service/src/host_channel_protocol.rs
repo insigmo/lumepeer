@@ -9,7 +9,13 @@
 //! `secure_desktop_input` on, trusts a device or changes the device password.
 //! Those are not refused here; they cannot be written down (ADR 0043).
 //! [`Request::effect`] is where that is kept true: every request is one of
-//! [`Effect`]'s three kinds, and there is no fourth to put a widening one in.
+//! [`Effect`]'s kinds, and none of them is a widening one.
+//!
+//! The one request that names a widening, [`Request::AskToWiden`], is
+//! [`Effect::Asks`]: it puts the session host's own dialog in front of the
+//! person at the machine, which a program of theirs cannot press (ADR 0169
+//! §5), and does nothing else. It carries no "yes" to forge; the yes is
+//! somebody's mouse on a System-integrity window (pack 04).
 //!
 //! The framing follows `agent_protocol.rs`'s rules where its fixed size cannot
 //! carry what this one must (a session list, a chat line):
@@ -78,6 +84,8 @@ const KIND_REFUSE_PENDING: u8 = 0x12;
 const KIND_HOSTING_OFF: u8 = 0x13;
 /// Kind byte of [`Request::SendChat`].
 const KIND_SEND_CHAT: u8 = 0x14;
+/// Kind byte of [`Request::AskToWiden`].
+const KIND_ASK_TO_WIDEN: u8 = 0x20;
 
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
@@ -140,6 +148,58 @@ pub enum Request {
         /// The line.
         text: String,
     },
+    /// Put the session host's own dialog in front of the person at this
+    /// machine, asking whether `peer`'s session may have `widening`
+    /// (pack 04, ADR 0169 §5).
+    ///
+    /// Grants nothing. The answer is the person's, given in a window this
+    /// channel's callers cannot press, and an answer that is not a yes —
+    /// a no, a closed window, nobody there — leaves the session as it was.
+    AskToWiden {
+        /// The session's label.
+        peer: String,
+        /// What the person is asked about.
+        widening: Widening,
+    },
+}
+
+/// What a running session's host can be asked to give it, in the session
+/// host's own dialog (ADR 0169 §5). The whole list, closed: one byte each on
+/// the wire, and a byte that is not one of them ends the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Widening {
+    /// The keyboard and mouse: view only becomes full control.
+    Control,
+    /// Answering administrator prompts and the lock screen (ADR 0057 §4).
+    SecureDesktopInput,
+    /// Saving the guest's device as a trusted one (ADR 0120).
+    TrustDevice,
+}
+
+/// Wire byte of [`Widening::Control`].
+const WIDENING_CONTROL: u8 = 1;
+/// Wire byte of [`Widening::SecureDesktopInput`].
+const WIDENING_SECURE_DESKTOP_INPUT: u8 = 2;
+/// Wire byte of [`Widening::TrustDevice`].
+const WIDENING_TRUST_DEVICE: u8 = 3;
+
+impl Widening {
+    const fn to_byte(self) -> u8 {
+        match self {
+            Self::Control => WIDENING_CONTROL,
+            Self::SecureDesktopInput => WIDENING_SECURE_DESKTOP_INPUT,
+            Self::TrustDevice => WIDENING_TRUST_DEVICE,
+        }
+    }
+
+    const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            WIDENING_CONTROL => Some(Self::Control),
+            WIDENING_SECURE_DESKTOP_INPUT => Some(Self::SecureDesktopInput),
+            WIDENING_TRUST_DEVICE => Some(Self::TrustDevice),
+            _ => None,
+        }
+    }
 }
 
 /// What a request does to the host — and the whole list of what one may do.
@@ -151,6 +211,9 @@ pub enum Effect {
     Narrows,
     /// Puts a line of chat in front of a guest already admitted.
     Says,
+    /// Puts a question in front of the person at this machine, in a window
+    /// only they can answer; changes nothing until they do (pack 04).
+    Asks,
 }
 
 impl Request {
@@ -168,6 +231,7 @@ impl Request {
             | Self::RefusePending { .. }
             | Self::HostingOff => Effect::Narrows,
             Self::SendChat { .. } => Effect::Says,
+            Self::AskToWiden { .. } => Effect::Asks,
         }
     }
 }
@@ -269,6 +333,11 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
         Request::RefusePending { peer } => (KIND_REFUSE_PENDING, peer.as_bytes().to_vec()),
         Request::HostingOff => (KIND_HOSTING_OFF, Vec::new()),
         Request::SendChat { peer, text } => (KIND_SEND_CHAT, with_label(peer, text)),
+        Request::AskToWiden { peer, widening } => {
+            let mut payload = vec![widening.to_byte()];
+            payload.extend_from_slice(peer.as_bytes());
+            (KIND_ASK_TO_WIDEN, payload)
+        }
     }
 }
 
@@ -301,6 +370,12 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
             let (peer, text) = label_and_rest(payload)?;
             (!text.is_empty() && text.len() <= MAX_CHAT_BYTES)
                 .then_some(Request::SendChat { peer, text })
+        }
+        KIND_ASK_TO_WIDEN => {
+            // `widening:u8 | label`: one closed byte, then the label.
+            let (&byte, peer) = payload.split_first()?;
+            let widening = Widening::from_byte(byte)?;
+            label(peer).map(|peer| Request::AskToWiden { peer, widening })
         }
         _ => None,
     }
@@ -347,6 +422,18 @@ mod tests {
                 peer: peer(),
                 text: "привет".to_owned(),
             },
+            Request::AskToWiden {
+                peer: peer(),
+                widening: Widening::Control,
+            },
+            Request::AskToWiden {
+                peer: peer(),
+                widening: Widening::SecureDesktopInput,
+            },
+            Request::AskToWiden {
+                peer: peer(),
+                widening: Widening::TrustDevice,
+            },
         ]
     }
 
@@ -368,8 +455,17 @@ mod tests {
         for request in every_request() {
             let effect = request.effect();
             assert!(
-                matches!(effect, Effect::Reads | Effect::Narrows | Effect::Says),
+                matches!(
+                    effect,
+                    Effect::Reads | Effect::Narrows | Effect::Says | Effect::Asks
+                ),
                 "{request:?} is {effect:?}"
+            );
+            // Asking is the one request about a widening, and it only asks.
+            assert_eq!(
+                effect == Effect::Asks,
+                matches!(request, Request::AskToWiden { .. }),
+                "{request:?}"
             );
         }
         // And the one request that names a grant can only turn it off: there
@@ -472,6 +568,37 @@ mod tests {
             decode_request(KIND_SEND_CHAT, &[9, b'p']),
             None,
             "a label longer than the payload"
+        );
+    }
+
+    /// Pack 04: asking to widen carries what to ask about and whose session —
+    /// one closed byte and a label — and nothing that could say "yes". A
+    /// widening nobody knows, or a label that is not one, ends the connection.
+    #[test]
+    fn an_ask_to_widen_carries_no_answer() {
+        let mut wire = Vec::new();
+        assert!(write_request(
+            &mut wire,
+            &Request::AskToWiden {
+                peer: "p".to_owned(),
+                widening: Widening::SecureDesktopInput
+            }
+        ));
+        assert_eq!(
+            wire[HEADER_LEN..],
+            [WIDENING_SECURE_DESKTOP_INPUT, b'p'],
+            "the byte that names it, then the label — the whole payload"
+        );
+        assert_eq!(decode_request(KIND_ASK_TO_WIDEN, &[0, b'p']), None);
+        assert_eq!(decode_request(KIND_ASK_TO_WIDEN, &[4, b'p']), None);
+        assert_eq!(
+            decode_request(KIND_ASK_TO_WIDEN, &[WIDENING_CONTROL]),
+            None,
+            "no label"
+        );
+        assert_eq!(
+            decode_request(KIND_ASK_TO_WIDEN, &[WIDENING_CONTROL, b'p', b'\n']),
+            None
         );
     }
 

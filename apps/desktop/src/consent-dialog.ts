@@ -9,6 +9,7 @@ import { html, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { peerDisplayName } from './peer-name';
 import type { SessionStatus } from './session-status';
 
 export type Role = 'view_only' | 'control_limited' | 'full_control';
@@ -29,7 +30,9 @@ export function consentDialog(
   /**
    * Whether the Lumepeer service, not this window, hosts this machine
    * (ADR 0169). Letting a guest in is then the service's to decide, in a
-   * dialog of its own; this window can only say no.
+   * system dialog of its own (ADR 0169 §5), and this window only says where
+   * to answer: two windows on one request would be one too many, and the one
+   * that counts is the one no other program can press.
    */
   decidedByHost = false,
 ): TemplateResult {
@@ -39,6 +42,14 @@ export function consentDialog(
         <h1>${t(locale, 'consent.none.title')}</h1>
         <p>${t(locale, 'consent.none.body')}</p>
       </section>
+    `;
+  }
+
+  if (decidedByHost) {
+    return html`
+      <p class="consent-elsewhere" role="status" aria-live="polite" data-testid="consent-elsewhere">
+        ${t(locale, 'consent.answerInSystemWindow', peerDisplayName(request))}
+      </p>
     `;
   }
 
@@ -58,9 +69,7 @@ export function consentDialog(
           >
             ${t(locale, 'consent.action.deny')}
           </button>
-          ${decidedByHost
-            ? ''
-            : request.terminal_only
+          ${request.terminal_only
             ? // A guest that came for a shell (ADR 0131) is let in or not:
               // a lesser role would carry no shell at all, and the host
               // grants this one the shell and nothing else whatever the

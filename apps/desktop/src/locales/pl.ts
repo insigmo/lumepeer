@@ -171,6 +171,10 @@ export const pl: Dictionary = {
     'To urządzenie nie ma kodera wideo, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
   'status.hostedByService':
     'Tym urządzeniem zarządza usługa Lumepeer, a nie to okno. Nadal możesz stąd łączyć się z innymi urządzeniami.',
+  'consent.answerInSystemWindow': (peer) => `${peer} chce się połączyć. Odpowiedz w oknie systemowym Lumepeer.`,
+  'status.askHost.control': 'Przekaż sterowanie… (zapyta w oknie systemowym)',
+  'status.askHost.secureDesktopInput': 'Zezwól na monity administratora… (zapyta w oknie systemowym)',
+  'status.askHost.trustDevice': 'Zapisz to urządzenie… (zapyta w oknie systemowym)',
   'titlebar.minimize': 'Minimalizuj',
   'titlebar.maximize': 'Maksymalizuj',
   'titlebar.close': 'Zamknij',

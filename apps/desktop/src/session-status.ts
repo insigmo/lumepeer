@@ -410,6 +410,56 @@ function recordingMenuItem(
   `;
 }
 
+/** What the session host can be asked to put to the person at this machine. */
+export type Widening = 'control' | 'secure_desktop_input' | 'trust_device';
+
+/**
+ * Asks the Lumepeer service to show its own dialog about `widening` for
+ * `peer` (ADR 0169 §5; pack 04). Grants nothing: the yes is the person's, in
+ * a system window this one cannot press.
+ */
+async function askHost(peer: string, widening: Widening): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('session_ask_host', { args: { peer, widening } });
+}
+
+/**
+ * While the service hosts this machine, the menu's ways to give a running
+ * session more: each puts the service's dialog up, and only what is worth
+ * asking is offered — control to a guest that is watching, administrator
+ * prompts to one in control without them, and saving any guest's device.
+ */
+function askHostItems(session: SessionStatus, locale: Locale): TemplateResult[] {
+  const peer = session.peer_label;
+  const screen = !session.terminal_only;
+  const asks: [Widening, TranslationKey][] = [];
+  if (screen && session.role !== 'full_control') {
+    asks.push(['control', 'status.askHost.control']);
+  }
+  if (screen && session.input && !session.secure_desktop_input) {
+    asks.push(['secure_desktop_input', 'status.askHost.secureDesktopInput']);
+  }
+  asks.push(['trust_device', 'status.askHost.trustDevice']);
+  return asks.map(
+    ([widening, key]) => html`
+      <button
+        type="button"
+        class="peer-menu-item peer-menu-ask-host"
+        role="menuitem"
+        data-widening=${widening}
+        @click=${(event: Event) => {
+          closeMenu(event);
+          void askHost(peer, widening).catch((error: unknown) => {
+            console.error('asking the service failed:', error);
+          });
+        }}
+      >
+        ${t(locale, key)}
+      </button>
+    `,
+  );
+}
+
 /** The recording indicator (§17): on while the core says a recording runs. */
 function recordingIndicator(
   session: SessionStatus,
@@ -697,7 +747,8 @@ export function sessionStatus(
    * Whether the Lumepeer service, not this window, hosts this machine
    * (ADR 0169). Its channel can end a session and take a grant away, never
    * give one, so the record request — a yes that grants `recording` — is not
-   * offered here.
+   * offered here, and "save this device" becomes asking the service to put
+   * its own dialog up (pack 04), beside asking it about control.
    */
   decidedByHost = false,
 ): TemplateResult {
@@ -818,7 +869,10 @@ export function sessionStatus(
                           `
                         : '',
                       active ? recordingMenuItem(session, locale, onRefresh, onRecordingPath) : '',
-                      active ? html`<span class="peer-menu-item" role="menuitem">${saveDevice(peer)}</span>` : '',
+                      active && !decidedByHost
+                        ? html`<span class="peer-menu-item" role="menuitem">${saveDevice(peer)}</span>`
+                        : '',
+                      ...(active && decidedByHost ? askHostItems(session, locale) : []),
                       html`
                         <button
                           type="button"

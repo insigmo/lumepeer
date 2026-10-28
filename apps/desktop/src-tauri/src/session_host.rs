@@ -30,8 +30,10 @@
 //! attached, it starts the person's client, and if none attaches within
 //! [`SESSION_INDICATOR_DEADLINE_SECS`] it ends every session (§7).
 //!
-//! Until the consent dialog is its own (pack 04), nobody here can be asked:
-//! a guest gets in with the device password, or is refused and told why.
+//! The person at the machine is asked in this process's own dialog
+//! ([`crate::session_host_consent`], ADR 0169 §5): a guest without the device
+//! password, and every widening of a running session, wait for their answer
+//! in a window no program of theirs can press.
 //!
 //! It refuses — [`SESSION_HOST_EXIT_NOT_ENABLED`] — until an administrator has
 //! turned ADR 0169 on for this machine, and — [`SESSION_HOST_EXIT_NO_STORE`]
@@ -45,7 +47,7 @@ use std::time::{Duration, Instant};
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::SESSION_INDICATOR_DEADLINE_SECS;
 use lumepeer_net::keystore::IDENTITY_ENTRY;
-use lumepeer_runtime::network::ActorHandle;
+use lumepeer_runtime::network::{ActorHandle, SessionStateDto};
 use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::host_role::ReleaseRequests;
 use lumepeer_service::{
@@ -55,6 +57,7 @@ use lumepeer_service::{
 
 use crate::host_panel::Served;
 use crate::placement::Placement;
+use crate::session_host_consent::Consents;
 use crate::system_host::{self, EXIT_FAILED, Hosting};
 
 /// Where the relay measurement of ADR 0098 is kept, in the person's directory
@@ -177,6 +180,11 @@ async fn serve(
         return EXIT_FAILED;
     };
     served.opened(handle.clone());
+    let consents = Arc::new(Consents::new(
+        handle.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    served.asks_with(Arc::clone(&consents));
 
     let mut unseen = Unseen::default();
     loop {
@@ -184,8 +192,13 @@ async fn serve(
         if system_host::released(releases) {
             return system_host::hand_over(&handle, |_| 0).await;
         }
-        let sessions = handle.status().await.map_or(0, |sessions| sessions.len());
-        match unseen.next(sessions > 0, served.anybody_attached(), Instant::now()) {
+        let rows = handle.status().await.unwrap_or_default();
+        consents.follow(&rows);
+        let sessions = rows.len();
+        // A guest still waiting on the dialog is not a session anybody needs
+        // to see yet (§7); it is the dialog's to answer.
+        let running = rows.iter().any(|row| row.state == SessionStateDto::Active);
+        match unseen.next(running, served.anybody_attached(), Instant::now()) {
             Step::Nothing => {}
             Step::StartClient => {
                 tracing::info!("a session started with no client to show it; starting the client");
@@ -215,7 +228,11 @@ async fn serve(
 /// (ADR 0169 §7, §2.2).
 async fn end_unseen_sessions(handle: &ActorHandle) {
     let sessions = handle.status().await.unwrap_or_default();
-    for session in sessions {
+    // Running sessions only: a guest still asking is the dialog's to answer.
+    for session in sessions
+        .into_iter()
+        .filter(|session| session.state == SessionStateDto::Active)
+    {
         tracing::warn!(
             peer = %session.label,
             deadline_secs = SESSION_INDICATOR_DEADLINE_SECS,
@@ -291,12 +308,11 @@ impl ViewWindows for SignedInDesktop {
     /// (ADR 0169 §7).
     fn set_host_bar(&self, _visible: bool) {}
 
-    /// Somebody is signed in, but nothing this process can show them yet
-    /// takes an answer: the consent dialog is pack 04's. Until then the
-    /// device password is the only way in, and a guest without one is told
-    /// nobody can let it in, rather than left waiting on a dialog nobody sees.
+    /// Somebody is signed in, and this process asks them in its own dialog
+    /// (ADR 0169 §5): a guest without the device password waits for their
+    /// answer, as it did for the elevated client's window.
     fn attendance(&self) -> HostAttendance {
-        HostAttendance::Unattended
+        HostAttendance::Attended
     }
 
     fn on_secure_desktop(&self) -> bool {
@@ -317,11 +333,11 @@ mod tests {
     use super::*;
 
     /// The signed-in desktop is somebody's, is not the secure desktop, takes
-    /// input from this process itself — and, until pack 04, asks nobody.
+    /// input from this process itself, and asks the person there (pack 04).
     #[test]
-    fn the_signed_in_desktop_injects_itself_and_asks_nobody_yet() {
+    fn the_signed_in_desktop_injects_itself_and_asks_the_person() {
         let screen = SignedInDesktop;
-        assert_eq!(screen.attendance(), HostAttendance::Unattended);
+        assert_eq!(screen.attendance(), HostAttendance::Attended);
         assert!(!screen.on_secure_desktop());
         assert!(!screen.nobody_signed_in());
         assert!(screen.injects_as_system());

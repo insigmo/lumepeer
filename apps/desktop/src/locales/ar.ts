@@ -170,6 +170,10 @@ export const ar: Dictionary = {
     'لا يوجد في هذا الجهاز مُرمِّز فيديو، لذلك لن يرى من تدعوه أي صورة. تظل الجلسات تتصل ويظل الإدخال يعمل.',
   'status.hostedByService':
     'تستضيف خدمة Lumepeer هذا الجهاز، وليس هذه النافذة. لا يزال بإمكانك الاتصال بأجهزة أخرى من هنا.',
+  'consent.answerInSystemWindow': (peer) => `${peer} يريد الاتصال. أجب في نافذة نظام Lumepeer.`,
+  'status.askHost.control': 'منح التحكم… (يسأل في نافذة النظام)',
+  'status.askHost.secureDesktopInput': 'السماح بمطالبات المسؤول… (يسأل في نافذة النظام)',
+  'status.askHost.trustDevice': 'حفظ هذا الجهاز… (يسأل في نافذة النظام)',
   'titlebar.minimize': 'تصغير',
   'titlebar.maximize': 'تكبير',
   'titlebar.close': 'إغلاق',

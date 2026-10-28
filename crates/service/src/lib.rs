@@ -27,6 +27,8 @@ pub mod client;
 #[cfg(target_os = "windows")]
 pub mod client_launch;
 #[cfg(target_os = "windows")]
+pub mod consent_dialog;
+#[cfg(target_os = "windows")]
 pub mod desktop_input_channel;
 #[cfg(target_os = "windows")]
 pub mod frame;

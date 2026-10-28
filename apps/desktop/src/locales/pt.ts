@@ -171,6 +171,10 @@ export const pt: Dictionary = {
     'Este dispositivo não tem codificador de vídeo, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
   'status.hostedByService':
     'Este dispositivo é hospedado pelo serviço Lumepeer, não por esta janela. Você ainda pode se conectar a outros dispositivos daqui.',
+  'consent.answerInSystemWindow': (peer) => `${peer} quer se conectar. Responda na janela do sistema do Lumepeer.`,
+  'status.askHost.control': 'Dar o controle… (pergunta em uma janela do sistema)',
+  'status.askHost.secureDesktopInput': 'Permitir solicitações de administrador… (pergunta em uma janela do sistema)',
+  'status.askHost.trustDevice': 'Salvar este dispositivo… (pergunta em uma janela do sistema)',
   'titlebar.minimize': 'Minimizar',
   'titlebar.maximize': 'Maximizar',
   'titlebar.close': 'Fechar',

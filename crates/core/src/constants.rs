@@ -940,6 +940,23 @@ pub const CHAT_MAX_BYTES: usize = 4_096;
 /// that a hidden session is a matter of seconds.
 pub const SESSION_INDICATOR_DEADLINE_SECS: u64 = 10;
 
+/// How long the session host's own consent dialog waits for the person at
+/// the machine before it answers no (ADR 0169 §5; pack 04).
+///
+/// The webview's consent window had no deadline: it waited until the guest
+/// gave up. A `LocalSystem` dialog nobody answers is a different thing — the
+/// machine may be locked or empty — and an unanswered question is a refusal,
+/// never a yes. A minute is long enough to walk back to the desk and read it.
+pub const CONSENT_DIALOG_TIMEOUT_SECS: u64 = 60;
+
+/// The most characters of one peer-supplied string — a device name, an OS
+/// tag — that the session host's consent dialog shows (ADR 0169 §5).
+///
+/// The core already bounds a device name when it arrives; this bound is the
+/// dialog's own, so a `LocalSystem` window never lays out more text from a
+/// stranger than fits on a line, whatever any other layer let through.
+pub const CONSENT_DIALOG_PEER_TEXT_MAX_CHARS: usize = 64;
+
 /// Maximum pixel area of one cursor shape update (§11). A cursor is UI
 /// chrome, never a second video channel; anything larger is malformed.
 pub const MAX_CURSOR_SHAPE_PIXELS: usize = 128 * 128;

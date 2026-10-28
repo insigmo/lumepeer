@@ -171,6 +171,10 @@ export const tr: Dictionary = {
     'Bu cihazda video kodlayıcı yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
   'status.hostedByService':
     'Bu cihazı bu pencere değil, Lumepeer hizmeti barındırıyor. Buradan diğer cihazlara bağlanmaya devam edebilirsiniz.',
+  'consent.answerInSystemWindow': (peer) => `${peer} bağlanmak istiyor. Lumepeer sistem penceresinde yanıtlayın.`,
+  'status.askHost.control': 'Kontrol ver… (sistem penceresinde sorar)',
+  'status.askHost.secureDesktopInput': 'Yönetici istemlerine izin ver… (sistem penceresinde sorar)',
+  'status.askHost.trustDevice': 'Bu cihazı kaydet… (sistem penceresinde sorar)',
   'titlebar.minimize': 'Küçült',
   'titlebar.maximize': 'Büyüt',
   'titlebar.close': 'Kapat',

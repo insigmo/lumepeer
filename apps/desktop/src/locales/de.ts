@@ -171,6 +171,10 @@ export const de: Dictionary = {
     'Dieses Gerät hat keinen Video-Encoder, daher sehen eingeladene Personen nichts. Sitzungen verbinden sich trotzdem, und die Eingabe funktioniert weiterhin.',
   'status.hostedByService':
     'Dieses Gerät wird vom Lumepeer-Dienst bereitgestellt, nicht von diesem Fenster. Mit anderen Geräten können Sie sich von hier aus weiterhin verbinden.',
+  'consent.answerInSystemWindow': (peer) => `${peer} möchte sich verbinden. Antworten Sie im Lumepeer-Systemfenster.`,
+  'status.askHost.control': 'Steuerung geben… (fragt in einem Systemfenster)',
+  'status.askHost.secureDesktopInput': 'Administratorabfragen erlauben… (fragt in einem Systemfenster)',
+  'status.askHost.trustDevice': 'Dieses Gerät speichern… (fragt in einem Systemfenster)',
   'titlebar.minimize': 'Minimieren',
   'titlebar.maximize': 'Maximieren',
   'titlebar.close': 'Schließen',

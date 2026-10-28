@@ -170,6 +170,10 @@ export const ja: Dictionary = {
     'このデバイスにはビデオエンコーダーがないため、招待した相手には何も見えません。セッション自体は接続され、入力も引き続き機能します。',
   'status.hostedByService':
     'このデバイスはこのウィンドウではなく Lumepeer サービスがホストしています。ここから他のデバイスへの接続は引き続き行えます。',
+  'consent.answerInSystemWindow': (peer) => `${peer} が接続を求めています。Lumepeer のシステムウィンドウで応答してください。`,
+  'status.askHost.control': '操作を許可…（システムウィンドウで確認）',
+  'status.askHost.secureDesktopInput': '管理者の確認への応答を許可…（システムウィンドウで確認）',
+  'status.askHost.trustDevice': 'このデバイスを保存…（システムウィンドウで確認）',
   'titlebar.minimize': '最小化',
   'titlebar.maximize': '最大化',
   'titlebar.close': '閉じる',

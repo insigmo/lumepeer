@@ -1,7 +1,7 @@
 // docs/bugs/03-connection-list.md, task 5: a remembered host can be removed
 // from the connection list, with a confirmation and without disturbing the
 // row's own reconnect control.
-import { render } from 'lit-html';
+import { html, render } from 'lit-html';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -544,5 +544,91 @@ describe('checking a remembered host', () => {
   it('is not offered while a connect is in progress', () => {
     renderHost('host-check-busy', () => {}, true);
     expect(checkButton()?.disabled).toBe(true);
+  });
+});
+
+// Pack 04 (ADR 0169 §5): while the Lumepeer service hosts this machine, the
+// card's ways to give a session more only ask the service to put up its own
+// system dialog; nothing here grants, and only what is worth asking is offered.
+describe('host card while the service hosts this machine', () => {
+  const ACTIVE: SessionStatus = {
+    peer_label: 'guest-cd34',
+    state: 'active',
+    role: 'view_only',
+    input: false,
+    clipboard_read: false,
+    clipboard_write: false,
+    file_transfer: false,
+    recording: false,
+    display_mode: false,
+    recording_active: false,
+    record_request: false,
+    secure_desktop: true,
+    secure_desktop_input: false,
+    secure_desktop_active: false,
+    tunnel: false,
+    terminal: false,
+    terminal_active: false,
+    terminal_only: false,
+    chat_unread: false,
+  };
+
+  function renderCard(session: SessionStatus, decidedByHost: boolean): void {
+    render(
+      sessionStatus(
+        [session],
+        'en',
+        () => {},
+        [],
+        () => {},
+        false,
+        () => {},
+        new Map(),
+        { offers: [], transfers: [] },
+        undefined,
+        new Map(),
+        () => {},
+        () => html`<button type="button" class="book-save-btn">save</button>`,
+        new Map(),
+        decidedByHost,
+      ),
+      container,
+    );
+  }
+
+  function asks(): (string | undefined)[] {
+    return Array.from(container.querySelectorAll<HTMLElement>('.peer-menu-ask-host')).map(
+      (item) => item.dataset.widening,
+    );
+  }
+
+  it('offers asking about control and the device to a watching guest, and nothing that grants', () => {
+    renderCard(ACTIVE, true);
+    expect(asks()).toEqual(['control', 'trust_device']);
+    expect(container.querySelector('.book-save-btn')).toBeNull();
+  });
+
+  it('offers asking about administrator prompts only to a guest in control without them', () => {
+    renderCard({ ...ACTIVE, role: 'full_control', input: true, secure_desktop_input: true }, true);
+    expect(asks()).toEqual(['trust_device']);
+    renderCard({ ...ACTIVE, role: 'full_control', input: true, secure_desktop_input: false }, true);
+    expect(asks()).toEqual(['secure_desktop_input', 'trust_device']);
+  });
+
+  it('asks the service and nothing else when pressed', async () => {
+    renderCard(ACTIVE, true);
+    container.querySelector<HTMLButtonElement>('[data-widening="control"]')?.click();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('session_ask_host', {
+        args: { peer: 'guest-cd34', widening: 'control' },
+      });
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the save button, and asks nothing, while this window is the host', () => {
+    renderCard(ACTIVE, false);
+    expect(asks()).toEqual([]);
+    expect(container.querySelector('.book-save-btn')).not.toBeNull();
   });
 });
