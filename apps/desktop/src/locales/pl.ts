@@ -169,6 +169,8 @@ export const pl: Dictionary = {
     'To urządzenie uruchamia Linuksa wewnątrz ChromeOS, a aplikacje w nim nie widzą ekranu ChromeOS, więc zaproszone osoby niczego nie zobaczą. Łączenie się stąd z innymi urządzeniami działa jak zwykle.',
   'status.noEncoder':
     'To urządzenie nie ma kodera wideo, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
+  'status.hostedByService':
+    'Tym urządzeniem zarządza usługa Lumepeer, a nie to okno. Nadal możesz stąd łączyć się z innymi urządzeniami.',
   'titlebar.minimize': 'Minimalizuj',
   'titlebar.maximize': 'Maksymalizuj',
   'titlebar.close': 'Zamknij',

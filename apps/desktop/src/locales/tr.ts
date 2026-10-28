@@ -169,6 +169,8 @@ export const tr: Dictionary = {
     'Bu cihaz ChromeOS içinde Linux çalıştırıyor ve oradaki uygulamalar ChromeOS ekranını göremez, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Buradan diğer cihazlara bağlanmak her zamanki gibi çalışır.',
   'status.noEncoder':
     'Bu cihazda video kodlayıcı yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
+  'status.hostedByService':
+    'Bu cihazı bu pencere değil, Lumepeer hizmeti barındırıyor. Buradan diğer cihazlara bağlanmaya devam edebilirsiniz.',
   'titlebar.minimize': 'Küçült',
   'titlebar.maximize': 'Büyüt',
   'titlebar.close': 'Kapat',

@@ -7,7 +7,8 @@
 //! turned the feature on — so a guest reaches the same saved host at the logon
 //! screen as after it. The moment somebody signs in, it is asked to give the
 //! host role up and stopped, and the ordinary client takes over — started
-//! here, when the logon host leaves with a guest still on it (ADR 0164).
+//! here, when the logon host leaves with a guest still on it (ADR 0164) —
+//! or, where ADR 0169 is on, the session host does.
 //!
 //! The service decides only *when*: somebody signed in or not. Whether the
 //! feature is on, and whose store to open, is the logon host's own question,
@@ -16,25 +17,11 @@
 //! console changes. So this binary still reads no configuration of its own
 //! (ADR 0043).
 //!
-//! The launch is [`crate::system_injector_launch`]'s with the desktop swapped
-//! for `Winlogon` and the argument for [`LOGON_HOST_ARG`].
-
-#![allow(
-    unsafe_code,
-    reason = "CreateProcessAsUserW and the process queries around it have no \
-              safe bindings; same justification standard as the rest of this \
-              crate's Win32 surface (ADR 0043, ADR 0056, ADR 0114, ADR 0126)"
-)]
+//! The launch is [`crate::host_process`]'s onto `Winlogon` with
+//! [`LOGON_HOST_ARG`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
-};
-use windows::core::{PCWSTR, PWSTR};
 
 use lumepeer_service::agent_launch::{anybody_signed_in, console_session};
 use lumepeer_service::{
@@ -42,24 +29,14 @@ use lumepeer_service::{
     LOGON_HOST_EXIT_ROLE_TAKEN,
 };
 
+use crate::host_process::HostProcess;
+
 /// The logon screen's desktop, as a path for `STARTUPINFOW.lpDesktop`.
 ///
 /// Every thread the logon host starts lands on it, so its capture duplicates
 /// the logon screen and its `SendInput` types into it without any thread
 /// having to move desktops.
 const LOGON_DESKTOP: &str = r"WinSta0\Winlogon";
-
-/// File name of the logon host, resolved beside this binary: the desktop
-/// application, for the reason `system_injector_launch::INJECTOR_EXE` is.
-const LOGON_HOST_EXE: &str = "lumepeer-desktop.exe";
-
-/// How long [`LogonHost::stop`] waits for the host to give the role up and
-/// leave before it is terminated, in milliseconds.
-///
-/// Longer than the injector's: this one has sessions to close and an endpoint
-/// to shut down, and a guest told the session ended is better off than one
-/// left to time a dead link out.
-const LOGON_HOST_STOP_TIMEOUT_MS: u32 = 5_000;
 
 /// How often the supervisor looks at the console.
 const SUPERVISION_TICK: Duration = Duration::from_millis(500);
@@ -81,11 +58,6 @@ const RELAUNCH_BACKOFF: Duration = Duration::from_secs(5);
 /// console sits at its logon screen, or a client in a disconnected session
 /// that has since let the role go.
 const PARKED_RECHECK: Duration = Duration::from_mins(5);
-
-/// A null-terminated UTF-16 copy of `text`, for the `W` entry points.
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 /// Keeps a logon host on the console for as long as nobody is signed in
 /// there, until `stopping` is set.
@@ -110,8 +82,9 @@ pub fn supervise(stopping: &AtomicBool) {
             continue;
         }
         parked = None;
-        let Some(host) = LogonHost::start(session) else {
-            // `LogonHost::start` has already said why.
+        let Some(host) = HostProcess::start(session, LOGON_DESKTOP, LOGON_HOST_ARG, "logon host")
+        else {
+            // `HostProcess::start` has already said why.
             std::thread::sleep(RELAUNCH_BACKOFF);
             continue;
         };
@@ -161,7 +134,7 @@ const fn ended_by(code: Option<u32>) -> Ended {
 /// Watches one logon host until it exits, somebody signs in, the console
 /// moves away from it or the service stops — stopping it in the last three
 /// cases.
-fn watch(host: LogonHost, stopping: &AtomicBool) -> Ended {
+fn watch(host: HostProcess, stopping: &AtomicBool) -> Ended {
     loop {
         if !host.is_alive() {
             let code = host.exit_code();
@@ -197,6 +170,12 @@ const fn stopped_with(code: Option<u32>, service_stopping: bool) -> Ended {
 
 /// The guest on the logon host has just signed the console in and is dialing
 /// again: starts the client it is dialing for (ADR 0164).
+///
+/// Where the session host serves the signed-in console (ADR 0169), the guest's
+/// dial is for the session host, which its own supervisor starts with the same
+/// identity — but closed until a client attaches. So the person's client is
+/// started here all the same, as their guest and panel, and its attaching is
+/// what opens the endpoint the guest is dialing.
 fn hand_over_to_client() {
     let Some(session) =
         console_session().filter(|&session| anybody_signed_in(session) == Some(true))
@@ -204,156 +183,14 @@ fn hand_over_to_client() {
         tracing::info!("the logon host handed over, but nobody is signed in at the console now");
         return;
     };
+    if lumepeer_service::program_data::session_host_enabled() {
+        tracing::info!(
+            "the logon host handed over; starting the client the session host opens for (ADR 0169)"
+        );
+        let _ = lumepeer_service::client_launch::start_client(session);
+        return;
+    }
     let _ = lumepeer_service::client_launch::start_owner_client(session);
-}
-
-/// A running logon host.
-#[derive(Debug)]
-struct LogonHost {
-    process: HANDLE,
-    thread: HANDLE,
-    pid: u32,
-    session: u32,
-}
-
-impl LogonHost {
-    /// Launches the logon host into `session` as `LocalSystem`; `None` on
-    /// every failure, each of which is logged.
-    fn start(session: u32) -> Option<Self> {
-        let exe = std::env::current_exe().ok()?;
-        let Some(host) = exe.parent().map(|dir| dir.join(LOGON_HOST_EXE)) else {
-            tracing::warn!("logon host: this executable has no directory");
-            return None;
-        };
-        if !host.is_file() {
-            tracing::warn!(path = %host.display(), "logon host: no desktop binary beside this one");
-            return None;
-        }
-        let host = host.to_string_lossy().into_owned();
-        if host.contains('"') {
-            tracing::warn!("logon host: refusing an executable path that contains a quote");
-            return None;
-        }
-        let token = crate::secure_desktop_launch::duplicate_own_token_for_session(session)?;
-        let spawned = spawn(token, session, &host);
-        // SAFETY: `token` is a live handle from `duplicate_own_token_for_session`
-        // and is not used again after the spawn above copied what it needed.
-        unsafe {
-            let _ = CloseHandle(token);
-        }
-        spawned
-    }
-
-    /// Whether the logon host is still running; a handle that cannot be
-    /// waited on reads as not running.
-    fn is_alive(&self) -> bool {
-        // SAFETY: `self.process` is a live process handle owned by this value.
-        unsafe { WaitForSingleObject(self.process, 0) == WAIT_TIMEOUT }
-    }
-
-    /// The exit code, once it has exited.
-    fn exit_code(&self) -> Option<u32> {
-        if self.is_alive() {
-            return None;
-        }
-        let mut code = 0u32;
-        // SAFETY: `self.process` is a live handle and `code` is a local the call
-        // writes.
-        unsafe { GetExitCodeProcess(self.process, &raw mut code) }
-            .ok()
-            .map(|()| code)
-    }
-
-    /// Asks the logon host to give the host role up and leave, and terminates
-    /// it if it has not within [`LOGON_HOST_STOP_TIMEOUT_MS`]; the exit code
-    /// when it left on its own.
-    fn stop(self) -> Option<u32> {
-        // The request the desktop client makes too (ADR 0085 §4): the host
-        // ends its sessions and releases the role on its own.
-        let asked = lumepeer_service::host_role::request_release();
-        // SAFETY: `self.process` is a live process handle owned by this value.
-        let waited = unsafe {
-            WaitForSingleObject(
-                self.process,
-                if asked { LOGON_HOST_STOP_TIMEOUT_MS } else { 0 },
-            )
-        };
-        if waited == WAIT_TIMEOUT {
-            tracing::warn!(
-                pid = self.pid,
-                "the logon host did not leave; terminating it"
-            );
-            // SAFETY: `self.process` is still live; terminating it is always
-            // valid.
-            unsafe {
-                let _ = TerminateProcess(self.process, 1);
-            }
-            return None;
-        }
-        self.exit_code()
-    }
-}
-
-impl Drop for LogonHost {
-    fn drop(&mut self) {
-        // SAFETY: both handles came from a successful create and are not used
-        // again after this.
-        unsafe {
-            let _ = CloseHandle(self.thread);
-            let _ = CloseHandle(self.process);
-        }
-    }
-}
-
-/// `CreateProcessAsUserW`s the logon host onto the console session's
-/// `Winlogon` desktop as `LocalSystem`.
-fn spawn(token: HANDLE, session: u32, host: &str) -> Option<LogonHost> {
-    let application = wide(host);
-    // `"exe" --logon-host`: the quotes keep a `C:\Program Files\...` path whole,
-    // and the tail is a constant.
-    let mut command_line = wide(&format!("\"{host}\" {LOGON_HOST_ARG}"));
-    let mut desktop = wide(LOGON_DESKTOP);
-    let startup = STARTUPINFOW {
-        cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap_or(0),
-        lpDesktop: PWSTR(desktop.as_mut_ptr()),
-        ..Default::default()
-    };
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: `token` is a live primary `LocalSystem` token stamped for the
-    // console session; `application`, `command_line` and `desktop` are
-    // null-terminated wide buffers that outlive the call; `startup` borrows
-    // `desktop` and outlives the call; `process` is written by the call. No
-    // handles are inherited: the host reaches everything by name.
-    let created = unsafe {
-        CreateProcessAsUserW(
-            Some(token),
-            PCWSTR(application.as_ptr()),
-            Some(PWSTR(command_line.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW,
-            None,
-            PCWSTR::null(),
-            &raw const startup,
-            &raw mut process,
-        )
-    };
-    if let Err(error) = created {
-        tracing::warn!(session, %error, "logon host: CreateProcessAsUser refused");
-        return None;
-    }
-    tracing::info!(
-        session,
-        pid = process.dwProcessId,
-        "logon host started on the logon screen"
-    );
-    Some(LogonHost {
-        process: process.hProcess,
-        thread: process.hThread,
-        pid: process.dwProcessId,
-        session,
-    })
 }
 
 #[cfg(test)]
@@ -403,6 +240,5 @@ mod tests {
     #[test]
     fn the_host_is_launched_onto_the_logon_screen() {
         assert_eq!(LOGON_DESKTOP, r"WinSta0\Winlogon");
-        assert!(!LOGON_HOST_EXE.contains('\\') && !LOGON_HOST_EXE.contains('/'));
     }
 }

@@ -53,6 +53,14 @@ function actions(): string[] {
 }
 
 describe('consent dialog', () => {
+  it('offers only "no" when the Lumepeer service hosts this machine (ADR 0169)', () => {
+    render(consentDialog(REQUEST, 'en', true), container);
+    expect(actions()).toEqual(['consent-action-deny']);
+
+    render(consentDialog({ ...REQUEST, terminal_only: true }, 'en', true), container);
+    expect(actions()).toEqual(['consent-action-deny']);
+  });
+
   it('offers a screen request the view and full-control answers', () => {
     render(consentDialog(REQUEST, 'en'), container);
 

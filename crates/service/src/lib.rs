@@ -31,6 +31,9 @@ pub mod desktop_input_channel;
 #[cfg(target_os = "windows")]
 pub mod frame;
 #[cfg(target_os = "windows")]
+pub mod host_channel;
+pub mod host_channel_protocol;
+#[cfg(target_os = "windows")]
 pub mod host_role;
 pub mod log;
 pub mod logon_enroll;
@@ -157,3 +160,45 @@ pub const LOGON_HOST_EXIT_ROLE_TAKEN: u32 = 4;
 /// reads this as "start the owner's client", so the dial has somebody to reach
 /// whether or not autostart is on.
 pub const LOGON_HOST_EXIT_HANDED_OVER: u32 = 5;
+
+/// The single argument that starts the desktop application as this machine's
+/// host in the signed-in console session (ADR 0169 §1).
+///
+/// [`LOGON_HOST_ARG`]'s counterpart for the other side of a sign-in: the
+/// service launches the desktop binary with exactly this argument into the
+/// console session's `Winsta0\Default` desktop, as `LocalSystem`, while
+/// somebody is signed in there. It hosts with that person's stores, the ones
+/// their elevated client kept (ADR 0123), so every guest reaches the identity
+/// it saved; and it injects from where the ADR 0114 injector stands, so
+/// elevated windows and a `VMware` guest take its input.
+pub const SESSION_HOST_ARG: &str = "--session-host";
+
+/// Exit code of a session host on a machine where ADR 0169 is not turned on
+/// yet: no `session-host-enabled` marker under `%ProgramData%\Lumepeer`
+/// (`program_data::session_host_enabled`).
+///
+/// Waited out like [`LOGON_HOST_EXIT_NOT_ENABLED`]: the elevated client hosts
+/// as before, and starting the same refusal on every tick would only fill the
+/// log.
+pub const SESSION_HOST_EXIT_NOT_ENABLED: u32 = 6;
+
+/// Exit code of a session host whose signed-in user has no store to host
+/// with: they never opened Lumepeer, so there is no identity any guest saved
+/// (ADR 0169 §1). Waited out like [`SESSION_HOST_EXIT_NOT_ENABLED`].
+pub const SESSION_HOST_EXIT_NO_STORE: u32 = 7;
+
+/// Exit code of a session host that found the host role held for longer than
+/// it waits for a leaving logon host to let it go — an elevated client
+/// started before ADR 0169 was turned on, most likely. Waited out like the two
+/// above.
+pub const SESSION_HOST_EXIT_ROLE_TAKEN: u32 = 8;
+
+/// Exit code of a session host that closed its endpoint (ADR 0169 §1): no
+/// client attached, "accept connections after sign-in" off, no session left.
+///
+/// Not a refusal: the service starts it again at once, and the new process
+/// listens on the client's channel without binding an endpoint until a
+/// client attaches or the setting is turned on. Leaving is how this host
+/// closes the endpoint, because a process that never bound one is the only
+/// kind sure to answer nothing.
+pub const SESSION_HOST_EXIT_CLOSED: u32 = 9;

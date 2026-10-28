@@ -169,6 +169,8 @@ export const pt: Dictionary = {
     'Este dispositivo executa o Linux dentro do ChromeOS, e os apps ali não conseguem ver a tela do ChromeOS, então quem você convidar não verá nada. Conectar-se daqui a outros dispositivos funciona normalmente.',
   'status.noEncoder':
     'Este dispositivo não tem codificador de vídeo, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
+  'status.hostedByService':
+    'Este dispositivo é hospedado pelo serviço Lumepeer, não por esta janela. Você ainda pode se conectar a outros dispositivos daqui.',
   'titlebar.minimize': 'Minimizar',
   'titlebar.maximize': 'Maximizar',
   'titlebar.close': 'Fechar',

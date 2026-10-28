@@ -693,6 +693,13 @@ export function sessionStatus(
    * has measured it: a session with no row here simply shows no pill.
    */
   connectionStats: ReadonlyMap<string, ConnectionStats> = new Map(),
+  /**
+   * Whether the Lumepeer service, not this window, hosts this machine
+   * (ADR 0169). Its channel can end a session and take a grant away, never
+   * give one, so the record request — a yes that grants `recording` — is not
+   * offered here.
+   */
+  decidedByHost = false,
 ): TemplateResult {
   const empty = sessions.length === 0 && history.length === 0;
   return html`
@@ -842,7 +849,7 @@ export function sessionStatus(
                         </div>
                       `
                     : ''}
-                  ${active ? recordRequest(session, locale, onRefresh, onRecordingPath) : ''}
+                  ${active && !decidedByHost ? recordRequest(session, locale, onRefresh, onRecordingPath) : ''}
                   ${active && session.file_transfer && hasFiles
                     ? fileTransferPanel(peer, files, locale, fileCommands, onRefresh)
                     : ''}

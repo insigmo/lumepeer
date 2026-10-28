@@ -26,6 +26,12 @@ async function revoke(peer: string): Promise<void> {
 export function consentDialog(
   request: SessionStatus | undefined,
   locale: Locale,
+  /**
+   * Whether the Lumepeer service, not this window, hosts this machine
+   * (ADR 0169). Letting a guest in is then the service's to decide, in a
+   * dialog of its own; this window can only say no.
+   */
+  decidedByHost = false,
 ): TemplateResult {
   if (!request) {
     return html`
@@ -52,7 +58,9 @@ export function consentDialog(
           >
             ${t(locale, 'consent.action.deny')}
           </button>
-          ${request.terminal_only
+          ${decidedByHost
+            ? ''
+            : request.terminal_only
             ? // A guest that came for a shell (ADR 0131) is let in or not:
               // a lesser role would carry no shell at all, and the host
               // grants this one the shell and nothing else whatever the

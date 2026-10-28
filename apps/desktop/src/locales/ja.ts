@@ -168,6 +168,8 @@ export const ja: Dictionary = {
     'このデバイスは ChromeOS 内で Linux を実行しており、そこのアプリからは ChromeOS の画面が見えないため、招待した相手には何も見えません。ここから他のデバイスへの接続は通常どおり使えます。',
   'status.noEncoder':
     'このデバイスにはビデオエンコーダーがないため、招待した相手には何も見えません。セッション自体は接続され、入力も引き続き機能します。',
+  'status.hostedByService':
+    'このデバイスはこのウィンドウではなく Lumepeer サービスがホストしています。ここから他のデバイスへの接続は引き続き行えます。',
   'titlebar.minimize': '最小化',
   'titlebar.maximize': '最大化',
   'titlebar.close': '閉じる',

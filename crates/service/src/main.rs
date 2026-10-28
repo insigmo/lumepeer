@@ -34,6 +34,8 @@
 )]
 
 #[cfg(target_os = "windows")]
+mod host_process;
+#[cfg(target_os = "windows")]
 mod install;
 #[cfg(target_os = "windows")]
 mod logon_host_launch;
@@ -47,6 +49,8 @@ mod secure_desktop;
 mod secure_desktop_input;
 #[cfg(target_os = "windows")]
 mod secure_desktop_launch;
+#[cfg(target_os = "windows")]
+mod session_host_launch;
 #[cfg(target_os = "windows")]
 mod system_injector_launch;
 #[cfg(target_os = "windows")]

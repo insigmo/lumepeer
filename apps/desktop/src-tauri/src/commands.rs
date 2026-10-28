@@ -207,6 +207,50 @@ fn check_host_surface(window: &Window) -> Result<(), IpcError> {
     }
 }
 
+/// The session host's channel, when it — not this process — hosts this
+/// machine (ADR 0169 §4). The host panel's commands go there instead of to
+/// this process's own actor, which has no host-side sessions.
+fn session_host(state: &AppState) -> Option<std::sync::Arc<crate::host_panel::HostPanel>> {
+    state.host_panel.clone()
+}
+
+/// What the webview hears when the session host did not do something.
+fn panel_error(error: crate::host_panel::PanelError) -> IpcError {
+    match error {
+        crate::host_panel::PanelError::Unreachable => IpcError {
+            code: "HOST_SERVICE_UNREACHABLE",
+            message: "the Lumepeer service hosting this machine does not answer".to_owned(),
+        },
+        crate::host_panel::PanelError::Refused => IpcError {
+            code: "HOST_SERVICE_REFUSED",
+            message: "the Lumepeer service hosting this machine did not do that".to_owned(),
+        },
+    }
+}
+
+/// What the webview hears when it asks this window for something only the
+/// session host may decide: letting a guest in, or giving one more
+/// (ADR 0169 §4, §5). Nothing on the channel can say it.
+fn decided_by_the_host() -> IpcError {
+    IpcError {
+        code: "DECIDED_BY_HOST_SERVICE",
+        message: "the Lumepeer service hosting this machine decides that, not this window"
+            .to_owned(),
+    }
+}
+
+/// Runs one narrowing request on the session host, off the async runtime: the
+/// channel blocks.
+async fn panel_act(
+    panel: std::sync::Arc<crate::host_panel::HostPanel>,
+    request: lumepeer_service::host_channel_protocol::Request,
+) -> Result<(), IpcError> {
+    tauri::async_runtime::spawn_blocking(move || panel.act(&request))
+        .await
+        .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+        .map_err(panel_error)
+}
+
 /// Rejects calls that do not come from the host's session bar.
 fn check_host_bar(window: &Window) -> Result<(), IpcError> {
     if window.label() == crate::view_windows::HOST_BAR_LABEL {
@@ -294,7 +338,7 @@ impl From<lumepeer_core::consent::Role> for RoleDto {
 }
 
 /// Session state as seen by the webview.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStateDtoWire {
     /// Queued, waiting for the host's decision.
@@ -364,7 +408,7 @@ pub struct InviteConnectArgs {
     clippy::struct_excessive_bools,
     reason = "mirrors `Grants`: §2.2 requires these permissions to stay               independent flags, and folding them here would hide that"
 )]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStatusDto {
     /// Pseudonymized peer label; never a raw `NodeId` (§15).
     pub peer_label: String,
@@ -695,6 +739,10 @@ pub struct UnattendedSubmitArgs {
 }
 
 /// Whether this host is ready to accept incoming connections.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent facts the webview reads one by one; none is a state of another"
+)]
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkStatusDto {
     /// True once the local endpoint has reached a relay and is dialable
@@ -716,6 +764,10 @@ pub struct NetworkStatusDto {
     /// ChromeOS screen, so hosting has to happen somewhere else (gap-tasks/05).
     /// `null` otherwise.
     pub capture_unavailable_reason: Option<&'static str>,
+    /// True when this window is not this machine's host because something
+    /// else is — on Windows, the Lumepeer service's session host (ADR 0169).
+    /// It still connects out; the window says so rather than staying silent.
+    pub hosted_by_service: bool,
 }
 
 /// What one live connection's link actually looks like (§18; ADR 0026,
@@ -904,6 +956,9 @@ pub async fn session_grant(
     args: SessionGrantArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    if session_host(&state).is_some() {
+        return Err(decided_by_the_host());
+    }
     state.network.grant(args.peer, args.role.into()).await?;
     Ok(())
 }
@@ -933,6 +988,11 @@ pub async fn session_revoke(
         state.network.leave_view(args.peer).await?;
         return Ok(());
     }
+    if let Some(panel) = session_host(&state) {
+        use lumepeer_service::host_channel_protocol::Request;
+
+        return panel_act(panel, Request::EndSession { peer: args.peer }).await;
+    }
     state.network.revoke(args.peer).await?;
     Ok(())
 }
@@ -948,33 +1008,48 @@ pub async fn session_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SessionStatusDto>, IpcError> {
     check_host_surface(&window)?;
+    if let Some(panel) = session_host(&state) {
+        // No answer is no sessions to show, not an error to raise every
+        // second while the session host restarts.
+        return Ok(
+            tauri::async_runtime::spawn_blocking(move || panel.snapshot())
+                .await
+                .ok()
+                .flatten()
+                .map(|snapshot| snapshot.sessions)
+                .unwrap_or_default(),
+        );
+    }
     let snapshot = state.network.status().await?;
-    Ok(snapshot
-        .into_iter()
-        .map(|s| SessionStatusDto {
-            peer_label: s.label,
-            device_os: s.device.as_ref().and_then(|d| d.os.clone()),
-            device_name: s.device.map(|d| d.name),
-            state: s.state.into(),
-            role: s.role.into(),
-            input: s.input,
-            clipboard_read: s.grants.clipboard_read,
-            clipboard_write: s.grants.clipboard_write,
-            file_transfer: s.grants.file_transfer,
-            recording: s.grants.recording,
-            display_mode: s.grants.display_mode,
-            recording_active: s.recording_active,
-            record_request: s.record_request,
-            secure_desktop: s.grants.secure_desktop,
-            secure_desktop_input: s.grants.secure_desktop_input,
-            secure_desktop_active: s.secure_desktop_active,
-            tunnel: s.grants.tunnel,
-            terminal: s.grants.terminal,
-            terminal_active: s.terminal_active,
-            terminal_only: s.kind == lumepeer_core::consent::SessionKind::Terminal,
-            chat_unread: s.chat_unread,
-        })
-        .collect())
+    Ok(snapshot.into_iter().map(session_status_dto).collect())
+}
+
+/// One host-side session as the webview reads it — here, and on the far side
+/// of the session host's channel (ADR 0169 §4), which sends the same rows.
+pub fn session_status_dto(s: lumepeer_runtime::network::SessionSnapshot) -> SessionStatusDto {
+    SessionStatusDto {
+        peer_label: s.label,
+        device_os: s.device.as_ref().and_then(|d| d.os.clone()),
+        device_name: s.device.map(|d| d.name),
+        state: s.state.into(),
+        role: s.role.into(),
+        input: s.input,
+        clipboard_read: s.grants.clipboard_read,
+        clipboard_write: s.grants.clipboard_write,
+        file_transfer: s.grants.file_transfer,
+        recording: s.grants.recording,
+        display_mode: s.grants.display_mode,
+        recording_active: s.recording_active,
+        record_request: s.record_request,
+        secure_desktop: s.grants.secure_desktop,
+        secure_desktop_input: s.grants.secure_desktop_input,
+        secure_desktop_active: s.secure_desktop_active,
+        tunnel: s.grants.tunnel,
+        terminal: s.grants.terminal,
+        terminal_active: s.terminal_active,
+        terminal_only: s.kind == lumepeer_core::consent::SessionKind::Terminal,
+        chat_unread: s.chat_unread,
+    }
 }
 
 /// Argument of [`session_set_grant`].
@@ -1007,6 +1082,25 @@ pub async fn session_set_grant(
     args: SessionSetGrantArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    if let Some(panel) = session_host(&state) {
+        use lumepeer_service::host_channel_protocol::Request;
+
+        if args.allowed {
+            return Err(decided_by_the_host());
+        }
+        let grant = serde_json::to_value(args.grant)
+            .ok()
+            .and_then(|name| name.as_str().map(str::to_owned))
+            .ok_or_else(|| panel_error(crate::host_panel::PanelError::Refused))?;
+        return panel_act(
+            panel,
+            Request::LowerGrant {
+                peer: args.peer,
+                grant,
+            },
+        )
+        .await;
+    }
     state
         .network
         .set_grant(args.peer, args.grant, args.allowed)
@@ -1485,6 +1579,7 @@ pub fn network_status(
         can_encode: health.can_encode(),
         capture_unavailable_reason: lumepeer_media::capture::inside_chromeos_container()
             .then_some("chromeos-container"),
+        hosted_by_service: !state.hosting,
     })
 }
 
@@ -2320,7 +2415,7 @@ pub async fn input_wheel(
 }
 
 /// DTO of one chat transcript row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatEntryDto {
     /// `true` when sent by the local user, `false` when received.
     pub outgoing: bool,
@@ -2349,6 +2444,30 @@ pub async fn chat_send(
     args: ChatSendArgs,
 ) -> Result<ChatEntryDto, IpcError> {
     check_view_window(&window, &args.peer).or_else(|_| check_window(&window))?;
+    // The main window's chat is with the host's guests, and those are the
+    // session host's (ADR 0169 §4); a view window's is this process's own.
+    if window.label() == MAIN_WINDOW_LABEL
+        && let Some(panel) = session_host(&state)
+    {
+        use lumepeer_service::host_channel_protocol::Request;
+
+        let text = args.text.clone();
+        panel_act(
+            panel,
+            Request::SendChat {
+                peer: args.peer,
+                text: args.text,
+            },
+        )
+        .await?;
+        return Ok(ChatEntryDto {
+            outgoing: true,
+            text,
+            at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        });
+    }
     let stored = state.network.chat_send(args.peer, args.text).await?;
     Ok(ChatEntryDto {
         outgoing: stored.outgoing,
@@ -2368,6 +2487,14 @@ pub async fn chat_transcript(
     peer: String,
 ) -> Result<Vec<ChatEntryDto>, IpcError> {
     check_view_window(&window, &peer).or_else(|_| check_window(&window))?;
+    if window.label() == MAIN_WINDOW_LABEL
+        && let Some(panel) = session_host(&state)
+    {
+        return tauri::async_runtime::spawn_blocking(move || panel.transcript(peer))
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
+    }
     let rows = state.network.chat_transcript(peer).await?;
     Ok(rows
         .into_iter()
@@ -2391,6 +2518,11 @@ pub async fn chat_mark_read(
     peer: String,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    if let Some(panel) = session_host(&state) {
+        use lumepeer_service::host_channel_protocol::Request;
+
+        return panel_act(panel, Request::MarkChatRead { peer }).await;
+    }
     state.network.chat_mark_read(peer).await?;
     Ok(())
 }

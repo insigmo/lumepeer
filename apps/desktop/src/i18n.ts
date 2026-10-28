@@ -228,6 +228,7 @@ export type TranslationKey =
   | 'status.noCapture'
   | 'status.noCapture.chromeos'
   | 'status.noEncoder'
+  | 'status.hostedByService'
   | 'titlebar.minimize'
   | 'titlebar.maximize'
   | 'titlebar.close'

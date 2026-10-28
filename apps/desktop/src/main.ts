@@ -79,6 +79,10 @@ let canEncode = true;
 // "no capture" a person can act on: host from ChromeOS itself instead
 // (gap-tasks/05).
 let chromeosContainer = false;
+// Whether this window is not this machine's host because the Lumepeer
+// service's session host is (ADR 0169). False until `network_status` says
+// so, which is also what an older backend that never says it reads as.
+let hostedByService = false;
 // When each peer last synced a clipboard, by pseudonymized label. Only the
 // timestamp is kept: `clipboard_pull` hands back the text, and this is where
 // that text stops — nothing renders it and nothing stores it (§15).
@@ -134,6 +138,16 @@ function recordingBanner(): TemplateResult | typeof nothing {
   }
   return html`<p class="recording-banner" role="status" aria-live="polite" data-testid="recording-banner">
     <span class="recording-dot" aria-hidden="true"></span>${t(locale, 'status.recording.banner')}
+  </p>`;
+}
+
+/** Says, rather than leaves to be guessed, that another process hosts this machine. */
+function hostedNotice(): TemplateResult | typeof nothing {
+  if (!hostedByService) {
+    return nothing;
+  }
+  return html`<p class="hosted-notice" role="status" data-testid="hosted-notice">
+    ${t(locale, 'status.hostedByService')}
   </p>`;
 }
 
@@ -305,7 +319,7 @@ function renderNow(): void {
             </aside>
             <main class="main-panel">
               ${rebootBanner(rebootPending, locale, () => void cancelReboot())}
-              ${recordingBanner()} ${mediaWarning()}
+              ${recordingBanner()} ${hostedNotice()} ${mediaWarning()}
               ${connectPanel(locale)}
               <div class="main-divider"></div>
               ${sessionStatus(
@@ -329,12 +343,13 @@ function renderNow(): void {
                 },
                 (peer) => saveDeviceButton(peer, locale, () => void refresh()),
                 connectionStats,
+                hostedByService,
               )}
             </main>
           </div>
         </div>
       `,
-      consentDialog(pendingRequest, locale),
+      consentDialog(pendingRequest, locale, hostedByService),
       isAwaitingCredentials() && !isCredentialsAuto() ? credentialsPanel(locale) : '',
       settingsView({
         locale,
@@ -412,6 +427,7 @@ async function refresh(): Promise<void> {
           can_capture: boolean;
           can_encode: boolean;
           capture_unavailable_reason: 'chromeos-container' | null;
+          hosted_by_service?: boolean;
         }>('network_status'),
         invoke<{
           phase: ConnectPhase;
@@ -464,6 +480,7 @@ async function refresh(): Promise<void> {
     canCapture = networkResult.can_capture;
     canEncode = networkResult.can_encode;
     chromeosContainer = networkResult.capture_unavailable_reason === 'chromeos-container';
+    hostedByService = networkResult.hosted_by_service === true;
     // The peer the drawer is open on ended its session: close rather than
     // leave a transcript poll spinning on a dead label (the poll itself stops
     // on the first IPC error, but this keeps the UI honest immediately).

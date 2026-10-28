@@ -2285,6 +2285,18 @@ input[type='checkbox'].switch:disabled {
    are the act, and the indicator that goes with it. Neither the banner nor
    the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
    about what the person at this machine sees without going looking. */
+/* Another process hosts this machine (ADR 0169): information, not alarm, so
+   the quiet surface rather than a colour. */
+.hosted-notice {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: var(--fs-micro);
+}
+
 .recording-banner {
   display: flex;
   align-items: center;

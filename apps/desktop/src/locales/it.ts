@@ -169,6 +169,8 @@ export const it: Dictionary = {
     "Questo dispositivo esegue Linux all'interno di ChromeOS e le app lì non possono vedere lo schermo di ChromeOS, quindi chi inviti non vedrà nulla. Connettersi da qui ad altri dispositivi funziona come sempre.",
   'status.noEncoder':
     "Questo dispositivo non ha un encoder video, quindi chi inviti non vedrà nulla. Le sessioni si connettono comunque e l'input continua a funzionare.",
+  'status.hostedByService':
+    'Questo dispositivo è gestito dal servizio Lumepeer, non da questa finestra. Da qui puoi comunque connetterti ad altri dispositivi.',
   'titlebar.minimize': 'Riduci a icona',
   'titlebar.maximize': 'Ingrandisci',
   'titlebar.close': 'Chiudi',

@@ -367,19 +367,75 @@ pub fn discard_untrusted_file(path: &Path) -> bool {
     }
     // Something is there. Whatever cannot even be read is treated as
     // somebody else's, like one that can and turns out to be.
-    let trusted = open_without_following(path, READ_CONTROL).is_some_and(|handle| {
+    if is_trusted_file(path) {
+        return true;
+    }
+    tracing::warn!(path = %path.display(), "removing a file in a machine directory that this service did not write");
+    std::fs::remove_file(path).is_ok()
+}
+
+/// Whether `path` is a plain file with a single name, owned by `LocalSystem`
+/// or administrators: one only they could have written.
+fn is_trusted_file(path: &Path) -> bool {
+    open_without_following(path, READ_CONTROL).is_some_and(|handle| {
         let plain_single_file = handle.information().is_some_and(|info| {
             info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT.0 | FILE_ATTRIBUTE_DIRECTORY.0)
                 == 0
                 && info.nNumberOfLinks <= 1
         });
         plain_single_file && handle.owner_is_trusted() == Some(true)
-    });
-    if trusted {
-        return true;
+    })
+}
+
+/// Name of the file under the root whose presence turns the session host of
+/// ADR 0169 on, until pack 09 turns it on for everybody. It holds nothing.
+const SESSION_HOST_ENABLED_FILE: &str = "session-host-enabled";
+
+/// Whether this machine is hosted by the session host of ADR 0169 rather than
+/// by the elevated client.
+///
+/// Only a file `LocalSystem` or administrators own counts — the rule
+/// [`logon_host_owner`] keeps, for the same reason: it decides which process
+/// admits guests to this machine. One somebody else left is ignored rather
+/// than removed, so a process with no rights asks the same question safely.
+#[must_use]
+pub fn session_host_enabled() -> bool {
+    session_host_enabled_in(&root())
+}
+
+/// [`session_host_enabled`], under the tree rooted at `root`.
+fn session_host_enabled_in(root: &Path) -> bool {
+    is_trusted_file(&root.join(SESSION_HOST_ENABLED_FILE))
+}
+
+/// Name of the file in an account's own directory that says the session host
+/// accepts connections after sign-in even with no client open (ADR 0169 §1,
+/// §9). Its presence is the whole answer.
+const ACCEPT_AFTER_SIGN_IN_FILE: &str = "accept-after-sign-in";
+
+/// Whether the account whose directory is `directory` wants this machine
+/// reachable from the moment it signs in, client open or not (ADR 0169 §9).
+///
+/// Off unless written: the directory only `LocalSystem` and administrators
+/// can write is what makes the answer the account owner's.
+#[must_use]
+pub fn accept_after_sign_in(directory: &Path) -> bool {
+    directory.join(ACCEPT_AFTER_SIGN_IN_FILE).exists()
+}
+
+/// Records whether the account whose directory is `directory` accepts
+/// connections after sign-in; `false` when that could not be written.
+#[must_use]
+pub fn set_accept_after_sign_in(directory: &Path, accept: bool) -> bool {
+    let path = directory.join(ACCEPT_AFTER_SIGN_IN_FILE);
+    if accept {
+        std::fs::write(&path, b"").is_ok()
+    } else {
+        match std::fs::remove_file(&path) {
+            Ok(()) => true,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
     }
-    tracing::warn!(path = %path.display(), "removing a file in a machine directory that this service did not write");
-    std::fs::remove_file(path).is_ok()
 }
 
 /// Reads who owns the directory behind `handle`, refuses what is not a
@@ -792,6 +848,60 @@ mod tests {
         assert!(set_logon_host_owner_in(&base, None));
         assert_eq!(logon_host_owner_in(&base), None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ADR 0169: the session host is on only while a file administrators own
+    /// says so. One an ordinary user wrote is not believed, and a reader
+    /// leaves it where it is. Runs both ways: unelevated, the file this test
+    /// writes is the ordinary user's.
+    #[test]
+    fn the_session_host_marker_counts_only_when_administrators_wrote_it() {
+        let base = std::env::temp_dir().join(format!(
+            "lumepeer-program-data-session-host-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(!session_host_enabled_in(&base), "off until written");
+
+        let marker = base.join(SESSION_HOST_ENABLED_FILE);
+        std::fs::write(&marker, b"").unwrap();
+        let elevated = this_process().is_some_and(|(_, elevated)| elevated);
+        assert_eq!(
+            session_host_enabled_in(&base),
+            elevated,
+            "an elevated run writes an administrators' file, an unelevated one its own"
+        );
+        if elevated {
+            assert!(give_to_this_user(&marker));
+            assert!(
+                !session_host_enabled_in(&base),
+                "a file an ordinary user owns does not turn the session host on"
+            );
+        }
+        assert!(marker.exists(), "asking removes nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ADR 0169 §9: accepting connections after sign-in is off until written,
+    /// and turning it on or off twice is the same as once.
+    #[test]
+    fn accepting_after_sign_in_is_off_until_turned_on() {
+        let directory = std::env::temp_dir().join(format!(
+            "lumepeer-program-data-accept-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+
+        assert!(!accept_after_sign_in(&directory), "off unless turned on");
+        assert!(set_accept_after_sign_in(&directory, true));
+        assert!(set_accept_after_sign_in(&directory, true));
+        assert!(accept_after_sign_in(&directory));
+        assert!(set_accept_after_sign_in(&directory, false));
+        assert!(set_accept_after_sign_in(&directory, false));
+        assert!(!accept_after_sign_in(&directory));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// ADR 0133: what an account remembers is its refusal, and taking it back

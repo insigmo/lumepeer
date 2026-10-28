@@ -18,6 +18,10 @@
 //! the user's split UAC token, the user's own environment, the ordinary
 //! desktop. The path is the desktop binary beside this one and the command line
 //! carries nothing else (ADR 0043 §4).
+//!
+//! The session host (ADR 0169 §7) starts the same client for the person signed
+//! in — with the limited half of their token, since a client that is only a
+//! guest and a panel needs nothing more ([`start_client`]).
 
 #![allow(
     unsafe_code,
@@ -29,7 +33,7 @@
 use core::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ELEVATION_REQUIRED, HANDLE};
 use windows::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION_TYPE, TOKEN_LINKED_TOKEN, TokenElevationType,
     TokenElevationTypeLimited, TokenLinkedToken,
@@ -38,7 +42,7 @@ use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnviron
 use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
 };
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
 
 use crate::agent_launch::{primary_token_of, query_user_token, sid_of_token};
 use crate::host_role::HostRole;
@@ -157,13 +161,95 @@ fn start_as(user: HANDLE, session: u32) -> bool {
         tracing::warn!(session, "cannot start the client: no token to run it with");
         return false;
     };
-    let started = spawn(token, session, &client);
+    let started = spawn(token, session, &client)
+        .inspect(|()| {
+            tracing::info!(
+                session,
+                "started the owner's client for the guest who signed in (ADR 0164)"
+            );
+        })
+        .inspect_err(
+            |error| tracing::warn!(session, %error, "cannot start the client: CreateProcessAsUser refused"),
+        )
+        .is_ok();
     // SAFETY: `token` is a live token handle and is not used again after the
     // spawn above.
     unsafe {
         let _ = CloseHandle(token);
     }
     started
+}
+
+/// Starts the client of the person signed in at `session`, for the session
+/// host that has a session nobody can see yet (ADR 0169 §7); says whether one
+/// was started.
+///
+/// With the person's own token as `WTSQueryUserToken` hands it out — the
+/// limited half of an administrator's — because the client is their guest
+/// and their panel and needs nothing more. Until the client's manifest stops
+/// asking for administrator rights (pack 09), that launch is refused with
+/// `ERROR_ELEVATION_REQUIRED`, and the elevated half is used instead, as
+/// [`start_owner_client`] does. Every failure is logged.
+#[must_use]
+pub fn start_client(session: u32) -> bool {
+    let Some(user) = query_user_token(session) else {
+        tracing::warn!(
+            session,
+            "cannot start the client: nobody's token in this session"
+        );
+        return false;
+    };
+    let started = client_path().is_some_and(|client| start_limited(user, session, &client));
+    // SAFETY: `user` came from `query_user_token` and is not used again.
+    unsafe {
+        let _ = CloseHandle(user);
+    }
+    started
+}
+
+/// [`start_client`] once the person's token and the client's path are in
+/// hand.
+fn start_limited(user: HANDLE, session: u32, client: &str) -> bool {
+    let Some(limited) = primary_token_of(user) else {
+        tracing::warn!(session, "cannot start the client: no token to run it with");
+        return false;
+    };
+    let result = spawn(limited, session, client);
+    // SAFETY: `limited` is a live token handle and is not used again.
+    unsafe {
+        let _ = CloseHandle(limited);
+    }
+    let result = match result {
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_ELEVATION_REQUIRED.0) => {
+            let Some(elevated) = elevated_primary(user) else {
+                tracing::warn!(
+                    session,
+                    "cannot start the client: it asks for rights this person has not got"
+                );
+                return false;
+            };
+            let result = spawn(elevated, session, client);
+            // SAFETY: `elevated` is a live token handle and is not used again.
+            unsafe {
+                let _ = CloseHandle(elevated);
+            }
+            result
+        }
+        result => result,
+    };
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                session,
+                "started the client for a session nobody could see yet (ADR 0169)"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(session, %error, "cannot start the client: CreateProcessAsUser refused");
+            false
+        }
+    }
 }
 
 /// The client beside this binary, as a string safe to quote on a command
@@ -240,7 +326,7 @@ fn elevated_primary(user: HANDLE) -> Option<HANDLE> {
 
 /// `CreateProcessAsUserW`s the client onto `session`'s ordinary desktop as the
 /// user `token` names, in that user's own environment.
-fn spawn(token: HANDLE, session: u32, client: &str) -> bool {
+fn spawn(token: HANDLE, session: u32, client: &str) -> windows::core::Result<()> {
     // The client keeps its settings, logs and webview under the user's
     // `LOCALAPPDATA`; started with this service's environment it would be
     // `LocalSystem`'s, a different client with none of the user's state.
@@ -251,7 +337,7 @@ fn spawn(token: HANDLE, session: u32, client: &str) -> bool {
     if let Err(error) = unsafe { CreateEnvironmentBlock(&raw mut environment, Some(token), false) }
     {
         tracing::warn!(session, %error, "cannot start the client: no environment for the user");
-        return false;
+        return Err(error);
     }
     let application = wide(client);
     // `"exe"`: the quotes keep a `C:\Program Files\...` path whole, and there
@@ -289,15 +375,8 @@ fn spawn(token: HANDLE, session: u32, client: &str) -> bool {
     unsafe {
         let _ = DestroyEnvironmentBlock(environment);
     }
-    if let Err(error) = created {
-        tracing::warn!(session, %error, "cannot start the client: CreateProcessAsUser refused");
-        return false;
-    }
-    tracing::info!(
-        session,
-        pid = process.dwProcessId,
-        "started the owner's client for the guest who signed in (ADR 0164)"
-    );
+    created?;
+    tracing::debug!(session, pid = process.dwProcessId, "client process created");
     // The client lives on its own; nothing here waits on it.
     //
     // SAFETY: both handles came from the successful create above and are not
@@ -306,7 +385,7 @@ fn spawn(token: HANDLE, session: u32, client: &str) -> bool {
         let _ = CloseHandle(process.hThread);
         let _ = CloseHandle(process.hProcess);
     }
-    true
+    Ok(())
 }
 
 #[cfg(test)]

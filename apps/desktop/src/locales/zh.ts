@@ -161,6 +161,8 @@ export const zh: Dictionary = {
   'status.noCapture': '此设备不支持屏幕捕获，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
   'status.noCapture.chromeos': '此设备在 ChromeOS 内运行 Linux，其中的应用无法看到 ChromeOS 的屏幕，因此受邀者将看不到任何画面。从这里连接其他设备仍可照常使用。',
   'status.noEncoder': '此设备没有视频编码器，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
+  'status.hostedByService':
+    '此设备由 Lumepeer 服务托管，而不是此窗口。你仍可以从这里连接到其他设备。',
   'titlebar.minimize': '最小化',
   'titlebar.maximize': '最大化',
   'titlebar.close': '关闭',
