@@ -441,6 +441,14 @@ export const es: Dictionary = {
   'unattended.logonScreen.label': 'También en la pantalla de inicio de sesión de Windows',
   'unattended.logonScreen.note':
     'Tras un reinicio o un cierre de sesión, un invitado con la contraseña del dispositivo ve la pantalla de inicio de sesión y puede iniciar sesión. En esa pantalla no se indica que haya alguien conectado.',
+  'unattended.managedByService':
+    'Este dispositivo lo atiende el servicio Lumepeer. Aquí puedes ver la configuración de acceso; cambiarla requiere permisos de administrador.',
+  'unattended.openAccessSettings':
+    'Cambiar la configuración de acceso',
+  'access.heading':
+    'Configuración de acceso',
+  'access.explain':
+    'Esta ventana se ejecuta con permisos de administrador. Lo que cambies aquí se aplica de inmediato al servicio Lumepeer que atiende este dispositivo.',
   'book.heading': 'Dispositivos guardados',
   'book.explain':
     'Confiar en un dispositivo no le permite entrar por sí solo. Determina quién puede intentar la contraseña del dispositivo.',

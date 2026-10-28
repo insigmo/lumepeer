@@ -677,7 +677,7 @@ pub struct AddressBookSetTrustedArgs {
 /// There is no field here for the password, its hash or the TOTP secret, and
 /// that is the point: the webview cannot be handed what the type cannot carry
 /// (§2.3, §13; ADR 0033).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnattendedStatusDto {
     /// Whether a device password is set.
     pub enabled: bool,
@@ -690,6 +690,11 @@ pub struct UnattendedStatusDto {
     /// cannot be: off Windows, or a run that does not keep its stores where
     /// only administrators can write.
     pub logon_screen: Option<bool>,
+    /// True when the session host keeps this policy and this window may only
+    /// read it, turn it off, and open the elevated access-settings window to
+    /// change it (ADR 0169 §5).
+    #[serde(default)]
+    pub managed_by_service: bool,
 }
 
 /// Argument of [`unattended_set_password`].
@@ -1635,10 +1640,14 @@ pub async fn connection_stats(
 #[tauri::command]
 pub async fn address_book_list(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<Vec<AddressBookEntryDto>, IpcError> {
     check_window(&window)?;
-    let rows = state.network.address_book_list().await?;
+    let rows = if let Some(editor) = access_settings(&app) {
+        editor.book()?
+    } else {
+        app_state(&app)?.network.address_book_list().await?
+    };
     Ok(rows
         .into_iter()
         .map(|row| AddressBookEntryDto {
@@ -1663,11 +1672,14 @@ pub async fn address_book_list(
 #[tauri::command]
 pub async fn address_book_upsert(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: AddressBookUpsertArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    state
+    if let Some(editor) = access_settings(&app) {
+        return Ok(editor.upsert(&args.peer, args.name, args.tags, args.notes)?);
+    }
+    app_state(&app)?
         .network
         .address_book_upsert(args.peer, args.name, args.tags, args.notes)
         .await?;
@@ -1681,11 +1693,17 @@ pub async fn address_book_upsert(
 #[tauri::command]
 pub async fn address_book_remove(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: AddressBookRemoveArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    state.network.address_book_remove(args.peer).await?;
+    if let Some(editor) = access_settings(&app) {
+        return Ok(editor.remove(&args.peer)?);
+    }
+    app_state(&app)?
+        .network
+        .address_book_remove(args.peer)
+        .await?;
     Ok(())
 }
 
@@ -1701,11 +1719,14 @@ pub async fn address_book_remove(
 #[tauri::command]
 pub async fn address_book_set_trusted(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: AddressBookSetTrustedArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
-    state
+    if let Some(editor) = access_settings(&app) {
+        return Ok(editor.set_trusted(&args.peer, args.trusted)?);
+    }
+    app_state(&app)?
         .network
         .address_book_set_trusted(args.peer, args.trusted)
         .await?;
@@ -1719,16 +1740,145 @@ pub async fn address_book_set_trusted(
 #[tauri::command]
 pub async fn unattended_status(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<UnattendedStatusDto, IpcError> {
     check_window(&window)?;
+    if let Some(editor) = access_settings(&app) {
+        let settings = editor.status()?;
+        return Ok(UnattendedStatusDto {
+            enabled: settings.enabled,
+            totp_enabled: settings.totp_enabled,
+            role: settings.role.into(),
+            logon_screen: editor_logon_screen_status(&editor),
+            managed_by_service: false,
+        });
+    }
+    let state = app_state(&app)?;
+    // The session host keeps the policy; this window reads it from there, and
+    // only the elevated access-settings window changes it (ADR 0169 §5).
+    if let Some(panel) = session_host(&state) {
+        let read = tauri::async_runtime::spawn_blocking(move || panel.unattended())
+            .await
+            .ok()
+            .flatten();
+        return Ok(read.unwrap_or(UnattendedStatusDto {
+            enabled: false,
+            totp_enabled: false,
+            role: RoleDto::ViewOnly,
+            logon_screen: None,
+            managed_by_service: true,
+        }));
+    }
     let settings = state.network.unattended_status().await?;
     Ok(UnattendedStatusDto {
         enabled: settings.enabled,
         totp_enabled: settings.totp_enabled,
         role: settings.role.into(),
         logon_screen: logon_screen_status(),
+        managed_by_service: false,
     })
+}
+
+/// The access-settings window's policy, when this process is that window
+/// (ADR 0169 §5): the `unattended_*` and `address_book_*` commands act on it
+/// instead of on an actor, which that process does not have.
+fn access_settings(
+    app: &tauri::AppHandle,
+) -> Option<tauri::State<'_, crate::access_settings::AccessSettings>> {
+    use tauri::Manager as _;
+    app.try_state()
+}
+
+/// This process's state, which every process but the access-settings window
+/// has.
+fn app_state(app: &tauri::AppHandle) -> Result<tauri::State<'_, AppState>, IpcError> {
+    use tauri::Manager as _;
+    app.try_state().ok_or_else(IpcError::poisoned)
+}
+
+/// What this window answers when asked to widen the policy the session host
+/// keeps: that is the elevated access-settings window's to do (ADR 0169 §5).
+fn access_settings_required() -> IpcError {
+    IpcError {
+        code: "ACCESS_SETTINGS_REQUIRED",
+        message: "the Lumepeer service hosts this machine: change this in the access settings, \
+                  which ask for administrator rights"
+            .to_owned(),
+    }
+}
+
+/// Whether the logon screen is hosted with the edited account's stores.
+#[cfg_attr(
+    target_os = "windows",
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "`None` off Windows, as the DTO says"
+    )
+)]
+fn editor_logon_screen_status(editor: &crate::access_settings::AccessSettings) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        Some(
+            lumepeer_service::program_data::logon_host_owner().as_deref() == Some(editor.account()),
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = editor;
+        None
+    }
+}
+
+/// Opens the access-settings window: this binary, started again elevated —
+/// one UAC prompt — to change what this window may only read (ADR 0169 §5).
+///
+/// # Errors
+/// `ACCESS_SETTINGS_NOT_NEEDED` where this window is the host and edits its
+/// policy in place; `ACCESS_SETTINGS_CANCELLED` when the prompt was declined;
+/// `ACCESS_SETTINGS_FAILED` when Windows would not start it.
+#[tauri::command]
+pub async fn access_settings_open(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    if session_host(&state).is_none() {
+        return Err(IpcError {
+            code: "ACCESS_SETTINGS_NOT_NEEDED",
+            message: "this window hosts this machine and changes its access settings itself"
+                .to_owned(),
+        });
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use lumepeer_service::access_settings::{OpenError, open_elevated};
+
+        let failed = |message: String| IpcError {
+            code: "ACCESS_SETTINGS_FAILED",
+            message,
+        };
+        let (account, _) = lumepeer_service::program_data::this_process()
+            .ok_or_else(|| failed("cannot tell which account this is".to_owned()))?;
+        let exe = std::env::current_exe().map_err(|error| failed(error.to_string()))?;
+        let opened = tauri::async_runtime::spawn_blocking(move || open_elevated(&exe, &account))
+            .await
+            .map_err(|error| failed(error.to_string()))?;
+        match opened {
+            Ok(()) => Ok(()),
+            Err(OpenError::Cancelled) => Err(IpcError {
+                code: "ACCESS_SETTINGS_CANCELLED",
+                message: "the access settings need administrator rights, and the prompt was \
+                          declined"
+                    .to_owned(),
+            }),
+            Err(OpenError::NotAnAccount) => Err(failed("not an account".to_owned())),
+            Err(OpenError::Failed(code)) => Err(failed(format!("Windows error {code}"))),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err(IpcError::unsupported())
+    }
 }
 
 /// Whether the logon screen is hosted with this account's stores (ADR 0126),
@@ -1807,8 +1957,27 @@ pub struct LogonScreenArgs {
 /// feature cannot be (see [`logon_screen_status`]) or the choice cannot be
 /// written.
 #[tauri::command]
-pub fn unattended_set_logon_screen(window: Window, args: LogonScreenArgs) -> Result<(), IpcError> {
+pub fn unattended_set_logon_screen(
+    window: Window,
+    app: tauri::AppHandle,
+    args: LogonScreenArgs,
+) -> Result<(), IpcError> {
     check_window(&window)?;
+    #[cfg(target_os = "windows")]
+    if let Some(editor) = access_settings(&app) {
+        set_logon_screen_for(editor.account(), args.enabled).map_err(|message| IpcError {
+            code: "UNATTENDED",
+            message,
+        })?;
+        tracing::info!(
+            enabled = args.enabled,
+            "hosting the logon screen changed (access settings)"
+        );
+        return Ok(());
+    }
+    if app_state(&app).is_ok_and(|state| session_host(&state).is_some()) {
+        return Err(access_settings_required());
+    }
     set_logon_screen(args.enabled).map_err(|message| IpcError {
         code: "UNATTENDED",
         message,
@@ -1825,30 +1994,10 @@ pub fn unattended_set_logon_screen(window: Window, args: LogonScreenArgs) -> Res
 fn set_logon_screen(enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use lumepeer_service::program_data::{
-            logon_host_owner, set_logon_host_declined, set_logon_host_owner, user_directory,
-        };
-
         let Some(account) = crate::placement::protected_account() else {
             return Err("the sign-in screen can only be hosted by the installed app".to_owned());
         };
-        let recorded = user_directory(&account)
-            .is_some_and(|directory| set_logon_host_declined(&directory, !enabled));
-        if !recorded {
-            return Err("cannot save the sign-in screen setting".to_owned());
-        }
-        let owner = if enabled {
-            Some(account.as_str())
-        } else if logon_host_owner().as_deref() == Some(&*account) {
-            None
-        } else {
-            return Ok(());
-        };
-        if set_logon_host_owner(owner) {
-            Ok(())
-        } else {
-            Err("cannot save the sign-in screen setting".to_owned())
-        }
+        set_logon_screen_for(&account, enabled)
     }
     #[cfg(target_os = "linux")]
     {
@@ -1883,6 +2032,34 @@ fn set_logon_screen(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// The Windows half of [`set_logon_screen`], for the account `account`: this
+/// run's own, or — in the access-settings window — the one it edits
+/// (ADR 0169 §5).
+#[cfg(target_os = "windows")]
+fn set_logon_screen_for(account: &str, enabled: bool) -> Result<(), String> {
+    use lumepeer_service::program_data::{
+        logon_host_owner, set_logon_host_declined, set_logon_host_owner, user_directory,
+    };
+
+    let recorded = user_directory(account)
+        .is_some_and(|directory| set_logon_host_declined(&directory, !enabled));
+    if !recorded {
+        return Err("cannot save the sign-in screen setting".to_owned());
+    }
+    let owner = if enabled {
+        Some(account)
+    } else if logon_host_owner().as_deref() == Some(account) {
+        None
+    } else {
+        return Ok(());
+    };
+    if set_logon_host_owner(owner) {
+        Ok(())
+    } else {
+        Err("cannot save the sign-in screen setting".to_owned())
+    }
+}
+
 /// Hosts the logon screen with this account's stores, now that it has a device
 /// password — unless its owner turned that off, or another account on this
 /// machine already hosts it (ADR 0133).
@@ -1894,30 +2071,8 @@ fn set_logon_screen(enabled: bool) -> Result<(), String> {
 pub fn host_logon_screen_unless_declined() {
     #[cfg(target_os = "windows")]
     {
-        use lumepeer_service::program_data::{
-            logon_host_declined, logon_host_owner, set_logon_host_owner, user_directory,
-        };
-
-        let Some(account) = crate::placement::protected_account() else {
-            return;
-        };
-        let Some(directory) = user_directory(&account) else {
-            return;
-        };
-        if logon_host_declined(&directory) {
-            return;
-        }
-        match logon_host_owner() {
-            Some(owner) if owner == account => {}
-            Some(_) => {
-                tracing::info!("another account on this machine hosts the sign-in screen");
-            }
-            None if set_logon_host_owner(Some(&account)) => {
-                tracing::info!(
-                    "a device password is set: the sign-in screen is hosted too (ADR 0133)"
-                );
-            }
-            None => tracing::warn!("cannot turn hosting the sign-in screen on"),
+        if let Some(account) = crate::placement::protected_account() {
+            host_logon_screen_unless_declined_for(&account);
         }
     }
     #[cfg(target_os = "linux")]
@@ -1947,6 +2102,33 @@ pub fn host_logon_screen_unless_declined() {
     }
 }
 
+/// The Windows half of [`host_logon_screen_unless_declined`], for the account
+/// `account`: this run's own, or the one the access-settings window edits
+/// (ADR 0169 §5).
+#[cfg(target_os = "windows")]
+fn host_logon_screen_unless_declined_for(account: &str) {
+    use lumepeer_service::program_data::{
+        logon_host_declined, logon_host_owner, set_logon_host_owner, user_directory,
+    };
+
+    let Some(directory) = user_directory(account) else {
+        return;
+    };
+    if logon_host_declined(&directory) {
+        return;
+    }
+    match logon_host_owner() {
+        Some(owner) if owner == account => {}
+        Some(_) => {
+            tracing::info!("another account on this machine hosts the sign-in screen");
+        }
+        None if set_logon_host_owner(Some(account)) => {
+            tracing::info!("a device password is set: the sign-in screen is hosted too (ADR 0133)");
+        }
+        None => tracing::warn!("cannot turn hosting the sign-in screen on"),
+    }
+}
+
 /// Sets or replaces the device password, turning unattended access on (§8).
 ///
 /// The password travels one way only. It is hashed with Argon2id inside
@@ -1959,10 +2141,22 @@ pub fn host_logon_screen_unless_declined() {
 #[tauri::command]
 pub async fn unattended_set_password(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: UnattendedSetPasswordArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    if let Some(editor) = access_settings(&app) {
+        editor.set_password(&args.password)?;
+        #[cfg(target_os = "windows")]
+        host_logon_screen_unless_declined_for(editor.account());
+        return Ok(());
+    }
+    let state = app_state(&app)?;
+    // Never over the channel, not even confirmed in a dialog: a password a
+    // program of this user's swapped in would look the same (ADR 0169 §5).
+    if session_host(&state).is_some() {
+        return Err(access_settings_required());
+    }
     state.network.unattended_set_password(args.password).await?;
     host_logon_screen_unless_declined();
     Ok(())
@@ -1974,11 +2168,21 @@ pub async fn unattended_set_password(
 /// Rejects calls from any window but the main one; propagates a keystore
 /// failure rather than reporting a success that did not persist.
 #[tauri::command]
-pub async fn unattended_disable(
-    window: Window,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), IpcError> {
+pub async fn unattended_disable(window: Window, app: tauri::AppHandle) -> Result<(), IpcError> {
     check_window(&window)?;
+    if let Some(editor) = access_settings(&app) {
+        return Ok(editor.disable()?);
+    }
+    let state = app_state(&app)?;
+    // Turning it off narrows, so this window may ask the session host for it
+    // over the channel, with no prompt (ADR 0169 §4).
+    if let Some(panel) = session_host(&state) {
+        return panel_act(
+            panel,
+            lumepeer_service::host_channel_protocol::Request::UnattendedOff,
+        )
+        .await;
+    }
     state.network.unattended_disable().await?;
     Ok(())
 }
@@ -1995,11 +2199,19 @@ pub async fn unattended_disable(
 #[tauri::command]
 pub async fn unattended_set_totp(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: UnattendedSetTotpArgs,
 ) -> Result<Option<TotpProvisioningDto>, IpcError> {
     check_window(&window)?;
-    let provisioning = state.network.unattended_set_totp(args.enabled).await?;
+    let provisioning = if let Some(editor) = access_settings(&app) {
+        editor.set_totp(args.enabled)?
+    } else {
+        let state = app_state(&app)?;
+        if session_host(&state).is_some() {
+            return Err(access_settings_required());
+        }
+        state.network.unattended_set_totp(args.enabled).await?
+    };
     Ok(provisioning.map(|p| TotpProvisioningDto {
         secret_base32: p.secret_base32,
         uri: p.uri,
@@ -2016,10 +2228,17 @@ pub async fn unattended_set_totp(
 #[tauri::command]
 pub async fn unattended_set_role(
     window: Window,
-    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
     args: UnattendedSetRoleArgs,
 ) -> Result<(), IpcError> {
     check_window(&window)?;
+    if let Some(editor) = access_settings(&app) {
+        return Ok(editor.set_role(args.role.into())?);
+    }
+    let state = app_state(&app)?;
+    if session_host(&state).is_some() {
+        return Err(access_settings_required());
+    }
     state.network.unattended_set_role(args.role.into()).await?;
     Ok(())
 }

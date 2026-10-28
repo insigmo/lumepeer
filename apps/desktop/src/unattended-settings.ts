@@ -27,6 +27,12 @@ export interface UnattendedStatus {
    * these credentials (ADR 0126); `null` where it cannot be.
    */
   logon_screen?: boolean | null;
+  /**
+   * True when the Lumepeer service's session host keeps this policy (ADR 0169
+   * §5): this window reads it, may turn it off, and changes it only through
+   * the elevated access-settings window.
+   */
+  managed_by_service?: boolean;
 }
 
 /** The one-time payload `unattended_set_totp` returns when turning it on. */
@@ -156,6 +162,9 @@ export function unattendedSettings(
   locale: Locale,
   onRefresh: () => void = () => {},
 ): TemplateResult {
+  if (status.managed_by_service === true) {
+    return managedByService(status, locale, onRefresh);
+  }
   const justSaved = Date.now() - savedAt < SAVED_FEEDBACK_MS;
   return html`
     <section class="unattended-panel" aria-labelledby="unattended-heading">
@@ -260,6 +269,94 @@ export function unattendedSettings(
                 void run(async (invoke) => {
                   await invoke('unattended_disable');
                   provisioning = undefined;
+                }, onRefresh);
+              }}
+            >
+              ${t(locale, 'unattended.disable')}
+            </button>
+          `
+        : ''}
+      ${errorMessage
+        ? html`<p class="unattended-error" role="alert" data-testid="unattended-error">${errorMessage}</p>`
+        : ''}
+    </section>
+  `;
+}
+
+/** The shield on the button that asks Windows for administrator rights. */
+const SHIELD_ICON = html`<svg
+  viewBox="0 0 16 16"
+  width="14"
+  height="14"
+  aria-hidden="true"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.4"
+  stroke-linejoin="round"
+>
+  <path d="M8 1.75 2.75 3.9v3.6c0 3.1 2.2 5.6 5.25 6.75 3.05-1.15 5.25-3.65 5.25-6.75V3.9Z" />
+</svg>`;
+
+/**
+ * The panel where the Lumepeer service hosts this machine (ADR 0169 §5).
+ *
+ * Read only: no password field, no switch that widens anything. Turning
+ * unattended access off narrows, so it stays — the session host takes that
+ * from this window with no prompt. Everything else is one button that starts
+ * this app again elevated, as the access-settings window: one UAC prompt, at
+ * the moment of the change. No password ever goes from this window to the
+ * service: a password a program of this user's swapped in would look exactly
+ * the same.
+ */
+function managedByService(
+  status: UnattendedStatus,
+  locale: Locale,
+  onRefresh: () => void,
+): TemplateResult {
+  const role = ROLE_OPTIONS.find((option) => option.role === status.role);
+  return html`
+    <section class="unattended-panel" aria-labelledby="unattended-heading" data-testid="unattended-managed">
+      <h3 id="unattended-heading">${t(locale, 'unattended.heading')}</h3>
+      <p class="unattended-explain">${t(locale, 'unattended.managedByService')}</p>
+      <p class="unattended-state">
+        ${t(locale, status.enabled ? 'unattended.state.on' : 'unattended.state.off')}
+      </p>
+      ${status.enabled
+        ? html`
+            <p class="unattended-hint">
+              ${t(locale, 'unattended.totp.label')}:
+              ${t(locale, status.totp_enabled ? 'unattended.totp.on' : 'unattended.totp.off')}
+            </p>
+            <p class="unattended-hint">
+              ${t(locale, 'unattended.role.label')}: ${role ? t(locale, role.key) : ''}
+            </p>
+          `
+        : ''}
+      <button
+        type="button"
+        class="unattended-save unattended-elevate"
+        data-testid="unattended-open-access-settings"
+        ?disabled=${busy}
+        @click=${() => {
+          void run(async (invoke) => {
+            await invoke('access_settings_open');
+          }, onRefresh);
+        }}
+      >
+        ${SHIELD_ICON} ${t(locale, 'unattended.openAccessSettings')}
+      </button>
+      ${status.enabled
+        ? html`
+            <button
+              type="button"
+              class="unattended-disable"
+              ?disabled=${busy}
+              @click=${() => {
+                if (!globalThis.confirm(t(locale, 'unattended.disable.confirm'))) {
+                  return;
+                }
+                void run(async (invoke) => {
+                  await invoke('unattended_disable');
                 }, onRefresh);
               }}
             >

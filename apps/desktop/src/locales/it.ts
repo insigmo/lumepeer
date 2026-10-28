@@ -441,6 +441,14 @@ export const it: Dictionary = {
   'unattended.logonScreen.label': 'Anche nella schermata di accesso di Windows',
   'unattended.logonScreen.note':
     'Dopo un riavvio o una disconnessione, un ospite con la password del dispositivo vede la schermata di accesso e può accedere. Su quella schermata nulla indica che qualcuno è connesso.',
+  'unattended.managedByService':
+    'Questo dispositivo è servito dal servizio Lumepeer. Le impostazioni di accesso si possono leggere qui; per modificarle servono i diritti di amministratore.',
+  'unattended.openAccessSettings':
+    'Modifica impostazioni di accesso',
+  'access.heading':
+    'Impostazioni di accesso',
+  'access.explain':
+    'Questa finestra viene eseguita con diritti di amministratore. Ciò che modifichi qui vale subito per il servizio Lumepeer che serve questo dispositivo.',
   'book.heading': 'Dispositivi salvati',
   'book.explain':
     "Contrassegnare un dispositivo come attendibile non lo lascia entrare da solo. Decide chi ha il permesso di provare la password del dispositivo.",

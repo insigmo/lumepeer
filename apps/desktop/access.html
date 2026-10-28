@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumepeer</title>
+    <link rel="stylesheet" href="/src/app.css" />
+    <style>
+      /* The elevated access-settings window (ADR 0169 §5): one scrolling
+         column of the two panels that decide who gets in, nothing else. */
+      html,
+      body {
+        height: auto;
+        overflow: auto;
+      }
+      #access {
+        box-sizing: border-box;
+        max-width: 620px;
+        margin: 0 auto;
+        padding: 20px 20px 32px;
+      }
+      .access-explain {
+        color: var(--text-2);
+        margin: 0 0 16px;
+      }
+    </style>
+  </head>
+  <body>
+    <main id="access"></main>
+    <script type="module" src="/src/access-settings-window.ts"></script>
+  </body>
+</html>

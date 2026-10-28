@@ -36,6 +36,9 @@ export default defineConfig({
         agentbar: resolve(import.meta.dirname, 'agentbar.html'),
         files: resolve(import.meta.dirname, 'files.html'),
         terminal: resolve(import.meta.dirname, 'terminal.html'),
+        // The elevated access-settings window (ADR 0169 §5): its own page, so
+        // the process that edits the policy loads none of the main screen.
+        access: resolve(import.meta.dirname, 'access.html'),
       },
     },
   },

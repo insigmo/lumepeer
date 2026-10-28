@@ -19,6 +19,8 @@
 //! what bounds it are the same question twice, so it is answered once.
 
 #[cfg(target_os = "windows")]
+pub mod access_settings;
+#[cfg(target_os = "windows")]
 pub mod agent_channel;
 #[cfg(target_os = "windows")]
 pub mod agent_launch;
@@ -202,3 +204,14 @@ pub const SESSION_HOST_EXIT_ROLE_TAKEN: u32 = 8;
 /// closes the endpoint, because a process that never bound one is the only
 /// kind sure to answer nothing.
 pub const SESSION_HOST_EXIT_CLOSED: u32 = 9;
+
+/// The argument that starts the desktop application as the access-settings
+/// window only, followed by the SID of the account whose policy it edits
+/// (ADR 0169 §5).
+///
+/// The client starts itself again with it through UAC
+/// (`access_settings::open_elevated`): an elevated process with no hosting, no
+/// tray, no network and no guest window, that edits the device password, the
+/// second factor, the unattended role, the logon screen and the trusted
+/// devices where only administrators write, and then tells the session host.
+pub const ACCESS_SETTINGS_ARG: &str = "--access-settings";

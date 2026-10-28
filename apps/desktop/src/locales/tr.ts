@@ -441,6 +441,14 @@ export const tr: Dictionary = {
   'unattended.logonScreen.label': 'Windows oturum açma ekranında da',
   'unattended.logonScreen.note':
     'Yeniden başlatma veya oturum kapatmadan sonra cihaz parolasını bilen bir konuk oturum açma ekranını görür ve oturum açabilir. Bu ekranda birinin bağlı olduğunu gösteren bir şey yoktur.',
+  'unattended.managedByService':
+    'Bu cihaza Lumepeer hizmeti hizmet veriyor. Erişim ayarları burada okunabilir; değiştirmek yönetici hakları gerektirir.',
+  'unattended.openAccessSettings':
+    'Erişim ayarlarını değiştir',
+  'access.heading':
+    'Erişim ayarları',
+  'access.explain':
+    'Bu pencere yönetici haklarıyla çalışır. Burada değiştirdikleriniz bu cihaza hizmet veren Lumepeer hizmetine hemen uygulanır.',
   'book.heading': 'Kayıtlı cihazlar',
   'book.explain':
     'Bir cihaza güvenmek onun kendiliğinden girmesini sağlamaz. Yalnızca cihaz parolasını denemesine kimin izinli olduğunu belirler.',

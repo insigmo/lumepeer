@@ -107,6 +107,9 @@ const COMMANDS: &[&str] = &[
     "host_bar_expand",
     "host_bar_focus_main",
     "host_bar_open_chat",
+    // The shield button: this binary again, elevated, as the access-settings
+    // window (ADR 0169 §5).
+    "access_settings_open",
 ];
 
 /// The Windows application manifest, replacing tauri-build's default.

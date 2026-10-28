@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-access-settings-open"
+description = "Enables the access_settings_open command without any pre-configured scope."
+commands.allow = ["access_settings_open"]
+
+[[permission]]
+identifier = "deny-access-settings-open"
+description = "Denies the access_settings_open command without any pre-configured scope."
+commands.deny = ["access_settings_open"]

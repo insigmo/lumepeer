@@ -469,6 +469,14 @@ export const en: Dictionary = {
   'unattended.logonScreen.label': 'Also at the sign-in screen',
   'unattended.logonScreen.note':
     'After a restart or a sign-out, a guest with the device password sees the sign-in screen and can sign in. Nothing on that screen shows that somebody is connected.',
+  'unattended.managedByService':
+    'This device is hosted by the Lumepeer service. Its access settings can be read here; changing them asks for administrator rights.',
+  'unattended.openAccessSettings':
+    'Change access settings',
+  'access.heading':
+    'Access settings',
+  'access.explain':
+    'This window runs with administrator rights. What you change here applies at once to the Lumepeer service hosting this device.',
   'book.heading': 'Saved devices',
   'book.explain': 'Trusting a device does not let it in on its own. It decides who is allowed to try the device password at all.',
   'book.empty': 'No devices saved yet. Save a device from a connection to add it here.',

@@ -141,6 +141,36 @@ impl UnattendedStore {
         self.store.store_secret(UNATTENDED_ROLE_ENTRY, &bytes)
     }
 
+    /// Brings `access` in step with what the keystore holds now, after another
+    /// process changed it (ADR 0169 §5: the policy is written by the elevated
+    /// `--access-settings` process, and the session host re-reads it).
+    ///
+    /// The failure counter and the lockout are left as they are: re-reading
+    /// the policy must never be a way to get more guesses. Turned off in the
+    /// store, `access` is turned off — which drops them with the credentials,
+    /// exactly as [`UnattendedAccess::disable`] does on this host.
+    pub fn reload(&self, access: &mut UnattendedAccess) {
+        let mut stored = UnattendedAccess::new();
+        self.restore(&mut stored);
+        let Some(phc) = stored.stored_secret() else {
+            access.disable();
+            // The role goes with the password it was chosen for (ADR 0033).
+            access.set_role(stored.role());
+            return;
+        };
+        if access.stored_secret() != Some(phc) {
+            access.restore_password_hash(phc);
+        }
+        match stored.stored_totp_secret() {
+            Some(secret) if access.stored_totp_secret() != Some(secret) => {
+                access.set_totp_secret(*secret);
+            }
+            Some(_) => {}
+            None => access.clear_totp_secret(),
+        }
+        access.set_role(stored.role());
+    }
+
     /// Clears every slot, for turning unattended access off.
     ///
     /// # Errors
@@ -269,6 +299,77 @@ mod tests {
         let mut restored = UnattendedAccess::new();
         store.restore(&mut restored);
         assert_eq!(restored.role(), Role::ViewOnly);
+    }
+
+    /// ADR 0169 §5: what another process wrote is what a reload leaves in
+    /// force — a new password admits, the old one no longer does, the role and
+    /// the second factor follow — and a store turned off turns the gate off.
+    #[test]
+    fn a_reload_follows_what_another_process_wrote() {
+        let keystore = std::sync::Arc::new(MemoryKeystore::new());
+        let shared = |k: &std::sync::Arc<MemoryKeystore>| -> Box<dyn Keystore> {
+            Box::new(Shared(std::sync::Arc::clone(k)))
+        };
+        let host = UnattendedStore::new(shared(&keystore));
+        let editor = UnattendedStore::new(shared(&keystore));
+
+        let mut written = UnattendedAccess::new();
+        written.set_password("the old password").unwrap();
+        editor.save_password(&written).unwrap();
+        let mut access = UnattendedAccess::new();
+        host.restore(&mut access);
+
+        written.set_password("the new password").unwrap();
+        written.set_role(Role::FullControl);
+        written.set_totp_secret([4u8; 20]);
+        editor.save_password(&written).unwrap();
+        editor.save_role(&written).unwrap();
+        editor.save_totp(&written).unwrap();
+        host.reload(&mut access);
+        assert_eq!(access.stored_secret(), written.stored_secret());
+        assert_eq!(access.role(), Role::FullControl);
+        assert_eq!(access.stored_totp_secret(), Some(&[4u8; 20]));
+
+        editor.clear().unwrap();
+        host.reload(&mut access);
+        assert!(!access.enabled());
+        assert!(!access.code_required());
+        assert_eq!(
+            access.role(),
+            Role::ViewOnly,
+            "the role went with the password"
+        );
+    }
+
+    /// A reload is not a way to more guesses: the lockout earned before it is
+    /// still in force after it.
+    #[test]
+    fn a_reload_keeps_the_lockout() {
+        let store = store();
+        let mut access = UnattendedAccess::new();
+        access.set_password("correct horse battery staple").unwrap();
+        store.save_password(&access).unwrap();
+        while !access.locked_out() {
+            let _ = access.admit(Some("wrong guess"), None);
+        }
+        store.reload(&mut access);
+        assert!(access.locked_out());
+    }
+
+    /// One keystore behind two handles, the way two processes see one file.
+    #[derive(Debug)]
+    struct Shared(std::sync::Arc<MemoryKeystore>);
+
+    impl Keystore for Shared {
+        fn load_secret(&self, entry: &str) -> lumepeer_net::Result<Option<Vec<u8>>> {
+            self.0.load_secret(entry)
+        }
+        fn store_secret(&self, entry: &str, bytes: &[u8]) -> lumepeer_net::Result<()> {
+            self.0.store_secret(entry, bytes)
+        }
+        fn delete_secret(&self, entry: &str) -> lumepeer_net::Result<()> {
+            self.0.delete_secret(entry)
+        }
     }
 
     #[test]

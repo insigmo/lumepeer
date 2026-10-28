@@ -441,6 +441,14 @@ export const pt: Dictionary = {
   'unattended.logonScreen.label': 'Também na tela de entrada do Windows',
   'unattended.logonScreen.note':
     'Após reiniciar ou encerrar a sessão, um convidado com a senha do dispositivo vê a tela de entrada e pode entrar. Nada nessa tela mostra que alguém está conectado.',
+  'unattended.managedByService':
+    'Este dispositivo é atendido pelo serviço Lumepeer. As configurações de acesso podem ser vistas aqui; alterá-las exige direitos de administrador.',
+  'unattended.openAccessSettings':
+    'Alterar configurações de acesso',
+  'access.heading':
+    'Configurações de acesso',
+  'access.explain':
+    'Esta janela é executada com direitos de administrador. O que você alterar aqui vale imediatamente para o serviço Lumepeer que atende este dispositivo.',
   'book.heading': 'Dispositivos salvos',
   'book.explain':
     'Confiar em um dispositivo não o deixa entrar por conta própria. Isso decide quem tem permissão para sequer tentar a senha do dispositivo.',

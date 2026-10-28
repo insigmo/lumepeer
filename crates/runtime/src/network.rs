@@ -1829,6 +1829,10 @@ enum ActorCommand {
     },
     /// Replaces the plan the license layer says is in force (§12; ADR 0163).
     SetPlan { plan: Plan },
+    /// Host side: reads the access policy — the unattended credentials and
+    /// the trusted devices — again from the stores, after another process
+    /// wrote them (ADR 0169 §5).
+    ReloadPolicy { reply: oneshot::Sender<()> },
 }
 
 /// Thin handle IPC commands hold. Cloneable: every command gets its own
@@ -3443,6 +3447,24 @@ impl ActorHandle {
         rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
+    /// Host side: reads the access policy again from the stores, after the
+    /// elevated `--access-settings` process changed it (ADR 0169 §5).
+    ///
+    /// The next admission is decided by what was written; sessions already
+    /// running are left as they are, the rule a policy change made in this
+    /// process has always followed.
+    ///
+    /// # Errors
+    /// [`ActorError::ChannelClosed`] if the actor is gone.
+    pub async fn reload_policy(&self) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::ReloadPolicy { reply })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)
+    }
+
     /// Host side: turns one independent grant of `label`'s session on or off
     /// (§8.2; ADR 0029).
     ///
@@ -3508,7 +3530,11 @@ fn unix_now() -> u64 {
 /// The same value is used as the IPC label and as the `tracing` field, so an
 /// operator reading the log can line a warning up with a row in the UI without
 /// either side ever seeing a raw `NodeId`.
-fn peer_tag(install_salt: &[u8; 32], peer: &NodeId) -> String {
+///
+/// Public for the `--access-settings` window (ADR 0169 §5), which lists the
+/// trusted devices with no actor of its own and labels them the same way.
+#[must_use]
+pub fn peer_tag(install_salt: &[u8; 32], peer: &NodeId) -> String {
     let hash = lumepeer_core::audit::peer_hash(install_salt, peer);
     hex_prefix(&hash)
 }
@@ -13154,6 +13180,10 @@ impl Actor {
             } => {
                 let _ = reply.send(self.on_unattended_submit(&password, code, remember));
             }
+            ActorCommand::ReloadPolicy { reply } => {
+                self.on_reload_policy();
+                let _ = reply.send(());
+            }
             ActorCommand::SetPlan { plan } => {
                 if self.sessions.plan() != plan {
                     tracing::info!(plan = plan.as_str(), "license plan in force");
@@ -16371,6 +16401,31 @@ impl Actor {
         }
         tracing::info!(?role, "the unattended role was set");
         Ok(())
+    }
+
+    /// Host side: reads the access policy again after another process wrote
+    /// it — the session host after `--access-settings` (ADR 0169 §5).
+    ///
+    /// Each part follows the rule its own setter here follows, so a change
+    /// made there behaves as one made in this process: a new password or role
+    /// decides the next admission, running sessions keep what they were
+    /// granted, and a policy turned off also drops the admissions in flight
+    /// (as [`Self::on_unattended_disable`] does). Trust withdrawn ends no
+    /// session either, as [`Self::on_address_book_set_trusted`] does not.
+    fn on_reload_policy(&mut self) {
+        self.unattended_store.reload(&mut self.unattended);
+        if !self.unattended.enabled() {
+            self.unattended_pending.clear();
+            self.unattended_proofs.clear();
+        }
+        self.address_book.reload();
+        self.rebuild_labels_and_snapshot();
+        tracing::info!(
+            unattended = self.unattended.enabled(),
+            code_required = self.unattended.code_required(),
+            role = ?self.unattended.role(),
+            "the access policy changed on disk; read it again without restarting"
+        );
     }
 
     /// Guest side: abandons this node's own outgoing connect attempt, at

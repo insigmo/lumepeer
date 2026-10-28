@@ -66,6 +66,15 @@ impl AddressBookStore {
         &self.book
     }
 
+    /// Reads the book again from its file, after another process changed it
+    /// (ADR 0169 §5: the trusted devices are edited by the elevated
+    /// `--access-settings` process). A book with no file keeps what it holds.
+    pub fn reload(&mut self) {
+        if let Some(path) = self.path.as_deref() {
+            self.book = Self::load(path);
+        }
+    }
+
     /// Saves or replaces one device entry and persists the book.
     pub fn upsert(&mut self, peer: &NodeId, entry: AddressEntry) {
         self.book.upsert(peer, entry);
@@ -166,6 +175,27 @@ mod tests {
             reloaded.book().get(&peer(2)).map(|e| e.label.as_str()),
             Some("home")
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// ADR 0169 §5: trust withdrawn by another process is withdrawn here
+    /// once the book is read again.
+    #[test]
+    fn a_reload_sees_what_another_process_wrote() {
+        let dir = temp_dir("reload");
+        let path = dir.join("address_book.json");
+
+        let mut host = AddressBookStore::open(Some(path.clone()));
+        host.upsert(&peer(1), entry("office", true));
+        let mut editor = AddressBookStore::open(Some(path));
+        assert_eq!(editor.set_trusted(&peer(1), false), Some(false));
+        editor.upsert(&peer(2), entry("home", true));
+
+        assert!(host.book().is_trusted(&peer(1)), "not read again yet");
+        host.reload();
+        assert!(!host.book().is_trusted(&peer(1)));
+        assert!(host.book().is_trusted(&peer(2)));
 
         let _ = fs::remove_dir_all(dir);
     }

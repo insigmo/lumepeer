@@ -435,6 +435,14 @@ export const ja: Dictionary = {
   'unattended.logonScreen.label': 'Windows のサインイン画面でも',
   'unattended.logonScreen.note':
     '再起動やサインアウトの後、デバイスパスワードを持つゲストはサインイン画面を見て、サインインできます。その画面には接続中であることは表示されません。',
+  'unattended.managedByService':
+    'このデバイスは Lumepeer サービスがホストしています。アクセス設定はここで確認できます。変更するには管理者権限が必要です。',
+  'unattended.openAccessSettings':
+    'アクセス設定を変更',
+  'access.heading':
+    'アクセス設定',
+  'access.explain':
+    'このウィンドウは管理者権限で実行されています。ここでの変更は、このデバイスをホストする Lumepeer サービスに直ちに反映されます。',
   'book.heading': '保存済みのデバイス',
   'book.explain': 'デバイスを信頼しても、それだけで自動的に入室できるわけではありません。デバイスパスワードを試す資格があるかどうかを決めるだけです。',
   'book.empty': 'まだ保存されたデバイスはありません。接続からデバイスを保存すると、ここに表示されます。',

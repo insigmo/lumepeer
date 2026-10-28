@@ -425,6 +425,14 @@ export const zh: Dictionary = {
   'unattended.logonScreen.label': '在 Windows 登录屏幕上也可访问',
   'unattended.logonScreen.note':
     '重启或注销后，拥有设备密码的访客可以看到登录屏幕并登录。该屏幕上不会显示有人已连接。',
+  'unattended.managedByService':
+    '此设备由 Lumepeer 服务托管。可以在此查看访问设置；更改需要管理员权限。',
+  'unattended.openAccessSettings':
+    '更改访问设置',
+  'access.heading':
+    '访问设置',
+  'access.explain':
+    '此窗口以管理员权限运行。在此所做的更改会立即应用于托管此设备的 Lumepeer 服务。',
   'book.heading': '已保存的设备',
   'book.explain': '信任某设备并不会让它自行进入，而是决定谁一开始就有资格尝试输入设备密码。',
   'book.empty': '尚无已保存的设备。从某次连接中保存设备后，它就会显示在此处。',

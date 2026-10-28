@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use lumepeer_service::host_channel_protocol::{Reply, Request};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::{ChatEntryDto, SessionStatusDto};
+use crate::commands::{ChatEntryDto, SessionStatusDto, UnattendedStatusDto};
 
 /// What the session host says about itself in one snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -31,6 +31,10 @@ pub struct HostSnapshot {
     pub ready: bool,
     /// Its sessions, as `session_status` rows.
     pub sessions: Vec<SessionStatusDto>,
+    /// Its unattended access, to be read here and changed only in the
+    /// elevated access-settings window (ADR 0169 §5); `None` while closed.
+    #[serde(default)]
+    pub unattended: Option<UnattendedStatusDto>,
 }
 
 /// Why a request through the panel did not happen.
@@ -104,6 +108,13 @@ impl HostPanel {
             Reply::Snapshot(json) => serde_json::from_slice(&json).ok(),
             Reply::Transcript(_) | Reply::Done | Reply::Refused => None,
         }
+    }
+
+    /// The host's unattended access as it stands; `None` when no session host
+    /// answers or it is closed (ADR 0169 §5).
+    #[must_use]
+    pub fn unattended(&self) -> Option<UnattendedStatusDto> {
+        self.snapshot()?.unattended
     }
 
     /// The chat with `peer`, one of the host's sessions.
@@ -192,7 +203,7 @@ mod served {
     use lumepeer_service::host_channel_protocol::{Reply, Request};
 
     use super::HostSnapshot;
-    use crate::commands::{ChatEntryDto, session_status_dto};
+    use crate::commands::{ChatEntryDto, UnattendedStatusDto, session_status_dto};
 
     /// What the session host's channel threads and its own loop share.
     #[derive(Debug)]
@@ -286,6 +297,7 @@ mod served {
                         open: true,
                         ready: actor.online(),
                         sessions: sessions.into_iter().map(session_status_dto).collect(),
+                        unattended: unattended_of(runtime, &actor),
                     })
                 }
                 Request::Transcript { peer } => runtime
@@ -328,8 +340,33 @@ mod served {
                 Request::SendChat { peer, text } => {
                     done(runtime.block_on(actor.chat_send(peer, text)).is_ok())
                 }
+                // Narrowing, so a client may ask it with no prompt (ADR 0169
+                // §4); turning it back on is the access-settings window's.
+                Request::UnattendedOff => {
+                    let off = runtime.block_on(actor.unattended_disable()).is_ok();
+                    tracing::info!(off, "a client turned unattended access off");
+                    done(off)
+                }
             }
         }
+    }
+
+    /// The host's unattended access, as the client's settings panel reads it.
+    fn unattended_of(
+        runtime: &tokio::runtime::Handle,
+        actor: &ActorHandle,
+    ) -> Option<UnattendedStatusDto> {
+        let settings = runtime.block_on(actor.unattended_status()).ok()?;
+        Some(UnattendedStatusDto {
+            enabled: settings.enabled,
+            totp_enabled: settings.totp_enabled,
+            role: settings.role.into(),
+            // Who hosts the logon screen is read where only administrators
+            // can, which this process could, but the client changes it only in
+            // the access-settings window, which reads it itself.
+            logon_screen: None,
+            managed_by_service: true,
+        })
     }
 
     /// The grant `name` spells, in `IndependentGrant`'s own spelling; `None`
@@ -388,6 +425,11 @@ mod served {
             let snapshot: HostSnapshot =
                 serde_json::from_slice(&json).unwrap_or_else(|error| panic!("{error}"));
             assert!(!snapshot.open && snapshot.sessions.is_empty());
+            assert!(
+                snapshot.unattended.is_none(),
+                "nothing to read while closed"
+            );
+            assert_eq!(served.answer(Request::UnattendedOff), Reply::Refused);
             assert_eq!(
                 served.answer(Request::EndSession {
                     peer: "p".to_owned()
@@ -400,6 +442,27 @@ mod served {
 
 #[cfg(test)]
 mod tests {
+    /// A snapshot from a session host that says nothing about unattended
+    /// access reads as "not known", and one that does reads as kept by the
+    /// service (ADR 0169 §5).
+    #[test]
+    fn the_unattended_state_rides_the_snapshot() {
+        let older: super::HostSnapshot =
+            serde_json::from_str(r#"{"open":true,"ready":true,"sessions":[]}"#)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert!(older.unattended.is_none());
+        let newer: super::HostSnapshot = serde_json::from_str(
+            r#"{"open":true,"ready":true,"sessions":[],"unattended":{"enabled":true,
+                "totp_enabled":false,"role":"full_control","logon_screen":null,
+                "managed_by_service":true}}"#,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let unattended = newer
+            .unattended
+            .unwrap_or_else(|| panic!("the field was there"));
+        assert!(unattended.enabled && unattended.managed_by_service);
+    }
+
     /// The protocol's chat bound is the core's, which it cannot import.
     #[test]
     fn the_channel_carries_any_chat_line_the_core_accepts() {
