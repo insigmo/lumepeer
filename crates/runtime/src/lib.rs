@@ -43,6 +43,7 @@ pub mod license_client;
 pub mod media_stats;
 pub mod net_errors;
 pub mod network;
+pub mod person;
 pub mod recorder;
 pub mod remembered_password;
 pub mod session_agent;

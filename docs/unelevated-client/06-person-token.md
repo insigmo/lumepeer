@@ -58,6 +58,93 @@ Session-host запускает `lumepeer-terminal-worker` **ограничен�
   с `file_browse` получил бы больше, чем имеет человек за машиной.
 - Не запускать оболочку повышенной половиной.
 
+## Статус (2026-10-28)
+
+Код — ветка `unelev/06-person-token` (свой worktree, не закоммичено).
+Юнит-тесты, `clippy -D warnings`, `fmt` зелёные **неповышенно**; повышенный
+прогон и все живые пункты ниже **не сделаны** (нужен UAC, маркер
+`session-host-enabled` и установленная сборка).
+
+Где что:
+
+- **токены человека** — `crates/service/src/person_token.rs`:
+  `SignedInPerson { session, sid }`, `own_token()` (`WTSQueryUserToken`,
+  с проверкой, что SID тот же, кого обслуживает хост), `files_token()`
+  (`TokenLinkedToken`, если токен ограниченная половина, иначе свой),
+  `local_app_data()` (из `CreateEnvironmentBlock` человека),
+  `run_impersonating(token, work)` — `ImpersonateLoggedOnUser` на **отдельном
+  потоке** (`std::thread::scope`), `RevertToSelf` в `Drop` guard'а на том же
+  потоке, поток тут же кончается. Токены не кэшируются: берутся при каждом
+  использовании, поэтому «обновляется при смене пользователя» и «на экране
+  входа токена нет → отказ» получаются сами;
+- **кто трогает диск** — `crates/net/src/run_as.rs`: трейт `RunAs` и
+  `DiskAs { ThisProcess, Person(..), Nobody }`; `blocking` / `run`
+  (последний — `spawn_blocking`). `crates/runtime/src/person.rs`: `Person`
+  (`ThisProcess | SignedIn(Arc<dyn SignedIn>) | Nobody`) и трейт `SignedIn:
+  RunAs + spawn_shell`. Шов — новый метод по умолчанию
+  `ViewWindows::person()` (`ThisProcess`); session-host отвечает
+  `SignedIn`, логон-хост — `Nobody`;
+- **файлы** — в `crates/runtime/src/network.rs` через `self.disk()` идут:
+  листинг (+ проверка ссылки), проверки и открытие при fetch, обход каталога
+  (`walk_directory` стал блокирующим внутри `disk.run`), хеш и отправка
+  (файл открывается от человека, байты идут через хэндл — `hash_open`,
+  `send_open` в `file_transfer.rs`), put (каталог/место/имя), раскладка
+  дерева при приёме каталога, staging-файл (`StagedReceive::create_as`:
+  создание, `export` и `discard` — тем же `DiskAs`), `FileOpPlan::run`,
+  проверки при ручном `file_accept`, `stat_offer` буфера обмена;
+- **терминал** — `Shell::spawn_as_user(size, token)` в `crates/terminal`:
+  `CreateProcessAsUserW`, окружение человека (`CreateEnvironmentBlock`),
+  `WinSta0\Default`; повышенная половина (`TokenElevationTypeFull`)
+  отклоняется до создания чего-либо. Ветка «токен Проводника +
+  `CreateProcessWithTokenW`» не тронута (`Shell::spawn` для клиента);
+- **запись** — канал пачки 03 получил `Request::Recordings` /
+  `Request::ExportRecording { name }` (оба `Effect::Reads`, коды `0x20/0x21`,
+  ответы `0xA0/0xA1`). Session-host читает свою запись (своё дерево,
+  от `SYSTEM`), а пишет экспорт в
+  `<LOCALAPPDATA человека>\io.insigmo.lumepeer\recordings\exports` под
+  **собственным** (ограниченным) токеном человека. Клиент при
+  `hosted_by_service` берёт `recordings_list`/`recording_export` из канала;
+- **туннель** — абзац в doc-комментарии `crates/net/src/tunnel.rs`.
+
+Что сделано не буквально по тексту пачки:
+
+- **Экспорт записи — ограниченным токеном, не повышенной половиной.**
+  Запрос приходит по каналу клиента, который может открыть любая программа
+  пользователя (ADR 0169 §4). Повышенная половина дала бы ей запись (хоть и в
+  фиксированный путь — но через подложенный junction куда угодно) с правами
+  администратора — это расширение. Ограниченный токен пишет только туда, куда
+  человек может сам.
+- **Логон-хост теперь отказывает** в файлах и терминале (`Person::Nobody`).
+  До этой пачки файловые операции на экране входа шли от `SYSTEM` — пачка
+  называет это «как сейчас», код говорил иначе.
+- **Владелец файлов, созданных повышенной половиной.** Для UAC-админа
+  `TokenOwner` повышенного токена по умолчанию — `BUILTIN\Administrators`, а
+  не SID пользователя (так же вёл себя повышенный клиент). Проверка DoD
+  «владелец — пользователь» на админской учётке может показать
+  `Administrators`; главное — не `SYSTEM`. На стандартной учётке — сам
+  пользователь.
+- **Листинг остаётся синхронным на потоке актора** (как был): актор ждёт
+  отдельный поток с имперсонацией. В пул tokio имперсонация не попадает
+  никогда — ни здесь, ни в `spawn_blocking`.
+- **Не сделано:** приём файлов из буфера обмена на session-host пишет в
+  `clipboard_files_dir()`, а у `SYSTEM` это его профиль — под токеном
+  человека это теперь отказ (раньше было бы «в профиль SYSTEM»). Путь в
+  session-host сейчас недостижим (принимать некому — UI нет), чинить вместе
+  с буфером обмена в session-host. Рабочий каталог оболочки — каталог
+  session-host, а не `USERPROFILE`.
+
+Проверки, которые остались (команды):
+
+- повышенный прогон службы: из повышенного PowerShell
+  `cargo test -p lumepeer-service` (в т.ч. `person_token::tests` — там
+  неповышенно уже зелёно, но `files_token`/`own_token` проверены только на
+  отказ без TCB);
+- живой шелл через токен: собрать `lumepeer-terminal-worker`, скопировать
+  `target\debug\lumepeer-terminal-worker.exe` в `target\debug\deps\` и
+  `cargo test -p lumepeer-terminal -- --ignored a_shell_starts`;
+- живые пункты DoD ниже — с маркером `session-host-enabled` и установленной
+  службой, гость с `beta` или локальный второй экземпляр.
+
 ## Definition of done
 
 - [ ] Терминал гостя на хосте-session-host: `whoami` — пользователь,

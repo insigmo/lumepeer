@@ -45,7 +45,7 @@
 use std::ffi::{OsString, c_void};
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -55,17 +55,20 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{
     DuplicateTokenEx, EqualSid, GetTokenInformation, SECURITY_ATTRIBUTES, SecurityImpersonation,
-    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation,
-    TokenPrimary, TokenUser,
+    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_QUERY,
+    TOKEN_USER, TokenElevation, TokenElevationType, TokenElevationTypeFull, TokenPrimary,
+    TokenUser,
 };
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
-    CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CreateProcessW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::worker_protocol::{WORKER_READY, encode_input, encode_resize};
 use crate::{ShellError, ShellSize};
@@ -91,6 +94,10 @@ const KILLED_EXIT_CODE: u32 = 1;
 /// a `cargo build` tree drops it beside the debug binary, and an installed
 /// build ships it through Tauri's `externalBin` with a target-triple suffix.
 const WORKER_BINARY: &str = "lumepeer-terminal-worker";
+
+/// The person's ordinary desktop, where a worker started with their token is
+/// put (ADR 0169 §6) — the one the session host itself stands on.
+const USER_DESKTOP: &str = r"WinSta0\Default";
 
 /// Target triple this build was compiled for, matching the `-$TARGET_TRIPLE`
 /// suffix Tauri's sidecar convention puts on the staged binary. Only the two
@@ -202,6 +209,41 @@ impl Shell {
         // cannot make the drop must not have started a pipe, let alone a
         // process (ADR 0079).
         let token = interactive_user_token()?;
+        Self::spawn_worker(|program, stdin, stdout| {
+            start_worker(program, size, &token, stdin, stdout)
+        })
+    }
+
+    /// Starts the worker with `token` through `CreateProcessAsUserW`, for a
+    /// `LocalSystem` caller that holds the person's own token (ADR 0169 §6).
+    ///
+    /// `LocalSystem` holds `SE_ASSIGNPRIMARYTOKEN_NAME` and
+    /// `SE_INCREASE_QUOTA_NAME`, which is exactly what ADR 0102 measured an
+    /// elevated client not to have, so the call ADR 0079 first named is the
+    /// one made here, with the person's own environment and on their desktop.
+    /// The elevated half of a split token is refused before anything is
+    /// created: the shell runs as the person, never as their administrator.
+    pub(crate) fn spawn_as_user(
+        size: ShellSize,
+        token: BorrowedHandle<'_>,
+    ) -> Result<Self, ShellError> {
+        if is_elevated_half(token) {
+            tracing::warn!(
+                "refusing a remote shell: the token handed over is the elevated half of the \
+                 person's, and a shell runs with their own (ADR 0079, ADR 0169 §6)"
+            );
+            return Err(ShellError::CannotDropPrivileges);
+        }
+        Self::spawn_worker(|program, stdin, stdout| {
+            start_worker_as_user(program, size, token, stdin, stdout)
+        })
+    }
+
+    /// Everything after the identity is settled: the pipes, the worker
+    /// `start` makes, and its ready byte.
+    fn spawn_worker(
+        start: impl FnOnce(&Path, &OwnedHandle, &OwnedHandle) -> Result<OwnedHandle, ShellError>,
+    ) -> Result<Self, ShellError> {
         let program = locate_worker_binary()?;
 
         // Exactly one end of each pipe crosses into the worker; the ends kept
@@ -212,7 +254,7 @@ impl Shell {
         keep_private(&to_worker_write)?;
         keep_private(&from_worker_read)?;
 
-        let process = start_worker(&program, size, &token, &to_worker_read, &from_worker_write);
+        let process = start(&program, &to_worker_read, &from_worker_write);
         // The worker's ends are the worker's now. Holding them here would keep
         // the pipes open after it exits, and the reader would never see EOF.
         drop(to_worker_read);
@@ -383,6 +425,122 @@ fn start_worker(
         let _ = CloseHandle(info.hThread);
     }
     Ok(process)
+}
+
+/// Starts the worker as the user `token` names, with `CreateProcessAsUserW`
+/// (ADR 0169 §6).
+///
+/// The person's own environment, not this process's: `LocalSystem`'s would
+/// give the shell its `USERPROFILE` and its `TEMP`. Their ordinary desktop,
+/// named rather than inherited. Any refusal is
+/// [`ShellError::CannotDropPrivileges`] with no process created — there is no
+/// second way to start it.
+fn start_worker_as_user(
+    program: &Path,
+    size: ShellSize,
+    token: BorrowedHandle<'_>,
+    stdin: &OwnedHandle,
+    stdout: &OwnedHandle,
+) -> Result<OwnedHandle, ShellError> {
+    let token = borrowed(token);
+    let mut desktop: Vec<u16> = OsString::from(USER_DESKTOP)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let startup = STARTUPINFOW {
+        cb: u32::try_from(size_of::<STARTUPINFOW>()).unwrap_or(0),
+        lpDesktop: PWSTR(desktop.as_mut_ptr()),
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: HANDLE(stdin.as_raw_handle()),
+        hStdOutput: HANDLE(stdout.as_raw_handle()),
+        // As in `start_worker`: diagnostics only on a path with no shell.
+        hStdError: HANDLE(stdout.as_raw_handle()),
+        ..STARTUPINFOW::default()
+    };
+    let mut command: Vec<u16> = command_line(program, size)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut environment: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `environment` is a local the call writes an allocation into;
+    // `token` is a live token. `false`: nothing of this process's own.
+    if let Err(error) = unsafe { CreateEnvironmentBlock(&raw mut environment, Some(token), false) }
+    {
+        tracing::warn!(%error, "refusing a remote shell: no environment for the person (ADR 0169)");
+        return Err(ShellError::CannotDropPrivileges);
+    }
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: a live primary token; a NUL-terminated mutable command line
+    // naming a path this process built; a startup struct borrowing the
+    // desktop name and two live pipe ends, all of which outlive the call; the
+    // environment block allocated above; an output slot for the ids.
+    // `bInheritHandles` is true because the two pipe ends are how the worker
+    // is reached at all, and they were made inheritable for this alone.
+    let spawned = unsafe {
+        CreateProcessAsUserW(
+            Some(token),
+            PCWSTR::null(),
+            Some(PWSTR(command.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            Some(environment),
+            PCWSTR::null(),
+            &raw const startup,
+            &raw mut info,
+        )
+    };
+    // SAFETY: allocated by `CreateEnvironmentBlock` above; the child holds its
+    // own copy by now, and nothing reads this one again.
+    unsafe {
+        let _ = DestroyEnvironmentBlock(environment);
+    }
+    if let Err(error) = spawned {
+        tracing::warn!(
+            %error,
+            "refusing a remote shell: the shell worker could not be started with the \
+             person's token, and this process will not lend its own (ADR 0169 §6)"
+        );
+        return Err(ShellError::CannotDropPrivileges);
+    }
+    // SAFETY: both handles were just written by a successful spawn; the thread
+    // handle is taken only to be closed.
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
+    // SAFETY: same, and closing it does not affect the running process.
+    unsafe {
+        let _ = CloseHandle(info.hThread);
+    }
+    Ok(process)
+}
+
+/// Whether `token` is the elevated half of a split UAC token
+/// (`TokenElevationTypeFull`).
+///
+/// A query that fails is read as "yes": the question is asked to decide
+/// whether a shell may start with this token, and an unanswered question is
+/// not a yes to that.
+fn is_elevated_half(token: BorrowedHandle<'_>) -> bool {
+    let mut kind = TOKEN_ELEVATION_TYPE::default();
+    let mut returned = 0u32;
+    // SAFETY: a live token handle and a local of exactly the size named,
+    // which the call fills in.
+    let queried = unsafe {
+        GetTokenInformation(
+            borrowed(token),
+            TokenElevationType,
+            Some(std::ptr::from_mut(&mut kind).cast::<c_void>()),
+            u32::try_from(size_of::<TOKEN_ELEVATION_TYPE>()).unwrap_or(0),
+            &raw mut returned,
+        )
+    };
+    queried.is_err() || kind == TokenElevationTypeFull
+}
+
+/// A borrowed handle as the `HANDLE` the `windows` crate speaks.
+fn borrowed(handle: BorrowedHandle<'_>) -> HANDLE {
+    HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&handle))
 }
 
 /// Whether a child of this process would already be what the drop is for: the
@@ -795,6 +953,126 @@ mod tests {
             .expect("the flags");
         assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0, "the handle still travels");
         drop(read);
+    }
+
+    /// This process's own token, with the rights a test can open it with.
+    fn own_token() -> OwnedHandle {
+        let mut ours = HANDLE::default();
+        // SAFETY: the current-process pseudo-handle and a stack slot.
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE | windows::Win32::Security::TOKEN_ASSIGN_PRIMARY,
+                &raw mut ours,
+            )
+        }
+        .expect("this process's own token");
+        // SAFETY: a token handle OpenProcessToken just wrote.
+        unsafe { OwnedHandle::from_raw_handle(ours.0) }
+    }
+
+    /// ADR 0169 §6: the shell runs with the person's own token and never
+    /// with the elevated half of it. That half is refused before a pipe or a
+    /// process exists — whether or not a worker is staged here at all.
+    #[test]
+    fn the_elevated_half_of_a_token_never_starts_a_shell() {
+        use std::os::windows::io::AsHandle;
+        use windows::Win32::Security::{TOKEN_LINKED_TOKEN, TokenLinkedToken};
+
+        let ours = own_token();
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut returned = 0u32;
+        // SAFETY: a live token handle and a local of exactly the size named.
+        // Unelevated, the handle written is an identification-level copy,
+        // which is enough to ask what it is.
+        let queried = unsafe {
+            GetTokenInformation(
+                HANDLE(ours.as_raw_handle()),
+                TokenLinkedToken,
+                Some(std::ptr::from_mut(&mut linked).cast::<c_void>()),
+                u32::try_from(size_of::<TOKEN_LINKED_TOKEN>()).unwrap_or(0),
+                &raw mut returned,
+            )
+        };
+        if queried.is_err() {
+            // No split token on this account: nothing to tell apart.
+            return;
+        }
+        // SAFETY: a handle the call above opened.
+        let linked = unsafe { OwnedHandle::from_raw_handle(linked.LinkedToken.0) };
+        let (elevated, limited) = if is_elevated_half(ours.as_handle()) {
+            (&ours, &linked)
+        } else {
+            (&linked, &ours)
+        };
+        assert!(is_elevated_half(elevated.as_handle()));
+        assert!(!is_elevated_half(limited.as_handle()));
+        assert_eq!(
+            Shell::spawn_as_user(ShellSize { cols: 80, rows: 24 }, elevated.as_handle()).err(),
+            Some(ShellError::CannotDropPrivileges)
+        );
+    }
+
+    /// A worker started with a token it is handed runs a shell and says so.
+    ///
+    /// Ignored by default: it needs `lumepeer-terminal-worker.exe` beside this
+    /// test binary (`target\debug\deps`), which `cargo test` does not put
+    /// there. Run it with the worker copied in:
+    /// `cargo build -p lumepeer-terminal-worker`, copy
+    /// `target\debug\lumepeer-terminal-worker.exe` to `target\debug\deps\`,
+    /// then `cargo test -p lumepeer-terminal -- --ignored a_shell_starts`.
+    /// Unelevated it starts the worker with this process's own primary token,
+    /// which `CreateProcessAsUserW` allows without `SE_ASSIGNPRIMARYTOKEN_NAME`;
+    /// the session host makes the same call with the person's.
+    #[test]
+    #[ignore = "needs the worker staged beside the test binary"]
+    fn a_shell_starts_with_a_token_it_is_handed() {
+        use std::os::windows::io::AsHandle;
+
+        let ours = own_token();
+        let mut primary = HANDLE::default();
+        // SAFETY: a live token handle; `primary` is taken over below.
+        unsafe {
+            DuplicateTokenEx(
+                HANDLE(ours.as_raw_handle()),
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &raw mut primary,
+            )
+        }
+        .expect("a primary copy of this process's token");
+        // SAFETY: a token handle DuplicateTokenEx just wrote.
+        let primary = unsafe { OwnedHandle::from_raw_handle(primary.0) };
+        let shell = Shell::spawn_as_user(ShellSize { cols: 80, rows: 24 }, primary.as_handle())
+            .expect("a shell");
+        let (mut output, mut input, control) = shell.into_parts();
+        input
+            .write_all(b"echo lumepeer-as-user\r\n")
+            .expect("a keystroke");
+        let mut seen = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let read = output.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buffer[..read]);
+            if String::from_utf8_lossy(&seen)
+                .matches("lumepeer-as-user")
+                .count()
+                >= 2
+            {
+                break;
+            }
+        }
+        control.kill();
+        assert!(
+            String::from_utf8_lossy(&seen).contains("lumepeer-as-user"),
+            "the shell never answered"
+        );
     }
 
     /// An installed client lives under a path with a space in it, so the

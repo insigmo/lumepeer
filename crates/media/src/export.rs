@@ -76,6 +76,25 @@ pub fn export_file(source: &Path, out_dir: &Path) -> Result<ExportOutput, Record
         .ok_or(RecordingError::Corrupt("recording path has no file name"))?
         .to_owned();
     let file = std::fs::File::open(source).map_err(|e| RecordingError::Io(e.to_string()))?;
+    export_open(file, &stem, out_dir)
+}
+
+/// [`export_file`] from a recording somebody already opened, written into
+/// `out_dir` under `stem`.
+///
+/// For a caller that reads the recording with one identity and writes the
+/// export with another: the session host opens its own recording as
+/// `LocalSystem` and writes the export into the person's profile in their
+/// name (ADR 0169 §6). The output directory and both files are created by
+/// whoever calls this.
+///
+/// # Errors
+/// As [`export_file`].
+pub fn export_open(
+    file: std::fs::File,
+    stem: &str,
+    out_dir: &Path,
+) -> Result<ExportOutput, RecordingError> {
     std::fs::create_dir_all(out_dir).map_err(|e| RecordingError::Io(e.to_string()))?;
 
     let video_path = out_dir.join(format!("{stem}.{VIDEO_EXTENSION}"));

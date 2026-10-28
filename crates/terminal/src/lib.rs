@@ -148,6 +148,28 @@ impl Shell {
         Ok(Self { inner })
     }
 
+    /// Starts the host's own shell at `size` as the user `token` names: for a
+    /// `LocalSystem` host holding the signed-in person's own token — the
+    /// session host (ADR 0169 §6).
+    ///
+    /// `token` is the person's own, never the elevated half of a split one:
+    /// that half is refused before anything is created. The shell still
+    /// lives in `crates/terminal-worker`, started here with
+    /// `CreateProcessAsUserW`, which `LocalSystem` may call and an elevated
+    /// client may not (ADR 0102).
+    ///
+    /// # Errors
+    /// As [`Self::spawn`].
+    #[cfg(windows)]
+    pub fn spawn_as_user(
+        size: ShellSize,
+        token: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> Result<Self, ShellError> {
+        let inner = platform::Shell::spawn_as_user(size, token)?;
+        tracing::info!("a remote shell started as the signed-in person");
+        Ok(Self { inner })
+    }
+
     /// Splits into the output stream, the input stream and the control half.
     ///
     /// The two streams are blocking and are meant for their own threads; the

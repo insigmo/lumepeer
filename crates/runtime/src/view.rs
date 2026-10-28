@@ -1231,6 +1231,15 @@ pub trait ViewWindows: std::fmt::Debug + Send + Sync {
     fn injects_as_system(&self) -> bool {
         false
     }
+
+    /// Who a guest's file work and shells run as on this host (ADR 0169 §6).
+    ///
+    /// This process, by default: a desktop client is the person at the
+    /// machine. The session host answers with the person signed in, the
+    /// logon host with nobody. Asked at each use, never cached.
+    fn person(&self) -> crate::person::Person {
+        crate::person::Person::ThisProcess
+    }
 }
 
 /// [`ViewWindows`] that does nothing, for driving the actor without a webview.

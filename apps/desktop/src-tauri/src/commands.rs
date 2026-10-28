@@ -4058,7 +4058,10 @@ pub async fn host_encoder_select(
 
 /// One recording this device has written, as the host's own screen sees it
 /// (§9.2, §17; ADR 0031, ADR 0035).
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` too: on Windows the session host's recordings reach the
+/// client over the host channel in this shape (ADR 0169 §6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordingDto {
     /// File name inside the app's recordings directory, never a path.
     ///
@@ -4077,7 +4080,7 @@ pub struct RecordingDto {
 /// Directory the exports of §9.2 are written into, under the recordings
 /// directory so one folder holds a session's recording and what came out of
 /// it.
-const EXPORTS_SUBDIR: &str = "exports";
+pub(crate) const EXPORTS_SUBDIR: &str = "exports";
 
 /// Extension of a session recording (`lumepeer_media::record`).
 const RECORDING_EXTENSION: &str = "lmrc";
@@ -4098,7 +4101,7 @@ fn recordings_dir() -> Result<std::path::PathBuf, IpcError> {
 /// recording extension, so a separator, a drive letter, a parent segment or
 /// an absolute path all fail on the same rule. Where this process reads and
 /// writes is not a decision the untrusted view layer takes (§2.3).
-fn recording_file_name(name: &str) -> Result<&str, IpcError> {
+pub(crate) fn recording_file_name(name: &str) -> Result<&str, IpcError> {
     let path = std::path::Path::new(name);
     // `\` is only a separator to `Path` on Windows; checked here regardless of
     // target so a name a Windows peer would treat as a subdirectory is
@@ -4132,13 +4135,31 @@ fn recording_file_name(name: &str) -> Result<&str, IpcError> {
 /// # Errors
 /// [`IpcError`] when called from another window, or when this machine has no
 /// per-user data directory.
+///
+/// While the session host hosts this machine its recordings are its own, in
+/// its own tree, and the list comes from it over the host channel
+/// (ADR 0169 §6).
 #[tauri::command]
-pub async fn recordings_list(window: Window) -> Result<Vec<RecordingDto>, IpcError> {
+pub async fn recordings_list(
+    window: Window,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<RecordingDto>, IpcError> {
     check_window(&window)?;
-    let dir = recordings_dir()?;
+    if let Some(panel) = session_host(&state) {
+        return tauri::async_runtime::spawn_blocking(move || panel.recordings())
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
+    }
+    Ok(recordings_in(&recordings_dir()?))
+}
+
+/// The recordings in `dir`, newest first; none for a directory that is not
+/// there.
+pub(crate) fn recordings_in(dir: &std::path::Path) -> Vec<RecordingDto> {
     let exports = dir.join(EXPORTS_SUBDIR);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
     let mut recordings: Vec<RecordingDto> = entries
         .flatten()
@@ -4175,7 +4196,7 @@ pub async fn recordings_list(window: Window) -> Result<Vec<RecordingDto>, IpcErr
     // Newest first: the recording someone just stopped is the one they are
     // looking for.
     recordings.sort_unstable_by(|a, b| b.modified.cmp(&a.modified).then(a.name.cmp(&b.name)));
-    Ok(recordings)
+    recordings
 }
 
 /// Last-write time of `meta` in unix seconds, `0` where the platform has none.
@@ -4194,7 +4215,7 @@ pub struct RecordingExportArgs {
 }
 
 /// What one export produced, for the panel that asked for it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportDto {
     /// Directory both files were written into, shown so the host can find
     /// them. Travels outwards only, exactly like a recording's own path.
@@ -4227,12 +4248,24 @@ pub struct ExportDto {
 /// [`IpcError`] when called from another window, when `name` is not a plain
 /// recording name, or when the recording cannot be read or the export
 /// written.
+///
+/// While the session host hosts this machine, it exports its own recording
+/// into this person's profile, as them (ADR 0169 §6); this window names the
+/// recording and nothing else.
 #[tauri::command]
 pub async fn recording_export(
     window: Window,
+    state: tauri::State<'_, AppState>,
     args: RecordingExportArgs,
 ) -> Result<ExportDto, IpcError> {
     check_window(&window)?;
+    if let Some(panel) = session_host(&state) {
+        let name = recording_file_name(&args.name)?.to_owned();
+        return tauri::async_runtime::spawn_blocking(move || panel.export_recording(name))
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
+    }
     let dir = recordings_dir()?;
     let source = dir.join(recording_file_name(&args.name)?);
     let out_dir = dir.join(EXPORTS_SUBDIR);
@@ -4254,14 +4287,22 @@ pub async fn recording_export(
         // string about this machine's own file, and names no peer (§15).
         message: error.to_string(),
     })?;
-    Ok(ExportDto {
+    Ok(export_dto(&out_dir, &output))
+}
+
+/// What the panel is told about one export written into `out_dir`.
+pub(crate) fn export_dto(
+    out_dir: &std::path::Path,
+    output: &lumepeer_media::export::ExportOutput,
+) -> ExportDto {
+    ExportDto {
         dir: out_dir.to_string_lossy().into_owned(),
         video: file_name_of(output.video.as_deref()),
         audio: file_name_of(output.audio.as_deref()),
         video_frames: output.summary.video_frames,
         audio_packets: output.summary.audio_packets,
         events_skipped: output.summary.events_skipped,
-    })
+    }
 }
 
 /// File name of an exported track, dropping the directory the DTO already

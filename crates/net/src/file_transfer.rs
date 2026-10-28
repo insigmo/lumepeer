@@ -29,6 +29,7 @@ use lumepeer_core::constants::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{NetError, Result};
+use crate::run_as::DiskAs;
 
 /// Identifies one transfer within a session.
 pub type TransferId = u64;
@@ -373,6 +374,9 @@ pub fn safe_file_name(name: &str) -> Option<String> {
 pub struct StagedReceive {
     path: PathBuf,
     file: tokio::fs::File,
+    /// Who every path this staging file names is touched as — its creation,
+    /// its export and its removal (ADR 0169 §6).
+    disk: DiskAs,
 }
 
 impl StagedReceive {
@@ -400,18 +404,39 @@ impl StagedReceive {
     /// [`NetError::Io`] when the directory cannot be created or the file
     /// cannot be opened.
     pub async fn create(dir: &Path, id: TransferId) -> Result<Self> {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?;
-        sweep_stale(dir).await;
+        Self::create_as(dir, id, DiskAs::ThisProcess).await
+    }
+
+    /// [`Self::create`], with every path it names touched as `disk`
+    /// (ADR 0169 §6).
+    ///
+    /// The staging file is created in that identity, so it — and the file it
+    /// becomes — belongs to whoever `disk` is, and a directory that identity
+    /// may not write into refuses the transfer here, at the first chunk.
+    /// [`Self::export`] and [`Self::discard`] use the same identity.
+    ///
+    /// # Errors
+    /// As [`Self::create`], and when there is nobody to act as.
+    pub async fn create_as(dir: &Path, id: TransferId, disk: DiskAs) -> Result<Self> {
         // Named by the transfer id alone: the offered name is untrusted, and
         // nothing hostile should be able to decide a path, even inside a
         // directory this side chose.
         let path = dir.join(format!("{STAGING_PREFIX}{id}{STAGING_SUFFIX}"));
-        let file = tokio::fs::File::create(&path)
+        let directory = dir.to_path_buf();
+        let staging = path.clone();
+        let file = disk
+            .run(move || {
+                std::fs::create_dir_all(&directory)?;
+                sweep_stale_blocking(&directory);
+                std::fs::File::create(&staging)
+            })
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file: tokio::fs::File::from_std(file),
+            disk,
+        })
     }
 
     /// Where the partial file currently lives.
@@ -454,26 +479,30 @@ impl StagedReceive {
             .await
             .map_err(|e| NetError::Io(e.to_string()))?;
         drop(self.file);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| NetError::Io(e.to_string()))?;
-        }
-        if tokio::fs::rename(&self.path, dest).await.is_ok() {
-            return Ok(());
-        }
-        tokio::fs::copy(&self.path, dest)
+        let staged = self.path;
+        let dest = dest.to_path_buf();
+        self.disk
+            .run(move || {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if std::fs::rename(&staged, &dest).is_ok() {
+                    return Ok(());
+                }
+                std::fs::copy(&staged, &dest)?;
+                let _ = std::fs::remove_file(&staged);
+                Ok(())
+            })
             .await
-            .map_err(|e| NetError::Io(e.to_string()))?;
-        let _ = tokio::fs::remove_file(&self.path).await;
-        Ok(())
+            .map_err(|e| NetError::Io(e.to_string()))
     }
 
     /// Deletes the partial file. Used on cancel, on abort, and on a hash that
     /// did not match — every path that must leave nothing behind (§9.2).
     pub async fn discard(self) {
         drop(self.file);
-        if let Err(error) = tokio::fs::remove_file(&self.path).await {
+        let staged = self.path;
+        if let Err(error) = self.disk.run(move || std::fs::remove_file(&staged)).await {
             tracing::debug!(%error, "could not remove a staging file");
         }
     }
@@ -511,6 +540,13 @@ static PROCESS_EPOCH: std::sync::OnceLock<std::time::SystemTime> = std::sync::On
 /// cannot read a directory must not stop the transfer that is about to write
 /// into it.
 pub async fn sweep_stale(dir: &Path) {
+    let dir = dir.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sweep_stale_blocking(&dir)).await;
+}
+
+/// [`sweep_stale`] on the calling thread, for a caller that is already off
+/// the async runtime — and acting as whoever owns `dir` (ADR 0169 §6).
+fn sweep_stale_blocking(dir: &Path) {
     let epoch = *PROCESS_EPOCH.get_or_init(std::time::SystemTime::now);
     // A staging file this process created a moment after the epoch can carry
     // a modification time from before it, because the filesystem stamps files
@@ -524,10 +560,10 @@ pub async fn sweep_stale(dir: &Path) {
     )) else {
         return;
     };
-    let Ok(mut reader) = tokio::fs::read_dir(dir).await else {
+    let Ok(reader) = std::fs::read_dir(dir) else {
         return;
     };
-    while let Ok(Some(entry)) = reader.next_entry().await {
+    for entry in reader.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -535,7 +571,7 @@ pub async fn sweep_stale(dir: &Path) {
         if !name.starts_with(STAGING_PREFIX) || !name.ends_with(STAGING_SUFFIX) {
             continue;
         }
-        let Ok(meta) = entry.metadata().await else {
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
         if !meta.is_file() {
@@ -549,7 +585,7 @@ pub async fn sweep_stale(dir: &Path) {
         if modified >= cutoff {
             continue;
         }
-        if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+        if let Err(error) = std::fs::remove_file(entry.path()) {
             tracing::debug!(%error, "could not remove a staging file from an earlier run");
         }
     }
@@ -563,9 +599,18 @@ pub async fn sweep_stale(dir: &Path) {
 /// # Errors
 /// [`NetError::Io`] when the file cannot be read.
 pub async fn hash_file(path: &Path) -> Result<[u8; 32]> {
-    let mut file = tokio::fs::File::open(path)
+    let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
+    hash_open(file).await
+}
+
+/// [`hash_file`] over a file somebody already opened — in whose name, the
+/// opener decided (ADR 0169 §6).
+///
+/// # Errors
+/// [`NetError::Io`] when the file cannot be read.
+pub async fn hash_open(mut file: tokio::fs::File) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; FILE_CHUNK_MAX_BYTES];
     loop {
@@ -598,11 +643,26 @@ pub async fn send_file<W: AsyncWrite + Unpin + Send>(
     id: TransferId,
     path: &Path,
     from: u64,
-    mut progress: impl FnMut(u64) + Send,
+    progress: impl FnMut(u64) + Send,
 ) -> Result<()> {
-    let mut file = tokio::fs::File::open(path)
+    let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
+    send_open(writer, id, file, from, progress).await
+}
+
+/// [`send_file`] from a file somebody already opened — in whose name, the
+/// opener decided (ADR 0169 §6).
+///
+/// # Errors
+/// As [`send_file`].
+pub async fn send_open<W: AsyncWrite + Unpin + Send>(
+    writer: &mut W,
+    id: TransferId,
+    mut file: tokio::fs::File,
+    from: u64,
+    mut progress: impl FnMut(u64) + Send,
+) -> Result<()> {
     if from > 0 {
         use tokio::io::AsyncSeekExt as _;
         file.seek(io::SeekFrom::Start(from))

@@ -43,6 +43,8 @@ pub mod logon_seat;
 #[cfg(target_os = "windows")]
 pub mod machine_store;
 #[cfg(target_os = "windows")]
+pub mod person_token;
+#[cfg(target_os = "windows")]
 pub mod program_data;
 pub mod protocol;
 pub mod session_change;

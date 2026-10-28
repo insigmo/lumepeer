@@ -30,6 +30,13 @@
 //! attached, it starts the person's client, and if none attaches within
 //! [`SESSION_INDICATOR_DEADLINE_SECS`] it ends every session (§7).
 //!
+//! What it does for a guest as a person it does as **the person signed in**,
+//! never as itself (ADR 0169 §6, [`ThePerson`]): the shell starts with their
+//! own token, a guest's file work runs impersonating the elevated half of it
+//! where there is one, and a recording export is written into their profile
+//! with their own token. Tunnels stay this process's: a TCP connection
+//! carries no Windows identity.
+//!
 //! Until the consent dialog is its own (pack 04), nobody here can be asked:
 //! a guest gets in with the device password, or is refused and told why.
 //!
@@ -45,13 +52,17 @@ use std::time::{Duration, Instant};
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::SESSION_INDICATOR_DEADLINE_SECS;
 use lumepeer_net::keystore::IDENTITY_ENTRY;
+use lumepeer_net::run_as::RunAs;
 use lumepeer_runtime::network::ActorHandle;
+use lumepeer_runtime::person::{Person, SignedIn};
 use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::host_role::ReleaseRequests;
+use lumepeer_service::person_token::SignedInPerson;
 use lumepeer_service::{
     SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_NOT_ENABLED,
     SESSION_HOST_EXIT_ROLE_TAKEN,
 };
+use lumepeer_terminal::{Shell, ShellError, ShellSize};
 
 use crate::host_panel::Served;
 use crate::placement::Placement;
@@ -120,6 +131,8 @@ fn host() -> u32 {
         return EXIT_FAILED;
     };
     let served = Served::new(runtime.handle().clone());
+    let person = SignedInPerson::new(session, sid.clone());
+    served.act_for(person.clone());
     if let Some(channel) = lumepeer_service::host_channel::HostChannel::new(&sid) {
         crate::host_panel::serve(channel, &served);
     } else {
@@ -131,6 +144,7 @@ fn host() -> u32 {
         &served,
         releases.as_ref(),
         session,
+        person,
     ));
     system_host::give_back(role, releases.as_ref());
     code
@@ -144,6 +158,7 @@ async fn serve(
     served: &Arc<Served>,
     releases: Option<&ReleaseRequests>,
     session: u32,
+    person: SignedInPerson,
 ) -> u32 {
     let wanted = || {
         lumepeer_service::program_data::accept_after_sign_in(directory)
@@ -165,7 +180,9 @@ async fn serve(
     );
     let Some(handle) = system_host::open(Hosting {
         placement,
-        screen: Arc::new(SignedInDesktop),
+        screen: Arc::new(SignedInDesktop {
+            person: Arc::new(ThePerson(person)),
+        }),
         relay_cache_file: RELAY_CACHE_FILE,
         serving: "the signed-in desktop",
         role_taken: SESSION_HOST_EXIT_ROLE_TAKEN,
@@ -266,10 +283,42 @@ impl Unseen {
     }
 }
 
-/// The session host's screen seam: no windows of its own, and input from
-/// where the ADR 0114 injector stands.
+/// The session host's screen seam: no windows of its own, input from where
+/// the ADR 0114 injector stands, and a guest's files and shells as the person
+/// signed in.
 #[derive(Debug)]
-struct SignedInDesktop;
+struct SignedInDesktop {
+    person: Arc<ThePerson>,
+}
+
+/// The person signed in, as the actor acts for them (ADR 0169 §6).
+#[derive(Debug)]
+struct ThePerson(SignedInPerson);
+
+impl RunAs for ThePerson {
+    /// A guest's file work, impersonating the elevated half of the person's
+    /// token where there is one — exactly what their elevated client acted
+    /// with — and their own token otherwise. Never `LocalSystem`.
+    fn run(&self, work: &mut (dyn FnMut() + Send)) -> std::io::Result<()> {
+        let token = self.0.files_token()?;
+        lumepeer_service::person_token::run_impersonating(
+            std::os::windows::io::AsHandle::as_handle(&token),
+            work,
+        )
+    }
+}
+
+impl SignedIn for ThePerson {
+    /// The shell, with the person's own token: their limited half, medium
+    /// integrity (ADR 0079, ADR 0102).
+    fn spawn_shell(&self, size: ShellSize) -> Result<Shell, ShellError> {
+        let token = self.0.own_token().map_err(|error| {
+            tracing::warn!(%error, "refusing a remote shell: no token of the person's to start it with");
+            ShellError::CannotDropPrivileges
+        })?;
+        Shell::spawn_as_user(size, std::os::windows::io::AsHandle::as_handle(&token))
+    }
+}
 
 impl ViewWindows for SignedInDesktop {
     /// The session host never views another machine: that is the client's,
@@ -310,6 +359,10 @@ impl ViewWindows for SignedInDesktop {
     fn injects_as_system(&self) -> bool {
         true
     }
+
+    fn person(&self) -> Person {
+        Person::SignedIn(Arc::clone(&self.person) as Arc<dyn SignedIn>)
+    }
 }
 
 #[cfg(test)]
@@ -320,11 +373,30 @@ mod tests {
     /// input from this process itself — and, until pack 04, asks nobody.
     #[test]
     fn the_signed_in_desktop_injects_itself_and_asks_nobody_yet() {
-        let screen = SignedInDesktop;
+        let screen = SignedInDesktop {
+            person: Arc::new(ThePerson(SignedInPerson::new(1, "S-1-5-21-1".to_owned()))),
+        };
         assert_eq!(screen.attendance(), HostAttendance::Unattended);
         assert!(!screen.on_secure_desktop());
         assert!(!screen.nobody_signed_in());
         assert!(screen.injects_as_system());
+        assert!(matches!(screen.person(), Person::SignedIn(_)));
+    }
+
+    /// ADR 0169 §6: a guest's file work and shell are the person's, and with
+    /// no token of theirs to be had — anything but `LocalSystem`, as this
+    /// test is — both are refused, never done as this process.
+    #[test]
+    fn without_the_persons_token_nothing_is_done_as_this_process() {
+        let session = lumepeer_service::agent_launch::current_session().unwrap_or(1);
+        let person = ThePerson(SignedInPerson::new(session, "S-1-5-21-1".to_owned()));
+        let mut ran = false;
+        assert!(person.run(&mut || ran = true).is_err());
+        assert!(!ran, "file work ran without the person's token");
+        assert_eq!(
+            person.spawn_shell(ShellSize { cols: 80, rows: 24 }).err(),
+            Some(ShellError::CannotDropPrivileges)
+        );
     }
 
     /// ADR 0169 §7: a session with no client starts one at once, and is ended

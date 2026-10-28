@@ -140,6 +140,13 @@ impl ViewWindows for LogonScreen {
     fn nobody_signed_in(&self) -> bool {
         true
     }
+
+    /// Nobody is signed in, so there is nobody to read, write or start a
+    /// shell as: a guest's file work and shells are refused here rather than
+    /// done as `LocalSystem` (ADR 0169 §6).
+    fn person(&self) -> lumepeer_runtime::person::Person {
+        lumepeer_runtime::person::Person::Nobody
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +170,10 @@ mod tests {
         assert_eq!(screen.attendance(), HostAttendance::Unattended);
         assert!(screen.on_secure_desktop());
         assert!(screen.nobody_signed_in());
+        assert!(
+            matches!(screen.person(), lumepeer_runtime::person::Person::Nobody),
+            "nobody to do a guest's files or shell as (ADR 0169 §6)"
+        );
         assert!(
             !screen.injects_as_system(),
             "its input goes to the secure desktop"

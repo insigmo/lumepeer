@@ -24,6 +24,14 @@
 //! Transport-agnostic below one seam, like `file_transfer`: it talks to any
 //! [`AsyncRead`]/[`AsyncWrite`] pair, so tests run over in-memory duplexes
 //! and production over the QUIC connection of `ALPN_TUNNEL`.
+//!
+//! **Whose connection it is.** The host's end of a tunnel connects as the
+//! host process itself — on Windows that is the `LocalSystem` session host
+//! (ADR 0169 §6), not the person signed in. Unlike a file or a shell, which
+//! the session host opens in the person's name, a raw TCP connection carries
+//! no Windows identity to act as: the service at the far end of it sees an
+//! address and a port, and decides on its own. So there is nothing to
+//! impersonate here, and nothing is.
 
 use lumepeer_core::constants::TUNNEL_BUFFER_BYTES;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
