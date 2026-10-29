@@ -11,6 +11,8 @@
     reason = "binary crate: `pub` marks the IPC surface of §13, not a library API"
 )]
 
+// This same binary as the elevated access-settings window only (ADR 0169 §5).
+mod access_settings;
 mod autostart;
 mod bootstrap;
 mod commands;
@@ -734,7 +736,15 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::host_bar_expand,
         commands::host_bar_focus_main,
         commands::host_bar_open_chat,
+        commands::access_settings_open,
     ]
+}
+
+/// The application's context — config, assets, capabilities — generated once
+/// and shared by the client and the access-settings window, which only
+/// changes what its one window loads (ADR 0169 §5).
+fn context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
 }
 
 /// Reads `--enable-autostart` / `--disable-autostart` off the command line.
@@ -848,6 +858,16 @@ fn main() {
     // Before everything else: one of the processes the service launches this
     // binary as, never a client. Each of them returns only by exiting.
     run_as_a_launched_role(&args);
+    // Before the single-instance check: the client that asked for it is
+    // still running, and this process is not a second client but its
+    // elevated settings window (ADR 0169 §5). It returns only by exiting.
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| arg == lumepeer_service::ACCESS_SETTINGS_ARG)
+    {
+        access_settings::run(&args, context());
+    }
     if let Some(enabled) = autostart_cli_flag(&args) {
         match autostart::Autostart::for_this_app().set(enabled) {
             Ok(()) => return,
@@ -998,7 +1018,7 @@ fn main() {
             }
         })
         .invoke_handler(invoke_handler())
-        .run(tauri::generate_context!())
+        .run(context())
         .unwrap_or_else(|error| {
             eprintln!("fatal: failed to start the application: {error}");
             std::process::exit(1);

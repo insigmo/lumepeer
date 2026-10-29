@@ -445,6 +445,14 @@ export const fr: Dictionary = {
   'unattended.logonScreen.label': "Aussi sur l'écran de connexion Windows",
   'unattended.logonScreen.note':
     "Après un redémarrage ou une déconnexion, un invité disposant du mot de passe de l'appareil voit l'écran de connexion et peut ouvrir une session. Rien sur cet écran n'indique qu'une personne est connectée.",
+  'unattended.managedByService':
+    'Cet appareil est servi par le service Lumepeer. Ses paramètres d\'accès sont visibles ici ; les modifier demande des droits d\'administrateur.',
+  'unattended.openAccessSettings':
+    'Modifier les paramètres d\'accès',
+  'access.heading':
+    'Paramètres d\'accès',
+  'access.explain':
+    'Cette fenêtre s\'exécute avec des droits d\'administrateur. Ce que vous modifiez ici s\'applique immédiatement au service Lumepeer qui sert cet appareil.',
   'book.heading': 'Appareils enregistrés',
   'book.explain':
     "Faire confiance à un appareil ne le laisse pas entrer de lui-même. Cela détermine simplement qui est autorisé à essayer le mot de passe de l'appareil.",

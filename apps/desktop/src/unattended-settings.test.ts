@@ -212,6 +212,53 @@ describe('unattended settings', () => {
   });
 });
 
+// ADR 0169 §5: where the Lumepeer service hosts this machine, this window
+// reads the policy, may turn it off, and changes it only through the elevated
+// access-settings window. Nothing here can send a password to the service.
+describe('unattended settings kept by the service', () => {
+  const managed: UnattendedStatus = { ...on, totp_enabled: true, managed_by_service: true };
+
+  it('offers no password field, no second-factor switch and no role picker', () => {
+    render(unattendedSettings(managed, 'en'), container);
+    expect(container.querySelector('[data-testid="unattended-managed"]')).not.toBeNull();
+    expect(container.querySelector('#unattended-password')).toBeNull();
+    expect(container.querySelector('.unattended-totp input')).toBeNull();
+    expect(container.querySelector('select')).toBeNull();
+    expect(container.querySelector('[data-testid="unattended-logon-screen"]')).toBeNull();
+    expect(container.textContent).toContain(t('en', 'unattended.totp.on'));
+  });
+
+  it('opens the elevated access settings from the shield button', async () => {
+    render(unattendedSettings(managed, 'en'), container);
+    container
+      .querySelector<HTMLButtonElement>('[data-testid="unattended-open-access-settings"]')
+      ?.click();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('access_settings_open'));
+  });
+
+  it('still turns unattended access off, after asking', async () => {
+    const confirm = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    render(unattendedSettings(managed, 'en'), container);
+    container.querySelector<HTMLButtonElement>('.unattended-disable')?.click();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('unattended_disable'));
+    confirm.mockRestore();
+  });
+
+  it('says a declined prompt rather than nothing', async () => {
+    invoke.mockRejectedValueOnce({ code: 'ACCESS_SETTINGS_CANCELLED', message: 'the prompt was declined' });
+    const onRefresh = vi.fn();
+    render(unattendedSettings(managed, 'en', onRefresh), container);
+    container
+      .querySelector<HTMLButtonElement>('[data-testid="unattended-open-access-settings"]')
+      ?.click();
+    await vi.waitFor(() => expect(onRefresh).toHaveBeenCalled());
+    render(unattendedSettings(managed, 'en', onRefresh), container);
+    expect(container.querySelector('[data-testid="unattended-error"]')?.textContent).toContain(
+      'the prompt was declined',
+    );
+  });
+});
+
 describe('unattended indicator', () => {
   it('is absent while unattended access is off', () => {
     render(unattendedIndicator(off, 'en'), container);

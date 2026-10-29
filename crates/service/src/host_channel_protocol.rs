@@ -5,7 +5,7 @@
 //! this channel (`host_channel.rs`). So the rule is about what the channel can
 //! say, not who says it: the client **reads** the host's state and **narrows**
 //! it — ends a session, turns a grant off, refuses a request, turns hosting
-//! off, chats — and nothing on this wire admits a guest, raises a grant, turns
+//! off, turns unattended access off, chats — and nothing on this wire admits a guest, raises a grant, turns
 //! `secure_desktop_input` on, trusts a device or changes the device password.
 //! Those are not refused here; they cannot be written down (ADR 0043).
 //! [`Request::effect`] is where that is kept true: every request is one of
@@ -86,6 +86,8 @@ const KIND_HOSTING_OFF: u8 = 0x13;
 const KIND_SEND_CHAT: u8 = 0x14;
 /// Kind byte of [`Request::AskToWiden`].
 const KIND_ASK_TO_WIDEN: u8 = 0x20;
+/// Kind byte of [`Request::UnattendedOff`].
+const KIND_UNATTENDED_OFF: u8 = 0x15;
 
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
@@ -148,6 +150,11 @@ pub enum Request {
         /// The line.
         text: String,
     },
+    /// Turn unattended access off: forget the device password and its second
+    /// factor (ADR 0169 §4, §5). The way back on is the elevated
+    /// `--access-settings` window; there is no request here that turns it on
+    /// or sets a password.
+    UnattendedOff,
     /// Put the session host's own dialog in front of the person at this
     /// machine, asking whether `peer`'s session may have `widening`
     /// (pack 04, ADR 0169 §5).
@@ -229,7 +236,8 @@ impl Request {
             Self::EndSession { .. }
             | Self::LowerGrant { .. }
             | Self::RefusePending { .. }
-            | Self::HostingOff => Effect::Narrows,
+            | Self::HostingOff
+            | Self::UnattendedOff => Effect::Narrows,
             Self::SendChat { .. } => Effect::Says,
             Self::AskToWiden { .. } => Effect::Asks,
         }
@@ -338,6 +346,7 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
             payload.extend_from_slice(peer.as_bytes());
             (KIND_ASK_TO_WIDEN, payload)
         }
+        Request::UnattendedOff => (KIND_UNATTENDED_OFF, Vec::new()),
     }
 }
 
@@ -377,6 +386,7 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
             let widening = Widening::from_byte(byte)?;
             label(peer).map(|peer| Request::AskToWiden { peer, widening })
         }
+        KIND_UNATTENDED_OFF => payload.is_empty().then_some(Request::UnattendedOff),
         _ => None,
     }
 }
@@ -434,6 +444,7 @@ mod tests {
                 peer: peer(),
                 widening: Widening::TrustDevice,
             },
+            Request::UnattendedOff,
         ]
     }
 
@@ -479,6 +490,18 @@ mod tests {
             }
         ));
         assert_eq!(wire[1], KIND_LOWER_GRANT);
+    }
+
+    /// ADR 0169 §5: unattended access can be turned off over the channel and
+    /// carries nothing — no password, no role, no "on" — and a payload on it
+    /// is not understood.
+    #[test]
+    fn turning_unattended_access_off_carries_nothing() {
+        assert_eq!(Request::UnattendedOff.effect(), Effect::Narrows);
+        let mut wire = Vec::new();
+        assert!(write_request(&mut wire, &Request::UnattendedOff));
+        assert_eq!(wire.len(), HEADER_LEN, "no payload at all");
+        assert_eq!(decode_request(KIND_UNATTENDED_OFF, b"password"), None);
     }
 
     /// Every reply survives the wire unchanged.

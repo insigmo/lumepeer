@@ -445,6 +445,14 @@ export const pl: Dictionary = {
   'unattended.logonScreen.label': 'Także na ekranie logowania Windows',
   'unattended.logonScreen.note':
     'Po ponownym uruchomieniu lub wylogowaniu gość znający hasło urządzenia widzi ekran logowania i może się zalogować. Na tym ekranie nic nie wskazuje, że ktoś jest połączony.',
+  'unattended.managedByService':
+    'To urządzenie obsługuje usługa Lumepeer. Ustawienia dostępu można tu odczytać; ich zmiana wymaga uprawnień administratora.',
+  'unattended.openAccessSettings':
+    'Zmień ustawienia dostępu',
+  'access.heading':
+    'Ustawienia dostępu',
+  'access.explain':
+    'To okno działa z uprawnieniami administratora. Zmiany wprowadzone tutaj od razu obowiązują usługę Lumepeer obsługującą to urządzenie.',
   'book.heading': 'Zapisane urządzenia',
   'book.explain':
     'Uznanie urządzenia za zaufane samo w sobie go nie wpuszcza. Decyduje jedynie o tym, kto w ogóle może próbować hasła urządzenia.',

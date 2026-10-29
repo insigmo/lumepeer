@@ -35,6 +35,12 @@
 //! password, and every widening of a running session, wait for their answer
 //! in a window no program of theirs can press.
 //!
+//! That password, the rest of the access policy and the trusted devices are
+//! written only by the elevated `--access-settings` window
+//! ([`crate::access_settings`]); when it raises the person's policy-changed
+//! event, this host reads them again without restarting, and the next
+//! admission is decided by what was written (ADR 0169 §5).
+//!
 //! It refuses — [`SESSION_HOST_EXIT_NOT_ENABLED`] — until an administrator has
 //! turned ADR 0169 on for this machine, and — [`SESSION_HOST_EXIT_NO_STORE`]
 //! — for a person whose store holds no identity: they never opened Lumepeer,
@@ -49,6 +55,7 @@ use lumepeer_core::constants::SESSION_INDICATOR_DEADLINE_SECS;
 use lumepeer_net::keystore::IDENTITY_ENTRY;
 use lumepeer_runtime::network::{ActorHandle, SessionStateDto};
 use lumepeer_runtime::view::{ViewSurface, ViewWindows};
+use lumepeer_service::access_settings::PolicyChanges;
 use lumepeer_service::host_role::ReleaseRequests;
 use lumepeer_service::{
     SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_NOT_ENABLED,
@@ -128,12 +135,21 @@ fn host() -> u32 {
     } else {
         tracing::error!("no channel for the client: it cannot attach");
     }
+    // The access-settings window raises it after writing the policy
+    // (ADR 0169 §5); without it the policy is read only at start.
+    let policy_changes = lumepeer_service::access_settings::PolicyChanges::create(&sid);
+    if policy_changes.is_none() {
+        tracing::warn!(
+            "no policy-changed event: a changed device password takes effect at the next start"
+        );
+    }
     let code = runtime.block_on(serve(
         placement,
         &directory,
         &served,
         releases.as_ref(),
         session,
+        policy_changes.as_ref(),
     ));
     system_host::give_back(role, releases.as_ref());
     code
@@ -147,6 +163,7 @@ async fn serve(
     served: &Arc<Served>,
     releases: Option<&ReleaseRequests>,
     session: u32,
+    policy_changes: Option<&PolicyChanges>,
 ) -> u32 {
     let wanted = || {
         lumepeer_service::program_data::accept_after_sign_in(directory)
@@ -157,6 +174,9 @@ async fn serve(
         if system_host::released(releases) {
             return 0;
         }
+        // Closed, nothing holds the policy: the endpoint reads it when it
+        // opens. Taken down here so it is not read twice then.
+        let _ = policy_changes.is_some_and(PolicyChanges::changed);
         if wanted() {
             break;
         }
@@ -191,6 +211,12 @@ async fn serve(
         tokio::time::sleep(TICK).await;
         if system_host::released(releases) {
             return system_host::hand_over(&handle, |_| 0).await;
+        }
+        if policy_changes.is_some_and(PolicyChanges::changed) {
+            tracing::info!("the access settings were changed; reading the policy again");
+            if let Err(error) = handle.reload_policy().await {
+                tracing::warn!(?error, "cannot read the access policy again");
+            }
         }
         let rows = handle.status().await.unwrap_or_default();
         consents.follow(&rows);
