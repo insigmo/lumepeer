@@ -282,7 +282,8 @@ select option {
   flex: none;
   display: block;
   border-radius: 22%;
-  /* The tile is dark navy by design; on the dark sidebar it needs an edge. */
+  /* The tile is readout glass, dark in both themes (ADR 0170); on the dark
+     sidebar it needs an edge. */
   box-shadow: 0 0 0 1px var(--logo-ring);
 }
 
@@ -2300,24 +2301,21 @@ input[type='checkbox'].switch:disabled {
   font-size: var(--fs-micro);
 }
 
+/* A press for a code that produced none (ADR 0170). */
+.invite-error {
+  margin: 8px 0 0;
+  padding-inline: 2px;
+  color: var(--red);
+  font-size: var(--fs-micro);
+}
+
 /* Session recording (§17). Permission comes with the session's role; these
    are the act, and the indicator that goes with it. Neither the banner nor
    the in-row badge can be dismissed: "no hidden capture" (§2.2) is a rule
    about what the person at this machine sees without going looking. */
-/* Another process hosts this machine (ADR 0169): information, not alarm, so
-   the quiet surface rather than a colour. */
-.hosted-notice {
-  margin: 0 0 10px;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-2);
-  color: var(--text-2);
-  font-size: var(--fs-micro);
-}
-
-/* ...and it does not answer (ADR 0169 §2): nobody can reach this machine
-   until the service runs, so this one carries the accent and the fix. */
+/* Another process hosts this machine (ADR 0169) and it does not answer
+   (§2): nobody can reach this machine until the service runs, so this
+   carries the accent and the fix. */
 .host-unreachable {
   display: flex;
   flex-wrap: wrap;

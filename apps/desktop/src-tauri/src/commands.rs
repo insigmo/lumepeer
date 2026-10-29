@@ -387,8 +387,9 @@ pub struct InviteCreateArgs {
     pub renew: bool,
 }
 
-/// What [`invite_create`] hands back to the UI to show as the invite code.
-#[derive(Debug, Clone, Serialize)]
+/// What [`invite_create`] hands back to the UI to show as the invite code —
+/// and what the session host sends this window for it (ADR 0170).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteDto {
     /// The invite code itself: plain text the host shows and a guest pastes.
     pub code: String,
@@ -1604,6 +1605,10 @@ pub async fn report_decoder_codecs(
 
 /// Issues an invite for `args.role` and returns its code.
 ///
+/// Where the session host hosts this machine (ADR 0169), this window's own
+/// actor is a guest and may not invite anybody (ADR 0085 §4); the session
+/// host issues the code instead, always for view only (ADR 0170).
+///
 /// # Errors
 /// Rejects calls from other windows; propagates [`ActorError`].
 #[tauri::command]
@@ -1613,6 +1618,13 @@ pub async fn invite_create(
     args: InviteCreateArgs,
 ) -> Result<InviteDto, IpcError> {
     check_window(&window)?;
+    if let Some(panel) = session_host(&state) {
+        let renew = args.renew;
+        return tauri::async_runtime::spawn_blocking(move || panel.invite(renew))
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
+    }
     let dto = state
         .network
         .invite_create(args.role.into(), args.renew)
@@ -1637,6 +1649,12 @@ pub async fn invite_current(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<InviteDto>, IpcError> {
     check_window(&window)?;
+    if let Some(panel) = session_host(&state) {
+        return tauri::async_runtime::spawn_blocking(move || panel.current_invite())
+            .await
+            .map_err(|_| panel_error(crate::host_panel::PanelError::Unreachable))?
+            .map_err(panel_error);
+    }
     Ok(state.network.invite_current().await?.map(|dto| InviteDto {
         code: dto.code,
         expires_at: dto.expires_at,

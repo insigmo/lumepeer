@@ -1,26 +1,23 @@
-// Lumepeer logomark (PRODUCT.md Brand Commitments): rounded-square tile,
-// dark navy fill (#0F1724), abstract blue-gradient "L" glyph with a small
-// violet accent triangle at its foot and a solid blue dot at bottom-right.
+// Lumepeer logomark (PRODUCT.md Brand Commitments; ADR 0170): two peers, and
+// the light where they meet. Two rings overlap on the dark readout-glass tile
+// and the lens they share is lit in the accent key's amber — two machines and
+// nothing between them, which is what serverless means here.
 //
-// Inline SVG rather than a shipped raster: the confirmed asset file itself
-// was never handed to this repo (only its description and pixel-picked
-// palette), and an inline mark stays crisp at every size CSS puts it at.
+// The same drawing as `src-tauri/icons/icon.svg`, the master every app,
+// installer and tray icon is rendered from; change the two together. Inline
+// rather than a shipped raster so it stays crisp at every size CSS puts it at.
 
 import { svg, type SVGTemplateResult } from 'lit-html';
 
 export function logoMark(): SVGTemplateResult {
   return svg`
     <svg class="logo-icon" viewBox="0 0 32 32" role="img" aria-hidden="true">
-      <defs>
-        <linearGradient id="lumepeer-l-gradient" x1="10" y1="7" x2="23" y2="24" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stop-color="#6C8CF5" />
-          <stop offset="1" stop-color="#3564E4" />
-        </linearGradient>
-      </defs>
-      <rect width="32" height="32" rx="7" fill="#0F1724" />
-      <path d="M12 7.5h3.4v13.6h7.4v3.4H12z" fill="url(#lumepeer-l-gradient)" />
-      <path d="M12 21.1h4.6L12 25.5z" fill="#7C5CFC" />
-      <circle cx="23" cy="23.5" r="2.6" fill="#3564E4" />
+      <rect width="32" height="32" rx="7" fill="#232325" />
+      <path d="M16 9.77A7 7 0 0 1 16 22.23A7 7 0 0 1 16 9.77Z" fill="#F2A31B" />
+      <g fill="none" stroke="#F1F1EC" stroke-width="2.2">
+        <circle cx="12.8" cy="16" r="7" />
+        <circle cx="19.2" cy="16" r="7" />
+      </g>
     </svg>
   `;
 }

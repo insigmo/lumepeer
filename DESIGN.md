@@ -310,7 +310,7 @@ A single round-ended plate of 32px glyph keys at 94% faceplate opacity over the 
 - **Do** use the platform's UI face; installed builds load no fonts.
 
 ### Don't:
-- **Don't** ship a dark-navy dashboard with a glowing blue accent; blue is not in this palette outside the logomark and the terminal's ANSI colours.
+- **Don't** ship a dark-navy dashboard with a glowing blue accent; blue is not in this palette outside the terminal's ANSI colours. The logomark is drawn in the palette too: readout glass, readout text and key yellow (ADR 0170).
 - **Don't** show a disabled yellow key as a paler yellow; it goes grey.
 - **Don't** draw a focus outline in the key's yellow alone.
 - **Don't** let the agent bar or the recording strip follow the theme into a pale colour.

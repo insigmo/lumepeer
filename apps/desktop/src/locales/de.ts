@@ -34,6 +34,8 @@ export const de: Dictionary = {
   'invite.badTicket': 'Dieser Einladungscode ist ungültig oder abgelaufen.',
   'invite.offline':
     'Dieses Gerät ist noch nicht aus dem Internet erreichbar. Warten Sie, bis der Status bereit ist, und versuchen Sie es erneut.',
+  'invite.createFailed':
+    'Der Einladungscode konnte nicht erstellt werden. Warten Sie, bis der Status bereit ist, und versuchen Sie es erneut.',
   'invite.versionMismatch': 'Auf dem anderen Gerät läuft eine nicht kompatible Version von Lumepeer.',
   'status.inputOn': 'Eingabe an',
   'status.inputOff': 'Eingabe aus',
@@ -174,8 +176,6 @@ export const de: Dictionary = {
     'Dieses Gerät führt Linux innerhalb von ChromeOS aus, und Apps dort können den ChromeOS-Bildschirm nicht sehen, daher sehen eingeladene Personen nichts. Verbindungen von hier zu anderen Geräten funktionieren wie gewohnt.',
   'status.noEncoder':
     'Dieses Gerät hat keinen Video-Encoder, daher sehen eingeladene Personen nichts. Sitzungen verbinden sich trotzdem, und die Eingabe funktioniert weiterhin.',
-  'status.hostedByService':
-    'Dieses Gerät wird vom Lumepeer-Dienst bereitgestellt, nicht von diesem Fenster. Mit anderen Geräten können Sie sich von hier aus weiterhin verbinden.',
   'status.unreachable':
     'Dieser Computer ist gerade nicht erreichbar: Der Lumepeer-Dienst läuft nicht.',
   'status.startService':

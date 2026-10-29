@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Lumepeer mark (ADR 0170): two peers, and the light where they meet.
+       Tile = the readout glass (#232325), rings = readout text (#F1F1EC),
+       lens = the accent key (#F2A31B). The master for every raster in this
+       folder (`npx tauri icon icons/icon.svg`) and for src/logo.ts. -->
+  <rect width="32" height="32" rx="7" fill="#232325"/>
+  <path d="M16 9.77A7 7 0 0 1 16 22.23A7 7 0 0 1 16 9.77Z" fill="#F2A31B"/>
+  <g fill="none" stroke="#F1F1EC" stroke-width="2.2">
+    <circle cx="12.8" cy="16" r="7"/>
+    <circle cx="19.2" cy="16" r="7"/>
+  </g>
+</svg>

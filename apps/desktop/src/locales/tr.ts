@@ -34,6 +34,8 @@ export const tr: Dictionary = {
   'invite.badTicket': 'Bu davet kodu geçersiz veya süresi dolmuş.',
   'invite.offline':
     'Bu cihaz henüz internetten erişilebilir değil. Durum hazır olana kadar bekleyip tekrar deneyin.',
+  'invite.createFailed':
+    'Davet kodu oluşturulamadı. Durum hazır olana kadar bekleyip tekrar deneyin.',
   'invite.versionMismatch': 'Diğer cihaz Lumepeer\'in uyumsuz bir sürümünü çalıştırıyor.',
   'status.inputOn': 'giriş açık',
   'status.inputOff': 'giriş kapalı',
@@ -174,8 +176,6 @@ export const tr: Dictionary = {
     'Bu cihaz ChromeOS içinde Linux çalıştırıyor ve oradaki uygulamalar ChromeOS ekranını göremez, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Buradan diğer cihazlara bağlanmak her zamanki gibi çalışır.',
   'status.noEncoder':
     'Bu cihazda video kodlayıcı yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
-  'status.hostedByService':
-    'Bu cihazı bu pencere değil, Lumepeer hizmeti barındırıyor. Buradan diğer cihazlara bağlanmaya devam edebilirsiniz.',
   'status.unreachable':
     'Bu bilgisayara şu anda bağlanılamıyor: Lumepeer hizmeti çalışmıyor.',
   'status.startService':

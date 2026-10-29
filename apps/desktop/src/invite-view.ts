@@ -7,7 +7,7 @@
 // status-pill-preview.html) puts them in different places: the invite code
 // lives in the sidebar, the connect form in the main panel.
 
-import { html, type TemplateResult } from 'lit-html';
+import { html, nothing, type TemplateResult } from 'lit-html';
 
 import type { Locale, TranslationKey } from './i18n';
 import { t } from './i18n';
@@ -74,6 +74,8 @@ const CREDENTIAL_ERROR_TEXT: Record<string, TranslationKey> = {
 
 let lastCode: string | undefined;
 let creatingInvite = false;
+/** Why the last press for a code produced none, until the next press. */
+let inviteError: TranslationKey | undefined;
 let copied = false;
 /** True from the moment `invite_connect` is invoked until it settles. */
 let dialing = false;
@@ -427,6 +429,7 @@ export async function loadLiveInvite(): Promise<void> {
  */
 async function createInvite(renew = false): Promise<void> {
   creatingInvite = true;
+  inviteError = undefined;
   notify();
   try {
     const invoke = await invoker();
@@ -436,6 +439,11 @@ async function createInvite(renew = false): Promise<void> {
       code: string;
     };
     lastCode = invite.code;
+  } catch (error) {
+    // Said, not swallowed: a refusal used to leave the button looking as if
+    // it had never been pressed (ADR 0170).
+    console.error('invite_create failed:', describeError(error));
+    inviteError = inviteFailureKey(error);
   } finally {
     creatingInvite = false;
     notify();
@@ -465,6 +473,22 @@ async function copyCode(): Promise<void> {
  * (see commands.rs), a plain object rather than an `Error` — `String()` on
  * that yields `[object Object]` instead of the message it carries.
  */
+/**
+ * What to say when no code came back: the service that hosts this machine is
+ * not running, or it is and could not issue one yet (ADR 0170).
+ */
+function inviteFailureKey(error: unknown): TranslationKey {
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  return code === 'HOST_SERVICE_UNREACHABLE' ? 'status.unreachable' : 'invite.createFailed';
+}
+
+/** The line under a code button whose last press produced no code. */
+function inviteErrorLine(locale: Locale): TemplateResult | typeof nothing {
+  return inviteError
+    ? html`<p class="invite-error" role="alert" data-testid="invite-error">${t(locale, inviteError)}</p>`
+    : nothing;
+}
+
 function describeError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -625,6 +649,7 @@ export function inviteCodePanel(locale: Locale): TemplateResult {
       >
         ${t(locale, 'invite.create')}
       </button>
+      ${inviteErrorLine(locale)}
     `;
   }
 
@@ -660,6 +685,7 @@ export function inviteRefreshPanel(locale: Locale): TemplateResult {
       >
         ${t(locale, 'invite.refresh')}
       </button>
+      ${inviteErrorLine(locale)}
       <p class="invite-refresh-note">${t(locale, 'invite.refresh.note')}</p>
     </div>
   `;

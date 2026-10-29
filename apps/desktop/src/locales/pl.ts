@@ -34,6 +34,8 @@ export const pl: Dictionary = {
   'invite.badTicket': 'Ten kod zaproszenia jest nieprawidłowy lub wygasł.',
   'invite.offline':
     'To urządzenie nie jest jeszcze dostępne z internetu. Poczekaj, aż stan zmieni się na gotowy, i spróbuj ponownie.',
+  'invite.createFailed':
+    'Nie udało się utworzyć kodu zaproszenia. Poczekaj, aż stan zmieni się na gotowy, i spróbuj ponownie.',
   'invite.versionMismatch': 'Na drugim urządzeniu działa niezgodna wersja Lumepeer.',
   'status.inputOn': 'wejście włączone',
   'status.inputOff': 'wejście wyłączone',
@@ -174,8 +176,6 @@ export const pl: Dictionary = {
     'To urządzenie uruchamia Linuksa wewnątrz ChromeOS, a aplikacje w nim nie widzą ekranu ChromeOS, więc zaproszone osoby niczego nie zobaczą. Łączenie się stąd z innymi urządzeniami działa jak zwykle.',
   'status.noEncoder':
     'To urządzenie nie ma kodera wideo, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
-  'status.hostedByService':
-    'Tym urządzeniem zarządza usługa Lumepeer, a nie to okno. Nadal możesz stąd łączyć się z innymi urządzeniami.',
   'status.unreachable':
     'Z tym komputerem nie można się teraz połączyć: usługa Lumepeer nie działa.',
   'status.startService':

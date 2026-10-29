@@ -272,7 +272,7 @@ describe('media warning (gap-tasks/05)', () => {
     expect(warning?.textContent).toBe(t('en', 'status.noCapture'));
   });
 
-  it('says the service hosts this machine when this window is not its host (ADR 0169)', async () => {
+  it('says nothing about the service while the service answers (ADR 0169)', async () => {
     RESPONSES.network_status = {
       ready: true,
       can_capture: true,
@@ -281,8 +281,8 @@ describe('media warning (gap-tasks/05)', () => {
       hosted_by_service: true,
     };
     await boot();
-    const notice = app().querySelector('[data-testid="hosted-notice"]');
-    expect(notice?.textContent?.trim()).toBe(t('en', 'status.hostedByService'));
+    expect(app().querySelector('[data-testid="host-unreachable"]')).toBeNull();
+    expect(app().querySelector('.main-panel')?.textContent).not.toContain('Lumepeer service');
   });
 
   it('says the machine cannot be reached and offers to start the service when its host is silent (ADR 0169 §2)', async () => {
@@ -295,7 +295,6 @@ describe('media warning (gap-tasks/05)', () => {
       host_unreachable: true,
     };
     await boot();
-    expect(app().querySelector('[data-testid="hosted-notice"]')).toBeNull();
     const notice = app().querySelector('[data-testid="host-unreachable"]');
     expect(notice?.textContent).toContain(t('en', 'status.unreachable'));
     app().querySelector<HTMLButtonElement>('[data-testid="service-start"]')?.click();
@@ -304,6 +303,6 @@ describe('media warning (gap-tasks/05)', () => {
 
   it('says nothing about the service while this window is the host', async () => {
     await boot();
-    expect(app().querySelector('[data-testid="hosted-notice"]')).toBeNull();
+    expect(app().querySelector('[data-testid="host-unreachable"]')).toBeNull();
   });
 });

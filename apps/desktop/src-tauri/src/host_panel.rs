@@ -21,7 +21,7 @@ use lumepeer_service::host_channel_protocol::{Reply, Request};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{
-    ChatEntryDto, ExportDto, RecordingDto, SessionStatusDto, UnattendedStatusDto,
+    ChatEntryDto, ExportDto, InviteDto, RecordingDto, SessionStatusDto, UnattendedStatusDto,
 };
 
 /// What the session host says about itself in one snapshot.
@@ -178,7 +178,8 @@ impl HostPanel {
             | Reply::Refused
             | Reply::Recordings(_)
             | Reply::Exported(_)
-            | Reply::GuestStores(_) => None,
+            | Reply::GuestStores(_)
+            | Reply::Invite(_) => None,
         }
     }
 
@@ -239,6 +240,39 @@ impl HostPanel {
             None => Err(PanelError::Unreachable),
         }
     }
+    /// The invite code the session host is living with, if it has one
+    /// (ADR 0170). Never issues one (ADR 0062).
+    ///
+    /// # Errors
+    /// [`PanelError`] when there is no host, or it is closed.
+    pub fn current_invite(&self) -> Result<Option<InviteDto>, PanelError> {
+        match self.ask(&Request::CurrentInvite) {
+            Some(Reply::Invite(json)) => {
+                serde_json::from_slice(&json).map_err(|_| PanelError::Refused)
+            }
+            Some(_) => Err(PanelError::Refused),
+            None => Err(PanelError::Unreachable),
+        }
+    }
+
+    /// The code a guest dials the session host with: the live one, issued
+    /// first if there is none, or with `renew` a new one that retires every
+    /// code before it (ADR 0170). Always for view only.
+    ///
+    /// # Errors
+    /// [`PanelError`] when there is no host, or it issued nothing — closed,
+    /// or not on the network yet.
+    pub fn invite(&self, renew: bool) -> Result<InviteDto, PanelError> {
+        match self.ask(&Request::Invite { renew }) {
+            Some(Reply::Invite(json)) => serde_json::from_slice::<Option<InviteDto>>(&json)
+                .ok()
+                .flatten()
+                .ok_or(PanelError::Refused),
+            Some(_) => Err(PanelError::Refused),
+            None => Err(PanelError::Unreachable),
+        }
+    }
+
     /// Asks the host to install the update it found (ADR 0169 §8). The
     /// request names nothing: what is installed is the host's to choose.
     ///
@@ -317,13 +351,13 @@ mod served {
 
     use lumepeer_service::person_token::SignedInPerson;
 
-    use lumepeer_core::consent::IndependentGrant;
+    use lumepeer_core::consent::{IndependentGrant, Role};
     use lumepeer_runtime::network::ActorHandle;
     use lumepeer_service::host_channel::{HostChannel, PanelConnection};
     use lumepeer_service::host_channel_protocol::{Reply, Request};
 
     use super::HostSnapshot;
-    use crate::commands::{ChatEntryDto, UnattendedStatusDto, session_status_dto};
+    use crate::commands::{ChatEntryDto, InviteDto, UnattendedStatusDto, session_status_dto};
     use crate::placement::guest_stores::{GuestStores, InAdminTree};
     use crate::session_host_consent::Consents;
 
@@ -610,6 +644,8 @@ mod served {
                 | Request::GuestStores
                 | Request::GuestStoresTaken => Reply::Refused,
                 Request::InstallUpdate => self.install_update(),
+                Request::CurrentInvite => current_invite_reply(runtime, &actor),
+                Request::Invite { renew } => invite_reply(runtime, &actor, renew),
             }
         }
 
@@ -734,6 +770,39 @@ mod served {
         })
     }
 
+    /// The actor's invite as the client's sidebar reads it.
+    fn invite_dto(invite: lumepeer_runtime::network::InviteDto) -> InviteDto {
+        InviteDto {
+            code: invite.code,
+            expires_at: invite.expires_at,
+        }
+    }
+
+    /// The code this host is living with, or `null`; issues none (ADR 0062).
+    fn current_invite_reply(runtime: &tokio::runtime::Handle, actor: &ActorHandle) -> Reply {
+        runtime
+            .block_on(actor.invite_current())
+            .ok()
+            .and_then(|live| serde_json::to_vec(&live.map(invite_dto)).ok())
+            .map_or(Reply::Refused, Reply::Invite)
+    }
+
+    /// The code a guest dials this host with (ADR 0170). View only, whatever
+    /// the caller would have liked: the request has no role to name, and
+    /// whoever arrives with the code still meets this host's own consent
+    /// dialog.
+    fn invite_reply(runtime: &tokio::runtime::Handle, actor: &ActorHandle, renew: bool) -> Reply {
+        match runtime.block_on(actor.invite_create(Role::ViewOnly, renew)) {
+            Ok(invite) => {
+                serde_json::to_vec(&invite_dto(invite)).map_or(Reply::Refused, Reply::Invite)
+            }
+            Err(error) => {
+                tracing::warn!(?error, "a client asked for an invite; none was issued");
+                Reply::Refused
+            }
+        }
+    }
+
     /// The grant `name` spells, in `IndependentGrant`'s own spelling; `None`
     /// for anything that is not one.
     fn grant_named(name: &str) -> Option<IndependentGrant> {
@@ -818,6 +887,20 @@ mod served {
                 }),
                 Reply::Refused
             );
+        }
+
+        /// ADR 0170: a closed host has no endpoint a code could name, so it
+        /// issues none and has none to show.
+        #[test]
+        fn a_closed_host_hands_out_no_invite() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let served = Served::new(runtime.handle().clone());
+            assert_eq!(served.answer(Request::CurrentInvite), Reply::Refused);
+            for renew in [false, true] {
+                assert_eq!(served.answer(Request::Invite { renew }), Reply::Refused);
+            }
         }
 
         /// ADR 0169 §8: the snapshot says where the updates stand, open or

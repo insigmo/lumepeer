@@ -45,7 +45,7 @@ The app is used day and night, often beside other tools for hours.
 ## Brand Commitments
 
 - Name: Lumepeer.
-- Logomark (`apps/desktop/src/logo.ts`): rounded-square tile, dark navy fill `#0F1724`, abstract blue-gradient "L" with a small violet triangle at its foot and a solid blue dot at bottom-right. The mark stays; it is the one fixed brand asset.
+- Logomark (ADR 0170): "two peers, and the light where they meet". A rounded-square tile in readout glass `#232325`, two overlapping rings in readout text `#F1F1EC`, and the lens they share filled with the key yellow `#F2A31B`. One drawing everywhere: `apps/desktop/src-tauri/icons/icon.svg` is the master every app, installer and tray icon is rendered from (`npx tauri icon icons/icon.svg`), `tray-template.svg` is its one-colour glyph for the macOS menu bar, and `apps/desktop/src/logo.ts` draws the same geometry in the windows. Change them together.
 
 ## Evidence on Hand
 

@@ -32,6 +32,8 @@ export const zh: Dictionary = {
   'invite.unreachable': '无法联系到该设备。它可能处于离线状态，或者邀请代码已过期——请索取新的代码。',
   'invite.badTicket': '该邀请代码无效或已过期。',
   'invite.offline': '此设备目前尚无法从互联网访问。请等待状态变为就绪后再试。',
+  'invite.createFailed':
+    '无法创建邀请代码。请等待状态变为就绪后再试。',
   'invite.versionMismatch': '对方设备运行的 Lumepeer 版本不兼容。',
   'status.inputOn': '输入已开启',
   'status.inputOff': '输入已关闭',
@@ -166,8 +168,6 @@ export const zh: Dictionary = {
   'status.noCapture': '此设备不支持屏幕捕获，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
   'status.noCapture.chromeos': '此设备在 ChromeOS 内运行 Linux，其中的应用无法看到 ChromeOS 的屏幕，因此受邀者将看不到任何画面。从这里连接其他设备仍可照常使用。',
   'status.noEncoder': '此设备没有视频编码器，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
-  'status.hostedByService':
-    '此设备由 Lumepeer 服务托管，而不是此窗口。你仍可以从这里连接到其他设备。',
   'status.unreachable':
     '目前无法连接到这台电脑：Lumepeer 服务未运行。',
   'status.startService':

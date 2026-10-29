@@ -392,6 +392,39 @@ describe('invite refresh (docs/bugs/05-settings-window.md, task 4)', () => {
     });
   });
 
+  // ADR 0170: a refused invite used to be an unhandled rejection, and the
+  // button looked as if it had never been pressed.
+  it('says why no code came back instead of doing nothing', async () => {
+    invoke.mockRejectedValue({ code: 'HOST_SERVICE_REFUSED', message: 'refused' });
+    const view = await load();
+    const { t } = await import('./i18n');
+    render(view.inviteCodePanel('en'), container);
+
+    container.querySelector<HTMLButtonElement>('.create-btn')?.click();
+    await vi.waitFor(() => {
+      render(view.inviteCodePanel('en'), container);
+      expect(container.querySelector('[data-testid="invite-error"]')?.textContent).toBe(
+        t('en', 'invite.createFailed'),
+      );
+    });
+    expect(container.querySelector<HTMLButtonElement>('.create-btn')?.disabled).toBe(false);
+  });
+
+  it('says the service is not running when nothing hosts this machine', async () => {
+    invoke.mockRejectedValue({ code: 'HOST_SERVICE_UNREACHABLE', message: 'no answer' });
+    const view = await load();
+    const { t } = await import('./i18n');
+    render(view.inviteCodePanel('en'), container);
+
+    container.querySelector<HTMLButtonElement>('.create-btn')?.click();
+    await vi.waitFor(() => {
+      render(view.inviteCodePanel('en'), container);
+      expect(container.querySelector('[data-testid="invite-error"]')?.textContent).toBe(
+        t('en', 'status.unreachable'),
+      );
+    });
+  });
+
   it('names what the button does rather than saying "Refresh"', async () => {
     const view = await load();
     render(view.inviteRefreshPanel('en'), container);

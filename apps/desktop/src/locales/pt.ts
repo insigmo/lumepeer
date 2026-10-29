@@ -34,6 +34,8 @@ export const pt: Dictionary = {
   'invite.badTicket': 'Esse código de convite não é válido ou expirou.',
   'invite.offline':
     'Este dispositivo ainda não está acessível pela internet. Aguarde o status ficar pronto e tente novamente.',
+  'invite.createFailed':
+    'Não foi possível criar o código de convite. Aguarde o status ficar pronto e tente novamente.',
   'invite.versionMismatch': 'O outro dispositivo está com uma versão incompatível do Lumepeer.',
   'status.inputOn': 'entrada ativada',
   'status.inputOff': 'entrada desativada',
@@ -174,8 +176,6 @@ export const pt: Dictionary = {
     'Este dispositivo executa o Linux dentro do ChromeOS, e os apps ali não conseguem ver a tela do ChromeOS, então quem você convidar não verá nada. Conectar-se daqui a outros dispositivos funciona normalmente.',
   'status.noEncoder':
     'Este dispositivo não tem codificador de vídeo, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
-  'status.hostedByService':
-    'Este dispositivo é hospedado pelo serviço Lumepeer, não por esta janela. Você ainda pode se conectar a outros dispositivos daqui.',
   'status.unreachable':
     'No momento não é possível se conectar a este computador: o serviço Lumepeer não está em execução.',
   'status.startService':

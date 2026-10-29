@@ -149,17 +149,13 @@ function recordingBanner(): TemplateResult | typeof nothing {
   </p>`;
 }
 
-/** Says, rather than leaves to be guessed, that another process hosts this machine. */
+/**
+ * Speaks up only when the process that hosts this machine stops answering:
+ * that it is the service and not this window is nothing the person has to
+ * read while it works.
+ */
 function hostedNotice(): TemplateResult | typeof nothing {
-  if (!hostedByService) {
-    return nothing;
-  }
-  if (hostUnreachable) {
-    return unreachableNotice();
-  }
-  return html`<p class="hosted-notice" role="status" data-testid="hosted-notice">
-    ${t(locale, 'status.hostedByService')}
-  </p>`;
+  return hostedByService && hostUnreachable ? unreachableNotice() : nothing;
 }
 
 /**

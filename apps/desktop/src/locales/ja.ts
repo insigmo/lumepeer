@@ -33,6 +33,8 @@ export const ja: Dictionary = {
     'そのデバイスに接続できませんでした。オフラインであるか、招待コードが古くなっている可能性があります — 新しいコードを依頼してください。',
   'invite.badTicket': 'この招待コードは無効か、有効期限が切れています。',
   'invite.offline': 'このデバイスはまだインターネットから到達できません。状態が「準備完了」になるまで待ってから再試行してください。',
+  'invite.createFailed':
+    '招待コードを作成できませんでした。状態が「準備完了」になるまで待ってから再試行してください。',
   'invite.versionMismatch': '相手のデバイスは互換性のないバージョンの Lumepeer を実行しています。',
   'status.inputOn': '入力オン',
   'status.inputOff': '入力オフ',
@@ -173,8 +175,6 @@ export const ja: Dictionary = {
     'このデバイスは ChromeOS 内で Linux を実行しており、そこのアプリからは ChromeOS の画面が見えないため、招待した相手には何も見えません。ここから他のデバイスへの接続は通常どおり使えます。',
   'status.noEncoder':
     'このデバイスにはビデオエンコーダーがないため、招待した相手には何も見えません。セッション自体は接続され、入力も引き続き機能します。',
-  'status.hostedByService':
-    'このデバイスはこのウィンドウではなく Lumepeer サービスがホストしています。ここから他のデバイスへの接続は引き続き行えます。',
   'status.unreachable':
     '現在このコンピューターには接続できません。Lumepeer サービスが実行されていません。',
   'status.startService':

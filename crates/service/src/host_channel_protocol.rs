@@ -17,6 +17,12 @@
 //! that is neither a read, a narrowing nor a chat line is "install the update
 //! you found" (ADR 0169 §8), which names no package and admits nobody.
 //!
+//! [`Request::Invite`] hands out the code a guest dials this host with
+//! (ADR 0170), which is [`Effect::Invites`]: it admits nobody either. Whoever
+//! arrives with the code meets the session host's own consent dialog like any
+//! other guest (ADR 0169 §5), and the code is for view only — the request has
+//! no field that could name another role.
+//!
 //! The one request that names a widening, [`Request::AskToWiden`], is
 //! [`Effect::Asks`]: it puts the session host's own dialog in front of the
 //! person at the machine, which a program of theirs cannot press (ADR 0169
@@ -115,6 +121,11 @@ const KIND_ACCEPT_AFTER_SIGN_IN_OFF: u8 = 0x17;
 /// Kind byte of [`Request::InstallUpdate`].
 const KIND_INSTALL_UPDATE: u8 = 0x40;
 
+/// Kind byte of [`Request::CurrentInvite`] (ADR 0170).
+const KIND_CURRENT_INVITE: u8 = 0x05;
+/// Kind byte of [`Request::Invite`] (ADR 0170).
+const KIND_INVITE: u8 = 0x50;
+
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
 /// Kind byte of [`Reply::Transcript`].
@@ -130,6 +141,9 @@ const KIND_REPLY_GUEST_STORES: u8 = 0x85;
 const KIND_REPLY_RECORDINGS: u8 = 0xA0;
 /// Kind byte of [`Reply::Exported`].
 const KIND_REPLY_EXPORTED: u8 = 0xA1;
+
+/// Kind byte of [`Reply::Invite`].
+const KIND_REPLY_INVITE: u8 = 0xB0;
 
 /// The bit that separates the two directions.
 const REPLY_KIND_FLOOR: u8 = 0x80;
@@ -232,6 +246,20 @@ pub enum Request {
         /// What the person is asked about.
         widening: Widening,
     },
+    /// The invite code the host is living with, as JSON, or `null` when it
+    /// has none (ADR 0170). Never issues one (ADR 0062).
+    CurrentInvite,
+    /// The code a guest dials this host with, as JSON (ADR 0170): the live
+    /// one, issued first if there is none — or, with `renew`, a new one that
+    /// retires every code handed out before it.
+    ///
+    /// Admits nobody: a guest who arrives with it meets the session host's
+    /// own consent dialog (ADR 0169 §5). The code is always for view only;
+    /// there is no field here that names a role.
+    Invite {
+        /// Retire every earlier code and issue a new one.
+        renew: bool,
+    },
 }
 
 /// What a running session's host can be asked to give it, in the session
@@ -289,6 +317,10 @@ pub enum Effect {
     /// (ADR 0169 §8). Admits nobody and raises nothing: the caller chooses
     /// no package, and what it costs a guest is the restart every update is.
     Updates,
+    /// Hands out the code a guest dials this host with (ADR 0170). Admits
+    /// nobody and raises nothing: whoever arrives with it meets the session
+    /// host's own consent dialog, and the code is for view only.
+    Invites,
 }
 
 impl Request {
@@ -307,6 +339,7 @@ impl Request {
             | Self::MarkChatRead { .. }
             | Self::Recordings
             | Self::ExportRecording { .. }
+            | Self::CurrentInvite
             | Self::GuestStores => Effect::Reads,
             // ...then taken out of the host's tree: out of its reach, never
             // into it.
@@ -320,6 +353,7 @@ impl Request {
             Self::SendChat { .. } => Effect::Says,
             Self::AskToWiden { .. } => Effect::Asks,
             Self::InstallUpdate => Effect::Updates,
+            Self::Invite { .. } => Effect::Invites,
         }
     }
 }
@@ -342,6 +376,9 @@ pub enum Reply {
     Exported(Vec<u8>),
     /// [`Request::GuestStores`]'s answer.
     GuestStores(Vec<u8>),
+    /// [`Request::CurrentInvite`]'s and [`Request::Invite`]'s answer: the
+    /// code and its expiry as JSON, or `null`.
+    Invite(Vec<u8>),
 }
 
 /// Writes `request` as one frame; whether it went out whole.
@@ -372,6 +409,7 @@ pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> bool {
         Reply::Recordings(json) => (KIND_REPLY_RECORDINGS, json),
         Reply::Exported(json) => (KIND_REPLY_EXPORTED, json),
         Reply::GuestStores(json) => (KIND_REPLY_GUEST_STORES, json),
+        Reply::Invite(json) => (KIND_REPLY_INVITE, json),
     };
     payload.len() <= MAX_REPLY_PAYLOAD && write_frame(writer, kind, payload)
 }
@@ -387,6 +425,7 @@ pub fn read_reply(reader: &mut impl Read) -> Option<Reply> {
         KIND_REPLY_RECORDINGS => Some(Reply::Recordings(payload)),
         KIND_REPLY_EXPORTED => Some(Reply::Exported(payload)),
         KIND_REPLY_GUEST_STORES => Some(Reply::GuestStores(payload)),
+        KIND_REPLY_INVITE => Some(Reply::Invite(payload)),
         _ => None,
     }
 }
@@ -445,6 +484,8 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
         Request::GuestStores => (KIND_GUEST_STORES, Vec::new()),
         Request::GuestStoresTaken => (KIND_GUEST_STORES_TAKEN, Vec::new()),
         Request::InstallUpdate => (KIND_INSTALL_UPDATE, Vec::new()),
+        Request::CurrentInvite => (KIND_CURRENT_INVITE, Vec::new()),
+        Request::Invite { renew } => (KIND_INVITE, vec![u8::from(*renew)]),
     }
 }
 
@@ -495,6 +536,13 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
         KIND_GUEST_STORES => payload.is_empty().then_some(Request::GuestStores),
         KIND_GUEST_STORES_TAKEN => payload.is_empty().then_some(Request::GuestStoresTaken),
         KIND_INSTALL_UPDATE => payload.is_empty().then_some(Request::InstallUpdate),
+        KIND_CURRENT_INVITE => payload.is_empty().then_some(Request::CurrentInvite),
+        // One byte, 0 or 1, and nothing after it: there is no role to send.
+        KIND_INVITE => match payload {
+            [0] => Some(Request::Invite { renew: false }),
+            [1] => Some(Request::Invite { renew: true }),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -573,6 +621,9 @@ mod tests {
             Request::GuestStores,
             Request::GuestStoresTaken,
             Request::InstallUpdate,
+            Request::CurrentInvite,
+            Request::Invite { renew: false },
+            Request::Invite { renew: true },
         ]
     }
 
@@ -596,7 +647,12 @@ mod tests {
             assert!(
                 matches!(
                     effect,
-                    Effect::Reads | Effect::Narrows | Effect::Says | Effect::Asks | Effect::Updates
+                    Effect::Reads
+                        | Effect::Narrows
+                        | Effect::Says
+                        | Effect::Asks
+                        | Effect::Updates
+                        | Effect::Invites
                 ),
                 "{request:?} is {effect:?}"
             );
@@ -660,6 +716,8 @@ mod tests {
             Reply::Recordings(b"[]".to_vec()),
             Reply::Exported(br#"{"dir":"x"}"#.to_vec()),
             Reply::GuestStores(br#"{"hosts":[],"passwords":[]}"#.to_vec()),
+            Reply::Invite(br#"{"code":"x","expires_at":1}"#.to_vec()),
+            Reply::Invite(b"null".to_vec()),
         ] {
             let mut wire = Vec::new();
             assert!(write_reply(&mut wire, &reply));
@@ -810,5 +868,21 @@ mod tests {
         assert_eq!(decode_request(KIND_GUEST_STORES_TAKEN, b"x"), None);
         assert_eq!(Request::GuestStores.effect(), Effect::Reads);
         assert_eq!(Request::GuestStoresTaken.effect(), Effect::Narrows);
+    }
+
+    /// ADR 0170: an invite request carries one byte — renew or not — and no
+    /// role, so a caller cannot ask for a code that lets a guest ask for more
+    /// than view only. Reading the live code carries nothing at all.
+    #[test]
+    fn an_invite_names_no_role() {
+        let mut wire = Vec::new();
+        assert!(write_request(&mut wire, &Request::Invite { renew: true }));
+        assert_eq!(wire, [HOST_CHANNEL_MAGIC, KIND_INVITE, 1, 0, 0, 0, 1]);
+        for payload in [&b""[..], &[2], &[0, 0], b"full_control"] {
+            assert_eq!(decode_request(KIND_INVITE, payload), None, "{payload:?}");
+        }
+        assert_eq!(decode_request(KIND_CURRENT_INVITE, b"x"), None);
+        assert_eq!(Request::Invite { renew: false }.effect(), Effect::Invites);
+        assert_eq!(Request::CurrentInvite.effect(), Effect::Reads);
     }
 }
