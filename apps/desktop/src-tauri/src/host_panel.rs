@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use lumepeer_service::host_channel_protocol::{Reply, Request};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::{ChatEntryDto, SessionStatusDto, UnattendedStatusDto};
+use crate::commands::{ChatEntryDto, ExportDto, RecordingDto, SessionStatusDto, UnattendedStatusDto};
 
 /// What the session host says about itself in one snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -106,7 +106,11 @@ impl HostPanel {
     pub fn snapshot(&self) -> Option<HostSnapshot> {
         match self.ask(&Request::Snapshot)? {
             Reply::Snapshot(json) => serde_json::from_slice(&json).ok(),
-            Reply::Transcript(_) | Reply::Done | Reply::Refused => None,
+            Reply::Transcript(_)
+            | Reply::Done
+            | Reply::Refused
+            | Reply::Recordings(_)
+            | Reply::Exported(_) => None,
         }
     }
 
@@ -124,6 +128,35 @@ impl HostPanel {
     pub fn transcript(&self, peer: String) -> Result<Vec<ChatEntryDto>, PanelError> {
         match self.ask(&Request::Transcript { peer }) {
             Some(Reply::Transcript(json)) => {
+                serde_json::from_slice(&json).map_err(|_| PanelError::Refused)
+            }
+            Some(_) => Err(PanelError::Refused),
+            None => Err(PanelError::Unreachable),
+        }
+    }
+
+    /// The recordings the session host has written (ADR 0169 §6).
+    ///
+    /// # Errors
+    /// [`PanelError`] when there is no host, or it could not list them.
+    pub fn recordings(&self) -> Result<Vec<RecordingDto>, PanelError> {
+        match self.ask(&Request::Recordings) {
+            Some(Reply::Recordings(json)) => {
+                serde_json::from_slice(&json).map_err(|_| PanelError::Refused)
+            }
+            Some(_) => Err(PanelError::Refused),
+            None => Err(PanelError::Unreachable),
+        }
+    }
+
+    /// Has the session host export its recording `name` into this person's
+    /// profile, as them (ADR 0169 §6).
+    ///
+    /// # Errors
+    /// [`PanelError`] when there is no host, or the export did not happen.
+    pub fn export_recording(&self, name: String) -> Result<ExportDto, PanelError> {
+        match self.ask(&Request::ExportRecording { name }) {
+            Some(Reply::Exported(json)) => {
                 serde_json::from_slice(&json).map_err(|_| PanelError::Refused)
             }
             Some(_) => Err(PanelError::Refused),
@@ -195,7 +228,9 @@ pub use served::{Served, serve};
 #[cfg(target_os = "windows")]
 mod served {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use lumepeer_service::person_token::SignedInPerson;
 
     use lumepeer_core::consent::IndependentGrant;
     use lumepeer_runtime::network::ActorHandle;
@@ -220,6 +255,8 @@ mod served {
         /// Who puts a question the client asked for in front of the person
         /// at this machine (pack 04); none until the endpoint is open.
         consents: Mutex<Option<Arc<Consents>>>,
+        /// Whom a recording export is written as and for (ADR 0169 §6).
+        person: OnceLock<SignedInPerson>,
     }
 
     impl Served {
@@ -232,6 +269,7 @@ mod served {
                 connected: AtomicUsize::new(0),
                 wanting: AtomicUsize::new(0),
                 consents: Mutex::new(None),
+                person: OnceLock::new(),
             })
         }
 
@@ -245,6 +283,11 @@ mod served {
 
         fn consents(&self) -> Option<Arc<Consents>> {
             self.consents.lock().ok()?.clone()
+        }
+
+        /// The person this host serves, for what it writes in their name.
+        pub fn act_for(&self, person: SignedInPerson) {
+            let _ = self.person.set(person);
         }
 
         /// The endpoint is open, and this is its actor.
@@ -298,6 +341,13 @@ mod served {
         /// One request's answer. Every arm narrows, reads or chats; there is
         /// no other kind of request to answer (`Request::effect`).
         fn answer(&self, request: Request) -> Reply {
+            // The host's recordings are on its disk whether or not its
+            // endpoint is open (ADR 0169 §6).
+            match request {
+                Request::Recordings => return recordings_reply(),
+                Request::ExportRecording { name } => return self.export_reply(&name),
+                _ => {}
+            }
             let Some(actor) = self.actor() else {
                 // Closed: nothing to read but that, nothing to narrow.
                 return match request {
@@ -374,8 +424,84 @@ mod served {
                     tracing::info!(off, "a client turned unattended access off");
                     done(off)
                 }
+                // Answered above, open or closed.
+                Request::Recordings | Request::ExportRecording { .. } => Reply::Refused,
             }
         }
+
+        /// Exports the recording `name` for the person this host serves.
+        fn export_reply(&self, name: &str) -> Reply {
+            let Some(person) = self.person.get() else {
+                tracing::warn!("no person to export a recording for");
+                return Reply::Refused;
+            };
+            match export_for(person, name) {
+                Ok(exported) => {
+                    serde_json::to_vec(&exported).map_or(Reply::Refused, Reply::Exported)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "a recording was not exported");
+                    Reply::Refused
+                }
+            }
+        }
+    }
+
+    /// This host's recordings, as the client's own list would show them.
+    fn recordings_reply() -> Reply {
+        let recordings = lumepeer_runtime::config::recordings_dir()
+            .map(|dir| crate::commands::recordings_in(&dir))
+            .unwrap_or_default();
+        serde_json::to_vec(&recordings).map_or(Reply::Refused, Reply::Recordings)
+    }
+
+    /// Exports this host's recording `name` into `person`'s own profile, as
+    /// them (ADR 0169 §6).
+    ///
+    /// The recording is this host's own file, in its own tree, and is opened
+    /// as this process. The export is written while impersonating the
+    /// person's own token — never the elevated half: the caller is any program
+    /// of theirs, and what it may cause to be written must be no more than
+    /// they could write themselves — into the directory their own client
+    /// exports into, so it is theirs and lands where they would look.
+    fn export_for(
+        person: &SignedInPerson,
+        name: &str,
+    ) -> Result<crate::commands::ExportDto, String> {
+        let name = crate::commands::recording_file_name(name)
+            .map_err(|error| error.message)?
+            .to_owned();
+        let source = lumepeer_runtime::config::recordings_dir()
+            .ok_or("this host has no recordings directory")?
+            .join(&name);
+        let stem = std::path::Path::new(&name)
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or("a recording name with no stem")?
+            .to_owned();
+        let file = std::fs::File::open(&source).map_err(|error| error.to_string())?;
+        let out_dir = person
+            .local_app_data()
+            .map_err(|error| error.to_string())?
+            .join(lumepeer_runtime::config::APP_IDENTIFIER)
+            .join("recordings")
+            .join(crate::commands::EXPORTS_SUBDIR);
+        let token = person.own_token().map_err(|error| error.to_string())?;
+        let mut file = Some(file);
+        let mut output = None;
+        lumepeer_service::person_token::run_impersonating(
+            std::os::windows::io::AsHandle::as_handle(&token),
+            &mut || {
+                if let Some(file) = file.take() {
+                    output = Some(lumepeer_media::export::export_open(file, &stem, &out_dir));
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let output = output
+            .ok_or("the export never ran")?
+            .map_err(|error| error.to_string())?;
+        Ok(crate::commands::export_dto(&out_dir, &output))
     }
 
     /// The host's unattended access, as the client's settings panel reads it.

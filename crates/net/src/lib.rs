@@ -22,6 +22,7 @@ pub mod peer_connection;
 pub mod reconnect;
 pub mod relay;
 pub mod rendezvous;
+pub mod run_as;
 pub mod stun;
 pub mod terminal;
 pub mod ticket;

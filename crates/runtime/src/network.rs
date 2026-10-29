@@ -74,10 +74,11 @@ use lumepeer_media::encode::{
     select_software_encoder,
 };
 use lumepeer_net::file_transfer::{
-    ReceiveTracker, StagedReceive, TransferId, hash_file, read_chunk, safe_file_name, send_file,
+    ReceiveTracker, StagedReceive, TransferId, hash_open, read_chunk, safe_file_name, send_open,
 };
 use lumepeer_net::keystore::Keystore;
 use lumepeer_net::obfuscated_endpoint::{HostObfuscatedEndpoint, ObfuscatedAcceptor};
+use lumepeer_net::run_as::DiskAs;
 use lumepeer_net::terminal::{
     ShellId, read_frame as read_terminal_frame, write_close as write_terminal_close,
     write_frame as write_terminal_frame,
@@ -7288,19 +7289,33 @@ impl Actor {
             self.refuse_dir_list(peer, DirListRefusal::BadPath);
             return;
         };
+        // Read as whoever this host acts for (ADR 0169 §6): the session host
+        // lists what the person at the machine can list, never what
+        // `LocalSystem` can.
+        //
         // A symbolic link is not followed even when the path that names it is
         // otherwise fine: the directory it leads to is not the directory the
         // guest asked for, and "where does this link go" is a question about
         // the host's own layout (ADR 0075).
-        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
-            tracing::warn!(peer = %tag, "directory listing for a symbolic link; refused");
-            self.refuse_dir_list(peer, DirListRefusal::Unreadable);
-            return;
-        }
-        let Ok((entries, truncated)) = read_directory(std::path::Path::new(path)) else {
-            tracing::info!(peer = %tag, "the host could not read the directory a guest asked for");
-            self.refuse_dir_list(peer, DirListRefusal::Unreadable);
-            return;
+        let listed = self.disk().blocking(|| {
+            let path = std::path::Path::new(path);
+            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+                return Ok(None);
+            }
+            read_directory(path).map(Some)
+        });
+        let (entries, truncated) = match listed {
+            Ok(Some(listed)) => listed,
+            Ok(None) => {
+                tracing::warn!(peer = %tag, "directory listing for a symbolic link; refused");
+                self.refuse_dir_list(peer, DirListRefusal::Unreadable);
+                return;
+            }
+            Err(_) => {
+                tracing::info!(peer = %tag, "the host could not read the directory a guest asked for");
+                self.refuse_dir_list(peer, DirListRefusal::Unreadable);
+                return;
+            }
         };
 
         self.send_to(
@@ -7373,7 +7388,18 @@ impl Actor {
         };
         // A symbolic link is not followed, exactly as it is not for a listing
         // (ADR 0075): the file it leads to is not the file the guest named.
-        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) {
+        // Both questions are asked as whoever this host acts for
+        // (ADR 0169 §6).
+        let Ok((is_link, is_dir)) = self.disk().blocking(|| {
+            let path = std::path::Path::new(path);
+            let is_link = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink());
+            Ok((is_link, path.is_dir()))
+        }) else {
+            tracing::info!(peer = %tag, "nobody to read a fetched file as; refused");
+            self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
+            return;
+        };
+        if is_link {
             tracing::warn!(peer = %tag, "a file fetch for a symbolic link; refused");
             self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
             return;
@@ -7382,7 +7408,7 @@ impl Actor {
         // "send me that" is then the manifest of ADR 0077 rather than one
         // offer. The guest's own request is still the acceptance, and the
         // tree lands where that request named.
-        if std::path::Path::new(path).is_dir() {
+        if is_dir {
             if !self.may_offer_directory(&peer) {
                 tracing::debug!(peer = %tag, "a directory fetch from a peer that cannot take one");
                 self.refuse_fetch(peer, FileFetchRefusal::Unreadable);
@@ -7410,8 +7436,9 @@ impl Actor {
         *self.fetch_preparing.entry(peer).or_default() += 1;
         let path = std::path::PathBuf::from(path);
         let events = self.events_tx.clone();
+        let disk = self.disk();
         tokio::spawn(async move {
-            let prepared = prepare_offer(&path)
+            let prepared = prepare_offer(&path, &disk)
                 .await
                 .map_err(|_| FileFetchRefusal::Unreadable);
             let _ = events
@@ -7437,6 +7464,13 @@ impl Actor {
                 .sessions
                 .grants(peer)
                 .is_some_and(|grants| grants.file_browse && grants.file_transfer)
+    }
+
+    /// Who this host touches the disk as for a guest (ADR 0169 §6): itself
+    /// on a desktop client, the signed-in person on the session host, nobody
+    /// on the logon host. Asked of the screen seam each time.
+    fn disk(&self) -> DiskAs {
+        self.windows.person().disk()
     }
 
     /// Sends the one answer a refused fetch gets (§18; ADR 0076).
@@ -7499,8 +7533,12 @@ impl Actor {
         };
         *self.file_ops_in_flight.entry(peer).or_default() += 1;
         let events = self.events_tx.clone();
+        // As whoever this host acts for (ADR 0169 §6); nobody to act as is a
+        // failure, never a run as this process.
+        let disk = self.disk();
         tokio::spawn(async move {
-            let refused = tokio::task::spawn_blocking(move || plan.run())
+            let refused = disk
+                .run(move || Ok(plan.run()))
                 .await
                 .unwrap_or(Some(FileOpRefusal::Failed));
             let _ = events
@@ -7659,28 +7697,43 @@ impl Actor {
             return;
         }
         let directory = std::path::Path::new(dir);
-        if !directory.is_dir() {
-            tracing::warn!(peer = %tag, "a file put for a directory this host does not have; declined");
-            self.send_to(&peer, MessageKind::FileAccept(false));
-            return;
-        }
-        if !Self::has_room(directory, size) {
-            tracing::warn!(peer = %tag, "a put with no room where it was going; declined");
-            self.send_to(&peer, MessageKind::FileAccept(false));
-            self.audit_file(&peer, "put-declined-no-space");
-            return;
-        }
+        // Every question about the destination is asked as whoever this host
+        // acts for (ADR 0169 §6): a directory the person cannot see is one
+        // this host does not have.
+        //
+        // Never overwrites: a put lands beside a file of the same name, the
+        // same way every other received file does. Writing over one would
+        // make an upload a delete as well, and deleting on the host is not
+        // something any grant here covers.
+        let destination = self.disk().blocking(|| {
+            Ok(if !directory.is_dir() {
+                Err(false)
+            } else if !Self::has_room(directory, size) {
+                Err(true)
+            } else {
+                Ok(unique_destination(directory, &name))
+            })
+        });
+        let destination = match destination {
+            Ok(Ok(destination)) => destination,
+            Ok(Err(true)) => {
+                tracing::warn!(peer = %tag, "a put with no room where it was going; declined");
+                self.send_to(&peer, MessageKind::FileAccept(false));
+                self.audit_file(&peer, "put-declined-no-space");
+                return;
+            }
+            Ok(Err(false)) | Err(_) => {
+                tracing::warn!(peer = %tag, "a file put for a directory this host does not have; declined");
+                self.send_to(&peer, MessageKind::FileAccept(false));
+                return;
+            }
+        };
         let accepted = self.file_accepted.entry(peer).or_default();
         if accepted.len() >= MAX_PENDING_FILE_OFFERS {
             tracing::warn!(peer = %tag, "declining a put past the pending limit");
             self.send_to(&peer, MessageKind::FileAccept(false));
             return;
         }
-        // Never overwrites: a put lands beside a file of the same name, the
-        // same way every other received file does. Writing over one would
-        // make an upload a delete as well, and deleting on the host is not
-        // something any grant here covers.
-        let destination = unique_destination(directory, &name);
         accepted.push_back(AcceptedOffer {
             name,
             size,
@@ -7793,8 +7846,9 @@ impl Actor {
         dir: Option<String>,
     ) {
         let events = self.events_tx.clone();
+        let disk = self.disk();
         tokio::spawn(async move {
-            let walked = walk_directory(&root).await;
+            let walked = walk_directory(&root, &disk).await;
             let _ = events
                 .send(ActorEvent::File(FileEvent::DirWalked {
                     peer,
@@ -7980,39 +8034,56 @@ impl Actor {
         destination: &std::path::Path,
     ) {
         let tag = self.label_of(&peer);
-        let root = unique_destination(destination, &offer.name);
-        if !Self::has_room(destination, offer.total_bytes()) {
-            tracing::warn!(peer = %tag, "a directory with no room where it was going; declined");
-            self.send_to(&peer, MessageKind::DirAccept(false));
-            self.audit_file(&peer, "directory-declined-no-space");
-            let _ = self.notify.send(ActorNotification::FileTransferChanged);
-            return;
-        }
-        if let Err(error) = std::fs::create_dir_all(&root) {
-            tracing::warn!(peer = %tag, %error, "a directory could not be created; declined");
-            self.send_to(&peer, MessageKind::DirAccept(false));
-            return;
-        }
+        // The tree is laid out as whoever this host acts for (ADR 0169 §6),
+        // so every directory of it belongs to them and none is made where
+        // they could not make it. `None` is no room.
+        let laid_out = self.disk().blocking(|| {
+            let root = unique_destination(destination, &offer.name);
+            if !Self::has_room(destination, offer.total_bytes()) {
+                return Ok(None);
+            }
+            std::fs::create_dir_all(&root)?;
+            let mut files = Vec::new();
+            for entry in &offer.entries {
+                let Some(path) = manifest_destination(&root, entry) else {
+                    continue;
+                };
+                if entry.is_dir {
+                    if let Err(error) = std::fs::create_dir_all(&path) {
+                        tracing::warn!(peer = %tag, %error, "an empty directory could not be created");
+                    }
+                    continue;
+                }
+                if let Some(parent) = path.parent()
+                    && let Err(error) = std::fs::create_dir_all(parent)
+                {
+                    tracing::warn!(peer = %tag, %error, "a subdirectory could not be created");
+                    continue;
+                }
+                files.push((path, entry.size));
+            }
+            Ok(Some(files))
+        });
+        let files = match laid_out {
+            Ok(Some(files)) => files,
+            Ok(None) => {
+                tracing::warn!(peer = %tag, "a directory with no room where it was going; declined");
+                self.send_to(&peer, MessageKind::DirAccept(false));
+                self.audit_file(&peer, "directory-declined-no-space");
+                let _ = self.notify.send(ActorNotification::FileTransferChanged);
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(peer = %tag, %error, "a directory could not be created; declined");
+                self.send_to(&peer, MessageKind::DirAccept(false));
+                return;
+            }
+        };
 
         let group_id = self.next_transfer_id;
         self.next_transfer_id = self.next_transfer_id.wrapping_add(1);
         let mut members = Vec::new();
-        for entry in &offer.entries {
-            let Some(path) = manifest_destination(&root, entry) else {
-                continue;
-            };
-            if entry.is_dir {
-                if let Err(error) = std::fs::create_dir_all(&path) {
-                    tracing::warn!(peer = %tag, %error, "an empty directory could not be created");
-                }
-                continue;
-            }
-            if let Some(parent) = path.parent()
-                && let Err(error) = std::fs::create_dir_all(parent)
-            {
-                tracing::warn!(peer = %tag, %error, "a subdirectory could not be created");
-                continue;
-            }
+        for (path, size) in files {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -8025,7 +8096,7 @@ impl Actor {
                 .or_default()
                 .push_back(AcceptedOffer {
                     name,
-                    size: entry.size,
+                    size,
                     // A manifest carries sizes and no hashes: hashing a whole
                     // tree before offering it would read every byte of it
                     // twice. Each file's own `FileTransferStart` still names
@@ -8119,10 +8190,11 @@ impl Actor {
         // tree, in manifest order, because that is the order the receiver
         // accepted them in.
         let events = self.events_tx.clone();
+        let disk = self.disk();
         tokio::spawn(async move {
             let mut prepared = Vec::new();
             for (id, path) in files {
-                match prepare_offer(&path).await {
+                match prepare_offer(&path, &disk).await {
                     Ok((name, size, hash)) => prepared.push((id, path, name, size, hash)),
                     Err(error) => {
                         let _ = events
@@ -8998,7 +9070,9 @@ impl Actor {
             self.refuse_terminal(peer, TerminalRefusal::TooMany);
             return;
         }
-        let shell = match Shell::spawn(ShellSize { cols, rows }) {
+        // As the person at this machine, whoever this host is (ADR 0079,
+        // ADR 0169 §6).
+        let shell = match self.windows.person().spawn_shell(ShellSize { cols, rows }) {
             Ok(shell) => shell,
             Err(error) => {
                 tracing::warn!(peer = %tag, %error, "no shell was started");
@@ -13842,8 +13916,9 @@ impl Actor {
             return Ok(());
         }
         let events = self.events_tx.clone();
+        let disk = self.disk();
         tokio::spawn(async move {
-            let prepared = prepare_offer(&path).await;
+            let prepared = prepare_offer(&path, &disk).await;
             let _ = events
                 .send(ActorEvent::PutPrepared {
                     peer,
@@ -14651,11 +14726,12 @@ impl Actor {
     fn spawn_clipboard_offer(&self, peer: NodeId, paths: Vec<std::path::PathBuf>) {
         let events = self.events_tx.clone();
         let tag = self.label_of(&peer);
+        let disk = self.disk();
         tokio::spawn(async move {
             let mut files = Vec::new();
             let mut kept_paths = Vec::new();
             for path in paths {
-                match stat_offer(&path).await {
+                match stat_offer(&path, &disk).await {
                     Ok((name, size)) => {
                         files.push(ClipboardFileEntry { name, size });
                         kept_paths.push(path);
@@ -14761,15 +14837,27 @@ impl Actor {
         let directory = directory
             .map(std::path::PathBuf::from)
             .ok_or(ActorError::Core(CoreError::Malformed))?;
-        if !Self::has_room(&directory, offer.size) {
+        // As whoever this host acts for (ADR 0169 §6), like every other
+        // question about where a received file lands.
+        let destination = self.disk().blocking(|| {
+            Ok(Self::has_room(&directory, offer.size)
+                .then(|| unique_destination(&directory, &offer.name)))
+        });
+        let destination = match destination {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.send_to(&peer, MessageKind::FileAccept(false));
+                return Err(ActorError::Net(NetError::Io(error.to_string())));
+            }
+        };
+        let Some(destination) = destination else {
             // Declined out loud on both sides: the sender hears "no", and the
             // caller hears why, before a byte moves (§18; ADR 0077).
             self.send_to(&peer, MessageKind::FileAccept(false));
             self.audit_file(&peer, "offer-declined-no-space");
             let _ = self.notify.send(ActorNotification::FileTransferChanged);
             return Err(ActorError::NoSpace);
-        }
-        let destination = unique_destination(&directory, &offer.name);
+        };
         self.file_accepted
             .entry(peer)
             .or_default()
@@ -15119,6 +15207,7 @@ impl Actor {
         let progress = self.events_tx.clone();
         let tag = self.label_of(&peer);
         let id = job.id;
+        let disk = self.disk();
         let task = tokio::spawn(async move {
             let mut send = match connection.open_uni().await {
                 Ok(send) => send,
@@ -15134,14 +15223,29 @@ impl Actor {
                     return;
                 }
             };
-            let result = send_file(&mut send, id, &job.path, job.from, |at| {
-                let _ = progress.try_send(ActorEvent::File(FileEvent::Progress {
-                    peer,
-                    id,
-                    moved: at,
-                }));
-            })
-            .await;
+            // Opened as whoever this host acts for (ADR 0169 §6); the bytes
+            // then stream through the handle, which needs nobody's name.
+            let opened = job.path.clone();
+            let file = disk.run(move || std::fs::File::open(&opened)).await;
+            let result = match file {
+                Ok(file) => {
+                    send_open(
+                        &mut send,
+                        id,
+                        tokio::fs::File::from_std(file),
+                        job.from,
+                        |at| {
+                            let _ = progress.try_send(ActorEvent::File(FileEvent::Progress {
+                                peer,
+                                id,
+                                moved: at,
+                            }));
+                        },
+                    )
+                    .await
+                }
+                Err(error) => Err(NetError::Io(error.to_string())),
+            };
             match result {
                 Ok(()) => {
                     // Finishing the stream is what tells the far side there
@@ -15580,6 +15684,9 @@ impl Actor {
         );
         let channel = self.file_channel(peer);
         let events = self.events_tx.clone();
+        // The staging file, and the file it becomes, are made as whoever this
+        // host acts for (ADR 0169 §6): they belong to the person.
+        let disk = self.disk();
         let destination = accepted.destination;
         self.file_receive_destinations.insert(
             (peer, transfer_id),
@@ -15607,7 +15714,7 @@ impl Actor {
                 || std::path::PathBuf::from("."),
                 std::path::Path::to_path_buf,
             );
-            match StagedReceive::create(&directory, transfer_id).await {
+            match StagedReceive::create_as(&directory, transfer_id, disk).await {
                 Ok(staged) => {
                     inbox.staged.insert(transfer_id, staged);
                     inbox.expected.insert(transfer_id, (hash, destination));
@@ -15697,8 +15804,9 @@ impl Actor {
             return;
         }
         let events = self.events_tx.clone();
+        let disk = self.disk();
         tokio::spawn(async move {
-            let event = match prepare_offer(&path).await {
+            let event = match prepare_offer(&path, &disk).await {
                 Ok((name, size, hash)) => FileEvent::ClipboardTransferReady {
                     peer,
                     path,
@@ -17965,8 +18073,21 @@ impl Actor {
 ///
 /// Runs on its own task: hashing `FILE_OFFER_MAX_BYTES` is a full disk pass,
 /// and the actor loop is not where a disk pass belongs (ADR 0027).
-async fn prepare_offer(path: &std::path::Path) -> Result<(String, u64, [u8; 32]), NetError> {
-    let meta = tokio::fs::metadata(path)
+///
+/// The file is opened as `disk` (ADR 0169 §6); measuring and hashing then go
+/// through that handle.
+async fn prepare_offer(
+    path: &std::path::Path,
+    disk: &DiskAs,
+) -> Result<(String, u64, [u8; 32]), NetError> {
+    let opened = path.to_path_buf();
+    let file = disk
+        .run(move || std::fs::File::open(&opened))
+        .await
+        .map_err(|e| NetError::Io(e.to_string()))?;
+    let file = tokio::fs::File::from_std(file);
+    let meta = file
+        .metadata()
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
     if !meta.is_file() {
@@ -17984,7 +18105,7 @@ async fn prepare_offer(path: &std::path::Path) -> Result<(String, u64, [u8; 32])
         .and_then(|name| name.to_str())
         .and_then(safe_file_name)
         .ok_or_else(|| NetError::Io("the file has no name that can be offered".to_owned()))?;
-    let hash = hash_file(path).await?;
+    let hash = hash_open(file).await?;
     Ok((name, size, hash))
 }
 
@@ -17996,8 +18117,10 @@ async fn prepare_offer(path: &std::path::Path) -> Result<(String, u64, [u8; 32])
 /// exactly what `prepare_offer` does for a file the user already chose to
 /// send — would be a disk pass nobody asked for yet. The hash is computed
 /// once, in `prepare_offer`, only for the specific file the peer accepts.
-async fn stat_offer(path: &std::path::Path) -> Result<(String, u64), NetError> {
-    let meta = tokio::fs::metadata(path)
+async fn stat_offer(path: &std::path::Path, disk: &DiskAs) -> Result<(String, u64), NetError> {
+    let measured = path.to_path_buf();
+    let meta = disk
+        .run(move || std::fs::metadata(&measured))
         .await
         .map_err(|e| NetError::Io(e.to_string()))?;
     if !meta.is_file() {
@@ -18247,19 +18370,24 @@ fn manifest_destination(
 /// # Errors
 /// [`NetError::Io`] when `root` cannot be read, or when it holds more than
 /// `MAX_DIR_MANIFEST_ENTRIES` entries.
-async fn walk_directory(root: &std::path::Path) -> Result<WalkedTree, NetError> {
+///
+/// Walked as `disk` (ADR 0169 §6), on the blocking pool.
+async fn walk_directory(root: &std::path::Path, disk: &DiskAs) -> Result<WalkedTree, NetError> {
+    let root = root.to_path_buf();
+    disk.run(move || Ok(walk_directory_blocking(&root)))
+        .await
+        .map_err(|e| NetError::Io(e.to_string()))?
+}
+
+/// [`walk_directory`] on the calling thread.
+fn walk_directory_blocking(root: &std::path::Path) -> Result<WalkedTree, NetError> {
     let mut out = WalkedTree::default();
     let mut queue = std::collections::VecDeque::from([(root.to_path_buf(), String::new())]);
     while let Some((dir, prefix)) = queue.pop_front() {
-        let mut reader = tokio::fs::read_dir(&dir)
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?;
+        let reader = std::fs::read_dir(&dir).map_err(|e| NetError::Io(e.to_string()))?;
         let mut empty = true;
-        while let Some(entry) = reader
-            .next_entry()
-            .await
-            .map_err(|e| NetError::Io(e.to_string()))?
-        {
+        for entry in reader {
+            let entry = entry.map_err(|e| NetError::Io(e.to_string()))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 // A name that is not UTF-8 has no representation on this wire
@@ -18281,7 +18409,7 @@ async fn walk_directory(root: &std::path::Path) -> Result<WalkedTree, NetError> 
                 // transfer never disagree about what is in it.
                 continue;
             }
-            let Ok(kind) = entry.file_type().await else {
+            let Ok(kind) = entry.file_type() else {
                 continue;
             };
             if kind.is_symlink() {
@@ -18298,7 +18426,7 @@ async fn walk_directory(root: &std::path::Path) -> Result<WalkedTree, NetError> 
                 queue.push_back((entry.path(), relative));
                 continue;
             }
-            let size = entry.metadata().await.map_or(0, |meta| meta.len());
+            let size = entry.metadata().map_or(0, |meta| meta.len());
             out.entries.push(ManifestEntry {
                 path: relative,
                 size,
@@ -22544,6 +22672,155 @@ mod tests {
         .await;
         let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
         (host, guest, guest_label, host_label, host_clipboard)
+    }
+
+    /// A host's screen seam that acts for `person` (ADR 0169 §6) and is
+    /// otherwise [`DetachedViewWindows`].
+    #[derive(Debug)]
+    struct PersonWindows {
+        person: crate::person::Person,
+    }
+
+    impl ViewWindows for PersonWindows {
+        fn open(&self, _: &str, _: &str, _: &str, _: bool, _: ViewSurface) {}
+        fn close(&self, _label: &str) {}
+        fn set_host_bar(&self, _visible: bool) {}
+        fn attendance(&self) -> lumepeer_core::consent::HostAttendance {
+            lumepeer_core::consent::HostAttendance::Attended
+        }
+        fn on_secure_desktop(&self) -> bool {
+            false
+        }
+        fn nobody_signed_in(&self) -> bool {
+            false
+        }
+        fn person(&self) -> crate::person::Person {
+            self.person.clone()
+        }
+    }
+
+    /// A signed-in person who runs work on a thread of their own, the way the
+    /// session host's does, and counts it.
+    #[derive(Debug, Default)]
+    struct CountingPerson {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl lumepeer_net::run_as::RunAs for CountingPerson {
+        fn run(&self, work: &mut (dyn FnMut() + Send)) -> std::io::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::scope(|scope| scope.spawn(work).join())
+                .map_err(|_| std::io::Error::other("the person's thread panicked"))
+        }
+    }
+
+    impl crate::person::SignedIn for CountingPerson {
+        fn spawn_shell(&self, _size: ShellSize) -> Result<Shell, ShellError> {
+            Err(ShellError::CannotDropPrivileges)
+        }
+    }
+
+    /// [`file_pair`], with the host acting for `person`.
+    async fn file_pair_acting_for(
+        person: crate::person::Person,
+    ) -> (ActorHandle, ActorHandle, String, String) {
+        let (host, _clipboard) =
+            actor_with_clipboard(Arc::new(PersonWindows { person }) as Arc<dyn ViewWindows>).await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+        let invite = host.invite_create(Role::ViewOnly, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let guest_label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(guest_label.clone(), Role::ViewOnly)
+            .await
+            .unwrap();
+        wait_until("the guest never opened a view", || {
+            !recorder.opened().is_empty()
+        })
+        .await;
+        let (_window, host_label, _input, _surface) = recorder.opened().remove(0);
+        for grant in [IndependentGrant::FileBrowse, IndependentGrant::FileTransfer] {
+            host.set_grant(guest_label.clone(), grant, true)
+                .await
+                .unwrap();
+        }
+        (host, guest, guest_label, host_label)
+    }
+
+    /// ADR 0169 §6: a host acting for a signed-in person lists and changes
+    /// the disk as that person — every call goes through them — and the
+    /// guest sees the same answers it would from the person's own client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_host_touches_the_disk_as_the_person() {
+        let scratch = Scratch::new("person-disk");
+        std::fs::write(scratch.join("notes.txt"), b"x").unwrap();
+        let person = Arc::new(CountingPerson::default());
+        let (_host, guest, _guest_label, host_label) =
+            file_pair_acting_for(crate::person::Person::SignedIn(person.clone())).await;
+        let calls = || person.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        guest
+            .request_dir_list(host_label.clone(), scratch.0.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let listing = wait_for_listing(&guest, &host_label).await;
+        assert_eq!(listing.refused, None);
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "notes.txt")
+        );
+        let after_listing = calls();
+        assert!(after_listing >= 1, "the listing was not read as the person");
+
+        let made = scratch.join("made").to_string_lossy().into_owned();
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::MakeDir { path: made })
+            .await
+            .unwrap();
+        assert_eq!(wait_for_file_op(&guest, &host_label, id).await, None);
+        assert!(scratch.join("made").is_dir());
+        assert!(
+            calls() > after_listing,
+            "the directory was not made as the person"
+        );
+    }
+
+    /// ADR 0169 §6: with nobody signed in there is nobody to act as, and the
+    /// disk is not touched as this process instead — the listing is refused
+    /// and the directory is never made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_nobody_signed_in_a_guest_touches_no_disk() {
+        let scratch = Scratch::new("nobody-disk");
+        std::fs::write(scratch.join("notes.txt"), b"x").unwrap();
+        let (_host, guest, _guest_label, host_label) =
+            file_pair_acting_for(crate::person::Person::Nobody).await;
+
+        guest
+            .request_dir_list(host_label.clone(), scratch.0.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let listing = wait_for_listing(&guest, &host_label).await;
+        assert_eq!(listing.refused, Some(DirListRefusal::Unreadable));
+        assert!(listing.entries.is_empty());
+
+        let made = scratch.join("made").to_string_lossy().into_owned();
+        let id = guest
+            .remote_file_op(host_label.clone(), FileOp::MakeDir { path: made })
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_file_op(&guest, &host_label, id).await,
+            Some(FileOpRefusal::Failed)
+        );
+        assert!(
+            !scratch.join("made").exists(),
+            "nobody's request changed the disk"
+        );
     }
 
     /// Copies `paths` on that machine, the way a user pressing Ctrl+C does.

@@ -85,9 +85,20 @@ const KIND_HOSTING_OFF: u8 = 0x13;
 /// Kind byte of [`Request::SendChat`].
 const KIND_SEND_CHAT: u8 = 0x14;
 /// Kind byte of [`Request::AskToWiden`].
-const KIND_ASK_TO_WIDEN: u8 = 0x20;
+const KIND_ASK_TO_WIDEN: u8 = 0x30;
 /// Kind byte of [`Request::UnattendedOff`].
 const KIND_UNATTENDED_OFF: u8 = 0x15;
+
+/// Kind byte of [`Request::Recordings`] (pack 06; numbered apart from the
+/// other blocks so packs that add requests in parallel do not collide).
+const KIND_RECORDINGS: u8 = 0x20;
+/// Kind byte of [`Request::ExportRecording`].
+const KIND_EXPORT_RECORDING: u8 = 0x21;
+
+/// The longest recording name, in bytes: `session-<unix secs>-<label>.lmrc`
+/// with room to spare. The session host checks the name itself; this only
+/// bounds what is read.
+pub const MAX_RECORDING_NAME_BYTES: usize = 128;
 
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
@@ -97,6 +108,11 @@ const KIND_REPLY_TRANSCRIPT: u8 = 0x82;
 const KIND_REPLY_DONE: u8 = 0x83;
 /// Kind byte of [`Reply::Refused`].
 const KIND_REPLY_REFUSED: u8 = 0x84;
+
+/// Kind byte of [`Reply::Recordings`].
+const KIND_REPLY_RECORDINGS: u8 = 0xA0;
+/// Kind byte of [`Reply::Exported`].
+const KIND_REPLY_EXPORTED: u8 = 0xA1;
 
 /// The bit that separates the two directions.
 const REPLY_KIND_FLOOR: u8 = 0x80;
@@ -149,6 +165,16 @@ pub enum Request {
         peer: String,
         /// The line.
         text: String,
+    },
+    /// The recordings the host has written, as JSON (ADR 0169 §6).
+    Recordings,
+    /// Export the host's recording `name` into the person's own profile, as
+    /// them (ADR 0169 §6). It reads the host's own file and hands the person
+    /// a copy; the caller names a recording, never a path, and where the copy
+    /// is written is the host's choice.
+    ExportRecording {
+        /// The recording's file name, as [`Self::Recordings`] reported it.
+        name: String,
     },
     /// Turn unattended access off: forget the device password and its second
     /// factor (ADR 0169 §4, §5). The way back on is the elevated
@@ -232,7 +258,11 @@ impl Request {
     #[must_use]
     pub const fn effect(&self) -> Effect {
         match self {
-            Self::Snapshot | Self::Transcript { .. } | Self::MarkChatRead { .. } => Effect::Reads,
+            Self::Snapshot
+            | Self::Transcript { .. }
+            | Self::MarkChatRead { .. }
+            | Self::Recordings
+            | Self::ExportRecording { .. } => Effect::Reads,
             Self::EndSession { .. }
             | Self::LowerGrant { .. }
             | Self::RefusePending { .. }
@@ -256,6 +286,10 @@ pub enum Reply {
     /// The request was understood and not carried out: no such session, a
     /// grant that is not one, an actor that said no.
     Refused,
+    /// [`Request::Recordings`]'s answer.
+    Recordings(Vec<u8>),
+    /// [`Request::ExportRecording`]'s answer: what was written, as JSON.
+    Exported(Vec<u8>),
 }
 
 /// Writes `request` as one frame; whether it went out whole.
@@ -283,6 +317,8 @@ pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> bool {
         Reply::Transcript(json) => (KIND_REPLY_TRANSCRIPT, json),
         Reply::Done => (KIND_REPLY_DONE, &[]),
         Reply::Refused => (KIND_REPLY_REFUSED, &[]),
+        Reply::Recordings(json) => (KIND_REPLY_RECORDINGS, json),
+        Reply::Exported(json) => (KIND_REPLY_EXPORTED, json),
     };
     payload.len() <= MAX_REPLY_PAYLOAD && write_frame(writer, kind, payload)
 }
@@ -295,6 +331,8 @@ pub fn read_reply(reader: &mut impl Read) -> Option<Reply> {
         KIND_REPLY_TRANSCRIPT => Some(Reply::Transcript(payload)),
         KIND_REPLY_DONE if payload.is_empty() => Some(Reply::Done),
         KIND_REPLY_REFUSED if payload.is_empty() => Some(Reply::Refused),
+        KIND_REPLY_RECORDINGS => Some(Reply::Recordings(payload)),
+        KIND_REPLY_EXPORTED => Some(Reply::Exported(payload)),
         _ => None,
     }
 }
@@ -347,6 +385,8 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
             (KIND_ASK_TO_WIDEN, payload)
         }
         Request::UnattendedOff => (KIND_UNATTENDED_OFF, Vec::new()),
+        Request::Recordings => (KIND_RECORDINGS, Vec::new()),
+        Request::ExportRecording { name } => (KIND_EXPORT_RECORDING, name.as_bytes().to_vec()),
     }
 }
 
@@ -387,6 +427,10 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
             label(peer).map(|peer| Request::AskToWiden { peer, widening })
         }
         KIND_UNATTENDED_OFF => payload.is_empty().then_some(Request::UnattendedOff),
+        KIND_RECORDINGS => payload.is_empty().then_some(Request::Recordings),
+        KIND_EXPORT_RECORDING => {
+            recording_name(payload).map(|name| Request::ExportRecording { name })
+        }
         _ => None,
     }
 }
@@ -397,6 +441,18 @@ fn label(payload: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(payload).ok()?;
     let ok =
         !text.is_empty() && text.len() <= MAX_LABEL_BYTES && !text.chars().any(char::is_control);
+    ok.then(|| text.to_owned())
+}
+
+/// `payload` as a recording name: UTF-8, non-empty, at most
+/// [`MAX_RECORDING_NAME_BYTES`], no control character and no separator.
+fn recording_name(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let ok = !text.is_empty()
+        && text.len() <= MAX_RECORDING_NAME_BYTES
+        && !text
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\');
     ok.then(|| text.to_owned())
 }
 
@@ -445,6 +501,10 @@ mod tests {
                 widening: Widening::TrustDevice,
             },
             Request::UnattendedOff,
+            Request::Recordings,
+            Request::ExportRecording {
+                name: "session-1-ab12.lmrc".to_owned(),
+            },
         ]
     }
 
@@ -512,6 +572,8 @@ mod tests {
             Reply::Transcript(b"[]".to_vec()),
             Reply::Done,
             Reply::Refused,
+            Reply::Recordings(b"[]".to_vec()),
+            Reply::Exported(br#"{"dir":"x"}"#.to_vec()),
         ] {
             let mut wire = Vec::new();
             assert!(write_reply(&mut wire, &reply));
@@ -623,6 +685,22 @@ mod tests {
             decode_request(KIND_ASK_TO_WIDEN, &[WIDENING_CONTROL, b'p', b'\n']),
             None
         );
+    }
+    /// A recording is named, never pathed: a separator, a control character,
+    /// nothing, or too long a name ends the connection.
+    #[test]
+    fn a_recording_is_named_and_never_pathed() {
+        for bad in [
+            &br"..\..\x.lmrc"[..],
+            b"a/b.lmrc",
+            b"",
+            b"x\n.lmrc",
+            &[0xff, 0xfe],
+        ] {
+            assert_eq!(decode_request(KIND_EXPORT_RECORDING, bad), None, "{bad:?}");
+        }
+        let long = "x".repeat(MAX_RECORDING_NAME_BYTES + 1);
+        assert_eq!(decode_request(KIND_EXPORT_RECORDING, long.as_bytes()), None);
     }
 
     /// The largest legitimate request fits under the request bound.
