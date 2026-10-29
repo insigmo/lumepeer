@@ -110,7 +110,8 @@ impl HostPanel {
             | Reply::Done
             | Reply::Refused
             | Reply::Recordings(_)
-            | Reply::Exported(_) => None,
+            | Reply::Exported(_)
+            | Reply::GuestStores(_) => None,
         }
     }
 
@@ -119,6 +120,14 @@ impl HostPanel {
     #[must_use]
     pub fn unattended(&self) -> Option<UnattendedStatusDto> {
         self.snapshot()?.unattended
+    }
+
+    /// Asks one thing and hands back whatever came back; `None` when no
+    /// session host answers. For the one-time move of the guest stores
+    /// (`placement::guest_stores`), which reads its own replies.
+    #[must_use]
+    pub fn request(&self, request: &Request) -> Option<Reply> {
+        self.ask(request)
     }
 
     /// The chat with `peer`, one of the host's sessions.
@@ -240,6 +249,7 @@ mod served {
     use super::HostSnapshot;
     use crate::session_host_consent::Consents;
     use crate::commands::{ChatEntryDto, UnattendedStatusDto, session_status_dto};
+    use crate::placement::guest_stores::{GuestStores, InAdminTree};
 
     /// What the session host's channel threads and its own loop share.
     #[derive(Debug)]
@@ -257,6 +267,9 @@ mod served {
         consents: Mutex<Option<Arc<Consents>>>,
         /// Whom a recording export is written as and for (ADR 0169 §6).
         person: OnceLock<SignedInPerson>,
+        /// The person's guest stores still in the admin directory, handed to
+        /// their client once (ADR 0169 §3). `None` holds nothing to hand.
+        guest: Mutex<Option<InAdminTree>>,
     }
 
     impl Served {
@@ -270,6 +283,7 @@ mod served {
                 wanting: AtomicUsize::new(0),
                 consents: Mutex::new(None),
                 person: OnceLock::new(),
+                guest: Mutex::new(None),
             })
         }
 
@@ -288,6 +302,42 @@ mod served {
         /// The person this host serves, for what it writes in their name.
         pub fn act_for(&self, person: SignedInPerson) {
             let _ = self.person.set(person);
+        }
+
+        /// The person's guest stores this host may hand to their client
+        /// (ADR 0169 §3).
+        pub fn keeps_guest_stores(&self, stores: InAdminTree) {
+            if let Ok(mut slot) = self.guest.lock() {
+                *slot = Some(stores);
+            }
+        }
+
+        /// The guest stores, as JSON; refused when they cannot all be read.
+        fn guest_stores(&self) -> Reply {
+            let Ok(slot) = self.guest.lock() else {
+                return Reply::Refused;
+            };
+            slot.as_ref()
+                .map_or_else(|| Some(GuestStores::default()), InAdminTree::collect)
+                .and_then(|stores| serde_json::to_vec(&stores).ok())
+                .map_or(Reply::Refused, Reply::GuestStores)
+        }
+
+        /// The client has kept them: out of the admin directory with them.
+        fn guest_stores_taken(&self) -> Reply {
+            let Ok(slot) = self.guest.lock() else {
+                return Reply::Refused;
+            };
+            match slot.as_ref() {
+                None => Reply::Done,
+                Some(stores) if stores.remove() => {
+                    tracing::info!(
+                        "the client keeps the remembered hosts now; they are out of the admin directory (ADR 0169 §3)"
+                    );
+                    Reply::Done
+                }
+                Some(_) => Reply::Refused,
+            }
         }
 
         /// The endpoint is open, and this is its actor.
@@ -321,12 +371,23 @@ mod served {
             self.connected.fetch_add(1, Ordering::SeqCst);
             self.wanting.fetch_add(1, Ordering::SeqCst);
             let mut wants = true;
+            // Whether this connection was handed the guest stores: only then
+            // may it say they were kept (ADR 0169 §3).
+            let mut handed = false;
             while let Some(request) = panel.recv() {
                 if request == Request::HostingOff && wants {
                     wants = false;
                     self.wanting.fetch_sub(1, Ordering::SeqCst);
                 }
-                let reply = self.answer(request);
+                let reply = match request {
+                    Request::GuestStores => {
+                        let reply = self.guest_stores();
+                        handed |= matches!(reply, Reply::GuestStores(_));
+                        reply
+                    }
+                    Request::GuestStoresTaken if handed => self.guest_stores_taken(),
+                    request => self.answer(request),
+                };
                 if !panel.send(&reply) {
                     break;
                 }
@@ -426,6 +487,10 @@ mod served {
                 }
                 // Answered above, open or closed.
                 Request::Recordings | Request::ExportRecording { .. } => Reply::Refused,
+                // Answered by `serve_one`, which knows whether this connection
+                // was handed the guest stores; a letting-go that reaches here
+                // was not, and lets nothing go.
+                Request::GuestStores | Request::GuestStoresTaken => Reply::Refused,
             }
         }
 

@@ -27,6 +27,8 @@ export const tr: Dictionary = {
   'invite.denied': 'Diğer cihaz isteği reddetti.',
   'invite.failed': 'Bağlantı kabul edilmeden önce sona erdi.',
   'invite.sessionNotResumed': 'Oturum sürdürülemedi. Yeni bir oturum istemek için yeniden bağlanın.',
+  'invite.newGuestKey':
+    'Bu bilgisayar yeni bir konuk anahtarı aldı, bu yüzden o cihaz onu artık tanımıyor. Oradaki biri sizi içeri alıp bu cihazı kaydettiğinde, hatırlanan parola yeniden kendiliğinden giriş yapar.',
   'invite.unreachable':
     'Bu cihaza ulaşılamadı. Çevrimdışı olabilir ya da davet kodu güncelliğini yitirmiş olabilir — yeni bir kod isteyin.',
   'invite.badTicket': 'Bu davet kodu geçersiz veya süresi dolmuş.',

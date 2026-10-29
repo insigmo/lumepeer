@@ -187,7 +187,45 @@ export function setConnectPhase(
   if (wasWaiting !== isConnecting()) {
     syncConnectingAnimation();
   }
+  noteUnrecognisedGuestKey(next, code);
   notify();
+}
+
+/**
+ * History label of the remembered host the outstanding attempt dials, or
+ * `undefined` for a pasted code (ADR 0169 §3, pack 07).
+ */
+let reconnectPeer: string | undefined;
+/** Whether this attempt has already asked about a new guest key. */
+let guestKeyAsked = false;
+/** Whether to say why a remembered host did not let this computer in by itself. */
+let guestKeyHint = false;
+
+/**
+ * A remembered host that asks its person, or turns this computer away, where
+ * it used to take the remembered password: when this computer has a new guest
+ * key since that host last saw it, say so — once per host, which the Rust
+ * side keeps count of (ADR 0169 §3, pack 07).
+ */
+function noteUnrecognisedGuestKey(next: ConnectPhase, code?: string | null): void {
+  const unrecognised =
+    next === 'awaiting_consent' || next === 'denied' || (next === 'failed' && code === 'REJECTED');
+  if (reconnectPeer === undefined || guestKeyAsked || !unrecognised) {
+    return;
+  }
+  guestKeyAsked = true;
+  const peer = reconnectPeer;
+  void (async () => {
+    try {
+      const invoke = await invoker();
+      if ((await invoke('guest_key_hint', { args: { peer } })) === true && reconnectPeer === peer) {
+        guestKeyHint = true;
+        notify();
+      }
+    } catch (error) {
+      console.error('guest_key_hint failed:', describeError(error));
+    }
+  })();
 }
 
 /** Whether the outstanding credential attempt was started automatically. */
@@ -483,6 +521,11 @@ async function attempt(command: string, args: unknown): Promise<void> {
 }
 
 async function connect(ticket: string): Promise<void> {
+  if (isConnecting()) {
+    return;
+  }
+  reconnectPeer = undefined;
+  guestKeyHint = false;
   await attempt('invite_connect', { args: { ticket } });
 }
 
@@ -496,6 +539,12 @@ async function connect(ticket: string): Promise<void> {
  * opened beside the running session instead of a second dial.
  */
 export async function reconnect(peer: string, surface: ConnectSurface = 'screen'): Promise<void> {
+  if (isConnecting()) {
+    return;
+  }
+  reconnectPeer = peer;
+  guestKeyAsked = false;
+  guestKeyHint = false;
   await attempt('history_connect', {
     args: { peer, terminal_only: surface === 'terminal', files_only: surface === 'files' },
   });
@@ -698,5 +747,10 @@ export function connectPanel(locale: Locale): TemplateResult {
         </p>`
       : ''}
     ${message ? html`<p class="connect-error" role="alert">${message}</p>` : ''}
+    ${guestKeyHint
+      ? html`<p class="connect-status" role="status" data-testid="guest-key-hint">
+          ${t(locale, 'invite.newGuestKey')}
+        </p>`
+      : ''}
   `;
 }

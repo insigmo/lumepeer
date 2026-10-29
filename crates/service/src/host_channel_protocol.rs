@@ -8,6 +8,9 @@
 //! off, turns unattended access off, chats — and nothing on this wire admits a guest, raises a grant, turns
 //! `secure_desktop_input` on, trusts a device or changes the device password.
 //! Those are not refused here; they cannot be written down (ADR 0043).
+//! One read is of the person's own data rather than the host's state: the
+//! guest stores still in the admin tree, handed to their client once and then
+//! let go (ADR 0169 §3, [`Request::GuestStores`]).
 //! [`Request::effect`] is where that is kept true: every request is one of
 //! [`Effect`]'s kinds, and none of them is a widening one.
 //!
@@ -99,6 +102,10 @@ const KIND_EXPORT_RECORDING: u8 = 0x21;
 /// with room to spare. The session host checks the name itself; this only
 /// bounds what is read.
 pub const MAX_RECORDING_NAME_BYTES: usize = 128;
+/// Kind byte of [`Request::GuestStores`].
+const KIND_GUEST_STORES: u8 = 0x04;
+/// Kind byte of [`Request::GuestStoresTaken`].
+const KIND_GUEST_STORES_TAKEN: u8 = 0x16;
 
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
@@ -108,6 +115,8 @@ const KIND_REPLY_TRANSCRIPT: u8 = 0x82;
 const KIND_REPLY_DONE: u8 = 0x83;
 /// Kind byte of [`Reply::Refused`].
 const KIND_REPLY_REFUSED: u8 = 0x84;
+/// Kind byte of [`Reply::GuestStores`].
+const KIND_REPLY_GUEST_STORES: u8 = 0x85;
 
 /// Kind byte of [`Reply::Recordings`].
 const KIND_REPLY_RECORDINGS: u8 = 0xA0;
@@ -166,6 +175,18 @@ pub enum Request {
         /// The line.
         text: String,
     },
+    /// The person's own guest stores still in the admin tree — the hosts
+    /// they remembered and the passwords remembered for those hosts — as
+    /// JSON, so their client can keep them in the profile (ADR 0169 §3).
+    ///
+    /// A read of the person's own data about other machines: nothing in it
+    /// lets anybody into this one.
+    GuestStores,
+    /// The client has kept what [`Request::GuestStores`] gave it on this
+    /// connection: take it out of the admin tree. The host's own stores —
+    /// identity, device password, trusted devices, invite, audit — are not
+    /// touched (ADR 0169 §3).
+    GuestStoresTaken,
     /// The recordings the host has written, as JSON (ADR 0169 §6).
     Recordings,
     /// Export the host's recording `name` into the person's own profile, as
@@ -258,16 +279,22 @@ impl Request {
     #[must_use]
     pub const fn effect(&self) -> Effect {
         match self {
+            // The guest stores are the person's own data, read out once
+            // (ADR 0169 §3)...
             Self::Snapshot
             | Self::Transcript { .. }
             | Self::MarkChatRead { .. }
             | Self::Recordings
-            | Self::ExportRecording { .. } => Effect::Reads,
+            | Self::ExportRecording { .. }
+            | Self::GuestStores => Effect::Reads,
+            // ...then taken out of the host's tree: out of its reach, never
+            // into it.
             Self::EndSession { .. }
             | Self::LowerGrant { .. }
             | Self::RefusePending { .. }
             | Self::HostingOff
-            | Self::UnattendedOff => Effect::Narrows,
+            | Self::UnattendedOff
+            | Self::GuestStoresTaken => Effect::Narrows,
             Self::SendChat { .. } => Effect::Says,
             Self::AskToWiden { .. } => Effect::Asks,
         }
@@ -290,6 +317,8 @@ pub enum Reply {
     Recordings(Vec<u8>),
     /// [`Request::ExportRecording`]'s answer: what was written, as JSON.
     Exported(Vec<u8>),
+    /// [`Request::GuestStores`]'s answer.
+    GuestStores(Vec<u8>),
 }
 
 /// Writes `request` as one frame; whether it went out whole.
@@ -319,6 +348,7 @@ pub fn write_reply(writer: &mut impl Write, reply: &Reply) -> bool {
         Reply::Refused => (KIND_REPLY_REFUSED, &[]),
         Reply::Recordings(json) => (KIND_REPLY_RECORDINGS, json),
         Reply::Exported(json) => (KIND_REPLY_EXPORTED, json),
+        Reply::GuestStores(json) => (KIND_REPLY_GUEST_STORES, json),
     };
     payload.len() <= MAX_REPLY_PAYLOAD && write_frame(writer, kind, payload)
 }
@@ -333,6 +363,7 @@ pub fn read_reply(reader: &mut impl Read) -> Option<Reply> {
         KIND_REPLY_REFUSED if payload.is_empty() => Some(Reply::Refused),
         KIND_REPLY_RECORDINGS => Some(Reply::Recordings(payload)),
         KIND_REPLY_EXPORTED => Some(Reply::Exported(payload)),
+        KIND_REPLY_GUEST_STORES => Some(Reply::GuestStores(payload)),
         _ => None,
     }
 }
@@ -387,6 +418,8 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
         Request::UnattendedOff => (KIND_UNATTENDED_OFF, Vec::new()),
         Request::Recordings => (KIND_RECORDINGS, Vec::new()),
         Request::ExportRecording { name } => (KIND_EXPORT_RECORDING, name.as_bytes().to_vec()),
+        Request::GuestStores => (KIND_GUEST_STORES, Vec::new()),
+        Request::GuestStoresTaken => (KIND_GUEST_STORES_TAKEN, Vec::new()),
     }
 }
 
@@ -431,6 +464,8 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
         KIND_EXPORT_RECORDING => {
             recording_name(payload).map(|name| Request::ExportRecording { name })
         }
+        KIND_GUEST_STORES => payload.is_empty().then_some(Request::GuestStores),
+        KIND_GUEST_STORES_TAKEN => payload.is_empty().then_some(Request::GuestStoresTaken),
         _ => None,
     }
 }
@@ -505,6 +540,8 @@ mod tests {
             Request::ExportRecording {
                 name: "session-1-ab12.lmrc".to_owned(),
             },
+            Request::GuestStores,
+            Request::GuestStoresTaken,
         ]
     }
 
@@ -574,6 +611,7 @@ mod tests {
             Reply::Refused,
             Reply::Recordings(b"[]".to_vec()),
             Reply::Exported(br#"{"dir":"x"}"#.to_vec()),
+            Reply::GuestStores(br#"{"hosts":[],"passwords":[]}"#.to_vec()),
         ] {
             let mut wire = Vec::new();
             assert!(write_reply(&mut wire, &reply));
@@ -713,5 +751,16 @@ mod tests {
         let mut wire = Vec::new();
         assert!(write_request(&mut wire, &request));
         assert_eq!(read_request(&mut wire.as_slice()), Some(request));
+    }
+
+    /// Pack 07: the guest-store requests carry nothing a caller could steer
+    /// them with — no host, no entry, no path — and are a read and a
+    /// letting-go, never anything that widens.
+    #[test]
+    fn the_guest_store_requests_carry_nothing() {
+        assert_eq!(decode_request(KIND_GUEST_STORES, b"x"), None);
+        assert_eq!(decode_request(KIND_GUEST_STORES_TAKEN, b"x"), None);
+        assert_eq!(Request::GuestStores.effect(), Effect::Reads);
+        assert_eq!(Request::GuestStoresTaken.effect(), Effect::Narrows);
     }
 }

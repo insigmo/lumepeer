@@ -188,7 +188,10 @@ pub(crate) async fn open_audit_log(
     keystore: &dyn Keystore,
 ) -> Option<lumepeer_runtime::audit_store::AuditStore> {
     let Some(path) = path else {
-        tracing::warn!("cannot resolve the app data directory; no audit log this run");
+        tracing::warn!(
+            "no audit log this run: no app data directory, or a guest of the session host, \
+             which hosts nothing to audit (ADR 0169 §3)"
+        );
         return None;
     };
     let store = match lumepeer_runtime::audit_store::AuditStore::open(path, keystore).await {
@@ -228,7 +231,18 @@ fn profile(app: &tauri::AppHandle) -> Profile {
         invite_dir: lumepeer_runtime::config::config_dir(),
         history: connection_history_path(app),
         audit: local.map(|dir| dir.join("audit.db")),
+        guest_key_hint: guest_key_hint_path(app),
     }
+}
+
+/// Where the hosts that knew this computer as a guest by a key it no longer
+/// has are noted, beside the remembered-hosts list (ADR 0169 §3).
+pub(crate) fn guest_key_hint_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager as _;
+    app.path()
+        .app_local_data_dir()
+        .ok()
+        .map(|dir| dir.join(placement::GUEST_KEY_HINT_FILE))
 }
 
 /// Where the relay measurement of ADR 0098 is kept between runs.

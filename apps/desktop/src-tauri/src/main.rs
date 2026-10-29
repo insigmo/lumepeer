@@ -143,13 +143,10 @@ fn claim_host_role() -> (Option<HostRoleGuard>, bool) {
 
         // Where ADR 0169 is on, the service's session host is this machine's
         // host and this window is its guest and its panel: not a second host,
-        // and not the one to ask it to leave. Only for a run that would host
-        // with the protected stores the session host serves — an unelevated
-        // development run still asks below, is refused by the role's access
-        // list, and reads the role as taken.
-        if lumepeer_service::program_data::session_host_enabled()
-            && crate::placement::protected_account().is_some()
-        {
+        // and not the one to ask it to leave — elevated or not, since either
+        // way it keeps the guest's stores only (`placement::session_host_guest`,
+        // ADR 0169 §3) and has nothing a host would host with.
+        if crate::placement::session_host_guest() {
             tracing::info!(
                 "this machine is hosted by the Lumepeer service (ADR 0169); this window connects \
                  out and views other machines, and is not a second host"
@@ -656,6 +653,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::history_connect,
         commands::history_remove,
         commands::history_forget_password,
+        commands::guest_key_hint,
         commands::history_set_trusted,
         commands::history_probe,
         commands::history_check,

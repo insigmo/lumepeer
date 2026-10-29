@@ -27,6 +27,8 @@ export const it: Dictionary = {
   'invite.denied': "L'altro dispositivo ha rifiutato la richiesta.",
   'invite.failed': 'La connessione è terminata prima di essere accettata.',
   'invite.sessionNotResumed': 'Impossibile riprendere la sessione. Connettiti di nuovo per richiederne una nuova.',
+  'invite.newGuestKey':
+    'Questo computer ha una nuova chiave ospite, quindi quel dispositivo non lo riconosce più. Quando qualcuno lì ti farà entrare e salverà questo dispositivo, la password memorizzata tornerà ad accedere da sola.',
   'invite.unreachable':
     "Impossibile raggiungere quel dispositivo. Potrebbe essere offline, oppure il codice di invito non è più aggiornato — richiedine uno nuovo.",
   'invite.badTicket': 'Questo codice di invito non è valido o è scaduto.',

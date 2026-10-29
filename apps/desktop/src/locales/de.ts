@@ -27,6 +27,8 @@ export const de: Dictionary = {
   'invite.denied': 'Das andere Gerät hat die Anfrage abgelehnt.',
   'invite.failed': 'Die Verbindung wurde beendet, bevor sie angenommen wurde.',
   'invite.sessionNotResumed': 'Die Sitzung konnte nicht fortgesetzt werden. Verbinden Sie sich erneut, um eine neue anzufragen.',
+  'invite.newGuestKey':
+    'Dieser Computer hat einen neuen Gastschlüssel, daher erkennt ihn das andere Gerät nicht mehr. Sobald Sie dort jemand hereinlässt und dieses Gerät speichert, meldet Sie das gespeicherte Passwort wieder von selbst an.',
   'invite.unreachable':
     'Dieses Gerät war nicht erreichbar. Es könnte offline sein, oder der Einladungscode ist nicht mehr aktuell — fragen Sie nach einem neuen.',
   'invite.badTicket': 'Dieser Einladungscode ist ungültig oder abgelaufen.',
