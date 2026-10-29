@@ -438,6 +438,37 @@ pub fn set_accept_after_sign_in(directory: &Path, accept: bool) -> bool {
     }
 }
 
+/// The folder under the root the session host downloads updates into
+/// (ADR 0169 §8).
+const UPDATES: &str = "updates";
+
+/// Access list of the updates folder: `LocalSystem` and administrators,
+/// nobody else — what is in it is started as `LocalSystem`.
+pub const UPDATES_SDDL: &str = PRIVATE_SDDL;
+
+/// `%ProgramData%\Lumepeer\updates`, secured, or `None` when it cannot be
+/// (ADR 0169 §8).
+///
+/// The session host writes an installer here and starts it as `LocalSystem`,
+/// so the folder is the private kind: no ordinary user may write, or even
+/// read, a byte in it. One an ordinary user made before the tree was secured
+/// is refused, never adopted — its contents could be anything — and an
+/// administrator deleting it is the way back, as for an account's store. Only
+/// an elevated process gets `Some`.
+#[must_use]
+pub fn updates_directory() -> Option<PathBuf> {
+    updates_directory_in(&root())
+}
+
+/// [`updates_directory`], under the tree rooted at `root`.
+fn updates_directory_in(root: &Path) -> Option<PathBuf> {
+    if !secure_directory(root, TREE_SDDL, Foreign::Adopt) {
+        return None;
+    }
+    let updates = root.join(UPDATES);
+    secure_directory(&updates, UPDATES_SDDL, Foreign::Refuse).then_some(updates)
+}
+
 /// Reads who owns the directory behind `handle`, refuses what is not a
 /// directory, and writes the owner and list of `descriptor` onto it.
 fn secure_handle(
@@ -902,6 +933,67 @@ mod tests {
         assert!(set_accept_after_sign_in(&directory, false));
         assert!(!accept_after_sign_in(&directory));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// ADR 0169 §8: the updates folder admits `LocalSystem` and
+    /// administrators and nobody else — not even to read: what is in it is
+    /// started as `LocalSystem`.
+    #[test]
+    fn the_updates_folder_admits_only_system_and_administrators() {
+        assert!(
+            UPDATES_SDDL.starts_with("D:P"),
+            "the list must be protected"
+        );
+        assert!(UPDATES_SDDL.contains("(A;OICI;GA;;;SY)"));
+        assert!(UPDATES_SDDL.contains("(A;OICI;GA;;;BA)"));
+        for other in [";;;BU)", ";;;IU)", ";;;WD)", ";;;AU)", ";;;CO)", ";;;S-1-"] {
+            assert!(
+                !UPDATES_SDDL.contains(other),
+                "{other} must not be admitted"
+            );
+        }
+        let descriptor = Descriptor::parse(&format!("{OWNER_SDDL}{UPDATES_SDDL}")).unwrap();
+        assert!(descriptor.dacl().is_some());
+    }
+
+    /// ADR 0169 §8: only an elevated process gets the updates folder; it is
+    /// administrators', and one an ordinary user made beforehand is refused
+    /// rather than used. Unelevated, the whole answer is `None`.
+    #[test]
+    fn the_updates_folder_is_administrators_or_nothing() {
+        let base = std::env::temp_dir().join(format!(
+            "lumepeer-program-data-updates-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let elevated = this_process().is_some_and(|(_, elevated)| elevated);
+        if !elevated {
+            assert_eq!(
+                updates_directory_in(&base),
+                None,
+                "an unelevated process was handed the updates folder"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            eprintln!("skipping the rest: securing a directory needs an elevated run");
+            return;
+        }
+        let updates = updates_directory_in(&base).expect("an elevated run gets it");
+        assert_eq!(updates, base.join(UPDATES));
+        assert_eq!(
+            open_without_following(&updates, READ_CONTROL)
+                .unwrap()
+                .owner_is_trusted(),
+            Some(true)
+        );
+        assert_eq!(updates_directory_in(&base), Some(updates.clone()));
+
+        assert!(give_to_this_user(&updates));
+        assert_eq!(
+            updates_directory_in(&base),
+            None,
+            "a folder an ordinary user owns never holds what LocalSystem starts"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// ADR 0133: what an account remembers is its refusal, and taking it back

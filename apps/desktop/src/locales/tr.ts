@@ -138,6 +138,9 @@ export const tr: Dictionary = {
     'Yalnızca daha yeni bir sürüm olup olmadığını sorar. Siz Yükle\'ye basana kadar hiçbir şey indirilmez veya yüklenmez.',
   'system.installNote': 'Yükleme Lumepeer\'ı kapatabilir ve süren oturumları sonlandırabilir.',
   'system.updateOff': 'Bu derlemede yapılandırılmış bir güncelleme kanalı yok.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Bu güncellemeyi Lumepeer hizmeti yükler. Bu sırada Lumepeer kapanır ve yeniden açılır.',
+  'system.installingByService': 'Lumepeer hizmeti güncellemeyi yüklüyor. Lumepeer kapanıp yeniden açılacak.',
   'status.clipboardSynced': 'Pano eşitlendi',
   'status.reconnect': 'Yeniden bağlan',
   'status.reconnectTerminal': 'Terminale bağlan',

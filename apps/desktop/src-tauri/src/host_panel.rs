@@ -20,7 +20,9 @@ use std::sync::Mutex;
 use lumepeer_service::host_channel_protocol::{Reply, Request};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::{ChatEntryDto, ExportDto, RecordingDto, SessionStatusDto, UnattendedStatusDto};
+use crate::commands::{
+    ChatEntryDto, ExportDto, RecordingDto, SessionStatusDto, UnattendedStatusDto,
+};
 
 /// What the session host says about itself in one snapshot.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -35,6 +37,41 @@ pub struct HostSnapshot {
     /// elevated access-settings window (ADR 0169 §5); `None` while closed.
     #[serde(default)]
     pub unattended: Option<UnattendedStatusDto>,
+    /// Where its updates stand (ADR 0169 §8).
+    #[serde(default)]
+    pub update: HostUpdate,
+}
+
+/// Where the session host's updates stand, as the client shows them
+/// (ADR 0169 §8).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum HostUpdate {
+    /// Not asked yet.
+    #[default]
+    Unknown,
+    /// This host installs no updates: a development build, an `.msi`
+    /// install, no channel. The client updates the way it always has.
+    Off,
+    /// The channel offers nothing newer.
+    Current,
+    /// A newer release is there.
+    Available {
+        /// Its version.
+        version: String,
+        /// Its release notes, or empty.
+        notes: String,
+    },
+    /// It is being downloaded and verified.
+    Downloading {
+        /// Its version.
+        version: String,
+    },
+    /// Its installer is starting: the host is about to restart into it.
+    Installing {
+        /// Its version.
+        version: String,
+    },
 }
 
 /// Why a request through the panel did not happen.
@@ -172,6 +209,14 @@ impl HostPanel {
             None => Err(PanelError::Unreachable),
         }
     }
+    /// Asks the host to install the update it found (ADR 0169 §8). The
+    /// request names nothing: what is installed is the host's to choose.
+    ///
+    /// # Errors
+    /// [`PanelError`] when there is no host, or it has nothing to install.
+    pub fn install_update(&self) -> Result<(), PanelError> {
+        self.act(&Request::InstallUpdate)
+    }
 
     /// Asks the host to do one narrowing thing, or to take a chat line.
     ///
@@ -247,9 +292,9 @@ mod served {
     use lumepeer_service::host_channel_protocol::{Reply, Request};
 
     use super::HostSnapshot;
-    use crate::session_host_consent::Consents;
     use crate::commands::{ChatEntryDto, UnattendedStatusDto, session_status_dto};
     use crate::placement::guest_stores::{GuestStores, InAdminTree};
+    use crate::session_host_consent::Consents;
 
     /// What the session host's channel threads and its own loop share.
     #[derive(Debug)]
@@ -270,6 +315,9 @@ mod served {
         /// The person's guest stores still in the admin directory, handed to
         /// their client once (ADR 0169 §3). `None` holds nothing to hand.
         guest: Mutex<Option<InAdminTree>>,
+        /// Where this host's updates stand, and a client's "install now"
+        /// (ADR 0169 §8).
+        updates: Arc<crate::host_update::Updates>,
     }
 
     impl Served {
@@ -284,6 +332,7 @@ mod served {
                 consents: Mutex::new(None),
                 person: OnceLock::new(),
                 guest: Mutex::new(None),
+                updates: Arc::default(),
             })
         }
 
@@ -340,6 +389,12 @@ mod served {
             }
         }
 
+        /// This host's updates (ADR 0169 §8).
+        #[must_use]
+        pub const fn updates(&self) -> &Arc<crate::host_update::Updates> {
+            &self.updates
+        }
+
         /// The endpoint is open, and this is its actor.
         pub fn opened(&self, actor: ActorHandle) {
             if let Ok(mut slot) = self.actor.lock() {
@@ -359,7 +414,8 @@ mod served {
             self.wanting.load(Ordering::SeqCst) > 0
         }
 
-        fn actor(&self) -> Option<ActorHandle> {
+        /// The actor, once the endpoint is open.
+        pub fn actor(&self) -> Option<ActorHandle> {
             self.actor.lock().ok()?.clone()
         }
 
@@ -399,8 +455,9 @@ mod served {
             tracing::info!(pid, "a client left the session host");
         }
 
-        /// One request's answer. Every arm narrows, reads or chats; there is
-        /// no other kind of request to answer (`Request::effect`).
+        /// One request's answer. Every arm narrows, reads, chats or asks for
+        /// the host's own update; there is no other kind of request to answer
+        /// (`Request::effect`).
         fn answer(&self, request: Request) -> Reply {
             // The host's recordings are on its disk whether or not its
             // endpoint is open (ADR 0169 §6).
@@ -410,9 +467,14 @@ mod served {
                 _ => {}
             }
             let Some(actor) = self.actor() else {
-                // Closed: nothing to read but that, nothing to narrow.
+                // Closed: nothing to read but that and the updates, nothing to
+                // narrow.
                 return match request {
-                    Request::Snapshot => snapshot_reply(&HostSnapshot::default()),
+                    Request::Snapshot => snapshot_reply(&HostSnapshot {
+                        update: self.updates.state(),
+                        ..HostSnapshot::default()
+                    }),
+                    Request::InstallUpdate => self.install_update(),
                     _ => Reply::Refused,
                 };
             };
@@ -426,6 +488,7 @@ mod served {
                         ready: actor.online(),
                         sessions: sessions.into_iter().map(session_status_dto).collect(),
                         unattended: unattended_of(runtime, &actor),
+                        update: self.updates.state(),
                     })
                 }
                 Request::Transcript { peer } => runtime
@@ -491,6 +554,19 @@ mod served {
                 // was handed the guest stores; a letting-go that reaches here
                 // was not, and lets nothing go.
                 Request::GuestStores | Request::GuestStoresTaken => Reply::Refused,
+                Request::InstallUpdate => self.install_update(),
+            }
+        }
+
+        /// A client's "install now" (ADR 0169 §8): the host checks and
+        /// installs what it finds itself; refused when it knows there is
+        /// nothing, or installs nothing at all.
+        fn install_update(&self) -> Reply {
+            if self.updates.ask_to_install() {
+                tracing::info!("a client asked for the update to be installed now");
+                Reply::Done
+            } else {
+                Reply::Refused
             }
         }
 
@@ -672,6 +748,25 @@ mod served {
                 Reply::Refused
             );
         }
+
+        /// ADR 0169 §8: the snapshot says where the updates stand, open or
+        /// closed, and "install now" is taken unless the host installs
+        /// nothing.
+        #[test]
+        fn the_updates_are_read_and_asked_for_over_the_channel() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap_or_else(|error| panic!("{error}"));
+            let served = Served::new(runtime.handle().clone());
+            assert_eq!(served.answer(Request::InstallUpdate), Reply::Done);
+
+            let Reply::Snapshot(json) = served.answer(Request::Snapshot) else {
+                panic!("a snapshot is always answered");
+            };
+            let snapshot: HostSnapshot =
+                serde_json::from_slice(&json).unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(snapshot.update, super::super::HostUpdate::Unknown);
+        }
     }
 }
 
@@ -696,6 +791,25 @@ mod tests {
             .unattended
             .unwrap_or_else(|| panic!("the field was there"));
         assert!(unattended.enabled && unattended.managed_by_service);
+    }
+    use super::{HostSnapshot, HostUpdate};
+
+    /// The update state is a tagged object on the wire, and a snapshot from a
+    /// host that says nothing about updates reads as "not asked yet".
+    #[test]
+    fn the_update_state_is_tagged_and_optional() {
+        let available = HostUpdate::Available {
+            version: "0.0.166".to_owned(),
+            notes: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&available).unwrap_or_default(),
+            serde_json::json!({"stage": "available", "version": "0.0.166", "notes": ""})
+        );
+        let old: HostSnapshot =
+            serde_json::from_str(r#"{"open":false,"ready":false,"sessions":[]}"#)
+                .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(old.update, HostUpdate::Unknown);
     }
 
     /// The protocol's chat bound is the core's, which it cannot import.

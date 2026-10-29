@@ -12,7 +12,9 @@
 //! guest stores still in the admin tree, handed to their client once and then
 //! let go (ADR 0169 §3, [`Request::GuestStores`]).
 //! [`Request::effect`] is where that is kept true: every request is one of
-//! [`Effect`]'s kinds, and none of them is a widening one.
+//! [`Effect`]'s kinds, and none of them is a widening one. The one request
+//! that is neither a read, a narrowing nor a chat line is "install the update
+//! you found" (ADR 0169 §8), which names no package and admits nobody.
 //!
 //! The one request that names a widening, [`Request::AskToWiden`], is
 //! [`Effect::Asks`]: it puts the session host's own dialog in front of the
@@ -107,6 +109,9 @@ const KIND_GUEST_STORES: u8 = 0x04;
 /// Kind byte of [`Request::GuestStoresTaken`].
 const KIND_GUEST_STORES_TAKEN: u8 = 0x16;
 
+/// Kind byte of [`Request::InstallUpdate`].
+const KIND_INSTALL_UPDATE: u8 = 0x40;
+
 /// Kind byte of [`Reply::Snapshot`].
 const KIND_REPLY_SNAPSHOT: u8 = 0x81;
 /// Kind byte of [`Reply::Transcript`].
@@ -175,6 +180,11 @@ pub enum Request {
         /// The line.
         text: String,
     },
+    /// Install the update the host found, now (ADR 0169 §8). It carries
+    /// nothing: no path, no URL, no version — the host checks the channel
+    /// itself and installs only what verifies against the key it was built
+    /// with.
+    InstallUpdate,
     /// The person's own guest stores still in the admin tree — the hosts
     /// they remembered and the passwords remembered for those hosts — as
     /// JSON, so their client can keep them in the profile (ADR 0169 §3).
@@ -268,6 +278,10 @@ pub enum Effect {
     /// Puts a question in front of the person at this machine, in a window
     /// only they can answer; changes nothing until they do (pack 04).
     Asks,
+    /// Has the host install the update it found and verified itself
+    /// (ADR 0169 §8). Admits nobody and raises nothing: the caller chooses
+    /// no package, and what it costs a guest is the restart every update is.
+    Updates,
 }
 
 impl Request {
@@ -297,6 +311,7 @@ impl Request {
             | Self::GuestStoresTaken => Effect::Narrows,
             Self::SendChat { .. } => Effect::Says,
             Self::AskToWiden { .. } => Effect::Asks,
+            Self::InstallUpdate => Effect::Updates,
         }
     }
 }
@@ -420,6 +435,7 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
         Request::ExportRecording { name } => (KIND_EXPORT_RECORDING, name.as_bytes().to_vec()),
         Request::GuestStores => (KIND_GUEST_STORES, Vec::new()),
         Request::GuestStoresTaken => (KIND_GUEST_STORES_TAKEN, Vec::new()),
+        Request::InstallUpdate => (KIND_INSTALL_UPDATE, Vec::new()),
     }
 }
 
@@ -466,6 +482,7 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
         }
         KIND_GUEST_STORES => payload.is_empty().then_some(Request::GuestStores),
         KIND_GUEST_STORES_TAKEN => payload.is_empty().then_some(Request::GuestStoresTaken),
+        KIND_INSTALL_UPDATE => payload.is_empty().then_some(Request::InstallUpdate),
         _ => None,
     }
 }
@@ -542,6 +559,7 @@ mod tests {
             },
             Request::GuestStores,
             Request::GuestStoresTaken,
+            Request::InstallUpdate,
         ]
     }
 
@@ -565,7 +583,7 @@ mod tests {
             assert!(
                 matches!(
                     effect,
-                    Effect::Reads | Effect::Narrows | Effect::Says | Effect::Asks
+                    Effect::Reads | Effect::Narrows | Effect::Says | Effect::Asks | Effect::Updates
                 ),
                 "{request:?} is {effect:?}"
             );
@@ -599,6 +617,23 @@ mod tests {
         assert!(write_request(&mut wire, &Request::UnattendedOff));
         assert_eq!(wire.len(), HEADER_LEN, "no payload at all");
         assert_eq!(decode_request(KIND_UNATTENDED_OFF, b"password"), None);
+    }
+    /// ADR 0169 §8: "install now" carries nothing — no path, no URL, no
+    /// version — so the caller cannot choose what the host installs; a payload
+    /// on it is not a request at all.
+    #[test]
+    fn install_now_carries_no_package() {
+        let mut wire = Vec::new();
+        assert!(write_request(&mut wire, &Request::InstallUpdate));
+        assert_eq!(wire, [HOST_CHANNEL_MAGIC, KIND_INSTALL_UPDATE, 0, 0, 0, 0]);
+        assert_eq!(Request::InstallUpdate.effect(), Effect::Updates);
+        for payload in [
+            &b"C:\\Users\\me\\evil.exe"[..],
+            b"https://example.invalid/x",
+            b"0.0.1",
+        ] {
+            assert_eq!(decode_request(KIND_INSTALL_UPDATE, payload), None);
+        }
     }
 
     /// Every reply survives the wire unchanged.

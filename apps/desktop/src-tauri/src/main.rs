@@ -18,6 +18,9 @@ mod bootstrap;
 mod commands;
 // The channel between the session host and this client (ADR 0169 §4).
 mod host_panel;
+// The session host installs this machine's updates (ADR 0169 §8).
+#[cfg(target_os = "windows")]
+mod host_update;
 // When the operator's own keyboard belongs to the remote machine (ADR 0090).
 mod keyboard_grab;
 mod license;

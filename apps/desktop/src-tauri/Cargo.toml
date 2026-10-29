@@ -123,6 +123,17 @@ winreg.workspace = true
 # ADR 0047) — the exact crate `arboard`'s own Windows text backend already
 # depends on, so this is a new direct edge, not a new dependency version.
 clipboard-win.workspace = true
+# The session host's own updater (ADR 0169 §8): it has no Tauri app to hang
+# `tauri-plugin-updater` on, so it does what the plugin does with the crates
+# the plugin already pulls in, at the versions and features already resolved
+# for it — none of these adds a package to `Cargo.lock`. `minisign-verify` is
+# the plugin's own verifier, `reqwest` its HTTP client without a bundled TLS
+# provider, `rustls` with `ring` the provider the plugin installs.
+minisign-verify = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+semver = "1"
+data-encoding.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid` for the sign-in screen host's "runs as root" check (ADR 0151).

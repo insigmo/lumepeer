@@ -138,6 +138,9 @@ export const pl: Dictionary = {
     'Tylko pyta, czy istnieje nowsze wydanie. Nic nie jest pobierane ani instalowane, dopóki nie naciśniesz Zainstaluj.',
   'system.installNote': 'Instalacja może zamknąć Lumepeer i zakończyć trwające sesje.',
   'system.updateOff': 'Ta kompilacja nie ma skonfigurowanego kanału aktualizacji.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'Tę aktualizację instaluje usługa Lumepeer. Lumepeer zamknie się na ten czas i uruchomi ponownie.',
+  'system.installingByService': 'Usługa Lumepeer instaluje aktualizację. Lumepeer zamknie się i uruchomi ponownie.',
   'status.clipboardSynced': 'Schowek zsynchronizowany',
   'status.reconnect': 'Połącz ponownie',
   'status.reconnectTerminal': 'Połącz z terminalem',

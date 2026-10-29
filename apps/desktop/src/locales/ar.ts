@@ -137,6 +137,9 @@ export const ar: Dictionary = {
     'يسأل فقط عمّا إذا كان هناك إصدار أحدث. لا يُنزَّل أو يُثبَّت أي شيء حتى تضغط على تثبيت.',
   'system.installNote': 'قد يؤدي التثبيت إلى إغلاق Lumepeer وإنهاء أي جلسة جارية.',
   'system.updateOff': 'لا توجد قناة تحديث مهيأة لهذا الإصدار.',
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  'system.installNoteService': 'تثبّت خدمة Lumepeer هذا التحديث. يُغلق Lumepeer أثناء ذلك ثم يُفتح من جديد.',
+  'system.installingByService': 'تقوم خدمة Lumepeer بتثبيت التحديث. سيُغلق Lumepeer ثم يُفتح من جديد.',
   'status.clipboardSynced': 'تمت مزامنة الحافظة',
   'status.reconnect': 'الاتصال مرة أخرى',
   'status.reconnectTerminal': 'الاتصال بالطرفية',

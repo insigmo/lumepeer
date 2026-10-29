@@ -956,6 +956,43 @@ pub const CONSENT_DIALOG_TIMEOUT_SECS: u64 = 60;
 /// dialog's own, so a `LocalSystem` window never lays out more text from a
 /// stranger than fits on a line, whatever any other layer let through.
 pub const CONSENT_DIALOG_PEER_TEXT_MAX_CHARS: usize = 64;
+/// How long after it starts the session host first asks the update channel
+/// (ADR 0169 §8).
+///
+/// Not at once: a session host is started again each time it closes its
+/// endpoint, and a sign-in has better things to do in its first seconds. A
+/// client's "install now" does not wait for it.
+pub const UPDATE_FIRST_CHECK_DELAY_SECS: u64 = 30;
+
+/// How often the session host asks the update channel again (ADR 0169 §8).
+/// A few times a day: a release a day is the most this project ships.
+pub const UPDATE_CHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
+/// How long the console must have seen no input before the session host
+/// installs an update nobody asked for (ADR 0169 §8, ADR 0117 §3).
+///
+/// Installing closes the person's client; only somebody who is not there
+/// cannot have decided against that. Long enough that a person reading
+/// something is not "away"; short enough that a machine left alone overnight
+/// is updated the same night.
+pub const UPDATE_INSTALL_IDLE_SECS: u64 = 15 * 60;
+
+/// Largest update manifest the session host reads, in bytes (ADR 0169 §8).
+/// `latest.json` is a few kilobytes; anything near this is not one.
+pub const UPDATE_MANIFEST_MAX_BYTES: usize = 256 * 1024;
+
+/// How long the session host waits for the update manifest (ADR 0169 §8).
+pub const UPDATE_MANIFEST_TIMEOUT_SECS: u64 = 30;
+
+/// Largest installer the session host downloads, in bytes (ADR 0169 §8).
+///
+/// The Windows setup is tens of megabytes and is held in memory to be
+/// verified before it is written; this bounds that, with room for growth.
+pub const UPDATE_INSTALLER_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// How long the session host gives one installer download (ADR 0169 §8):
+/// the bound above over a slow line.
+pub const UPDATE_DOWNLOAD_TIMEOUT_SECS: u64 = 15 * 60;
 
 /// Maximum pixel area of one cursor shape update (§11). A cursor is UI
 /// chrome, never a second video channel; anything larger is malformed.

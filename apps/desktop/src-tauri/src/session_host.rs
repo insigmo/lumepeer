@@ -54,6 +54,11 @@
 //! with their own token. Tunnels stay this process's: a TCP connection
 //! carries no Windows identity.
 //!
+//! It also installs this machine's updates ([`crate::host_update`], §8): when
+//! nobody is at the machine or a client asks, it tells every guest it is
+//! restarting, starts the installer and leaves with
+//! [`SESSION_HOST_EXIT_UPDATING`].
+//!
 //! It refuses — [`SESSION_HOST_EXIT_NOT_ENABLED`] — until an administrator has
 //! turned ADR 0169 on for this machine, and — [`SESSION_HOST_EXIT_NO_STORE`]
 //! — for a person whose store holds no identity: they never opened Lumepeer,
@@ -66,9 +71,8 @@ use std::time::{Duration, Instant};
 use lumepeer_core::consent::HostAttendance;
 use lumepeer_core::constants::SESSION_INDICATOR_DEADLINE_SECS;
 use lumepeer_net::keystore::IDENTITY_ENTRY;
-use lumepeer_runtime::network::{ActorHandle, SessionStateDto};
 use lumepeer_net::run_as::RunAs;
-use lumepeer_runtime::network::ActorHandle;
+use lumepeer_runtime::network::{ActorHandle, SessionStateDto};
 use lumepeer_runtime::person::{Person, SignedIn};
 use lumepeer_runtime::view::{ViewSurface, ViewWindows};
 use lumepeer_service::access_settings::PolicyChanges;
@@ -76,7 +80,7 @@ use lumepeer_service::host_role::ReleaseRequests;
 use lumepeer_service::person_token::SignedInPerson;
 use lumepeer_service::{
     SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_NOT_ENABLED,
-    SESSION_HOST_EXIT_ROLE_TAKEN,
+    SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
 };
 use lumepeer_terminal::{Shell, ShellError, ShellSize};
 
@@ -164,6 +168,15 @@ fn host() -> u32 {
             "no policy-changed event: a changed device password takes effect at the next start"
         );
     }
+    // Updates are this host's to install (ADR 0169 §8), open or closed; the
+    // client the last update closed is started again first.
+    runtime.spawn({
+        let served = Arc::clone(&served);
+        async move {
+            crate::host_update::relaunch_client_if_asked(session).await;
+            crate::host_update::keep_up_to_date(served).await;
+        }
+    });
     let code = runtime.block_on(serve(
         placement,
         &directory,
@@ -200,6 +213,9 @@ async fn serve(
         // Closed, nothing holds the policy: the endpoint reads it when it
         // opens. Taken down here so it is not read twice then.
         let _ = policy_changes.is_some_and(PolicyChanges::changed);
+        if served.updates().leaving() {
+            return SESSION_HOST_EXIT_UPDATING;
+        }
         if wanted() {
             break;
         }
@@ -242,6 +258,10 @@ async fn serve(
             if let Err(error) = handle.reload_policy().await {
                 tracing::warn!(?error, "cannot read the access policy again");
             }
+        }
+        // Every guest has been told already (ADR 0148), by the update itself.
+        if served.updates().leaving() {
+            return SESSION_HOST_EXIT_UPDATING;
         }
         let rows = handle.status().await.unwrap_or_default();
         consents.follow(&rows);

@@ -24,6 +24,8 @@ export interface UpdateInfo {
   version: string;
   current: string;
   notes: string;
+  /** The Lumepeer service installs it, not this window (ADR 0169 §8). */
+  by_service?: boolean;
 }
 
 /** How this panel reaches the core; injectable so tests need no Tauri. */
@@ -414,15 +416,19 @@ function updateStatus(locale: Locale): TemplateResult {
       : html`<span class="setting-note system-error" data-testid="update-error"
           >${t(locale, state.updateError === "off" ? "system.updateOff" : "system.updateFailed")}</span
         >`;
+  // The Lumepeer service installs it (ADR 0169 §8): this window only asked,
+  // and closes when the installer runs.
+  const byService = state.update?.by_service === true;
   if (state.installed) {
     return html`<span class="setting-label" data-testid="update-installed"
-      >${t(locale, "system.installedRestart")}</span
+      >${t(locale, byService ? "system.installingByService" : "system.installedRestart")}</span
     >`;
   }
   if (state.update !== null) {
     return html`
       <span class="setting-label" data-testid="update-found">${t(locale, "system.available", state.update.version)}</span>
-      ${error || html`<span class="setting-note">${t(locale, "system.installNote")}</span>`}
+      ${error ||
+      html`<span class="setting-note">${t(locale, byService ? "system.installNoteService" : "system.installNote")}</span>`}
     `;
   }
   if (state.checking) {

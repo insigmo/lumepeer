@@ -195,6 +195,9 @@ export type TranslationKey =
   | 'system.autoCheckNote'
   | 'system.installNote'
   | 'system.updateOff'
+  // The Lumepeer service installs updates (ADR 0169 §8).
+  | 'system.installNoteService'
+  | 'system.installingByService'
   | 'status.clipboardSynced'
   | 'status.reconnect'
   // Opens a shell on a remembered host and nothing else (ADR 0101), plus the
