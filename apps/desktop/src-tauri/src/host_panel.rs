@@ -40,6 +40,10 @@ pub struct HostSnapshot {
     /// Where its updates stand (ADR 0169 §8).
     #[serde(default)]
     pub update: HostUpdate,
+    /// Whether it accepts connections from sign-in on, with no client attached
+    /// (ADR 0169 §9); `None` when it cannot say. Open or closed alike.
+    #[serde(default)]
+    pub accept_after_sign_in: Option<bool>,
 }
 
 /// Where the session host's updates stand, as the client shows them
@@ -89,6 +93,9 @@ pub enum PanelError {
 pub struct HostPanel {
     sid: String,
     link: Mutex<Option<Link>>,
+    /// When a session host last answered, or when this panel was made if
+    /// none has yet: what [`Self::unreachable`] measures from.
+    answered: Mutex<std::time::Instant>,
 }
 
 #[cfg(target_os = "windows")]
@@ -110,6 +117,7 @@ impl HostPanel {
             Some(Self {
                 sid,
                 link: Mutex::new(None),
+                answered: Mutex::new(std::time::Instant::now()),
             })
         }
         #[cfg(not(target_os = "windows"))]
@@ -131,11 +139,33 @@ impl HostPanel {
             }
             let held = link.as_mut()?;
             match ask_on(held, request) {
-                Some(reply) => return Some(reply),
+                Some(reply) => {
+                    if let Ok(mut answered) = self.answered.lock() {
+                        *answered = std::time::Instant::now();
+                    }
+                    return Some(reply);
+                }
                 None => *link = None,
             }
         }
         None
+    }
+
+    /// Whether no session host has answered for
+    /// [`SESSION_HOST_UNREACHABLE_SECS`]: nobody can reach this machine until
+    /// the service runs again (ADR 0169 §2). Kept fresh by [`stay_attached`]'s
+    /// poll; the restart a session host makes each time it closes its
+    /// endpoint is shorter than that.
+    ///
+    /// [`SESSION_HOST_UNREACHABLE_SECS`]: lumepeer_core::constants::SESSION_HOST_UNREACHABLE_SECS
+    #[must_use]
+    pub fn unreachable(&self) -> bool {
+        self.answered.lock().is_ok_and(|answered| {
+            answered.elapsed()
+                >= std::time::Duration::from_secs(
+                    lumepeer_core::constants::SESSION_HOST_UNREACHABLE_SECS,
+                )
+        })
     }
 
     /// The host's state; `None` when no session host answers.
@@ -281,6 +311,7 @@ pub use served::{Served, serve};
 /// The session host's end.
 #[cfg(target_os = "windows")]
 mod served {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -318,6 +349,9 @@ mod served {
         /// Where this host's updates stand, and a client's "install now"
         /// (ADR 0169 §8).
         updates: Arc<crate::host_update::Updates>,
+        /// The person's directory, where "accept connections after sign-in"
+        /// is kept (ADR 0169 §9).
+        directory: OnceLock<PathBuf>,
     }
 
     impl Served {
@@ -333,6 +367,7 @@ mod served {
                 person: OnceLock::new(),
                 guest: Mutex::new(None),
                 updates: Arc::default(),
+                directory: OnceLock::new(),
             })
         }
 
@@ -351,6 +386,18 @@ mod served {
         /// The person this host serves, for what it writes in their name.
         pub fn act_for(&self, person: SignedInPerson) {
             let _ = self.person.set(person);
+        }
+
+        /// The person's directory, which this host reads and narrows the
+        /// "accept connections after sign-in" setting in (ADR 0169 §9).
+        pub fn keeps_settings_in(&self, directory: PathBuf) {
+            let _ = self.directory.set(directory);
+        }
+
+        fn accept_after_sign_in(&self) -> Option<bool> {
+            self.directory
+                .get()
+                .map(|directory| lumepeer_service::program_data::accept_after_sign_in(directory))
         }
 
         /// The person's guest stores this host may hand to their client
@@ -464,6 +511,9 @@ mod served {
             match request {
                 Request::Recordings => return recordings_reply(),
                 Request::ExportRecording { name } => return self.export_reply(&name),
+                // A file in the person's directory, open or closed: off is
+                // how a closed host stays closed after sign-in.
+                Request::AcceptAfterSignInOff => return self.accept_after_sign_in_off(),
                 _ => {}
             }
             let Some(actor) = self.actor() else {
@@ -472,6 +522,7 @@ mod served {
                 return match request {
                     Request::Snapshot => snapshot_reply(&HostSnapshot {
                         update: self.updates.state(),
+                        accept_after_sign_in: self.accept_after_sign_in(),
                         ..HostSnapshot::default()
                     }),
                     Request::InstallUpdate => self.install_update(),
@@ -489,6 +540,7 @@ mod served {
                         sessions: sessions.into_iter().map(session_status_dto).collect(),
                         unattended: unattended_of(runtime, &actor),
                         update: self.updates.state(),
+                        accept_after_sign_in: self.accept_after_sign_in(),
                     })
                 }
                 Request::Transcript { peer } => runtime
@@ -548,14 +600,31 @@ mod served {
                     tracing::info!(off, "a client turned unattended access off");
                     done(off)
                 }
-                // Answered above, open or closed.
-                Request::Recordings | Request::ExportRecording { .. } => Reply::Refused,
-                // Answered by `serve_one`, which knows whether this connection
-                // was handed the guest stores; a letting-go that reaches here
-                // was not, and lets nothing go.
-                Request::GuestStores | Request::GuestStoresTaken => Reply::Refused,
+                // The first three are answered above, open or closed. The
+                // guest stores are answered by `serve_one`, which knows
+                // whether this connection was handed them; a letting-go that
+                // reaches here was not, and lets nothing go.
+                Request::Recordings
+                | Request::ExportRecording { .. }
+                | Request::AcceptAfterSignInOff
+                | Request::GuestStores
+                | Request::GuestStoresTaken => Reply::Refused,
                 Request::InstallUpdate => self.install_update(),
             }
+        }
+
+        /// A client's "accept only while I am open" (ADR 0169 §9): a
+        /// narrowing, so no prompt; turning it back on is the access-settings
+        /// window's.
+        fn accept_after_sign_in_off(&self) -> Reply {
+            let off = self.directory.get().is_some_and(|directory| {
+                lumepeer_service::program_data::set_accept_after_sign_in(directory, false)
+            });
+            tracing::info!(
+                off,
+                "a client turned accepting connections after sign-in off"
+            );
+            if off { Reply::Done } else { Reply::Refused }
         }
 
         /// A client's "install now" (ADR 0169 §8): the host checks and
@@ -660,6 +729,8 @@ mod served {
             // the access-settings window, which reads it itself.
             logon_screen: None,
             managed_by_service: true,
+            // In the snapshot itself, which a closed host answers too.
+            accept_after_sign_in: None,
         })
     }
 

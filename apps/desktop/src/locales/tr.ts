@@ -176,6 +176,10 @@ export const tr: Dictionary = {
     'Bu cihazda video kodlayıcı yok, bu yüzden davet ettikleriniz hiçbir şey görmeyecek. Oturumlar yine de bağlanır ve giriş çalışmaya devam eder.',
   'status.hostedByService':
     'Bu cihazı bu pencere değil, Lumepeer hizmeti barındırıyor. Buradan diğer cihazlara bağlanmaya devam edebilirsiniz.',
+  'status.unreachable':
+    'Bu bilgisayara şu anda bağlanılamıyor: Lumepeer hizmeti çalışmıyor.',
+  'status.startService':
+    'Hizmeti başlat',
   'consent.answerInSystemWindow': (peer) => `${peer} bağlanmak istiyor. Lumepeer sistem penceresinde yanıtlayın.`,
   'status.askHost.control': 'Kontrol ver… (sistem penceresinde sorar)',
   'status.askHost.secureDesktopInput': 'Yönetici istemlerine izin ver… (sistem penceresinde sorar)',
@@ -454,6 +458,16 @@ export const tr: Dictionary = {
     'Bu cihaza Lumepeer hizmeti hizmet veriyor. Erişim ayarları burada okunabilir; değiştirmek yönetici hakları gerektirir.',
   'unattended.openAccessSettings':
     'Erişim ayarlarını değiştir',
+  'unattended.acceptAfterSignIn.label':
+    'Oturum açıldıktan sonra bağlantıları kabul et',
+  'unattended.acceptAfterSignIn.note':
+    'Oturum açtığınız andan itibaren konuklar Lumepeer penceresi kapalıyken de bu cihaza ulaşabilir. Cihaz parolası olmadan yine de yanıtınızı beklerler.',
+  'unattended.acceptAfterSignIn.on':
+    'Konuklar bu cihaza oturum açıldığı andan itibaren, bu pencere kapalıyken de ulaşabilir.',
+  'unattended.acceptAfterSignIn.off':
+    'Konuklar bu cihaza yalnızca bu pencere açıkken ulaşabilir.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Yalnızca bu pencere açıkken kabul et',
   'access.heading':
     'Erişim ayarları',
   'access.explain':

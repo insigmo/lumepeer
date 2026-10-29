@@ -33,6 +33,13 @@ export interface UnattendedStatus {
    * the elevated access-settings window.
    */
   managed_by_service?: boolean;
+  /**
+   * Whether the session host takes connections from sign-in on, with no
+   * window open (ADR 0169 §9); `null` where there is no session host. Turning
+   * it on widens, so only the access-settings window does; turning it off
+   * narrows, so this window may.
+   */
+  accept_after_sign_in?: boolean | null;
 }
 
 /** The one-time payload `unattended_set_totp` returns when turning it on. */
@@ -253,6 +260,7 @@ export function unattendedSettings(
       </select>
 
       ${logonScreenToggle(status, locale, onRefresh)}
+      ${acceptAfterSignInToggle(status, locale, onRefresh)}
 
       ${status.enabled
         ? html`
@@ -332,6 +340,7 @@ function managedByService(
             </p>
           `
         : ''}
+      ${acceptAfterSignInState(status, locale, onRefresh)}
       <button
         type="button"
         class="unattended-save unattended-elevate"
@@ -400,6 +409,76 @@ function logonScreenToggle(
       <span>${t(locale, 'unattended.logonScreen.label')}</span>
     </label>
     <p class="unattended-hint">${t(locale, 'unattended.logonScreen.note')}</p>
+  `;
+}
+
+/**
+ * "Accept connections after sign-in" in the access-settings window (ADR 0169
+ * §9): only where a session host reads it. No device password is needed —
+ * without one, a guest still waits for the person here to say yes.
+ */
+function acceptAfterSignInToggle(
+  status: UnattendedStatus,
+  locale: Locale,
+  onRefresh: () => void,
+): TemplateResult | typeof nothing {
+  if (status.accept_after_sign_in === null || status.accept_after_sign_in === undefined) {
+    return nothing;
+  }
+  return html`
+    <label class="unattended-logon-screen">
+      <input
+        type="checkbox"
+        data-testid="unattended-accept-after-sign-in"
+        .checked=${status.accept_after_sign_in}
+        ?disabled=${busy}
+        @change=${(event: Event) => {
+          const enabled = (event.target as HTMLInputElement).checked;
+          void run(async (invoke) => {
+            await invoke('unattended_set_accept_after_sign_in', { args: { enabled } });
+          }, onRefresh);
+        }}
+      />
+      <span>${t(locale, 'unattended.acceptAfterSignIn.label')}</span>
+    </label>
+    <p class="unattended-hint">${t(locale, 'unattended.acceptAfterSignIn.note')}</p>
+  `;
+}
+
+/**
+ * The same setting as the client reads it from the session host: its state,
+ * and "off" — a narrowing, taken with no prompt (ADR 0169 §4).
+ */
+function acceptAfterSignInState(
+  status: UnattendedStatus,
+  locale: Locale,
+  onRefresh: () => void,
+): TemplateResult | typeof nothing {
+  if (status.accept_after_sign_in === null || status.accept_after_sign_in === undefined) {
+    return nothing;
+  }
+  if (!status.accept_after_sign_in) {
+    return html`<p class="unattended-hint" data-testid="accept-after-sign-in-state">
+      ${t(locale, 'unattended.acceptAfterSignIn.off')}
+    </p>`;
+  }
+  return html`
+    <p class="unattended-hint" data-testid="accept-after-sign-in-state">
+      ${t(locale, 'unattended.acceptAfterSignIn.on')}
+    </p>
+    <button
+      type="button"
+      class="unattended-disable"
+      data-testid="accept-after-sign-in-off"
+      ?disabled=${busy}
+      @click=${() => {
+        void run(async (invoke) => {
+          await invoke('unattended_set_accept_after_sign_in', { args: { enabled: false } });
+        }, onRefresh);
+      }}
+    >
+      ${t(locale, 'unattended.acceptAfterSignIn.turnOff')}
+    </button>
   `;
 }
 

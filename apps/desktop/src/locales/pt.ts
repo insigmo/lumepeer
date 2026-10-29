@@ -176,6 +176,10 @@ export const pt: Dictionary = {
     'Este dispositivo não tem codificador de vídeo, então quem você convidar não verá nada. As sessões ainda se conectam, e a entrada continua funcionando.',
   'status.hostedByService':
     'Este dispositivo é hospedado pelo serviço Lumepeer, não por esta janela. Você ainda pode se conectar a outros dispositivos daqui.',
+  'status.unreachable':
+    'No momento não é possível se conectar a este computador: o serviço Lumepeer não está em execução.',
+  'status.startService':
+    'Iniciar o serviço',
   'consent.answerInSystemWindow': (peer) => `${peer} quer se conectar. Responda na janela do sistema do Lumepeer.`,
   'status.askHost.control': 'Dar o controle… (pergunta em uma janela do sistema)',
   'status.askHost.secureDesktopInput': 'Permitir solicitações de administrador… (pergunta em uma janela do sistema)',
@@ -454,6 +458,16 @@ export const pt: Dictionary = {
     'Este dispositivo é atendido pelo serviço Lumepeer. As configurações de acesso podem ser vistas aqui; alterá-las exige direitos de administrador.',
   'unattended.openAccessSettings':
     'Alterar configurações de acesso',
+  'unattended.acceptAfterSignIn.label':
+    'Aceitar conexões após o login',
+  'unattended.acceptAfterSignIn.note':
+    'A partir do login, os convidados podem alcançar este dispositivo mesmo com a janela do Lumepeer fechada. Sem a senha do dispositivo, eles ainda aguardam sua resposta.',
+  'unattended.acceptAfterSignIn.on':
+    'Os convidados podem alcançar este dispositivo desde o login, mesmo com esta janela fechada.',
+  'unattended.acceptAfterSignIn.off':
+    'Os convidados só podem alcançar este dispositivo enquanto esta janela estiver aberta.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Aceitar só com esta janela aberta',
   'access.heading':
     'Configurações de acesso',
   'access.explain':

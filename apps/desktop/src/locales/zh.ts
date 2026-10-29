@@ -168,6 +168,10 @@ export const zh: Dictionary = {
   'status.noEncoder': '此设备没有视频编码器，因此受邀者将看不到任何画面。会话仍会连接，输入功能仍可使用。',
   'status.hostedByService':
     '此设备由 Lumepeer 服务托管，而不是此窗口。你仍可以从这里连接到其他设备。',
+  'status.unreachable':
+    '目前无法连接到这台电脑：Lumepeer 服务未运行。',
+  'status.startService':
+    '启动服务',
   'consent.answerInSystemWindow': (peer) => `${peer} 请求连接。请在 Lumepeer 系统窗口中回答。`,
   'status.askHost.control': '授予控制…（在系统窗口中询问）',
   'status.askHost.secureDesktopInput': '允许回应管理员提示…（在系统窗口中询问）',
@@ -438,6 +442,16 @@ export const zh: Dictionary = {
     '此设备由 Lumepeer 服务托管。可以在此查看访问设置；更改需要管理员权限。',
   'unattended.openAccessSettings':
     '更改访问设置',
+  'unattended.acceptAfterSignIn.label':
+    '登录后接受连接',
+  'unattended.acceptAfterSignIn.note':
+    '从你登录起，即使 Lumepeer 窗口已关闭，访客也能连接到此设备。没有设备密码的访客仍需等待你的答复。',
+  'unattended.acceptAfterSignIn.on':
+    '从登录起，即使此窗口已关闭，访客也能连接到此设备。',
+  'unattended.acceptAfterSignIn.off':
+    '只有在此窗口打开时，访客才能连接到此设备。',
+  'unattended.acceptAfterSignIn.turnOff':
+    '仅在此窗口打开时接受',
   'access.heading':
     '访问设置',
   'access.explain':

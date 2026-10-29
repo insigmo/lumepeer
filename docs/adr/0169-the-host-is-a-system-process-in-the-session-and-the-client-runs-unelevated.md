@@ -265,8 +265,17 @@ effect of the client starting.
 - The consent prompt is a plain system dialog, not the Braun window
   (ADR 0168), because nothing that only looks like it is safe in that place.
 - Changing the access policy takes a UAC prompt at the moment of the change.
-- The ADR 0114 injector worker and `OP_INJECT_DESKTOP` lose their caller once
-  the client stops hosting. They are removed in the last pack, not before.
+- The ADR 0114 injector worker and `OP_INJECT_DESKTOP` lose their caller in a
+  release build, where the client never hosts and the session host injects
+  itself. They are kept (pack 10): a development host — a debug build, or
+  `LUMEPEER_KEYSTORE=file`, started elevated, the way `e2e/matrix` runs on
+  `beta` — still hosts in process and reaches the helper through them, and
+  the `VMware` and elevated-window cases are tested there.
+- A person who never opened Lumepeer gets their identity from the session
+  host, minted when their client first attaches (decision 1), with "accept
+  connections after sign-in" on, as "start with Windows" was by default
+  (ADR 0103). Nobody else can mint it: the `asInvoker` client cannot write
+  the admin-only directory.
 
 ## Not done
 

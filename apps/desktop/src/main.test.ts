@@ -285,6 +285,23 @@ describe('media warning (gap-tasks/05)', () => {
     expect(notice?.textContent?.trim()).toBe(t('en', 'status.hostedByService'));
   });
 
+  it('says the machine cannot be reached and offers to start the service when its host is silent (ADR 0169 §2)', async () => {
+    RESPONSES.network_status = {
+      ready: true,
+      can_capture: true,
+      can_encode: true,
+      capture_unavailable_reason: null,
+      hosted_by_service: true,
+      host_unreachable: true,
+    };
+    await boot();
+    expect(app().querySelector('[data-testid="hosted-notice"]')).toBeNull();
+    const notice = app().querySelector('[data-testid="host-unreachable"]');
+    expect(notice?.textContent).toContain(t('en', 'status.unreachable'));
+    app().querySelector<HTMLButtonElement>('[data-testid="service-start"]')?.click();
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('service_start'));
+  });
+
   it('says nothing about the service while this window is the host', async () => {
     await boot();
     expect(app().querySelector('[data-testid="hosted-notice"]')).toBeNull();

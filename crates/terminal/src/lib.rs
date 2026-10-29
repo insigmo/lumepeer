@@ -14,13 +14,14 @@
 //! `lumepeer-service`). `GetShellWindow`/`DuplicateTokenEx`/
 //! `CreateProcessWithTokenW` and the `openpty` pair have no safe bindings, so
 //! they live here. It also means `cargo test -p lumepeer-terminal` runs
-//! without the Tauri build script, the `requireAdministrator` manifest or the
-//! sidecar binaries in the way.
+//! without the Tauri build script, its manifest or the sidecar binaries in the
+//! way.
 //!
 //! ## The one invariant
 //!
 //! **The shell gets the desktop user's privileges, never this process's.**
-//! On Windows the client runs elevated (ADR 0057), so the drop is explicit:
+//! On Windows the host is `LocalSystem` (the session host, ADR 0169) or a
+//! development client that may run elevated, so the drop is explicit:
 //! the token comes from the process behind `GetShellWindow()`, which is
 //! Explorer running unelevated as the person at the machine, and the shell is
 //! started on the far side of it by `crates/terminal-worker` — because the one

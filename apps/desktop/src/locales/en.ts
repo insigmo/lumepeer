@@ -182,6 +182,10 @@ export const en: Dictionary = {
     'This device has no video encoder, so anyone you invite will see nothing. Sessions still connect, and input still works.',
   'status.hostedByService':
     'This device is hosted by the Lumepeer service, not by this window. You can still connect to other devices from here.',
+  'status.unreachable':
+    'This computer can\'t be reached for connections right now: the Lumepeer service is not running.',
+  'status.startService':
+    'Start the service',
   'consent.answerInSystemWindow': (peer) => `${peer} wants to connect. Answer in the Lumepeer system window.`,
   'status.askHost.control': 'Give control… (asks in a system window)',
   'status.askHost.secureDesktopInput': 'Allow administrator prompts… (asks in a system window)',
@@ -482,6 +486,16 @@ export const en: Dictionary = {
     'This device is hosted by the Lumepeer service. Its access settings can be read here; changing them asks for administrator rights.',
   'unattended.openAccessSettings':
     'Change access settings',
+  'unattended.acceptAfterSignIn.label':
+    'Accept connections after sign-in',
+  'unattended.acceptAfterSignIn.note':
+    'From the moment you sign in, guests can reach this device even with the Lumepeer window closed. Without the device password they still wait for your answer.',
+  'unattended.acceptAfterSignIn.on':
+    'Guests can reach this device from sign-in on, even with this window closed.',
+  'unattended.acceptAfterSignIn.off':
+    'Guests can reach this device only while this window is open.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Accept only while this window is open',
   'access.heading':
     'Access settings',
   'access.explain':

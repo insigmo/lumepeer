@@ -83,6 +83,14 @@ let chromeosContainer = false;
 // service's session host is (ADR 0169). False until `network_status` says
 // so, which is also what an older backend that never says it reads as.
 let hostedByService = false;
+// Whether that session host has stopped answering this window (ADR 0169 §2):
+// nobody can connect to this machine until the service runs again. False
+// until `network_status` says so, like `hostedByService`.
+let hostUnreachable = false;
+// Whether "Start the service" is waiting on its UAC prompt, and what it said
+// if it was refused.
+let startingService = false;
+let startServiceError: string | undefined;
 // When each peer last synced a clipboard, by pseudonymized label. Only the
 // timestamp is kept: `clipboard_pull` hands back the text, and this is where
 // that text stops — nothing renders it and nothing stores it (§15).
@@ -146,9 +154,50 @@ function hostedNotice(): TemplateResult | typeof nothing {
   if (!hostedByService) {
     return nothing;
   }
+  if (hostUnreachable) {
+    return unreachableNotice();
+  }
   return html`<p class="hosted-notice" role="status" data-testid="hosted-notice">
     ${t(locale, 'status.hostedByService')}
   </p>`;
+}
+
+/**
+ * The service's session host does not answer (ADR 0169 §2): this window never
+ * hosts in its place, so it says the machine cannot be reached and offers the
+ * one fix, starting the service — one UAC prompt.
+ */
+function unreachableNotice(): TemplateResult {
+  return html`<div class="host-unreachable" role="alert" data-testid="host-unreachable">
+    <p>${t(locale, 'status.unreachable')}</p>
+    <button
+      type="button"
+      class="host-unreachable-start"
+      data-testid="service-start"
+      ?disabled=${startingService}
+      @click=${() => void startService()}
+    >
+      ${t(locale, 'status.startService')}
+    </button>
+    ${startServiceError
+      ? html`<p class="host-unreachable-error" data-testid="service-start-error">${startServiceError}</p>`
+      : nothing}
+  </div>`;
+}
+
+async function startService(): Promise<void> {
+  startingService = true;
+  startServiceError = undefined;
+  renderNow();
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('service_start');
+  } catch (error) {
+    startServiceError = (error as { message?: string }).message ?? String(error);
+  } finally {
+    startingService = false;
+  }
+  await refresh();
 }
 
 function mediaWarning(): TemplateResult | typeof nothing {
@@ -428,6 +477,7 @@ async function refresh(): Promise<void> {
           can_encode: boolean;
           capture_unavailable_reason: 'chromeos-container' | null;
           hosted_by_service?: boolean;
+          host_unreachable?: boolean;
         }>('network_status'),
         invoke<{
           phase: ConnectPhase;
@@ -481,6 +531,7 @@ async function refresh(): Promise<void> {
     canEncode = networkResult.can_encode;
     chromeosContainer = networkResult.capture_unavailable_reason === 'chromeos-container';
     hostedByService = networkResult.hosted_by_service === true;
+    hostUnreachable = networkResult.host_unreachable === true;
     // The peer the drawer is open on ended its session: close rather than
     // leave a transcript poll spinning on a dead label (the poll itself stops
     // on the first IPC error, but this keeps the UI honest immediately).

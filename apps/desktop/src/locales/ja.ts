@@ -175,6 +175,10 @@ export const ja: Dictionary = {
     'このデバイスにはビデオエンコーダーがないため、招待した相手には何も見えません。セッション自体は接続され、入力も引き続き機能します。',
   'status.hostedByService':
     'このデバイスはこのウィンドウではなく Lumepeer サービスがホストしています。ここから他のデバイスへの接続は引き続き行えます。',
+  'status.unreachable':
+    '現在このコンピューターには接続できません。Lumepeer サービスが実行されていません。',
+  'status.startService':
+    'サービスを開始',
   'consent.answerInSystemWindow': (peer) => `${peer} が接続を求めています。Lumepeer のシステムウィンドウで応答してください。`,
   'status.askHost.control': '操作を許可…（システムウィンドウで確認）',
   'status.askHost.secureDesktopInput': '管理者の確認への応答を許可…（システムウィンドウで確認）',
@@ -448,6 +452,16 @@ export const ja: Dictionary = {
     'このデバイスは Lumepeer サービスがホストしています。アクセス設定はここで確認できます。変更するには管理者権限が必要です。',
   'unattended.openAccessSettings':
     'アクセス設定を変更',
+  'unattended.acceptAfterSignIn.label':
+    'サインイン後に接続を受け付ける',
+  'unattended.acceptAfterSignIn.note':
+    'サインインした時点から、Lumepeer のウィンドウを閉じていてもゲストはこのデバイスに接続できます。デバイスのパスワードがなければ、ゲストはあなたの応答を待ちます。',
+  'unattended.acceptAfterSignIn.on':
+    'サインイン後は、このウィンドウを閉じていてもゲストがこのデバイスに接続できます。',
+  'unattended.acceptAfterSignIn.off':
+    'ゲストがこのデバイスに接続できるのは、このウィンドウが開いている間だけです。',
+  'unattended.acceptAfterSignIn.turnOff':
+    'このウィンドウが開いている間だけ受け付ける',
   'access.heading':
     'アクセス設定',
   'access.explain':

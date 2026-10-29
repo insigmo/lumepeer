@@ -176,6 +176,10 @@ export const de: Dictionary = {
     'Dieses Gerät hat keinen Video-Encoder, daher sehen eingeladene Personen nichts. Sitzungen verbinden sich trotzdem, und die Eingabe funktioniert weiterhin.',
   'status.hostedByService':
     'Dieses Gerät wird vom Lumepeer-Dienst bereitgestellt, nicht von diesem Fenster. Mit anderen Geräten können Sie sich von hier aus weiterhin verbinden.',
+  'status.unreachable':
+    'Dieser Computer ist gerade nicht erreichbar: Der Lumepeer-Dienst läuft nicht.',
+  'status.startService':
+    'Dienst starten',
   'consent.answerInSystemWindow': (peer) => `${peer} möchte sich verbinden. Antworten Sie im Lumepeer-Systemfenster.`,
   'status.askHost.control': 'Steuerung geben… (fragt in einem Systemfenster)',
   'status.askHost.secureDesktopInput': 'Administratorabfragen erlauben… (fragt in einem Systemfenster)',
@@ -454,6 +458,16 @@ export const de: Dictionary = {
     'Dieses Gerät wird vom Lumepeer-Dienst bereitgestellt. Die Zugriffseinstellungen sind hier lesbar; zum Ändern sind Administratorrechte nötig.',
   'unattended.openAccessSettings':
     'Zugriffseinstellungen ändern',
+  'unattended.acceptAfterSignIn.label':
+    'Verbindungen nach der Anmeldung annehmen',
+  'unattended.acceptAfterSignIn.note':
+    'Ab der Anmeldung erreichen Gäste dieses Gerät auch bei geschlossenem Lumepeer-Fenster. Ohne das Gerätepasswort warten sie trotzdem auf Ihre Antwort.',
+  'unattended.acceptAfterSignIn.on':
+    'Gäste erreichen dieses Gerät ab der Anmeldung, auch wenn dieses Fenster geschlossen ist.',
+  'unattended.acceptAfterSignIn.off':
+    'Gäste erreichen dieses Gerät nur, solange dieses Fenster geöffnet ist.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Nur bei geöffnetem Fenster annehmen',
   'access.heading':
     'Zugriffseinstellungen',
   'access.explain':

@@ -387,27 +387,6 @@ fn is_trusted_file(path: &Path) -> bool {
     })
 }
 
-/// Name of the file under the root whose presence turns the session host of
-/// ADR 0169 on, until pack 09 turns it on for everybody. It holds nothing.
-const SESSION_HOST_ENABLED_FILE: &str = "session-host-enabled";
-
-/// Whether this machine is hosted by the session host of ADR 0169 rather than
-/// by the elevated client.
-///
-/// Only a file `LocalSystem` or administrators own counts — the rule
-/// [`logon_host_owner`] keeps, for the same reason: it decides which process
-/// admits guests to this machine. One somebody else left is ignored rather
-/// than removed, so a process with no rights asks the same question safely.
-#[must_use]
-pub fn session_host_enabled() -> bool {
-    session_host_enabled_in(&root())
-}
-
-/// [`session_host_enabled`], under the tree rooted at `root`.
-fn session_host_enabled_in(root: &Path) -> bool {
-    is_trusted_file(&root.join(SESSION_HOST_ENABLED_FILE))
-}
-
 /// Name of the file in an account's own directory that says the session host
 /// accepts connections after sign-in even with no client open (ADR 0169 §1,
 /// §9). Its presence is the whole answer.
@@ -878,39 +857,6 @@ mod tests {
         assert!(set_logon_host_owner_in(&base, Some(sid)));
         assert!(set_logon_host_owner_in(&base, None));
         assert_eq!(logon_host_owner_in(&base), None);
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// ADR 0169: the session host is on only while a file administrators own
-    /// says so. One an ordinary user wrote is not believed, and a reader
-    /// leaves it where it is. Runs both ways: unelevated, the file this test
-    /// writes is the ordinary user's.
-    #[test]
-    fn the_session_host_marker_counts_only_when_administrators_wrote_it() {
-        let base = std::env::temp_dir().join(format!(
-            "lumepeer-program-data-session-host-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        assert!(!session_host_enabled_in(&base), "off until written");
-
-        let marker = base.join(SESSION_HOST_ENABLED_FILE);
-        std::fs::write(&marker, b"").unwrap();
-        let elevated = this_process().is_some_and(|(_, elevated)| elevated);
-        assert_eq!(
-            session_host_enabled_in(&base),
-            elevated,
-            "an elevated run writes an administrators' file, an unelevated one its own"
-        );
-        if elevated {
-            assert!(give_to_this_user(&marker));
-            assert!(
-                !session_host_enabled_in(&base),
-                "a file an ordinary user owns does not turn the session host on"
-            );
-        }
-        assert!(marker.exists(), "asking removes nothing");
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -23,6 +23,7 @@ const COMMANDS: &[&str] = &[
     "unattended_set_totp",
     "unattended_set_role",
     "unattended_set_logon_screen",
+    "unattended_set_accept_after_sign_in",
     "unattended_submit",
     "connection_history",
     "history_connect",
@@ -112,24 +113,28 @@ const COMMANDS: &[&str] = &[
     // The shield button: this binary again, elevated, as the access-settings
     // window (ADR 0169 §5).
     "access_settings_open",
+    // "Start the service" where its session host does not answer (ADR 0169
+    // §2): the service binary elevated, one prompt.
+    "service_start",
 ];
 
 /// The Windows application manifest, replacing tauri-build's default.
 ///
 /// Two changes from the default, and only two:
 ///
-/// - `requestedExecutionLevel level="requireAdministrator"`. Lumepeer injects
-///   input with `SendInput`, and UIPI silently drops input a medium-integrity
-///   process aims at a higher-integrity window — every window an elevated app
-///   owns (`services.msc`, `regedit`, Task Manager, an installer's own UI).
-///   Running the client at high integrity is what lets a guest drive those.
-///   It does **not** reach the secure desktop (the UAC prompt itself, the lock
-///   screen): `Winsta0\Winlogon` is a different desktop object that no amount
-///   of elevation puts this process's thread onto — that half goes through the
-///   `LocalSystem` helper (ADR 0043, ADR 0049, ADR 0056). See ADR 0057 for why
-///   always-elevated was chosen over relaunch-on-demand and what it costs (a
-///   UAC prompt at every launch; no drag-and-drop from a non-elevated
-///   Explorer).
+/// - `requestedExecutionLevel level="asInvoker"` (ADR 0169). The client starts
+///   with whatever token the person has, no UAC prompt, and on a standard
+///   account too, and drag-and-drop from Explorer reaches it. It needs nothing
+///   more, because on Windows a release client never hosts: this machine's
+///   host is this same binary run by the helper service as
+///   `--session-host`, a `LocalSystem` process on the person's desktop. That
+///   process is what drives elevated windows and a `VMware` guest, keeps the
+///   access policy where only administrators can write it, and asks the
+///   helper for the secure desktop. Administrator rights are spent once on
+///   installing the service, and again only when the access policy changes
+///   (this binary elevated as `--access-settings`, one prompt). ADR 0057 shipped
+///   `requireAdministrator` instead, at the cost of a prompt at every launch;
+///   ADR 0169 §2 says why that is gone.
 /// - Nothing else. The `Microsoft.Windows.Common-Controls` v6 dependency is
 ///   carried over verbatim from tauri-build's own default manifest, because
 ///   dropping it breaks tauri's dialog APIs (tauri-build's docs warn of this)
@@ -144,7 +149,7 @@ const APP_MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="y
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

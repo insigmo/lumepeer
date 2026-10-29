@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-15
+Amended by: ADR 0169 (§1: on the signed-in console the host is the `LocalSystem` session host, which draws its own consent dialog)
 
 Answers the half of `docs/tasks/14-release-infrastructure.md` task 4 that
 [ADR 0043](0043-one-privileged-helper-with-one-capability.md) explicitly did

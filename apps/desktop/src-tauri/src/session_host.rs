@@ -59,10 +59,17 @@
 //! restarting, starts the installer and leaves with
 //! [`SESSION_HOST_EXIT_UPDATING`].
 //!
-//! It refuses — [`SESSION_HOST_EXIT_NOT_ENABLED`] — until an administrator has
-//! turned ADR 0169 on for this machine, and — [`SESSION_HOST_EXIT_NO_STORE`]
-//! — for a person whose store holds no identity: they never opened Lumepeer,
-//! and a new identity would be a host no guest has saved.
+//! A person who never opened Lumepeer has no identity in their store, and it
+//! is minted only when their client first attaches (ADR 0169 §1): until then
+//! this host stays closed, and a machine nobody set up answers as nothing.
+//! The first identity comes with "accept connections after sign-in" on, the
+//! default "start with Windows" had for the elevated client (ADR 0103). It
+//! refuses — [`SESSION_HOST_EXIT_NO_STORE`] — only for a person whose store
+//! it cannot open or read.
+//!
+//! At start it also retires the person's ADR 0140 logon task, which would
+//! start the client elevated, into their `Run` entry
+//! ([`crate::autostart::retire_logon_task`], ADR 0169 §9).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -79,8 +86,8 @@ use lumepeer_service::access_settings::PolicyChanges;
 use lumepeer_service::host_role::ReleaseRequests;
 use lumepeer_service::person_token::SignedInPerson;
 use lumepeer_service::{
-    SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_NOT_ENABLED,
-    SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
+    SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE, SESSION_HOST_EXIT_ROLE_TAKEN,
+    SESSION_HOST_EXIT_UPDATING,
 };
 use lumepeer_terminal::{Shell, ShellError, ShellSize};
 
@@ -113,12 +120,6 @@ fn host() -> u32 {
     if !system_host::is_local_system() {
         return EXIT_FAILED;
     }
-    if !lumepeer_service::program_data::session_host_enabled() {
-        tracing::info!(
-            "the session host is not turned on for this machine; the client hosts as before"
-        );
-        return SESSION_HOST_EXIT_NOT_ENABLED;
-    }
     let Some(session) = lumepeer_service::agent_launch::current_session() else {
         tracing::warn!("cannot tell which session this is; not hosting");
         return EXIT_FAILED;
@@ -134,11 +135,25 @@ fn host() -> u32 {
         tracing::warn!("the signed-in person has no store this host can open");
         return SESSION_HOST_EXIT_NO_STORE;
     };
-    if !matches!(placement.keystore.load_secret(IDENTITY_ENTRY), Ok(Some(_))) {
-        tracing::info!(
-            "the signed-in person has never opened Lumepeer: there is no identity any guest saved"
-        );
-        return SESSION_HOST_EXIT_NO_STORE;
+    let minting = match placement.keystore.load_secret(IDENTITY_ENTRY) {
+        Ok(Some(_)) => false,
+        Ok(None) => {
+            tracing::info!(
+                "the signed-in person has never opened Lumepeer: their identity is minted when \
+                 their client first attaches"
+            );
+            true
+        }
+        // Unreadable is not absent: minting over it would make this a host no
+        // guest has saved.
+        Err(error) => {
+            tracing::warn!(%error, "cannot read the signed-in person's identity; not hosting");
+            return SESSION_HOST_EXIT_NO_STORE;
+        }
+    };
+    if let Some(user) = lumepeer_service::agent_launch::user_name(session) {
+        let sid = sid.clone();
+        std::thread::spawn(move || crate::autostart::retire_logon_task(&user, &sid));
     }
 
     // The request event first, so a sign-out that lands while this is still
@@ -155,6 +170,7 @@ fn host() -> u32 {
     let person = SignedInPerson::new(session, sid.clone());
     served.act_for(person.clone());
     served.keeps_guest_stores(guest_stores);
+    served.keeps_settings_in(directory.clone());
     if let Some(channel) = lumepeer_service::host_channel::HostChannel::new(&sid) {
         crate::host_panel::serve(channel, &served);
     } else {
@@ -179,7 +195,10 @@ fn host() -> u32 {
     });
     let code = runtime.block_on(serve(
         placement,
-        &directory,
+        Store {
+            directory: &directory,
+            minting,
+        },
         &served,
         releases.as_ref(),
         session,
@@ -190,17 +209,24 @@ fn host() -> u32 {
     code
 }
 
+/// The person's directory, and whether their identity is minted by this run.
+struct Store<'a> {
+    directory: &'a Path,
+    minting: bool,
+}
+
 /// Waits closed until somebody wants this host listening, then hosts until
 /// asked to leave or nobody does any more.
 async fn serve(
     placement: Placement,
-    directory: &Path,
+    store: Store<'_>,
     served: &Arc<Served>,
     releases: Option<&ReleaseRequests>,
     session: u32,
     policy_changes: Option<&PolicyChanges>,
     person: SignedInPerson,
 ) -> u32 {
+    let directory = store.directory;
     let wanted = || {
         lumepeer_service::program_data::accept_after_sign_in(directory)
             || served.somebody_wants_hosting()
@@ -240,6 +266,16 @@ async fn serve(
     else {
         return EXIT_FAILED;
     };
+    // Opening minted the identity. On by default, as "start with Windows"
+    // was for the elevated client (ADR 0103, ADR 0169 §9); turning it off is
+    // the person's, from their client.
+    if store.minting {
+        let on = lumepeer_service::program_data::set_accept_after_sign_in(directory, true);
+        tracing::info!(
+            on,
+            "a first identity for this person; accepting connections after sign-in"
+        );
+    }
     served.opened(handle.clone());
     let consents = Arc::new(Consents::new(
         handle.clone(),

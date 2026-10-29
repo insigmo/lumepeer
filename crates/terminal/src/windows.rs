@@ -3,8 +3,12 @@
 //!
 //! ## Why the console is not in this process
 //!
-//! It was, and it could not work. ADR 0057 ships this client with
-//! `requireAdministrator`, and an elevated administrator token may not call
+//! It was, and it could not work. ADR 0057 shipped the client with
+//! `requireAdministrator`. Since ADR 0169 the client is `asInvoker` and the
+//! shells of a release host are the `LocalSystem` session host's, which
+//! starts the worker with the person's own token (`Shell::spawn_as_user`);
+//! what is left on this path is a development client, elevated or not. And
+//! an elevated administrator token may not call
 //! `CreateProcessAsUserW`: it has `SE_INCREASE_QUOTA_NAME` disabled and does
 //! not contain `SE_ASSIGNPRIMARYTOKEN_NAME` at all, so the call comes back
 //! `ERROR_PRIVILEGE_NOT_HELD` and no shell is started. Enabling the privilege

@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-25
+Amended by: ADR 0169 (the session host injects in-process from the same `LocalSystem` position; a release client no longer hosts)
 
 Answers `docs/bugs/17-remote-hotkeys.md`'s remaining half: a guest can drive an
 ordinary window on the host, but not a **`VMware` guest** running on it. Ctrl+V

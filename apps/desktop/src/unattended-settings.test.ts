@@ -184,6 +184,27 @@ describe('unattended settings', () => {
     );
   });
 
+  it('offers accepting connections after sign-in only where a session host reads it (ADR 0169 §9)', async () => {
+    render(unattendedSettings(off, 'en'), container);
+    expect(container.querySelector('[data-testid="unattended-accept-after-sign-in"]')).toBeNull();
+
+    render(unattendedSettings({ ...off, accept_after_sign_in: false }, 'en'), container);
+    const toggle = container.querySelector<HTMLInputElement>(
+      '[data-testid="unattended-accept-after-sign-in"]',
+    );
+    expect(toggle?.checked).toBe(false);
+    expect(toggle?.disabled, 'needs no device password').toBe(false);
+    if (toggle) {
+      toggle.checked = true;
+      toggle.dispatchEvent(new Event('change'));
+    }
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('unattended_set_accept_after_sign_in', {
+        args: { enabled: true },
+      }),
+    );
+  });
+
   it('the password field is a password field, and never renders a value', () => {
     render(unattendedSettings(on, 'en'), container);
     const field = passwordField();
@@ -242,6 +263,26 @@ describe('unattended settings kept by the service', () => {
     container.querySelector<HTMLButtonElement>('.unattended-disable')?.click();
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith('unattended_disable'));
     confirm.mockRestore();
+  });
+
+  it('turns accepting after sign-in off, and never on (ADR 0169 §4, §9)', async () => {
+    render(unattendedSettings({ ...managed, accept_after_sign_in: true }, 'en'), container);
+    expect(container.querySelector('[data-testid="unattended-accept-after-sign-in"]')).toBeNull();
+    expect(container.querySelector('[data-testid="accept-after-sign-in-state"]')?.textContent?.trim()).toBe(
+      t('en', 'unattended.acceptAfterSignIn.on'),
+    );
+    container.querySelector<HTMLButtonElement>('[data-testid="accept-after-sign-in-off"]')?.click();
+    await vi.waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith('unattended_set_accept_after_sign_in', {
+        args: { enabled: false },
+      }),
+    );
+
+    render(unattendedSettings({ ...managed, accept_after_sign_in: false }, 'en'), container);
+    expect(container.querySelector('[data-testid="accept-after-sign-in-off"]')).toBeNull();
+    expect(container.querySelector('[data-testid="accept-after-sign-in-state"]')?.textContent?.trim()).toBe(
+      t('en', 'unattended.acceptAfterSignIn.off'),
+    );
   });
 
   it('says a declined prompt rather than nothing', async () => {

@@ -402,12 +402,12 @@ fn open(args: &[String]) -> Result<AccessSettings, i32> {
         );
         return Err(3);
     }
-    // Without ADR 0169 the elevated client hosts and holds this policy in its
+    // A development build hosts in its own window and holds this policy in its
     // own actor, which would not hear a change made here: it is edited there.
-    if !lumepeer_service::program_data::session_host_enabled() {
+    if !crate::placement::session_host_guest() {
         tracing::error!(
-            "this machine is not hosted by the Lumepeer service; its access settings are in the \
-             client"
+            "this build hosts in the client, not in the Lumepeer service; its access settings \
+             are in the client"
         );
         return Err(4);
     }

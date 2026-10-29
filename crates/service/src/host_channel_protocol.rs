@@ -5,7 +5,8 @@
 //! this channel (`host_channel.rs`). So the rule is about what the channel can
 //! say, not who says it: the client **reads** the host's state and **narrows**
 //! it — ends a session, turns a grant off, refuses a request, turns hosting
-//! off, turns unattended access off, chats — and nothing on this wire admits a guest, raises a grant, turns
+//! off, turns unattended access off, stops accepting connections after
+//! sign-in, chats — and nothing on this wire admits a guest, raises a grant, turns
 //! `secure_desktop_input` on, trusts a device or changes the device password.
 //! Those are not refused here; they cannot be written down (ADR 0043).
 //! One read is of the person's own data rather than the host's state: the
@@ -108,6 +109,8 @@ pub const MAX_RECORDING_NAME_BYTES: usize = 128;
 const KIND_GUEST_STORES: u8 = 0x04;
 /// Kind byte of [`Request::GuestStoresTaken`].
 const KIND_GUEST_STORES_TAKEN: u8 = 0x16;
+/// Kind byte of [`Request::AcceptAfterSignInOff`] (pack 09).
+const KIND_ACCEPT_AFTER_SIGN_IN_OFF: u8 = 0x17;
 
 /// Kind byte of [`Request::InstallUpdate`].
 const KIND_INSTALL_UPDATE: u8 = 0x40;
@@ -212,6 +215,10 @@ pub enum Request {
     /// `--access-settings` window; there is no request here that turns it on
     /// or sets a password.
     UnattendedOff,
+    /// Stop accepting connections from sign-in on: from now the host listens
+    /// only while a client of the person's is attached (ADR 0169 §9). There
+    /// is no "on" here; that is the elevated `--access-settings` window's.
+    AcceptAfterSignInOff,
     /// Put the session host's own dialog in front of the person at this
     /// machine, asking whether `peer`'s session may have `widening`
     /// (pack 04, ADR 0169 §5).
@@ -308,6 +315,7 @@ impl Request {
             | Self::RefusePending { .. }
             | Self::HostingOff
             | Self::UnattendedOff
+            | Self::AcceptAfterSignInOff
             | Self::GuestStoresTaken => Effect::Narrows,
             Self::SendChat { .. } => Effect::Says,
             Self::AskToWiden { .. } => Effect::Asks,
@@ -431,6 +439,7 @@ fn encode_request(request: &Request) -> (u8, Vec<u8>) {
             (KIND_ASK_TO_WIDEN, payload)
         }
         Request::UnattendedOff => (KIND_UNATTENDED_OFF, Vec::new()),
+        Request::AcceptAfterSignInOff => (KIND_ACCEPT_AFTER_SIGN_IN_OFF, Vec::new()),
         Request::Recordings => (KIND_RECORDINGS, Vec::new()),
         Request::ExportRecording { name } => (KIND_EXPORT_RECORDING, name.as_bytes().to_vec()),
         Request::GuestStores => (KIND_GUEST_STORES, Vec::new()),
@@ -476,6 +485,9 @@ fn decode_request(kind: u8, payload: &[u8]) -> Option<Request> {
             label(peer).map(|peer| Request::AskToWiden { peer, widening })
         }
         KIND_UNATTENDED_OFF => payload.is_empty().then_some(Request::UnattendedOff),
+        KIND_ACCEPT_AFTER_SIGN_IN_OFF => {
+            payload.is_empty().then_some(Request::AcceptAfterSignInOff)
+        }
         KIND_RECORDINGS => payload.is_empty().then_some(Request::Recordings),
         KIND_EXPORT_RECORDING => {
             recording_name(payload).map(|name| Request::ExportRecording { name })
@@ -553,6 +565,7 @@ mod tests {
                 widening: Widening::TrustDevice,
             },
             Request::UnattendedOff,
+            Request::AcceptAfterSignInOff,
             Request::Recordings,
             Request::ExportRecording {
                 name: "session-1-ab12.lmrc".to_owned(),

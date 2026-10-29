@@ -81,11 +81,18 @@ pub fn state() -> ServiceState {
 /// covers what the installer cannot — a development run, an installation that
 /// could not finish its hook, and a service somebody stopped by hand.
 ///
-/// Nothing is prompted for: the client already runs elevated (ADR 0057), so
-/// the elevation this needs is the one it was launched with. Blocking, and a
-/// failure is logged rather than raised — a missing service degrades
-/// Ctrl+Alt+Del, not the app (§18).
+/// Nothing is prompted for. Only a run that is elevated already — a
+/// development client started elevated — repairs the service here, with the
+/// elevation it was launched with. The release client is `asInvoker`
+/// (ADR 0169 §2), and asking for administrator rights at every start on a
+/// machine without the service would be the prompt ADR 0169 took away; it
+/// says this machine cannot be reached instead and offers [`start`]. Blocking,
+/// and a failure is logged rather than raised (§18).
 pub fn ensure_installed() {
+    #[cfg(target_os = "windows")]
+    if !lumepeer_service::program_data::this_process().is_some_and(|(_, elevated)| elevated) {
+        return;
+    }
     match state() {
         // Nothing on this machine for a helper to hold.
         ServiceState::Unsupported => {}
@@ -99,6 +106,25 @@ pub fn ensure_installed() {
                 Err(error) => tracing::warn!(%error, "cannot register the helper service"),
             }
         }
+    }
+}
+
+/// Registers and starts the helper service, asking Windows for administrator
+/// rights to do it: one UAC prompt, at the person's click. The fix the window
+/// offers where its session host does not answer (ADR 0169 §2) — nobody can
+/// reach this machine until the service runs. Blocking.
+///
+/// # Errors
+/// What went wrong, in words the window can show: most often that the prompt
+/// was closed.
+pub fn start() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_impl::elevate("--install")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("there is no Lumepeer service on this platform".to_owned())
     }
 }
 

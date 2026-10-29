@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unattended-set-accept-after-sign-in"
+description = "Enables the unattended_set_accept_after_sign_in command without any pre-configured scope."
+commands.allow = ["unattended_set_accept_after_sign_in"]
+
+[[permission]]
+identifier = "deny-unattended-set-accept-after-sign-in"
+description = "Denies the unattended_set_accept_after_sign_in command without any pre-configured scope."
+commands.deny = ["unattended_set_accept_after_sign_in"]

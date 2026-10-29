@@ -175,6 +175,10 @@ export const ar: Dictionary = {
     'لا يوجد في هذا الجهاز مُرمِّز فيديو، لذلك لن يرى من تدعوه أي صورة. تظل الجلسات تتصل ويظل الإدخال يعمل.',
   'status.hostedByService':
     'تستضيف خدمة Lumepeer هذا الجهاز، وليس هذه النافذة. لا يزال بإمكانك الاتصال بأجهزة أخرى من هنا.',
+  'status.unreachable':
+    'لا يمكن الاتصال بهذا الكمبيوتر الآن: خدمة Lumepeer لا تعمل.',
+  'status.startService':
+    'تشغيل الخدمة',
   'consent.answerInSystemWindow': (peer) => `${peer} يريد الاتصال. أجب في نافذة نظام Lumepeer.`,
   'status.askHost.control': 'منح التحكم… (يسأل في نافذة النظام)',
   'status.askHost.secureDesktopInput': 'السماح بمطالبات المسؤول… (يسأل في نافذة النظام)',
@@ -448,6 +452,16 @@ export const ar: Dictionary = {
     'تستضيف خدمة Lumepeer هذا الجهاز. يمكن قراءة إعدادات الوصول هنا؛ ويتطلب تغييرها صلاحيات المسؤول.',
   'unattended.openAccessSettings':
     'تغيير إعدادات الوصول',
+  'unattended.acceptAfterSignIn.label':
+    'قبول الاتصالات بعد تسجيل الدخول',
+  'unattended.acceptAfterSignIn.note':
+    'منذ لحظة تسجيل الدخول يمكن للضيوف الوصول إلى هذا الجهاز حتى مع إغلاق نافذة Lumepeer. ومن دون كلمة مرور الجهاز ينتظرون ردك.',
+  'unattended.acceptAfterSignIn.on':
+    'يمكن للضيوف الوصول إلى هذا الجهاز منذ تسجيل الدخول، حتى مع إغلاق هذه النافذة.',
+  'unattended.acceptAfterSignIn.off':
+    'يمكن للضيوف الوصول إلى هذا الجهاز فقط عندما تكون هذه النافذة مفتوحة.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'القبول فقط عندما تكون هذه النافذة مفتوحة',
   'access.heading':
     'إعدادات الوصول',
   'access.explain':

@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-10-20
+Amended by: ADR 0169 (§1: after sign-in the session host serves the guest; the client is started with the person's limited token, as its interface only)
 
 Amends [ADR 0126](0126-the-logon-screen-is-hosted-by-the-same-host.md) §5 and
 closes its "A seamless sign-in" and "Starting the client after sign-in" gaps

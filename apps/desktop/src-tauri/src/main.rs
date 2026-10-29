@@ -180,8 +180,8 @@ fn claim_host_role() -> (Option<HostRoleGuard>, bool) {
             }
             HostRoleClaim::Unavailable => {
                 tracing::info!(
-                    "cannot read this machine's host role; hosting as usual (a shipped client \
-                     runs elevated and does not land here)"
+                    "cannot read this machine's host role; hosting as usual (a development run: \
+                     a shipped client is the session host's guest and does not land here)"
                 );
                 (None, true)
             }
@@ -651,6 +651,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::unattended_set_totp,
         commands::unattended_set_role,
         commands::unattended_set_logon_screen,
+        commands::unattended_set_accept_after_sign_in,
         commands::unattended_submit,
         commands::connection_history,
         commands::history_connect,
@@ -738,6 +739,7 @@ fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool {
         commands::host_bar_focus_main,
         commands::host_bar_open_chat,
         commands::access_settings_open,
+        commands::service_start,
     ]
 }
 

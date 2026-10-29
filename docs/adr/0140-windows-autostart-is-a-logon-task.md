@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-10-02
+Amended by: ADR 0169 (§9: the `asInvoker` client's tray is a `Run` entry again, and the logon task is removed)
 
 Corrects the Windows half of ADR 0042 (autostart, cited in
 `apps/desktop/src-tauri/src/autostart.rs`) and

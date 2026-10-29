@@ -36,7 +36,7 @@ TeamViewer и AnyDesk на `v0.0.61`).
 | 14 | Wake-on-LAN | S | адресная книга | `address_book`, `network.rs` |
 | 15 | Обнаружение хостов в локальной сети (mDNS) | M | — | `crates/net`, UI списка |
 | 16 | Прямое подключение по IP/имени, без тикета | M | решение по доверию ключа | `ticket.rs`, `invite-view.ts`, новый ADR |
-| 17 | Снять постоянный `requireAdministrator`, повышаться по требованию | M | 11 | `build.rs`, `service_control.rs`, ADR 0057 переписать |
+| ~~17~~ | ~~Снять постоянный `requireAdministrator`, повышаться по требованию~~ | M | 11 | **закрыт** ADR 0169: клиент `asInvoker`, хост — `--session-host` от `LocalSystem` в сессии пользователя (`docs/unelevated-client/`) |
 
 ## Возможности внутри сессии
 

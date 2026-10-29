@@ -940,6 +940,16 @@ pub const CHAT_MAX_BYTES: usize = 4_096;
 /// that a hidden session is a matter of seconds.
 pub const SESSION_INDICATOR_DEADLINE_SECS: u64 = 10;
 
+/// How long the client goes without an answer from the session host before it
+/// says this machine cannot be reached and offers to start the service
+/// (ADR 0169 §2).
+///
+/// Longer than the session host's own restart each time it closes its
+/// endpoint (one second, `session_host_launch::CLOSED_RELAUNCH`) plus the
+/// client's one-second poll, so that restart never shows; short enough that a
+/// stopped service is said within seconds of the window opening.
+pub const SESSION_HOST_UNREACHABLE_SECS: u64 = 5;
+
 /// How long the session host's own consent dialog waits for the person at
 /// the machine before it answers no (ADR 0169 §5; pack 04).
 ///

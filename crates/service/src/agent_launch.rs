@@ -149,6 +149,18 @@ pub fn current_session() -> Option<u32> {
 /// console answers `false`.
 #[must_use]
 pub fn anybody_signed_in(session: u32) -> Option<bool> {
+    session_user_name(session).map(|name| !name.is_empty())
+}
+
+/// The name of whoever is signed in at `session` — the `USERNAME` their own
+/// processes see; `None` when nobody is, or the kernel will not say.
+#[must_use]
+pub fn user_name(session: u32) -> Option<String> {
+    session_user_name(session).filter(|name| !name.is_empty())
+}
+
+/// `WTSUserName` of `session`: empty at a logon screen nobody is signed in to.
+fn session_user_name(session: u32) -> Option<String> {
     let mut buffer = PWSTR::null();
     let mut bytes = 0u32;
     // SAFETY: the local server handle, and two locals the call writes; the
@@ -170,7 +182,7 @@ pub fn anybody_signed_in(session: u32) -> Option<bool> {
     let name = unsafe { buffer.to_string() }.unwrap_or_default();
     // SAFETY: allocated by `WTSQuerySessionInformationW` and freed only here.
     unsafe { WTSFreeMemory(buffer.as_ptr().cast()) };
-    Some(!name.is_empty())
+    Some(name)
 }
 
 /// The string form of the SID of whoever is signed in at `session`.

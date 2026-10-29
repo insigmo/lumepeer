@@ -6,9 +6,9 @@
 //! identity, the device password and the address book of the account that
 //! turned the feature on — so a guest reaches the same saved host at the logon
 //! screen as after it. The moment somebody signs in, it is asked to give the
-//! host role up and stopped, and the ordinary client takes over — started
-//! here, when the logon host leaves with a guest still on it (ADR 0164) —
-//! or, where ADR 0169 is on, the session host does.
+//! host role up and stopped, and the session host takes over (ADR 0169) —
+//! with the person's client started here, when the logon host leaves with a
+//! guest still on it (ADR 0164).
 //!
 //! The service decides only *when*: somebody signed in or not. Whether the
 //! feature is on, and whose store to open, is the logon host's own question,
@@ -169,13 +169,13 @@ const fn stopped_with(code: Option<u32>, service_stopping: bool) -> Ended {
 }
 
 /// The guest on the logon host has just signed the console in and is dialing
-/// again: starts the client it is dialing for (ADR 0164).
+/// again: starts the client its dial needs (ADR 0164, ADR 0169).
 ///
-/// Where the session host serves the signed-in console (ADR 0169), the guest's
-/// dial is for the session host, which its own supervisor starts with the same
-/// identity — but closed until a client attaches. So the person's client is
-/// started here all the same, as their guest and panel, and its attaching is
-/// what opens the endpoint the guest is dialing.
+/// The guest's dial is for the session host, which its own supervisor starts
+/// with the same identity — but closed until a client attaches, unless the
+/// person accepts connections after sign-in. So the person's client is started
+/// here, as their guest and panel, and its attaching is what opens the
+/// endpoint the guest is dialing.
 fn hand_over_to_client() {
     let Some(session) =
         console_session().filter(|&session| anybody_signed_in(session) == Some(true))
@@ -183,14 +183,10 @@ fn hand_over_to_client() {
         tracing::info!("the logon host handed over, but nobody is signed in at the console now");
         return;
     };
-    if lumepeer_service::program_data::session_host_enabled() {
-        tracing::info!(
-            "the logon host handed over; starting the client the session host opens for (ADR 0169)"
-        );
-        let _ = lumepeer_service::client_launch::start_client(session);
-        return;
-    }
-    let _ = lumepeer_service::client_launch::start_owner_client(session);
+    tracing::info!(
+        "the logon host handed over; starting the client the session host opens for (ADR 0169)"
+    );
+    let _ = lumepeer_service::client_launch::start_client(session);
 }
 
 #[cfg(test)]

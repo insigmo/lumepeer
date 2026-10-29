@@ -2316,6 +2316,32 @@ input[type='checkbox'].switch:disabled {
   font-size: var(--fs-micro);
 }
 
+/* ...and it does not answer (ADR 0169 §2): nobody can reach this machine
+   until the service runs, so this one carries the accent and the fix. */
+.host-unreachable {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-micro);
+}
+
+.host-unreachable p {
+  flex: 1 1 16rem;
+  margin: 0;
+}
+
+.host-unreachable .host-unreachable-error {
+  flex-basis: 100%;
+  color: var(--text-2);
+}
+
 .recording-banner {
   display: flex;
   align-items: center;

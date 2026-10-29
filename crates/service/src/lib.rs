@@ -167,8 +167,9 @@ pub const LOGON_HOST_EXIT_ROLE_TAKEN: u32 = 4;
 /// (ADR 0164).
 ///
 /// That guest has just signed the machine in and is dialing again; the service
-/// reads this as "start the owner's client", so the dial has somebody to reach
-/// whether or not autostart is on.
+/// reads this as "start the signed-in person's client", whose attaching opens
+/// the session host's endpoint, so the dial has somebody to reach whether or
+/// not autostart is on (ADR 0169 §1).
 pub const LOGON_HOST_EXIT_HANDED_OVER: u32 = 5;
 
 /// The single argument that starts the desktop application as this machine's
@@ -183,24 +184,18 @@ pub const LOGON_HOST_EXIT_HANDED_OVER: u32 = 5;
 /// elevated windows and a `VMware` guest take its input.
 pub const SESSION_HOST_ARG: &str = "--session-host";
 
-/// Exit code of a session host on a machine where ADR 0169 is not turned on
-/// yet: no `session-host-enabled` marker under `%ProgramData%\Lumepeer`
-/// (`program_data::session_host_enabled`).
-///
-/// Waited out like [`LOGON_HOST_EXIT_NOT_ENABLED`]: the elevated client hosts
-/// as before, and starting the same refusal on every tick would only fill the
-/// log.
-pub const SESSION_HOST_EXIT_NOT_ENABLED: u32 = 6;
+// 6 was `SESSION_HOST_EXIT_NOT_ENABLED`, the refusal of a machine without the
+// marker that turned ADR 0169 on before pack 09. Not reused: a log from that
+// time says 6 for that.
 
-/// Exit code of a session host whose signed-in user has no store to host
-/// with: they never opened Lumepeer, so there is no identity any guest saved
-/// (ADR 0169 §1). Waited out like [`SESSION_HOST_EXIT_NOT_ENABLED`].
+/// Exit code of a session host whose signed-in user has no store it can
+/// open (ADR 0169 §1). Waited out like [`LOGON_HOST_EXIT_NOT_ENABLED`]:
+/// starting the same refusal on every tick would only fill the log.
 pub const SESSION_HOST_EXIT_NO_STORE: u32 = 7;
 
 /// Exit code of a session host that found the host role held for longer than
-/// it waits for a leaving logon host to let it go — an elevated client
-/// started before ADR 0169 was turned on, most likely. Waited out like the two
-/// above.
+/// it waits for a leaving logon host to let it go — a development client run
+/// elevated, most likely. Waited out like [`SESSION_HOST_EXIT_NO_STORE`].
 pub const SESSION_HOST_EXIT_ROLE_TAKEN: u32 = 8;
 
 /// Exit code of a session host that closed its endpoint (ADR 0169 §1): no

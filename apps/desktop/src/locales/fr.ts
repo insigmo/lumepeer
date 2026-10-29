@@ -176,6 +176,10 @@ export const fr: Dictionary = {
     "Cet appareil n'a pas d'encodeur vidéo, les personnes invitées ne verront donc rien. Les sessions se connectent tout de même, et la saisie fonctionne toujours.",
   'status.hostedByService':
     "Cet appareil est hébergé par le service Lumepeer, pas par cette fenêtre. Vous pouvez toujours vous connecter à d'autres appareils d'ici.",
+  'status.unreachable':
+    'Cet ordinateur est injoignable pour le moment : le service Lumepeer n\'est pas démarré.',
+  'status.startService':
+    'Démarrer le service',
   'consent.answerInSystemWindow': (peer) => `${peer} souhaite se connecter. Répondez dans la fenêtre système de Lumepeer.`,
   'status.askHost.control': 'Donner le contrôle… (demande dans une fenêtre système)',
   'status.askHost.secureDesktopInput': 'Autoriser les invites administrateur… (demande dans une fenêtre système)',
@@ -454,6 +458,16 @@ export const fr: Dictionary = {
     'Cet appareil est servi par le service Lumepeer. Ses paramètres d\'accès sont visibles ici ; les modifier demande des droits d\'administrateur.',
   'unattended.openAccessSettings':
     'Modifier les paramètres d\'accès',
+  'unattended.acceptAfterSignIn.label':
+    'Accepter les connexions après l\'ouverture de session',
+  'unattended.acceptAfterSignIn.note':
+    'Dès l\'ouverture de session, les invités peuvent joindre cet appareil même si la fenêtre Lumepeer est fermée. Sans le mot de passe de l\'appareil, ils attendent toujours votre réponse.',
+  'unattended.acceptAfterSignIn.on':
+    'Les invités peuvent joindre cet appareil dès l\'ouverture de session, même si cette fenêtre est fermée.',
+  'unattended.acceptAfterSignIn.off':
+    'Les invités ne peuvent joindre cet appareil que lorsque cette fenêtre est ouverte.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Accepter seulement si cette fenêtre est ouverte',
   'access.heading':
     'Paramètres d\'accès',
   'access.explain':

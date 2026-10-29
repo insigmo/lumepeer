@@ -7,7 +7,10 @@
 //! host, never as the elevated client. On Windows that meant
 //! `CreateProcessAsUserW` with Explorer's token — and ADR 0057 then shipped
 //! the client with `requireAdministrator`, which is exactly the configuration
-//! that call refuses. An elevated administrator token has
+//! that call refuses. (ADR 0169 made the client `asInvoker` again; a release
+//! host's shells are now the `LocalSystem` session host's, which starts this
+//! binary with the person's own token. A development client started elevated
+//! still meets the refusal.) An elevated administrator token has
 //! `SE_INCREASE_QUOTA_NAME` disabled and no `SE_ASSIGNPRIMARYTOKEN_NAME` at
 //! all, so the call comes back `ERROR_PRIVILEGE_NOT_HELD` and, correctly, no
 //! shell is started. Enabling the one privilege that *is* present does not

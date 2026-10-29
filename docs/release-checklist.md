@@ -141,11 +141,10 @@ No automated gate, and deliberately none: installing it registers a
 No automated gate: these need a real elevated app, a live UAC prompt, and a
 second machine. All manual, once per release.
 
-- [ ] The client now requests administrator: launching `lumepeer-desktop.exe`
-      raises Windows' own UAC prompt every time. With a guest holding `input`,
-      open `services.msc` (or `regedit`) on the host and have the guest click a
-      control inside it — the click lands. Before ADR 0057 the same click was
-      dropped by UIPI, so this is the elevated-window half of the feature.
+- [ ] With a guest holding `input`, open `services.msc` (or `regedit`) on the
+      host and have the guest click a control inside it — the click lands.
+      Since ADR 0169 that click comes from the `LocalSystem` session host, not
+      an elevated client (see the next section).
 - [ ] `secure_desktop_input` is off for every role: connect a guest at
       **full control** and confirm the "Allow controlling the admin prompt"
       switch starts off. No role turns it on.
@@ -159,6 +158,45 @@ second machine. All manual, once per release.
 - [ ] With the helper **not** installed, or the switch off, the guest sees ADR
       0056's honest "respond to it there" message and the picture, and nothing
       the guest does reaches the prompt — the ADR 0011/0056 fallback is intact.
+
+### The client runs unelevated; the session host hosts (ADR 0169)
+
+Needs the NSIS build installed on a Windows host with the service running, a
+second machine as the guest, a standard (non-administrator) account on the
+host, and a host you can reboot. All manual, once per release; a log of both
+sides and a screenshot for each.
+
+- [ ] Launching `lumepeer-desktop.exe` raises **no** UAC prompt. Process
+      Explorer (or `whoami /groups` from a shell the client starts) shows
+      Medium integrity, and `lumepeer-desktop.exe --session-host` runs as
+      `SYSTEM` in the console session.
+- [ ] A file dragged from Explorer onto the client window is taken.
+- [ ] A guest clicks inside `services.msc` and `regedit` on the host.
+- [ ] A guest types into a `VMware` guest on the host: Ctrl+V pastes,
+      Ctrl+Alt releases the grab.
+- [ ] A guest answers a UAC prompt with `secure_desktop_input` on; with it off
+      the same click does nothing.
+- [ ] A guest sends Ctrl+Alt+Del.
+- [ ] Reboot the host: the guest reaches the logon screen (logon host), signs
+      in, and redials into the session host **with the same identity** — the
+      saved entry connects without a new invite.
+- [ ] Consent is a system `TaskDialog` from the session host; a
+      medium-integrity `SendInput` probe cannot press it.
+- [ ] A shell the guest opens runs as the signed-in person at Medium
+      integrity, never as `SYSTEM`.
+- [ ] An update installs with nobody at the host: the session host downloads,
+      verifies and runs the installer, and the guest redials into the new
+      version.
+- [ ] Guests that saved this host before the update connect without a new
+      invite.
+- [ ] Standard account: the client starts without an administrator's
+      password, and the machine is reachable from a guest.
+- [ ] Stop the service (`sc stop LumepeerHelper`): the client says this
+      computer cannot be reached and offers **Start the service**; pressing it
+      raises one UAC prompt, and after it the machine is reachable again.
+- [ ] The ADR 0140 logon task `\Lumepeer\Autostart-<user>` is gone after the
+      first start of the new build, and the tray starts from the per-user
+      `Run` key at sign-in.
 
 ### Hosting the sign-in screen (ADR 0126)
 

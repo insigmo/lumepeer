@@ -7,12 +7,12 @@
 //! and when the service stops, it is asked to give the host role up and
 //! stopped; the logon host then takes the console back.
 //!
-//! The service decides only *when*: somebody signed in or not. Whether the
-//! scheme is on and whose store to open is the session host's own question;
-//! one that finds nothing to serve with exits [`SESSION_HOST_EXIT_NOT_ENABLED`],
-//! [`SESSION_HOST_EXIT_NO_STORE`] or [`SESSION_HOST_EXIT_ROLE_TAKEN`] and is
-//! left parked until the console changes, or [`PARKED_RECHECK`] passes. So
-//! this binary still reads no configuration of its own (ADR 0043).
+//! The service decides only *when*: somebody signed in or not. Whose store
+//! to open is the session host's own question; one that finds nothing to
+//! serve with exits [`SESSION_HOST_EXIT_NO_STORE`] or
+//! [`SESSION_HOST_EXIT_ROLE_TAKEN`] and is left parked until the console
+//! changes, or [`PARKED_RECHECK`] passes. So this binary still reads no
+//! configuration of its own (ADR 0043).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use lumepeer_service::agent_launch::{anybody_signed_in, console_session};
 use lumepeer_service::{
     SESSION_HOST_ARG, SESSION_HOST_EXIT_CLOSED, SESSION_HOST_EXIT_NO_STORE,
-    SESSION_HOST_EXIT_NOT_ENABLED, SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
+    SESSION_HOST_EXIT_ROLE_TAKEN, SESSION_HOST_EXIT_UPDATING,
 };
 
 use crate::host_process::HostProcess;
@@ -47,9 +47,8 @@ const CLOSED_RELAUNCH: Duration = Duration::from_secs(1);
 /// console before it is asked again.
 ///
 /// Normally the console changing is what unparks it. This bounds the rest:
-/// the marker written by an administrator in the middle of a session, the
-/// first run of the client minting the store, an elevated client that held
-/// the role and has since quit.
+/// a store that could not be opened a moment ago, a development client run
+/// elevated that held the role and has since quit.
 const PARKED_RECHECK: Duration = Duration::from_mins(5);
 
 /// Keeps a session host on the console for as long as somebody is signed in
@@ -123,10 +122,7 @@ const fn ended_by(code: Option<u32>) -> Ended {
         // one, and a host from the old binary in between would only be closed
         // by it.
         Some(
-            SESSION_HOST_EXIT_NOT_ENABLED
-            | SESSION_HOST_EXIT_NO_STORE
-            | SESSION_HOST_EXIT_ROLE_TAKEN
-            | SESSION_HOST_EXIT_UPDATING,
+            SESSION_HOST_EXIT_NO_STORE | SESSION_HOST_EXIT_ROLE_TAKEN | SESSION_HOST_EXIT_UPDATING,
         ) => Ended::Refused,
         Some(SESSION_HOST_EXIT_CLOSED) => Ended::Closed,
         _ => Ended::Crashed,
@@ -180,15 +176,11 @@ mod tests {
         assert_eq!(serve_now(None, None), None);
     }
 
-    /// A host that refused — the scheme off, no store, the role held — parks
-    /// the console; one that closed its endpoint is started again closed;
-    /// anything else it exits with is a crash to back off from.
+    /// A host that refused — no store, the role held — parks the console;
+    /// one that closed its endpoint is started again closed; anything else it
+    /// exits with is a crash to back off from.
     #[test]
     fn a_refusal_parks_and_anything_else_is_a_crash() {
-        assert_eq!(
-            ended_by(Some(SESSION_HOST_EXIT_NOT_ENABLED)),
-            Ended::Refused
-        );
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_NO_STORE)), Ended::Refused);
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_ROLE_TAKEN)), Ended::Refused);
         assert_eq!(ended_by(Some(SESSION_HOST_EXIT_CLOSED)), Ended::Closed);
@@ -222,7 +214,6 @@ mod tests {
             LOGON_HOST_EXIT_HANDED_OVER,
         ];
         for code in [
-            SESSION_HOST_EXIT_NOT_ENABLED,
             SESSION_HOST_EXIT_NO_STORE,
             SESSION_HOST_EXIT_ROLE_TAKEN,
             SESSION_HOST_EXIT_CLOSED,

@@ -215,15 +215,15 @@ pub fn for_system_host(sid: &str) -> Option<Placement> {
 }
 
 /// Whether this run is the session host's guest and panel rather than a host
-/// (ADR 0169 §2, §3): ADR 0169 is turned on for this machine, and this is not
-/// an end-to-end rig on the file keystore, which keeps hosting in process.
+/// (ADR 0169 §2, §3): every release build, unless it is an end-to-end rig on
+/// the file keystore. A development build and that rig keep hosting in
+/// process, as an unelevated run always did, so `e2e/matrix` keeps working.
 ///
 /// Elevated or not: either way the session host is this machine's host, and
 /// this window keeps the guest's stores only ([`choose`]).
 #[cfg(target_os = "windows")]
 pub fn session_host_guest() -> bool {
-    std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file")
-        && lumepeer_service::program_data::session_host_enabled()
+    !cfg!(debug_assertions) && std::env::var("LUMEPEER_KEYSTORE").as_deref() != Ok("file")
 }
 
 /// The stores of a run that is only ever a guest (ADR 0169 §3): its own guest

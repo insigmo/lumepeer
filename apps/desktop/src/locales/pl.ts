@@ -176,6 +176,10 @@ export const pl: Dictionary = {
     'To urządzenie nie ma kodera wideo, więc zaproszone osoby niczego nie zobaczą. Sesje mimo to się łączą, a wejście nadal działa.',
   'status.hostedByService':
     'Tym urządzeniem zarządza usługa Lumepeer, a nie to okno. Nadal możesz stąd łączyć się z innymi urządzeniami.',
+  'status.unreachable':
+    'Z tym komputerem nie można się teraz połączyć: usługa Lumepeer nie działa.',
+  'status.startService':
+    'Uruchom usługę',
   'consent.answerInSystemWindow': (peer) => `${peer} chce się połączyć. Odpowiedz w oknie systemowym Lumepeer.`,
   'status.askHost.control': 'Przekaż sterowanie… (zapyta w oknie systemowym)',
   'status.askHost.secureDesktopInput': 'Zezwól na monity administratora… (zapyta w oknie systemowym)',
@@ -454,6 +458,16 @@ export const pl: Dictionary = {
     'To urządzenie obsługuje usługa Lumepeer. Ustawienia dostępu można tu odczytać; ich zmiana wymaga uprawnień administratora.',
   'unattended.openAccessSettings':
     'Zmień ustawienia dostępu',
+  'unattended.acceptAfterSignIn.label':
+    'Przyjmuj połączenia po zalogowaniu',
+  'unattended.acceptAfterSignIn.note':
+    'Od chwili zalogowania goście mogą połączyć się z tym urządzeniem nawet przy zamkniętym oknie Lumepeer. Bez hasła urządzenia nadal czekają na Twoją odpowiedź.',
+  'unattended.acceptAfterSignIn.on':
+    'Goście mogą połączyć się z tym urządzeniem od chwili zalogowania, nawet przy zamkniętym oknie.',
+  'unattended.acceptAfterSignIn.off':
+    'Goście mogą połączyć się z tym urządzeniem tylko wtedy, gdy to okno jest otwarte.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Przyjmuj tylko przy otwartym oknie',
   'access.heading':
     'Ustawienia dostępu',
   'access.explain':

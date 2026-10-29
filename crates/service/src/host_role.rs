@@ -64,9 +64,11 @@ pub const HOST_ROLE_RELEASE_EVENT: &str = r"Global\lumepeer-host-role-release";
 
 /// Who may take the host role or ask for it back, in SDDL.
 ///
-/// - `SY` — `LocalSystem`, which the host service runs as.
-/// - `BA` — administrators, which is what the desktop client runs as
-///   (ADR 0057 ships it `requireAdministrator`).
+/// - `SY` — `LocalSystem`, which the logon host and the session host run as
+///   (ADR 0126, ADR 0169 §1).
+/// - `BA` — administrators: a development client started elevated, which
+///   still hosts in process. The release client is `asInvoker` and never asks
+///   for the role on Windows (ADR 0169 §2).
 ///
 /// Deliberately **not** `IU`, the same as the helper's request pipe since
 /// ADR 0122. Taking the host role, or knocking the current host off it, is

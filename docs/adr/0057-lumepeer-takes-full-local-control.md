@@ -1,6 +1,6 @@
 # ADR 0057 — Lumepeer takes full local control: an elevated client and secure-desktop input
 
-Status: accepted
+Status: accepted; §1 superseded by ADR 0169 (the client is `asInvoker`; the host is a `LocalSystem` process in the session)
 Date: 2026-09-02
 
 Extends ADR 0043 (one privileged helper), ADR 0049 (its second capability) and

@@ -695,6 +695,11 @@ pub struct UnattendedStatusDto {
     /// change it (ADR 0169 §5).
     #[serde(default)]
     pub managed_by_service: bool,
+    /// Whether the session host accepts connections from sign-in on, with no
+    /// window open (ADR 0169 §9). `None` where there is no session host to
+    /// accept them: off Windows, and a run that hosts in process.
+    #[serde(default)]
+    pub accept_after_sign_in: Option<bool>,
 }
 
 /// Argument of [`unattended_set_password`].
@@ -773,6 +778,10 @@ pub struct NetworkStatusDto {
     /// else is — on Windows, the Lumepeer service's session host (ADR 0169).
     /// It still connects out; the window says so rather than staying silent.
     pub hosted_by_service: bool,
+    /// True when that session host has not answered for a while: nobody can
+    /// reach this machine until the service runs (ADR 0169 §2). The window
+    /// says so, and offers [`service_start`].
+    pub host_unreachable: bool,
 }
 
 /// What one live connection's link actually looks like (§18; ADR 0026,
@@ -1680,6 +1689,7 @@ pub fn network_status(
         capture_unavailable_reason: lumepeer_media::capture::inside_chromeos_container()
             .then_some("chromeos-container"),
         hosted_by_service: !state.hosting,
+        host_unreachable: session_host(&state).is_some_and(|panel| panel.unreachable()),
     })
 }
 
@@ -1846,23 +1856,28 @@ pub async fn unattended_status(
             role: settings.role.into(),
             logon_screen: editor_logon_screen_status(&editor),
             managed_by_service: false,
+            accept_after_sign_in: editor_accept_after_sign_in(&editor),
         });
     }
     let state = app_state(&app)?;
     // The session host keeps the policy; this window reads it from there, and
     // only the elevated access-settings window changes it (ADR 0169 §5).
     if let Some(panel) = session_host(&state) {
-        let read = tauri::async_runtime::spawn_blocking(move || panel.unattended())
+        let snapshot = tauri::async_runtime::spawn_blocking(move || panel.snapshot())
             .await
             .ok()
-            .flatten();
-        return Ok(read.unwrap_or(UnattendedStatusDto {
+            .flatten()
+            .unwrap_or_default();
+        let mut status = snapshot.unattended.unwrap_or(UnattendedStatusDto {
             enabled: false,
             totp_enabled: false,
             role: RoleDto::ViewOnly,
             logon_screen: None,
             managed_by_service: true,
-        }));
+            accept_after_sign_in: None,
+        });
+        status.accept_after_sign_in = snapshot.accept_after_sign_in;
+        return Ok(status);
     }
     let settings = state.network.unattended_status().await?;
     Ok(UnattendedStatusDto {
@@ -1871,6 +1886,7 @@ pub async fn unattended_status(
         role: settings.role.into(),
         logon_screen: logon_screen_status(),
         managed_by_service: false,
+        accept_after_sign_in: None,
     })
 }
 
@@ -1922,6 +1938,99 @@ fn editor_logon_screen_status(editor: &crate::access_settings::AccessSettings) -
         let _ = editor;
         None
     }
+}
+
+/// Whether the edited account's session host accepts connections after
+/// sign-in (ADR 0169 §9), read where the access-settings window writes it.
+fn editor_accept_after_sign_in(editor: &crate::access_settings::AccessSettings) -> Option<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        lumepeer_service::program_data::user_directory(editor.account())
+            .map(|directory| lumepeer_service::program_data::accept_after_sign_in(&directory))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = editor;
+        None
+    }
+}
+
+/// Argument of [`unattended_set_accept_after_sign_in`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcceptAfterSignInArgs {
+    /// `true` lets the session host take connections from sign-in on.
+    pub enabled: bool,
+}
+
+/// Turns "accept connections after sign-in" on or off for this account
+/// (ADR 0169 §9).
+///
+/// On widens — the machine answers with no window open — so only the elevated
+/// access-settings window turns it on. Off narrows, so the client asks the
+/// session host for it over the channel, with no prompt.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; `ACCESS_SETTINGS_REQUIRED`
+/// for "on" from the client; `UNATTENDED` when there is no session host, or
+/// it did not take the change.
+#[tauri::command]
+pub async fn unattended_set_accept_after_sign_in(
+    window: Window,
+    app: tauri::AppHandle,
+    args: AcceptAfterSignInArgs,
+) -> Result<(), IpcError> {
+    check_window(&window)?;
+    let failed = |message: &str| IpcError {
+        code: "UNATTENDED",
+        message: message.to_owned(),
+    };
+    #[cfg(target_os = "windows")]
+    if let Some(editor) = access_settings(&app) {
+        let written = lumepeer_service::program_data::user_directory(editor.account()).is_some_and(
+            |directory| {
+                lumepeer_service::program_data::set_accept_after_sign_in(&directory, args.enabled)
+            },
+        );
+        if !written {
+            return Err(failed("cannot save the setting"));
+        }
+        tracing::info!(
+            enabled = args.enabled,
+            "accepting connections after sign-in changed (access settings)"
+        );
+        return Ok(());
+    }
+    let state = app_state(&app)?;
+    let Some(panel) = session_host(&state) else {
+        return Err(failed("this window hosts this machine itself"));
+    };
+    if args.enabled {
+        return Err(access_settings_required());
+    }
+    panel_act(
+        panel,
+        lumepeer_service::host_channel_protocol::Request::AcceptAfterSignInOff,
+    )
+    .await
+}
+
+/// Starts the Lumepeer service where its session host does not answer
+/// (ADR 0169 §2): the service binary, elevated — one UAC prompt.
+///
+/// # Errors
+/// Rejects calls from any window but the main one; `SERVICE_START` when the
+/// prompt was declined or the service could not be started.
+#[tauri::command]
+pub async fn service_start(window: Window) -> Result<(), IpcError> {
+    check_window(&window)?;
+    tauri::async_runtime::spawn_blocking(crate::service_control::start)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|started| started)
+        .map_err(|message| IpcError {
+            code: "SERVICE_START",
+            message,
+        })
 }
 
 /// Opens the access-settings window: this binary, started again elevated —

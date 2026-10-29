@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-09-27
+Amended by: ADR 0169 (§5: the protected directory is written by the session host and `--access-settings`, never by the `asInvoker` client; the guest-side stores go back to the profile)
 
 The five risks [ADR 0122](0122-nothing-below-the-host-and-nobody-but-the-host.md)
 listed under "What this does not change", each closed. Amends

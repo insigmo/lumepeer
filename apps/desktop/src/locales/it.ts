@@ -176,6 +176,10 @@ export const it: Dictionary = {
     "Questo dispositivo non ha un encoder video, quindi chi inviti non vedrà nulla. Le sessioni si connettono comunque e l'input continua a funzionare.",
   'status.hostedByService':
     'Questo dispositivo è gestito dal servizio Lumepeer, non da questa finestra. Da qui puoi comunque connetterti ad altri dispositivi.',
+  'status.unreachable':
+    'Al momento non è possibile connettersi a questo computer: il servizio Lumepeer non è in esecuzione.',
+  'status.startService':
+    'Avvia il servizio',
   'consent.answerInSystemWindow': (peer) => `${peer} vuole connettersi. Rispondi nella finestra di sistema di Lumepeer.`,
   'status.askHost.control': 'Concedi il controllo… (chiede in una finestra di sistema)',
   'status.askHost.secureDesktopInput': 'Consenti le richieste di amministratore… (chiede in una finestra di sistema)',
@@ -454,6 +458,16 @@ export const it: Dictionary = {
     'Questo dispositivo è servito dal servizio Lumepeer. Le impostazioni di accesso si possono leggere qui; per modificarle servono i diritti di amministratore.',
   'unattended.openAccessSettings':
     'Modifica impostazioni di accesso',
+  'unattended.acceptAfterSignIn.label':
+    'Accetta connessioni dopo l\'accesso',
+  'unattended.acceptAfterSignIn.note':
+    'Dal momento dell\'accesso gli ospiti possono raggiungere questo dispositivo anche con la finestra di Lumepeer chiusa. Senza la password del dispositivo attendono comunque la tua risposta.',
+  'unattended.acceptAfterSignIn.on':
+    'Gli ospiti possono raggiungere questo dispositivo dall\'accesso in poi, anche con questa finestra chiusa.',
+  'unattended.acceptAfterSignIn.off':
+    'Gli ospiti possono raggiungere questo dispositivo solo mentre questa finestra è aperta.',
+  'unattended.acceptAfterSignIn.turnOff':
+    'Accetta solo con questa finestra aperta',
   'access.heading':
     'Impostazioni di accesso',
   'access.explain':
