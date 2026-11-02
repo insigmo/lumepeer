@@ -13,7 +13,6 @@ workspace = true
 default = []
 # Phase 2 pulls in the real capture/encode backends. Kept behind features so
 # that `cargo build --workspace` in phase 0 needs no platform SDKs.
-capture-scap = ["dep:scap"]
 capture-x11 = ["dep:x11rb"]
 # ScreenCaptureKit capture for macOS (§11, §5.1; ADR 0013). Kept behind a
 # feature, exactly like capture-x11 above, so `cargo build --workspace` needs
@@ -193,7 +192,6 @@ memmap2.workspace = true
 tokio = { workspace = true, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
-scap = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
 
 [target.'cfg(all(target_os = "linux", not(target_os = "android")))'.dependencies]
@@ -213,7 +211,14 @@ x11rb = { workspace = true, optional = true, features = [
     "xfixes",
     "randr",
 ] }
-pipewire = { version = "0.8", optional = true }
+# 0.10, not 0.8: 0.8's `libspa-sys` generates its bindings with bindgen 0.69,
+# which reads `spa_pod_builder` as an opaque struct under libclang 22 (what
+# ubuntu-26.04 ships), and `libspa` then does not compile; 0.10's uses bindgen
+# 0.72. Only one `pipewire` can be in the lock file, since `pipewire-sys`
+# links `pipewire-0.3`: the `scap` crate, which pinned 0.8 and which no code
+# here ever called, was dropped for it. `ashpd`'s own `pipewire` feature
+# stays off for the same reason.
+pipewire = { version = "0.10", optional = true }
 # Safe libva bindings for the VA-API encoder (ADR 0040). BSD-3-Clause, which
 # `deny.toml`'s allowlist already carries. Intel and AMD only by design:
 # NVIDIA encode is NVENC, a separate SDK under separate terms, and is a

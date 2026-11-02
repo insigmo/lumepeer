@@ -81,7 +81,6 @@ toml = "1.1"
 winreg = "0.56.0"
 config = "0.15.27"
 # Deviations from §5 are recorded in docs/adr/0002-dependency-version-deviations.md
-scap = "=0.1.0-beta.1" # `scap = "0.1"` in §5 does not resolve: only pre-releases exist
 # Not named in §5; see docs/adr/0004-phase-1-transport-dependencies.md.
 rand = "0.10"           # CSPRNG for session ids and invite ids (§7, §9.1)
 data-encoding = "2"     # base32 for the QR ticket encoding (§7)

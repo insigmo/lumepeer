@@ -121,9 +121,10 @@ impl PipewirePlayout {
         use pipewire::stream::StreamFlags;
 
         pipewire::init();
-        let mainloop = pipewire::main_loop::MainLoop::new(None)
+        // `Rc` for the loop and `Box` for the rest, as the capture paths do.
+        let mainloop = pipewire::main_loop::MainLoopRc::new(None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-        let context = pipewire::context::Context::new(&mainloop)
+        let context = pipewire::context::ContextBox::new(mainloop.loop_(), None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
         let core = context
             .connect(None)
@@ -139,7 +140,7 @@ impl PipewirePlayout {
             *pipewire::keys::MEDIA_CATEGORY => "Playback",
             *pipewire::keys::MEDIA_ROLE => "Communication",
         };
-        let stream = pipewire::stream::Stream::new(&core, "lumepeer-remote-audio", props)
+        let stream = pipewire::stream::StreamBox::new(&core, "lumepeer-remote-audio", props)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         let data = StreamUserData {
