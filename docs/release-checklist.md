@@ -46,7 +46,7 @@ at the repo root pull the matching asset from the latest (or a pinned)
 release and install it with the platform's native package manager.
 
 Windows/Linux ARM64 build **natively** on GitHub's `windows-11-arm` /
-`ubuntu-24.04-arm` hosted runners, not cross-compiled, so no extra linker
+`ubuntu-26.04-arm` hosted runners, not cross-compiled, so no extra linker
 setup is needed for those legs.
 
 

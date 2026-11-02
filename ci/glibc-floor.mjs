@@ -39,9 +39,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Oldest glibc a released Lumepeer client is expected to start on: Ubuntu
-// 22.04 (2.35). Debian 12 (2.36) and RHEL 9 (2.34) clear it too. Matches the
-// ubuntu-22.04 runner release.yml builds linux-amd64 on, so CI itself never
-// produces anything above this line.
+// 22.04 (2.35). Debian 12 (2.36) and RHEL 9 (2.34) clear it too. release.yml
+// builds on ubuntu-26.04 (glibc 2.43), so this script is what keeps its
+// packages at this line: there the only requirement above it is std's weak
+// GLIBC_2.39 pidfd pair.
 const DEFAULT_FLOOR = "2.35";
 
 const STB_WEAK = 2;
@@ -300,10 +301,10 @@ function main() {
       `glibc-floor: this build host's glibc exceeds the supported floor ${args.floor} in a way that`,
     );
     console.error(
-      "glibc-floor: cannot be patched away. Build this target on an older distro (release.yml uses",
+      "glibc-floor: cannot be patched away. Build this target on an older distro,",
     );
     console.error(
-      "glibc-floor: ubuntu-22.04), or raise the floor deliberately via --floor/LUMEPEER_GLIBC_FLOOR",
+      "glibc-floor: or raise the floor deliberately via --floor/LUMEPEER_GLIBC_FLOOR",
     );
     console.error("glibc-floor: and record why in docs/adr/.");
     process.exit(1);
