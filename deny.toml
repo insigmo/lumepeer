@@ -98,11 +98,11 @@ deny = [{ crate = "quinn" }]
 # `cargo update` and prune entries that no longer appear, otherwise
 # cargo-deny will start warning about unused `skip` entries instead.
 #
-# Three of them arrive with `lumepeer-terminal`'s Unix pseudo-terminal
-# (ADR 0079): `portable-pty` pulls `nix` 0.28 beside the 0.27 already in the
-# tree, `cfg_aliases` 0.1 with it, and `winreg` 0.10 for a ConPTY backend this
-# workspace never builds — `portable-pty` is a `cfg(unix)` dependency, so that
-# last one is a lock-file entry and nothing else.
+# Two of them arrive with `lumepeer-terminal`'s Unix pseudo-terminal
+# (ADR 0079): `portable-pty` pulls `cfg_aliases` 0.1 with its `nix` 0.28, and
+# `winreg` 0.10 for a ConPTY backend this workspace never builds —
+# `portable-pty` is a `cfg(unix)` dependency, so that last one is a lock-file
+# entry and nothing else. (`nix` 0.27, the third, left with `pipewire` 0.8.)
 skip = [
     { crate = "aead:0.5.2" },
     { crate = "base64:0.21.7" },
@@ -139,7 +139,6 @@ skip = [
     { crate = "libloading:0.7.4" },
     { crate = "miniz_oxide:0.8.9" },
     { crate = "netdev:0.45.0" },
-    { crate = "nix:0.27.1" },
     { crate = "png:0.17.16" },
     { crate = "proc-macro-crate:1.3.1" },
     { crate = "proc-macro-crate:2.0.2" },
@@ -204,3 +203,6 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The workspace's `[patch.crates-io]` for cros-libva (libva 2.23), pinned to
+# one upstream commit.
+allow-git = ["https://github.com/chromeos/cros-libva"]

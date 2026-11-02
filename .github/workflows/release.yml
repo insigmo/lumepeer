@@ -178,16 +178,21 @@ jobs:
       # rows, which is what `ci/find-libaom-asm.py` reads: a libaom without
       # its SIMD is several times slower, which is exactly what the openh264
       # fallback turned out to ship as whenever its build found no nasm.
+      #
+      # The Linux rows build on the newest Ubuntu. That does not raise what
+      # the packages need: `ci/glibc-floor.mjs` still holds them to glibc 2.35
+      # (ADR 0017). Checked 2026-11-02: a .deb built on 26.04 installs and
+      # starts on Ubuntu 22.04, 24.04 and 26.04 and on Debian 13.
       matrix:
         include:
           - name: linux-amd64 (deb/rpm)
-            os: ubuntu-24.04
+            os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
             nasm: true
             aom: true
           - name: linux-arm64 (deb/rpm)
-            os: ubuntu-24.04-arm
+            os: ubuntu-26.04-arm
             target: aarch64-unknown-linux-gnu
             features: capture-x11,capture-portal,encode-vaapi-zero-copy,encode-aom
           - name: windows-amd64

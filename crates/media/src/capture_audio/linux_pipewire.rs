@@ -158,9 +158,10 @@ impl PipewireCapture {
         use pipewire::stream::StreamFlags;
 
         pipewire::init();
-        let mainloop = pipewire::main_loop::MainLoop::new(None)
+        // `Rc` for the loop and `Box` for the rest, as the video path does.
+        let mainloop = pipewire::main_loop::MainLoopRc::new(None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-        let context = pipewire::context::Context::new(&mainloop)
+        let context = pipewire::context::ContextBox::new(mainloop.loop_(), None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
         let core = context
             .connect(None)
@@ -199,7 +200,7 @@ impl PipewireCapture {
                 "lumepeer-microphone",
             ),
         };
-        let stream = pipewire::stream::Stream::new(&core, name, props)
+        let stream = pipewire::stream::StreamBox::new(&core, name, props)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         let data = StreamUserData {

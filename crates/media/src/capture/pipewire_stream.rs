@@ -201,14 +201,13 @@ impl PipeWireFrameThread {
         use pipewire::stream::StreamFlags;
 
         pipewire::init();
-        // pipewire 0.8.0 API: MainLoop is already Rc-backed and Clone on its
-        // own — no separate `*Rc` type. `Context::new` takes only the loop,
-        // no properties argument. `connect()` (not `connect_rc()`) returns
-        // `Core` directly. See crates/media/Cargo.toml's `capture-portal`
-        // feature comment for why 0.8.0 specifically.
-        let mainloop = pipewire::main_loop::MainLoop::new(None)
+        // The loop is the one `Rc` handle: the shutdown callback below has to
+        // own a handle to quit with. Everything else is a `Box` borrowing
+        // what it was made from, so the compiler holds each one to outliving
+        // the next — context from loop, core from context, stream from core.
+        let mainloop = pipewire::main_loop::MainLoopRc::new(None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
-        let context = pipewire::context::Context::new(&mainloop)
+        let context = pipewire::context::ContextBox::new(mainloop.loop_(), None)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
         let core = context
             .connect(None)
@@ -217,7 +216,7 @@ impl PipeWireFrameThread {
         // Cross-thread shutdown: dropping `PipeWireFrameThread` sends
         // `Shutdown`, which this attaches to the loop as an IO source.
         let _shutdown_listener = {
-            // Two handles, deliberately: `attach` borrows the `LoopRef` for as
+            // Two handles, deliberately: `attach` borrows the `Loop` for as
             // long as the returned listener lives, so the loop it is taken
             // from has to be the outer `mainloop` that outlives this block —
             // and the closure needs an owned handle of its own to call
@@ -231,7 +230,7 @@ impl PipeWireFrameThread {
             *pipewire::keys::MEDIA_CATEGORY => "Capture",
             *pipewire::keys::MEDIA_ROLE => "Screen",
         };
-        let stream = pipewire::stream::Stream::new(&core, "lumepeer-capture", props)
+        let stream = pipewire::stream::StreamBox::new(&core, "lumepeer-capture", props)
             .map_err(|e| MediaError::CaptureUnavailable(e.to_string()))?;
 
         #[cfg(feature = "encode-vaapi-zero-copy")]
@@ -753,7 +752,7 @@ mod dmabuf {
         /// withdraws the offer instead (ADR 0161).
         pub(crate) fn format_changed(
             &mut self,
-            stream: &pipewire::stream::StreamRef,
+            stream: &pipewire::stream::Stream,
             format: &Pod,
             video_format: VideoFormat,
             modifier: u64,
@@ -797,7 +796,7 @@ mod dmabuf {
         /// become the shared-memory one alone, which the producer offered all
         /// along beside its DMA-BUF ones, and the negotiation this starts
         /// lands there.
-        fn withdraw(&mut self, stream: &pipewire::stream::StreamRef) {
+        fn withdraw(&mut self, stream: &pipewire::stream::Stream) {
             self.offered = false;
             self.negotiated = None;
             tracing::warn!(
@@ -818,7 +817,7 @@ mod dmabuf {
 
     /// The `process` callback: every buffer is dequeued raw, a DMA-BUF leaves
     /// with the frame, shared memory is packed and given straight back.
-    pub(crate) fn process(stream: &pipewire::stream::StreamRef, user_data: &mut StreamUserData) {
+    pub(crate) fn process(stream: &pipewire::stream::Stream, user_data: &mut StreamUserData) {
         // SAFETY: called on the stream's loop thread from its own `process`
         // event, which is where PipeWire allows dequeuing. A null return is
         // "no buffer" and is checked before anything reads through it.
