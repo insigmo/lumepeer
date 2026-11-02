@@ -1294,8 +1294,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 [[package]]
 name = "cros-libva"
 version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0d5dfcdd9b868cc52eb2b5f5b8dea053314b205073ab9f13fa118c479d3a161"
+source = "git+https://github.com/chromeos/cros-libva?rev=59384456ac2ae78c0c3e5515f41ef1efd9b802cf#59384456ac2ae78c0c3e5515f41ef1efd9b802cf"
 dependencies = [
  "bindgen 0.70.1",
  "bitflags 2.13.2",

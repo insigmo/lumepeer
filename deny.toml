@@ -203,3 +203,6 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The workspace's `[patch.crates-io]` for cros-libva (libva 2.23), pinned to
+# one upstream commit.
+allow-git = ["https://github.com/chromeos/cros-libva"]

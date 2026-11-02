@@ -157,3 +157,12 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
+
+# cros-libva 0.0.13, the latest release, initialises
+# `VAEncPictureParameterBufferVP9` field by field, so it stops compiling
+# against libva 2.23 (Ubuntu 26.04), which added two fields to it. Upstream
+# fixed it behind a VA-API version cfg (chromeos/cros-libva#37) but has not
+# released since; this is that commit, still versioned 0.0.13. Drop the patch
+# once a release carries it.
+[patch.crates-io]
+cros-libva = { git = "https://github.com/chromeos/cros-libva", rev = "59384456ac2ae78c0c3e5515f41ef1efd9b802cf" }
