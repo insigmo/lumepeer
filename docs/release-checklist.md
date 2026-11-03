@@ -87,6 +87,9 @@ steps, and what "checked" means for each.
 
 - [ ] A run dispatched with `channel = beta` marks the GitHub release as a
       prerelease and republishes the manifest to the rolling `beta` release.
+- [ ] A stable release from a push to `master` republishes its manifest to the
+      rolling `beta` release too, so a client on `channel = "beta"` is offered
+      it.
 - [ ] A client left on `channel = "stable"` is **not** offered that build.
       This is the check that matters: GitHub's `/releases/latest` redirect
       skips prereleases, and if it ever stops doing so, stable clients start

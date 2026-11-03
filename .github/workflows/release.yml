@@ -21,9 +21,9 @@ on:
         description: >-
           Update channel this release is published to (ADR 0042). "beta" marks
           the GitHub release as a prerelease, which GitHub's own /releases/
-          latest redirect skips, so a stable client never sees it; the manifest
-          is then also published to the rolling `beta` release that beta
-          clients poll.
+          latest redirect skips, so a stable client never sees it. Every
+          release, stable or beta, also publishes its manifest to the rolling
+          `beta` release that beta clients poll.
         type: choice
         options: [stable, beta]
         default: stable
@@ -533,10 +533,12 @@ jobs:
   # The beta channel needs its own manifest at a stable URL, and GitHub has no
   # "newest release including prereleases" download link. So the manifest this
   # run produced is copied onto a rolling `beta` release, which is the only
-  # thing beta clients ever fetch.
+  # thing beta clients ever fetch. It runs for every release, stable ones from
+  # a push included: the beta channel is stable releases plus prereleases, so
+  # a beta client must be offered a stable build that is newer than its beta.
   beta-manifest:
     needs: [guard, version, manifest]
-    if: needs.guard.outputs.proceed == 'true' && needs.version.outputs.channel == 'beta'
+    if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
