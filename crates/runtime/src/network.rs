@@ -1487,6 +1487,18 @@ enum ActorCommand {
         label: String,
         reply: oneshot::Sender<Option<StreamCapsView>>,
     },
+    /// Tests only: [`ActorCommand::HistoryConnect`], and then, in the same
+    /// actor turn and so before that dial can land, the `Closed` of a
+    /// connection to `peer` this node had already let go of. A loaded machine
+    /// delivers such a late report now and then by itself; this delivers it
+    /// every time.
+    #[cfg(test)]
+    HistoryConnectBeforeLateClose {
+        label: String,
+        surface: ViewSurface,
+        peer: NodeId,
+        reply: oneshot::Sender<Result<(), ActorError>>,
+    },
     InviteCreate {
         role: Role,
         /// Retire every code handed out so far and issue a fresh one. `false`
@@ -2227,6 +2239,30 @@ impl ActorHandle {
         {
             let _ = rx.await;
         }
+    }
+
+    /// Tests only: see [`ActorCommand::HistoryConnectBeforeLateClose`].
+    ///
+    /// # Errors
+    /// What [`ActorHandle::history_connect`] returns.
+    #[cfg(test)]
+    pub async fn history_connect_before_late_close(
+        &self,
+        label: String,
+        surface: ViewSurface,
+        peer: NodeId,
+    ) -> Result<(), ActorError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(ActorCommand::HistoryConnectBeforeLateClose {
+                label,
+                surface,
+                peer,
+                reply,
+            })
+            .await
+            .map_err(|_| ActorError::ChannelClosed)?;
+        rx.await.map_err(|_| ActorError::ChannelClosed)?
     }
 
     /// Tests only: drops every connection like a lost link (ADR 0089).
@@ -6125,10 +6161,13 @@ struct Actor {
     /// grants — the intent has to survive the handshake, and the handshake is
     /// several actor turns long. A set rather than a flag because a dial in
     /// flight and a session being resumed are two different peers as far as
-    /// this is concerned; emptied by `stop_view` and by a connect that ends
-    /// without a session, so a later ordinary Connect to the same host is an
-    /// ordinary one. Only ever holds a surface without a picture: a screen
-    /// session is what a peer missing from here means (ADR 0124).
+    /// this is concerned; emptied by a connect that ends without a session,
+    /// and replaced by every later dial, so a later ordinary Connect to the
+    /// same host is an ordinary one. Never emptied by a view or a connection
+    /// ending: the end of a connection can be reported after the next dial at
+    /// the same host has written its own intent here. Only ever holds a
+    /// surface without a picture: a screen session is what a peer missing
+    /// from here means (ADR 0124).
     pending_surface: std::collections::HashMap<NodeId, ViewSurface>,
     /// Guest side: whether each remembered host answered the last time this
     /// node reached for it, by history label (ADR 0127).
@@ -6262,8 +6301,8 @@ struct ReconnectWait {
     /// What the session that went away had in its window (ADR 0101,
     /// ADR 0124).
     ///
-    /// Carried here because `stop_view` has already taken the intent out of
-    /// `pending_surface` by the time this wait is armed, and a session that
+    /// Carried here because `start_view` took the intent out of
+    /// `pending_surface` when the window opened, and a session that
     /// came back as a screen one would start an encode loop on the host that
     /// nobody asked for.
     surface: ViewSurface,
@@ -10534,6 +10573,8 @@ impl Actor {
         let grants = Grants::from_role(role);
         let tag = self.label_of(&peer);
         if !grants.view {
+            // A grant that opens no window ends what the dial asked for too.
+            self.pending_surface.remove(&peer);
             self.stop_view(peer);
             return;
         }
@@ -10730,10 +10771,16 @@ impl Actor {
 
     /// The body of both: `end` is the one thing they disagree about.
     fn end_view(&mut self, peer: NodeId, end: ViewEnd) {
-        // Whether or not a view was open: a dial that never reached one has
-        // an intent recorded against it, and this is one of the two places
-        // that ends (ADR 0101).
-        self.pending_surface.remove(&peer);
+        // `pending_surface` is not touched here (ADR 0101). The intent in it
+        // belongs to a connect, not to a view or a connection: `start_view`
+        // takes it when the window opens, and `settle_connect` or a cancel
+        // drops it when the connect ends without one. A live view's intent
+        // was taken when the window opened. With no view, the intent there may
+        // be a newer dial's: the `Closed` of a connection the revoke already
+        // let go of can land after the next dial at the same host has started,
+        // and dropping the intent then made that dial's shell a screen
+        // session. The same drop lost the shell a retry round re-dials with
+        // (ADR 0096) when a connection went before its grant.
         let Some(mut state) = self.views.remove(&peer) else {
             return;
         };
@@ -12913,6 +12960,26 @@ impl Actor {
                     handle.connection.close(0u32.into(), b"link lost");
                 }
                 let _ = reply.send(());
+            }
+            #[cfg(test)]
+            ActorCommand::HistoryConnectBeforeLateClose {
+                label,
+                surface,
+                peer,
+                reply,
+            } => {
+                let (dialed, mut answer) = oneshot::channel();
+                self.handle_command(ActorCommand::HistoryConnect {
+                    label,
+                    surface,
+                    reply: dialed,
+                });
+                // No connection of this run is ever given this id. What
+                // `on_closed` sees of a connection `close_connection` already
+                // took out is the same whatever its id was: no entry for the
+                // peer to compare it with.
+                self.on_closed(peer, u64::MAX);
+                let _ = reply.send(answer.try_recv().unwrap_or(Err(ActorError::ChannelClosed)));
             }
             ActorCommand::Revoke { label, reply } => {
                 let result = self.on_revoke(&label);
@@ -25666,6 +25733,64 @@ mod tests {
             0,
             "a terminal session starts no capture on the host"
         );
+    }
+
+    /// The `Closed` of a connection this guest let go of can reach the actor
+    /// after the next dial at the same host has started: the revoke closes the
+    /// connection and takes it out at once, and its reader reports the end a
+    /// moment later. That report ends the old connection and nothing else.
+    /// The shell the new dial asked for belongs to the dial (ADR 0101), so the
+    /// window the host's grant opens is still a terminal one.
+    ///
+    /// A loaded macOS runner once let the late report land inside the dial of
+    /// the test above, which then saw a screen window. This test makes it
+    /// land there every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_close_of_the_last_connection_keeps_the_next_dials_terminal() {
+        let (host, host_endpoint, host_capture) = actor().await;
+        let recorder = Arc::new(RecordingWindows::default());
+        let (guest, _guest_endpoint, _guest_capture, _windows) =
+            actor_with_windows(Arc::clone(&recorder) as Arc<dyn ViewWindows>).await;
+
+        // The remembered row a connect "for the terminal" starts from.
+        let invite = host.invite_create(Role::FullControl, false).await.unwrap();
+        guest.invite_connect(invite.code).await.unwrap();
+        let label = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .unwrap();
+        host.grant(label.clone(), Role::FullControl).await.unwrap();
+        wait_for_phase(&guest, ConnectPhase::Connected).await;
+        host.revoke(label).await.unwrap();
+        let remembered = wait_for_history(&guest, "nothing to reconnect to").await;
+        wait_for_phase(&guest, ConnectPhase::Idle).await;
+        wait_until("the revoked session is still capturing", || {
+            viewers(&host_capture) == 0
+        })
+        .await;
+
+        guest
+            .history_connect_before_late_close(
+                remembered[0].peer_label.clone(),
+                ViewSurface::Terminal,
+                host_endpoint.addr().id,
+            )
+            .await
+            .unwrap();
+        let again = tokio::time::timeout(TIMEOUT, wait_for_pending(&host))
+            .await
+            .expect("the late close called the dial off");
+        host.grant(again, Role::FullControl).await.unwrap();
+        wait_until("the second window was never opened", || {
+            recorder.opened().len() == 2
+        })
+        .await;
+        let (_window, _peer, input, surface) = recorder.opened().remove(1);
+        assert_eq!(
+            surface,
+            ViewSurface::Terminal,
+            "a late close of the connection before it made the terminal connect a screen one"
+        );
+        assert!(!input, "a terminal window arms no keyboard grab");
     }
 
     /// ADR 0131: one guest in control, and a shell for another beside it —
