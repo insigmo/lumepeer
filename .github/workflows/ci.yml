@@ -110,6 +110,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
       - run: cargo test --workspace --no-fail-fast
         if: ${{ !cancelled() }}
+      # The encode loop's wall-clock pacing tests (ADR 0136, 0139, 0144) are
+      # `#[ignore]`d in the run above, where hundreds of other tests share the
+      # runner's few cores and starve them: the macOS runner measured a 60 fps
+      # loop at 27 fps there. Here they run alone, one at a time.
+      - name: Pacing tests, alone
+        if: ${{ !cancelled() }}
+        run: cargo test -p lumepeer-runtime --lib -- --ignored --test-threads=1 view::tests::
 
   ui:
     name: ui (i18n + accessibility)

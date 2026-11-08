@@ -3948,6 +3948,9 @@ mod tests {
     /// doing 2 ms of work a tick ran at about 32 on Windows; the bound leaves
     /// room for a loaded machine without letting that through.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "wall-clock pacing, starved by the parallel suite on a loaded machine; \
+                CI runs it alone: cargo test -p lumepeer-runtime --lib -- --ignored \
+                --test-threads=1 view::tests::"]
     async fn the_pacing_keeps_up_with_60_fps() {
         const TICKS: u32 = 60;
         let interval = frame_interval(60);
@@ -5476,6 +5479,9 @@ mod tests {
     /// that cannot keep up, and every picture it is shown is older than the
     /// last; with them the host waits, and every picture is fresh.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "wall-clock pacing, starved by the parallel suite on a loaded machine; \
+                CI runs it alone: cargo test -p lumepeer-runtime --lib -- --ignored \
+                --test-threads=1 view::tests::"]
     async fn an_acknowledging_guest_is_shown_fresh_pictures_on_a_slow_link() {
         let queued = age_at_a_slow_guest(false, 40).await;
         let fresh = age_at_a_slow_guest(true, 40).await;
@@ -5487,11 +5493,11 @@ mod tests {
             "the test's link is not slow enough to queue anything: {queued:?}"
         );
         // Against the queue this test just measured, not a fixed ceiling: the
-        // ages are wall-clock time while hundreds of other tests share the
-        // CPU, and a loaded GitHub Windows runner showed 413 ms with
-        // acknowledgements against 1.39 s without — the mechanism plainly at
-        // work, and still over the 400 ms this used to demand. A host that
-        // ignored the acknowledgements would show the queued age both times.
+        // ages are wall-clock time, and a GitHub Windows runner sharing its
+        // CPU with the rest of the suite showed 413 ms with acknowledgements
+        // against 1.39 s without — the mechanism plainly at work, and still
+        // over the 400 ms this used to demand. A host that ignored the
+        // acknowledgements would show the queued age both times.
         assert!(
             fresh * 2 < queued,
             "an acknowledging guest was shown a picture {fresh:?} old, not much fresher than \
@@ -5591,6 +5597,9 @@ mod tests {
     /// it had just handed the frame to had not run yet. Now the loop waits
     /// for it, and the frame rate is the encoder's own.
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "wall-clock pacing, starved by the parallel suite on a loaded machine; \
+                CI runs it alone: cargo test -p lumepeer-runtime --lib -- --ignored \
+                --test-threads=1 view::tests::"]
     async fn an_encoder_slower_than_the_interval_sets_the_frame_rate_alone() {
         let took = ms(30);
         let (_, elapsed) = read_from_a_host(
