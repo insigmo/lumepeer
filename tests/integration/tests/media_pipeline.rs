@@ -25,13 +25,95 @@ use lumepeer_media::encode::{EncoderConfig, EncoderKind, VideoCodec, select_enco
 use lumepeer_media::error::MediaError;
 
 /// Path of the decoder worker built into the same target directory.
+///
+/// Nothing in `cargo test` builds it: a binary of another package is only
+/// built by `cargo build -p lumepeer-decoder-worker` (or `--workspace`), so
+/// whatever an older tree left there is what runs. One from before ADR 0162
+/// decodes H.264 and not AV1, and failed this suite with an `OpenH264` decode
+/// error in the middle of a test. A missing or stale worker fails here
+/// instead, saying what to do about it.
 fn worker_binary() -> PathBuf {
     // The test binary lives in target/<profile>/deps/, the worker one level up.
     let mut path = std::env::current_exe().unwrap();
     path.pop();
     path.pop();
     path.push("lumepeer-decoder-worker");
+    if let Err(why) = worker_is_current(&path) {
+        panic!("{why} — rebuild it: cargo build -p lumepeer-decoder-worker");
+    }
     path
+}
+
+/// Whether the worker at `path` (no extension) was built from the sources it
+/// would be built from now.
+///
+/// Cargo writes the list of local files a binary was built from next to it,
+/// as `<name>.d`. The worker is current when it exists and none of those
+/// files is missing or newer than it — the same mtime rule cargo applies
+/// when it decides whether to rebuild, so a worker this calls stale is one
+/// `cargo build` would rebuild, and never one it would leave alone.
+fn worker_is_current(path: &std::path::Path) -> Result<(), String> {
+    let binary = path.with_extension(std::env::consts::EXE_EXTENSION);
+    let built = std::fs::metadata(&binary)
+        .and_then(|meta| meta.modified())
+        .map_err(|e| format!("no decoder worker at {} ({e})", binary.display()))?;
+    let dep_info = path.with_extension("d");
+    let listing = std::fs::read_to_string(&dep_info).map_err(|e| {
+        format!(
+            "cannot tell what the decoder worker at {} was built from: {} ({e})",
+            binary.display(),
+            dep_info.display()
+        )
+    })?;
+    for source in dep_info_sources(&listing) {
+        let changed = std::fs::metadata(&source)
+            .and_then(|meta| meta.modified())
+            .map_err(|_| {
+                format!(
+                    "the decoder worker at {} was built from {}, which no longer exists",
+                    binary.display(),
+                    source.display()
+                )
+            })?;
+        if changed > built {
+            return Err(format!(
+                "the decoder worker at {} is older than {}, so it is not this tree's",
+                binary.display(),
+                source.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The prerequisites of a Makefile-style dep-info file: everything after the
+/// first `": "` (the colon of a Windows drive letter is followed by `\`, not a
+/// space), split on whitespace, with `\ ` standing for a space in a path.
+fn dep_info_sources(listing: &str) -> Vec<PathBuf> {
+    let Some((_, prerequisites)) = listing.split_once(": ") else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    let mut current = String::new();
+    let mut chars = prerequisites.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&' ') => {
+                current.push(' ');
+                chars.next();
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    sources.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        sources.push(PathBuf::from(current));
+    }
+    sources
 }
 
 fn peer(n: u8) -> lumepeer_core::NodeId {
