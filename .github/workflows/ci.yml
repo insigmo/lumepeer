@@ -1,9 +1,16 @@
 name: ci
 
+# A push to `master` is tested inside `release.yml`, which calls this workflow
+# (`workflow_call`) and cuts no version until every job here is green. Running
+# it here as well would build the whole matrix twice per push, so `master` is
+# left out of `push`; every other branch, every pull request and a manual run
+# still get it on their own.
 on:
   push:
-    branches: [master]
+    branches-ignore: [master]
   pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,6 +29,83 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  # Design doc §19 phase 0: the workspace builds, is clippy-clean and passes
+  # its tests on Windows, Linux and macOS. `eb90617` dropped this job on
+  # 2026-09-17, and for seven weeks nothing ran most of the workspace's tests
+  # anywhere — while `release.yml` shipped every push regardless.
+  #
+  # Default features, plus whatever `--workspace` unifies in: the desktop
+  # crate's per-OS tables (audio, X11, ScreenCaptureKit) and
+  # `tests/integration`'s `capture-x11,capture-portal,encode-aom`. That last
+  # one builds the vendored libaom, whose x86-64 build refuses to go on
+  # without nasm (ADR 0141), so every row installs it.
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # The Linux row is the image `release.yml` ships from (pipewire 0.10,
+        # libclang 22), not `ubuntu-latest`.
+        os: [ubuntu-26.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # The desktop build's own list (release.yml), plus X11/XTest for
+          # capture-x11 and D-Bus for the keystore's secret-service backend.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libpipewire-0.3-dev libclang-dev libx11-dev libxtst-dev libdbus-1-dev nasm
+      - name: Install nasm
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --no-progress -y
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+      # The Arm runner builds libaom's NEON kernels with the compiler alone,
+      # but a missing nasm should never be why this row differs from the rest.
+      - name: Install nasm
+        if: runner.os == 'macOS'
+        run: brew install nasm
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      # tauri-build reads frontendDist at compile time, so the webview bundle
+      # has to exist before cargo runs.
+      - run: npm install
+        working-directory: apps/desktop
+      - run: npm run build
+        working-directory: apps/desktop
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # tauri-build validates `externalBin` at compile time: each sidecar must
+      # exist as binaries/<name>-<target-triple><exe> before lumepeer-desktop
+      # builds. The directory is gitignored, so it is produced here from the
+      # same tree. The plain target/debug/lumepeer-decoder-worker this leaves
+      # behind is also the worker `tests/integration/tests/media_pipeline.rs`
+      # spawns.
+      - name: Build the sidecars for this target
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/ {print $2}')
+          case "$RUNNER_OS" in
+            Windows) EXE=.exe ;;
+            *) EXE= ;;
+          esac
+          mkdir -p apps/desktop/src-tauri/binaries
+          for BIN in lumepeer-decoder-worker lumepeer-service lumepeer-terminal-worker; do
+            cargo build -p "${BIN}"
+            cp "target/debug/${BIN}${EXE}" "apps/desktop/src-tauri/binaries/${BIN}-${TRIPLE}${EXE}"
+          done
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
   ui:
     name: ui (i18n + accessibility)

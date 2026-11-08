@@ -6,10 +6,23 @@ name: release
 # release.yml). tauri.conf.json sets bundle.targets = "all", so each Linux
 # job emits both .deb and .rpm in one pass; the matrix only needs to vary by
 # OS/arch, not by package format.
+#
+# Nothing is versioned, built or published until `ci.yml` has passed on the
+# same commit: the `ci` job below calls it, and `version` — which everything
+# after it needs — needs `ci`. A red test therefore stops the release before
+# a tag exists. That holds for every trigger, a manual run or tag included.
+#
+# A push that touches only documentation releases nothing: an update that
+# changes no byte of the app is still downloaded and installed by every
+# client. GitHub does not evaluate `paths-ignore` for tag pushes, so a `v*`
+# tag releases whatever it contains.
 on:
   push:
     branches: ["master"]
     tags: ["v*"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
     inputs:
       bump:
@@ -68,8 +81,22 @@ jobs:
           fi
           echo "proceed=true" >> "$GITHUB_OUTPUT"
 
-  version:
+  # The whole of ci.yml — rustfmt, the three-OS clippy and test matrix, the
+  # Linux media backends, the UI suite, cargo audit/deny — on this commit.
+  # Until 2026-11-08 nothing here waited for it, and release after release went
+  # out from a commit whose CI was red (v0.0.170 from 79887e6, for one).
+  ci:
     needs: [guard]
+    if: needs.guard.outputs.proceed == 'true'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  version:
+    # `ci` is what gates the release. `if:` below carries the implicit
+    # `success()`, so a failed or cancelled `ci` skips this job, and with it
+    # every job that needs it.
+    needs: [guard, ci]
     if: needs.guard.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     outputs:
