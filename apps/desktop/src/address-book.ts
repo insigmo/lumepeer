@@ -15,6 +15,7 @@ import { html, nothing, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { askFirst } from './ask-first';
 
 /** One row of `address_book_list`. */
 export interface AddressBookEntry {
@@ -197,17 +198,17 @@ export function addressBook(
                             notify();
                             return;
                           }
-                          if (
-                            !globalThis.confirm(
-                              t(locale, 'book.untrust.confirm', entry.name || entry.peer_label),
-                            )
-                          ) {
-                            return;
-                          }
-                          void setTrusted(entry.peer_label, false).then(onRefresh, (error: unknown) => {
-                            console.error('address_book_set_trusted failed:', error);
-                            onRefresh();
-                          });
+                          void askFirst(t(locale, 'book.untrust.confirm', entry.name || entry.peer_label)).then(
+                            (yes) => {
+                              if (!yes) {
+                                return;
+                              }
+                              void setTrusted(entry.peer_label, false).then(onRefresh, (error: unknown) => {
+                                console.error('address_book_set_trusted failed:', error);
+                                onRefresh();
+                              });
+                            },
+                          );
                         }}
                       />
                       <span>${t(locale, 'book.trusted')}</span>
@@ -216,17 +217,17 @@ export function addressBook(
                       type="button"
                       class="book-forget"
                       @click=${() => {
-                        if (
-                          !globalThis.confirm(
-                            t(locale, 'book.remove.confirm', entry.name || entry.peer_label),
-                          )
-                        ) {
-                          return;
-                        }
-                        void forget(entry.peer_label).then(onRefresh, (error: unknown) => {
-                          console.error('address_book_remove failed:', error);
-                          onRefresh();
-                        });
+                        void askFirst(t(locale, 'book.remove.confirm', entry.name || entry.peer_label)).then(
+                          (yes) => {
+                            if (!yes) {
+                              return;
+                            }
+                            void forget(entry.peer_label).then(onRefresh, (error: unknown) => {
+                              console.error('address_book_remove failed:', error);
+                              onRefresh();
+                            });
+                          },
+                        );
                       }}
                     >
                       ${t(locale, 'book.remove')}

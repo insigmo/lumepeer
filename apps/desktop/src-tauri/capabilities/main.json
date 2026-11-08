@@ -23,6 +23,7 @@
       "allow": [{ "label": "main" }]
     },
     "updater:default",
+    "dialog:allow-message",
     "allow-session-grant",
     "allow-session-revoke",
     "allow-session-status",

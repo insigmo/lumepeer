@@ -15,6 +15,7 @@ import { html, nothing, type TemplateResult } from 'lit-html';
 
 import type { Locale } from './i18n';
 import { t } from './i18n';
+import { askFirst } from './ask-first';
 import type { Role } from './consent-dialog';
 
 /** What `unattended_status` reports. Note what is absent (§13). */
@@ -271,13 +272,15 @@ export function unattendedSettings(
               @click=${() => {
                 // Turning it off deletes credentials, so it asks first — the
                 // same standard the trust switch is held to.
-                if (!globalThis.confirm(t(locale, 'unattended.disable.confirm'))) {
-                  return;
-                }
-                void run(async (invoke) => {
-                  await invoke('unattended_disable');
-                  provisioning = undefined;
-                }, onRefresh);
+                void askFirst(t(locale, 'unattended.disable.confirm')).then((yes) => {
+                  if (!yes) {
+                    return;
+                  }
+                  void run(async (invoke) => {
+                    await invoke('unattended_disable');
+                    provisioning = undefined;
+                  }, onRefresh);
+                });
               }}
             >
               ${t(locale, 'unattended.disable')}
@@ -361,12 +364,14 @@ function managedByService(
               class="unattended-disable"
               ?disabled=${busy}
               @click=${() => {
-                if (!globalThis.confirm(t(locale, 'unattended.disable.confirm'))) {
-                  return;
-                }
-                void run(async (invoke) => {
-                  await invoke('unattended_disable');
-                }, onRefresh);
+                void askFirst(t(locale, 'unattended.disable.confirm')).then((yes) => {
+                  if (!yes) {
+                    return;
+                  }
+                  void run(async (invoke) => {
+                    await invoke('unattended_disable');
+                  }, onRefresh);
+                });
               }}
             >
               ${t(locale, 'unattended.disable')}

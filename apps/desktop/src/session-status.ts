@@ -20,6 +20,7 @@ import type { ConnectionStats } from './connection-quality';
 import { connectionQuality } from './connection-quality';
 import type { FileCommands, FileTransfers } from './file-transfers';
 import { forgetThumbnail, thumbnailOf } from './peer-thumbnails';
+import { askFirst } from './ask-first';
 import { fileTransferPanel, tauriFileCommands } from './file-transfers';
 import { peerDisplayName, peerName } from './peer-name';
 
@@ -1031,12 +1032,14 @@ export function sessionStatus(
                             aria-label=${`${t(locale, 'history.forgetPassword')}: ${name}`}
                             @click=${(event: Event) => {
                               closeMenu(event);
-                              if (!globalThis.confirm(t(locale, 'history.forgetPassword.confirm', name))) {
-                                return;
-                              }
-                              void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
-                                console.error('history_forget_password failed:', error);
-                                onRefresh();
+                              void askFirst(t(locale, 'history.forgetPassword.confirm', name)).then((yes) => {
+                                if (!yes) {
+                                  return;
+                                }
+                                void forgetPassword(entry.peer_label).then(onRefresh, (error: unknown) => {
+                                  console.error('history_forget_password failed:', error);
+                                  onRefresh();
+                                });
                               });
                             }}
                           >
@@ -1051,13 +1054,15 @@ export function sessionStatus(
                           aria-label=${`${t(locale, 'history.remove')}: ${name}`}
                           @click=${(event: Event) => {
                             closeMenu(event);
-                            if (!globalThis.confirm(t(locale, 'history.remove.confirm', name))) {
-                              return;
-                            }
-                            forgetThumbnail(entry.peer_label);
-                            void forgetHistory(entry.peer_label).then(onRefresh, (error: unknown) => {
-                              console.error('history_remove failed:', error);
-                              onRefresh();
+                            void askFirst(t(locale, 'history.remove.confirm', name)).then((yes) => {
+                              if (!yes) {
+                                return;
+                              }
+                              forgetThumbnail(entry.peer_label);
+                              void forgetHistory(entry.peer_label).then(onRefresh, (error: unknown) => {
+                                console.error('history_remove failed:', error);
+                                onRefresh();
+                              });
                             });
                           }}
                         >

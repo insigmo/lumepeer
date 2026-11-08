@@ -313,6 +313,48 @@ const GUEST: SessionStatus = {
 
 // ADR 0121: a peer is shown by what its machine is called, with the label
 // every command still names it by one hover away.
+// In the main window tauri-plugin-dialog makes `window.confirm` async. Read
+// without waiting, its promise counted as yes and Cancel removed nothing.
+describe('remembered-host row behind the dialog plugin', () => {
+  function pluginConfirm(answer: boolean): void {
+    vi.spyOn(globalThis, 'confirm').mockImplementation(
+      (() => Promise.resolve(answer)) as unknown as typeof globalThis.confirm,
+    );
+  }
+
+  function renderWithPassword(): void {
+    render(
+      sessionStatus([], 'en', () => {}, [{ ...ENTRY, has_password: true }], () => {}),
+      container,
+    );
+  }
+
+  it('Cancel keeps the row', async () => {
+    pluginConfirm(false);
+    renderWithPassword();
+    container.querySelector<HTMLButtonElement>('.history-remove')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invoke).not.toHaveBeenCalledWith('history_remove', expect.anything());
+  });
+
+  it('Cancel keeps the saved password', async () => {
+    pluginConfirm(false);
+    renderWithPassword();
+    container.querySelector<HTMLButtonElement>('.history-forget-password')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invoke).not.toHaveBeenCalledWith('history_forget_password', expect.anything());
+  });
+
+  it('OK removes the row once answered', async () => {
+    pluginConfirm(true);
+    renderWithPassword();
+    container.querySelector<HTMLButtonElement>('.history-remove')?.click();
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledWith('history_remove', { args: { peer: 'host-ab12' } });
+    });
+  });
+});
+
 describe('a peer that named its machine', () => {
   it('is shown by that name and its operating system, the label in the tooltip', () => {
     render(

@@ -166,6 +166,20 @@ describe('address book', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  // The main window's `confirm` is tauri-plugin-dialog's async one.
+  it('Cancel in the dialog plugin forgets nothing and keeps trust', async () => {
+    const confirm = vi
+      .spyOn(globalThis, 'confirm')
+      .mockImplementation((() => Promise.resolve(false)) as unknown as typeof globalThis.confirm);
+    render(addressBook([home], 'en'), container);
+
+    container.querySelector<HTMLButtonElement>('.book-forget')?.click();
+    trustBoxes()[0]?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invoke).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
   it('forgetting a device asks first', async () => {
     const confirm = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
     render(addressBook([office], 'en'), container);

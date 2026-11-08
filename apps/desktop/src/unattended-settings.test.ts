@@ -142,6 +142,20 @@ describe('unattended settings', () => {
     confirm.mockRestore();
   });
 
+  // The main window's `confirm` is tauri-plugin-dialog's async one: Cancel
+  // must keep the device password and second factor where they are.
+  it('Cancel in the dialog plugin keeps unattended access on', async () => {
+    const confirm = vi
+      .spyOn(globalThis, 'confirm')
+      .mockImplementation((() => Promise.resolve(false)) as unknown as typeof globalThis.confirm);
+    render(unattendedSettings(on, 'en'), container);
+
+    container.querySelector<HTMLButtonElement>('.unattended-disable')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(invoke).not.toHaveBeenCalledWith('unattended_disable');
+    confirm.mockRestore();
+  });
+
   it('the role select shows what the core holds and asks it to change', async () => {
     render(unattendedSettings({ ...on, role: 'full_control' }, 'en'), container);
     const select = container.querySelector<HTMLSelectElement>('#unattended-role');
