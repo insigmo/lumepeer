@@ -5486,9 +5486,16 @@ mod tests {
             queued > ms(800),
             "the test's link is not slow enough to queue anything: {queued:?}"
         );
+        // Against the queue this test just measured, not a fixed ceiling: the
+        // ages are wall-clock time while hundreds of other tests share the
+        // CPU, and a loaded GitHub Windows runner showed 413 ms with
+        // acknowledgements against 1.39 s without — the mechanism plainly at
+        // work, and still over the 400 ms this used to demand. A host that
+        // ignored the acknowledgements would show the queued age both times.
         assert!(
-            fresh < ms(400),
-            "an acknowledging guest was shown a picture {fresh:?} old (without: {queued:?})"
+            fresh * 2 < queued,
+            "an acknowledging guest was shown a picture {fresh:?} old, not much fresher than \
+             the {queued:?} of one that does not acknowledge"
         );
     }
 
