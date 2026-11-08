@@ -682,7 +682,9 @@ pub fn grab(sink: Sink) -> Option<Grab> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = sink;
+        // Consumed rather than `let _ =`'d, which moves nothing and leaves
+        // clippy's needless_pass_by_value to fail every non-Windows build.
+        drop(sink);
         tracing::info!(
             "no keyboard grab on this platform: the compositor's own chords stay with it"
         );
