@@ -98,6 +98,16 @@ setup is needed for those legs.
 - **Elevation.** GitHub's Windows runner is elevated and this repository's
   development machines usually are not, so a Windows test over a DACL'd
   kernel object can pass in one place and fail in the other.
+- **The encode loop's pacing on macOS.** The three wall-clock pacing tests in
+  `crates/runtime/src/view.rs` (ADR 0136, 0139, 0144) are `#[ignore]`d in the
+  parallel run, where a loaded machine starves them, and run alone in a step
+  of their own on Linux and Windows. Not on macOS: on GitHub's macOS runner a
+  14.7 ms `std::thread::sleep` took about 30 ms even with nothing else
+  running, so a 60 fps loop measured 31 fps. Whether a Mac host's encode loop
+  is held back the same way when the app is in the background (timer
+  coalescing, App Nap) is not known; on a real Mac run them with
+  `cargo test -p lumepeer-runtime --lib -- --ignored --test-threads=1 view::tests::`.
+  The macOS row also runs the workspace tests one at a time (see `ci.yml`).
 
 
 ## Updates and autostart (ADR 0042)

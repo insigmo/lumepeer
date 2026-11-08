@@ -108,14 +108,18 @@ jobs:
       # clippy: one red run names every crate, lint and test binary that fails
       # on this OS, not just the first.
       - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
-      - run: cargo test --workspace --no-fail-fast
+      # One test at a time on macOS: its runner has three cores, and the
+      # runtime suite's few hundred real-endpoint tests in parallel there
+      # timed out on whichever ran slowest — a different one each run.
+      - run: cargo test --workspace --no-fail-fast ${{ runner.os == 'macOS' && '-- --test-threads=1' || '' }}
         if: ${{ !cancelled() }}
       # The encode loop's wall-clock pacing tests (ADR 0136, 0139, 0144) are
       # `#[ignore]`d in the run above, where hundreds of other tests share the
-      # runner's few cores and starve them: the macOS runner measured a 60 fps
-      # loop at 27 fps there. Here they run alone, one at a time.
+      # runner's few cores and starve them. Here they run alone, one at a
+      # time. Not on macOS: there even alone a 14.7 ms sleep took about 30 ms,
+      # and a 60 fps loop ran at 31 fps (see docs/release-checklist.md).
       - name: Pacing tests, alone
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && runner.os != 'macOS' }}
         run: 'cargo test -p lumepeer-runtime --lib -- --ignored --test-threads=1 view::tests::'
 
   ui:
