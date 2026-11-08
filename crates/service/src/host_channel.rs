@@ -114,12 +114,20 @@ impl HostChannel {
     /// The channel for the user `user_sid`; `None` for anything but a SID.
     #[must_use]
     pub fn new(user_sid: &str) -> Option<Self> {
+        Self::at(&endpoint_for(user_sid), user_sid)
+    }
+
+    /// The channel for the user `user_sid` under the pipe name `endpoint`:
+    /// [`Self::new`] everywhere but the tests, which must not collide with
+    /// the session host already serving this user on a machine where
+    /// Lumepeer is installed.
+    fn at(endpoint: &str, user_sid: &str) -> Option<Self> {
         if !crate::frame::is_sid_string(user_sid) {
             tracing::error!("refusing to build the session host's channel from a non-SID");
             return None;
         }
         Some(Self {
-            name: wide(&endpoint_for(user_sid)),
+            name: wide(endpoint),
             sddl: sddl_for(user_sid),
             first_created: false,
         })
@@ -287,10 +295,17 @@ impl PanelLink {
         if !crate::frame::is_sid_string(user_sid) {
             return None;
         }
+        Self::open(&endpoint_for(user_sid))
+    }
+
+    /// [`Self::connect`] to the pipe named `endpoint`, with the same owner
+    /// check; the tests' way to reach a channel of their own rather than the
+    /// installed session host's.
+    fn open(endpoint: &str) -> Option<Self> {
         let pipe = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(endpoint_for(user_sid))
+            .open(endpoint)
             .ok()?;
         if !owned_by_local_system(&pipe) {
             tracing::warn!(
@@ -397,12 +412,19 @@ mod tests {
     /// connects to it. Unelevated the pipe's owner cannot be `LocalSystem`, so
     /// the client must refuse to believe it — the squatting case; a run as
     /// `LocalSystem` is the only one that gets an answer.
+    ///
+    /// The pipe is named for this test run, not [`endpoint_for`] the user:
+    /// wherever Lumepeer is installed, its session host — a `LocalSystem`
+    /// process — already serves that name for the signed-in user, so this
+    /// test's own pipe was refused and the client reached the real one, which
+    /// it rightly believed. The owner check under test is the same either way.
     #[test]
     fn a_client_believes_only_a_channel_local_system_owns() {
         let Some((sid, _)) = crate::program_data::this_process() else {
             return;
         };
-        let Some(mut channel) = HostChannel::new(&sid) else {
+        let endpoint = format!("{ENDPOINT_PREFIX}test-{}-{sid}", std::process::id());
+        let Some(mut channel) = HostChannel::at(&endpoint, &sid) else {
             return;
         };
         let server = std::thread::spawn(move || {
@@ -415,7 +437,7 @@ mod tests {
         });
         // Give the accept a moment to be waiting.
         std::thread::sleep(Duration::from_millis(100));
-        let link = PanelLink::connect(&sid);
+        let link = PanelLink::open(&endpoint);
         if sid == "S-1-5-18" {
             let mut link = link.expect("LocalSystem's own channel");
             assert_eq!(
@@ -430,7 +452,7 @@ mod tests {
             let _ = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(endpoint_for(&sid));
+                .open(&endpoint);
         }
         let _ = server.join();
     }
