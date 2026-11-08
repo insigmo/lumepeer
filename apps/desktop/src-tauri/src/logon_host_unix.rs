@@ -324,6 +324,8 @@ impl ViewWindows for LogonScreen {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "a failed assumption must fail the test")]
+
     use super::*;
 
     #[test]

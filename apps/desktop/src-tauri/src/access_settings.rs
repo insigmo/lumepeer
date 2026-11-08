@@ -68,6 +68,13 @@ impl AccessSettings {
     /// `address_book`; trust changes are audited into `audit` when there is
     /// one, and `told` is called after every write.
     #[must_use]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(
+            dead_code,
+            reason = "only Windows' access-settings process opens one (ADR 0169 §5)"
+        )
+    )]
     pub fn new(
         account: String,
         keystore: Box<dyn Keystore>,
@@ -97,6 +104,13 @@ impl AccessSettings {
 
     /// The SID of the account whose policy this is.
     #[must_use]
+    #[cfg_attr(
+        not(target_os = "windows"),
+        allow(
+            dead_code,
+            reason = "read only by the Windows-only sign-in screen commands"
+        )
+    )]
     pub fn account(&self) -> &str {
         &self.account
     }

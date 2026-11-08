@@ -2317,7 +2317,7 @@ pub fn host_logon_screen_unless_declined() {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "cannot read this account's credentials to refresh the sign-in screen copy")
+                    tracing::warn!(%error, "cannot read this account's credentials to refresh the sign-in screen copy");
                 }
             }
         }

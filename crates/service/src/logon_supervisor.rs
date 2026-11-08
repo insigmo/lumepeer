@@ -74,7 +74,7 @@ pub fn run() {
             }
         }
         Err(error) => {
-            tracing::error!(%error, "cannot listen on {SOCKET_PATH}; no account can enroll")
+            tracing::error!(%error, "cannot listen on {SOCKET_PATH}; no account can enroll");
         }
     }
     tracing::info!("watching {SEAT} for the sign-in screen (ADR 0151)");
