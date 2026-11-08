@@ -21,9 +21,11 @@ the other way around.
 
 `ci/resource-budget.yml` holds the thresholds. `tests/integration/tests/resource_budget.rs`
 measures the sandboxed decoder worker's own RSS against the `active_extra_rss_mib`
-gate and is wired into the `resource-budget` CI job — currently disabled
-(`if: false`) because no `[self-hosted, lumepeer-reference]` runner is
-registered against this repository yet. See
+gate. The `resource-budget` CI job that ran it — disabled (`if: false`)
+because no `[self-hosted, lumepeer-reference]` runner is registered against
+this repository — went out of `ci.yml` with the build matrix in `eb90617`
+(2026-09-17); the matrix is back, the job is not, since it would only be
+skipped. Its body is in `git show eb90617 -- .github/workflows/ci.yml`. See
 `docs/adr/0008-phase-5-resource-and-security-gates.md` for why, and what it
 would take to turn it on. Until then, this line of §21/§19 is **not** a real
 release gate: it is tooling that runs the moment the hardware exists.
@@ -31,23 +33,71 @@ release gate: it is tooling that runs the moment the hardware exists.
 ## Release pipeline
 
 `.github/workflows/release.yml` builds and publishes on every push to
-`master`: `guard` skips the workflow's own version-bump commit, `version`
-computes the next patch tag from the highest existing `v*` tag (or takes the
-bump type from `workflow_dispatch`, or the tag as-is on a manual `v*` push),
-writes it into `Cargo.toml` / `apps/desktop/package.json` /
-`apps/desktop/src-tauri/tauri.conf.json`, commits as `github-actions[bot]` and
-pushes the commit + tag with the default `GITHUB_TOKEN` (no PAT needed —
-GitHub does not let that token's own pushes retrigger workflows, so this
-can't loop). `build` then runs the platform matrix — Linux amd64/arm64
-(`.deb` + `.rpm`, `tauri.conf.json`'s `bundle.targets = "all"`), Windows
-amd64/arm64 (NSIS + MSI) and macOS arm64 (`.dmg`) — each publishing straight
-to that tag's GitHub Release via `tauri-action`. `install.sh` / `install.ps1`
-at the repo root pull the matching asset from the latest (or a pinned)
-release and install it with the platform's native package manager.
+`master` that changes more than documentation, on a manual `v*` tag push and
+on `workflow_dispatch`. Its jobs run in this order, and each needs the one
+before it:
+
+1. `guard` skips the workflow's own version-bump commit.
+2. `ci` runs the whole of `.github/workflows/ci.yml` on the same commit
+   (`workflow_call`): rustfmt; the `build` matrix, which runs
+   `cargo clippy --workspace --all-targets -- -D warnings` and
+   `cargo test --workspace` on `ubuntu-26.04`, `windows-latest` and
+   `macos-latest`; the Linux media backends under Xvfb; the UI suite and IPC
+   contract; the fuzz targets build; and `cargo audit`, `cargo deny check`
+   and the SBOM.
+3. `version` needs `ci`, so a red or cancelled CI skips it, and with it
+   everything below: no tag, no version commit, no release. It computes the
+   next patch tag from the highest existing `v*` tag (or takes the bump type
+   from `workflow_dispatch`, or the tag as-is on a manual `v*` push), writes
+   it into `Cargo.toml` / `apps/desktop/package.json` /
+   `apps/desktop/src-tauri/tauri.conf.json`, commits as
+   `beta <qwantone@gmail.com>` and pushes the commit + tag with the default
+   `GITHUB_TOKEN` (no PAT needed — GitHub does not let that token's own
+   pushes retrigger workflows, so this can't loop).
+4. `build` runs the platform matrix — Linux amd64/arm64 (`.deb` + `.rpm`,
+   `tauri.conf.json`'s `bundle.targets = "all"`), Windows amd64/arm64 (NSIS +
+   MSI) and macOS arm64/x86-64 (`.dmg`) — each publishing straight to that
+   tag's GitHub Release via `tauri-action`; `manifest`, `beta-manifest` and
+   `release-notes` follow it.
+
+`install.sh` / `install.ps1` at the repo root pull the matching asset from
+the latest (or a pinned) release and install it with the platform's native
+package manager.
+
+A push that changes only `docs/**` or `*.md` files starts no release
+(`paths-ignore`): every client would download and install a version whose app
+is byte-for-byte the previous one. The change goes out with the next push
+that touches code. GitHub does not evaluate `paths-ignore` for tag pushes, so
+a `v*` tag always releases.
+
+`ci.yml` runs on its own for pull requests, pushes to any branch but `master`
+and manual runs. A push to `master` runs it only inside `release.yml`, so its
+results for a `master` commit are in that commit's `release` run
+(`gh run list --branch master --workflow release.yml`), as jobs named
+`ci / …`. A docs-only push to `master` runs neither.
 
 Windows/Linux ARM64 build **natively** on GitHub's `windows-11-arm` /
 `ubuntu-26.04-arm` hosted runners, not cross-compiled, so no extra linker
 setup is needed for those legs.
+
+### What CI does not cover
+
+- **A whole session between two running apps.** The `e2e` job (two debug
+  builds of the app on one Xvfb display, paired over real iroh and QUIC and
+  driven by tauri-pilot through `e2e/ci-stand.sh`) was removed together with
+  ADR 0036 in `ab90e8e` (2026-08-30) and is not back: it needs WebKitGTK's
+  sandbox working under Xvfb on a hosted runner, two full desktop builds and
+  the pilot bridge, and the script has not been run since. Before a release a
+  session is checked by hand on real machines with `e2e/matrix`.
+- **The shipped media features of Windows and macOS.** The `build` matrix
+  uses default features plus what `--workspace` unifies in, so
+  `capture-windows`, `encode-mf`, `encode-mf-zero-copy` and
+  `encode-videotoolbox` are compiled only by `release.yml`'s `build` rows —
+  never linted, never tested. Linux's shipped set is linted and tested by the
+  `media` job.
+- **Elevation.** GitHub's Windows runner is elevated and this repository's
+  development machines usually are not, so a Windows test over a DACL'd
+  kernel object can pass in one place and fail in the other.
 
 
 ## Updates and autostart (ADR 0042)
