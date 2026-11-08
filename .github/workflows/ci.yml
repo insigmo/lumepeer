@@ -104,8 +104,10 @@ jobs:
             cargo build -p "${BIN}"
             cp "target/debug/${BIN}${EXE}" "apps/desktop/src-tauri/binaries/${BIN}-${TRIPLE}${EXE}"
           done
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--keep-going` and `--no-fail-fast`: one red run names every crate and
+      # every test binary that fails on this OS, not just the first.
+      - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
+      - run: cargo test --workspace --no-fail-fast
 
   ui:
     name: ui (i18n + accessibility)
