@@ -116,7 +116,7 @@ jobs:
       # loop at 27 fps there. Here they run alone, one at a time.
       - name: Pacing tests, alone
         if: ${{ !cancelled() }}
-        run: cargo test -p lumepeer-runtime --lib -- --ignored --test-threads=1 view::tests::
+        run: 'cargo test -p lumepeer-runtime --lib -- --ignored --test-threads=1 view::tests::'
 
   ui:
     name: ui (i18n + accessibility)
